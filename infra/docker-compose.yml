@@ -1,0 +1,124 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 开发环境依赖服务编排（postgres / redis / minio）
+#
+# 【为什么 app 不在 compose 里】
+#   仓库形态已定案为「前后端独立构建、独立部署」（docs/06 §3.0）：
+#   后端是一个容器、前端是纯静态资源，二者与依赖服务生命周期不同。
+#   开发期只用一个 compose 拉起**有状态依赖**，业务进程在宿主上跑
+#   （`pnpm dev:backend` / `pnpm dev:frontend`），改代码即热更 —— 比
+#   「改一行重建一个 app 镜像」快一个数量级。
+#   生产形态（app + 三依赖同 compose）见 docs/02 §十二，到 P0-3 收尾时再补。
+#
+# 【用法】
+#   infra/scripts/dev-up.ps1    拉起 + 等待健康 + 自动验收扩展
+#   infra/scripts/dev-down.ps1  停服（默认保留数据卷）
+#
+# 【端口】一律「宿主端口 ← 环境变量」，默认值见 infra/.env.example。
+#   冲突时改 .env 即可，不必动本文件。
+# ═══════════════════════════════════════════════════════════════════════
+
+name: doubulea
+
+services:
+  # ── PostgreSQL 16（自建镜像：pgvector + pg_bigm）────────────────────
+  # 决策 11 + 子方案① §4-4：向量路要 HNSW(vector_cosine_ops)，
+  # 全文路要 gin_bigm_ops，两个扩展都必须真的编译进镜像。
+  postgres:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: doubulea/postgres:pg16-vector-bigm
+    container_name: doubulea-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-doubulea}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必填，见 infra/.env.example}
+      POSTGRES_DB: ${POSTGRES_DB:-doubulea}
+      # 与宿主同区，便于日志时间与排查对齐
+      TZ: ${TZ:-Asia/Shanghai}
+      # 中文排序/大小写（initdb 时决定，之后不可改）
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 用 pg_isready 而非 psql：不依赖密码与库名，纯探「接受连接」
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-doubulea} -d ${POSTGRES_DB:-doubulea} -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    # 生产：pg_dump 定时备份 cron（docs/02 §十二）。开发期不挂。
+    networks:
+      - doubulea
+
+  # ── Redis 7 ────────────────────────────────────────────────────────
+  # 用途（docs/02）：session、会话互斥锁 chat.active:{id}、
+  # 停止信号 chat.stop:{id}、流水线队列 pipeline:jobs。
+  # **AOF everysec** 是硬要求 —— 重启不丢队列与锁（docs/02 §十二）。
+  redis:
+    image: redis:7-alpine
+    container_name: doubulea-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "3600 1"
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - doubulea
+
+  # ── MinIO（S3 兼容对象存储）─────────────────────────────────────────
+  # 存原始文档文件与任务产物；产物下载走 30 分钟时效预签名链接
+  # （ARTIFACT_URL_TTL_MIN，docs/02 §十一）。
+  minio:
+    image: minio/minio:latest
+    container_name: doubulea-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER 必填，见 infra/.env.example}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD 必填，见 infra/.env.example}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"      # S3 API（S3_ENDPOINT 指向这里）
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"  # Web 控制台
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      # MinIO 官方镜像自带 mc 但未配置 alias，用自带的 readiness 端点最省事。
+      # 早期版本没有 /minio/health/live 时兜底探根路径。
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - doubulea
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+
+networks:
+  doubulea:
+    name: doubulea
