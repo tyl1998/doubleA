@@ -390,6 +390,16 @@ const envSchema = z
     EMBEDDING_API_KEY: optionalText,
     EMBEDDING_API_MODEL: optionalText,
     LOCAL_EMBEDDING_MODEL_PATH: defaultedVar(z.string().trim().min(1), '/models/bge-m3-int8'),
+    /**
+     * 本地推理**运行时**模块（P0-1-13）：导出 `createEmbedder({ modelPath, dim })`，
+     * 契约见 `02` §八。默认空 = local 模式尚未就绪（待决事项 2：bge-m3 交付物形态未定）。
+     */
+    LOCAL_EMBEDDING_RUNTIME_MODULE: optionalText,
+    /**
+     * 一次 embedding 请求塞多少条文本（`子方案①` §4-3 的 `chunk_embed_batch`）。
+     * P0-1-15 建库时把它连同 chunk_size 一起**快照**进 KB 的入库参数。
+     */
+    EMBEDDING_BATCH_SIZE: intVar('EMBEDDING_BATCH_SIZE', 32, { min: 1, max: 512 }),
     EMBEDDING_DIM: intVar('EMBEDDING_DIM', 1024, { min: 1 }),
 
     // ── 并发与限额（`02` §十一）──
@@ -484,6 +494,10 @@ export interface AppConfig {
     apiKey: string | undefined
     apiModel: string | undefined
     localModelPath: string
+    /** `mode=local` 时的推理运行时模块（P0-1-13）；未配置即 local 模式未就绪 */
+    localRuntimeModule: string | undefined
+    /** 一次请求的文本条数（`子方案①` §4-3 的 `chunk_embed_batch`） */
+    batchSize: number
     dim: number
     /** `mode=api` 且三项齐备 —— 假时由 P0-1-13 的 provider 初始化硬报错 */
     apiReady: boolean
@@ -632,6 +646,13 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         '（待决事项 2：bge-m3 int8 文件获取渠道未定，P0-1-13 补验）',
     )
   }
+  if (vars.EMBEDDING_MODE === 'local' && vars.LOCAL_EMBEDDING_RUNTIME_MODULE === undefined) {
+    warnings.push(
+      'EMBEDDING_MODE=local 但未设置 LOCAL_EMBEDDING_RUNTIME_MODULE（本地推理运行时模块）—— ' +
+        '入库/检索会在 P0-1-13 初始化 embedding provider 时硬报错。' +
+        '运行时契约见 docs/02 §八；只想先把链路跑通用 EMBEDDING_MODE=api。',
+    )
+  }
   if (vars.EMBEDDING_DIM !== 1024) {
     warnings.push(
       `EMBEDDING_DIM=${vars.EMBEDDING_DIM} 与 chunks.embedding 的 vector(1024) 不一致（子方案① §4-4），` +
@@ -685,6 +706,8 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiKey: vars.EMBEDDING_API_KEY,
       apiModel: vars.EMBEDDING_API_MODEL,
       localModelPath: vars.LOCAL_EMBEDDING_MODEL_PATH,
+      localRuntimeModule: vars.LOCAL_EMBEDDING_RUNTIME_MODULE,
+      batchSize: vars.EMBEDDING_BATCH_SIZE,
       dim: vars.EMBEDDING_DIM,
       apiReady,
     },
@@ -754,6 +777,8 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       apiModel: value.embedding.apiModel ?? null,
       apiReady: value.embedding.apiReady,
       localModelPath: value.embedding.localModelPath,
+      localRuntimeModule: value.embedding.localRuntimeModule ?? null,
+      batchSize: value.embedding.batchSize,
       dim: value.embedding.dim,
     },
     concurrency: value.concurrency,

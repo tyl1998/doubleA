@@ -30,6 +30,7 @@
     "verify:model-providers": "pnpm --filter @doubulea/backend verify:model-providers",
     "verify:models": "pnpm --filter @doubulea/backend verify:models",
     "verify:llm": "pnpm --filter @doubulea/backend verify:llm",
+    "verify:embedding": "pnpm --filter @doubulea/backend verify:embedding",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

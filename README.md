@@ -84,13 +84,14 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
 pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（44 项）
+pnpm verify:embedding  # embedding 双模式验收：真 HTTP 假上游 + stub 推理运行时，**不占端口、不启 docker**（27 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
 pnpm verify:auth       # 认证接口验收：登录/改密/限速/首登闸门，**需要真实 PG + Redis**（21 项）
@@ -134,6 +135,15 @@ pnpm verify:llm        # LLM client 验收：起真 HTTP 假上游，报文/流�
 > SSE 分片/无 `[DONE]`/末帧无空行/思考增量/畸形帧等边界、两级超时、以及"用户点停止 ≠ 故障"）。
 > 各脚本都自造临时数据并在收尾时删净（含 Redis 键），跑完还会**断言**残留为零，不会污染开发库。
 > 看细节日志：`LOG_LEVEL=debug pnpm verify:users`。
+>
+> `pnpm verify:embedding` **与上一条相反：它不需要任何依赖**（本批没有新增 HTTP 路由、provider 也不碰库），
+> 因此可以跟 `verify:app` 一起进 CI。三组用例：① **api 模式**对着真 HTTP 假上游验报文（批 32、
+> 只发 `model`/`input` 不发 `encoding_format` 之类）与五种异常（条数不符/维度不符/`index` 不是排列/
+> 非数字/401 脱敏/超时）；② **local 模式**注入一个**临时 stub 运行时**，用线程内回报的 `threadId`
+> 证明"推理真的不在主线程跑"、批 32、维度与条数校验、出错后线程仍可用、`dispose()` 后能重建；
+> ③ **工厂接线**用**子进程注入环境变量**跑，验 `EMBEDDING_MODE` 切换真的接到了对的 provider 上
+> （与 `infra/.env` 当前状态解耦）。⚠️ **它验不到的东西**：local 的**推理与精度**（模型文件未就位，
+> 见 `docs/06` §七 待决事项 2）与"单条 < 500ms"的性能门槛 —— 这两条要等运行时模块到位后补验。
 >
 > ⭐ `pnpm verify:e2e` 与前四个的关键区别：**它自己 spawn 一个真实后端进程**（默认端口 **13099**，
 > 不占你正在看的 13000），用真实 TCP + `fetch` 走一遍，并**手写 Cookie 罐**（不使用任何测试后门）。
@@ -337,6 +347,17 @@ curl -s --noproxy '*' -b /tmp/jar "$BASE/api/model-providers/<①的id>/remote-m
 #  → { providerId, providerName, baseUrl, total, truncated, items:[{id, ownedBy, created}] }
 #    只读探测、不落库（库里模型条数一条都不变）；上游 401/超时会得到 502/504 + 可读文案，
 #    且**错误消息里不会出现你的 Key**（上游把 Authorization 回显进 body 时也照样被抹掉）。
+
+# ⑥ embedding 双模式自检（P0-1-13）—— 没有 HTTP 端点（入库/检索是 D 包的事），
+#    所以这里验的是"配置接对了没有、就绪了没有"：
+pnpm config:check | grep -A8 '"embedding"'
+#  → 看 mode / dim / batchSize / localRuntimeModule / apiReady
+#    维度必须与 chunks.embedding 的 vector(1024) 一致（不一致会打 WARN）
+node --input-type=module -e "const m=await import('./backend/dist/backend/src/llm/embedding/index.js');console.log(m.embeddingReadiness())"
+#  → { mode:'api'|'local', ready:true|false, dim:1024, name:'api:<模型>'|'local:<目录名>'|null, problems:[…] }
+#    ready=false 时 problems 就是"缺什么"的人话清单（同一句话会在 getEmbeddingProvider() 抛出来）
+#  → api 模式：填好 EMBEDDING_API_URL/KEY/MODEL 三项即 ready；
+#    local 模式：除了模型目录，还要 LOCAL_EMBEDDING_RUNTIME_MODULE（推理运行时，见 docs/02 §八）
 ```
 
 **已知边界（别当 bug）**：① 接口只有三组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
@@ -347,11 +368,15 @@ curl -s --noproxy '*' -b /tmp/jar "$BASE/api/model-providers/<①的id>/remote-m
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
 ③ **LLM client 目前没有对外调用入口**（`chat()` / `chatStream()` 是给 F 包编排用的），
 所以"模型通不通"这一层现在还只能用 `remote-models` 探一下（P1 的 `POST /api/models/:id/test` 未做）；
-④ **端测完请复位**（走查会把 admin 的密码改掉、也会往模型池留下你建的 Provider，删掉即可）：
+④ **embedding 同样没有对外端点**（入库/检索是 D 包的事），上面 ⑥ 的两条自检能告诉你"配置齐不齐、
+就绪没就绪"；**local 模式的推理还跑不了**（`LOCAL_EMBEDDING_RUNTIME_MODULE` 为空 =
+`docs/06` §七 待决事项 2 未关闭），要试就先走 `EMBEDDING_MODE=api`；
+⑤ **端测完请复位**（走查会把 admin 的密码改掉、也会往模型池留下你建的 Provider，删掉即可）：
 `SEED_RESET_PASSWORD=1 pnpm db:seed` 把两个种子账号打回首登态并恢复成你指定的密码。
 
 > 想一条命令跑完上面全部 + 六条门槛的自动版：`pnpm verify:e2e`（它自己起进程、自己造号、跑完删净）；
-> LLM client 那部分（含假上游）的自动版：`pnpm verify:llm`。
+> LLM client 那部分（含假上游）的自动版：`pnpm verify:llm`；
+> embedding 双模式（含 stub 推理运行时，**不需要起 docker**）：`pnpm verify:embedding`。
 
 > 进程支持 SIGINT/SIGTERM 优雅退出：停止接流 → 关闭 PG/Redis 连接 → flush 日志 → 退出（10s 兜底强退）。
 
@@ -397,6 +422,7 @@ curl -s --noproxy '*' -b /tmp/jar "$BASE/api/model-providers/<①的id>/remote-m
 | `issue_fix/问题记录-P0-1-10-模型池Provider管理.md` | **AAD 绑定到 `id` 会让加密依赖 `id`** → 建 Provider 必须用事务（先落行拿 id 再加密），否则失败重试会留下"建好了但没 Key"的行、而且调用方还会再建一个；**解密失败不能掀桌**（预览降级 `****`，否则主密钥一换列表整页 500，连"哪个 Key 坏了"都看不到）；三态的实现落点（`.nullable().optional()` **不加 default**）；**最强验收是"密文逐字不变"**（能抓出"每次 PATCH 都重写 Key"）；`ON DELETE RESTRICT` 让"删 Provider"必须前置检查、且**软删的 Agent 仍占外键**；`baseUrl` 去尾斜杠 + 只允许 http(s)（SSRF 面）；改 type 与硬删的取舍；`maskApiKey` 的断言别拿"字符集不相交"去写（分隔符会误报） |
 | `issue_fix/问题记录-P0-1-9-认证与用户验收.md` | **种子脚本的「幂等」是安全属性**（默认绝不覆盖密码，否则改过密码的人下次 seed 后登录不上）、种子脚本的 console 是交付通道而非日志（需 ESLint 例外）、`prisma/seed.ts` 会被编译进 dist 的两面性、**「端到端」的关键是换掉传输层**（spawn 真实进程 + 真实 HTTP）、子进程端口先探再用、`UID` 是 shell 只读变量、`fetch` 要多条 `Set-Cookie` 必须用 `getSetCookie()`、**「跑完干净」要写成断言**、门槛 3 的「业务 API」本仓还没有（用 403 文案区分闸门 vs 权限）、手工走查会留下不可用状态（收尾必须 seed 复位） |
 | `issue_fix/问题记录-P0-1-12-LLM-client封装.md` | **两个实现 bug 都是跑验收才抓出来的**：① "到响应头"与"流内空闲"各建一个 `AbortController` ⇒ 空闲超时**根本没接到 `fetch` 上**（计时器照常触发、读流纹丝不动，脚本挂死被 SIGTERM）；② 中断只靠"abort 让读流失败" ⇒ 响应已在同一个 TCP 包里缓冲好时**点了停止回答还在往外冒**（必须在每帧之前显式查信号）。另有：`stream_options` 默认不能发（400 的常见来源）、末帧可能没有结尾空行（残留缓冲也要当一帧）、SSE 帧会被 TCP 切碎、`200` 里藏 `{error}`、`rawFinishReason` 不在传输层归一化、**上游 401 的 body 会回显 `Authorization` ⇒ 任何进日志/错误消息的片段都要先脱敏**、把"真实 provider"换成**本地真 HTTP 假上游**（验收不依赖外部厂商）、拉模型列表的两种"不"（不要求启用、不要求配 Key）与上游 404 的可执行文案 |
+| `issue_fix/问题记录-P0-1-13-embedding双模式.md` | **两个实现问题也都是跑验收才抓出来的**：① worker 无脑继承 `process.execArgv` ⇒ 父进程若是 `node --input-type=module -e …` 起的（验收脚本的子进程就是），worker 一启动就崩（`.ts` 入口才该继承，`.js` 传 `[]`）；② 用 `spawnSync` 起子进程验"工厂接线" ⇒ 把父进程事件循环钉住，跑在父进程里的假上游无法应答，症状是"地址配对了却报 30s 超时"（改异步 `spawn`）。另有：**先抽 `llm/upstream.ts` 再写第二个上游调用点**（否则 P0-1-12 的两个坑要养两份，且 `verify:llm` 22 项证明了抽取未改行为）、`worker_threads` 隔离要用**线程内回报的 `threadId`** 取证、local 的推理运行时（含分词）**走注入**而不是写死 `onnxruntime-node`（交付物形态未定；且本批因此零新增依赖）、`dim()` 恒返回配置维度而实际维度逐条校验、**批串行**（不裸 `Promise.all`）、`index` 归位与"必须是 `0..n-1` 的排列"、`input: []` 不发请求、就绪判定两级（config 只 WARN / 取用时硬报错） |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 
@@ -481,6 +507,9 @@ doubuleA/
 │   │   │                              + 模型 CRUD + 三套守卫 + 两套投影（P0-1-11 ✅）
 │   │   │                              + resolveChatTarget()（解密 Key → 上游目标）+ 拉上游模型列表（P0-1-12 ✅）
 │   │   ├── llm/client.ts          ← OpenAI 兼容传输层：chat() / chatStream() / fetchRemoteModels()（P0-1-12 ✅）
+│   │   ├── llm/upstream.ts        ← 通用上游件：看门狗/中断/脱敏/状态码映射/fetchUpstreamJson（P0-1-13 ✅）
+│   │   ├── llm/embedding/         ← index.ts（工厂 + 就绪自检）+ api.ts（OpenAI 兼容 /embeddings）
+│   │   │                            + local.ts（worker 客户端）+ embedding.worker.ts（线程内宿主）（P0-1-13 ✅）
 │   │   └── infra/                 ← logger.ts（P0-1-3 ✅）+ pg/redis/s3.ts（P0-1-4 ✅）
 │   │                                + prisma.ts（客户端单例，P0-1-5 ✅）
 │   │                                + crypto.ts（AES-256-GCM + bcrypt，P0-1-6 ✅）
@@ -488,6 +517,7 @@ doubuleA/
 │                                     + verify-session.mjs / verify-auth.mjs / verify-users.mjs（真实 PG+Redis）
 │                                     + verify-model-providers.mjs / verify-models.mjs（真实 PG+Redis）
 │                                     + verify-llm.mjs（真 HTTP 假上游 + 真实 PG+Redis）
+│                                     + verify-embedding.mjs（真 HTTP 假上游 + stub 运行时，**无依赖**）
 │                                     + verify-e2e.mjs（自起真实进程）
 ├── frontend/                      ← @doubulea/frontend（独立构建，→ frontend/dist 纯静态）
 ├── infra/                         ← docker-compose + 自建 PG 镜像 + 启停脚本（P0-1-2 ✅）
@@ -531,3 +561,4 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-10 完成（包 C 起步）**：模型池 Provider 管理 —— `shared/src/modelProvider.ts`（`MODEL_TYPES` / `maskApiKey` / 三段 schema）、`backend/src/services/model.service.ts`（**Key 写入即 AES-256-GCM 加密、AAD 绑定到 `id`**；读接口只出口 `hasKey` + `apiKeyPreview` 掩码；PATCH 三态；删除与改 type 的两条 409 守卫）、`backend/src/routes/modelProviders.ts` + `app.ts` 接线。`pnpm verify:app` 扩到 **38 项**（CI 模式 39 项），新增 **`pnpm verify:model-providers`（18 项，需 PG+Redis）**；`verify:db`/`session`/`auth`/`users`/`e2e` 全部未回归；**零新增依赖、零新增环境变量**；`docs/02` 新增 **§10.2 Provider Key 存储口径**；新增缺陷归档 `issue_fix/问题记录-P0-1-10-模型池Provider管理.md` |
 | 2026-09-21 | — | **P0-1-11 完成（包 C 继续）**：模型管理 —— `shared/src/model.ts`（`ModelItem`/`ModelOption` **两套投影** + 四段 schema）、`backend/src/services/model.service.ts`（模型 CRUD + 三条守卫）、`backend/src/routes/models.ts`（`GET /api/models` 仅 ADMIN + `GET /api/models/available` 登录即可 + POST/PATCH/DELETE）+ `app.ts` 接线。`pnpm verify:app` 扩到 **42 项**（CI 模式 43 项），新增 **`pnpm verify:models`（17 项，需 PG+Redis）**；`verify:db/session/auth/users/model-providers/e2e` 全部未回归；**零新增依赖、零新增环境变量**；路由表订正：`GET /api/models?type=CHAT` → `GET /api/models/available?type=CHAT`（`03` §116 同步）；新增缺陷归档 `issue_fix/问题记录-P0-1-11-模型管理.md` |
 | 2026-09-21 | — | **P0-1-12 完成（包 C 继续）**：LLM client 封装 —— `backend/src/llm/client.ts`（OpenAI 兼容**传输层**：`chat()` / `chatStream()` / `fetchRemoteModels()`；**零新增依赖**，手写 SSE 解析）、`services/model.service.ts` 补 `resolveChatTarget()`（四道前置校验 + 解密 Key 注入）与 `listProviderRemoteModels()`、`routes/modelProviders.ts` 补 **`GET /api/model-providers/:id/remote-models`**（用户追加需求：**拉取该配置下的上游模型**，通用 `GET {baseUrl}/models`，只读探测不落库）、`shared/src/modelProvider.ts` 补上游模型列表契约；**新增 2 个环境变量**（`LLM_REQUEST_TIMEOUT_MS` / `LLM_STREAM_IDLE_TIMEOUT_MS`，已同步 `.env.example`/`.env`/`02` §十一）；`02` 新增 **§6.1 LLM client 实现口径**（差异收敛清单 11 条 + 两条实现纪律）与 §4.3 契约增量。`pnpm verify:app` 扩到 **44 项**（CI 模式 45 项），新增 **`pnpm verify:llm`（22 项：起真 HTTP 假上游，upstream 侧取证 Key 注入 / **未发 `stream_options`** / SSE 分片 / 无 `[DONE]` / 末帧无空行 / 思考增量 / 畸形帧 / 两级超时 / 「点停止 ≠ 故障」）**；`verify:db(17)/session(13)/auth(21)/users(17)/model-providers(18)/models(17)/e2e(17)` **全部未回归**；README 快速开始补「静态检查与验收」的 `verify:llm` 一行与手工端测的 ⑤ 拉取上游模型；新增缺陷归档 `issue_fix/问题记录-P0-1-12-LLM-client封装.md` |
+| 2026-09-21 | — | **P0-1-13 完成（包 C 收口 ✅）**：embedding 双模式 provider —— `backend/src/llm/embedding/{index,api,local,embedding.worker}.ts`（api 走 OpenAI 兼容 `/embeddings`；local 走 `worker_threads` 真隔离 + 懒加载；两种模式都批 `EMBEDDING_BATCH_SIZE`=32）；**通用上游件抽出** `backend/src/llm/upstream.ts`（看门狗/中断/脱敏/状态码映射/`fetchUpstreamJson`）并让 `client.ts` 复用 —— 第二次做上游调用不再把 P0-1-12 的两个坑再养一遍（`verify:llm` 22 项逐项仍通过即是证据）。**local 的推理运行时（含分词）走注入**（`LOCAL_EMBEDDING_RUNTIME_MODULE`，契约见 `02` §八）：交付物形态未定（`06` §七 待决事项 2）写死等于赌，且本批因此**零新增依赖**。**新增 2 个环境变量**（`EMBEDDING_BATCH_SIZE` / `LOCAL_EMBEDDING_RUNTIME_MODULE`），`02` 新增 §8.1 实现口径 + §十一 同步；README 手工端测新增 ⑥ embedding 自检两步。**验收**：新增 **`pnpm verify:embedding`（27 项，⚠️ 不需要 PG/Redis，可进 CI）**；既有 9 档（`app 44 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / e2e 17`）**全部未回归**；**两个实现问题也是跑验收才抓出来的**（worker 继承 `--input-type` 崩 / `spawnSync` 钉死父进程事件循环）；新增缺陷归档 `issue_fix/问题记录-P0-1-13-embedding双模式.md` |
