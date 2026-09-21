@@ -404,6 +404,24 @@ const envSchema = z
     ARTIFACT_URL_TTL_MIN: intVar('ARTIFACT_URL_TTL_MIN', 30),
     SANDBOX_IMAGE: optionalText,
 
+    // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
+    /**
+     * 「到响应头」的上限（连接 + TTFT）。流式路径**收到头就撤**（之后交给 LLM_STREAM_IDLE_TIMEOUT_MS），
+     * 非流式路径则覆盖"发请求 + 读 body"全程 —— 报文很小，不必再开一个计时器。
+     *
+     * 上限 10 分钟：再长就等于没有超时（F 包的 SSE 与网关的 `proxy_read_timeout` 都在分钟级，
+     * 这里放任不管不会让任何一条链路变好，只会让"上游挂了"变成"界面一直转圈"）。
+     */
+    LLM_REQUEST_TIMEOUT_MS: intVar('LLM_REQUEST_TIMEOUT_MS', 30_000, { min: 500, max: 600_000 }),
+    /**
+     * 流式响应体传输期「两次数据之间的间隔」上限。每收到一块即重置。
+     *
+     * 比上面大得多是刻意的：思考型模型（o 系列 / reasoner）在首字之后常有**长静默期**，
+     * 但静默期也是有心跳的（多数实现会发空 delta 或 `: keep-alive` 注释行，那也算"收到数据"）；
+     * 真出现 2 分钟一个字节都没有，基本可以断定是连接死了。
+     */
+    LLM_STREAM_IDLE_TIMEOUT_MS: intVar('LLM_STREAM_IDLE_TIMEOUT_MS', 120_000, { min: 1_000, max: 3_600_000 }),
+
     // ── 知识库流水线（子方案① §二 参数总表）──
     CHUNK_SIZE_DEFAULT: intVar('CHUNK_SIZE_DEFAULT', 512),
     CHUNK_OVERLAP_DEFAULT: intVar('CHUNK_OVERLAP_DEFAULT', 64, { min: 0 }),
@@ -473,6 +491,13 @@ export interface AppConfig {
 
   concurrency: { chatbot: number; sandbox: number; pipeline: number }
   sandbox: { idleTtlMin: number; image: string | undefined }
+  /** LLM 调用（P0-1-12；`backend/src/llm/client.ts` 是唯一消费方） */
+  llm: {
+    /** 「到响应头」上限（毫秒）。流式收到头即撤，非流式覆盖全程 */
+    requestTimeoutMs: number
+    /** 流式响应体「两次数据之间的间隔」上限（毫秒） */
+    streamIdleTimeoutMs: number
+  }
   limits: {
     uploadBodyLimitRaw: string
     uploadBodyLimitBytes: number
@@ -670,6 +695,10 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       pipeline: vars.PIPELINE_CONCURRENCY,
     },
     sandbox: { idleTtlMin: vars.SANDBOX_IDLE_TTL_MIN, image: vars.SANDBOX_IMAGE },
+    llm: {
+      requestTimeoutMs: vars.LLM_REQUEST_TIMEOUT_MS,
+      streamIdleTimeoutMs: vars.LLM_STREAM_IDLE_TIMEOUT_MS,
+    },
     limits: {
       uploadBodyLimitRaw: vars.UPLOAD_BODY_LIMIT.raw,
       uploadBodyLimitBytes: vars.UPLOAD_BODY_LIMIT.bytes,
@@ -729,6 +758,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     },
     concurrency: value.concurrency,
     sandbox: { idleTtlMin: value.sandbox.idleTtlMin, image: value.sandbox.image ?? null },
+    llm: value.llm,
     limits: {
       uploadBodyLimit: `${value.limits.uploadBodyLimitRaw}（${value.limits.uploadBodyLimitBytes} 字节）`,
       ssePingIntervalSec: value.limits.ssePingIntervalSec,

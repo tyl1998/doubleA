@@ -46,6 +46,7 @@ import {
   type ModelOption,
   type ModelProviderItem,
   type OffsetPage,
+  type RemoteModelListResult,
   type UpdateModelBody,
   type UpdateModelProviderBody,
 } from '@doubulea/shared'
@@ -53,6 +54,7 @@ import {
 import { decryptSecret, encryptSecret } from '../infra/crypto.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import { describeTarget, fetchRemoteModels, type LlmTarget } from '../llm/client.js'
 
 /**
  * 查询字段白名单（列表 / 建 / 改共用一份）。
@@ -649,4 +651,143 @@ export async function removeModel(id: string): Promise<{ id: string; modelName: 
 
   getLogger().info({ modelId: id, modelName: target.modelName }, '已删除模型')
   return { id: target.id, modelName: target.modelName }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 上游解析与探测（P0-1-12：LLM client 的两个后端入口）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * Provider 行 → 已解密的上游凭据。
+ *
+ * **单点**：`api_key_enc` 的明文只在这里出现一次，调用方拿到的是
+ * {@link LlmTarget.apiKey}（仅内存）。与 {@link providerKeyAad} 一样，
+ * 把"怎么解密、失败怎么办"收在一处，避免将来有第二个人再写一遍（写错就是 401 排查半天）。
+ */
+async function readProviderCredential(providerId: string): Promise<{ providerName: string; baseUrl: string; apiKey: string | null }> {
+  const db = getPrisma()
+  const row = await db.modelProvider.findUnique({
+    where: { id: providerId },
+    select: { name: true, baseUrl: true, apiKeyEnc: true },
+  })
+  if (row === null) throw AppError.notFound('Provider 不存在')
+  if (row.apiKeyEnc === null) return { providerName: row.name, baseUrl: row.baseUrl, apiKey: null }
+  try {
+    return {
+      providerName: row.name,
+      baseUrl: row.baseUrl,
+      apiKey: decryptSecret(row.apiKeyEnc, providerKeyAad(providerId)),
+    }
+  } catch (error) {
+    // 与列表页的降级不同：这里**不能**降级成"没配 Key" —— 那会让调用方以为"换个能用的
+    // Provider 就行"，而真相是"这一条的密文坏了/主密钥换了"。要显式说清楚该怎么修。
+    getLogger().warn({ providerId, err: error }, 'Provider Key 解密失败（无法解析上游目标）')
+    throw AppError.internal(
+      `该 Provider 的 API Key 无法解密（密文可能已损坏，或 CREDENTIAL_MASTER_KEY 已更换）。` +
+        '请在模型池管理页重新设置这一项的 Key',
+    )
+  }
+}
+
+/**
+ * 解析「一个模型 → 可调用的上游目标」（P0-1-12 的对外接口，F 包的编排层用它）。
+ *
+ * 四道前置校验，全部按"先查再说人话"排（`06` P0-1-6 起的纪律：不许把 500 抛给用户）：
+ *   ① 模型存在 → 否则 404；
+ *   ② `type = CHAT` → 否则 409。向量模型与对话模型不可互换（`02` §4.3 同款结论），
+ *      把 EMBEDDING 模型塞给对话编排只会在上游得到一个 404/400；
+ *   ③ 模型与 Provider 都**启用**着 → 否则 409。「停用」是这个平台的语义（`01` §3.2 的
+ *      「无效模型创建 Agent 时不可选」管的是**选的时候**），而"能选到、但发消息就失败"
+ *      更难排查 —— 所以调用点也要把话说清楚，而不是把 400 甩给上游；
+ *   ④ Provider 配了 Key → 否则 **424 `NEED_CREDENTIAL`**（`02` §四 的 `NEED_CREDENTIAL`
+ *      正是"缺凭据"的语义，MCP 用户级凭据用的是同一个码）。⚠️ 这里只对**这个接口**
+ *      要求 Key：自建/内网 OpenAI 兼容实现常常不校验凭据，那种情况由部署方自己决定 ——
+ *      见 {@link listProviderRemoteModels} 的宽松口径。
+ *
+ * @throws {AppError} 见上（404 / 409 / 424 / 500）
+ */
+export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
+  const db = getPrisma()
+  const row = await db.model.findUnique({
+    where: { id: modelId },
+    select: {
+      id: true,
+      modelName: true,
+      label: true,
+      type: true,
+      enabled: true,
+      maxContext: true,
+      supportsVision: true,
+      providerId: true,
+      provider: { select: { name: true, baseUrl: true, enabled: true } },
+    },
+  })
+  if (row === null) throw AppError.notFound('模型不存在')
+
+  if (row.type !== 'CHAT') {
+    throw AppError.conflict(`该模型是向量模型（EMBEDDING），不能用于对话：${row.modelName}`)
+  }
+  if (!row.enabled) {
+    throw AppError.conflict(`模型已停用，无法调用：${row.modelName}。请在模型池管理页启用它或改用其他模型`)
+  }
+  if (!row.provider.enabled) {
+    throw AppError.conflict(
+      `该模型所属的 Provider「${row.provider.name}」已停用，无法调用。请启用该 Provider 或改用其他模型`,
+    )
+  }
+
+  const credential = await readProviderCredential(row.providerId)
+  if (credential.apiKey === null) {
+    throw AppError.needCredential(
+      `Provider「${row.provider.name}」尚未配置 API Key，无法调用模型。请在模型池管理页为它设置 Key`,
+    )
+  }
+
+  const target: LlmTarget = {
+    modelId: row.id,
+    modelName: row.modelName,
+    label: row.label,
+    maxContext: row.maxContext,
+    supportsVision: row.supportsVision,
+    providerId: row.providerId,
+    providerName: row.provider.name,
+    baseUrl: row.provider.baseUrl,
+    apiKey: credential.apiKey,
+  }
+  // 记日志一律走 describeTarget（只打 id/名字/hasKey），**绝不整体序列化 target**（里面是明文 Key）
+  getLogger().debug(describeTarget(target), '已解析上游模型目标')
+  return target
+}
+
+/**
+ * 拉取 Provider 上游实际提供的模型列表（`GET /api/model-providers/:id/remote-models`，仅 ADMIN）。
+ *
+ * 用途：管理页在"加模型"时列出上游真实有的型号，避免手敲 model id 敲错一个字符
+ * （错的代价是"第一次发消息才 404"）。
+ *
+ * 两条与 {@link resolveChatTarget} **刻意不同**的口径：
+ *   ① **不要求 Provider 启用**：这正是用来诊断"这个 Provider 还能不能连上"的动作，
+ *      停用了反而更需要探（比如换 Key 后先探一次再启用）；
+ *   ② **不要求配 Key**：`GET /models` 在许多自建/内网实现上是免鉴权的，本地 vLLM /
+ *      llama.cpp / ollama 的兼容层都属此类。没配就不带 `Authorization` 头去探，
+ *      能不能成由上游决定 —— 这样"用不了"与"不支持列表"能被区分开。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) Provider 不存在 / `INTERNAL`(500) Key 解密失败
+ *                    / `UPSTREAM_ERROR`(502)、`UPSTREAM_TIMEOUT`(504) 见 `llm/client.ts`
+ */
+export async function listProviderRemoteModels(providerId: string): Promise<RemoteModelListResult> {
+  const credential = await readProviderCredential(providerId)
+  const result = await fetchRemoteModels(credential)
+  getLogger().info(
+    { providerId, providerName: credential.providerName, total: result.total, truncated: result.truncated, hasKey: credential.apiKey !== null },
+    '已拉取上游模型列表',
+  )
+  return {
+    providerId,
+    providerName: credential.providerName,
+    baseUrl: credential.baseUrl,
+    total: result.total,
+    truncated: result.truncated,
+    items: result.items,
+  }
 }

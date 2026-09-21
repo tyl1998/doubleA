@@ -19,6 +19,7 @@
     "verify:users": "pnpm run build:shared && pnpm run build && node scripts/verify-users.mjs",
     "verify:model-providers": "pnpm run build:shared && pnpm run build && node scripts/verify-model-providers.mjs",
     "verify:models": "pnpm run build:shared && pnpm run build && node scripts/verify-models.mjs",
+    "verify:llm": "pnpm run build:shared && pnpm run build && node scripts/verify-llm.mjs",
     "verify:e2e": "pnpm run build:shared && pnpm run build && node scripts/verify-e2e.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",

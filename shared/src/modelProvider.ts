@@ -216,3 +216,42 @@ export const modelProviderIdParamsSchema = z.object({
   id: z.string().uuid('Provider ID 不是合法 UUID'),
 })
 export type ModelProviderIdParams = z.infer<typeof modelProviderIdParamsSchema>
+
+// ───────────────────── 拉取上游模型列表（P0-1-12） ─────────────────────
+
+/**
+ * 上游 `GET {baseUrl}/models` 的一项（三种常见形态已在后端归一化，见
+ * `backend/src/llm/client.ts#normalizeRemoteModels`）。
+ *
+ * ⚠️ 这个端点是**只读探测**，不落库：把上游的真实情况照实回给管理页，
+ * 让管理员自己决定"要不要把它加成模型"（自动化增删是另一件事，`01` §3.2 没要求，
+ * 而且上游的模型清单里常常混着一堆不能用的：embedding、图像、老版本……）。
+ */
+export const remoteModelItemSchema = z.object({
+  /** 上游的 model id（要原样填进 `POST /api/models` 的 `modelName`） */
+  id: z.string(),
+  /** `owned_by` / `organization`，各家命名不一，缺失为 `null` */
+  ownedBy: z.string().nullable(),
+  /** 上游给的 Unix 秒级创建时间，缺失为 `null` */
+  created: z.number().int().nullable(),
+})
+export type RemoteModelItem = z.infer<typeof remoteModelItemSchema>
+
+/**
+ * `GET /api/model-providers/:id/remote-models` 的响应。
+ *
+ * 刻意**不带** Provider 的 `apiKey`/明文/掩码 —— 与 Provider 的读接口同一条不变式
+ * （`02` §十：Key 有进无出）。`baseUrl` 回显是为了让管理员一眼看到"探的是哪个地址"
+ * （配错 baseUrl 是这个端点最常暴露的问题）。
+ */
+export const remoteModelListResultSchema = z.object({
+  providerId: z.string(),
+  providerName: z.string(),
+  baseUrl: z.string(),
+  /** 上游**真实**条数（去重后） */
+  total: z.number().int().min(0),
+  /** `items` 是否被上限截断（截断是**显式**的，不做静默截断） */
+  truncated: z.boolean(),
+  items: z.array(remoteModelItemSchema),
+})
+export type RemoteModelListResult = z.infer<typeof remoteModelListResultSchema>

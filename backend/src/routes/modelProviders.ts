@@ -29,6 +29,7 @@ import type { FastifyInstance } from 'fastify'
 import {
   createModelProvider,
   listModelProviders,
+  listProviderRemoteModels,
   removeModelProvider,
   updateModelProvider,
 } from '../services/model.service.js'
@@ -59,6 +60,24 @@ export function registerModelProviderRoutes(app: FastifyInstance): void {
       schema: { params: modelProviderIdParamsSchema, body: updateModelProviderBodySchema },
     },
     async (request) => ok(await updateModelProvider(request.params.id, request.body)),
+  )
+
+  /**
+   * 拉取上游模型列表（P0-1-12；`02` §4.3）。
+   *
+   * 为什么挂在 Provider 下而不是模型下：它有 `baseUrl` 与 Key 这两个前提，
+   * 而这两个都在 Provider 上；挂这里正好表达"探的是这个配置"。
+   *
+   * 这是一条**子路径**（`/:id/remote-models`），不是"用查询参数分流" —— 与 P0-1-11 的结论一致：
+   * 同路径同方法注册两次会在**启动期**抛 `FST_ERR_DUPLICATED_ROUTE`，只能拆路径。
+   *
+   * 只读、不落库、不改任何数据；**不要求 Provider 启用、也不要求配 Key**
+   * （诊断场景，理由见 `services/model.service.ts#listProviderRemoteModels`）。
+   */
+  app.get<{ Params: ModelProviderIdParams }>(
+    '/api/model-providers/:id/remote-models',
+    { preHandler: app.requireAdmin, schema: { params: modelProviderIdParamsSchema } },
+    async (request) => ok(await listProviderRemoteModels(request.params.id)),
   )
 
   /**

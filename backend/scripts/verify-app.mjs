@@ -17,6 +17,8 @@
  *              （⚠️ 同路径注册两个 GET 会在**启动期**抛 `FST_ERR_DUPLICATED_ROUTE`，
  *              这是"必须拆路径"的硬证据）+ 模型契约（型号名/别名校验、
  *              `available` 的 `type` 必填、`maxContext` 三态、两套投影的键集合互不串味）
+ *   · P0-1-12：`/api/model-providers/:id/remote-models` 已注册（**子路径**，匿名 401 / 非法 UUID 400）
+ *              + 上游模型列表契约（形态与取值域、键集合里不存在任何凭据名）
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -65,6 +67,7 @@ import {
   normalizeUsername,
   offsetPageOf,
   ok,
+  remoteModelListResultSchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateUserBodySchema,
@@ -1070,6 +1073,62 @@ await it('shared 模型两套投影：键集合互不串味（管理面有 agent
     true,
     '管理列表分页形态',
   )
+})
+
+// ── 17. LLM client 契约与路由（P0-1-12）──
+await it('拉取上游模型列表的路由已注册（子路径，不是查询参数分流）：匿名 401、非法 UUID 400', async () => {
+  const route = '/api/model-providers/:id/remote-models'
+  assertEqual(app.hasRoute({ method: 'GET', url: route }), true, '路由应已注册')
+  // 与 P0-1-11 同一条结论：同路径同方法注册两次会在**启动期**抛错，所以这里挂得上
+  // 就说明它是独立子路径，而不是跟 `GET /api/model-providers` 抢同一个 handler
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/model-providers' }), true, '列表路由仍在')
+
+  // 校验先于鉴权（validation → preHandler），所以匿名也能验 schema 是否接线
+  const badUuid = await app.inject({ method: 'GET', url: '/api/model-providers/not-a-uuid/remote-models' })
+  assertEqual(badUuid.statusCode, 400, '非法 UUID 的状态码')
+
+  // schema 通过后才轮到鉴权：401 说明它真的走到了自己的 preHandler
+  const anonymous = await app.inject({
+    method: 'GET',
+    url: '/api/model-providers/01a0c289-6738-715c-a10c-ef95c1286bf9/remote-models',
+  })
+  assertEqual(anonymous.statusCode, 401, '匿名状态码（仅 ADMIN 的端点）')
+  assertEqual(anonymous.json().code, 'UNAUTHORIZED', '匿名错误码')
+})
+
+await it('shared 上游模型列表契约：形态与取值域 + 键集合不含任何凭据名', () => {
+  const sample = {
+    providerId: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    providerName: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    total: 2,
+    truncated: false,
+    items: [
+      { id: 'bge-m3', ownedBy: null, created: null },
+      { id: 'gpt-4o-mini', ownedBy: 'system', created: 1_700_000_000 },
+    ],
+  }
+  assertEqual(remoteModelListResultSchema.safeParse(sample).success, true, '标准形态应通过')
+  assertEqual(
+    remoteModelListResultSchema.safeParse({ ...sample, items: [{ id: 'x' }] }).success,
+    false,
+    '缺 ownedBy/created 应被拒（服务层负责补 null，而不是让前端判 undefined）',
+  )
+  assertEqual(
+    remoteModelListResultSchema.safeParse({ ...sample, total: -1 }).success,
+    false,
+    'total 不能为负',
+  )
+  assertEqual(
+    remoteModelListResultSchema.safeParse({ ...sample, truncated: 'yes' }).success,
+    false,
+    'truncated 必须是布尔（"被截断了多少"这种事不许用字符串糊过去）',
+  )
+  // 键级自检：与 Provider 的读接口同一条不变式（`02` §十：Key 有进无出）
+  const keys = Object.keys(remoteModelListResultSchema.shape)
+  for (const forbidden of ['apiKey', 'apiKeyEnc', 'apiKeyPreview', 'hasKey', 'authorization']) {
+    assert(!keys.includes(forbidden), `该响应不得含凭据类键 ${forbidden}，实际：${keys.join(',')}`)
+  }
 })
 
 await app.close()
