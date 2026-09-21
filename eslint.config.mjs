@@ -56,8 +56,10 @@ export default tseslint.config(
   },
 
   {
-    // 施工/验收脚本：控制台输出就是它的接口（`pnpm infra:verify` 的 PASS/FAIL 要能直接被 grep）
-    files: ['**/scripts/**/*.{js,mjs}', '**/*.config.{js,mjs,ts}'],
+    // 施工/验收脚本 + CLI：控制台输出就是它的接口
+    // （`pnpm infra:verify` 的 PASS/FAIL 要能直接被 grep；`prisma/seed.ts` 要打印初始密码，
+    //  那是**交付初始密码的唯一通道**，与业务代码走 pino 的口径不冲突 —— 它不是在记日志）
+    files: ['**/scripts/**/*.{js,mjs}', '**/*.config.{js,mjs,ts}', '**/prisma/seed.ts'],
     rules: { 'no-console': 'off' },
   },
 )

@@ -17,6 +17,7 @@
     "verify:session": "pnpm run build:shared && pnpm run build && node scripts/verify-session.mjs",
     "verify:auth": "pnpm run build:shared && pnpm run build && node scripts/verify-auth.mjs",
     "verify:users": "pnpm run build:shared && pnpm run build && node scripts/verify-users.mjs",
+    "verify:e2e": "pnpm run build:shared && pnpm run build && node scripts/verify-e2e.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "db:generate": "prisma generate",
@@ -24,6 +25,7 @@
     "db:deploy": "prisma migrate deploy",
     "db:status": "prisma migrate status",
     "db:partitions": "prisma db execute --file prisma/sql/ensure_messages_partitions.sql",
+    "db:seed": "pnpm run db:generate && tsx prisma/seed.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {
