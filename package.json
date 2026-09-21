@@ -19,6 +19,7 @@
     "dev:frontend": "pnpm --filter @doubulea/frontend dev",
     "build:backend": "pnpm --filter @doubulea/backend build",
     "build:frontend": "pnpm --filter @doubulea/frontend build",
+    "config:check": "pnpm --filter @doubulea/backend config:check",
     "infra:up": "node infra/scripts/infra.mjs up",
     "infra:down": "node infra/scripts/infra.mjs down",
     "infra:build": "docker compose -f infra/docker-compose.yml --env-file infra/.env build",

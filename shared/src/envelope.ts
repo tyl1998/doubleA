@@ -11,7 +11,12 @@
  * - `data` 成功时为业务数据；失败时可为 `null` 或附加信息（如缺失字段清单）。
  */
 
-import type { ErrorCode } from './errors.js'
+import {
+  DEFAULT_MESSAGE_BY_ERROR_CODE,
+  HTTP_STATUS_BY_ERROR_CODE,
+  isAppError,
+  type ErrorCode,
+} from './errors.js'
 
 /** 成功码字面量 */
 export const OK_CODE = 0 as const
@@ -69,4 +74,26 @@ export interface CursorPage<T> {
   nextCursor: string | null
   /** 是否还有更多（前端据此决定是否继续加载） */
   hasMore: boolean
+}
+
+/**
+ * 任意错误 → 失败信封（后端 errorHandler 与前端拦截器共用同一条收敛规则）。
+ *
+ * 语义：
+ * - 领域错误（{@link AppError}）：原样带出 `code/msg/data`（msg 已是可直接展示的中文）；
+ * - 非领域错误：一律收敛为 `INTERNAL` + 通用文案，**不透传原始 message**
+ *   —— 避免把 SQL 片段、堆栈、密钥等内部细节回给客户端（`02` §十）。
+ *   原始错误请在后端侧用日志记（`infra/logger.ts` 的 err 序列化）。
+ */
+export function toErrorEnvelope(error: unknown): ErrorEnvelope {
+  if (isAppError(error)) return fail(error.code, error.message, error.data ?? null)
+  return fail('INTERNAL', DEFAULT_MESSAGE_BY_ERROR_CODE.INTERNAL, null)
+}
+
+/**
+ * 任意错误 → HTTP 状态码（errorHandler 插件用）：
+ * 领域错误查 {@link HTTP_STATUS_BY_ERROR_CODE}，其余 500。
+ */
+export function toHttpStatus(error: unknown): number {
+  return isAppError(error) ? error.status : HTTP_STATUS_BY_ERROR_CODE.INTERNAL
 }

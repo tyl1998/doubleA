@@ -97,6 +97,12 @@ export class AppError extends Error {
   static needCredential(message?: string, data?: unknown): AppError {
     return new AppError('NEED_CREDENTIAL', message, data)
   }
+  static upstreamError(message?: string, data?: unknown): AppError {
+    return new AppError('UPSTREAM_ERROR', message, data)
+  }
+  static upstreamTimeout(message?: string, data?: unknown): AppError {
+    return new AppError('UPSTREAM_TIMEOUT', message, data)
+  }
   static internal(message?: string, data?: unknown): AppError {
     return new AppError('INTERNAL', message, data)
   }
