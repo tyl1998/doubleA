@@ -7,6 +7,8 @@
  * 本模块只有两件事，**不做业务策略**：
  *   1. 把连接收敛成一个单例（`getRedis()`）—— P0-1-6（会话）/ P0-1-17（流水线队列）/
  *      P0-1-26（停止信号、会话互斥锁）都复用它，不各建各的连接。
+ *      唯一的例外是**阻塞式命令**：`BRPOP` 会把整条连接占住，故队列用
+ *      {@link createRedisConnection} 另开一条（理由见该函数注释）。
  *   2. 定义键名与读写原语（会话 / 用户状态快照缓存）—— 「什么时候读库、失效怎么算」
  *      属于 `plugins/session.ts` 的策略，不放这里。
  *
@@ -47,12 +49,7 @@ let lastConnectionError: Error | undefined
 /** 取（必要时创建）单例客户端 */
 export function getRedis(): Redis {
   if (client !== undefined) return client
-  client = new Redis(config.redis.url, {
-    lazyConnect: true,
-    connectTimeout: config.limits.healthProbeTimeoutMs,
-    maxRetriesPerRequest: 1,
-    retryStrategy: (times) => (times > RECONNECT_LIMIT ? null : Math.min(times * 100, RECONNECT_MAX_DELAY_MS)),
-  })
+  client = buildClient()
   // ⚠️ 必须挂：ioredis 每次失败都会 emit('error')，EventEmitter 无人监听即抛出未捕获异常。
   //    策略：一轮故障只 warn 一次，恢复时再补一条 info（宕机期不刷屏，恢复有痕迹）。
   client.on('error', (error: unknown) => {
@@ -74,6 +71,51 @@ export function getRedis(): Redis {
 }
 
 /**
+ * 连接参数（主连接与额外连接共用一份 —— 两处各写一遍必然漂移）。
+ * 四个取值的理由见文件头；`lazyConnect` 的后果是"命令会自动触发拨号"，
+ * 故额外连接不需要调用方显式 `connect()`，但**仍需**过 {@link ensureRedisConnected}（见其注释）。
+ */
+function buildClient(): Redis {
+  return new Redis(config.redis.url, {
+    lazyConnect: true,
+    connectTimeout: config.limits.healthProbeTimeoutMs,
+    maxRetriesPerRequest: 1,
+    retryStrategy: (times) => (times > RECONNECT_LIMIT ? null : Math.min(times * 100, RECONNECT_MAX_DELAY_MS)),
+  })
+}
+
+/**
+ * 另开一条**独立连接**（P0-1-17 起供流水线队列的阻塞读使用）。
+ *
+ * 为什么必须独立：`BRPOP` 是**阻塞**命令 —— ioredis 在它返回之前不会在同一条连接上发送
+ * 后续命令。拿共享的会话连接去 BRPOP，等于把 `/api/auth`、`/health` 以及所有会话读写
+ * 一起钉在队列上（症状：队列空闲时整个后端的请求都莫名变慢甚至超时）。
+ * `role` 只用于日志区分（如 `pipeline-queue`），不参与任何逻辑。
+ *
+ * ⚠️ 返回的连接**不受 `closeRedis()` 管理** ⇒ 调用方必须自己收尾
+ * （见 `pipeline/queue.ts#closePipelineQueue`），否则进程退出时会挂在这条连接上。
+ */
+export function createRedisConnection(role: string): Redis {
+  const extra = buildClient()
+  // 与主连接同一套"一轮故障只告警一次"策略，但状态**各自独立**（两条连接的可用性互不影响）
+  let extraDownNotified = false
+  extra.on('error', (error: unknown) => {
+    if (extraDownNotified) {
+      getLogger().debug({ err: error, role }, `Redis 连接异常（${role}，本轮已告警过，降为 debug）`)
+      return
+    }
+    extraDownNotified = true
+    getLogger().warn({ err: error, role }, `Redis 连接异常（${role}；本轮同类错误降为 debug）`)
+  })
+  extra.on('ready', () => {
+    if (!extraDownNotified) return
+    extraDownNotified = false
+    getLogger().info({ role }, `Redis 连接已恢复（${role}）`)
+  })
+  return extra
+}
+
+/**
  * 确保连接已建立。
  *
  * 为什么必要：`lazyConnect` 下客户端停在 `wait`（还没拨号），`end` 则是上轮重试放弃后已关闭。
@@ -81,9 +123,10 @@ export function getRedis(): Redis {
  * "连不上"。显式 `connect()` 让「连接被拒」作为一个明确错误抛出（与 {@link pingRedis} 同一手法）。
  *
  * 导出给 P0-1-17（队列）/ P0-1-26（锁）复用：任何 Redis 命令前都该先过这里。
+ * P0-1-17 起接受一个**非单例**客户端（见 {@link createRedisConnection}）。
  */
-export async function ensureRedisConnected(): Promise<Redis> {
-  const redis = getRedis()
+export async function ensureRedisConnected(connection: Redis = getRedis()): Promise<Redis> {
+  const redis = connection
   if (redis.status === 'wait' || redis.status === 'end') await redis.connect()
   return redis
 }

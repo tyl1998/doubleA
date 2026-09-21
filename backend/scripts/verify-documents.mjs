@@ -28,6 +28,10 @@
  * · `EMBEDDING_MODE=api` 三项 —— 建库要取 `EmbeddingProvider.name()` 快照
  *   （P0-1-14/15 定案），不注入就建不了库。URL 指向 `127.0.0.1:1`（永不会被访问：
  *   上传不触发 embedding，那是 P0-1-19 的事）。
+ * · `PIPELINE_QUEUE_KEY=verify:documents:jobs:<随机>` —— P0-1-17 起上传会**入队**，
+ *   而 Redis 是共享的：沿用默认键的话，跑着的 dev server（它也有 worker）会把本脚本
+ *   投的任务吃掉，E 组的"队列长度"断言就成了掷骰子。本脚本**不启动 worker**，
+ *   投进去的任务留在队列里由收尾段删除（`pipeline/queue.ts` 的文件头解释了为什么键可配）。
  * · `LOG_LEVEL=error` —— 本脚本会打一堆"应当失败"的请求，收敛它自己的日志，
  *   否则断言输出会被 warn 刷掉。要看细节：`LOG_LEVEL=debug pnpm verify:documents`。
  *
@@ -41,6 +45,8 @@ process.env.EMBEDDING_API_URL = 'http://127.0.0.1:1/v1'
 process.env.EMBEDDING_API_KEY = 'verify-doc-key'
 process.env.EMBEDDING_API_MODEL = 'verify-embed-model'
 process.env.UPLOAD_BODY_LIMIT = '8KB'
+// 队列键必须隔离：本脚本会上传十几篇文档，P0-1-17 起每次新建都会入队（见文件头）
+process.env.PIPELINE_QUEUE_KEY = `verify:documents:jobs:${Math.random().toString(36).slice(2, 8)}`
 
 const { buildApp } = await import('../dist/backend/src/app.js')
 const { hashPassword } = await import('../dist/backend/src/infra/crypto.js')
@@ -54,6 +60,9 @@ const { ensureBucket, getS3Client } = await import('../dist/backend/src/infra/s3
 const { config } = await import('../dist/backend/src/config.js')
 const { detectFormat, parseDocument, countChars } = await import(
   '../dist/backend/src/pipeline/parse/index.js'
+)
+const { pipelineQueueDepth, pipelineQueueKey } = await import(
+  '../dist/backend/src/pipeline/queue.js'
 )
 const { documentItemSchema, uploadDocumentResultSchema } = await import('@doubulea/shared')
 const { createHash } = await import('node:crypto')
@@ -705,9 +714,39 @@ try {
   })
 
   // ═══════════════════════════════════════════════════════════════════
-  // E 组 · 自清理 + 残留复核
+  // E 组 · 入队（P0-1-17 起：上传与入队是同一件事的两半）
   // ═══════════════════════════════════════════════════════════════════
-  console.log(`\n${c.b}── E 组 · 删库后 DB 与 S3 两侧都回到基线 ──${c.x}`)
+  console.log(`\n${c.b}── E 组 · 上传即入队（不消费，只看队列）──${c.x}`)
+
+  await it('新建一条文档就多一条任务（`子方案①` §三 ① 登记 → ② 入队）', async () => {
+    const before = await pipelineQueueDepth()
+    const bytes = Buffer.from(`入队用例：新建 ${suffix}\n`, 'utf8')
+    await upload(kb.id, { cookie: adminCookie, bytes, fileName: '入队.md', contentType: 'text/markdown' })
+    assertEqual(await pipelineQueueDepth(), before + 1, '新建文档应入队一条任务')
+  })
+
+  await it('判重命中**不入队**：没有新文档要处理，多投一条只会让 worker 白跑一次跳过', async () => {
+    const bytes = Buffer.from(`入队用例：判重 ${suffix}\n`, 'utf8')
+    await upload(kb.id, { cookie: adminCookie, bytes, fileName: '入队-判重.md', contentType: 'text/markdown' })
+    const afterFirst = await pipelineQueueDepth()
+    const second = await upload(kb.id, {
+      cookie: adminCookie,
+      bytes,
+      fileName: '入队-判重.md',
+      contentType: 'text/markdown',
+    })
+    assertEqual(
+      uploadDocumentResultSchema.parse(second.json().data).deduplicated,
+      true,
+      '第二次应是判重命中',
+    )
+    assertEqual(await pipelineQueueDepth(), afterFirst, '判重命中不应再入队')
+  })
+
+  // ═══════════════════════════════════════════════════════════════════
+  // F 组 · 自清理 + 残留复核
+  // ═══════════════════════════════════════════════════════════════════
+  console.log(`\n${c.b}── F 组 · 删库后 DB 与 S3 两侧都回到基线 ──${c.x}`)
 
   await it('删库（走 API）→ 该库的 documents 行与 S3 对象全部消失', async () => {
     const keyPrefix = `kb/${kb.id}/`
@@ -772,6 +811,9 @@ try {
     }
     await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } })
     for (const sid of sessionIds) await redis.del(sessionKey(sid)).catch(() => undefined)
+    // 队列键：本脚本投进去的任务没有消费者，收尾必须自己删掉（否则留给跑着的 dev server 去处理
+    // 一堆"文档已不存在"的任务）
+    await redis.del(pipelineQueueKey()).catch(() => undefined)
 
     // S3：按**库前缀**逐个清（本批的键是 `kb/{kbId}/...`；`S3_PREFIX` 那个前缀留给正向确认）
     for (const kbId of createdKbIds) {

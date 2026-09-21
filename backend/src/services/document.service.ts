@@ -1,21 +1,23 @@
 /**
- * 文档服务（P0-1-16）
+ * 文档服务（P0-1-16 起；P0-1-17 补入队）
  *
  * 依据：`docs/02-后端设计.md` §4.6（上传端点）+ `子方案/知识库流水线.md` §三（流水线总览）、
- *      §4-1（四格式 + 上传前置校验）、§七（覆盖重建的判重语义）
+ *      §4-1（四格式 + 上传前置校验）、§七（覆盖重建的判重语义）、§十（队列）
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本批只做到"入库登记 + 原始文件落 S3"，**不解析、不入队**
+ * 本服务做到"入库登记 + 原文件落 S3 + **入队**"，解析在 worker 里
  * ─────────────────────────────────────────────────────────────────────
- * `子方案①` §三 的流程是「① 入库登记 → ② 入队 → worker 解析…」。② 的队列与 worker 属
- * **P0-1-17**（`pipeline/queue.ts` / `pipeline/worker.ts`），且它的验收写的是
- * "上传后立即返回 docId 且 status=PARSING" —— 所以本批**刻意**不同步解析：
- * 上传返回的文档状态就是 `PARSING`，等 P0-1-17 把队列接上。
- * 同步解析（上传时就跑完）是这条流水线明确不要的形态：大 PDF 的解析 + 向量化是分钟级的，
- * 挂在 HTTP 请求里会把上传变成"转圈几分钟"，而 §十 就是为了解决它才引入队列的。
+ * `子方案①` §三 的流程是「① 入库登记 → ② 入队 → worker 消费」。P0-1-16 落了 ①，
+ * **P0-1-17 补上 ②**（`pipeline/queue.ts`）；真正的处理在 `pipeline/worker.ts` + `stages.ts`。
+ * 上传端点**刻意不同步解析**：大 PDF 的解析 + 向量化是分钟级的，挂在 HTTP 请求里会把上传变成
+ * "转圈几分钟"，而 §十 引入队列正是为了解决它。所以响应里的 `status` 恒为 `PARSING`，
+ * 想知道结果得看列表接口（P0-1-21）或直接查库。
+ *
+ * ⚠️ ① 与 ② 是**同一件事的两半**：入队失败必须把 ① 一起撤掉，否则留下"永远转圈且重传无救"
+ *   的文档 —— 见 `rollbackRegistration` 的注释。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 顺序：**先 S3、再落库**（与"删库"正好相反）
+ * 顺序：**先 S3、再落库、最后入队**（与"删库"正好相反）
  * ─────────────────────────────────────────────────────────────────────
  * 删库是"先 DB 后 S3"（见 `kb.service.ts` 文件头 ⑤），理由是"库还在但文件没了"比
  * "文件还在但库没了"坏。上传这一侧对称地反过来：
@@ -24,7 +26,7 @@
  *   且这条行永远不会自愈（重传会被判重命中而跳过）。
  * · 若"先传 S3 再落库"，落库失败时只是**多了一个无人引用的对象**（存储垃圾，可清理）
  *   —— 而且这里还顺手做了补偿删除，连垃圾都不留。
- * 另外这条顺序还让 S3 键可以带 `docId`（见下），因为 id 是**我们先生成**的。
+ * 入队放在**最后**：它失败时前面两步的产物都还在手边（行 id 与对象名），一次回滚就能全撤掉。
  *
  * ─────────────────────────────────────────────────────────────────────
  * S3 键的形状：`kb/{kbId}/{随机段}/source.{ext}`
@@ -63,6 +65,7 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { ensureBucket, getS3Client } from '../infra/s3.js'
 import { detectFormat } from '../pipeline/parse/index.js'
+import { enqueuePipelineJob } from '../pipeline/queue.js'
 
 /** 文档投影（与 `shared` 的 `documentItemSchema` 一一对应；列表端点 P0-1-21 复用它） */
 const DOCUMENT_SELECT = {
@@ -147,7 +150,8 @@ export interface UploadDocumentInput {
  * **判重是"每库"而不是"全局"**：同一份制度文件放进两个知识库是合法用法
  * （`knowledge_bases` 之间没有继承关系），所以查询必须带 `kbId`。
  *
- * @throws {AppError} `NOT_FOUND`(404) 知识库不存在 / `VALIDATION`(400) 前置校验不过 / `INTERNAL`(500) S3 失败
+ * @throws {AppError} `NOT_FOUND`(404) 知识库不存在 / `VALIDATION`(400) 前置校验不过 /
+ *   `INTERNAL`(500) S3 写入失败或**入队失败**（后者会把本次登记整个回滚）
  */
 export async function uploadDocument(input: UploadDocumentInput): Promise<UploadDocumentResult> {
   const db = getPrisma()
@@ -193,8 +197,9 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
   }
 
   // ⑤ 落库（`status=PARSING` —— 等 P0-1-17 的 worker 消费）
+  let created: DocumentRow
   try {
-    const created = await db.document.create({
+    created = await db.document.create({
       data: {
         kbId: input.kbId,
         fileKey,
@@ -205,11 +210,6 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
       },
       select: DOCUMENT_SELECT,
     })
-    logger.info(
-      { kbId: input.kbId, docId: created.id, fileName: created.fileName, format, bytes: input.bytes.length },
-      '文档已登记，等待流水线处理（P0-1-17 起入队）',
-    )
-    return { document: toItem(created), deduplicated: false }
   } catch (error) {
     // 补偿：删掉刚写上去的对象。删不掉也不能让请求"看起来失败得不明不白" —— 记 error 后照常抛出
     await removeQuietly(bucket, fileKey)
@@ -219,6 +219,65 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
     }
     throw error
   }
+
+  // ⑥ 入队（`子方案①` §三 ②）—— 与 ⑤ 是**同一件事的两半**，见下方回滚的注释
+  try {
+    await enqueuePipelineJob({
+      docId: created.id,
+      kbId: input.kbId,
+      contentHash,
+      mode: 'NEW',
+    })
+  } catch (error) {
+    await rollbackRegistration(created.id, bucket, fileKey, error)
+    throw AppError.internal(
+      `任务入队失败（队列不可用），本次上传已回滚，请稍后重试：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+
+  logger.info(
+    {
+      kbId: input.kbId,
+      docId: created.id,
+      fileName: created.fileName,
+      format,
+      bytes: input.bytes.length,
+    },
+    '文档已登记并入队，等待流水线 worker 消费',
+  )
+  return { document: toItem(created), deduplicated: false }
+}
+
+/**
+ * 入队失败时把"登记"整个撤掉（删行 + 删对象）。
+ *
+ * 为什么必须撤：上传端点对用户的承诺是"**已经交给流水线**" —— `子方案①` §三 的 ① 登记与 ② 入队
+ * 是同一件事的两半。只留 ① 的后果是最坏的一种：那行文档永远是 `PARSING`，**没有任何人会来消费它**，
+ * 而用户重传还会被 `content_hash` 判重命中直接跳过（`deduplicated: true`、连新行都不建）——
+ * 于是界面上出现一个"上传成功、永远转圈、重传也没用"的文档。撤销并让这次请求失败，
+ * 用户看到的是"上传失败，请重试"，这才是真相。
+ *
+ * 清理失败只记 error（调用方正在抛真正的错误，别用清理失败把它盖掉），但把残留是什么写清楚，
+ * 便于事后手工清。
+ */
+async function rollbackRegistration(
+  docId: string,
+  bucket: string,
+  fileKey: string,
+  cause: unknown,
+): Promise<void> {
+  const logger = getLogger()
+  try {
+    // 用 `deleteMany` 而不是 `delete`：删不存在的行时 `delete` 会抛 P2025（而这里只想尽力而为），
+    // 且 Prisma 的查询日志会把整个堆栈打到 stdout，反而盖住真正的原因（P0-1-11 的教训）
+    await getPrisma().document.deleteMany({ where: { id: docId } })
+  } catch (error) {
+    logger.error({ err: error, docId }, '入队失败后回滚文档行失败，库里可能残留一条 PARSING 记录')
+  }
+  await removeQuietly(bucket, fileKey)
+  logger.error({ err: cause, docId, fileKey }, '任务入队失败，已回滚本次上传（文档行与 S3 对象）')
 }
 
 /** 尽力删除一个对象（失败只记日志：调用方正在抛出真正的错误，别用清理失败把它盖掉） */

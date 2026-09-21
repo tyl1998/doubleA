@@ -194,7 +194,13 @@ async function startServer() {
 
   server = spawn(process.execPath, [SERVER_ENTRY], {
     cwd: BACKEND_DIR,
-    env: { ...process.env, BACKEND_PORT: String(port) },
+    env: {
+      ...process.env,
+      BACKEND_PORT: String(port),
+      // P0-1-17 起 index.ts 会启动流水线 worker，而队列是"被消费"的资源：给这个一次性进程
+      // 一条独立队列，免得它跟本机跑着的 dev server 抢任务（本档不上传文档，只是卫生习惯）
+      PIPELINE_QUEUE_KEY: `verify:e2e:jobs:${Math.random().toString(36).slice(2, 8)}`,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   server.stdout.on('data', (chunk) => (serverLog += chunk))

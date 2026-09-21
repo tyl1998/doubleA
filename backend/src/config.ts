@@ -440,6 +440,15 @@ const envSchema = z
     RETRIEVAL_TOPK_DEFAULT: intVar('RETRIEVAL_TOPK_DEFAULT', 5),
     RETRIEVAL_SCORE_DEFAULT: ratioVar('RETRIEVAL_SCORE_DEFAULT', 0.3),
     CANDIDATE_POOL_FACTOR: intVar('CANDIDATE_POOL_FACTOR', 3),
+    /**
+     * 流水线队列的 Redis 键（P0-1-17）。
+     *
+     * 为什么值得给一个环境变量：`REDIS_URL` 是**共享**资源（本机一份；内网还可能给多套部署
+     * 共用一个实例），而队列是**被消费**的资源 —— 两个进程用同一个键时，谁把 job 取走是随机的。
+     * 后果不是"报错"而是"看起来玄学"：验收脚本刚投的 job 被隔壁 dev server 的 worker 吃了，
+     * 于是断言时有时无。改一个键就能把消费方隔离开（验收脚本正是这么用的）。
+     */
+    PIPELINE_QUEUE_KEY: defaultedVar(z.string().trim().min(1), 'pipeline:jobs'),
   })
   .superRefine((env, ctx) => {
     if (env.CHUNK_OVERLAP_DEFAULT >= env.CHUNK_SIZE_DEFAULT) {
@@ -522,7 +531,7 @@ export interface AppConfig {
     /** /health 单项依赖探活超时（毫秒） */
     healthProbeTimeoutMs: number
   }
-  /** 知识库流水线默认值（建库时快照，此后按库独立可改） */
+  /** 知识库流水线默认值（建库时快照，此后按库独立可改）+ 队列（P0-1-17） */
   pipeline: {
     chunkSize: number
     chunkOverlap: number
@@ -531,6 +540,8 @@ export interface AppConfig {
     retrievalTopK: number
     retrievalScore: number
     candidatePoolFactor: number
+    /** 流水线队列的 Redis 键（见 `PIPELINE_QUEUE_KEY` 的注释：可换键 = 可隔离消费方） */
+    queueKey: string
   }
 
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
@@ -739,6 +750,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retrievalTopK: vars.RETRIEVAL_TOPK_DEFAULT,
       retrievalScore: vars.RETRIEVAL_SCORE_DEFAULT,
       candidatePoolFactor: vars.CANDIDATE_POOL_FACTOR,
+      queueKey: vars.PIPELINE_QUEUE_KEY,
     },
 
     warnings,

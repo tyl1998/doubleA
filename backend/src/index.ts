@@ -3,8 +3,12 @@
  *
  * 职责（刻意只有这三件，其余都在 app.ts / routes/）：
  *   1. `--check-config`：只校验配置并打印脱敏摘要（部署前自检，P0-1-3 起沿用）
- *   2. 启动：`buildApp()` → `listen(config.port)`
- *   3. 优雅退出：SIGINT/SIGTERM/未捕获异常 → 停止接流 → 关依赖连接 → flush 日志 → 退出
+ *   2. 启动：`buildApp()` → `listen(config.port)` → **启动流水线 worker**（P0-1-17）
+ *   3. 优雅退出：SIGINT/SIGTERM/未捕获异常 → 停 worker → 停止接流 → 关依赖连接 → flush 日志 → 退出
+ *
+ * ⚠️ **流水线 worker 的生命周期归本文件**（P0-1-17）：不放进 `buildApp()`，因为它是
+ *    "进程级后台组件"而不是"HTTP 应用的一部分" —— 放进 `buildApp()` 会让所有走
+ *    `app.inject` 的契约验收（verify:app）被迫连 Redis，还会莫名开始消费队列里的任务。
  *
  * ⚠️ import 顺序有意义：`./config.js` 必须最先求值 —— 它负责加载环境变量并做启动前校验，
  *    校验失败时在 logger 就绪之前用 stderr 打印缺失清单并 `exit 1`。
@@ -16,6 +20,7 @@ import { logger } from './infra/logger.js'
 import { closePg } from './infra/pg.js'
 import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
+import { getPipelineWorkerStats, startPipelineWorker, stopPipelineWorker } from './pipeline/worker.js'
 import { ok, type Envelope } from '@doubulea/shared'
 
 /** 「优雅退出」的兜底时限：超时则强杀，避免卡在某个不肯关闭的连接上（`06` P0-1-4 落地要点） */
@@ -70,6 +75,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
 
   logger.info({ reason }, '开始优雅退出：停止接收新请求')
   try {
+    // ⚠️ 顺序：先停流水线 worker（它还在用 PG/Redis/S3），再收 app，最后关依赖。
+    //    反过来的话 worker 会拿着已关闭的连接继续处理任务，日志里出现一堆"数据库不可用"的假故障。
+    await stopPipelineWorker()
     await app.close()
     // ⚠️ 顺序：Prisma 先于探活池（业务查询收尾不会晚于探活）。
     //    closePrisma 对「从未创建过客户端」的进程是空操作，因此不引入退出负担。
@@ -103,7 +111,7 @@ try {
     // ⚠️ 每批必须顺手改成当前批次（P0-1-6 起连漏三批：P0-1-7/8/9 都忘改，
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-1-16 文档上传 + 四格式解析 + 前置校验',
+    step: 'P0-1-17 异步队列 + 状态机 + worker 骨架',
     address,
   })
   logger.info(
@@ -116,6 +124,12 @@ try {
     },
     `后端已启动：${address}（健康检查 GET /health）`,
   )
+
+  // 流水线 worker：**在 listen 成功之后**才启动（绑定失败就没必要开始消费任务），
+  // 且刻意放在 `index.ts` 而不是 `buildApp()` —— `app.inject` 式的契约验收（verify:app）
+  // 不该顺带拉起一个消费者（那会要求它连 Redis，还会莫名其妙开始吃队列里的任务）。
+  logger.info(getPipelineWorkerStats(), '正在启动文档流水线 worker')
+  startPipelineWorker()
 } catch (error) {
   logger.fatal({ err: error, port: config.port }, '监听端口失败，进程退出')
   await shutdown('listen-failed', 1)

@@ -29,6 +29,9 @@
  *              NUL 字节、图片）+ 文档契约（`UPLOAD_EXTENSIONS` 与 `MIME_BY_EXTENSION` 同源、
  *              `documentItemSchema` / `uploadDocumentResultSchema` 的 `deduplicated` 必填、
  *              `countChars` 按**码点**计而非 `.length`）
+ *   · P0-1-17：**文档状态机的转换表**（合法转换恰好 5 条；`READY` 不得被打回 `FAILED`、也不能
+ *              自转 `READY` —— 这是"过期 job 把已成功的文档写坏"的唯一防线，没有任何 HTTP 路径
+ *              能验到它，只能在这一档守）。队列与 worker 的行为要真 Redis/PG/S3，归 `verify-pipeline`。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -66,6 +69,9 @@ import {
   createUserBodySchema,
   createKnowledgeBaseBodySchema,
   DEFAULT_RETRIEVAL_CONFIG,
+  DOCUMENT_STATUSES,
+  DOCUMENT_STATUS_TRANSITIONS,
+  canTransitionDocumentStatus,
   documentItemSchema,
   documentParamsSchema,
   LEGACY_DOC_EXTENSION,
@@ -1489,6 +1495,43 @@ await it('shared 文档契约 + `countChars` 的口径（按**码点**计，不�
   assertEqual('😀'.length, 2, '（对照）`.length` 会数成 2')
   assertEqual(countChars('中 a 文'), 3, '空白字符不计入')
   assertEqual(countChars(''), 0, '空串')
+})
+
+// ── 19. 文档状态机（P0-1-17）──
+console.log(`\n${c.b}── 文档状态机契约 ──${c.x}`)
+
+await it('状态机转换表：合法转换恰好 5 条，且 **READY 不得被打回 FAILED**', () => {
+  // 这条不变式没有任何 HTTP 路径能验到它：worker 是唯一的写者，而"过期 job 把 READY 文档
+  // 打回失败"只会表现为"内容明明能用却报失败、重投也救不回来"。就靠这条纯函数断言守着。
+  assertEqual(DOCUMENT_STATUSES.join(','), 'PARSING,READY,FAILED', '状态集合（与 schema.prisma 枚举逐字一致）')
+
+  const legal = []
+  for (const from of DOCUMENT_STATUSES) {
+    for (const to of DOCUMENT_STATUSES) {
+      if (canTransitionDocumentStatus(from, to)) legal.push(`${from}->${to}`)
+    }
+  }
+  // 集合语义：两边都排序再比（按枚举书写顺序写死期望值，换个顺序就会假失败）
+  assertEqual(
+    [...legal].sort().join(','),
+    ['PARSING->PARSING', 'PARSING->READY', 'PARSING->FAILED', 'READY->PARSING', 'FAILED->PARSING']
+      .sort()
+      .join(','),
+    '合法转换集合',
+  )
+
+  assertEqual(canTransitionDocumentStatus('READY', 'FAILED'), false, 'READY 不得直接转 FAILED')
+  assertEqual(canTransitionDocumentStatus('READY', 'READY'), false, 'READY 是终态：重复投递必须被跳过，而不是重写')
+  assertEqual(canTransitionDocumentStatus('FAILED', 'READY'), false, 'FAILED 必须先回 PARSING（重试要可见）')
+  assertEqual(canTransitionDocumentStatus('PARSING', 'READY'), true, '成功路径')
+  assertEqual(canTransitionDocumentStatus('PARSING', 'FAILED'), true, '失败路径')
+
+  // 与声明式表逐条一致（防"函数与表各写一套"）
+  for (const from of DOCUMENT_STATUSES) {
+    const declared = [...DOCUMENT_STATUS_TRANSITIONS[from]].sort().join(',')
+    const computed = DOCUMENT_STATUSES.filter((to) => canTransitionDocumentStatus(from, to)).sort().join(',')
+    assertEqual(computed, declared, `${from} 的后继集合应与 DOCUMENT_STATUS_TRANSITIONS 一致`)
+  }
 })
 
 await app.close()

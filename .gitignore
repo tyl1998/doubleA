@@ -7,6 +7,8 @@ dist/
 build/
 *.tsbuildinfo
 .vite/
+# Vite 在配置文件变更时旁落的临时文件（`vite.config.ts.timestamp-*.mjs`，dev server 退出后可能残留）
+vite.config.ts.timestamp-*.mjs
 
 # Prisma 生成物（`prisma generate` 产出，由 build/typecheck 自动重建）
 # ⚠️ 位置由 backend/prisma/schema.prisma 的 generator.output 决定，改那里要同步这里。

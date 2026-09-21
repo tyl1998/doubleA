@@ -18,10 +18,11 @@
  * ─────────────────────────────────────────────────────────────────────
  * ② `status` 是**流水线状态机**的投影，不是"有没有文件"
  * ─────────────────────────────────────────────────────────────────────
- * `PARSING` = 已入库、文件在 S3，**等 worker 消费**（P0-1-17）；`READY` = chunk 已入库可检索；
- * `FAILED` = 解析/入库失败，`errorMsg` 是给用户看的原因（如"疑似扫描件"）。
- * `chunkCount` 默认 0 而非 null：`PARSING` 期间就是"当前有 0 个可用 chunk"
+ * `PARSING` = 已入库、文件在 S3，**已入队**、等 worker 消费或正在消费（P0-1-17 起队列与 worker
+ * 都已就位）；`READY` = 处理完成可检索；`FAILED` = 处理失败，`errorMsg` 是给用户看的原因
+ * （如"疑似扫描件"）。`chunkCount` 默认 0 而非 null：`PARSING` 期间就是"当前有 0 个可用 chunk"
  * （schema 注释与 `子方案①` §七 的"更新中，暂不参与检索"都依赖它）。
+ * 状态之间的**合法转换**见 {@link DOCUMENT_STATUS_TRANSITIONS}。
  */
 
 import { z } from 'zod'
@@ -29,6 +30,36 @@ import { z } from 'zod'
 /** 文档流水线状态（与 `schema.prisma` 的 `document_status` 枚举逐字一致） */
 export const DOCUMENT_STATUSES = ['PARSING', 'READY', 'FAILED'] as const
 export type DocumentStatus = (typeof DOCUMENT_STATUSES)[number]
+
+/**
+ * 状态机的**唯一**定义（P0-1-17；`子方案①` §三 的"幂等/失败"两段 + schema 的枚举注释）。
+ *
+ * ```
+ * PARSING ──→ READY      处理成功（worker 跑完全部阶段）
+ * PARSING ──→ FAILED     任一步抛错（error_msg 落可读原因）
+ * FAILED  ──→ PARSING    重新入队重试（重投同一 job；P0-1-19 的 /retry 复用这条）
+ * READY   ──→ PARSING    覆盖重建 / 重新上传（P0-1-19 的 /reupload）
+ * PARSING ──→ PARSING    同态：重复投递或重试的**起点**（清掉上次的 error_msg）
+ * ```
+ *
+ * ⚠️ 刻意**不允许** `READY → FAILED`：那正是"一个过期 job 把已经成功的文档打回失败"的唯一形态，
+ * 也是这一层最值得拦下的一种写入 —— 用户会看到"内容明明能用却报失败"，且**无法自愈**
+ * （重投同一 job 会被 READY 幂等规则跳过，状态永远停在 FAILED）。
+ * 同理不允许 `FAILED → READY`：跳过 PARSING 就等于跳过了"正在重试"这个可观测的中间态。
+ *
+ * 为什么放在 `shared` 而不是 worker 里：前端要用它决定"这个状态要不要继续轮询"，
+ * 而"哪些转换合法"是契约而不是 worker 的实现细节（`docs/02` §4.6 的状态机口径）。
+ */
+export const DOCUMENT_STATUS_TRANSITIONS: Readonly<Record<DocumentStatus, readonly DocumentStatus[]>> = {
+  PARSING: ['PARSING', 'READY', 'FAILED'],
+  READY: ['PARSING'],
+  FAILED: ['PARSING'],
+}
+
+/** 状态转换是否合法（`from === to` 是否算合法**随状态而定**，见上面的表） */
+export function canTransitionDocumentStatus(from: DocumentStatus, to: DocumentStatus): boolean {
+  return DOCUMENT_STATUS_TRANSITIONS[from].includes(to)
+}
 
 /**
  * 可上传的扩展名白名单（`子方案①` §4-1 第 1 条）。
