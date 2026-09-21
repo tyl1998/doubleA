@@ -9,7 +9,7 @@
 
 ---
 
-## 汇总（6 个坑）
+## 汇总（8 个坑）
 
 | # | 问题 | 严重度 | 状态 |
 |---|------|--------|------|
@@ -20,6 +20,7 @@
 | 5 | Fastify v5：`disableRequestLogging` / `requestIdLogLabel` 已废弃 → 启动打 FSTDEP023/024 警告 | 低 | ✅ 已解决：改用 `logController: new LogController({…})` |
 | 6 | ioredis 只报「达到重试上限」，**不报 `ECONNREFUSED`** → `/health` 的 detail 没有运维价值 | 中 | ✅ 已解决：连接层错误单独留一份并拼进 message |
 | 7 | `pnpm verify:app -- --flag` 的额外参数被中间 `--filter` 吞掉 | 低（会静默丢参数） | ✅ 已解决：开关改走环境变量 |
+| 8 | **`pnpm dev:backend` 不起服务**：它落到 `tsc --watch`，只是编译 watcher | 中（"本地起不来"的误判来源） | ✅ 已解决：改为 `tsx watch src/index.ts` |
 
 ---
 
@@ -182,8 +183,35 @@ detail: "Connection is closed.（客户端状态：reconnecting；最近一次�
 
 ---
 
-## 附：本机验收记录（2026-09-21）
+## 坑 8 — 「本地启动」的入口其实是个编译 watcher
 
+**现象**：本批做完后端已经能监听 13000 了，但按最直觉的命令去起它——`pnpm dev:backend`
+（= backend 的 `dev` = `tsc -p tsconfig.json --watch`）——**终端上不会出现任何服务启动迹象**，
+只有 tsc 在等文件变化。看上去就像"本地起不来"。真正能起服务的是 `build` + `node dist/backend/src/index.js`
+两步，而这条只在 README 的角落提了一句"另开一个终端跑上面的 node"。
+
+**根因**：`dev` 这个脚本名的约定是"起开发服务"，而 P0-1-1 建仓时后端还没有 HTTP 服务，
+`dev` 就先被占成了"编译 watcher"。P0-1-4 开始真的监听端口后，这个语义错位就暴露了。
+
+**对策**（改 `backend/package.json`）：
+
+```jsonc
+"dev": "tsx watch src/index.ts",        // 开发态：直跑 TS 源码，改文件自动重启，Ctrl-C 优雅退出
+"watch:types": "tsc -p tsconfig.json --watch --preserveWatchOutput",  // 原 dev，仅供单独查类型
+"start": "node dist/backend/src/index.js",   // 产物态（根脚本 pnpm start:backend）
+```
+
+**为什么用 tsx 而不是 Node 22 自带的类型剥离**：Node 的类型剥离不做
+`import './config.js'` → `config.ts` 的映射，而本仓库按 `verbatimModuleSyntax` 的约定
+**相对导入一律写 `.js` 后缀**，直接 `node --watch src/index.ts` 会在第一个相对导入就 `MODULE_NOT_FOUND`。
+tsx 恰好补上这层映射（同时也能按 tsconfig 的 `paths` 解析 `@doubulea/shared` 源码）。
+
+**实测**：`pnpm dev:backend` → 4s 内监听 13000、`/health` 200；`touch src/routes/health.ts`
+→ tsx 自动重启且仍可访问；SIGINT → 两行优雅退出日志 + 端口释放。
+
+---
+
+## 附：本机验收记录（2026-09-21）
 ### 1. 静态检查
 
 ```bash

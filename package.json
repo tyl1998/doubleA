@@ -17,6 +17,7 @@
     "frontend": "pnpm --filter @doubulea/frontend",
     "shared": "pnpm --filter @doubulea/shared",
     "dev:backend": "pnpm --filter @doubulea/backend dev",
+    "start:backend": "pnpm --filter @doubulea/backend start",
     "dev:frontend": "pnpm --filter @doubulea/frontend dev",
     "build:backend": "pnpm --filter @doubulea/backend build",
     "build:frontend": "pnpm --filter @doubulea/frontend build",
