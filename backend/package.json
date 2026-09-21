@@ -16,6 +16,7 @@
     "verify:db": "pnpm run build:shared && pnpm run build && node scripts/verify-db.mjs",
     "verify:session": "pnpm run build:shared && pnpm run build && node scripts/verify-session.mjs",
     "verify:auth": "pnpm run build:shared && pnpm run build && node scripts/verify-auth.mjs",
+    "verify:users": "pnpm run build:shared && pnpm run build && node scripts/verify-users.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "db:generate": "prisma generate",

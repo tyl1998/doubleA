@@ -11,6 +11,8 @@
  * - `data` 成功时为业务数据；失败时可为 `null` 或附加信息（如缺失字段清单）。
  */
 
+import { z } from 'zod'
+
 import {
   DEFAULT_MESSAGE_BY_ERROR_CODE,
   HTTP_STATUS_BY_ERROR_CODE,
@@ -74,6 +76,32 @@ export interface CursorPage<T> {
   nextCursor: string | null
   /** 是否还有更多（前端据此决定是否继续加载） */
   hasMore: boolean
+}
+
+/**
+ * offset/limit 分页响应（`02` §四：除消息外的列表一律用这个，默认 20）。
+ * 与 {@link CursorPage} 并存：消息表是分区表、且要按时间倒序滚动加载，游标更合适；
+ * 用户/模型/知识库这类小列表直接给 `total` 更方便做分页器。
+ */
+export interface OffsetPage<T> {
+  items: T[]
+  /** 满足条件的总条数（不受本页 limit 影响） */
+  total: number
+  offset: number
+  limit: number
+}
+
+/**
+ * offset/limit 分页的 zod schema 工厂（`shared` 里各处列表响应共用一份形状）。
+ * 用法：`offsetPageOf(userListItemSchema)` → `{ items, total, offset, limit }` 的 schema + 类型。
+ */
+export function offsetPageOf<T extends z.ZodTypeAny>(item: T) {
+  return z.object({
+    items: z.array(item),
+    total: z.number().int().min(0),
+    offset: z.number().int().min(0),
+    limit: z.number().int().min(1),
+  })
 }
 
 /**

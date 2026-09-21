@@ -36,10 +36,16 @@ export const SERVICE_VERSION = '0.1.0'
  * 脱敏路径（pino redact 语法）。
  * 覆盖：HTTP 头（Cookie/Authorization）、密码、各类 token/key、MCP 用户凭据 `values`
  * （`02` §九：凭据只在后端解密，响应对不下发 —— 日志同样不得留痕）。
+ *
+ * `initialPassword`（P0-1-8 加入）是**建号/重置密码响应里唯一一次明文密码**：
+ * 代码里已经只记 id/username，但它是最容易被"顺手 log 一下整个响应对象"带出去的一个字段，
+ * 因此在脱敏层再兜一道（纵深防御：契约层"只在响应里出现一次" + 日志层"出现也打码"）。
  */
 export const LOG_REDACT_PATHS: readonly string[] = [
   'password',
   '*.password',
+  'initialPassword',
+  '*.initialPassword',
   'oldPassword',
   '*.oldPassword',
   'newPassword',

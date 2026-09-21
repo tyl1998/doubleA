@@ -21,6 +21,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerHealthRoutes } from './routes/health.js'
+import { registerUserRoutes } from './routes/users.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -98,9 +99,10 @@ export function buildApp(): FastifyInstance {
     maxAge: 600,
   })
 
-  // ⑦ 路由（`/api/auth/*` 从 P0-1-7 起；业务路由按批次逐个加）
+  // ⑦ 路由（`/api/auth/*` 从 P0-1-7 起、`/api/users/*` 从 P0-1-8 起；业务路由按批次逐个加）
   registerHealthRoutes(app)
   registerAuthRoutes(app)
+  registerUserRoutes(app)
 
   return app
 }

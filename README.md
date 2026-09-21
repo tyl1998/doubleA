@@ -84,16 +84,17 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
-pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（30 项）
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（33 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
 pnpm verify:auth       # 认证接口验收：登录/改密/限速/首登闸门，**需要真实 PG + Redis**（21 项）
+pnpm verify:users      # 用户管理验收：权限/建号/启停改角色/重置密码，**需要真实 PG + Redis**（17 项）
 ```
 
 > `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、领域错误、
@@ -103,12 +104,14 @@ pnpm verify:auth       # 认证接口验收：登录/改密/限速/首登闸门�
 > 无依赖环境（如 CI）加 `EXPECT_DEGRADED=1`，额外断言"依赖不可达时探活逐项降级"
 > 与"会话存储不可用时鉴权**失败关闭**（500，绝不放行）"。
 >
-> `pnpm verify:session` / `pnpm verify:auth` 是**必须**先起依赖 + 迁移的两档
+> `pnpm verify:session` / `verify:auth` / `verify:users` 是**必须**先起依赖 + 迁移的三档
 > （`pnpm infra:up && pnpm db:deploy`），因为验的正是"真实 Redis/PG 上的行为"：
-> 前者是会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
-> 后者是四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、
-> 以及"不泄露账号是否存在"的**耗时**取证）。两个脚本都自造临时用户并在 `finally` 删净
-> （含 Redis 键），不会污染开发库。看细节日志：`LOG_LEVEL=debug pnpm verify:auth`。
+> 会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
+> 四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、以及
+> "不泄露账号是否存在"的**耗时**取证）；用户管理四端点（含**建号 → 初始密码登录 → 首登改密**链路、
+> **停用后该用户已有会话下一个请求就 401**、**不能停用/降级/重置自己**）。
+> 三个脚本都自造临时用户并在 `finally` 删净（含 Redis 键），不会污染开发库。
+> 看细节日志：`LOG_LEVEL=debug pnpm verify:users`。
 
 ### 数据模型与迁移（P0-1-5 起）
 
@@ -176,7 +179,11 @@ curl -s --noproxy '*' http://127.0.0.1:13000/health | jq .
 | `POST /api/auth/logout` | 注销会话（幂等） |
 | `GET /api/auth/me` | 当前用户（含 `mustChangePassword`） |
 | `POST /api/auth/password` | 改密 `{oldPassword, newPassword}`（首登强制也走这里） |
-| 其余 `/api/**` | P0-1-8 起逐个落地（未注册路由得到统一信封 404）。数据模型（P0-1-5 ✅）、会话基础设施（P0-1-6 ✅）、认证四端点（P0-1-7 ✅）已就位 |
+| `GET /api/users` | 用户列表 `?offset=&limit=`（仅 ADMIN；`nickname` 可为 null） |
+| `POST /api/users` | 建号 `{username, nickname?, role?}` → **一次性初始密码**（仅 ADMIN） |
+| `PATCH /api/users/:id` | 启停 / 改角色 `{status?, role?}`（仅 ADMIN；不能操作自己） |
+| `POST /api/users/:id/reset-password` | 重置密码 → 新的**一次性初始密码**（仅 ADMIN；不能重置自己） |
+| 其余 `/api/**` | P0-1-9 起逐个落地（未注册路由得到统一信封 404）。数据模型（P0-1-5 ✅）、会话（P0-1-6 ✅）、认证（P0-1-7 ✅）、用户管理（P0-1-8 ✅）已就位 |
 
 > 认证四端点的跑法（本机端口 13000；macOS/Linux 走系统代理时 curl 要加 `--noproxy '*'`）：
 >
@@ -187,9 +194,16 @@ curl -s --noproxy '*' http://127.0.0.1:13000/health | jq .
 > curl -s -b /tmp/jar -X POST http://127.0.0.1:13000/api/auth/logout
 > ```
 >
-> ⚠️ 目前**还没有建号入口**（admin 建号是 P0-1-8，种子脚本是 P0-1-9），要手工造账号请用
-> `pnpm db:studio`（**不要**用 psql 直接 `INSERT`：`users.id` 与 `updated_at` 是 Prisma 客户端赋值、
-> DB 层没有默认值，见 `docs/06` P0-1-7 落地要点 11）。
+> ⚠️ **怎么拿到第一个账号**：建号接口（`POST /api/users`）已经能用，但它本身要求调用者是 ADMIN，
+> 而**种子脚本是 P0-1-9 的产出** —— 在此之前只能手工造一个管理员（用 Prisma 客户端，**不要** psql `INSERT`：
+> `users.id` 与 `updated_at` 是 Prisma 客户端赋值、DB 层没有默认值，见 `docs/06` P0-1-7 落地要点 11）：
+>
+> ```bash
+> node -e "Promise.all([import('./backend/dist/backend/src/infra/prisma.js'),import('./backend/dist/backend/src/infra/crypto.js')]).then(async([{getPrisma,closePrisma},{hashPassword}])=>{const p=getPrisma();await p.user.create({data:{username:'admin',nickname:'管理员',passwordHash:await hashPassword('改成你自己的密码'),role:'ADMIN',status:'ACTIVE',mustChangePassword:false}});await closePrisma();console.log('admin 已创建')})"
+> ```
+>
+> 建好的这个号（非首登态）可以直接调 `/api/users` 建别人的号；被建的人拿到初始密码后首登必须改密
+> （`mustChangePassword=true` 期间除 `/api/auth/{login,logout,me,password}` 外一律 403）。
 
 > 进程支持 SIGINT/SIGTERM 优雅退出：停止接流 → 关闭 PG/Redis 连接 → flush 日志 → 退出（10s 兜底强退）。
 
@@ -229,6 +243,7 @@ curl -s --noproxy '*' http://127.0.0.1:13000/health | jq .
 | `issue_fix/问题记录-macOS环境适配.md` | 启停脚本补 `.sh` + 跨平台入口、**宿主端口被另一项目占用→改 `.env` 避让**、**bash 3.2 把中文并进变量名**、corepack 取 pnpm |
 | `issue_fix/问题记录-P0-1-5-数据模型与Prisma基线.md` | **Prisma 7 的接入形态完全变了**（`prisma-client` generator + `output` 必填 + `prisma.config.ts` + 驱动适配器）、`allowBuilds` 要一次登记两个包、Prisma CLI 不该继承应用侧全量配置、**反向探针**证伪"分区表会被 `migrate dev` 重建"、`migrate diff` 的 `--exit-code` 用法、查询日志按 `trace` 门控且必须丢掉 `params` |
 | `issue_fix/问题记录-P0-1-6-密码与会话基础设施.md` | **bcrypt 对非法摘要 compare 立刻返回 false（等时比较会失效）**、bcrypt 静默截断 72 字节、原生 bcrypt 的 `allowBuilds`（但自带 prebuilds 不需编译器）、`@fastify/cookie` 是 `export =` 形态取不到类型名、会话令牌不需要签名、`decorateRequest` 必须直接调用、Cookie 属性不一致导致登出失效、"鉴权失败自毁会话"与"缓存窗口"的取舍 |
+| `issue_fix/问题记录-P0-1-8-用户管理接口.md` | **「响应体不含密码」的检查要分两层**（值/哈希 vs 键名，混在一起会让正确实现被判失败）、**重置密码必须清登录失败计数**、Prisma 唯一冲突要"先查 + catch"且用错误码而不是 `instanceof`、分页的稳定排序与 `total` 同快照、**「不能操作自己」放服务层**及其边界（含重置自己）、首登闸门会拦住首登态的 admin 调 `/api/users`、建号返回 200 而非 201 |
 | `issue_fix/问题记录-P0-1-7-认证接口.md` | **「不泄露账号是否存在」必须看耗时**（光对齐文案不够）、停用账号的报错时机（密码错 vs 密码对）、限速的三个顺序细节（判定在前 / 锁不续期 / 成功即清）、首登闸门挂根级 `preHandler` 且不依附 `requireAuth`、改密后必须主动失效快照缓存、**Prisma 函数型默认值不在 DB 层**（手工 INSERT 要给 id 与 updated_at）、verify 脚本要先构建 `shared` |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
@@ -286,6 +301,7 @@ doubuleA/
 │       └── 文件预览.md            ← 待写（P0-2 期间）
 ├── shared/                        ← @doubulea/shared：zod schema + 类型 + 错误码（编译期依赖）
 │   └── src/                       ← errors.ts + envelope.ts（P0-1-3 ✅）+ auth.ts（P0-1-7 ✅）
+│                                     + user.ts（用户管理契约，P0-1-8 ✅）
 ├── backend/                       ← @doubulea/backend（独立构建，→ backend/dist）
 │   ├── prisma/schema.prisma       ← 7 张表 + 7 个枚举（P0-1-5 ✅）
 │   ├── prisma/migrations/0001_init/ ← 首个迁移（含手写的 messages 分区 DDL）
@@ -300,7 +316,9 @@ doubuleA/
 │   │   ├── plugins/session.ts     ← Cookie 会话 + requireAuth/requireAdmin + 首登改密闸门（P0-1-6/7 ✅）
 │   │   ├── routes/health.ts       ← /health 探 PG/Redis/S3（P0-1-4 ✅）
 │   │   ├── routes/auth.ts         ← /api/auth/* 四端点（P0-1-7 ✅）
+│   │   ├── routes/users.ts        ← /api/users/* 四端点，仅 ADMIN（P0-1-8 ✅）
 │   │   ├── services/auth.service.ts ← 登录（含限速）/ 改密（P0-1-7 ✅）
+│   │   ├── services/user.service.ts ← 列表 / 建号 / 启停改角色 / 重置密码（P0-1-8 ✅）
 │   │   └── infra/                 ← logger.ts（P0-1-3 ✅）+ pg/redis/s3.ts（P0-1-4 ✅）
 │   │                                + prisma.ts（客户端单例，P0-1-5 ✅）
 │   │                                + crypto.ts（AES-256-GCM + bcrypt，P0-1-6 ✅）
@@ -341,4 +359,5 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-4 补**：修正本地开发启动路径 —— `pnpm dev:backend` 由「只编译不起服务」的 `tsc --watch` 改为 `tsx watch`（直接跑 TS 源码、改文件自动重启、Ctrl-C 优雅退出），原脚本改名 `watch:types`，新增 `pnpm start:backend` 跑产物；快速开始「起后端」一节改为「开发态 / 产物态」两条命令 |
 | 2026-09-21 | — | **P0-1-5 完成**：数据模型第一批 + Prisma 基线 —— `backend/prisma/schema.prisma`（7 张表 + 7 个枚举）、`prisma/migrations/0001_init/`（**手写 `messages` 按月分区** + 分区维护函数）、`prisma.config.ts`（v7 的 CLI 唯一配置入口）、`src/infra/prisma.ts`（`@prisma/adapter-pg` 单例）、`scripts/verify-db.mjs`（**17 项全通过**）。快速开始新增「数据模型与迁移」小节与 `db:*` 命令；`pnpm-workspace.yaml` 的 `allowBuilds` 补 `prisma`/`@prisma/engines`；新增缺陷归档 `issue_fix/问题记录-P0-1-5-数据模型与Prisma基线.md` |
 | 2026-09-21 | — | **P0-1-6 完成**：密码与会话基础设施 —— `src/infra/crypto.ts`（**AES-256-GCM 版本化信封 + AAD 上下文 + bcrypt cost 12** + 初始密码生成 + 等时比较用的 `DUMMY_PASSWORD_HASH`）、`src/infra/redis.ts`（`session:{sid}` 半衰期滑动续期 + `auth-user:{userId}` 状态快照缓存 + 主动失效）、`src/plugins/session.ts`（HttpOnly/SameSite=Lax Cookie + `requireAuth`/`requireAdmin` + 每请求校验 `user.status`）。`pnpm verify:app` 扩到 **25 项**（CI 无依赖模式 26 项），新增 **`pnpm verify:session`（13 项，需 PG+Redis）**；`infra/.env.example` 新增 `SESSION_TTL_HOURS` / `USER_STATUS_CACHE_TTL_SEC` / `SESSION_COOKIE_SECURE`；`allowBuilds` 补 `bcrypt`；新增缺陷归档 `issue_fix/问题记录-P0-1-6-密码与会话基础设施.md` |
+| 2026-09-21 | — | **P0-1-8 完成**：用户管理接口（admin）—— `src/routes/users.ts` + `src/services/user.service.ts`（列表 / 建号 / 启停改角色 / 重置密码，全部仅 ADMIN）、`shared/src/user.ts`（`UserListItem` + 四个 schema）、`envelope.ts` 补 `OffsetPage`/`offsetPageOf`。`pnpm verify:app` 扩到 **33 项**（CI 模式 34 项），新增 **`pnpm verify:users`（17 项，需 PG+Redis）**；**建号 → 初始密码登录 → 首登强制改密**链路与**停用后已有会话下一个请求就 401** 都真机走通；**不能停用/降级/重置自己**（409）；重置密码连带"失效快照 + 清登录失败计数"；零新增依赖与环境变量；快速开始补"怎么拿到第一个账号"；新增缺陷归档 `issue_fix/问题记录-P0-1-8-用户管理接口.md` |
 | 2026-09-21 | — | **P0-1-7 完成**：认证接口 —— `src/routes/auth.ts` + `src/services/auth.service.ts`（login/logout/me/password）、`shared/src/auth.ts`（用户名归一化 + 密码策略 + 三个 zod schema，前端表单校验共用）、**首登强制改密闸门**（根级 `preHandler`，白名单四条显式列出）、**登录限速**（Redis 计数 5 次/10 分钟，第 6 次 429 + `retryAfterSec`）。`pnpm verify:app` 扩到 **30 项**（CI 模式 31 项），新增 **`pnpm verify:auth`（21 项，需 PG+Redis）**；「不泄露账号是否存在」加**耗时**断言（235ms vs 236ms）；**零新增依赖、零新增环境变量**；快速开始补「认证四端点的 curl 跑法」与"还没有建号入口"的提示；新增缺陷归档 `issue_fix/问题记录-P0-1-7-认证接口.md` |

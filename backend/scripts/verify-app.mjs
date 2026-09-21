@@ -37,9 +37,15 @@ import {
   PASSWORD_MAX_BYTES,
   authUserSchema,
   changePasswordBodySchema,
+  createUserBodySchema,
+  initialPasswordResultSchema,
+  listUsersQuerySchema,
   loginBodySchema,
   normalizeUsername,
+  offsetPageOf,
   ok,
+  updateUserBodySchema,
+  userListItemSchema,
   utf8ByteLength,
 } from '@doubulea/shared'
 import { buildApp } from '../dist/backend/src/app.js'
@@ -568,6 +574,105 @@ await it('登录/改密 schema：拒绝空值、过短、超字节数；接受�
   const user = { id: 'x', username: 'a', nickname: null, role: 'ADMIN', mustChangePassword: false }
   assertEqual(authUserSchema.safeParse(user).success, true, 'authUserSchema 应接受典型响应体')
   assertEqual(authUserSchema.safeParse({ ...user, nickname: 1 }).success, false, 'authUserSchema 应拒绝非法 nickname')
+})
+
+// ── 14. 用户管理契约（P0-1-8）：路由已注册 + schema 生效 + 纯函数 ──
+await it('/api/users 四个路由已注册：未登录一律 401（不碰数据库），非法参数 400 而不是 404', async () => {
+  const anonymous = await app.inject({ method: 'GET', url: '/api/users' })
+  assertEqual(anonymous.statusCode, 401, '列表未登录状态码')
+  const missingId = await app.inject({
+    method: 'PATCH',
+    url: '/api/users/00000000-0000-7000-8000-000000000000',
+    payload: { status: 'ACTIVE' },
+  })
+  assertEqual(missingId.statusCode, 401, 'PATCH 未登录状态码（说明路由存在、只是没登录）')
+  const reset = await app.inject({
+    method: 'POST',
+    url: '/api/users/00000000-0000-7000-8000-000000000000/reset-password',
+  })
+  assertEqual(reset.statusCode, 401, '重置密码未登录状态码')
+})
+
+await it('用户管理请求体/路径参数校验：字段明细齐备（校验先于鉴权，故匿名下也能断言）', async () => {
+  const emptyCreate = await app.inject({ method: 'POST', url: '/api/users', payload: {} })
+  assertEqual(emptyCreate.statusCode, 400, '建号空 body 状态码')
+  assert(
+    emptyCreate.json().data.fields.some((field) => field.path === 'body.username'),
+    '建号空 body 应报 body.username',
+  )
+
+  const emptyPatch = await app.inject({
+    method: 'PATCH',
+    url: '/api/users/00000000-0000-7000-8000-000000000000',
+    payload: {},
+  })
+  assertEqual(emptyPatch.statusCode, 400, 'PATCH 空 body 状态码')
+
+  const badUuid = await app.inject({
+    method: 'PATCH',
+    url: '/api/users/not-a-uuid',
+    payload: { status: 'DISABLED' },
+  })
+  assertEqual(badUuid.statusCode, 400, '非法 uuid 状态码')
+  assert(
+    badUuid.json().data.fields.some((field) => field.path === 'params.id'),
+    '应报 params.id',
+  )
+
+  const badEnum = await app.inject({
+    method: 'PATCH',
+    url: '/api/users/00000000-0000-7000-8000-000000000000',
+    payload: { status: 'SUSPENDED' },
+  })
+  assertEqual(badEnum.statusCode, 400, '非法枚举状态码')
+  assert(
+    badEnum.json().data.fields.some((field) => field.path === 'body.status'),
+    '应报 body.status',
+  )
+})
+
+await it('shared 用户管理契约：建号/改角色/分页 schema 与列表响应形态', async () => {
+  // 建号：用户名不能含空白（会抄错）、nickname 空串按"没填"处理、role 可缺省
+  assertEqual(createUserBodySchema.safeParse({ username: 'a b' }).success, false, '含空格的用户名应被拒')
+  assertEqual(createUserBodySchema.safeParse({ username: '   ' }).success, false, '纯空白应被拒')
+  const created = createUserBodySchema.safeParse({ username: '  Alice  ', nickname: '' })
+  assertEqual(created.success, true, '合法建号应通过')
+  assertEqual(created.data?.username, 'Alice', 'trim 后保留原样（归一化在服务层做）')
+  assertEqual(created.data?.nickname, undefined, '空串 nickname 应被视为未填')
+
+  // 改角色：至少要给一个字段
+  assertEqual(updateUserBodySchema.safeParse({}).success, false, '空 body 应被拒')
+  assertEqual(updateUserBodySchema.safeParse({ status: 'DISABLED' }).success, true, '只给 status 应通过')
+  assertEqual(updateUserBodySchema.safeParse({ role: 'OWNER' }).success, false, '非法 role 应被拒')
+
+  // 分页：coerce + 默认值 + 上限
+  const query = listUsersQuerySchema.parse({})
+  assertEqual(query.offset, 0, 'offset 默认值')
+  assertEqual(query.limit, 20, 'limit 默认值')
+  assertEqual(listUsersQuerySchema.safeParse({ limit: '999' }).success, false, 'limit 超上限应被拒')
+  assertEqual(listUsersQuerySchema.parse({ limit: '5' }).limit, 5, 'limit 应被 coerce')
+
+  // 响应形态：三个 schema 能解析同构数据
+  const item = {
+    id: 'x',
+    username: 'a',
+    nickname: null,
+    role: 'ADMIN',
+    status: 'ACTIVE',
+    mustChangePassword: true,
+    createdAt: new Date().toISOString(),
+  }
+  assertEqual(userListItemSchema.safeParse(item).success, true, 'userListItemSchema')
+  assertEqual(
+    initialPasswordResultSchema.safeParse({ user: item, initialPassword: 'Abc123456789012345' }).success,
+    true,
+    'initialPasswordResultSchema',
+  )
+  assertEqual(
+    offsetPageOf(userListItemSchema).safeParse({ items: [item], total: 1, offset: 0, limit: 20 }).success,
+    true,
+    '列表分页 schema',
+  )
 })
 
 await app.close()
