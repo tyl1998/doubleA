@@ -2,8 +2,9 @@
 // doubuleA — 数据模型第一批（P0-1-5）
 //
 // 依据：`docs/02-后端设计.md` §三（数据模型核心表）。
-// 本文件只落 §三 的第一批 7 张表；知识库三表（knowledge_bases/documents/chunks）
-// 与 mcp/sandbox/artifact 等表分别在 P0-1-14 及 P0-2/P0-3 批次落。
+// 落地进度：第一批 7 张表见 P0-1-5；知识库三表（knowledge_bases/documents/chunks）
+// 见 P0-1-14（本文件末尾，含"为什么两个索引不在这里声明"的说明）；
+// mcp/sandbox/artifact 等表在 P0-2/P0-3 批次落。
 //
 // 命名约定：Prisma 侧 camelCase，数据库侧 snake_case（`@map` / `@@map` 逐列映射），
 // 与 `02` §三 的列名逐字对齐 —— 手写 SQL 迁移与 `psql` 排查时不用做心算转换。
@@ -102,6 +103,19 @@ enum MessageRole {
   SYSTEM
 
   @@map("message_role")
+}
+
+/// 文档在流水线中的状态（`02` §三 / `子方案①` §三）
+///
+/// · `PARSING` 是**初始态**（`子方案①` §三 第 ① 步：登记即入队），worker 成功后转 `READY`、
+///   任一步抛错转 `FAILED`（`error_msg` 落可读原因，`POST .../retry` 重新入队）。
+/// · 不设 `DELETED`：删除是**物理删除**行（连带级联清 chunks，`02` §4.6）。
+enum DocumentStatus {
+  PARSING
+  READY
+  FAILED
+
+  @@map("document_status")
 }
 
 // ───────────────────────────── 表 ─────────────────────────────
@@ -301,4 +315,144 @@ model Message {
   /// 会话内按时间倒序分页（`?beforeId=&limit=` 游标：先定位游标行拿 createdAt，再按此索引取）
   @@index([conversationId, createdAt(sort: Desc)])
   @@map("messages")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 知识库三表（P0-1-14）
+//
+// 依据：`docs/02-后端设计.md` §三 + §4.6、`docs/子方案/知识库流水线.md` §4-4（DDL 与索引）。
+// 两条与其它表不同的地方，改这三张表之前务必先读：
+//
+// 1. **`chunks.embedding` 是 `Unsupported("vector(1024)")`** —— Prisma 不认识 pgvector 类型，
+//    只能声明成「这个列存在，但别碰」。后果有两个，都是刻意的：
+//      · 该列**不在生成的 client 里**，于是 chunks 的写入/检索一律走手写 SQL
+//        （`子方案①` §4-4 的 `INSERT ... SELECT unnest(...)`、§6-1 的 `embedding <=> $1`）；
+//      · 列可空（`?`）是硬性要求 —— 可空才能让 Prisma 侧的 `create` 省略它，否则
+//        「模型里有必填的 unsupported 字段」会让整个模型无法建行（连造测试数据都不行）。
+//        顺带这也与 `子方案①` §4-4 的 DDL 一致（那里也没有 NOT NULL）。
+//
+// 2. **chunks 的两个特殊索引，一个在本文件里声明、一个不能**（P0-1-14 的关键结论）——
+//    Prisma 认不出的索引会被它当成"库里多出来的对象"并生成 `DROP INDEX`，
+//    所以"手写 DDL"这件事在本批**必须**配一个不让 diff 归不了零的处置：
+//      · 全文路的 GIN —— Prisma 能表达（`type: Gin` + `ops: raw(...)` + `map`），
+//        因此**在本文件里声明**（见 Chunk 模型），Prisma 自己管它；
+//      · 向量路的 HNSW —— Prisma 表达不了（`type: Hnsw` 直接报 Unknown index type，
+//        且 `WITH (m, ef_construction)` 也没有语法位置），于是改为在迁移里建**部分索引**
+//        （`WHERE kb_id IS NOT NULL`）：Prisma **忽略部分索引**（实测），
+//        而该谓词恒真（`kb_id` 是 NOT NULL 列）且被向量路的 `kb_id = $2` 蕴含，
+//        索引内容与全量 HNSW 等价、规划器照常使用。
+//    两条机制都由验收脚本断言守着（`pnpm verify:knowledge`）：
+//    它跑 `migrate diff --exit-code` 必须为 0，并用 `EXPLAIN` 证明两个索引真的被用上。
+//    探针原始输出见 `issue_fix/问题记录-P0-1-14-知识库数据模型.md`。
+//
+// 主键类型沿用 `02` §3.1「一律 uuid(7)」。`子方案①` §4-4 的 DDL 草稿写的是 `bigserial`，
+// 本批按 `02` §3.1 统一为 uuid(7)（时间有序，B-tree 写入近似追加），并把该草稿同步改掉 ——
+// 两张文档对同一条 DDL 给出不同口径属于文档腐烂，必须消掉其一。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// knowledge_bases —— 知识库（`02` §三 / §4.6、`子方案①` §二）
+///
+/// · `embeddingModel` **NOT NULL**：本系统的库一旦建出来就必然要入库/检索，
+///   而"用哪个 embedding 模型建的"是 `子方案①` §八「换模型重建路径」的唯一判据 ——
+///   留 null 等于把"这个库到底能不能检索"变成运行期才知道的事。
+///   取值 = `EmbeddingProvider.name()`（P0-1-13 的 `api:<模型名>` / `local:<目录名>`），
+///   P0-1-15 建库时**快照**。代价是"embedding 未就绪时建不了库"，这是刻意的：
+///   彼时建出来的库不可能完成入库（`config.embedding.apiReady=false` + 取用时硬报错）。
+/// · `chunkSize` / `chunkOverlap` 是**独立列**（`02` §三 已定），其余检索参数收进
+///   `retrievalConfig` jsonb —— 避免为每个调参加一列（`子方案①` §二 的口径）。
+/// · `retrievalConfig` 的 DB 默认值是**完整形状**（不是 `{}`）：即便将来有代码路径绕过
+///   服务层直接插行，读出来也是可用配置。读取端仍一律 `??` 补默认值（§二），两层兜底。
+model KnowledgeBase {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  name           String   @db.VarChar(128)
+  description    String?  @db.Text
+  embeddingModel String   @map("embedding_model") @db.VarChar(255)
+  chunkSize      Int      @default(512) @map("chunk_size")
+  chunkOverlap   Int      @default(64) @map("chunk_overlap")
+  /// 形状见 `子方案①` §二：`{topK, score, mode, splitStrategy, rrfK, weights:{vector,fulltext}}`
+  retrievalConfig Json    @default("{\"topK\":5,\"score\":0.3,\"mode\":\"HYBRID\",\"splitStrategy\":\"hybrid\",\"rrfK\":60,\"weights\":{\"vector\":1.0,\"fulltext\":1.0}}") @map("retrieval_config") @db.JsonB
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  documents Document[]
+
+  @@map("knowledge_bases")
+}
+
+/// documents —— 知识库文档（`02` §三 / §4.6、`子方案①` §三/§七）
+///
+/// · `contentHash` = sha256(原始文件字节) 的十六进制（64 字符），**上传时就算**：
+///   它是覆盖重建的判重依据（§七「`content_hash` 相同的重传 → 200 '内容未变化，已跳过'」），
+///   也是 P0-1-17 worker 幂等校验的一半（另一半是 `status`）。
+/// · 覆盖重建（§七）**不新建 documents 行** —— 所以文档 id 稳定，
+///   引用与 `agent_components.ref_id` 的绑定都不受影响。
+/// · `chunkCount` 默认 0 而非 null：`PARSING` 期间就是"当前有 0 个可用 chunk"，
+///   前端不必区分 null 与 0（文档列表在 `PARSING` 态另给"更新中"提示，§七 的取舍）。
+/// · `errorMsg` 只在 `FAILED` 时有值，内容是给用户看的可读原因（如"疑似扫描件"）。
+/// · 删除 `onDelete: Cascade`：删库必删其文档（`02` §4.6「删除时级联清 chunks 与 S3 原文件」，
+///   S3 部分由服务层在删行前后处理）。
+model Document {
+  id          String         @id @default(uuid(7)) @db.Uuid
+  kbId        String         @map("kb_id") @db.Uuid
+  fileKey     String         @map("file_key") @db.Text
+  fileName    String         @map("file_name") @db.VarChar(255)
+  status      DocumentStatus @default(PARSING)
+  chunkCount  Int            @default(0) @map("chunk_count")
+  errorMsg    String?        @map("error_msg") @db.Text
+  contentHash String         @map("content_hash") @db.VarChar(64)
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  kb     KnowledgeBase @relation(fields: [kbId], references: [id], onDelete: Cascade)
+  chunks Chunk[]
+
+  /// 文档列表（`GET /api/knowledge-bases/:id/documents`）按新建时间倒序；
+  /// `kb_id` 前缀同时服务 §4-1 第 4 条的判重查询（`WHERE kb_id=? AND content_hash=?`，
+  /// 单库千级文档下走前缀 + 过滤足够，不为它单独再开一条索引）
+  @@index([kbId, createdAt(sort: Desc)])
+  @@map("documents")
+}
+
+/// chunks —— 文档分块（`02` §三 / `子方案①` §4-4）
+///
+/// · **单表不分区**（02 §三 分区说明）：分区表无法建全局 HNSW 索引，
+///   而"百万级 chunk 以内"单表 + HNSW 足够（`01` §1.3 的容量目标）。
+/// · `seq` 是文档内序号（0 起），与 `docId` 组成 `@@index([docId, seq])` —— 它同时是
+///   覆盖重建时 `DELETE FROM chunks WHERE doc_id=?` 与按序回读的索引，
+///   并补上 `doc_id` 外键缺的那个索引（PG 不会为 FK 自动建索引）。
+/// · `embedding` 见文件顶部说明 1（Unsupported + 可空）。
+///   维度 1024 写死在 DDL 里 ⇒ 改维度走「新建 chunks_v2 → 双写 → 切检索 → 弃旧表」
+///   （`子方案①` §八），不做 `ALTER COLUMN`。
+/// · `meta` 存结构元数据：标题层级 / 页码（§4-1），以及 §八 用来判「模型是否换过」的
+///   `embeddingName`。默认 `{}` 而非 null，读取端不必判空。
+/// · ⚠️ `id` 由**客户端**生成（`@default(uuid(7))` 是 Prisma 侧默认值，不在 DB 层，
+///   见 `02` §3.1 与 P0-1-5 的实测：函数型默认值不进 DDL）。因此 P0-1-19 的
+///   `INSERT ... SELECT unnest(...)` **必须自带 id 数组**，不能指望 DB 兜底。
+model Chunk {
+  id        String                      @id @default(uuid(7)) @db.Uuid
+  docId     String                      @map("doc_id") @db.Uuid
+  kbId      String                      @map("kb_id") @db.Uuid
+  seq       Int
+  content   String                      @db.Text
+  /// pgvector 列，DDL 里是 `vector(1024)`；Prisma 侧只作声明，读写走手写 SQL。
+  /// 它的 HNSW 索引**不在本文件声明**（Prisma 表达不了），建在迁移里且刻意做成
+  /// 部分索引 —— 理由与代价见本文件顶部说明 2。
+  embedding Unsupported("vector(1024)")?
+  meta      Json                        @default("{}") @db.JsonB
+  createdAt DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  doc Document @relation(fields: [docId], references: [id], onDelete: Cascade)
+
+  /// 检索的两条路都要先按 `kb_id` 收窄（`子方案①` §6-1：绑定某 Agent 的每个 KB 各查一次）
+  @@index([kbId])
+  /// 覆盖重建的删除 + 按序回读 + `doc_id` 外键所需的索引（见上方说明）
+  @@index([docId, seq])
+  /// 全文路的中文 bigram 倒排（`子方案①` §4-4）。三处都不是可选项：
+  /// · `ops: raw("gin_bigm_ops")` —— `text` **没有**默认 GIN 算子类（连 pg_bigm 装上也不设默认），
+  ///   不写算子类 PG 直接报 `data type text has no default operator class for access method "gin"`；
+  /// · `type: Gin` —— 不写会按默认 btree 生成 `USING btree`，而 btree 走不了 `LIKE '%词%'`；
+  /// · `map: "idx_chunks_bigram"` —— 不给名字时 Prisma 会叫它 `chunks_content_idx`，
+  ///   于是**每次 diff 都想把它改名**（实测），迁移与库两边名字必须钉死。
+  @@index([content(ops: raw("gin_bigm_ops"))], type: Gin, map: "idx_chunks_bigram")
+  @@map("chunks")
 }

@@ -84,7 +84,7 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
@@ -100,6 +100,7 @@ pnpm verify:e2e        # 端到端验收：起真实进程 + 真实 HTTP 跑六�
 pnpm verify:model-providers  # 模型池 Provider 验收：Key 加密/读脱敏/三态/删除守卫，**需要真实 PG + Redis**（18 项）
 pnpm verify:models     # 模型管理验收：两套投影/可选列表过滤/六条守卫，**需要真实 PG + Redis**（17 项）
 pnpm verify:llm        # LLM client 验收：起真 HTTP 假上游，报文/流式边界/超时中断/上游模型列表，**需要真实 PG + Redis**（22 项）
+pnpm verify:knowledge  # 知识库数据层验收：扩展/算子类/两条特殊索引/migrate diff 无漂移/EXPLAIN 命中，**只需真实 PG**（23 项）
 ```
 
 > `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、领域错误、
@@ -358,6 +359,16 @@ node --input-type=module -e "const m=await import('./backend/dist/backend/src/ll
 #    ready=false 时 problems 就是"缺什么"的人话清单（同一句话会在 getEmbeddingProvider() 抛出来）
 #  → api 模式：填好 EMBEDDING_API_URL/KEY/MODEL 三项即 ready；
 #    local 模式：除了模型目录，还要 LOCAL_EMBEDDING_RUNTIME_MODULE（推理运行时，见 docs/02 §八）
+
+# ⑦ 知识库数据层自检（P0-1-14）—— 没有 HTTP 端点（CRUD 是 P0-1-15 的事），
+#    所以这里验的是"库结构对不对"：两扩展启用没有、两条特殊索引在不在、migrate 会不会把它们删掉：
+psql "$(grep -E '^DATABASE_URL=' infra/.env | cut -d= -f2- | tr -d '"')" -c '\d+ chunks'
+#  → 必须看到这两行（缺任一行都是 bug，见 issue_fix/问题记录-P0-1-14-知识库数据模型.md）：
+#      "idx_chunks_embedding" hnsw (embedding vector_cosine_ops) WITH (m='16', ef_construction='64') WHERE kb_id IS NOT NULL
+#      "idx_chunks_bigram" gin (content gin_bigm_ops)
+pnpm verify:knowledge
+#  → 23 项全通过；其中「结构无漂移：migrate diff --exit-code = 0」是关键的一条 ——
+#    它证明上面两条手写索引不会被下一次 `migrate dev` 生成 DROP INDEX（P0-1-14 实测踩到过的坑）。
 ```
 
 **已知边界（别当 bug）**：① 接口只有三组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
@@ -376,7 +387,8 @@ node --input-type=module -e "const m=await import('./backend/dist/backend/src/ll
 
 > 想一条命令跑完上面全部 + 六条门槛的自动版：`pnpm verify:e2e`（它自己起进程、自己造号、跑完删净）；
 > LLM client 那部分（含假上游）的自动版：`pnpm verify:llm`；
-> embedding 双模式（含 stub 推理运行时，**不需要起 docker**）：`pnpm verify:embedding`。
+> embedding 双模式（含 stub 推理运行时，**不需要起 docker**）：`pnpm verify:embedding`；
+> 知识库数据层（只连 PG，**不需要 Redis**）：`pnpm verify:knowledge`。
 
 > 进程支持 SIGINT/SIGTERM 优雅退出：停止接流 → 关闭 PG/Redis 连接 → flush 日志 → 退出（10s 兜底强退）。
 
@@ -423,6 +435,7 @@ node --input-type=module -e "const m=await import('./backend/dist/backend/src/ll
 | `issue_fix/问题记录-P0-1-9-认证与用户验收.md` | **种子脚本的「幂等」是安全属性**（默认绝不覆盖密码，否则改过密码的人下次 seed 后登录不上）、种子脚本的 console 是交付通道而非日志（需 ESLint 例外）、`prisma/seed.ts` 会被编译进 dist 的两面性、**「端到端」的关键是换掉传输层**（spawn 真实进程 + 真实 HTTP）、子进程端口先探再用、`UID` 是 shell 只读变量、`fetch` 要多条 `Set-Cookie` 必须用 `getSetCookie()`、**「跑完干净」要写成断言**、门槛 3 的「业务 API」本仓还没有（用 403 文案区分闸门 vs 权限）、手工走查会留下不可用状态（收尾必须 seed 复位） |
 | `issue_fix/问题记录-P0-1-12-LLM-client封装.md` | **两个实现 bug 都是跑验收才抓出来的**：① "到响应头"与"流内空闲"各建一个 `AbortController` ⇒ 空闲超时**根本没接到 `fetch` 上**（计时器照常触发、读流纹丝不动，脚本挂死被 SIGTERM）；② 中断只靠"abort 让读流失败" ⇒ 响应已在同一个 TCP 包里缓冲好时**点了停止回答还在往外冒**（必须在每帧之前显式查信号）。另有：`stream_options` 默认不能发（400 的常见来源）、末帧可能没有结尾空行（残留缓冲也要当一帧）、SSE 帧会被 TCP 切碎、`200` 里藏 `{error}`、`rawFinishReason` 不在传输层归一化、**上游 401 的 body 会回显 `Authorization` ⇒ 任何进日志/错误消息的片段都要先脱敏**、把"真实 provider"换成**本地真 HTTP 假上游**（验收不依赖外部厂商）、拉模型列表的两种"不"（不要求启用、不要求配 Key）与上游 404 的可执行文案 |
 | `issue_fix/问题记录-P0-1-13-embedding双模式.md` | **两个实现问题也都是跑验收才抓出来的**：① worker 无脑继承 `process.execArgv` ⇒ 父进程若是 `node --input-type=module -e …` 起的（验收脚本的子进程就是），worker 一启动就崩（`.ts` 入口才该继承，`.js` 传 `[]`）；② 用 `spawnSync` 起子进程验"工厂接线" ⇒ 把父进程事件循环钉住，跑在父进程里的假上游无法应答，症状是"地址配对了却报 30s 超时"（改异步 `spawn`）。另有：**先抽 `llm/upstream.ts` 再写第二个上游调用点**（否则 P0-1-12 的两个坑要养两份，且 `verify:llm` 22 项证明了抽取未改行为）、`worker_threads` 隔离要用**线程内回报的 `threadId`** 取证、local 的推理运行时（含分词）**走注入**而不是写死 `onnxruntime-node`（交付物形态未定；且本批因此零新增依赖）、`dim()` 恒返回配置维度而实际维度逐条校验、**批串行**（不裸 `Promise.all`）、`index` 归位与"必须是 `0..n-1` 的排列"、`input: []` 不发请求、就绪判定两级（config 只 WARN / 取用时硬报错） |
+| `issue_fix/问题记录-P0-1-14-知识库数据模型.md` | **本批最大的坑不在 `06` 的坑预判里**：**手写 DDL 会被 Prisma 判成"多余对象"并生成 `DROP INDEX`** ⇒ 下一批动 schema 时两条检索索引被静默删除、检索退化成全表扫描（P0-2 加表时必炸）。⚠️ **P0-1-5 的"Prisma 会跳过分区表"结论不能外推** —— 分区子表它跳过，**认不出的索引它照删**，两类对象机制不同。两处置法：**GIN 在 schema 里声明**（`type: Gin` + `ops: raw("gin_bigm_ops")` + `map`，三个参数都不可省）；**HNSW 藏进"部分索引"**（Prisma 7 无 `Hnsw` 类型、无 `WITH (m,ef_construction)` 位置；实测**普通 btree 与表达式索引都会被 DROP，唯独带 `WHERE` 的部分索引它一条 diff 都不出**），恒真谓词 `WHERE kb_id IS NOT NULL` ⇒ 内容等价全量 HNSW 且被 `kb_id = $2` / `= ANY(...)` 蕴含。失效是**静默的** ⇒ 三条守门断言（`migrate diff --exit-code`=0 / `indpred` 未变 / 两条路 `EXPLAIN` 命中）。**`06` 点名的 GIN 坑预判经实测部分不成立**：`USING gin (content)` **不是静默建错算子类，而是直接报错** `data type text has no default operator class for access method "gin"`（实测 `text` 装 pg_bigm 后仍无默认 GIN 算子类，`gin_bigm_ops` 的 `opcdefault=false`）⇒ 真风险是"报错文案不点破该写哪个算子类，易误读成 pg_bigm 没编进镜像"。另有：`Unsupported("vector(1024)")?` 的**可空是硬要求**（不可空则 Prisma `create` 建不了行）、主键统一 `uuid(7)` **改掉 `子方案①` §4-4 的 `bigserial`**（判据是 `agent_components.ref_id` 要指得过来；代价是 P0-1-19 手写 INSERT 得自带 id 数组）、`embedding_model` 定 NOT NULL 及其副作用、`retrieval_config` 的 **DB 默认值写完整形状**、`documents` **刻意不加** `UNIQUE(kb_id, content_hash)`（会把"已跳过"的业务语义变成 409）、**`EXPLAIN` 验索引用法要关掉更便宜的退路**（小表上 PG 选 kb_id 索引+排序是**理性**的；「现身」证明可用、「没现身」不构成反证） |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 
@@ -518,6 +531,7 @@ doubuleA/
 │                                     + verify-model-providers.mjs / verify-models.mjs（真实 PG+Redis）
 │                                     + verify-llm.mjs（真 HTTP 假上游 + 真实 PG+Redis）
 │                                     + verify-embedding.mjs（真 HTTP 假上游 + stub 运行时，**无依赖**）
+│                                     + verify-knowledge.mjs（**只需真实 PG**：扩展/特殊索引/migrate diff）
 │                                     + verify-e2e.mjs（自起真实进程）
 ├── frontend/                      ← @doubulea/frontend（独立构建，→ frontend/dist 纯静态）
 ├── infra/                         ← docker-compose + 自建 PG 镜像 + 启停脚本（P0-1-2 ✅）
@@ -562,3 +576,4 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-11 完成（包 C 继续）**：模型管理 —— `shared/src/model.ts`（`ModelItem`/`ModelOption` **两套投影** + 四段 schema）、`backend/src/services/model.service.ts`（模型 CRUD + 三条守卫）、`backend/src/routes/models.ts`（`GET /api/models` 仅 ADMIN + `GET /api/models/available` 登录即可 + POST/PATCH/DELETE）+ `app.ts` 接线。`pnpm verify:app` 扩到 **42 项**（CI 模式 43 项），新增 **`pnpm verify:models`（17 项，需 PG+Redis）**；`verify:db/session/auth/users/model-providers/e2e` 全部未回归；**零新增依赖、零新增环境变量**；路由表订正：`GET /api/models?type=CHAT` → `GET /api/models/available?type=CHAT`（`03` §116 同步）；新增缺陷归档 `issue_fix/问题记录-P0-1-11-模型管理.md` |
 | 2026-09-21 | — | **P0-1-12 完成（包 C 继续）**：LLM client 封装 —— `backend/src/llm/client.ts`（OpenAI 兼容**传输层**：`chat()` / `chatStream()` / `fetchRemoteModels()`；**零新增依赖**，手写 SSE 解析）、`services/model.service.ts` 补 `resolveChatTarget()`（四道前置校验 + 解密 Key 注入）与 `listProviderRemoteModels()`、`routes/modelProviders.ts` 补 **`GET /api/model-providers/:id/remote-models`**（用户追加需求：**拉取该配置下的上游模型**，通用 `GET {baseUrl}/models`，只读探测不落库）、`shared/src/modelProvider.ts` 补上游模型列表契约；**新增 2 个环境变量**（`LLM_REQUEST_TIMEOUT_MS` / `LLM_STREAM_IDLE_TIMEOUT_MS`，已同步 `.env.example`/`.env`/`02` §十一）；`02` 新增 **§6.1 LLM client 实现口径**（差异收敛清单 11 条 + 两条实现纪律）与 §4.3 契约增量。`pnpm verify:app` 扩到 **44 项**（CI 模式 45 项），新增 **`pnpm verify:llm`（22 项：起真 HTTP 假上游，upstream 侧取证 Key 注入 / **未发 `stream_options`** / SSE 分片 / 无 `[DONE]` / 末帧无空行 / 思考增量 / 畸形帧 / 两级超时 / 「点停止 ≠ 故障」）**；`verify:db(17)/session(13)/auth(21)/users(17)/model-providers(18)/models(17)/e2e(17)` **全部未回归**；README 快速开始补「静态检查与验收」的 `verify:llm` 一行与手工端测的 ⑤ 拉取上游模型；新增缺陷归档 `issue_fix/问题记录-P0-1-12-LLM-client封装.md` |
 | 2026-09-21 | — | **P0-1-13 完成（包 C 收口 ✅）**：embedding 双模式 provider —— `backend/src/llm/embedding/{index,api,local,embedding.worker}.ts`（api 走 OpenAI 兼容 `/embeddings`；local 走 `worker_threads` 真隔离 + 懒加载；两种模式都批 `EMBEDDING_BATCH_SIZE`=32）；**通用上游件抽出** `backend/src/llm/upstream.ts`（看门狗/中断/脱敏/状态码映射/`fetchUpstreamJson`）并让 `client.ts` 复用 —— 第二次做上游调用不再把 P0-1-12 的两个坑再养一遍（`verify:llm` 22 项逐项仍通过即是证据）。**local 的推理运行时（含分词）走注入**（`LOCAL_EMBEDDING_RUNTIME_MODULE`，契约见 `02` §八）：交付物形态未定（`06` §七 待决事项 2）写死等于赌，且本批因此**零新增依赖**。**新增 2 个环境变量**（`EMBEDDING_BATCH_SIZE` / `LOCAL_EMBEDDING_RUNTIME_MODULE`），`02` 新增 §8.1 实现口径 + §十一 同步；README 手工端测新增 ⑥ embedding 自检两步。**验收**：新增 **`pnpm verify:embedding`（27 项，⚠️ 不需要 PG/Redis，可进 CI）**；既有 9 档（`app 44 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / e2e 17`）**全部未回归**；**两个实现问题也是跑验收才抓出来的**（worker 继承 `--input-type` 崩 / `spawnSync` 钉死父进程事件循环）；新增缺陷归档 `issue_fix/问题记录-P0-1-13-embedding双模式.md` |
+| 2026-09-21 | — | **P0-1-14 完成（包 D 起步）**：知识库数据模型 + 扩展 —— `backend/prisma/schema.prisma`（**+3 表 +1 枚举**：`knowledge_bases`/`documents`/`chunks` + `document_status`，共 **10 表/8 枚举**）、`backend/prisma/migrations/0002_knowledge/migration.sql`（**手写 `CREATE EXTENSION vector/pg_bigm`** + HNSW（`vector_cosine_ops`, m=16, ef_construction=64）+ `gin (content gin_bigm_ops)`）、`backend/scripts/verify-knowledge.mjs` + `pnpm verify:knowledge`。⚠️ **本批最大的坑不在 `06` 的坑预判里**：**手写 DDL 会被 Prisma 判成"多余对象"并生成 `DROP INDEX`**（下一批动 schema 时两条检索索引被静默删掉 ⇒ 检索退化成全表扫描）；**P0-1-5 的"Prisma 会跳过分区表"结论不能外推**（分区子表它跳过、认不出的索引它照删）。两处置法：**GIN 在 schema 里声明**（`type: Gin` + `ops: raw("gin_bigm_ops")` + `map`）、**HNSW 藏进"部分索引"**（实测：普通 btree 与表达式索引都会被 DROP，唯独带 `WHERE` 的部分索引它不看），恒真谓词 `WHERE kb_id IS NOT NULL` ⇒ 内容等价全量 HNSW 且被 `kb_id = $2`/`= ANY(...)` 蕴含；失效**静默** ⇒ 三条守门断言（`migrate diff --exit-code`=0 / `indpred` 未变 / 两条路 `EXPLAIN` 命中）。**`06` 点名的 GIN 坑预判经实测部分不成立**：`USING gin (content)` 不是"静默建错算子类"而是**直接报错** `data type text has no default operator class for access method "gin"`（`text` 装 pg_bigm 后仍无默认 GIN 算子类）。另：主键统一 `uuid(7)` **改掉 `子方案①` §4-4 的 `bigserial`**（两文档对同一 DDL 口径不一致 = 文档腐烂，已消掉其一）、`Unsupported("vector(1024)")?` 的**可空是硬要求**、`embedding_model` 定 NOT NULL（及其"本机 .env 状态下令 P0-1-15 建库失败"的刻意副作用）、`retrieval_config` 的 **DB 默认值写完整形状**、`documents` **刻意不加** `UNIQUE(kb_id, content_hash)`。**验收**：新增 **`pnpm verify:knowledge`（23 项，⚠️ 只需 PG，不需要 Redis/S3）**；既有 10 档（`app 44 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / embedding 27 / e2e 17`）**全部未回归**；README 手工端测新增 ⑦ 知识库数据层自检两步；新增缺陷归档 `issue_fix/问题记录-P0-1-14-知识库数据模型.md` |
