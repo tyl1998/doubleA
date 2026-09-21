@@ -26,6 +26,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
+        // ⚠️ 默认值 3000 是「通用约定」，**不是**本机后端。本机（2026-09-21）3000 被另一个项目的
+        //    node 占着，本项目后端在 13000（`infra/.env` 的 BACKEND_PORT）→ 开发时必须显式传：
+        //      VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend
+        //    忘了传的症状是**静默串到陌生服务**：/api 返 404/502 或别人的响应，看起来像后端没写对。
+        //    验证：curl --noproxy '*' http://localhost:5174/api/auth/me 应得本项目 401 信封。
         target: process.env.VITE_DEV_PROXY_TARGET ?? 'http://localhost:3000',
         changeOrigin: true,
       },
