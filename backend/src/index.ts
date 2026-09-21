@@ -100,7 +100,10 @@ try {
   const address = await app.listen({ port: config.port, host: DEFAULT_HOST })
   const bootEnvelope: Envelope<{ service: string; step: string; address: string }> = ok({
     service: 'doubulea-backend',
-    step: 'P0-1-6 密码与会话基础设施',
+    // ⚠️ 每批必须顺手改成当前批次（P0-1-6 起连漏三批：P0-1-7/8/9 都忘改，
+    //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版）。
+    //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
+    step: 'P0-1-9 认证与用户验收',
     address,
   })
   logger.info(
