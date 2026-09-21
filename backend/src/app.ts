@@ -21,6 +21,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerHealthRoutes } from './routes/health.js'
+import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerUserRoutes } from './routes/users.js'
 
@@ -106,6 +107,7 @@ export function buildApp(): FastifyInstance {
   registerAuthRoutes(app)
   registerUserRoutes(app)
   registerModelProviderRoutes(app)
+  registerModelRoutes(app)
 
   return app
 }

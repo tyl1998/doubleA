@@ -13,11 +13,16 @@
  *   · P0-1-10：`/api/model-providers` 已注册 + Provider 契约（`maskApiKey` 边界、
  *              baseUrl 归一化、**PATCH 的 apiKey 三态**、密文**绑定到记录**（AAD 换 id 即解不开）、
  *              输出形态里不存在任何 key/密文字段）
+ *   · P0-1-11：`/api/models` 与 `/api/models/available` **两条路径各自独立注册**
+ *              （⚠️ 同路径注册两个 GET 会在**启动期**抛 `FST_ERR_DUPLICATED_ROUTE`，
+ *              这是"必须拆路径"的硬证据）+ 模型契约（型号名/别名校验、
+ *              `available` 的 `type` 必填、`maxContext` 三态、两套投影的键集合互不串味）
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
  * Provider 的**落库形态**（`api_key_enc` 是密文、读接口不含明文、三态真地写对列）
- * 由 `verify-model-providers.mjs` 覆盖，同样需要真实 PG。
+ * 由 `verify-model-providers.mjs` 覆盖；模型的落库与守卫（含"provider 停用后模型从
+ * 可选列表消失"）由 `verify-models.mjs` 覆盖，两档都需要真实 PG。
  *
  * 为什么用 `app.inject` 而不是 curl：
  *   ① 本机端口是稀缺资源（3000/5173 都被别的项目占着，见 `06` §七 待决事项 6），
@@ -43,17 +48,24 @@ import {
   PASSWORD_MAX_BYTES,
   authUserSchema,
   changePasswordBodySchema,
+  createModelBodySchema,
   createModelProviderBodySchema,
   createUserBodySchema,
   initialPasswordResultSchema,
+  listAvailableModelsQuerySchema,
   listModelProvidersQuerySchema,
+  listModelsQuerySchema,
   listUsersQuerySchema,
   loginBodySchema,
   maskApiKey,
+  modelItemSchema,
+  modelOptionListResultSchema,
+  modelOptionSchema,
   modelProviderItemSchema,
   normalizeUsername,
   offsetPageOf,
   ok,
+  updateModelBodySchema,
   updateModelProviderBodySchema,
   updateUserBodySchema,
   userListItemSchema,
@@ -117,7 +129,7 @@ async function it(name, fn) {
 
 const expectDegraded = process.env.EXPECT_DEGRADED === '1'
 
-console.log(`\n${c.b}══ 接口级验收：信封 / /health / 密码与会话 / 认证 / 用户管理 / 模型池 Provider ══${c.x}`)
+console.log(`\n${c.b}══ 接口级验收：信封 / /health / 密码与会话 / 认证 / 用户管理 / 模型池 ══${c.x}`)
 console.log(`  ${c.d}模式：${expectDegraded ? '依赖全部不可达（断言 degraded）' : '本机依赖（断言 /health 全绿）'}${c.x}`)
 
 const app = buildApp()
@@ -858,6 +870,205 @@ await it('shared Provider 输出形态：只含掩码与 hasKey，无任何 apiK
     offsetPageOf(modelProviderItemSchema).safeParse({ items: [item], total: 1, offset: 0, limit: 20 }).success,
     true,
     '列表分页 schema',
+  )
+})
+
+// ── 16. 模型契约与路由分流（P0-1-11）──
+await it('两条路径各自注册、互不遮蔽：/api/models 与 /api/models/available 都是真路由（不是 404 兜底）', async () => {
+  // 注册层面就断言"路径确实不同"：同路径两个 GET 会让 Fastify 在**启动期**抛
+  // `FST_ERR_DUPLICATED_ROUTE`（已实测），所以这里能挂上就说明分流是干净的
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/models' }), true, '管理列表路由')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/models/available' }), true, '可选列表路由')
+  // `GET /api/models/:id` **不该**存在（只有 PATCH/DELETE）：否则"取单条模型"会成为一个
+  // 没人设计过的端点。用一条合法 UUID 打过去，期望 404 兜底
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/models/:id' }), false, '不应有单条 GET')
+
+  // 校验先于鉴权（Fastify 生命周期：validation → preHandler），所以匿名请求也能验 schema 是否接线
+  const missingType = await app.inject({ method: 'GET', url: '/api/models/available' })
+  assertEqual(missingType.statusCode, 400, 'available 缺 type 的状态码')
+  const typeFields = missingType.json().data?.fields ?? []
+  const fieldPaths = typeFields.map((field) => field.path)
+  assert(
+    fieldPaths.includes('querystring.type'),
+    `应报 querystring.type（说明 type 真的是必填），实际 ${JSON.stringify(fieldPaths)}`,
+  )
+  // 文案也要说清"必填"：zod v3 里 `required_error` 与自定义 errorMap 互斥
+  // （同时给会在**模块加载期**抛错），所以这句文案是 errorMap 分派 `invalid_type` 产出的 ——
+  // 断言它在，等于守住了"必填语义没有被降级成通用的类型错误"
+  const missingTypeMessage = typeFields.find((field) => field.path === 'querystring.type')?.message ?? ''
+  assert(
+    missingTypeMessage.includes('必填'),
+    `缺 type 的文案应说明"必填"，实际：${missingTypeMessage}`,
+  )
+
+  const badType = await app.inject({ method: 'GET', url: '/api/models/available?type=chat' })
+  assertEqual(badType.statusCode, 400, 'type 大小写敏感（枚举是大写）')
+  const badTypeMessage =
+    (badType.json().data?.fields ?? []).find((field) => field.path === 'querystring.type')?.message ?? ''
+  assert(
+    badTypeMessage.includes('CHAT/EMBEDDING'),
+    `大小写写错时应提示合法取值，实际：${badTypeMessage}`,
+  )
+
+  // schema 通过后才轮到鉴权：401 说明这条路由**真的走到了自己的 preHandler**
+  // （若被 `/api/models/:id` 吞掉，这里会是 400「模型 ID 不是合法 UUID」）
+  const anonymousAvailable = await app.inject({ method: 'GET', url: '/api/models/available?type=CHAT' })
+  assertEqual(anonymousAvailable.statusCode, 401, 'available 匿名状态码')
+  assertEqual(anonymousAvailable.json().code, 'UNAUTHORIZED', 'available 匿名错误码')
+
+  const anonymousManage = await app.inject({ method: 'GET', url: '/api/models' })
+  assertEqual(anonymousManage.statusCode, 401, '管理列表匿名状态码（校验通过后落到鉴权）')
+
+  // GET 未注册在 `:id` 上 → 404 兜底（而不是被 PATCH/DELETE 的 schema 误判成 400）
+  const noSingleGet = await app.inject({
+    method: 'GET',
+    url: '/api/models/01a0c289-6738-715c-a10c-ef95c1286bf9',
+  })
+  assertEqual(noSingleGet.statusCode, 404, 'GET 单条模型状态码')
+  assertEqual(noSingleGet.json().code, 'NOT_FOUND', 'GET 单条模型错误码')
+})
+
+await it('shared 模型契约：type 必填 / 型号名与别名纪律 / maxContext 三态 / 分页过滤', () => {
+  // `available` 的 type 必填：它的唯一用途是填"选模型"的下拉，而对话模型与向量模型不可互换
+  const noType = listAvailableModelsQuerySchema.safeParse({})
+  assertEqual(noType.success, false, 'available 必须要求 type')
+  assertEqual(listAvailableModelsQuerySchema.safeParse({ type: 'CHAT' }).success, true, 'CHAT 合法')
+  assertEqual(
+    listAvailableModelsQuerySchema.safeParse({ type: 'EMBEDDING' }).success,
+    true,
+    'EMBEDDING 合法',
+  )
+
+  // 管理列表：默认值 + `enabled` 从查询串转布尔（`?enabled=false` 是字符串 "false"）
+  const pageDefaults = listModelsQuerySchema.parse({})
+  assertEqual(pageDefaults.offset, 0, 'offset 默认值')
+  assertEqual(pageDefaults.limit, 20, 'limit 默认值应与其它列表一致')
+  assertEqual(listModelsQuerySchema.parse({ enabled: 'true' }).enabled, true, 'enabled=true 应转布尔')
+  assertEqual(listModelsQuerySchema.parse({ enabled: 'false' }).enabled, false, 'enabled=false 应转布尔')
+  assertEqual(listModelsQuerySchema.safeParse({ enabled: '1' }).success, false, 'enabled 只认 true/false')
+  assertEqual(listModelsQuerySchema.safeParse({ providerId: 'not-a-uuid' }).success, false, 'providerId 要 UUID')
+  assertEqual(listModelsQuerySchema.safeParse({ limit: 101 }).success, false, 'limit 上限 100')
+
+  // 建模型：型号名 trim + 拒内部空白；别名可中文；maxContext 边界
+  const named = createModelBodySchema.safeParse({
+    providerId: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    modelName: '  gpt-4o-mini\n',
+    label: '  小钢炮  ',
+    type: 'CHAT',
+  })
+  assertEqual(named.success, true, '合法建模型请求应通过')
+  assertEqual(named.data?.modelName, 'gpt-4o-mini', '型号名应 trim（粘贴常带空格/换行）')
+  assertEqual(named.data?.label, '小钢炮', '别名应 trim（可中文）')
+  // 默认值走服务层而不是 schema：`supportsVision`/`enabled` 缺席时必须是 `undefined`，
+  // 否则服务层没法区分"调用方没给"与"调用方给了 false"
+  assertEqual(named.data?.supportsVision, undefined, 'supportsVision 缺席应保持 undefined')
+  assertEqual(named.data?.enabled, undefined, 'enabled 缺席应保持 undefined')
+  assertEqual(named.data?.maxContext, undefined, 'maxContext 缺席应保持 undefined')
+
+  const base = { providerId: '01a0c289-6738-715c-a10c-ef95c1286bf9', label: 'x', type: 'CHAT' }
+  assertEqual(
+    createModelBodySchema.safeParse({ ...base, modelName: 'gpt 4o' }).success,
+    false,
+    '型号名不得含空格（上游 model id 不含空格，放行只会把错误推迟到调上游时）',
+  )
+  assertEqual(createModelBodySchema.safeParse({ ...base, modelName: '' }).success, false, '型号名不得为空')
+  assertEqual(createModelBodySchema.safeParse({ ...base, modelName: 'a'.repeat(129) }).success, false, '型号名 128 上限')
+  assertEqual(createModelBodySchema.safeParse({ ...base, modelName: 'm', maxContext: 0 }).success, false, 'maxContext 至少 1')
+  assertEqual(
+    createModelBodySchema.safeParse({ ...base, modelName: 'm', maxContext: 10_000_001 }).success,
+    false,
+    'maxContext 上限',
+  )
+  assertEqual(
+    createModelBodySchema.safeParse({ ...base, modelName: 'm', maxContext: 128_000 }).data?.maxContext,
+    128_000,
+    'maxContext 正常值应保留',
+  )
+})
+
+await it('shared 模型契约：PATCH 的 maxContext 三态 + 空改动被拒 + 多余键不会静默通过', () => {
+  assertEqual(updateModelBodySchema.safeParse({}).success, false, '空改动应被拒（至少一个字段）')
+  // 三态：缺席 = 不动（`undefined`）、`null` = 清空。二者的区分是这一层的核心职责
+  const untouched = updateModelBodySchema.safeParse({ label: '改个名' })
+  assertEqual(untouched.success, true, '只改别名合法')
+  assertEqual(untouched.data?.maxContext, undefined, '不带 maxContext 时应保持 undefined（= 不动）')
+  const cleared = updateModelBodySchema.safeParse({ maxContext: null })
+  assertEqual(cleared.success, true, 'maxContext=null 是"清空"，算一次合法改动')
+  assertEqual(cleared.data?.maxContext, null, 'maxContext=null 必须原样保留')
+  assertEqual(
+    updateModelBodySchema.safeParse({ maxContext: 4096 }).data?.maxContext,
+    4096,
+    'maxContext 数字应保留',
+  )
+
+  // `providerId` 在契约里（为的是能把"想迁移"这种无效意图变成显式 409，而不是被静默剥掉）
+  assertEqual(
+    updateModelBodySchema.safeParse({ providerId: '01a0c289-6738-715c-a10c-ef95c1286bf9' }).success,
+    true,
+    'providerId 应在契约内（值不同时由服务层 409）',
+  )
+
+  // 与 `providerId` 相反：**完全不存在**的键会被 zod 剥掉，剥完等于没给字段 → 被 refine 拒掉。
+  // 这条断言把"静默 no-op"钉死：`{"foo": 1}` 不会返回 200 让人以为改成功了
+  assertEqual(updateModelBodySchema.safeParse({ foo: 1 }).success, false, '未知键不该静默通过')
+})
+
+await it('shared 模型两套投影：键集合互不串味（管理面有 agentCount，可选面不该有）', () => {
+  const now = new Date().toISOString()
+  const item = {
+    id: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    providerId: '01a0c289-6738-715c-a10c-ef95c1286bf8',
+    providerName: 'OpenAI',
+    providerEnabled: true,
+    modelName: 'gpt-4o-mini',
+    label: '小钢炮',
+    type: 'CHAT',
+    maxContext: 128_000,
+    supportsVision: true,
+    enabled: true,
+    agentCount: 2,
+    createdAt: now,
+    updatedAt: now,
+  }
+  assertEqual(modelItemSchema.safeParse(item).success, true, '管理投影 schema')
+  assertEqual(
+    modelItemSchema.safeParse({ ...item, maxContext: null }).success,
+    true,
+    'maxContext 可为 null（未填写）',
+  )
+  assertEqual(modelItemSchema.safeParse({ ...item, type: 'EMBEDDING' }).success, true, 'EMBEDDING 合法')
+
+  const option = {
+    id: item.id,
+    providerId: item.providerId,
+    providerName: item.providerName,
+    modelName: item.modelName,
+    label: item.label,
+    type: 'CHAT',
+    maxContext: 128_000,
+    supportsVision: true,
+  }
+  assertEqual(modelOptionSchema.safeParse(option).success, true, '可选投影 schema')
+  // 可选投影**故意**不含 enabled：按定义只含"能选的"，再下发一个恒为 true 的字段
+  // 只会诱使前端写 `if (option.enabled)` 这种永远为真的分支
+  const optionKeys = Object.keys(modelOptionSchema.shape)
+  for (const forbidden of ['enabled', 'agentCount', 'createdAt', 'updatedAt']) {
+    assert(!optionKeys.includes(forbidden), `可选投影不得含 ${forbidden}，实际键：${optionKeys.join(',')}`)
+  }
+  // 两套投影必须真的不同（否则"拆两条路径"就白拆了）
+  const itemKeys = Object.keys(modelItemSchema.shape)
+  assert(itemKeys.includes('agentCount'), `管理投影应含 agentCount，实际：${itemKeys.join(',')}`)
+  assert(itemKeys.includes('providerEnabled'), `管理投影应含 providerEnabled，实际：${itemKeys.join(',')}`)
+
+  assertEqual(
+    modelOptionListResultSchema.safeParse({ items: [option] }).success,
+    true,
+    '可选列表响应形态',
+  )
+  assertEqual(
+    offsetPageOf(modelItemSchema).safeParse({ items: [item], total: 1, offset: 0, limit: 20 }).success,
+    true,
+    '管理列表分页形态',
   )
 })
 

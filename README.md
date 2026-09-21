@@ -84,32 +84,37 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
-pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（38 项）
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（42 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
 pnpm verify:auth       # 认证接口验收：登录/改密/限速/首登闸门，**需要真实 PG + Redis**（21 项）
 pnpm verify:users      # 用户管理验收：权限/建号/启停改角色/重置密码，**需要真实 PG + Redis**（17 项）
 pnpm verify:e2e        # 端到端验收：起真实进程 + 真实 HTTP 跑六条门槛，**需要真实 PG + Redis**（17 项）
 pnpm verify:model-providers  # 模型池 Provider 验收：Key 加密/读脱敏/三态/删除守卫，**需要真实 PG + Redis**（18 项）
+pnpm verify:models     # 模型管理验收：两套投影/可选列表过滤/六条守卫，**需要真实 PG + Redis**（17 项）
 ```
 
 > `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、领域错误、
 > 未知异常不泄露内部信息、404 兜底、413/415、CORS 预检、requestId 透传，以及
 > P0-1-6 的密文往返/篡改检出、bcrypt 形态、初始密码生成、未登录出口，P0-1-7 的
-> `/api/auth/*` 注册与 schema 字段明细、首登闸门不误拦匿名请求，P0-1-7/8/10 的
-> shared 契约纯函数（认证 / 用户管理 / 模型池三套 schema，含 `maskApiKey` 的边界与
-> **Provider 输出形态的键级自检**：不得出现 `apiKey` 或任何带 `enc` 的键）。
+> `/api/auth/*` 注册与 schema 字段明细、首登闸门不误拦匿名请求，P0-1-7/8/10/11 的
+> shared 契约纯函数（认证 / 用户管理 / 模型池四套 schema，含 `maskApiKey` 的边界、
+> **Provider 输出形态的键级自检**：不得出现 `apiKey` 或任何带 `enc` 的键，
+> 以及**模型两套投影的键集合互不串味**：可选项不得含 `enabled`/`agentCount`/时间戳）。
+> P0-1-11 另有一条**路由分流**断言：`GET /api/models` 与 `GET /api/models/available`
+> 各自是真路由、且 `GET /api/models/:id` **不存在**（同路径两个 GET 会让 Fastify 在
+> 启动期就抛 `FST_ERR_DUPLICATED_ROUTE`）。
 > 无依赖环境（如 CI）加 `EXPECT_DEGRADED=1`，额外断言"依赖不可达时探活逐项降级"
 > 与"会话存储不可用时鉴权**失败关闭**（500，绝不放行）"。
 >
 > `pnpm verify:session` / `verify:auth` / `verify:users` / `verify:e2e` / `verify:model-providers`
-> 是**必须**先起依赖 + 迁移的五档
+> / `verify:models` 是**必须**先起依赖 + 迁移的**六档**
 > （`pnpm infra:up && pnpm db:deploy`），因为验的正是"真实 Redis/PG 上的行为"：
 > 会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
 > 四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、以及
@@ -117,7 +122,10 @@ pnpm verify:model-providers  # 模型池 Provider 验收：Key 加密/读脱敏/
 > **停用后该用户已有会话下一个请求就 401**、**不能停用/降级/重置自己**）；
 > 端到端（`docs/06` P0-1-9 的**六条门槛**：种子脚本 3 条 + 门槛 1~6 + 登出 + 自清理复核）；
 > 模型池 Provider（**Key 不回显明文**的三层取证：响应层搜不到明文/密文、存储层是
-> `v1.<iv>.<tag>.<ct>` 且能用 AAD 解回原文、绑定层换 id 即解不开；外加 PATCH 三态与两条 409 守卫）。
+> `v1.<iv>.<tag>.<ct>` 且能用 AAD 解回原文、绑定层换 id 即解不开；外加 PATCH 三态与两条 409 守卫）；
+> 模型管理（**两套投影**：管理列表看得见停用项、可选列表只含"能用的"；`?type=` 过滤、
+> **Provider 停用后模型也不可选**、`maxContext` 三态与六条守卫，其中"删被引用的模型"特意用了
+> **软删的 Agent** —— 它照样占 RESTRICT 外键）。
 > 五个脚本都自造临时数据并在收尾时删净（含 Redis 键），跑完还会**断言**残留为零，不会污染开发库。
 > 看细节日志：`LOG_LEVEL=debug pnpm verify:users`。
 >
@@ -220,6 +228,11 @@ curl -s --noproxy '*' http://127.0.0.1:13000/health | jq .
 | `POST /api/model-providers` | 新建 Provider `{name, baseUrl, type, enabled?, apiKey?}`（仅 ADMIN；`apiKey` 立即加密落库） |
 | `PATCH /api/model-providers/:id` | 部分更新；`apiKey` 三态：**不带=不动 / `null`=清空 / 有值=写入**（空串 400） |
 | `DELETE /api/model-providers/:id` | 删除（级联删其下模型；有模型被 Agent 引用时 409） |
+| `GET /api/models` | 模型列表 `?offset=&limit=&type=&providerId=&enabled=`（仅 ADMIN；含停用项） |
+| `POST /api/models` | 新建模型 `{providerId, modelName, label, type, maxContext?, supportsVision?, enabled?}`（仅 ADMIN） |
+| `PATCH /api/models/:id` | 部分更新；`maxContext` 三态：**不带=不动 / `null`=清空 / 数字=设置**；`providerId` 不可改 |
+| `DELETE /api/models/:id` | 删除（被 Agent 引用时 409；**软删的 Agent 也算**） |
+| `GET /api/models/available` | **全员可选模型列表** `?type=CHAT`（登录即可；只回"能用的"，给建智能体的下拉用） |
 | 其余 `/api/**` | P0-1-10 起逐个落地（未注册路由得到统一信封 404）。数据模型（P0-1-5 ✅）、会话（P0-1-6 ✅）、认证（P0-1-7 ✅）、用户管理（P0-1-8 ✅）、**种子脚本 + 端到端验收（P0-1-9 ✅）** 已就位 |
 
 ### 起前端（⚠️ 目前只有骨架页，**没有登录页**）
@@ -278,10 +291,43 @@ for i in 1 2 3 4 5 6; do curl -s --noproxy '*' -o /tmp/b.json -w "%{http_code} "
 **该看到什么**：① 200 + `mustChangePassword: true`；② 403（闸门文案）；③ 200 + `mustChangePassword: false`；
 ④ 200 + `initialPassword`（18 字符、无易混字符）；⑥ 401 + 「账号已停用」；⑦ 前 5 次 401 通用文案、第 6 次 429。
 
-**已知边界（别当 bug）**：① 目前只有 `/api/auth/*` 与 `/api/users` 两组接口，**没有 MEMBER 可用的业务接口**
-（`/api/agents` 是 E 包）—— 所以"改密后能正常用"用 403 文案的变化来验（改密前是闸门、改密后是权限）；
+#### 附：模型池（P0-1-10 Provider / P0-1-11 模型）
+
+```bash
+# ⓪ 先拿一个"非首登态"的 MEMBER 会话（种子账号 member 也是首登态，会被闸门拦 —— 需先自助改密）
+curl -s --noproxy '*' -c /tmp/member.jar -X POST $BASE/api/auth/login \
+  -H 'content-type: application/json' -d '{"username":"member","password":"<member的初始密码>"}' > /dev/null
+curl -s --noproxy '*' -b /tmp/member.jar -X POST $BASE/api/auth/password \
+  -H 'content-type: application/json' \
+  -d '{"oldPassword":"<member的初始密码>","newPassword":"<member的新密码>"}' | jq .
+
+# ① 建一个带 Key 的 Provider → 响应里只有掩码，**没有明文**
+curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/model-providers \
+  -H 'content-type: application/json' \
+  -d '{"name":"OpenAI","baseUrl":"https://api.openai.com/v1","type":"CHAT","apiKey":"sk-proj-abcdefghijklmnop"}' | jq .
+#  → apiKeyPreview 形如 "sk-****mnop"，hasKey:true（明文只进不出）
+
+# ② 在它下面建一个模型
+curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/models \
+  -H 'content-type: application/json' \
+  -d '{"providerId":"<①的id>","modelName":"gpt-4o-mini","label":"小钢炮","type":"CHAT","maxContext":128000}' | jq .
+
+# ③ 全员可选列表（MEMBER 会话也能读；用 ADMIN 会话打同一地址，结果必须一模一样）
+curl -s --noproxy '*' -b /tmp/member.jar "$BASE/api/models/available?type=CHAT" | jq .
+#  → 只含 enabled 且 Provider 也 enabled 的模型；缺 ?type= 会得到 400（type 必填）
+
+# ④ 停用那个模型 → 立刻从 ③ 消失，但管理列表里还看得见（两套投影的差别）
+curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/models/<②的id> \
+  -H 'content-type: application/json' -d '{"enabled":false}' | jq .
+curl -s --noproxy '*' -b /tmp/jar "$BASE/api/models?limit=100" | jq '.data.items[] | {modelName, enabled}'
+```
+
+**已知边界（别当 bug）**：① 接口只有三组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
+（`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员）。
+**"MEMBER 能用的业务接口"目前只有 `/api/models/available`** —— `/api/agents` 是 E 包，
+所以"改密后能正常用"仍主要靠 403 文案的变化来验（改密前是闸门、改密后是权限）；
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
-③ **端测完请复位**（走查会把 admin 的密码改掉）：
+③ **端测完请复位**（走查会把 admin 的密码改掉、也会往模型池留下你建的 Provider，删掉即可）：
 `SEED_RESET_PASSWORD=1 pnpm db:seed` 把两个种子账号打回首登态并恢复成你指定的密码。
 
 > 想一条命令跑完上面全部 + 六条门槛的自动版：`pnpm verify:e2e`（它自己起进程、自己造号、跑完删净）。
@@ -326,6 +372,7 @@ for i in 1 2 3 4 5 6; do curl -s --noproxy '*' -o /tmp/b.json -w "%{http_code} "
 | `issue_fix/问题记录-P0-1-7-认证接口.md` | **「不泄露账号是否存在」必须看耗时**（光对齐文案不够）、停用账号的报错时机（密码错 vs 密码对）、限速的三个顺序细节（判定在前 / 锁不续期 / 成功即清）、首登闸门挂根级 `preHandler` 且不依附 `requireAuth`、改密后必须主动失效快照缓存、**Prisma 函数型默认值不在 DB 层**（手工 INSERT 要给 id 与 updated_at）、verify 脚本要先构建 `shared` |
 | `issue_fix/问题记录-P0-1-8-用户管理接口.md` | **「响应体不含密码」的检查要分两层**（值/哈希 vs 键名，混在一起会让正确实现被判失败）、**重置密码必须清登录失败计数**、Prisma 唯一冲突要"先查 + catch"且用错误码而不是 `instanceof`、分页的稳定排序与 `total` 同快照、**「不能操作自己」放服务层**及其边界（含重置自己）、首登闸门会拦住首登态的 admin 调 `/api/users`、建号返回 200 而非 201 |
 | `issue_fix/问题记录-macOS环境适配.md` | 启停脚本补 `.sh` + 跨平台入口、**宿主端口被另一项目占用→改 `.env` 避让**、**bash 3.2 把中文并进变量名**、corepack 取 pnpm |
+| `issue_fix/问题记录-P0-1-11-模型管理.md` | **`06` 的坑预判只对了一半**（同路径两个 GET 是**注册期** `FST_ERR_DUPLICATED_ROUTE`，而静态段优先根本不是问题 → 真正的约束是"必须拆路径"）、**两套投影要按"用途"而不是按"角色"分**（按角色会让 ADMIN 的模型下拉看到停用模型，违反自家验收门槛）、zod v3 的 **`required_error` 与 `errorMap` 互斥且在模块加载期抛错**（typecheck 查不出来）、`available` 的 `type` 必填（否则 CHAT 模型会静默流进向量库）、**Provider 停用 ⇒ 其模型也不可选**（只筛 `models.enabled` 会给出"能建 Agent 一发消息就失败"的模型）、`providerId` 放进 PATCH 契约是为了把静默 no-op 变成显式 409、`model_name` 拒内部空白（上游 model id 不含空格）、`@@unique` 含 `type` ⇒ 同名不同 type 必须放行、清理段用 `deleteMany` 而不是 `delete`（空删会往日志丢 P2025 把断言冲掉） |
 | `issue_fix/问题记录-P0-1-10-模型池Provider管理.md` | **AAD 绑定到 `id` 会让加密依赖 `id`** → 建 Provider 必须用事务（先落行拿 id 再加密），否则失败重试会留下"建好了但没 Key"的行、而且调用方还会再建一个；**解密失败不能掀桌**（预览降级 `****`，否则主密钥一换列表整页 500，连"哪个 Key 坏了"都看不到）；三态的实现落点（`.nullable().optional()` **不加 default**）；**最强验收是"密文逐字不变"**（能抓出"每次 PATCH 都重写 Key"）；`ON DELETE RESTRICT` 让"删 Provider"必须前置检查、且**软删的 Agent 仍占外键**；`baseUrl` 去尾斜杠 + 只允许 http(s)（SSRF 面）；改 type 与硬删的取舍；`maskApiKey` 的断言别拿"字符集不相交"去写（分隔符会误报） |
 | `issue_fix/问题记录-P0-1-9-认证与用户验收.md` | **种子脚本的「幂等」是安全属性**（默认绝不覆盖密码，否则改过密码的人下次 seed 后登录不上）、种子脚本的 console 是交付通道而非日志（需 ESLint 例外）、`prisma/seed.ts` 会被编译进 dist 的两面性、**「端到端」的关键是换掉传输层**（spawn 真实进程 + 真实 HTTP）、子进程端口先探再用、`UID` 是 shell 只读变量、`fetch` 要多条 `Set-Cookie` 必须用 `getSetCookie()`、**「跑完干净」要写成断言**、门槛 3 的「业务 API」本仓还没有（用 403 文案区分闸门 vs 权限）、手工走查会留下不可用状态（收尾必须 seed 复位） |
 
@@ -385,7 +432,8 @@ doubuleA/
 ├── shared/                        ← @doubulea/shared：zod schema + 类型 + 错误码（编译期依赖）
 │   └── src/                       ← errors.ts + envelope.ts（P0-1-3 ✅）+ auth.ts（P0-1-7 ✅）
 │                                     + user.ts（用户管理契约，P0-1-8 ✅）
-│                                     + modelProvider.ts（模型池契约，P0-1-10 ✅）
+│                                     + modelProvider.ts（Provider 契约，P0-1-10 ✅）
+│                                     + model.ts（模型契约 + 两套投影，P0-1-11 ✅）
 ├── backend/                       ← @doubulea/backend（独立构建，→ backend/dist）
 │   ├── prisma/schema.prisma       ← 7 张表 + 7 个枚举（P0-1-5 ✅）
 │   ├── prisma/seed.ts             ← 种子脚本：第一个 admin（首登改密态）+ member（P0-1-9 ✅）
@@ -403,15 +451,18 @@ doubuleA/
 │   │   ├── routes/auth.ts         ← /api/auth/* 四端点（P0-1-7 ✅）
 │   │   ├── routes/users.ts        ← /api/users/* 四端点，仅 ADMIN（P0-1-8 ✅）
 │   │   ├── routes/modelProviders.ts ← /api/model-providers/* 四端点，仅 ADMIN（P0-1-10 ✅）
+│   │   ├── routes/models.ts       ← /api/models/* 四端点（仅 ADMIN）+ /available（登录即可）（P0-1-11 ✅）
 │   │   ├── services/auth.service.ts ← 登录（含限速）/ 改密（P0-1-7 ✅）
 │   │   ├── services/user.service.ts ← 列表 / 建号 / 启停改角色 / 重置密码（P0-1-8 ✅）
 │   │   ├── services/model.service.ts ← Provider CRUD + Key 加密/AAD 绑定/掩码（P0-1-10 ✅）
+│   │                                  + 模型 CRUD + 三套守卫 + 两套投影（P0-1-11 ✅）
 │   │   └── infra/                 ← logger.ts（P0-1-3 ✅）+ pg/redis/s3.ts（P0-1-4 ✅）
 │   │                                + prisma.ts（客户端单例，P0-1-5 ✅）
 │   │                                + crypto.ts（AES-256-GCM + bcrypt，P0-1-6 ✅）
 │   └── scripts/                   ← verify-app.mjs（不占端口）+ verify-db.mjs（真实 PG）
 │                                     + verify-session.mjs / verify-auth.mjs / verify-users.mjs（真实 PG+Redis）
-│                                     + verify-model-providers.mjs（真实 PG+Redis）+ verify-e2e.mjs（自起进程）
+│                                     + verify-model-providers.mjs / verify-models.mjs（真实 PG+Redis）
+│                                     + verify-e2e.mjs（自起真实进程）
 ├── frontend/                      ← @doubulea/frontend（独立构建，→ frontend/dist 纯静态）
 ├── infra/                         ← docker-compose + 自建 PG 镜像 + 启停脚本（P0-1-2 ✅）
 │   ├── docker-compose.yml         ← postgres / redis / minio
@@ -452,3 +503,4 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-9 完成（包 B 收口）—— 🎯 第一个「人工端测」里程碑达成**：`backend/prisma/seed.ts`（**幂等种子脚本**：第一个 admin（首登改密态）+ member；默认绝不覆盖密码，`SEED_RESET_PASSWORD=1` 才重置；初始密码只打印一次）、`backend/scripts/verify-e2e.mjs`（**自己 spawn 真实后端进程 + 真实 HTTP + 手写 Cookie 罐**，默认端口 13099，跑完自清理并断言残留为零）、新增 `pnpm db:seed` 与 `pnpm verify:e2e`。**验收**：`verify:e2e` **17 项全通过**（六条门槛逐条取证）+ **真机 curl 14 步走查**（首登闸门 → 改密 → 建号 → 初始密码登录 → 停用即失效 → 第 6 次 429 → MEMBER 403 → 登出），`verify:app` 33/34 项、`verify:session` 13、`verify:auth` 21、`verify:users` 17、`verify:db` 17 **全部未回归**；**零新增依赖**；种子变量以注释块进 `infra/.env.example` 的 `[G]` 段（不进 AppConfig）；README 新增「手工端测」小节（可照抄的 curl 步骤 + 该看到什么 + 已知边界 + 跑完复位）；新增缺陷归档 `issue_fix/问题记录-P0-1-9-认证与用户验收.md` |
 | 2026-09-21 | — | **P0-1-9 补（文档/注释，用户端测时发现）**：① `backend/src/index.ts` 启动信封的 `step` **连漏三批**没跟（P0-1-7/8/9 都报「P0-1-6」）→ 改为 `P0-1-9 认证与用户验收` + 写"每批必改"注释，并把这条写进 `docs/06` §六 **第 26 条施工纪律**；② 新增 README「**起前端**」小节：明确前端现在**只有 P0-1-1 占位页、没有登录页**，给出启动命令（`VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend` → 5174）与"怎么验证代理没串到陌生服务"；③ `vite.config.ts` 给 `/api` 代理的默认值（`localhost:3000` = 别人项目的 node）加显式警告注释；④ `docs/06` §七 待决事项 6 补同上口径 |
 | 2026-09-21 | — | **P0-1-10 完成（包 C 起步）**：模型池 Provider 管理 —— `shared/src/modelProvider.ts`（`MODEL_TYPES` / `maskApiKey` / 三段 schema）、`backend/src/services/model.service.ts`（**Key 写入即 AES-256-GCM 加密、AAD 绑定到 `id`**；读接口只出口 `hasKey` + `apiKeyPreview` 掩码；PATCH 三态；删除与改 type 的两条 409 守卫）、`backend/src/routes/modelProviders.ts` + `app.ts` 接线。`pnpm verify:app` 扩到 **38 项**（CI 模式 39 项），新增 **`pnpm verify:model-providers`（18 项，需 PG+Redis）**；`verify:db`/`session`/`auth`/`users`/`e2e` 全部未回归；**零新增依赖、零新增环境变量**；`docs/02` 新增 **§10.2 Provider Key 存储口径**；新增缺陷归档 `issue_fix/问题记录-P0-1-10-模型池Provider管理.md` |
+| 2026-09-21 | — | **P0-1-11 完成（包 C 继续）**：模型管理 —— `shared/src/model.ts`（`ModelItem`/`ModelOption` **两套投影** + 四段 schema）、`backend/src/services/model.service.ts`（模型 CRUD + 三条守卫）、`backend/src/routes/models.ts`（`GET /api/models` 仅 ADMIN + `GET /api/models/available` 登录即可 + POST/PATCH/DELETE）+ `app.ts` 接线。`pnpm verify:app` 扩到 **42 项**（CI 模式 43 项），新增 **`pnpm verify:models`（17 项，需 PG+Redis）**；`verify:db/session/auth/users/model-providers/e2e` 全部未回归；**零新增依赖、零新增环境变量**；路由表订正：`GET /api/models?type=CHAT` → `GET /api/models/available?type=CHAT`（`03` §116 同步）；新增缺陷归档 `issue_fix/问题记录-P0-1-11-模型管理.md` |
