@@ -9,14 +9,22 @@
 
 ## 一、快速开始
 
-本机为 Windows + Git Bash（**缺 coreutils**，不要依赖 shell 工具链）。pnpm 经 corepack 提供，**必须用系统 node 启动**（受管 node 下 pnpm shim 失效）：
+> **环境有两套，同一仓库通用**（命令除注明外两平台一致）：
+>
+> | 平台 | pnpm 来源 | 启停脚本 |
+> |------|-----------|----------|
+> | Windows + Git Bash | corepack 提供，**必须用系统 node 启动**（受管 node 下 pnpm shim 失效） | `infra/scripts/dev-*.ps1` |
+> | macOS / Linux | 同样 corepack 提供：`corepack enable pnpm` 后 `pnpm` 直接可用 | `infra/scripts/dev-*.sh` |
+>
+> `pnpm infra:up` / `pnpm infra:down` 经 `infra/scripts/infra.mjs` **自动按平台选脚本**，
+> 故下方命令不必记平台；也可直接调对应平台的脚本。
 
 ```bash
 # 安装依赖（三包一次装齐）
-"E:/software/nodejs/node.exe" "E:/software/nodejs/node_modules/corepack/dist/pnpm.js" install
+pnpm install
 
 # 全量构建（三包依次产出 dist）
-... install 后可用 pnpm 直连：pnpm -r build
+pnpm -r build
 
 # 单独构建（独立构建/独立部署能力的地基，见 docs/06 §二·补）
 pnpm --filter @doubulea/shared   build
@@ -24,32 +32,37 @@ pnpm --filter @doubulea/backend  build     # → backend/dist
 pnpm --filter @doubulea/frontend build     # → frontend/dist（纯静态）
 ```
 
-> 后续步骤（P0-1-3 起）的前端/后端 dev 命令同上；本机脚本一律走 Node / PowerShell。
+> 后续步骤（P0-1-3 起）的前端/后端 dev 命令同上；本机脚本一律走 Node / 平台原生脚本。
 
 ### 起依赖服务（postgres / redis / minio）
 
-```powershell
-# 一键：构建自建 PG 镜像 → 拉起三服务 → 等健康 → 自动验收扩展
-powershell -ExecutionPolicy Bypass -File infra/scripts/dev-up.ps1
-
-# 或走根脚本（等价）
+```bash
+# 一键：构建自建 PG 镜像 → 拉起三服务 → 等健康 → 自动验收扩展（跨平台）
 pnpm infra:up
 
+# 等价写法：
+#   Windows  powershell -ExecutionPolicy Bypass -File infra/scripts/dev-up.ps1
+#   macOS    bash infra/scripts/dev-up.sh
+
 # 停服（保留数据卷）
-powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1      # 或 pnpm infra:down
+pnpm infra:down            # 或 dev-down.ps1 / dev-down.sh
 
 # 停服并删除数据卷（⚠️ 数据全丢）
-powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1 -Purge
+pnpm infra:down -- --purge
 ```
 
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| PostgreSQL | `127.0.0.1:5432` | 自建镜像 `doubulea/postgres:pg16-vector-bigm`（pgvector + pg_bigm） |
-| Redis | `127.0.0.1:6379` | AOF everysec（重启不丢队列与锁） |
-| MinIO API | `127.0.0.1:9000` | S3 兼容 |
-| MinIO 控制台 | http://127.0.0.1:9001 | 账号见 `infra/.env` |
+| PostgreSQL | `127.0.0.1:15432` | 自建镜像 `doubulea/postgres:pg16-vector-bigm`（pgvector + pg_bigm） |
+| Redis | `127.0.0.1:16379` | AOF everysec（重启不丢队列与锁） |
+| MinIO API | `127.0.0.1:19000` | S3 兼容 |
+| MinIO 控制台 | http://127.0.0.1:19001 | 账号见 `infra/.env` |
 
-> **首次使用**先 `Copy-Item infra/.env.example infra/.env`，并填入 `CREDENTIAL_MASTER_KEY`
+> ⚠️ **端口以 `infra/.env` 为准，上表是当前本机的实际值**。macOS 本机 5432/6379/9000/9001
+> 已被另一项目（`apitest-server`）的容器占用，故整组后移到 1xxxx；compose 文件里端口本就是
+> `宿主端口 ← 环境变量`，冲突时只改 `.env`，**不要动 compose，也不要停别人的容器**。
+
+> **首次使用**先 `cp infra/.env.example infra/.env`（Windows：`Copy-Item`），并填入 `CREDENTIAL_MASTER_KEY`
 > （生成：`node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`）。
 > 单独只跑 PG 扩展验收：`pnpm infra:verify`（12 项检查，含 `bigm_similarity` 中文相似度）。
 
@@ -84,6 +97,7 @@ powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1 -Purge
 |------|------|
 | `issue_fix/问题记录-P0-1-1-环境与链接.md` | pnpm 不读 `.npmrc`、构建白名单键名、**目录符号链接静默失败**、`clean` 自递归、tsc 产物污染源码 |
 | `issue_fix/问题记录-P0-1-2-基础设施与镜像.md` | **pg_bigm 无二进制包**、tag 日期后缀、Docker 加速器 403、**PS 5.1 的 `{{}}` 与 `.ps1` 编码坑**、`psql` 多语句/临时表坑 |
+| `issue_fix/问题记录-macOS环境适配.md` | 启停脚本补 `.sh` + 跨平台入口、**宿主端口被另一项目占用→改 `.env` 避让**、**bash 3.2 把中文并进变量名**、corepack 取 pnpm |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 
@@ -146,7 +160,7 @@ doubuleA/
 │   ├── postgres/Dockerfile        ← pgvector + 源码编译 pg_bigm
 │   ├── postgres/initdb/           ← 空卷首次初始化时自动建扩展
 │   ├── .env.example  .env         ← 变量模板 / 本机（gitignore）
-│   └── scripts/                   ← dev-up.ps1 / dev-down.ps1 / pg-verify.mjs
+│   └── scripts/                   ← dev-up/down.{ps1,sh} + infra.mjs(跨平台入口) + pg-verify.mjs
 ├── package.json                   ← 仅编排，不装业务依赖
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json             ← strict 收敛 + 路径别名
