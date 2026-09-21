@@ -8,6 +8,14 @@ build/
 *.tsbuildinfo
 .vite/
 
+# 编译残留防护：tsc 若因 rootDir/outDir 配错而把产物写回源码目录，这些规则兜底。
+# （P0-1-1 实际发生过：shared/src 下混入 .js/.d.ts，已清理并加此防护）
+**/src/**/*.js
+**/src/**/*.js.map
+**/src/**/*.d.ts
+**/src/**/*.d.ts.map
+!**/src/**/*.d.mts
+
 # ===== 环境变量与密钥（绝不提交）=====
 .env
 .env.local

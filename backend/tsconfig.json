@@ -1,0 +1,19 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    // ⚠️ rootDir 必须是 monorepo 根，不能是 ./src。
+    // 原因：根 tsconfig.base.json 的 paths 把 `@doubulea/shared` 指向 `shared/src/index.ts`，
+    // 该文件会进入本包编译程序；若 rootDir 设为 ./src，会报
+    //   TS6059: File '.../shared/src/index.ts' is not under 'rootDir' '.../backend/src'
+    // 设为 monorepo 根后，产物落 dist/backend/src/**（见 package.json 的 start 脚本）。
+    // 若将来改用「先构建 shared，再由 backend 解析其 dist 类型」的方案，
+    // 可把 rootDir 收回 ./src 并同步调整 start 路径。
+    "rootDir": "../",
+    "outDir": "./dist",
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "node_modules"]
+}

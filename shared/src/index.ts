@@ -1,0 +1,13 @@
+/**
+ * @doubulea/shared — 共享契约层入口
+ *
+ * 定位（`06` §3.0 要点 3）：编译期依赖，构建时内联进 backend / frontend 各自产物，
+ * **运行期不产生耦合** —— 前端可部署到 CDN，后端可部署到内网，互不影响。
+ *
+ * 使用方式：
+ * - 运行时值（schema / 常量 / 类）：`import { ok, AppError, ERROR_CODES } from '@doubulea/shared'`
+ * - 纯类型：`import type { ErrorCode, Envelope } from '@doubulea/shared'`
+ */
+
+export * from './errors.js'
+export * from './envelope.js'

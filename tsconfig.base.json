@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": false,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "baseUrl": ".",
+    // ⚠️ 为什么 `@doubulea/shared` 走 paths 指向**源码**而不是 dist 类型：
+    //
+    // 本机 pnpm 12.4.2 无法创建目录符号链接（Windows 需开发者模式；pnpm 失败时**静默**）
+    // 创建空目录而不报错 —— 实证：fs.symlinkSync(t,'dir') 只会得到一个 0 项空目录。
+    // 后果：backend/node_modules/@doubulea/shared 是空目录，TS 与 Node 都解析不到该包。
+    //
+    // 对策：用 paths 直接把该包指到 shared 源码。TS 因此**不需要任何符号链接**即可解析。
+    // 运行期由 workspace 依赖 + shared/package.json 的 exports 负责。
+    //
+    // 附带好处：编辑 shared 源码后，backend/frontend 的 typecheck 立即反映，无需先构建。
+    // 注意：本 paths 只影响类型解析；**各包的 rootDir 会因此报 TS6059**，
+    //       故 backend/tsconfig.json 必须同时设 `"rootDir": "../"`（让 shared/src 落在 rootDir 内），
+    //       frontend 本就是 noEmit 纯类型检查，无需 rootDir。
+    "paths": {
+      "@doubulea/shared": ["./shared/src/index.ts"],
+      "@doubulea/shared/*": ["./shared/src/*.ts"]
+    }
+  }
+}

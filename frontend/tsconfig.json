@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"],
+    // 前端是纯静态产物，构建由 Vite 负责；tsc 只做类型检查（noEmit），
+    // 故**不能设 rootDir** —— 设了会因为 vite.config.ts 在 src/ 之外而报 TS6059。
+    "noEmit": true,
+    "tsBuildInfoFile": "./node_modules/.cache/.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}
