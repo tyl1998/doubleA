@@ -8,6 +8,10 @@ build/
 *.tsbuildinfo
 .vite/
 
+# Prisma 生成物（`prisma generate` 产出，由 build/typecheck 自动重建）
+# ⚠️ 位置由 backend/prisma/schema.prisma 的 generator.output 决定，改那里要同步这里。
+backend/generated/
+
 # 编译残留防护：tsc 若因 rootDir/outDir 配错而把产物写回源码目录，这些规则兜底。
 # （P0-1-1 实际发生过：shared/src 下混入 .js/.d.ts，已清理并加此防护）
 **/src/**/*.js

@@ -14,6 +14,7 @@ import { config, describeConfig, envFile } from './config.js'
 import { DEFAULT_HOST, buildApp } from './app.js'
 import { logger } from './infra/logger.js'
 import { closePg } from './infra/pg.js'
+import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
 import { ok, type Envelope } from '@doubulea/shared'
 
@@ -70,6 +71,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
   logger.info({ reason }, '开始优雅退出：停止接收新请求')
   try {
     await app.close()
+    // ⚠️ 顺序：Prisma 先于探活池（业务查询收尾不会晚于探活）。
+    //    closePrisma 对「从未创建过客户端」的进程是空操作，因此不引入退出负担。
+    await closePrisma()
     await Promise.all([closePg(), closeRedis()])
     logger.info({ reason }, '依赖连接已关闭，进程退出')
   } catch (error) {
@@ -96,7 +100,7 @@ try {
   const address = await app.listen({ port: config.port, host: DEFAULT_HOST })
   const bootEnvelope: Envelope<{ service: string; step: string; address: string }> = ok({
     service: 'doubulea-backend',
-    step: 'P0-1-4 Fastify 骨架 + /health',
+    step: 'P0-1-5 数据模型第一批 + Prisma 基线',
     address,
   })
   logger.info(

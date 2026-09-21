@@ -33,6 +33,12 @@ strictPeerDependencies: false
 #
 # 现列：
 # - esbuild：vite / tsx 的底层打包器，需 postinstall 落平台二进制。
+# - prisma：CLI 自带 `preinstall`（平台探测）；@prisma/engines 自带 postinstall。
+#   ⚠️ P0-1-5 实测：这两个不登记时 `pnpm add prisma` 直接以
+#      `ERR_PNPM_IGNORED_BUILDS: Ignored build scripts: @prisma/engines@7.10.0, prisma@7.10.0`
+#      失败退出（是错误，不是警告）—— 与 esbuild 同款机制。
 # 后续引入原生依赖（如 onnxruntime-node，P0-1-13）时在此追加。
 allowBuilds:
   esbuild: true
+  prisma: true
+  '@prisma/engines': true

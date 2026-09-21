@@ -44,6 +44,10 @@ jobs:
       - name: lint
         run: pnpm lint
 
+      # ⚠️ typecheck / build 内部会先跑 `prisma generate`（P0-1-5 起 Prisma Client 是构建前置）：
+      #    生成物落 backend/generated/prisma（已 gitignore），故 CI 里必须先有它 tsc 才解析得到。
+      #    刻意**不需要**在这里注入 DATABASE_URL —— `generate` 被列入「不连库命令」白名单
+      #    （backend/prisma.config.ts 里判定），本步在无任何数据库变量的裸环境下实测可跑。
       - name: typecheck
         run: pnpm -r typecheck
 

@@ -1,0 +1,304 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// doubuleA — 数据模型第一批（P0-1-5）
+//
+// 依据：`docs/02-后端设计.md` §三（数据模型核心表）。
+// 本文件只落 §三 的第一批 7 张表；知识库三表（knowledge_bases/documents/chunks）
+// 与 mcp/sandbox/artifact 等表分别在 P0-1-14 及 P0-2/P0-3 批次落。
+//
+// 命名约定：Prisma 侧 camelCase，数据库侧 snake_case（`@map` / `@@map` 逐列映射），
+// 与 `02` §三 的列名逐字对齐 —— 手写 SQL 迁移与 `psql` 排查时不用做心算转换。
+//
+// ⚠️ messages 是**按月分区表**（`02` §三 分区说明），Prisma 没有分区语法，
+//    因此 `prisma/migrations/0001_init/migration.sql` 由 `prisma migrate diff --script`
+//    生成基础 DDL 后**手工改造**（复合主键 + PARTITION BY RANGE + 分区维护函数）。
+//    实测（P0-1-5）：改造后 Prisma 的内省能正确识别分区关系，`migrate dev` 不会
+//    尝试重建它 —— 以后要给 Message 加列，照常改这个模型、照常 `migrate dev` 就行。
+//    细节与反向探针记录见 `issue_fix/问题记录-P0-1-5-数据模型与Prisma基线.md`。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── 生成器 / 数据源 ─────────────────────────────
+
+/// Prisma 7 的 Rust-free 客户端（`prisma-client`，旧的 `prisma-client-js` 将被移除）。
+/// 三个关键点（与仓库工程约定绑定，改动前先读 docs/06 §3.0 与 tsconfig.base.json）：
+///   · `output` 在 v7 是**必填**（不再往 node_modules 里生成），产物落 backend/generated/prisma
+///     （已 gitignore：它是生成物，由 `prisma generate` / `postinstall` 重建）。
+///   · `moduleFormat = "esm"` + `importFileExtension = "js"`：本仓库是 `"type": "module"`
+///     + tsc 编译（不是打包器），生成码内部的相对导入必须带 `.js` 后缀，否则运行期
+///     `ERR_MODULE_NOT_FOUND`（与 src 里「相对导入一律写 .js」是同一条约定）。
+///   · `generatedFileExtension = "ts"`：生成 TS 源码，由本包 tsc 一并编译进 dist。
+generator client {
+  provider               = "prisma-client"
+  output                 = "../generated/prisma"
+  runtime                = "nodejs"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+/// 连接串不写在这里：Prisma 7 起改由 `prisma.config.ts` 提供（v7 迁移指南明确
+/// datasource 的 `url`/`directUrl`/`shadowDatabaseUrl` 字段已废弃）。
+/// 这样「迁移用哪个库」与「应用配置」解耦 —— `prisma migrate` 只需要 DATABASE_URL，
+/// 不需要 S3 / embedding / 主密钥等一堆应用侧变量（详见 prisma.config.ts 头注释）。
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── 枚举（`02` §三 括号内的取值域）─────────────────────────────
+
+/// 用户角色（`01` §3.1：admin 建号；无自注册）
+enum UserRole {
+  ADMIN
+  MEMBER
+
+  @@map("user_role")
+}
+
+/// 用户状态：启停（`01` §3.1「被停用账号立即失效」）。
+/// 刻意用 DISABLED 而非 DELETED —— 本系统不删用户（历史会话/用量要留痕）。
+enum UserStatus {
+  ACTIVE
+  DISABLED
+
+  @@map("user_status")
+}
+
+/// provider 与 model 共用的类型域（`02` §三 两处都写 `type(CHAT|EMBEDDING)`）。
+/// 共用一个枚举而不是各建一个：两者本就同一取值域，将来加第三类（如 RERANK）只改一处。
+enum ModelType {
+  CHAT
+  EMBEDDING
+
+  @@map("model_type")
+}
+
+/// Agent 类型（`01` 决策 4：ChatBot 主 + TaskAgent 辅）
+enum AgentType {
+  CHATBOT
+  TASK_AGENT
+
+  @@map("agent_type")
+}
+
+/// Agent 可绑定的组件类型（`01` 决策 7：仅知识库 + MCP 两种）
+enum ComponentType {
+  KNOWLEDGE
+  MCP
+
+  @@map("component_type")
+}
+
+/// 会话状态（`02` §三）。FINISHED 之后的会话转只读保留（`02` §4.4 删除 Agent 时）
+enum ConversationStatus {
+  ACTIVE
+  FINISHED
+
+  @@map("conversation_status")
+}
+
+/// 消息角色（`02` §三）
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+
+  @@map("message_role")
+}
+
+// ───────────────────────────── 表 ─────────────────────────────
+
+/// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
+///
+/// 契约注意：
+/// · `username` 的唯一性是**大小写敏感**的（PG 默认）。「登录时用户名大小写不敏感」
+///   这层语义放在 P0-1-7 的 auth.service 里做（写入前统一小写归一），不进数据库约束 ——
+///   加 citext 会让 Prisma 的 `@db.` 映射变复杂，收益不抵成本。
+/// · `password_hash` 只存 bcrypt 摘要（P0-1-6 的 cost 12）；任何读接口都不得带出该列。
+/// · `must_change_password` 建号即为 true（`02` §4.2「建号即必须改密」）。
+model User {
+  id                 String     @id @default(uuid(7)) @db.Uuid
+  username           String     @unique @db.VarChar(64)
+  passwordHash       String     @map("password_hash") @db.Text
+  nickname           String?    @db.VarChar(64)
+  role               UserRole   @default(MEMBER)
+  status             UserStatus @default(ACTIVE)
+  mustChangePassword Boolean    @default(true) @map("must_change_password")
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  agents        Agent[]
+  conversations Conversation[]
+
+  @@map("users")
+}
+
+/// model_providers —— 模型服务商（`02` §三 / §4.3）
+///
+/// `api_key_enc` 是 **AES-256-GCM 密文**（P0-1-6 的 infra/crypto 加解密，P0-1-10 写入）。
+/// 可空：本系统允许无鉴权的自建 provider（如内网 vLLM / Ollama 兼容端点）。
+/// `@@index([type, enabled])` 服务管理页按类型过滤的列表查询。
+model ModelProvider {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  name      String    @db.VarChar(128)
+  baseUrl   String    @map("base_url") @db.Text
+  apiKeyEnc String?   @map("api_key_enc") @db.Text
+  type      ModelType
+  enabled   Boolean   @default(true)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  models Model[]
+
+  @@index([type, enabled])
+  @@map("model_providers")
+}
+
+/// models —— 模型（`02` §三 / §4.3）
+///
+/// · `label` = 别名（界面上给业务同学看的名字），`model_name` = 上游真实型号名。
+/// · `@@unique([providerId, modelName, type])`：同一 provider 下同型号同类型只应有一条。
+///   带 `type` 是因为同一型号名可能既提供 chat 又提供 embedding（如 bge 系列的兼容端点），
+///   不带 type 会把这种合法情况误判成重复。
+/// · `@@index([type, enabled])`：服务 `GET /api/models?type=CHAT`（全员可选模型列表，
+///   `enabled=false` 的必须筛掉 —— `01` §3.2「无效模型创建 Agent 时不可选」）。
+/// · 删除语义 `onDelete: Cascade`：模型之于 provider 没有独立意义，provider 没了模型也留不住。
+model Model {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  providerId     String    @map("provider_id") @db.Uuid
+  modelName      String    @map("model_name") @db.VarChar(128)
+  label          String    @db.VarChar(128)
+  type           ModelType
+  maxContext     Int?      @map("max_context")
+  supportsVision Boolean   @default(false) @map("supports_vision")
+  enabled        Boolean   @default(true)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  agents   Agent[]
+
+  @@unique([providerId, modelName, type])
+  @@index([type, enabled])
+  @@map("models")
+}
+
+/// agents —— Agent（`02` §三 / §4.4）
+///
+/// · `guideQuestions` 是 `string[]` 的 jsonb（引导问题，`01` §3.3）。默认 `[]` 而非 null，
+///   前端可以无脑 `.map()`；写入端（P0-1-22）负责校验元素都是字符串。
+/// · `modelId` 用 `onDelete: Restrict`：删模型前必须先处理绑定它的 Agent，不能让
+///   「Agent 指向一个不存在的模型」在库里出现（运行期拿不到模型 = 对话直接炸）。
+/// · `createdBy` 同理 Restrict：本系统不删用户（见 UserStatus 注释）。
+/// · `deletedAt` 支撑 §4.4 的**软删**（会话转只读保留、组件绑定解除），列表查询一律带
+///   `deletedAt: null`；因此加 `@@index([deletedAt, updatedAt])` 服务列表排序。
+model Agent {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  name           String    @db.VarChar(128)
+  description    String?   @db.Text
+  icon           String?   @db.VarChar(255)
+  type           AgentType
+  systemPrompt   String?   @map("system_prompt") @db.Text
+  openingRemarks String?   @map("opening_remarks") @db.Text
+  guideQuestions Json      @default("[]") @map("guide_questions") @db.JsonB
+  modelId        String    @map("model_id") @db.Uuid
+  createdBy      String    @map("created_by") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  model         Model             @relation(fields: [modelId], references: [id], onDelete: Restrict)
+  creator       User              @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  components    AgentComponent[]
+  conversations Conversation[]
+
+  @@index([deletedAt, updatedAt(sort: Desc)])
+  @@index([createdBy])
+  @@map("agents")
+}
+
+/// agent_components —— Agent 的组件绑定（`02` §三 / §4.4）
+///
+/// ⚠️ `refId` 是**多态外键**：`componentType=KNOWLEDGE` 时指向 `knowledge_bases.id`，
+/// `MCP` 时指向 `mcp_servers.id`。因此**刻意不建 FK 约束**（一张列不能同时指向两张表），
+/// 引用完整性由服务层保证（P0-1-23 的 PUT 全量替换）。知识库/MCP 表本身要到 P0-1-14
+/// 与 P0-2 才建，本批也不具备建 FK 的条件。
+///
+/// `@@unique([agentId, componentType, refId])` 防重复绑定；`config` 预留给未来的
+/// per-binding 参数（jsonb 可空，P0 不写）。
+/// `onDelete: Cascade`：删绑定随 Agent 走；注意 Agent 是**软删**，软删时由服务层显式删绑定行。
+model AgentComponent {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  agentId       String        @map("agent_id") @db.Uuid
+  componentType ComponentType @map("component_type")
+  refId         String        @map("ref_id") @db.Uuid
+  config        Json?         @db.JsonB
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, componentType, refId])
+  @@map("agent_components")
+}
+
+/// conversations —— 会话（`02` §三 / §4.5）
+///
+/// · `topic` 可空：新建会话时前端还没输入内容，标题由首条用户消息兜底（`03` 前端负责）。
+/// · `lastMessageAt` 是**列表排序键**（`01` §3.4「按最近活跃排序」），可空表示「还没有消息」；
+///   两个 `@@index` 分别服务「我的会话列表」与「某 Agent 的会话列表」两种查询。
+/// · `status` 的 FINISHED 用于 Agent 软删后把历史会话转只读（§4.4）。
+/// · 删除语义全部 `Restrict`：会话是业务留痕，不允许因为删 Agent/用户而被动消失。
+model Conversation {
+  id            String             @id @default(uuid(7)) @db.Uuid
+  agentId       String             @map("agent_id") @db.Uuid
+  userId        String             @map("user_id") @db.Uuid
+  topic         String?            @db.VarChar(255)
+  status        ConversationStatus @default(ACTIVE)
+  lastMessageAt DateTime?          @map("last_message_at") @db.Timestamptz(3)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  agent    Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  messages Message[]
+
+  @@index([userId, lastMessageAt(sort: Desc)])
+  @@index([agentId, lastMessageAt(sort: Desc)])
+  @@map("conversations")
+}
+
+/// messages —— 消息（`02` §三 / §4.5）**按月分区表**
+///
+/// ⚠️ 这张表在数据库里是 `PARTITION BY RANGE (created_at)`（`02` §三「分区说明」），
+/// 于是有两处与普通表不同的约定，改本模型前务必先读：
+///
+/// 1. **主键必须是 `(id, created_at)`** —— PG 硬性要求分区键包含在主键/唯一约束里。
+///    代价：`findUnique` 不能只给 `id`，要写复合键
+///    `where: { id_createdAt: { id, createdAt } }`（Prisma 对 `@@id([a, b])` 生成的键名）。
+///    业务上不亏：§4.5 的消息分页本来就带 `conversationId`，且排序键就是 `createdAt`，
+///    所以游标查询天然能拿到这两个值（见下方 `@@index`）。
+///
+/// 2. **分区不在这里声明**（Prisma 没有分区语法）。分区父表/子表与后续月份分区的维护
+///    全部在 `prisma/migrations/0001_init/migration.sql` 里用 SQL 完成，包括
+///    `ensure_messages_partition(month)` 这个「建当月分区」的幂等函数。
+///
+/// `content` 的 jsonb 结构（`02` §三）：`{ text, thinking, tool_calls, citations, attachments }`，
+/// 逐字段的 zod schema 属于 SSE 契约（P0-1-25），本批不定型 —— 但**结构一经写入不改语义**，
+/// 因为历史消息要能被后续版本原样渲染。
+/// `tokensIn/tokensOut` 可空：流被中断时也可能已产生 token，或 embedding/工具轮次无计量。
+/// `onDelete: Cascade`：删会话必删其消息（§4.5「DELETE /api/conversations/:id」）。
+model Message {
+  id             String      @default(uuid(7)) @db.Uuid
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  conversationId String      @map("conversation_id") @db.Uuid
+  role           MessageRole
+  content        Json        @db.JsonB
+  tokensIn       Int?        @map("tokens_in")
+  tokensOut      Int?        @map("tokens_out")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// ⚠️ 复合主键是分区的**前置条件**，不是设计偏好（见上方说明 1）
+  @@id([id, createdAt])
+  /// 会话内按时间倒序分页（`?beforeId=&limit=` 游标：先定位游标行拿 createdAt，再按此索引取）
+  @@index([conversationId, createdAt(sort: Desc)])
+  @@map("messages")
+}

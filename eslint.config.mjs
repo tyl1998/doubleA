@@ -15,7 +15,16 @@ import tseslint from 'typescript-eslint'
 export default tseslint.config(
   {
     // 产物 / 依赖 / 生成物不参与 lint（扁平配置没有 .eslintignore，忽略项必须写在这里）
-    ignores: ['**/dist/**', '**/node_modules/**', '**/*.d.ts', '**/*.map', '.workbuddy/**'],
+    // 注意：扁平配置**不读 .gitignore**，所以 `backend/generated` 即使已 gitignore 也要在这里再列一次
+    // （Prisma 生成物自带 `/* eslint-disable */`，这里是省掉解析开销与"靠注释兜底"的侥幸）。
+    ignores: [
+      '**/dist/**',
+      '**/node_modules/**',
+      '**/*.d.ts',
+      '**/*.map',
+      'backend/generated/**',
+      '.workbuddy/**',
+    ],
   },
 
   js.configs.recommended,
