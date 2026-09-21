@@ -27,6 +27,7 @@
     "verify:session": "pnpm --filter @doubulea/backend verify:session",
     "verify:auth": "pnpm --filter @doubulea/backend verify:auth",
     "verify:users": "pnpm --filter @doubulea/backend verify:users",
+    "verify:model-providers": "pnpm --filter @doubulea/backend verify:model-providers",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

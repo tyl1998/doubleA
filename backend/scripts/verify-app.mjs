@@ -2,16 +2,22 @@
 /**
  * verify-app.mjs —— **接口级验收**（不占端口、不需要真实依赖）
  *
- * 覆盖三批：
+ * 覆盖四批：
  *   · P0-1-4：信封形态 / HTTP 状态码 / Zod 校验失败字段明细 / 领域错误 / 未知异常不泄内部信息 /
  *             404 兜底 / 非法 JSON / CORS 预检 / requestId 透传 / `/health` 三项探活恒 200
  *   · P0-1-6：密文往返与**篡改检出**（GCM tag）/ 版本与 AAD 上下文 / bcrypt 形态与拒绝超长 /
  *             初始密码生成 / **未登录一律 401 且不碰会话存储**
  *   · P0-1-7：`/api/auth/*` 已注册 + 请求体 schema 的字段明细 + 首登闸门不给匿名请求增加依赖调用 /
  *             shared 认证契约的纯函数（`utf8ByteLength` 与 `Buffer.byteLength` 对照、用户名归一化）
+ *   · P0-1-8：`/api/users` 已注册 + 用户管理契约（建号/改角色/分页 schema 与字段明细）
+ *   · P0-1-10：`/api/model-providers` 已注册 + Provider 契约（`maskApiKey` 边界、
+ *              baseUrl 归一化、**PATCH 的 apiKey 三态**、密文**绑定到记录**（AAD 换 id 即解不开）、
+ *              输出形态里不存在任何 key/密文字段）
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
+ * Provider 的**落库形态**（`api_key_enc` 是密文、读接口不含明文、三态真地写对列）
+ * 由 `verify-model-providers.mjs` 覆盖，同样需要真实 PG。
  *
  * 为什么用 `app.inject` 而不是 curl：
  *   ① 本机端口是稀缺资源（3000/5173 都被别的项目占着，见 `06` §七 待决事项 6），
@@ -37,13 +43,18 @@ import {
   PASSWORD_MAX_BYTES,
   authUserSchema,
   changePasswordBodySchema,
+  createModelProviderBodySchema,
   createUserBodySchema,
   initialPasswordResultSchema,
+  listModelProvidersQuerySchema,
   listUsersQuerySchema,
   loginBodySchema,
+  maskApiKey,
+  modelProviderItemSchema,
   normalizeUsername,
   offsetPageOf,
   ok,
+  updateModelProviderBodySchema,
   updateUserBodySchema,
   userListItemSchema,
   utf8ByteLength,
@@ -65,6 +76,7 @@ import {
 } from '../dist/backend/src/infra/crypto.js'
 import { closePg } from '../dist/backend/src/infra/pg.js'
 import { closeRedis } from '../dist/backend/src/infra/redis.js'
+import { providerKeyAad } from '../dist/backend/src/services/model.service.js'
 
 const useColor = process.stdout.isTTY === true
 const c = {
@@ -105,7 +117,7 @@ async function it(name, fn) {
 
 const expectDegraded = process.env.EXPECT_DEGRADED === '1'
 
-console.log(`\n${c.b}══ 接口级验收：Fastify 骨架 / 错误信封 / /health / 密码与会话基础设施 ══${c.x}`)
+console.log(`\n${c.b}══ 接口级验收：信封 / /health / 密码与会话 / 认证 / 用户管理 / 模型池 Provider ══${c.x}`)
 console.log(`  ${c.d}模式：${expectDegraded ? '依赖全部不可达（断言 degraded）' : '本机依赖（断言 /health 全绿）'}${c.x}`)
 
 const app = buildApp()
@@ -670,6 +682,180 @@ await it('shared 用户管理契约：建号/改角色/分页 schema 与列表�
   )
   assertEqual(
     offsetPageOf(userListItemSchema).safeParse({ items: [item], total: 1, offset: 0, limit: 20 }).success,
+    true,
+    '列表分页 schema',
+  )
+})
+
+// ── 15. 模型池 Provider 契约（P0-1-10）──
+await it('maskApiKey：长 key 给「前3+****+后4」、短 key 只露尾巴、极短直接全遮', () => {
+  assertEqual(maskApiKey('sk-1234567890abcdef'), 'sk-****cdef', '19 字符 → 前3+****+后4')
+  assertEqual(maskApiKey('a'.repeat(16)), 'aaa****aaaa', '恰好 16 字符是临界点（含）')
+  assertEqual(maskApiKey('abcdefgh'), '****efgh', '8 字符 → 只露尾巴')
+  assertEqual(maskApiKey('abcdefg'), '****', '7 字符 → 全遮')
+  assertEqual(maskApiKey(''), '****', '空串 → 全遮（不报错）')
+
+  // 关键性质：中间段**一个字都不能露** —— 掩码的用途是"认出是哪把 key"，不是"拼回去"。
+  // ⚠️ 只比对**字母数字**：key 里常带 `-`/`_` 这类分隔符，它们本来就会出现在首/尾里，
+  //    拿"字符集不相交"去断言会误报（第一版就这么写成假失败了）。
+  const key = 'sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const masked = maskApiKey(key)
+  const alnum = (text) => text.replace(/[^A-Za-z0-9]/g, '')
+  const hiddenMiddle = alnum(key.slice(3, key.length - 4))
+  assert(masked.length < key.length / 2, `掩码应显著短于原文：${masked.length} vs ${key.length}`)
+  assert(
+    [...new Set(hiddenMiddle)].every((ch) => !masked.includes(ch)),
+    `掩码不得含中间段的任何字母数字，实际 ${masked}（中间段 ${hiddenMiddle}）`,
+  )
+  assert(!masked.includes(alnum(key).slice(5, 20)), '掩码不得含中间段的连续片段')
+})
+
+await it('Provider 路由已注册且仅 ADMIN：未登录 401；非法参数 400（校验先于鉴权，故匿名下可断言）', async () => {
+  // 已注册：不再走 404 兜底 —— 若无 Cookie 得到 401 而不是 404，即证明路由存在
+  const list = await app.inject({ method: 'GET', url: '/api/model-providers' })
+  assertEqual(list.statusCode, 401, '未登录访问列表')
+  assertEqual(list.json().code, 'UNAUTHORIZED', '列表错误码')
+
+  // 校验先于 preHandler：所以匿名 + 非法 body 得到的是 400（带字段明细）而不是 401
+  const badBody = await app.inject({
+    method: 'POST',
+    url: '/api/model-providers',
+    payload: { name: '', baseUrl: 'not-a-url', type: 'RERANK' },
+  })
+  assertEqual(badBody.statusCode, 400, '非法 body 状态码')
+  const fields = badBody.json().data?.fields ?? []
+  const paths = fields.map((field) => field.path)
+  assert(paths.includes('body.name'), `应报 body.name，实际 ${JSON.stringify(paths)}`)
+  assert(paths.includes('body.baseUrl'), `应报 body.baseUrl，实际 ${JSON.stringify(paths)}`)
+  assert(paths.includes('body.type'), `应报 body.type，实际 ${JSON.stringify(paths)}`)
+
+  const badId = await app.inject({ method: 'DELETE', url: '/api/model-providers/not-a-uuid' })
+  assertEqual(badId.statusCode, 400, '非法 UUID 状态码')
+  assert(
+    JSON.stringify(badId.json().data?.fields ?? []).includes('params.id'),
+    '应报 params.id',
+  )
+})
+
+await it('shared Provider 契约：baseUrl 归一化 / 空 apiKey 被拒 / PATCH 三态保住 undefined 与 null', () => {
+  // baseUrl：尾斜杠归一化（将来拼 /chat/completions 不能出现 //）、必须 http(s)、必须是真 URL
+  const trimmed = createModelProviderBodySchema.safeParse({
+    name: 'x',
+    baseUrl: 'https://api.openai.com/v1///',
+    type: 'CHAT',
+  })
+  assertEqual(trimmed.success, true, '合法地址应通过')
+  assertEqual(trimmed.data?.baseUrl, 'https://api.openai.com/v1', '尾部斜杠应被去掉')
+  assertEqual(
+    createModelProviderBodySchema.safeParse({ name: 'x', baseUrl: 'ftp://a.com', type: 'CHAT' }).success,
+    false,
+    '非 http(s) 应被拒',
+  )
+  assertEqual(
+    createModelProviderBodySchema.safeParse({ name: 'x', baseUrl: 'https://', type: 'CHAT' }).success,
+    false,
+    '只有 scheme 应被拒',
+  )
+  assertEqual(
+    createModelProviderBodySchema.safeParse({ name: 'x', baseUrl: 'https://a.com', type: 'RERANK' }).success,
+    false,
+    'type 取值域只有 CHAT/EMBEDDING',
+  )
+
+  // 建：apiKey 缺省 = 不配置；显式 null 与缺省同义（都保留 null / undefined 原样）
+  const noKey = createModelProviderBodySchema.parse({ name: 'x', baseUrl: 'https://a.com', type: 'CHAT' })
+  assertEqual(noKey.apiKey, undefined, '缺省 apiKey 应是 undefined')
+  assertEqual(
+    createModelProviderBodySchema.parse({ name: 'x', baseUrl: 'https://a.com', type: 'CHAT', apiKey: null }).apiKey,
+    null,
+    'apiKey: null 应保留 null',
+  )
+  // 空串不是"清空"的写法 —— 契约只留 undefined / null 两条路，避免"到底清没清"的歧义
+  assertEqual(
+    createModelProviderBodySchema.safeParse({ name: 'x', baseUrl: 'https://a.com', type: 'CHAT', apiKey: '' }).success,
+    false,
+    '空串 apiKey 应被拒',
+  )
+
+  // ⭐ PATCH 三态：这是本批最容易写错的地方（写错 → 改个名字顺手把 Key 抹了）
+  assertEqual(updateModelProviderBodySchema.safeParse({}).success, false, '空 body 应被拒')
+  const absent = updateModelProviderBodySchema.parse({ name: '新名字' })
+  assertEqual(absent.apiKey, undefined, '不带 apiKey = 不动（必须是 undefined，不能被 default 成 null）')
+  const cleared = updateModelProviderBodySchema.parse({ apiKey: null })
+  assertEqual(cleared.apiKey, null, 'apiKey: null = 清空（且 null 本身要算"给了字段"）')
+  const replaced = updateModelProviderBodySchema.parse({ apiKey: 'sk-new' })
+  assertEqual(replaced.apiKey, 'sk-new', 'apiKey: 字符串 = 写入')
+  assertEqual(updateModelProviderBodySchema.safeParse({ apiKey: '' }).success, false, 'PATCH 空串同样被拒')
+  // enabled 的三种取值（真/假/不给）都要能过 —— 它是最常用的开关
+  assertEqual(updateModelProviderBodySchema.parse({ enabled: false }).enabled, false, 'enabled: false 应保留')
+})
+
+await it('Provider Key 的密文绑定到记录（AAD）：换个 providerId 就解不开，不能跨记录搬运', () => {
+  const idA = '01a0c289-6738-715c-a10c-ef95c1286bf9'
+  const idB = '01a0c289-6831-76ab-b7d9-65e991557ba1'
+  // AAD 公式本身是契约（写/读两侧共用同一个函数，这里把公式也钉住）
+  assertEqual(providerKeyAad(idA), `model-providers:${idA}.api_key_enc`, 'AAD 公式')
+
+  const plaintext = 'sk-proj-ThisIsOnlyATestKey-0123456789'
+  const cipher = encryptSecret(plaintext, providerKeyAad(idA))
+  assertEqual(decryptSecret(cipher, providerKeyAad(idA)), plaintext, '同一记录的密文应能解回')
+  assert(!cipher.includes(plaintext), '密文里不得出现明文')
+
+  let wrongContextThrew = false
+  try {
+    decryptSecret(cipher, providerKeyAad(idB))
+  } catch (error) {
+    wrongContextThrew = error instanceof SecretDecryptionError
+  }
+  assert(wrongContextThrew, '换成另一个 Provider 的 AAD 必须抛 SecretDecryptionError')
+
+  // 不带 AAD（旧式/裸用）同样解不开 —— 防"某处忘了传 context"而静默可用
+  let noContextThrew = false
+  try {
+    decryptSecret(cipher)
+  } catch (error) {
+    noContextThrew = error instanceof SecretDecryptionError
+  }
+  assert(noContextThrew, '漏传 AAD 必须解不开（否则 AAD 形同虚设）')
+})
+
+await it('shared Provider 输出形态：只含掩码与 hasKey，无任何 apiKey 字段；列表分页同构', () => {
+  const now = new Date().toISOString()
+  const item = {
+    id: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    type: 'CHAT',
+    enabled: true,
+    hasKey: true,
+    apiKeyPreview: 'sk-****cdef',
+    modelCount: 3,
+    createdAt: now,
+    updatedAt: now,
+  }
+  assertEqual(modelProviderItemSchema.safeParse(item).success, true, 'item schema')
+  assertEqual(
+    modelProviderItemSchema.safeParse({ ...item, apiKeyPreview: null, hasKey: false }).success,
+    true,
+    '未配置 Key 时 hasKey=false / apiKeyPreview=null',
+  )
+  assertEqual(
+    modelProviderItemSchema.safeParse({ ...item, type: 'EMBEDDING' }).success,
+    true,
+    'EMBEDDING 也是合法类型',
+  )
+  // 形态自检：schema 的键集合里**不允许**出现任何 apiKey* 以外的敏感名
+  const keys = Object.keys(modelProviderItemSchema.shape)
+  assert(!keys.includes('apiKey'), `输出形态不得含 apiKey，实际键：${keys.join(',')}`)
+  assert(!keys.some((key) => key.toLowerCase().includes('enc')), `输出形态不得含密文字段：${keys.join(',')}`)
+
+  assertEqual(
+    listModelProvidersQuerySchema.parse({}).limit,
+    20,
+    '列表 limit 默认值应与其它列表一致',
+  )
+  assertEqual(
+    offsetPageOf(modelProviderItemSchema).safeParse({ items: [item], total: 1, offset: 0, limit: 20 }).success,
     true,
     '列表分页 schema',
   )

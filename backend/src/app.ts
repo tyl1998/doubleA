@@ -21,6 +21,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerHealthRoutes } from './routes/health.js'
+import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerUserRoutes } from './routes/users.js'
 
 /**
@@ -99,10 +100,12 @@ export function buildApp(): FastifyInstance {
     maxAge: 600,
   })
 
-  // ⑦ 路由（`/api/auth/*` 从 P0-1-7 起、`/api/users/*` 从 P0-1-8 起；业务路由按批次逐个加）
+  // ⑦ 路由（`/api/auth/*` P0-1-7、`/api/users/*` P0-1-8、`/api/model-providers/*` P0-1-10；
+  //    其余业务路由按批次逐个加）
   registerHealthRoutes(app)
   registerAuthRoutes(app)
   registerUserRoutes(app)
+  registerModelProviderRoutes(app)
 
   return app
 }
