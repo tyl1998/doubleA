@@ -13,6 +13,7 @@
  */
 
 import cors from '@fastify/cors'
+import multipart from '@fastify/multipart'
 import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } from 'fastify'
 
 import { config } from './config.js'
@@ -20,6 +21,7 @@ import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
+import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerModelRoutes } from './routes/models.js'
@@ -31,6 +33,15 @@ import { registerUserRoutes } from './routes/users.js'
  * 本机开发若不希望暴露到局域网，用 `HOST=127.0.0.1`（P0-1-4 暂不加变量，先写死默认值）。
  */
 export const DEFAULT_HOST = '0.0.0.0'
+
+/**
+ * JSON/普通端点的请求体上限（= Fastify 默认的 1MB）。
+ *
+ * 为什么不写进配置：`02` §十一 的变量清单里只有 `UPLOAD_BODY_LIMIT`（上传上限），
+ * 没有"普通端点上限"这一项 —— 这里取框架默认值就是最小惊讶的选择，
+ * 而"谁需要更大"这件事本身就该是一个**显式的路由级决定**（目前只有上传路由需要）。
+ */
+const JSON_BODY_LIMIT_BYTES = 1024 * 1024
 
 export function buildApp(): FastifyInstance {
   const app = Fastify({
@@ -53,10 +64,13 @@ export function buildApp(): FastifyInstance {
       disableRequestLogging: true,
       requestIdLogLabel: 'requestId',
     }),
-    // 上传（P0-1-16 的 multipart）要走 100MB 级 body，全局上限必须 ≥ UPLOAD_BODY_LIMIT，
-    // 否则 Fastify 默认的 1MB 会先把大文件拒掉。副作用是 JSON 端点也放宽到同一上限 ——
-    // 待 P0-1-16 落地时改为「上传路由单独放宽、其余端点收紧」，见 issue_fix 记录。
-    bodyLimit: config.limits.uploadBodyLimitBytes,
+    // 上传（P0-1-16 的 multipart）要走 100MB 级 body，但**只有上传路由**需要那么大。
+    // 全局上限收到 JSON 的 1MB（Fastify 的默认值），上传路由在**路由级**放宽到
+    // `UPLOAD_BODY_LIMIT`（见 `routes/documents.ts`）—— 这条"按需放宽"是 P0-1-4 埋下的
+    // 待办（当时注释写着"待 P0-1-16 落地时改为上传路由单独放宽、其余端点收紧"）。
+    // 副作用说明：路由未被匹配到时（404）仍按全局上限走，故一个超大 body 打向不存在的
+    // 路径会得到 413 而不是 404 —— 两种都是 4xx，且这张"面"比"任意端点都能吃 100MB"小得多。
+    bodyLimit: JSON_BODY_LIMIT_BYTES,
     // 部署形态是「网关 → 后端」（`02` §十二），信任 X-Forwarded-* 才能拿到真实客户端 IP
     trustProxy: true,
   })
@@ -102,6 +116,22 @@ export function buildApp(): FastifyInstance {
     maxAge: 600,
   })
 
+  // ⑦ multipart（P0-1-16 的文档上传）。
+  //    · 该插件用 `fastify-plugin` 包装 ⇒ 装饰器（`request.file()`）落在**根**实例上，
+  //      本文件里直接注册的路由都能用（否则会被封装作用域挡住，这是最容易踩的一次）。
+  //    · `files: 1`：本接口只接一个文件；给 2 个文件时插件抛 `FST_FILES_LIMIT`（413），
+  //      比"静默只取第一个、剩下不消费导致连接悬挂"好得多。
+  //    · `fileSize`：与路由级 `bodyLimit` 双保险 —— 前者管**流式**（分块传输、没有
+  //      Content-Length 时 Fastify 的 bodyLimit 拦不住），后者管声明了长度的常规请求。
+  void app.register(multipart, {
+    limits: {
+      fileSize: config.limits.uploadBodyLimitBytes,
+      files: 1,
+      fields: 8,
+      parts: 16,
+    },
+  })
+
   // ⑦ 路由（`/api/auth/*` P0-1-7、`/api/users/*` P0-1-8、`/api/model-providers/*` P0-1-10；
   //    其余业务路由按批次逐个加）
   registerHealthRoutes(app)
@@ -112,6 +142,9 @@ export function buildApp(): FastifyInstance {
   // ⑧ 知识库（P0-1-15）。注意权限是**登录即可**（`03` §25：`/knowledge` 的权限列是「登录」，
   //    与 `/admin/*` 不同）—— 路由内部一个 `requireAdmin` 都没有，这是刻意的。
   registerKnowledgeBaseRoutes(app)
+  // ⑨ 知识库文档（P0-1-16）。权限与知识库一致（登录即可），上传走 multipart。
+  //    端点数按批次增长：本批只有上传；reupload/retry/delete 在 P0-1-19，列表/下载在 P0-1-21。
+  registerDocumentRoutes(app)
 
   return app
 }

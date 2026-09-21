@@ -63,6 +63,28 @@ export async function pingS3(): Promise<{ bucket: string; bucketExists: boolean 
 }
 
 /**
+ * 确保桶存在（不存在则按需创建）。P0-1-16 起在**写原文件之前**调用。
+ *
+ * 为什么允许后端建桶：`02` §十二 的部署形态里 MinIO 随 compose 起来，桶名来自 `S3_BUCKET`。
+ * 要求运维"先手工 mc mb 一次"会变成部署清单里一条容易被漏掉的步骤，而漏掉的症状是
+ * "上传 500、日志说 NoSuchBucket"，与"密钥不对"长得几乎一样。顺手建出来最省事。
+ *
+ * 并发下 `makeBucket` 会抛 `BucketAlreadyOwnedByYou` —— 那**不是**失败，
+ * 故这里用"再探一次"来区分"别人刚建好"与"真的建不了"（后者才抛）。
+ */
+export async function ensureBucket(bucket: string = config.s3.bucket): Promise<void> {
+  const s3 = getS3Client()
+  if (await s3.bucketExists(bucket)) return
+  try {
+    await s3.makeBucket(bucket)
+    getLogger().info({ bucket }, '对象存储桶不存在，已创建')
+  } catch (error) {
+    if (!(await s3.bucketExists(bucket))) throw error
+    getLogger().debug({ bucket }, '对象存储桶已被并发创建（忽略本次冲突）')
+  }
+}
+
+/**
  * S3 客户端**无需显式关闭**：minio 客户端按请求复用 http agent，不持有常驻连接池句柄，
  * 故本模块不提供 `close` —— 退出流程（`index.ts`）只需收 PG / Redis 两个。
  */

@@ -98,6 +98,14 @@ const MESSAGE_BY_FASTIFY_CODE: Readonly<Record<string, string>> = {
   FST_ERR_BAD_URL: 'URL 格式非法',
   FST_ERR_NOT_FOUND: '接口不存在',
   FST_ERR_HANDLER_TIMEOUT: '处理超时（服务端已放弃本次请求）',
+  // @fastify/multipart（P0-1-16）：这四个都是 413，且**都是固定文案**
+  // —— 插件自带的英文 message 会带上限数值/字段名，翻译成固定中文更好读、也不会漏内部细节
+  FST_REQ_FILE_TOO_LARGE: '文件超过上传上限',
+  FST_FILES_LIMIT: '一次只能上传一个文件',
+  FST_FIELDS_LIMIT: '表单字段过多',
+  FST_PARTS_LIMIT: '表单分段过多',
+  FST_INVALID_MULTIPART_CONTENT_TYPE: 'Content-Type 不是合法的 multipart/form-data',
+  FST_MP_PREMATURE_CLOSE: '上传中断：连接在文件传完之前被关闭，请重试',
 }
 
 /** HTTP 状态码 → 错误码（仅用于 Fastify 抛出的「框架级」错误；领域错误自带错误码） */

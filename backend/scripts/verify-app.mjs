@@ -23,6 +23,12 @@
  *              （本资源对全员开放，不像模型池那样需要第二套投影）+ 知识库契约
  *              （`retrieval_config` 的**逐键兜底**与越界退回默认、建库四项可省、
  *              `description` 三态、`embeddingModelChanged` 三态）
+ *   · P0-1-16：`POST /api/knowledge-bases/:id/documents` 已注册（且只有这一条 —— 列表/下载/删除
+ *              属后续批次，不提前注册）+ **前置校验的纯函数矩阵**（扩展名白名单 / `.doc` 专拦 /
+ *              MIME 交叉校验 / **文件头魔数**：改名的假 PDF、不含 OOXML 的 zip、OLE2 改名、
+ *              NUL 字节、图片）+ 文档契约（`UPLOAD_EXTENSIONS` 与 `MIME_BY_EXTENSION` 同源、
+ *              `documentItemSchema` / `uploadDocumentResultSchema` 的 `deduplicated` 必填、
+ *              `countChars` 按**码点**计而非 `.length`）
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -60,6 +66,13 @@ import {
   createUserBodySchema,
   createKnowledgeBaseBodySchema,
   DEFAULT_RETRIEVAL_CONFIG,
+  documentItemSchema,
+  documentParamsSchema,
+  LEGACY_DOC_EXTENSION,
+  LEGACY_DOC_HINT,
+  MIME_BY_EXTENSION,
+  UPLOAD_EXTENSIONS,
+  UPLOAD_FILE_FIELD,
   initialPasswordResultSchema,
   knowledgeBaseItemSchema,
   knowledgeBaseListResultSchema,
@@ -83,6 +96,7 @@ import {
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
   updateUserBodySchema,
+  uploadDocumentResultSchema,
   userListItemSchema,
   utf8ByteLength,
 } from '@doubulea/shared'
@@ -103,6 +117,7 @@ import {
 } from '../dist/backend/src/infra/crypto.js'
 import { closePg } from '../dist/backend/src/infra/pg.js'
 import { closeRedis } from '../dist/backend/src/infra/redis.js'
+import { countChars, detectFormat } from '../dist/backend/src/pipeline/parse/index.js'
 import { providerKeyAad } from '../dist/backend/src/services/model.service.js'
 
 const useColor = process.stdout.isTTY === true
@@ -1291,6 +1306,189 @@ await it('shared 知识库契约：retrieval_config 补默认值（唯一入口�
     true,
     '分页响应同构',
   )
+})
+
+// ── 18. 文档上传：路由 + 前置校验四道 + 解析契约（P0-1-16）──
+await it('文档上传路由已注册且**只有这一条**：非法 UUID 400、匿名 401（校验先于鉴权，都不碰依赖）', async () => {
+  // `02` §4.6：上传挂在知识库下的子路径
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents' }), true, '上传路由')
+  // 列表（P0-1-21）、下载（P0-1-21）、reupload/retry/delete（P0-1-19）都还不该存在：
+  // 提前注册一条"返回空列表"的 GET 会让"上传成功但列表里没有"被当成已交付
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }),
+    false,
+    '列表端点属 P0-1-21，本批不应存在',
+  )
+
+  const badId = await app.inject({ method: 'POST', url: '/api/knowledge-bases/not-a-uuid/documents' })
+  assertEqual(badId.statusCode, 400, '非法 UUID 的状态码')
+  assertEqual(
+    (badId.json().data?.fields ?? []).some((field) => field.path === 'params.id'),
+    true,
+    '应报 params.id（路径参数 schema 真的接线了）',
+  )
+
+  // 无 Cookie ⇒ `requireAuth` 直接拒绝，**不去查会话存储** ⇒ CI（无 Redis）里也必须是 401 而不是 500。
+  // body 用 JSON 而非 multipart：鉴权在 `preHandler`，早于 handler 里的 `request.file()`，
+  // 所以这条断言验的是"闸门在不在"，与 multipart 解析无关（那条路在 verify-documents 里验）。
+  const anonymous = await app.inject({
+    method: 'POST',
+    url: '/api/knowledge-bases/01a0c289-6738-715c-a10c-ef95c1286bf9/documents',
+    payload: {},
+  })
+  assertEqual(anonymous.statusCode, 401, '匿名上传状态码')
+  assertEqual(anonymous.json().code, 'UNAUTHORIZED', '匿名上传错误码')
+})
+
+await it('前置校验的纯函数矩阵：白名单 / .doc 专拦 / MIME 交叉 / **文件头魔数**（改名的假 PDF 必须被拦）', () => {
+  // ── 夹具：只用几十字节的手工字节串，不依赖 scripts/fixtures 的生成器 ──
+  const TEXT = Buffer.from('这是一个纯文本文件\n第二行', 'utf8')
+  const PDF = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n', 'latin1')
+  const ZIP_OOXML = Buffer.concat([
+    Buffer.from('PK\x03\x04', 'latin1'),
+    Buffer.alloc(20),
+    Buffer.from('[Content_Types].xml', 'latin1'),
+  ])
+  const ZIP_PLAIN = Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.alloc(64, 0x41)])
+  const PNG = Buffer.concat([Buffer.from('\x89PNG\r\n\x1a\n', 'latin1'), Buffer.alloc(32)])
+  const OLE2 = Buffer.concat([
+    Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+    Buffer.alloc(32),
+  ])
+
+  /** 断言"这一组输入必须以 VALIDATION 被拒，且文案里含某个关键字" */
+  const rejected = (input, includes, label) => {
+    let error = null
+    try {
+      detectFormat(input)
+    } catch (caught) {
+      error = caught
+    }
+    assert(error !== null, `${label}：本应被拒，却通过了`)
+    assertEqual(error.code, 'VALIDATION', `${label}：错误码`)
+    assert(
+      String(error.message).includes(includes),
+      `${label}：文案应含「${includes}」，实际「${error.message}」`,
+    )
+  }
+
+  // ── 通过的四条（含大小写扩展名与 octet-stream 放行）──
+  assertEqual(detectFormat({ fileName: 'a.txt', declaredMime: 'text/plain', bytes: TEXT }), 'txt', 'txt')
+  assertEqual(detectFormat({ fileName: '读我.MD', bytes: TEXT }), 'md', '大写扩展名应归一化')
+  assertEqual(
+    detectFormat({ fileName: 'a.pdf', declaredMime: 'application/pdf', bytes: PDF }),
+    'pdf',
+    'pdf',
+  )
+  // `application/octet-stream` = 客户端"我不知道"，不是矛盾声明 ⇒ 放行（否则 curl -F 传不了）
+  assertEqual(
+    detectFormat({ fileName: 'a.pdf', declaredMime: 'application/octet-stream', bytes: PDF }),
+    'pdf',
+    'octet-stream 应放行',
+  )
+  const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  assertEqual(detectFormat({ fileName: 'a.docx', declaredMime: docxMime, bytes: ZIP_OOXML }), 'docx', 'docx')
+
+  // ── ① 扩展名白名单 + `.doc` 专拦（验收原文：400 + 「请另存为 .docx 后重传」）──
+  assertEqual(LEGACY_DOC_HINT, '请另存为 .docx 后重传', '`.doc` 的提示文案（前后端共用同一句）')
+  rejected({ fileName: '老合同.doc', declaredMime: 'application/msword', bytes: OLE2 }, LEGACY_DOC_HINT, '.doc')
+  rejected({ fileName: 'a.exe', bytes: TEXT }, '不支持的文件类型', '非白名单扩展名')
+  rejected({ fileName: '没有扩展名', bytes: TEXT }, '缺少扩展名', '无扩展名')
+  rejected({ fileName: 'a.', bytes: TEXT }, '缺少扩展名', '点结尾（等于没有扩展名）')
+
+  // ── ② MIME 交叉校验 ──
+  rejected(
+    { fileName: 'a.pdf', declaredMime: 'text/plain', bytes: PDF },
+    '不符',
+    'MIME 与扩展名矛盾',
+  )
+
+  // ── ③ 文件头魔数：**唯一能抓住"改名"的一道** ──
+  //    改名成 .pdf 的文本：扩展名与 MIME 完全自洽（浏览器就是这么报的），只有内容对不上
+  rejected(
+    { fileName: 'fake.pdf', declaredMime: 'application/pdf', bytes: TEXT },
+    '看起来是纯文本',
+    '改名成 .pdf 的文本',
+  )
+  rejected({ fileName: 'a.pdf', declaredMime: 'application/pdf', bytes: PNG }, '图片', 'PNG 改名成 .pdf')
+  rejected({ fileName: 'a.docx', declaredMime: docxMime, bytes: OLE2 }, LEGACY_DOC_HINT, 'OLE2 改名成 .docx')
+  // 任意 zip 改名成 .docx：签名过了（PNG 那种会被抓），必须靠包内 `[Content_Types].xml` 再确认
+  rejected({ fileName: 'a.docx', declaredMime: docxMime, bytes: ZIP_PLAIN }, 'OOXML', '普通 zip 改名成 .docx')
+  // 反向：真 PDF 改名成 .txt（内容是二进制、扩展名说是文本）
+  rejected({ fileName: 'a.txt', declaredMime: 'text/plain', bytes: PDF }, '不符', 'PDF 改名成 .txt')
+  // 文本扩展名里混进 NUL = 二进制内容的铁证
+  rejected(
+    { fileName: 'a.txt', declaredMime: 'text/plain', bytes: Buffer.concat([TEXT, Buffer.from([0]), TEXT]) },
+    'NUL',
+    '含 NUL 的 .txt',
+  )
+})
+
+await it('shared 文档契约 + `countChars` 的口径（按**码点**计，不是 `.length`）', () => {
+  // 白名单与 `.doc` 是**互斥**的两件事：`.doc` 不在白名单里，但有专门的拦截分支
+  assertEqual([...UPLOAD_EXTENSIONS].join(','), 'pdf,docx,md,txt', '扩展名白名单')
+  assertEqual(UPLOAD_EXTENSIONS.includes(LEGACY_DOC_EXTENSION), false, '.doc 不应在白名单里')
+  assertEqual(UPLOAD_FILE_FIELD, 'file', 'multipart 文件字段名（`02` §4.6 未定，本批定案）')
+
+  // MIME 表必须**恰好**覆盖白名单（多一个键 = 有条目永远不会被查到；少一个 = 该格式的 MIME 校验失效）
+  assertEqual(
+    Object.keys(MIME_BY_EXTENSION).sort().join(','),
+    [...UPLOAD_EXTENSIONS].sort().join(','),
+    'MIME 表的键集合应与白名单逐字一致',
+  )
+  for (const [extension, mimes] of Object.entries(MIME_BY_EXTENSION)) {
+    assert(mimes.length > 0, `${extension} 的 MIME 列表不应为空`)
+    assert(
+      mimes.every((mime) => mime === mime.toLowerCase()),
+      `${extension} 的 MIME 必须是小写（比对前会归一化，表里大写看不出问题但会误导人）`,
+    )
+  }
+
+  // 输出投影
+  const sample = {
+    id: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    kbId: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    fileName: '员工手册.pdf',
+    status: 'PARSING',
+    chunkCount: 0,
+    errorMsg: null,
+    createdAt: '2026-09-21T00:00:00.000Z',
+    updatedAt: '2026-09-21T00:00:00.000Z',
+  }
+  assertEqual(documentItemSchema.safeParse(sample).success, true, '文档项 schema')
+  assertEqual(
+    documentItemSchema.safeParse({ ...sample, status: 'PENDING' }).success,
+    false,
+    'status 只允许 PARSING/READY/FAILED（与 schema.prisma 的枚举逐字一致）',
+  )
+  assertEqual(
+    documentItemSchema.safeParse({ ...sample, chunkCount: -1 }).success,
+    false,
+    'chunkCount 不应允许负数',
+  )
+  // `deduplicated` 必填：调用方必须知道"这次到底有没有产生新文档"，否则前端会去列表里找一个不存在的新文档
+  assertEqual(
+    uploadDocumentResultSchema.safeParse({ document: sample }).success,
+    false,
+    'deduplicated 是必填，不能被省略',
+  )
+  assertEqual(
+    uploadDocumentResultSchema.safeParse({ document: sample, deduplicated: true }).success,
+    true,
+    '上传响应 schema',
+  )
+  assertEqual(
+    documentParamsSchema.safeParse({ id: sample.id, docId: 'not-a-uuid' }).success,
+    false,
+    'docId 必须是 UUID',
+  )
+
+  // `countChars`：`.length` 会把 emoji 数成 2（UTF-16 代理对），`[...str]` 按码点迭代才是"字符数"。
+  // P0-1-18 的 `chunk_size=512` 单位是**字符**，这条口径现在就钉死，免得下游各写一遍。
+  assertEqual(countChars('😀'), 1, '单个 emoji 应算 1 个字符')
+  assertEqual('😀'.length, 2, '（对照）`.length` 会数成 2')
+  assertEqual(countChars('中 a 文'), 3, '空白字符不计入')
+  assertEqual(countChars(''), 0, '空串')
 })
 
 await app.close()

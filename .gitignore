@@ -19,6 +19,10 @@ backend/generated/
 **/src/**/*.d.ts
 **/src/**/*.d.ts.map
 !**/src/**/*.d.mts
+# 例外：**手写的环境声明**（不是 tsc 产物）。约定 `backend/src/types/` 只放手写声明 ——
+# 目前只有 `mammoth.d.ts`（该包既不带类型、也没有 `@types/mammoth`，P0-1-16）。
+# ⚠️ 若哪天 tsc 真把产物写进这个目录，说明 `rootDir`/`outDir` 配错了，**别用 gitignore 掩盖**。
+!backend/src/types/**/*.d.ts
 
 # ===== 环境变量与密钥（绝不提交）=====
 .env
