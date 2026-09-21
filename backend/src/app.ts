@@ -1,5 +1,5 @@
 /**
- * Fastify 实例装配（P0-1-4）
+ * Fastify 实例装配（P0-1-4 起，P0-1-6 加入会话）
  *
  * 依据：`docs/02-后端设计.md` §一（Fastify）、§四（信封）、§五（SSE 前提）、
  *      §十（安全：Cookie 会话 → CORS 不能反射任意来源）、§十三（request id 贯穿）
@@ -9,7 +9,7 @@
  * （不需要占端口，也不会污染本机端口避让的那套约定）。
  *
  * 装配顺序有依赖，不要随意调换：
- *   错误处理 + 校验器 → 请求上下文钩子 → CORS → 路由
+ *   错误处理 + 校验器 → 请求上下文钩子 → 会话（Cookie/鉴权装饰器）→ CORS → 路由
  */
 
 import cors from '@fastify/cors'
@@ -18,6 +18,7 @@ import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } 
 import { config } from './config.js'
 import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
+import { installSession } from './plugins/session.js'
 import { registerHealthRoutes } from './routes/health.js'
 
 /**
@@ -67,7 +68,11 @@ export function buildApp(): FastifyInstance {
     done()
   })
 
-  // ③ 访问日志：默认那两条（incoming/request completed）已关掉，这里只留一条带耗时的，
+  // ③ 会话：`@fastify/cookie`（onRequest 解析 Cookie）+ `requireAuth`/`requireAdmin` 装饰器 +
+  //    `request.auth`（`02` §十 安全设计）。必须在路由前装好 —— 路由的 preHandler 直接用装饰器。
+  installSession(app)
+
+  // ④ 访问日志：默认那两条（incoming/request completed）已关掉，这里只留一条带耗时的，
   //    用 request.log 是为了尊重路由级 logLevel（如 /health 设为 warn，不打点也不刷屏）
   app.addHook('onResponse', (request, reply, done) => {
     request.log.info(
@@ -77,7 +82,7 @@ export function buildApp(): FastifyInstance {
     done()
   })
 
-  // ④ CORS：Cookie 会话 + 前后端分域部署（`02` §十、`06` §二·补）
+  // ⑤ CORS：Cookie 会话 + 前后端分域部署（`02` §十、`06` §二·补）
   //    - 显式白名单（CORS_ORIGINS）；未配置时反射请求 Origin（开发期便利，生产由 config 告警）
   //    - credentials 必须为 true，否则跨域下浏览器不带 Cookie
   void app.register(cors, {
@@ -88,7 +93,7 @@ export function buildApp(): FastifyInstance {
     maxAge: 600,
   })
 
-  // ⑤ 路由
+  // ⑥ 路由
   registerHealthRoutes(app)
 
   return app

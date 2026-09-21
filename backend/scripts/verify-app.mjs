@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 /**
- * verify-app.mjs —— P0-1-4 的**接口级验收**（不占端口、不需要真实依赖）
+ * verify-app.mjs —— **接口级验收**（不占端口、不需要真实依赖）
+ *
+ * 覆盖两批：
+ *   · P0-1-4：信封形态 / HTTP 状态码 / Zod 校验失败字段明细 / 领域错误 / 未知异常不泄内部信息 /
+ *             404 兜底 / 非法 JSON / CORS 预检 / requestId 透传 / `/health` 三项探活恒 200
+ *   · P0-1-6：密文往返与**篡改检出**（GCM tag）/ 版本与 AAD 上下文 / bcrypt 形态与拒绝超长 /
+ *             初始密码生成 / **未登录一律 401 且不碰会话存储**
  *
  * 为什么用 `app.inject` 而不是 curl：
  *   ① 本机端口是稀缺资源（3000/5173 都被别的项目占着，见 `06` §七 待决事项 6），
  *      inject 直接走 Fastify 内部请求生命周期，不监听、不留端口；
  *   ② CI 里不需要 docker-compose 就能验证 HTTP 层契约（依赖探活失败也是一种可断言的状态）。
  *
- * 验的是「协议契约」，不是「依赖可用性」——依赖那部分由 `/health` 探活 + 本机验收记录覆盖。
- * 覆盖：信封形态 / HTTP 状态码 / Zod 校验失败字段明细 / 领域错误 / 未知异常不泄内部信息 /
- *      404 兜底 / 非法 JSON / CORS 预检 / requestId 透传 / `/health` 三项探活恒 200。
+ * 验的是「协议契约」+「纯函数正确性」，不是「依赖可用性」——会话在真实 Redis/PG 上的
+ * 完整往返（Cookie 属性、停用即失效、登出、滑动续期）在 `verify-session.mjs` 里跑，
+ * 那一个**需要** `pnpm infra:up` + 已迁移的库。
  *
  * 附加探针路由（`/__verify/*`）由**本脚本自己注册**，不进源码树：
  *   产品代码里只有 `/health` 一个路由，测试用的路由不该混进去。
@@ -23,6 +29,20 @@ import { z } from 'zod'
 
 import { AppError, ok } from '@doubulea/shared'
 import { buildApp } from '../dist/backend/src/app.js'
+import {
+  BCRYPT_COST,
+  DUMMY_PASSWORD_HASH,
+  INITIAL_PASSWORD_LENGTH,
+  MAX_PASSWORD_BYTES,
+  SecretDecryptionError,
+  SecretFormatError,
+  decryptSecret,
+  encryptSecret,
+  generateInitialPassword,
+  hashPassword,
+  passwordByteLength,
+  verifyPassword,
+} from '../dist/backend/src/infra/crypto.js'
 import { closePg } from '../dist/backend/src/infra/pg.js'
 import { closeRedis } from '../dist/backend/src/infra/redis.js'
 
@@ -65,7 +85,7 @@ async function it(name, fn) {
 
 const expectDegraded = process.env.EXPECT_DEGRADED === '1'
 
-console.log(`\n${c.b}══ P0-1-4 接口级验收：Fastify 骨架 / 错误信封 / /health ══${c.x}`)
+console.log(`\n${c.b}══ 接口级验收：Fastify 骨架 / 错误信封 / /health / 密码与会话基础设施 ══${c.x}`)
 console.log(`  ${c.d}模式：${expectDegraded ? '依赖全部不可达（断言 degraded）' : '本机依赖（断言 /health 全绿）'}${c.x}`)
 
 const app = buildApp()
@@ -94,6 +114,12 @@ app.get('/__verify/boom', () => {
   // 故意夹带「内部细节」：验证它**不会**出现在响应体里（`02` §十）
   throw new Error('内部细节：secret-token-abc / password=hunter2')
 })
+// 会话探针（P0-1-6）：`requireAuth` 的实现里，「无 Cookie」这一条**不碰 Redis**，
+// 因此它在有/无依赖两种环境下都应当稳定返回 401 —— 这正是下面要断言的。
+app.get('/__verify/protected', { preHandler: app.requireAuth }, async (request) =>
+  ok({ userId: request.auth?.user.id, role: request.auth?.user.role }),
+)
+app.get('/__verify/admin-only', { preHandler: app.requireAdmin }, async () => ok({ scope: 'admin' }))
 
 await app.ready()
 
@@ -265,15 +291,200 @@ await it('requestId：上游 x-request-id 透传 + 响应头回带', async () =>
   )
 })
 
+// ── 9. 密文加解密（P0-1-6）：往返 / 篡改检出 / 版本 / AAD ──
+const SAMPLE = 'sk-live-这是一个带中文与 emoji 🔐 的密钥-0O1lI'
+
+await it('AES-256-GCM 往返一致（含中文/emoji/空串），且密文形态为 v1.<iv>.<tag>.<ct>', async () => {
+  const encrypted = encryptSecret(SAMPLE)
+  assertEqual(decryptSecret(encrypted), SAMPLE, '解密结果')
+  const parts = encrypted.split('.')
+  assertEqual(parts.length, 4, '密文段数')
+  assertEqual(parts[0], 'v1', '版本前缀')
+  assertEqual(decryptSecret(encryptSecret('')), '', '空串也应能往返')
+  console.log(`         ${c.d}${encrypted.slice(0, 46)}…（${encrypted.length} 字符）${c.x}`)
+})
+
+await it('同一明文两次加密得到**不同**密文（IV 随机），且明文不出现在密文里', async () => {
+  const a = encryptSecret(SAMPLE)
+  const b = encryptSecret(SAMPLE)
+  assert(a !== b, '两次加密结果相同 —— IV 没有随机化')
+  assertEqual(decryptSecret(a), SAMPLE, 'a 解密')
+  assertEqual(decryptSecret(b), SAMPLE, 'b 解密')
+  assert(a.includes('sk-live') === false && b.includes('sk-live') === false, '密文里出现了明文片段')
+})
+
+await it('篡改密文 / 认证标签 → SecretDecryptionError（GCM tag 校验生效）', async () => {
+  const parts = encryptSecret(SAMPLE).split('.')
+  for (const index of [2, 3]) {
+    const tampered = [...parts]
+    const segment = tampered[index]
+    // 改一个字符（首字符换掉）即可让 tag 校验失败
+    tampered[index] = (segment[0] === 'A' ? 'B' : 'A') + segment.slice(1)
+    let thrown
+    try {
+      decryptSecret(tampered.join('.'))
+    } catch (error) {
+      thrown = error
+    }
+    assert(thrown !== undefined, `篡改第 ${index} 段后仍然解密成功 —— 篡改未被检出`)
+    assert(
+      thrown instanceof SecretDecryptionError,
+      `篡改第 ${index} 段应抛 SecretDecryptionError，实际 ${thrown?.name}：${thrown?.message}`,
+    )
+  }
+})
+
+await it('IV 被替换成另一个合法 IV → 解密失败（不会解出错误明文）', async () => {
+  const a = encryptSecret(SAMPLE).split('.')
+  const b = encryptSecret(SAMPLE).split('.')
+  a[1] = b[1]
+  let thrown
+  try {
+    decryptSecret(a.join('.'))
+  } catch (error) {
+    thrown = error
+  }
+  assert(thrown instanceof SecretDecryptionError, `应抛 SecretDecryptionError，实际 ${thrown?.name}`)
+})
+
+await it('AAD 上下文：同值可解、错值被拒、缺省不匹配', async () => {
+  const bound = encryptSecret(SAMPLE, 'provider:abc')
+  assertEqual(decryptSecret(bound, 'provider:abc'), SAMPLE, '同一上下文应能解密')
+  for (const [label, context] of [
+    ['换了上下文', 'provider:def'],
+    ['不传上下文', undefined],
+  ]) {
+    let thrown
+    try {
+      decryptSecret(bound, context)
+    } catch (error) {
+      thrown = error
+    }
+    assert(thrown instanceof SecretDecryptionError, `${label} 时应解密失败，实际 ${thrown?.name}`)
+  }
+  // 反向：不带上下文加密的密文，带上下文也解不开
+  let thrown
+  try {
+    decryptSecret(encryptSecret(SAMPLE), 'provider:abc')
+  } catch (error) {
+    thrown = error
+  }
+  assert(thrown instanceof SecretDecryptionError, `带上下文解无上下文密文应失败，实际 ${thrown?.name}`)
+})
+
+await it('密文串结构非法 → SecretFormatError（版本未知 / 段数不对 / 编码非法）', async () => {
+  const bytes32 = Buffer.alloc(32).toString('base64url')
+  const bytes16 = Buffer.alloc(16).toString('base64url')
+  const cases = [
+    ['未知版本', `v9.${bytes32}.${bytes16}.`],
+    ['段数不足', `v1.${bytes32}.${bytes16}`],
+    ['IV 长度不对', `v1.${Buffer.alloc(8).toString('base64url')}.${bytes16}.`],
+    ['标签长度不对', `v1.${bytes32}.${bytes16}.`],
+  ]
+  for (const [label, payload] of cases) {
+    let thrown
+    try {
+      decryptSecret(payload)
+    } catch (error) {
+      thrown = error
+    }
+    assert(thrown instanceof SecretFormatError, `${label} 应抛 SecretFormatError，实际 ${thrown?.name}`)
+  }
+})
+
+// ── 10. 密码哈希（P0-1-6）：bcrypt 形态 / 校验 / 拒绝超长 ──
+await it(`bcrypt 摘要形态正确（$2b$${BCRYPT_COST}$… / 60 字符）且能校验正确与错误密码`, async () => {
+  const hash = await hashPassword('Passw0rd-中文-🔐')
+  assert(hash.startsWith(`$2b$${BCRYPT_COST}$`), `摘要前缀应为 $2b$${BCRYPT_COST}$，实际 ${hash.slice(0, 7)}`)
+  assertEqual(hash.length, 60, '摘要长度')
+  assertEqual(await verifyPassword('Passw0rd-中文-🔐', hash), true, '正确密码')
+  assertEqual(await verifyPassword('Passw0rd-中文-🔐x', hash), false, '错误密码')
+  const again = await hashPassword('Passw0rd-中文-🔐')
+  assert(again !== hash, '同一密码两次哈希结果相同 —— salt 没随机化')
+})
+
+await it('超长密码（>72 字节）被**显式拒绝**，不做静默截断', async () => {
+  const long = `${'a'.repeat(MAX_PASSWORD_BYTES)}中文` // 72 字节 + 6 字节
+  assert(passwordByteLength(long) > MAX_PASSWORD_BYTES, '构造的样本应当超长')
+  let thrown
+  try {
+    await hashPassword(long)
+  } catch (error) {
+    thrown = error
+  }
+  assert(thrown instanceof RangeError, `应抛 RangeError，实际 ${thrown?.name}`)
+  assert(thrown.message.includes('72'), `报错应点明 72 字节上限，实际：${thrown.message}`)
+  // 恰好 72 字节（多字节字符按字节算）应当放行 —— 边界不能"少一个也算超"
+  const exact = '中'.repeat(24) // 24 × 3 = 72 字节
+  assertEqual(passwordByteLength(exact), MAX_PASSWORD_BYTES, '样本字节数')
+  assert((await hashPassword(exact)).length === 60, '恰好在上限的密码应可哈希')
+})
+
+await it('DUMMY_PASSWORD_HASH 是**结构合法**的摘要（等时比较的前提），且恒不匹配', async () => {
+  // ⚠️ 实测：bcrypt 对结构非法的摘要 compare 会立刻返回 false（0ms）—— 那样就起不到等时作用
+  assert(DUMMY_PASSWORD_HASH.startsWith(`$2b$${BCRYPT_COST}$`), '必须是 cost 12 的合法摘要')
+  assertEqual(DUMMY_PASSWORD_HASH.length, 60, '摘要长度')
+  assertEqual(await verifyPassword('', DUMMY_PASSWORD_HASH), false, '空密码不应匹配')
+  assertEqual(await verifyPassword(DUMMY_PASSWORD_HASH, DUMMY_PASSWORD_HASH), false, '摘要自身不应匹配')
+})
+
+await it('摘要本身损坏时 verifyPassword 返回 false（不抛错，避免把脏数据包装成 500）', async () => {
+  assertEqual(await verifyPassword('whatever', 'not-a-bcrypt-hash'), false, '非法摘要')
+  assertEqual(await verifyPassword('whatever', ''), false, '空摘要')
+})
+
+// ── 11. 初始密码生成（P0-1-6；P0-1-8 建号用） ──
+await it('初始密码：长度 / 无易混字符 / 三类字符齐备 / 每次不同', async () => {
+  const samples = Array.from({ length: 30 }, () => generateInitialPassword())
+  for (const password of samples) {
+    assertEqual(password.length, INITIAL_PASSWORD_LENGTH, '长度')
+    assert(/^[A-Za-z0-9]+$/.test(password), `应只含字母数字，实际 ${password}`)
+    assert(/[0O1lI]/.test(password) === false, `不应含易混字符 0/O/1/l/I，实际 ${password}`)
+    assert(/[A-Z]/.test(password) && /[a-z]/.test(password) && /[0-9]/.test(password), `三类字符应齐备：${password}`)
+  }
+  assertEqual(new Set(samples).size, samples.length, '30 次生成应当互不相同')
+  assertEqual(generateInitialPassword(8).length, 8, '显式长度参数应生效')
+})
+
+// ── 12. 会话的「未登录」出口（P0-1-6）：不碰依赖也必须稳定拒绝 ──
+await it('未登录访问受保护路由 → 401 / UNAUTHORIZED（且**不依赖 Redis 可达**）', async () => {
+  for (const url of ['/__verify/protected', '/__verify/admin-only']) {
+    const response = await app.inject({ method: 'GET', url })
+    assertEqual(response.statusCode, 401, `${url} 状态码`)
+    const body = response.json()
+    assertEqual(body.code, 'UNAUTHORIZED', `${url} 信封 code`)
+    assert(typeof body.msg === 'string' && body.msg !== '', `${url} msg 不应为空`)
+    // 无 Cookie 时**不该**去查会话存储：所以依赖不可达的环境（CI）里这条也必须是 401 而不是 500
+  }
+})
+
+await it('伪造/过期会话 Cookie → 拒绝且**绝不放行**（有依赖时 401，依赖不可达时 500）', async () => {
+  const response = await app.inject({
+    method: 'GET',
+    url: '/__verify/protected',
+    headers: { cookie: 'doubulea_sid=not-a-real-session-token' },
+  })
+  assert(response.statusCode !== 200, '伪造的会话令牌竟然通过了鉴权')
+  if (expectDegraded) {
+    // 会话存储不可用 → 失败关闭（fail-closed）：语义是"服务端此刻给不出结论"，
+    // 不是"你的凭据不对"，故 500 而非 401（`plugins/session.ts` 文件头「②」）。
+    assertEqual(response.statusCode, 500, '依赖不可达时状态码')
+    assertEqual(response.json().code, 'INTERNAL', '依赖不可达时信封 code')
+  } else {
+    assertEqual(response.statusCode, 401, 'Redis 可达但会话不存在时状态码')
+    assertEqual(response.json().code, 'UNAUTHORIZED', '信封 code')
+  }
+})
+
 await app.close()
 await closePg()
 await closeRedis()
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-1-4 接口级验收通过：${passed} 项全通过${c.x}`)
+  console.log(`${c.g}${c.b}✅ 接口级验收通过：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-1-4 接口级验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ 接口级验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }

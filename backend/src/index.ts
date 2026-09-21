@@ -100,7 +100,7 @@ try {
   const address = await app.listen({ port: config.port, host: DEFAULT_HOST })
   const bootEnvelope: Envelope<{ service: string; step: string; address: string }> = ok({
     service: 'doubulea-backend',
-    step: 'P0-1-5 数据模型第一批 + Prisma 基线',
+    step: 'P0-1-6 密码与会话基础设施',
     address,
   })
   logger.info(

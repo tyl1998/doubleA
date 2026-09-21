@@ -13,6 +13,7 @@
     "config:check": "pnpm run build && node dist/backend/src/index.js --check-config",
     "verify:app": "pnpm run build && node scripts/verify-app.mjs",
     "verify:db": "pnpm run build && node scripts/verify-db.mjs",
+    "verify:session": "pnpm run build && node scripts/verify-session.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "db:generate": "prisma generate",
@@ -24,9 +25,11 @@
   },
   "dependencies": {
     "@doubulea/shared": "workspace:*",
+    "@fastify/cookie": "^11.1.2",
     "@fastify/cors": "^11.3.0",
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "^7.10.0",
+    "bcrypt": "^6.0.0",
     "fastify": "^5.12.5",
     "ioredis": "^6.0.0",
     "minio": "^8.0.7",
@@ -35,6 +38,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@types/node": "^22.9.0",
     "@types/pg": "^8.23.1",
     "pino-pretty": "^13.1.3",

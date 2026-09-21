@@ -366,6 +366,21 @@ const envSchema = z
     S3_BUCKET: requiredText('S3_BUCKET'),
     CREDENTIAL_MASTER_KEY: credentialMasterKeyVar,
 
+    // ── 会话与安全（P0-1-6；`02` §十）──
+    /**
+     * 会话有效期（小时）。命中后按**半衰期滑动续期**（见 `infra/redis.ts` 的 readSession），
+     * 因此「活跃用户不会被踢下线、闲置用户按此上限过期」。
+     */
+    SESSION_TTL_HOURS: intVar('SESSION_TTL_HOURS', 12, { min: 1, max: 720 }),
+    /**
+     * 「每请求校验 `user.status`」的缓存窗口（秒）。`02` §十 点名 60s ——
+     * 窗口内的状态变更由**写侧的主动失效**兜住（`plugins/session.ts#invalidateUserSnapshot`），
+     * 缓存只兜底非本机写入（直接在库里改状态）的场景。
+     */
+    USER_STATUS_CACHE_TTL_SEC: intVar('USER_STATUS_CACHE_TTL_SEC', 60, { min: 1, max: 600 }),
+    /** 会话 Cookie 是否加 `Secure`；未设置时跟随 `NODE_ENV=production` */
+    SESSION_COOKIE_SECURE: optionalBoolVar('SESSION_COOKIE_SECURE'),
+
     // ── embedding 双模式（决策 26 / `02` §八）──
     EMBEDDING_MODE: defaultedVar(
       z.enum(EMBEDDING_MODES, { errorMap: () => ({ message: `EMBEDDING_MODE 只能是 ${EMBEDDING_MODES.join('/')}` }) }),
@@ -434,6 +449,16 @@ export interface AppConfig {
   s3: { endpoint: string; key: string; secret: string; bucket: string }
   /** 凭据/Provider Key 加密主密钥（已解码的 32 字节；不进日志，见 `describeConfig`） */
   credentialMasterKey: Buffer
+
+  /** 会话（P0-1-6；`02` §十） */
+  session: {
+    /** 会话有效期（秒，由 `SESSION_TTL_HOURS` 换算；Redis 键上就是它） */
+    ttlSeconds: number
+    /** 「每请求校验 user.status」的缓存窗口（秒） */
+    statusCacheTtlSec: number
+    /** Cookie 是否加 `Secure`（HTTPS-only）。生产默认 true —— 明文 HTTP 上置 false 要自己认风险 */
+    cookieSecure: boolean
+  }
 
   embedding: {
     mode: EmbeddingMode
@@ -592,6 +617,17 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     warnings.push('生产环境主密钥长度异常（应恒为 44 字符的 base64）')
   }
 
+  // 会话 Cookie 的 Secure 位：默认跟随 NODE_ENV，但**允许显式关掉** ——
+  // 内网生产形态常是「HTTP 直连 + 网关」，此时 Secure 会让浏览器直接丢掉 Cookie（表现为「登录成功却立刻未登录」），
+  // 比明文传输更难排查。故给出口子，但生产关掉时必须告警（`02` §十：会话是 HttpOnly Cookie）。
+  const cookieSecure = vars.SESSION_COOKIE_SECURE ?? vars.NODE_ENV === 'production'
+  if (vars.NODE_ENV === 'production' && !cookieSecure) {
+    warnings.push(
+      'SESSION_COOKIE_SECURE=false：生产环境会话 Cookie 会在明文 HTTP 上传输（可被同网段嗅探）。' +
+        '请改用 HTTPS，或明确接受内网 HTTP 的风险。',
+    )
+  }
+
   return {
     nodeEnv: vars.NODE_ENV,
     isDevelopment,
@@ -611,6 +647,12 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       bucket: vars.S3_BUCKET,
     },
     credentialMasterKey: Buffer.from(vars.CREDENTIAL_MASTER_KEY, 'base64'),
+
+    session: {
+      ttlSeconds: vars.SESSION_TTL_HOURS * 3600,
+      statusCacheTtlSec: vars.USER_STATUS_CACHE_TTL_SEC,
+      cookieSecure,
+    },
 
     embedding: {
       mode: vars.EMBEDDING_MODE,
@@ -671,6 +713,11 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       secret: `${value.s3.secret.length} 字符`,
     },
     credentialMasterKey: `已设置（${value.credentialMasterKey.length} 字节）`,
+    session: {
+      ttlHours: value.session.ttlSeconds / 3600,
+      statusCacheTtlSec: value.session.statusCacheTtlSec,
+      cookieSecure: value.session.cookieSecure,
+    },
     embedding: {
       mode: value.embedding.mode,
       apiUrl: value.embedding.apiUrl ?? null,
