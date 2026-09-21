@@ -22,6 +22,7 @@
     "verify:llm": "pnpm run build:shared && pnpm run build && node scripts/verify-llm.mjs",
     "verify:embedding": "pnpm run build:shared && pnpm run build && node scripts/verify-embedding.mjs",
     "verify:knowledge": "pnpm run build:shared && pnpm run build && node scripts/verify-knowledge.mjs",
+    "verify:knowledge-bases": "pnpm run build:shared && pnpm run build && node scripts/verify-knowledge-bases.mjs",
     "verify:e2e": "pnpm run build:shared && pnpm run build && node scripts/verify-e2e.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",

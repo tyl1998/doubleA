@@ -21,6 +21,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerHealthRoutes } from './routes/health.js'
+import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerUserRoutes } from './routes/users.js'
@@ -108,6 +109,9 @@ export function buildApp(): FastifyInstance {
   registerUserRoutes(app)
   registerModelProviderRoutes(app)
   registerModelRoutes(app)
+  // ⑧ 知识库（P0-1-15）。注意权限是**登录即可**（`03` §25：`/knowledge` 的权限列是「登录」，
+  //    与 `/admin/*` 不同）—— 路由内部一个 `requireAdmin` 都没有，这是刻意的。
+  registerKnowledgeBaseRoutes(app)
 
   return app
 }

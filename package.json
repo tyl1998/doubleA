@@ -32,6 +32,7 @@
     "verify:llm": "pnpm --filter @doubulea/backend verify:llm",
     "verify:embedding": "pnpm --filter @doubulea/backend verify:embedding",
     "verify:knowledge": "pnpm --filter @doubulea/backend verify:knowledge",
+    "verify:knowledge-bases": "pnpm --filter @doubulea/backend verify:knowledge-bases",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

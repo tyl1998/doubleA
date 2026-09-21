@@ -19,12 +19,17 @@
  *              `available` 的 `type` 必填、`maxContext` 三态、两套投影的键集合互不串味）
  *   · P0-1-12：`/api/model-providers/:id/remote-models` 已注册（**子路径**，匿名 401 / 非法 UUID 400）
  *              + 上游模型列表契约（形态与取值域、键集合里不存在任何凭据名）
+ *   · P0-1-15：`/api/knowledge-bases` 五条路由已注册、且**刻意没有** `/available` 子路径
+ *              （本资源对全员开放，不像模型池那样需要第二套投影）+ 知识库契约
+ *              （`retrieval_config` 的**逐键兜底**与越界退回默认、建库四项可省、
+ *              `description` 三态、`embeddingModelChanged` 三态）
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
  * Provider 的**落库形态**（`api_key_enc` 是密文、读接口不含明文、三态真地写对列）
  * 由 `verify-model-providers.mjs` 覆盖；模型的落库与守卫（含"provider 停用后模型从
- * 可选列表消失"）由 `verify-models.mjs` 覆盖，两档都需要真实 PG。
+ * 可选列表消失"）由 `verify-models.mjs` 覆盖；知识库的落库、快照、级联与 S3 清理
+ * 由 `verify-knowledge-bases.mjs` 覆盖，三档都需要真实 PG（知识库那档不需要 Redis）。
  *
  * 为什么用 `app.inject` 而不是 curl：
  *   ① 本机端口是稀缺资源（3000/5173 都被别的项目占着，见 `06` §七 待决事项 6），
@@ -53,7 +58,11 @@ import {
   createModelBodySchema,
   createModelProviderBodySchema,
   createUserBodySchema,
+  createKnowledgeBaseBodySchema,
+  DEFAULT_RETRIEVAL_CONFIG,
   initialPasswordResultSchema,
+  knowledgeBaseItemSchema,
+  knowledgeBaseListResultSchema,
   listAvailableModelsQuerySchema,
   listModelProvidersQuerySchema,
   listModelsQuerySchema,
@@ -64,12 +73,15 @@ import {
   modelOptionListResultSchema,
   modelOptionSchema,
   modelProviderItemSchema,
+  normalizeRetrievalConfig,
   normalizeUsername,
   offsetPageOf,
   ok,
+  retrievalConfigInputSchema,
   remoteModelListResultSchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
+  updateKnowledgeBaseBodySchema,
   updateUserBodySchema,
   userListItemSchema,
   utf8ByteLength,
@@ -1129,6 +1141,156 @@ await it('shared 上游模型列表契约：形态与取值域 + 键集合不含
   for (const forbidden of ['apiKey', 'apiKeyEnc', 'apiKeyPreview', 'hasKey', 'authorization']) {
     assert(!keys.includes(forbidden), `该响应不得含凭据类键 ${forbidden}，实际：${keys.join(',')}`)
   }
+})
+
+// ── 17. 知识库契约与路由（P0-1-15）──
+await it('知识库五条路由已注册，且**刻意没有** /available 子路径（本资源对全员开放，不需要第二套投影）', async () => {
+  // `02` §4.6 的 CRUD 四端点 + `GET /:id` 详情
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases' }), true, '列表路由')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id' }), true, '详情路由')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases' }), true, '建库路由')
+  assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/knowledge-bases/:id' }), true, '改库路由')
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/knowledge-bases/:id' }), true, '删库路由')
+  // 与 `/api/models/available` 的对照：模型池的管理列表是 ADMIN 专属，所以必须另开一条全员可读的；
+  // 知识库列表**本来就对全员开放**（`03` §25 的权限列是「登录」），再开一条就是多余的第二个真相
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/available' }),
+    false,
+    '不应存在 /available（本资源无需拆投影）',
+  )
+
+  // 匿名：校验先于鉴权，所以先看到 400（非法 UUID）再看到 401（鉴权）
+  const badId = await app.inject({ method: 'GET', url: '/api/knowledge-bases/not-a-uuid' })
+  assertEqual(badId.statusCode, 400, '非法 UUID 的状态码')
+  assertEqual(
+    (badId.json().data?.fields ?? []).some((field) => field.path === 'params.id'),
+    true,
+    '应报 params.id（说明路径参数 schema 真的接线了）',
+  )
+
+  const anonymous = await app.inject({ method: 'GET', url: '/api/knowledge-bases' })
+  assertEqual(anonymous.statusCode, 401, '匿名列表状态码')
+  assertEqual(anonymous.json().code, 'UNAUTHORIZED', '匿名列表错误码')
+})
+
+await it('shared 知识库契约：retrieval_config 补默认值（唯一入口）与建/改 schema 纪律', () => {
+  // ① 规范默认值 = `子方案①` §二 的"完整形状"（6 键）—— 与 DB 默认值必须是同一组值
+  assertEqual(Object.keys(DEFAULT_RETRIEVAL_CONFIG).length, 6, '默认形状应有 6 个键')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.topK, 5, '默认 topK')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.score, 0.3, '默认 score')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.mode, 'HYBRID', '默认 mode')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.splitStrategy, 'hybrid', '默认 splitStrategy')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.rrfK, 60, '默认 rrfK')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.weights.vector, 1, '默认向量权重')
+  assertEqual(DEFAULT_RETRIEVAL_CONFIG.weights.fulltext, 1, '默认全文权重')
+
+  // ② **逐键兜底**（这是它的核心契约）：整体缺失、空对象、缺一半、类型错、越界值 —— 都要给出完整形状
+  for (const broken of [
+    undefined,
+    null,
+    {},
+    { topK: 10 }, // 只给一个键（PATCH 局部写入的典型形态）
+    { topK: 'abc', score: null, mode: 'NOPE', splitStrategy: 42, rrfK: {}, weights: 'x' },
+    { topK: 0, score: 5, mode: 'VECTOR', splitStrategy: 'fixed', rrfK: 99999, weights: { vector: -1 } },
+    'not-an-object',
+    [1, 2, 3],
+  ]) {
+    const normalized = normalizeRetrievalConfig(broken)
+    const parsed = retrievalConfigInputSchema.safeParse(normalized)
+    assertEqual(
+      parsed.success,
+      true,
+      `坏数据 ${JSON.stringify(broken)} 归一后必须仍符合契约，实际 ${JSON.stringify(normalized)}`,
+    )
+    // 越界值**退回默认**而不是 clamp：5 → 1 会被误读成"用户就是要 1"
+    if (typeof broken === 'object' && broken !== null && !Array.isArray(broken) && broken.score === 5) {
+      assertEqual(normalized.score, DEFAULT_RETRIEVAL_CONFIG.score, '越界 score 应退回默认值')
+    }
+    if (typeof broken === 'object' && broken !== null && !Array.isArray(broken) && broken.mode === 'VECTOR') {
+      assertEqual(normalized.mode, 'VECTOR', '合法 mode 应被保留')
+    }
+  }
+  // `patch` 的优先级必须**高于** `base`（建库时把请求体叠到环境默认值上、改库时叠到当前值上）——
+  // 反了的话症状很隐蔽：接口 200、响应看着正常，但**用户改的值被静默丢弃**（这条断言就是盯它）
+  assertEqual(normalizeRetrievalConfig({ topK: 99 }, { topK: 7 }).topK, 7, 'patch 应压过 base')
+  assertEqual(
+    normalizeRetrievalConfig({ topK: 6, score: 0.5 }, { score: 0.9 }).topK,
+    6,
+    'patch 没给的键应保留 base 的值（改一半不能把另一半打回默认）',
+  )
+  assertEqual(
+    normalizeRetrievalConfig({ weights: { vector: 2, fulltext: 3 } }, { weights: { vector: 9, fulltext: 3 } })
+      .weights.vector,
+    9,
+    'weights 也应按键合并',
+  )
+
+  // ③ 建库：四项全可省（`子方案①` §十一：建库时快照环境默认值）
+  assertEqual(createKnowledgeBaseBodySchema.safeParse({ name: '只给名字' }).success, true, '只给 name 应通过')
+  assertEqual(createKnowledgeBaseBodySchema.safeParse({}).success, false, '缺 name 应被拒')
+  assertEqual(createKnowledgeBaseBodySchema.safeParse({ name: '   ' }).success, false, '空白 name 应被拒')
+  assertEqual(
+    createKnowledgeBaseBodySchema.safeParse({ name: 'x'.repeat(129) }).success,
+    false,
+    'name 超 128 应被拒（列是 VARCHAR(128)）',
+  )
+  assertEqual(
+    createKnowledgeBaseBodySchema.safeParse({ name: 'n', retrievalConfig: { mode: 'vector' } }).success,
+    false,
+    'mode 枚举是大写，小写应被拒',
+  )
+  assertEqual(
+    createKnowledgeBaseBodySchema.safeParse({ name: 'n', chunkSize: 8193 }).success,
+    false,
+    'chunkSize 超 8192 应被拒（单位是字符，超上限只可能来自单位误解）',
+  )
+  // weights 要么都给、要么都不给
+  assertEqual(
+    createKnowledgeBaseBodySchema.safeParse({ name: 'n', retrievalConfig: { weights: { vector: 1 } } }).success,
+    false,
+    'weights 给一半应被拒（另一半会静默取默认值，像"设了没生效"）',
+  )
+
+  // ④ 改库：`description` 三态 —— 不带 / null（清空）/ 字符串，三者必须可区分
+  const patch = updateKnowledgeBaseBodySchema
+  assertEqual(patch.safeParse({}).success, false, '空改动应被拒')
+  const untouched = patch.safeParse({ name: 'x' })
+  assertEqual(untouched.success, true, '只改 name 应通过')
+  assertEqual(
+    Object.prototype.hasOwnProperty.call(untouched.data, 'description'),
+    false,
+    '不带 description 时该键**不应存在**（存在且为 undefined 都是"不动"的另一种写法，会误导服务层）',
+  )
+  const cleared = patch.safeParse({ description: null })
+  assertEqual(cleared.success, true, 'null 描述应通过（= 清空）')
+  assertEqual(cleared.data.description, null, 'null 必须原样保留（不能被 default 吃掉）')
+
+  // ⑤ 输出投影：`embeddingModelChanged` 是三态（null = provider 未就绪、无法判定）
+  const sample = {
+    id: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+    name: '示例库',
+    description: null,
+    embeddingModel: 'api:bge-m3',
+    embeddingModelChanged: null,
+    chunkSize: 512,
+    chunkOverlap: 64,
+    retrievalConfig: DEFAULT_RETRIEVAL_CONFIG,
+    documentCount: 0,
+    agentCount: 0,
+    createdAt: '2026-09-21T00:00:00.000Z',
+    updatedAt: '2026-09-21T00:00:00.000Z',
+  }
+  assertEqual(knowledgeBaseItemSchema.safeParse(sample).success, true, '列表项 schema')
+  assertEqual(
+    knowledgeBaseItemSchema.safeParse({ ...sample, embeddingModelChanged: 'no' }).success,
+    false,
+    'embeddingModelChanged 必须是布尔或 null（不许用字符串糊过去）',
+  )
+  assertEqual(
+    knowledgeBaseListResultSchema.safeParse({ items: [sample], total: 1, offset: 0, limit: 20 }).success,
+    true,
+    '分页响应同构',
+  )
 })
 
 await app.close()
