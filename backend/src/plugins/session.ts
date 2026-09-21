@@ -1,17 +1,20 @@
 /**
- * 会话插件（P0-1-6）
+ * 会话插件（P0-1-6 起，P0-1-7 加入首登改密闸门）
  *
  * 依据：`docs/02-后端设计.md` §十 安全设计 —— 「会话：HttpOnly + SameSite=Lax Cookie +
  *      Redis 存储（登出即毁）；**每请求校验 user.status（60s TTL 缓存），停用账号立即失效**」
- *      + §4.1（`/api/auth/*` 四个端点会用到本插件）+ §四（错误出口走统一信封）
+ *      + §4.1（`/api/auth/*` 四个端点、以及「首登强制改密期间除 password/me/logout 全 403」的注记）
+ *      + §四（错误出口走统一信封）
  *
- * 本文件提供四样东西：
+ * 本文件提供这些能力：
  *   1. {@link installSession} —— 装配：注册 `@fastify/cookie`、挂 `requireAuth`/`requireAdmin`
  *      装饰器、声明 `request.auth`。
  *   2. `requireAuth` —— 路由 `preHandler`：解析 Cookie → 查 Redis 会话 → **校验 user.status**
  *      → 把用户快照挂到 `request.auth`，并把 userId 补进日志上下文。
  *   3. `requireAdmin` —— 在其上再加一层角色判定（`(A)` 端点用）。
- *   4. {@link issueSession} / {@link endSession} —— 登录与登出的会话收发（P0-1-7 直接用）。
+ *   4. {@link requireAuthContext} —— handler 里取已认证上下文（省掉每处的 null 收窄）。
+ *   5. {@link issueSession} / {@link endSession} —— 登录与登出的会话收发。
+ *   6. {@link installPasswordChangeGate} —— 首登强制改密闸门（P0-1-7）。
  *
  * 三条刻意的口径：
  *
@@ -155,13 +158,14 @@ async function resolveSnapshot(userId: string): Promise<UserSnapshot | undefined
   const user = await getPrisma().user.findUnique({
     where: { id: userId },
     // 只取 `requireAuth` 需要的字段：**绝不带出 password_hash**（`02` §十 密钥零下发）
-    select: { id: true, username: true, role: true, status: true, mustChangePassword: true },
+    select: { id: true, username: true, nickname: true, role: true, status: true, mustChangePassword: true },
   })
   if (user === null) return undefined
 
   const snapshot: UserSnapshot = {
     id: user.id,
     username: user.username,
+    nickname: user.nickname,
     role: user.role,
     status: user.status,
     mustChangePassword: user.mustChangePassword,
@@ -244,6 +248,77 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promi
   // requireAuth 成功必然写入 auth；这里的判断只是给类型收窄 + 兜住"有人误把它当独立钩子用"
   if (auth === null) throw AppError.unauthorized('未登录或会话已失效')
   if (auth.user.role !== UserRole.ADMIN) throw AppError.forbidden('该操作仅限管理员')
+}
+
+/**
+ * 取「已认证上下文」（路由 handler 里用）。
+ *
+ * 为什么要有它：路由写了 `preHandler: app.requireAuth` 就一定能拿到 auth，
+ * 但 TypeScript 看不到这层因果关系（`request.auth` 的类型是 `AuthContext | null`），
+ * 于是每个 handler 都要写一遍 `if (request.auth === null) throw ...` 来收窄类型 ——
+ * 那种重复的、永远不会触发的分支散在各处只会掩盖真正的逻辑。收口到这一个函数里，
+ * 且它同时兜住"有人忘了挂 preHandler"这种真实的接线错误（此时它会 401 而不是拿 null 崩）。
+ */
+export function requireAuthContext(request: FastifyRequest): AuthContext {
+  const auth = request.auth
+  if (auth === null) throw AppError.unauthorized('未登录或会话已失效')
+  return auth
+}
+
+// ───────────────────────────── 首登强制改密闸门（P0-1-7）─────────────────────────────
+
+/**
+ * 首登强制改密期间**放行**的路径（`02` §4.1 注记：除这三个端点 + 登录本身外，其余 API 一律 403）。
+ * 用 Set 而不是前缀匹配：`/api/auth/**` 将来还会加端点（如 P1 的 SSO），
+ * 白名单必须逐条显式写出来，不然新增端点会**默认放行**而不是默认拦住。
+ */
+const PASSWORD_CHANGE_EXEMPT_PATHS = new Set([
+  '/api/auth/login',
+  '/api/auth/logout',
+  '/api/auth/me',
+  '/api/auth/password',
+])
+
+/**
+ * 安装闸门（在 `app.ts` 里于路由注册前调用）。
+ *
+ * 语义：`must_change_password=true` 的用户拿到了会话，但除上表之外**所有 `/api/**` 一律 403**，
+ * 直到他走完 `/api/auth/password`。为什么不是"前端跳转就够了"：前端跳转是体验，
+ * 后端拦截才是约束 —— 否则用户手敲 URL 或直接调 API 就能绕过强制改密。
+ *
+ * 三个刻意的实现细节：
+ * 1. **挂在根级 `preHandler`**（而不是某个路由的钩子）：它的作用对象是"所有业务路由"，
+ *    包括将来才写的那些 —— 逐个路由去挂，迟早会漏一个，而漏掉的那个就是缺口。
+ * 2. **放行"无会话 / 会话无效 / 账号已停用"**：这些情况交给 `requireAuth` 去出 401 + 自毁，
+ *    闸门只负责"已登录但没改密"。两处都处理会让错误原因含糊（403 还是 401 取决于钩子顺序）。
+ * 3. **`/api/auth/me` 要放行**：前端必须能读到 `mustChangePassword` 才知道该跳改密页；拦掉它就成了死循环。
+ *
+ * 代价：业务路由上每个请求会多做一次会话查询（Redis 两个 GET）。
+ * 刻意**不做**"闸门把结果塞给 requireAuth 复用"的优化 —— 那会让两个机制互相依赖，
+ * 将来单独调整任一个都容易踩空；本项目的规模下这点开销可以忽略。
+ */
+export function installPasswordChangeGate(app: FastifyInstance): void {
+  app.addHook('preHandler', async (request) => {
+    // 只看 `/api/**`：`/health` 之类的运维端点不该被用户状态影响
+    if (!request.url.startsWith('/api/')) return
+    // 去掉 querystring 再比对白名单
+    const path = request.url.split('?')[0] ?? ''
+    if (PASSWORD_CHANGE_EXEMPT_PATHS.has(path)) return
+
+    const sid = request.cookies?.[SESSION_COOKIE_NAME]
+    if (sid === undefined || sid === '') return
+
+    const userId = await readSessionUserId(sid, config.session.ttlSeconds)
+    if (userId === undefined) return
+
+    const snapshot = await resolveSnapshot(userId)
+    if (snapshot === undefined) return
+    // 停用账号由 requireAuth 处理（它会自毁会话 + 401）；闸门不越俎代庖
+    if (snapshot.status !== UserStatus.ACTIVE) return
+    if (snapshot.mustChangePassword) {
+      throw AppError.forbidden('首次登录必须修改密码后才能使用其他功能')
+    }
+  })
 }
 
 /**

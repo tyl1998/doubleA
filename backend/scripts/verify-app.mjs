@@ -2,11 +2,16 @@
 /**
  * verify-app.mjs —— **接口级验收**（不占端口、不需要真实依赖）
  *
- * 覆盖两批：
+ * 覆盖三批：
  *   · P0-1-4：信封形态 / HTTP 状态码 / Zod 校验失败字段明细 / 领域错误 / 未知异常不泄内部信息 /
  *             404 兜底 / 非法 JSON / CORS 预检 / requestId 透传 / `/health` 三项探活恒 200
  *   · P0-1-6：密文往返与**篡改检出**（GCM tag）/ 版本与 AAD 上下文 / bcrypt 形态与拒绝超长 /
  *             初始密码生成 / **未登录一律 401 且不碰会话存储**
+ *   · P0-1-7：`/api/auth/*` 已注册 + 请求体 schema 的字段明细 + 首登闸门不给匿名请求增加依赖调用 /
+ *             shared 认证契约的纯函数（`utf8ByteLength` 与 `Buffer.byteLength` 对照、用户名归一化）
+ *
+ * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
+ * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
  *
  * 为什么用 `app.inject` 而不是 curl：
  *   ① 本机端口是稀缺资源（3000/5173 都被别的项目占着，见 `06` §七 待决事项 6），
@@ -27,7 +32,16 @@
 
 import { z } from 'zod'
 
-import { AppError, ok } from '@doubulea/shared'
+import {
+  AppError,
+  PASSWORD_MAX_BYTES,
+  authUserSchema,
+  changePasswordBodySchema,
+  loginBodySchema,
+  normalizeUsername,
+  ok,
+  utf8ByteLength,
+} from '@doubulea/shared'
 import { buildApp } from '../dist/backend/src/app.js'
 import {
   BCRYPT_COST,
@@ -120,6 +134,10 @@ app.get('/__verify/protected', { preHandler: app.requireAuth }, async (request) 
   ok({ userId: request.auth?.user.id, role: request.auth?.user.role }),
 )
 app.get('/__verify/admin-only', { preHandler: app.requireAdmin }, async () => ok({ scope: 'admin' }))
+// 首登闸门（P0-1-7）的探针：一个 `/api/**` 下的**公共**路由（不挂任何鉴权钩子）。
+// 用来验「闸门不会给匿名请求增加依赖调用」—— 没有 Cookie 时闸门必须直接放行，
+// 否则依赖不可达的 CI 里这条会变成 500（而它本该是 200）。
+app.get('/api/__verify/open', async () => ok({ open: true }))
 
 await app.ready()
 
@@ -474,6 +492,82 @@ await it('伪造/过期会话 Cookie → 拒绝且**绝不放行**（有依赖�
     assertEqual(response.statusCode, 401, 'Redis 可达但会话不存在时状态码')
     assertEqual(response.json().code, 'UNAUTHORIZED', '信封 code')
   }
+})
+
+// ── 13. 认证契约（P0-1-7）：路由已注册 + schema 生效 + 纯函数正确性 ──
+await it('/api/auth/* 四个端点已注册（不再是 404 兜底），且请求体校验给出字段明细', async () => {
+  const missing = await app.inject({ method: 'POST', url: '/api/auth/login', payload: {} })
+  assertEqual(missing.statusCode, 400, '空 body 的状态码')
+  const fields = missing.json().data.fields.map((field) => field.path)
+  assert(fields.includes('body.username'), `应报出 body.username，实际 ${JSON.stringify(fields)}`)
+  assert(fields.includes('body.password'), `应报出 body.password，实际 ${JSON.stringify(fields)}`)
+
+  // 未登录的四个端点行为（都不需要数据库，因此在 CI 里也可断言）
+  const me = await app.inject({ method: 'GET', url: '/api/auth/me' })
+  assertEqual(me.statusCode, 401, '/api/auth/me 未登录状态码')
+  const change = await app.inject({
+    method: 'POST',
+    url: '/api/auth/password',
+    payload: { oldPassword: 'x'.repeat(9), newPassword: 'y'.repeat(9) },
+  })
+  assertEqual(change.statusCode, 401, '/api/auth/password 未登录状态码')
+  const logout = await app.inject({ method: 'POST', url: '/api/auth/logout' })
+  assertEqual(logout.statusCode, 200, '/api/auth/logout 幂等状态码')
+})
+
+await it('首登闸门不给**匿名**请求增加依赖调用：/api/** 的公共路由在无 Cookie 时仍是 200', async () => {
+  // 闸门若在无 Cookie 时也去查 Redis，依赖不可达的环境（CI）里这里会是 500。
+  // 两种模式下都断言 200，等于把「匿名请求不碰会话存储」钉死。
+  const response = await app.inject({ method: 'GET', url: '/api/__verify/open' })
+  assertEqual(response.statusCode, 200, '状态码')
+  assertEqual(response.json().data.open, true, '响应体')
+})
+
+await it('shared 的 utf8ByteLength 与 Buffer.byteLength 完全一致（前端要靠它算字节数）', async () => {
+  const samples = ['', 'abc', '中文测试', '🔐🔐', 'a中🙂z', '中'.repeat(24), 'ünïcödé', '\u0000\u007f\u0080\u0800\uffff']
+  for (const sample of samples) {
+    const expected = Buffer.byteLength(sample, 'utf8')
+    assertEqual(utf8ByteLength(sample), expected, `utf8ByteLength(${JSON.stringify(sample)})`)
+  }
+  assertEqual(utf8ByteLength('中'.repeat(24)), PASSWORD_MAX_BYTES, '24 个汉字应恰好等于 bcrypt 的 72 字节上限')
+})
+
+await it('normalizeUsername：去首尾空白 + 转小写（建号与登录必须共用同一口径）', async () => {
+  assertEqual(normalizeUsername('  Alice  '), 'alice', '带空白与大写')
+  assertEqual(normalizeUsername('admin'), 'admin', '已归一化的值不变')
+  assertEqual(normalizeUsername('ADMIN@EXAMPLE'), 'admin@example', '含符号')
+})
+
+await it('登录/改密 schema：拒绝空值、过短、超字节数；接受合法输入', async () => {
+  const badLogins = [
+    ['空用户名', { username: '', password: 'x' }],
+    ['空白用户名', { username: '   ', password: 'x' }],
+    ['空密码', { username: 'a', password: '' }],
+    ['缺字段', { username: 'a' }],
+  ]
+  for (const [label, payload] of badLogins) {
+    assertEqual(loginBodySchema.safeParse(payload).success, false, `登录应拒绝：${label}`)
+  }
+  assertEqual(loginBodySchema.safeParse({ username: ' a ', password: 'p' }).success, true, '合法登录应通过')
+
+  assertEqual(
+    changePasswordBodySchema.safeParse({ oldPassword: 'old-pass-1', newPassword: 'short1' }).success,
+    false,
+    '改密应拒绝过短的新密码',
+  )
+  const tooLongBytes = '中'.repeat(25) // 75 字节
+  assertEqual(
+    changePasswordBodySchema.safeParse({ oldPassword: 'old-pass-1', newPassword: tooLongBytes }).success,
+    false,
+    '改密应拒绝超过 72 字节的新密码',
+  )
+  const result = changePasswordBodySchema.safeParse({ oldPassword: 'old-pass-1', newPassword: 'new-pass-1' })
+  assertEqual(result.success, true, '合法改密应通过')
+
+  // authUserSchema 是前后端共用的响应形态：能被解析才算契约一致
+  const user = { id: 'x', username: 'a', nickname: null, role: 'ADMIN', mustChangePassword: false }
+  assertEqual(authUserSchema.safeParse(user).success, true, 'authUserSchema 应接受典型响应体')
+  assertEqual(authUserSchema.safeParse({ ...user, nickname: 1 }).success, false, 'authUserSchema 应拒绝非法 nickname')
 })
 
 await app.close()

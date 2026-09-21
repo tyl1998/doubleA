@@ -167,6 +167,8 @@ const SESSION_ID_BYTES = 32
 export interface UserSnapshot {
   id: string
   username: string
+  /** 显示名（P0-1-7 加入：`/auth/me` 与顶部用户区要用，不值得为此单独回库） */
+  nickname: string | null
   role: UserRole
   status: UserStatus
   mustChangePassword: boolean
@@ -297,17 +299,27 @@ export async function readUserSnapshot(userId: string): Promise<UserSnapshot | u
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return undefined
-    const { id, username, role, status, mustChangePassword } = parsed as Partial<UserSnapshot>
+    const { id, username, nickname, role, status, mustChangePassword } = parsed as Partial<UserSnapshot>
     if (
       typeof id !== 'string' ||
       typeof username !== 'string' ||
+      // ⚠️ 字段增删会让**旧缓存**在这里被判为不合法 → 视为未命中，回库重取。
+      //    （比"容忍缺字段"安全：容忍会让调用方拿到 undefined 的 nickname，前端莫名不显示。)
+      (nickname !== null && typeof nickname !== 'string') ||
       typeof role !== 'string' ||
       typeof status !== 'string' ||
       typeof mustChangePassword !== 'boolean'
     ) {
       return undefined
     }
-    return { id, username, role: role as UserRole, status: status as UserStatus, mustChangePassword }
+    return {
+      id,
+      username,
+      nickname: typeof nickname === 'string' ? nickname : null,
+      role: role as UserRole,
+      status: status as UserStatus,
+      mustChangePassword,
+    }
   } catch {
     return undefined
   }
@@ -331,3 +343,82 @@ export async function invalidateUserSnapshot(userId: string): Promise<void> {
     throw describeRedisFailure(getRedis(), error)
   }
 }
+
+// ═══════════════════════════ 登录限速（P0-1-7）═══════════════════════════
+//
+// `02` §十：**同账号连续 5 次密码错误 → 锁 10 分钟**（Redis 计数）。
+// 计数键按**归一化后的用户名**存（与登录查询口径一致），键在 10 分钟后自然过期即"自动解锁"。
+//
+// 为什么用滑动窗口而不是固定窗口：每次**未达上限**的失败都把 TTL 重置为 10 分钟 ——
+// 这既保证"5 次都发生在 10 分钟内才算连续"（隔一天再错一次不该累加），
+// 又保证锁一旦形成就**不再被新尝试续期**（否则攻击者一直点就能把它锁到天荒地老，
+// 顺便把自己的账号永久锁死 —— 那是个自伤式 DoS）。
+
+/** 登录失败计数键前缀 */
+const LOGIN_FAIL_KEY_PREFIX = 'login-fail:'
+/** 触发锁定的失败次数（`02` §十） */
+export const LOGIN_MAX_FAILURES = 5
+/** 锁定时长（秒）＝ 计数键 TTL（`02` §十：10 分钟） */
+export const LOGIN_LOCK_TTL_SEC = 600
+
+/** `login-fail:{username}` 键名（`username` 必须是归一化后的值） */
+export function loginFailKey(username: string): string {
+  return `${LOGIN_FAIL_KEY_PREFIX}${username}`
+}
+
+/** 登录锁状态：已锁定时给出剩余秒数（用于「请 N 分钟后重试」） */
+export interface LoginLock {
+  failures: number
+  retryAfterSec: number
+}
+
+/**
+ * 读登录锁状态；**未锁定返回 undefined**。
+ * 只有失败次数达到 {@link LOGIN_MAX_FAILURES} 才算锁定 —— 恰好 5 次时第 6 次被拒
+ * （`01` §五 门槛 5 的口径：「连续 5 次密码错误 → 第 6 次返回已锁定」）。
+ */
+export async function readLoginLock(username: string): Promise<LoginLock | undefined> {
+  try {
+    const redis = await ensureRedisConnected()
+    const key = loginFailKey(username)
+    const [raw, ttl] = await Promise.all([redis.get(key), redis.ttl(key)])
+    const failures = raw === null ? 0 : Number.parseInt(raw, 10)
+    if (!Number.isFinite(failures) || failures < LOGIN_MAX_FAILURES) return undefined
+    // TTL 为 -1/-2（无过期或键不存在）时兜底给 1 秒，避免前端显示"0 分钟后重试"
+    return { failures, retryAfterSec: ttl > 0 ? ttl : 1 }
+  } catch (error) {
+    throw describeRedisFailure(getRedis(), error)
+  }
+}
+
+/**
+ * 记一次失败，返回累计次数。
+ * 仅在**未达上限**时重置 TTL（见本小节头注释：锁定后不再续期，锁才会真的到期）。
+ */
+export async function recordLoginFailure(username: string): Promise<number> {
+  try {
+    const redis = await ensureRedisConnected()
+    const key = loginFailKey(username)
+    const failures = await redis.incr(key)
+    if (failures <= LOGIN_MAX_FAILURES) await redis.expire(key, LOGIN_LOCK_TTL_SEC)
+    return failures
+  } catch (error) {
+    throw describeRedisFailure(getRedis(), error)
+  }
+}
+
+/**
+ * 清除失败计数（**登录成功即清**，`06` P0-1-7 坑预判：「成功即 DEL 计数键」）。
+ * 幂等；不清的话"错了 4 次 → 成功 → 再错 1 次"就会被锁，与用户直觉不符。
+ */
+export async function clearLoginFailures(username: string): Promise<void> {
+  try {
+    const redis = await ensureRedisConnected()
+    await redis.del(loginFailKey(username))
+  } catch (error) {
+    // 清计数失败不该让一次**成功**的登录失败（否则用户明明密码对却登不进来）——
+    // 代价只是"下次失败会从旧计数继续累加"，最坏多锁一次。
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), username }, '清除登录失败计数失败（本次登录仍放行）')
+  }
+}
+

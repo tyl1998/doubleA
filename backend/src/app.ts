@@ -18,7 +18,8 @@ import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } 
 import { config } from './config.js'
 import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
-import { installSession } from './plugins/session.js'
+import { installPasswordChangeGate, installSession } from './plugins/session.js'
+import { registerAuthRoutes } from './routes/auth.js'
 import { registerHealthRoutes } from './routes/health.js'
 
 /**
@@ -72,7 +73,11 @@ export function buildApp(): FastifyInstance {
   //    `request.auth`（`02` §十 安全设计）。必须在路由前装好 —— 路由的 preHandler 直接用装饰器。
   installSession(app)
 
-  // ④ 访问日志：默认那两条（incoming/request completed）已关掉，这里只留一条带耗时的，
+  // ④ 首登强制改密闸门（P0-1-7；`02` §4.1 注记）：根级 preHandler，拦「除 /auth/{login,logout,me,password}
+  //    之外的所有 /api/**」。挂在根上是刻意的 —— 逐个业务路由去挂迟早会漏一个，而漏掉的就是缺口。
+  installPasswordChangeGate(app)
+
+  // ⑤ 访问日志：默认那两条（incoming/request completed）已关掉，这里只留一条带耗时的，
   //    用 request.log 是为了尊重路由级 logLevel（如 /health 设为 warn，不打点也不刷屏）
   app.addHook('onResponse', (request, reply, done) => {
     request.log.info(
@@ -82,7 +87,7 @@ export function buildApp(): FastifyInstance {
     done()
   })
 
-  // ⑤ CORS：Cookie 会话 + 前后端分域部署（`02` §十、`06` §二·补）
+  // ⑥ CORS：Cookie 会话 + 前后端分域部署（`02` §十、`06` §二·补）
   //    - 显式白名单（CORS_ORIGINS）；未配置时反射请求 Origin（开发期便利，生产由 config 告警）
   //    - credentials 必须为 true，否则跨域下浏览器不带 Cookie
   void app.register(cors, {
@@ -93,8 +98,9 @@ export function buildApp(): FastifyInstance {
     maxAge: 600,
   })
 
-  // ⑥ 路由
+  // ⑦ 路由（`/api/auth/*` 从 P0-1-7 起；业务路由按批次逐个加）
   registerHealthRoutes(app)
+  registerAuthRoutes(app)
 
   return app
 }
