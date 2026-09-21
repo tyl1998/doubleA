@@ -24,7 +24,13 @@ import pino, { type Logger, type LoggerOptions } from 'pino'
 
 import { config } from '../config.js'
 
-const SERVICE_NAME = 'doubulea-backend'
+/**
+ * 服务身份（日志 base 字段与 `/health` 的 `service/version` 共用）。
+ * 刻意放在本模块：`app.ts` 与 `routes/health.ts` 都要用，落在这两者之外的公共层可避免循环导入。
+ * 版本与 `backend/package.json` 保持一致（发版时一起改）。
+ */
+export const SERVICE_NAME = 'doubulea-backend'
+export const SERVICE_VERSION = '0.1.0'
 
 /**
  * 脱敏路径（pino redact 语法）。

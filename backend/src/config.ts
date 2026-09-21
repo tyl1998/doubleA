@@ -150,6 +150,54 @@ const requiredText = (label: string) =>
 /** 可选文本（空串 → undefined，不落空字符串） */
 const optionalText = z.preprocess(emptyToUndefined, z.string().trim().min(1).optional())
 
+/** 逗号分隔的来源列表（CORS 白名单） */
+const splitList = (raw: string): string[] =>
+  raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+
+/**
+ * CORS 来源白名单（`CORS_ORIGINS`，逗号分隔，如 `http://localhost:5174,https://ops.internal`）。
+ *
+ * ⚠️ 刻意**不允许 `*`**：本服务用 Cookie 会话（`02` §十），`Access-Control-Allow-Origin: *`
+ * 与 `credentials` 无法共存，浏览器会直接拒绝；且「反射任意来源 + 带凭据」是实质性的越权面。
+ * 未设置时（开发期）由 app.ts 反射请求 Origin，生产未设置则启动告警（见下方 warnings）。
+ */
+const corsOriginsVar = z.preprocess(
+  emptyToUndefined,
+  z
+    .string()
+    .trim()
+    .superRefine((value, ctx) => {
+      for (const origin of splitList(value)) {
+        if (origin === '*') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'CORS_ORIGINS 不能含 *（与 Cookie 凭据冲突）；请逐个列出来源，如 http://localhost:5174',
+          })
+          continue
+        }
+        try {
+          const parsed = new URL(origin)
+          if (parsed.origin !== origin) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `${origin} 不是「来源」写法（须为 scheme://host[:port]，不带路径），实际解析为 ${parsed.origin}`,
+            })
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${origin} 不是合法来源（示例：http://localhost:5174）`,
+          })
+        }
+      }
+    })
+    .transform(splitList)
+    .optional(),
+)
+
 /** 必填连接串 + 协议白名单（避免把 redis:// 填进 DATABASE_URL 这类低级错） */
 const requiredUrl = (label: string, schemes: readonly string[]) => {
   const allowed = schemes.map((scheme) => `${scheme}://`).join(' 或 ')
@@ -304,6 +352,10 @@ const envSchema = z
       'info',
     ),
     LOG_PRETTY: optionalBoolVar('LOG_PRETTY'),
+    /** CORS 来源白名单（P0-1-4 起生效）；留空 = 开发期反射请求 Origin */
+    CORS_ORIGINS: corsOriginsVar,
+    /** /health 单项依赖探活超时（P0-1-4；坑预判：PG 挂起不能让探活永不返回） */
+    HEALTH_TIMEOUT_MS: intVar('HEALTH_TIMEOUT_MS', 2000, { min: 100, max: 60_000 }),
 
     // ── 外部依赖（必填）──
     DATABASE_URL: requiredUrl('DATABASE_URL', ['postgresql', 'postgres']),
@@ -374,6 +426,8 @@ export interface AppConfig {
   logLevel: LogLevel
   /** 开发期是否用 pino-pretty 着色输出（`LOG_PRETTY`，默认跟随 NODE_ENV） */
   logPretty: boolean
+  /** CORS 来源白名单（`CORS_ORIGINS`）；空数组 = 未配置，由 app.ts 反射请求 Origin（仅开发期可接受） */
+  corsOrigins: string[]
 
   db: { url: string }
   redis: { url: string }
@@ -401,6 +455,8 @@ export interface AppConfig {
     contextRounds: number
     toolLoopLimit: number
     artifactUrlTtlMin: number
+    /** /health 单项依赖探活超时（毫秒） */
+    healthProbeTimeoutMs: number
   }
   /** 知识库流水线默认值（建库时快照，此后按库独立可改） */
   pipeline: {
@@ -496,6 +552,14 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const vars: EnvVars = parsed.data
   const isDevelopment = vars.NODE_ENV === 'development'
   const warnings: string[] = []
+  const corsOrigins = vars.CORS_ORIGINS ?? []
+
+  if (corsOrigins.length === 0 && vars.NODE_ENV === 'production') {
+    warnings.push(
+      'CORS_ORIGINS 未设置：生产环境会反射任意请求 Origin（等于放开所有站点带 Cookie 调本服务），' +
+        '请显式列出前端来源，如 CORS_ORIGINS=https://ops.internal',
+    )
+  }
 
   const apiReady =
     vars.EMBEDDING_MODE === 'api' &&
@@ -536,6 +600,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port: vars.BACKEND_PORT,
     logLevel: vars.LOG_LEVEL,
     logPretty: vars.LOG_PRETTY ?? isDevelopment,
+    corsOrigins,
 
     db: { url: vars.DATABASE_URL },
     redis: { url: vars.REDIS_URL },
@@ -570,6 +635,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       contextRounds: vars.CONTEXT_ROUNDS,
       toolLoopLimit: vars.TOOL_LOOP_LIMIT,
       artifactUrlTtlMin: vars.ARTIFACT_URL_TTL_MIN,
+      healthProbeTimeoutMs: vars.HEALTH_TIMEOUT_MS,
     },
     pipeline: {
       chunkSize: vars.CHUNK_SIZE_DEFAULT,
@@ -595,6 +661,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     port: value.port,
     logLevel: value.logLevel,
     logPretty: value.logPretty,
+    corsOrigins: value.corsOrigins.length > 0 ? value.corsOrigins : '（未设置：开发期反射请求 Origin）',
     db: { url: maskUrl(value.db.url) },
     redis: { url: maskUrl(value.redis.url) },
     s3: {
@@ -621,6 +688,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       contextRounds: value.limits.contextRounds,
       toolLoopLimit: value.limits.toolLoopLimit,
       artifactUrlTtlMin: value.limits.artifactUrlTtlMin,
+      healthProbeTimeoutMs: value.limits.healthProbeTimeoutMs,
     },
     pipeline: value.pipeline,
     warnings: value.warnings,

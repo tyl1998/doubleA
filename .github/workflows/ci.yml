@@ -1,0 +1,73 @@
+# CI —— 一条 push / PR 上跑通「安装 → 静态检查 → 类型 → 构建 → 接口级验收」
+#
+# 依据：`docs/06-实施计划.md` P0-1-4 的 CI 链路（install → lint → typecheck → build）
+#      + 本批增补的 `verify:app`（用 app.inject 打请求，不占端口、不需要真实依赖，
+#        因此不需要在这里拉起 docker-compose）。
+#
+# 与本地的一致性：GitHub runner 上 pnpm 目录符号链接是正常的，故 `pnpm-workspace.yaml` 的
+# `nodeLinker: hoisted` 与 `prepare` 里的 junction 补齐脚本都会自然失效/跳过（见 `06` §3.0 备注）。
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消上一次未完成的运行（省 runner 配额，也避免旧结果误导）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: lint / typecheck / build / verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 版本不写死：由根 package.json 的 `packageManager` 字段决定（与本地 corepack 同一来源）
+      - name: 准备 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 准备 Node 22 与 pnpm 缓存
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: lint
+        run: pnpm lint
+
+      - name: typecheck
+        run: pnpm -r typecheck
+
+      - name: build
+        run: pnpm -r build
+
+      # 接口级验收：用 Fastify 的 inject 直接打请求（不监听端口）。
+      # 依赖地址指向不可达端口 → 期望 /health 报 degraded 但**仍为 HTTP 200**，
+      # 这正是 `06` P0-1-4 验收里「依赖不可用不能整体 500」的机器化断言。
+      - name: verify（接口级自检）
+        run: pnpm verify:app
+        env:
+          NODE_ENV: test
+          # 不使用 infra/.env（CI 里也没有），全部由这里注入，12-factor 语义
+          DOUBULEA_SKIP_ENV_FILE: '1'
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:1/ci?schema=public
+          REDIS_URL: redis://127.0.0.1:1
+          S3_ENDPOINT: http://127.0.0.1:1
+          S3_KEY: ci
+          S3_SECRET: ci
+          S3_BUCKET: ci
+          # 32 字节 base64（仅用于校验通过，不是真密钥）
+          CREDENTIAL_MASTER_KEY: Y2ktb25seS1ub3QtYS1yZWFsLWtleS0wMDAwMDAwMDA=
+          LOG_PRETTY: 'false'
+          CORS_ORIGINS: http://localhost:5174
+          # verify-app.mjs 读它：CI 里没有依赖服务，故断言三项探活全部 degraded
+          EXPECT_DEGRADED: '1'

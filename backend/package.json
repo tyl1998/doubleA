@@ -10,16 +10,23 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/backend/src/index.js",
     "config:check": "pnpm run build && node dist/backend/src/index.js --check-config",
+    "verify:app": "pnpm run build && node scripts/verify-app.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@doubulea/shared": "workspace:*",
+    "@fastify/cors": "^11.3.0",
+    "fastify": "^5.12.5",
+    "ioredis": "^6.0.0",
+    "minio": "^8.0.7",
+    "pg": "^8.23.0",
     "pino": "^10.3.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "@types/pg": "^8.23.1",
     "pino-pretty": "^13.1.3",
     "typescript": "^5.6.3"
   }

@@ -84,6 +84,43 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
+### 静态检查与接口级验收（P0-1-4 起）
+
+```bash
+pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
+pnpm -r typecheck      # tsc strict（三包）
+pnpm -r build          # 三包依次产出 dist
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，不占端口、不启 docker（12 项）
+```
+
+> `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、
+> 领域错误、未知异常不泄露内部信息、404 兜底、413/415、CORS 预检、requestId 透传。
+> 无依赖环境（如 CI）加 `EXPECT_DEGRADED=1`，断言三项探活全部降级。
+
+### 起后端 + 健康检查
+
+```bash
+# 先起依赖（postgres/redis/minio），再起后端
+pnpm infra:up
+pnpm --filter @doubulea/backend build && node backend/dist/backend/src/index.js
+# 或 pnpm dev:backend（tsc --watch）另开一个终端跑上面的 node
+
+curl -s http://127.0.0.1:13000/health | jq .        # macOS/Linux 若走系统代理，加 --noproxy '*'
+```
+
+`/health` **恒返 HTTP 200**，依赖状态在 body 里：`data.status` 为 `ok` / `degraded`，
+`data.checks[]` 逐项给出 `target / ok / latencyMs / detail`。停掉某个依赖（如
+`docker compose -f infra/docker-compose.yml --env-file infra/.env stop redis`）后
+`/health` 仍返 200、只把 redis 标成不可用，且 `detail` 直接给出原因（如
+`connect ECONNREFUSED 127.0.0.1:16379`）；依赖起回后**无需重启进程**即自愈。
+
+| 端点 | 说明 |
+|------|------|
+| `GET /health` | 探活 PG / Redis / S3（`docs/02` §4.9） |
+| 其余 `/api/**` | P0-1-5 起逐个落地（当前访问未注册路由会得到统一信封 404） |
+
+> 进程支持 SIGINT/SIGTERM 优雅退出：停止接流 → 关闭 PG/Redis 连接 → flush 日志 → 退出（10s 兜底强退）。
+
 ---
 
 ## 二、文档清单
@@ -116,6 +153,7 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 | `issue_fix/问题记录-P0-1-1-环境与链接.md` | pnpm 不读 `.npmrc`、构建白名单键名、**目录符号链接静默失败**、`clean` 自递归、tsc 产物污染源码 |
 | `issue_fix/问题记录-P0-1-2-基础设施与镜像.md` | **pg_bigm 无二进制包**、tag 日期后缀、Docker 加速器 403、**PS 5.1 的 `{{}}` 与 `.ps1` 编码坑**、`psql` 多语句/临时表坑 |
 | `issue_fix/问题记录-P0-1-3-配置与日志.md` | **zod `.default()` 被 `.env` 空串绕过**、`loadEnvFile` 不覆盖已有变量、pino transport 与生产装包、产物期模块路径更深、pino 保活进程 |
+| `issue_fix/问题记录-P0-1-4-Fastify骨架与健康检查.md` | **错误处理自身崩溃把真实错误掩成 500**、Fastify v5 的 `loggerInstance` 类型参数化与 `logController` 换废弃选项、框架错误状态码被压成 400、Fastify 校验短路语义、ioredis 只报「重试上限」不报 `ECONNREFUSED`、`pnpm --filter` 吞掉脚本参数 |
 | `issue_fix/问题记录-macOS环境适配.md` | 启停脚本补 `.sh` + 跨平台入口、**宿主端口被另一项目占用→改 `.env` 避让**、**bash 3.2 把中文并进变量名**、corepack 取 pnpm |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
@@ -173,9 +211,14 @@ doubuleA/
 │       └── 文件预览.md            ← 待写（P0-2 期间）
 ├── shared/                        ← @doubulea/shared：zod schema + 类型 + 错误码（编译期依赖）
 ├── backend/                       ← @doubulea/backend（独立构建，→ backend/dist）
-│   └── src/
-│       ├── config.ts              ← 环境变量校验 → 强类型 config（P0-1-3 ✅）
-│       └── infra/logger.ts        ← pino + requestId 贯穿 + 敏感字段脱敏（P0-1-3 ✅）
+│   ├── src/
+│   │   ├── index.ts               ← 启动入口 + 优雅退出（P0-1-4 ✅）
+│   │   ├── app.ts                 ← Fastify 装配：CORS/bodyLimit/请求上下文钩子（P0-1-4 ✅）
+│   │   ├── config.ts              ← 环境变量校验 → 强类型 config（P0-1-3 ✅）
+│   │   ├── plugins/errorHandler.ts ← Zod 校验器 + 错误 → 信封（P0-1-4 ✅）
+│   │   ├── routes/health.ts       ← /health 探 PG/Redis/S3（P0-1-4 ✅）
+│   │   └── infra/                 ← logger.ts（P0-1-3 ✅）+ pg/redis/s3.ts（P0-1-4 ✅）
+│   └── scripts/verify-app.mjs     ← 接口级验收（app.inject，不占端口）
 ├── frontend/                      ← @doubulea/frontend（独立构建，→ frontend/dist 纯静态）
 ├── infra/                         ← docker-compose + 自建 PG 镜像 + 启停脚本（P0-1-2 ✅）
 │   ├── docker-compose.yml         ← postgres / redis / minio
@@ -186,8 +229,9 @@ doubuleA/
 ├── package.json                   ← 仅编排，不装业务依赖
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json             ← strict 收敛 + 路径别名
+├── eslint.config.mjs              ← 扁平配置（P0-1-4 ✅）
 ├── .editorconfig  .npmrc  .gitignore
-└── .github/workflows/ci.yml       ← P0-1-4 落地
+└── .github/workflows/ci.yml       ← install→lint→typecheck→build→verify（P0-1-4 ✅）
 ```
 
 ---
@@ -206,3 +250,4 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-2 完成**：`infra/` 基础设施落地 —— compose（postgres/redis/minio）+ **自建 PG 镜像（pgvector + 源码编译 pg_bigm）** + `.env.example` + PowerShell 起停脚本 + `pg-verify.mjs` 自动验收（12/12 通过，`bigm_similarity` 实测 0.4）。快速开始补「起依赖服务」小节与端口表；目录规划补 `infra/` 明细；文档索引新增缺陷归档表 |
 | 2026-09-21 | — | **macOS 环境适配（非计划内批次）**：补 `infra/scripts/dev-*.sh` + 跨平台入口 `infra.mjs`（根脚本不再硬编码 `powershell`）；宿主端口整组后移避让另一项目；新增缺陷归档 `issue_fix/问题记录-macOS环境适配.md`；本文快速开始改为双平台口径 |
 | 2026-09-21 | — | **P0-1-3 完成**：`backend/src/config.ts`（zod 启动即校验、缺项列清单并 exit 1、自动加载 `infra/.env` 且进程环境优先）+ `backend/src/infra/logger.ts`（pino + requestId 经 AsyncLocalStorage 贯穿 + 敏感字段脱敏）+ `shared` 补 `toErrorEnvelope`/`toHttpStatus`。新增 `pnpm config:check` 自检命令与「后端配置自检」小节；`infra/.env` 的 `BACKEND_PORT` 本机避让 13000；新增缺陷归档 `issue_fix/问题记录-P0-1-3-配置与日志.md` |
+| 2026-09-21 | — | **P0-1-4 完成（包 A 收口）**：Fastify 骨架（含 Zod 校验器与统一错误信封）、`/health` 三依赖探活（恒 200 + 逐项降级 + 超时）、启动与优雅退出；新增 `pnpm lint`（ESLint 扁平配置）、`pnpm verify:app`（12 项接口级验收脚本）、`.github/workflows/ci.yml`（install→lint→typecheck→build→verify）。快速开始补「静态检查与接口级验收」「起后端 + 健康检查」两节；`infra/.env.example` 新增 `CORS_ORIGINS` / `HEALTH_TIMEOUT_MS`；新增缺陷归档 `issue_fix/问题记录-P0-1-4-Fastify骨架与健康检查.md` |
