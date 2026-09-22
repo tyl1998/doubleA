@@ -68,6 +68,15 @@
  *              ⚠️ 这里**不**断言任何"库里有几行"的东西：四族权限的差别（**会话 = 仅本人，
  *              连 ADMIN 也不开后门**）、`last_message_at` 的排序与 CAS、级联删除的真数
  *              都要真 PG + Redis，归 `verify-conversations.mjs`。
+ *   · P0-1-27：**上下文组装与并发闸的纯函数** —— 检索块（连续序号 + 「来源：文档名」前缀 +
+ *              片段**逐字**不二次截断 + 零命中的明文提示）、system prompt 的三段顺序与
+ *              "rules 每一轮都注入"（`01` 决策 12 在 prompt 层的那一半）、多库命中的
+ *              `rrfScore desc` + `chunkId asc` tie-break 与**不设条数上限**、引用卡
+ *              `score` 取**融合分**、历史的 `rounds × 2` 截断与"从 user 开始 / 丢空助手行"、
+ *              落库形态（`text` 恒写而空 `thinking`/`citations` **不加键**）、以及信号量的
+ *              "满 ⇒ 同步 `null`（不排队）+ `release` 幂等"。
+ *              两个被测文件**不 import 任何运行期模块**（手法同 `pipeline/chunk/`）⇒ 本档直验；
+ *              行为侧（真检索 + 真假上游 + SSE 出口 + 落库）归 `verify-chatbot.mjs`。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -177,6 +186,9 @@ import {
   parseActiveSnapshot,
   removeConversationResultSchema,
   renameConversationBodySchema,
+  // 消息落库形态（P0-1-27 写入端 / P0-1-28 读取端）
+  citationItemSchema,
+  messageContentSchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -231,6 +243,25 @@ import {
   normalizeFulltextQuery,
   rrfScoreOf,
 } from '../dist/backend/src/services/retrieval.js'
+// 上下文组装与并发闸（P0-1-27）—— 两个文件**刻意不 import 任何运行期模块**
+// （不碰 `config`/`prisma`/日志，手法同 `pipeline/chunk/`）⇒ 这一档（无依赖、可进 CI）能直接断言。
+// 理由与 P0-1-18 把分块做成纯函数一样：它们的错**没有 HTTP 表现**（流照常 200 结束），
+// 症状是"模型开始编造来源""多轮对话答非所问""闸门悄悄失效"。
+// 行为侧（真 PG + 真 Redis + 假上游 + 真 TCP）归 `verify-chatbot.mjs`。
+import {
+  DEFAULT_SYSTEM_PROMPT,
+  RETRIEVAL_BLOCK_TITLE,
+  RETRIEVAL_EMPTY_HINT,
+  RETRIEVAL_RULES,
+  buildAssistantContent,
+  buildSystemPrompt,
+  formatRetrievalBlock,
+  mergeRetrievalHits,
+  selectHistoryMessages,
+  textOfHistoryRow,
+  toCitationItems,
+} from '../dist/backend/src/orchestrator/chatContext.js'
+import { createSemaphore } from '../dist/backend/src/orchestrator/semaphore.js'
 // 夹具是纯 JS 生成器（手写 PDF/DOCX/ZIP 字节），不引依赖、不读外部文件 ⇒ 仍然满足本档"无依赖"
 import * as fixtures from './fixtures/documents.mjs'
 
@@ -2712,6 +2743,274 @@ await it('判据与文案收在 shared：「只读」是纯函数、未命名会
   assertEqual(isConversationReadOnly('ACTIVE'), false, 'ACTIVE 可写')
   assertEqual(isConversationReadOnly('FINISHED'), true, 'FINISHED 只读（Agent 软删留下的标记）')
   assertEqual(CONVERSATION_UNTITLED_HINT, '新会话', 'topic 为 null 时的界面回落文案')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// P0-1-27：上下文组装 + 并发闸（纯函数）
+//
+// 这一节守的全是**没有 HTTP 表现**的错：流照常以 200 结束、界面看着正常，
+// 而模型已经开始编造来源 / 多轮对话开始答非所问 / 并发上限被悄悄放到无穷。
+// 两个被测文件刻意不 import 任何运行期模块（手法同 `pipeline/chunk/`，见 `06` 的
+// "能无依赖验的纯逻辑别粘依赖"）⇒ 这一档不需要 PG/Redis/上游。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/** 造一条检索命中：只有 `chatContext` 真正读的四列有意义（`docName`/`snippet`/`rrfScore`/`chunkId`） */
+const makeHit = (over = {}) => ({
+  chunkId: 'c0000000-0000-7000-8000-000000000001',
+  docId: 'd0000000-0000-7000-8000-000000000001',
+  docName: '报销制度.txt',
+  seq: 0,
+  page: null,
+  headingPath: [],
+  snippet: '出差住宿标准为每晚上限 500 元。',
+  vectorScore: 0.81,
+  vectorRank: 1,
+  fulltextScore: 0.42,
+  fulltextRank: 2,
+  rrfScore: 0.0328,
+  finalRank: 1,
+  ...over,
+})
+
+await it('检索块：标题 + 连续序号 + 「来源：文档名」前缀，片段**原样**（不二次截断）', () => {
+  // 为什么"片段原样"要单独守：检索层已按 `SNIPPET_WINDOW_CHARS` 截过一次。编排层再截一次，
+  // 会让"引用卡显示的片段"与"模型看到的片段"不一样 —— 而引用卡的全部意义就是让人核对模型看到了什么。
+  const messy = '  首行带缩进\n第二行\n  '
+  const block = formatRetrievalBlock([
+    makeHit({ docName: 'A.txt', snippet: messy }),
+    makeHit({ docName: 'B.txt', snippet: 'B 的片段' }),
+    makeHit({ docName: 'C.txt', snippet: 'C 的片段' }),
+  ])
+  assertIncludes(block, RETRIEVAL_BLOCK_TITLE, '含检索块标题（它是 prompt 与断言之间唯一的可观测点）')
+  assertIncludes(block, '1. 来源：A.txt', '序号从 1 开始且带「来源：」前缀')
+  assertIncludes(block, '2. 来源：B.txt', '序号连续（跳号会让模型把两条认成同一条）')
+  assertIncludes(block, '3. 来源：C.txt', '序号连续到 3')
+  assert(block.includes(messy), '片段必须**逐字**保留（首尾空白与换行都不动）')
+  assert(!block.includes('(截断)'), '不得有任何截断标记')
+})
+
+await it('检索块：零命中时写出「没有检索到」的明文（留白等于让模型自己决定有没有）', () => {
+  const block = formatRetrievalBlock([])
+  assertIncludes(block, RETRIEVAL_BLOCK_TITLE, '标题照发（模型要能看到"这一节存在但为空"）')
+  assertIncludes(block, RETRIEVAL_EMPTY_HINT, '空命中提示')
+  assertEqual(block.split('\n').length, 2, '恰好两行：标题 + 空提示（多一行都说明格式漂了）')
+})
+
+await it('system prompt：三段顺序固定 = 人格 → 检索规则 → 检索块', () => {
+  const prompt = buildSystemPrompt('你是报销专员。', [makeHit()])
+  const iPersona = prompt.indexOf('你是报销专员。')
+  const iRules = prompt.indexOf(RETRIEVAL_RULES)
+  const iBlock = prompt.indexOf(RETRIEVAL_BLOCK_TITLE)
+  assert(
+    iPersona >= 0 && iRules > iPersona && iBlock > iRules,
+    `三段顺序应为 人格→规则→检索块，实际 ${JSON.stringify([iPersona, iRules, iBlock])}`,
+  )
+})
+
+await it('⚠️ 检索规则**每一轮都注入**（无论有没有命中）—— 这是「不编造来源」在 prompt 层的那一半', () => {
+  // `01` 决策 12 是两半：不发 `citations` 事件 + prompt 明确禁止编造。只做前一半，
+  // 模型照样会在正文里写「根据《XX制度》…」（凭空造一个文档名），而界面上没有引用卡 ⇒
+  // 用户看到的是一段"看起来有出处、其实没有"的回答。这一半没有任何 HTTP 表现，只能在这里守。
+  for (const [hits, label] of [[[makeHit()], '有命中'], [[], '零命中']]) {
+    const prompt = buildSystemPrompt('你是报销专员。', hits)
+    assertIncludes(prompt, RETRIEVAL_RULES, `${label}时也要带规则`)
+    assertIncludes(prompt, '不要编造', `${label}时的规则里必须含"不要编造"字样`)
+  }
+})
+
+await it('system prompt：空白 systemPrompt 回落兜底文案；有值时**逐字保留**（不 trim）', () => {
+  for (const [value, label] of [[null, 'null'], [undefined, 'undefined'], ['', '空串'], ['   ', '全空格']]) {
+    assertIncludes(buildSystemPrompt(value, []), DEFAULT_SYSTEM_PROMPT, `${label} 应回落兜底`)
+  }
+  // 与 P0-1-22「systemPrompt 刻意不 trim」同一条口径：起止空白是人格格式的一部分。
+  // 若这里 trim 了，"库里存的"与"发出去的"就分叉（而库里那份是用户在表单里看到的）。
+  const padded = '  你是报销专员。\n\n'
+  const prompt = buildSystemPrompt(padded, [])
+  assert(prompt.startsWith(padded), '两侧空白与换行必须保留')
+  assert(!prompt.includes(DEFAULT_SYSTEM_PROMPT), '有值时不掺兜底文案（否则人格被两句话拉扯）')
+})
+
+await it('多库命中合并：`rrfScore desc` + 同分按 `chunkId asc`（确定性 tie-break）', () => {
+  // 多库的分数分布不同、撞分很常见。没有 tie-break 时"两次调用顺序不同"会让引用卡在刷新前后换位置，
+  // 用户会以为是"答案变了"。同口径见 P0-1-20 的检索层（那边是两路融合、这边是跨库展平）。
+  const merged = mergeRetrievalHits([
+    [makeHit({ chunkId: 'c-2', rrfScore: 0.01 }), makeHit({ chunkId: 'c-b', rrfScore: 0.03 })],
+    [makeHit({ chunkId: 'c-a', rrfScore: 0.03 }), makeHit({ chunkId: 'c-3', rrfScore: 0.02 })],
+  ])
+  assertSameSet(merged.map((hit) => hit.chunkId), ['c-2', 'c-b', 'c-a', 'c-3'], '跨库展平，一条不丢')
+  assertEqual(merged[0].chunkId, 'c-a', '0.03 的两条里 chunkId 小者在前')
+  assertEqual(merged[1].chunkId, 'c-b', '0.03 的第二条')
+  assertEqual(merged[2].chunkId, 'c-3', '0.02')
+  assertEqual(merged[3].chunkId, 'c-2', '0.01 垫底')
+})
+
+await it('多库命中合并：**刻意不设条数上限**（每个库的 topK 是它自己的配置）', () => {
+  // 在编排层再叠一个隐藏上限，会造出"我配了 topK=10、进模型的却只有 5 条"这种**查不出来**的事
+  // （与 P0-1-23「组件绑定不设条数上限」同款判断）。
+  const ten = Array.from({ length: 10 }, (_value, i) =>
+    makeHit({ chunkId: `c-${String(i).padStart(2, '0')}`, rrfScore: 1 - i * 0.01 }),
+  )
+  assertEqual(mergeRetrievalHits([ten]).length, 10, '10 进 10 出')
+  assertEqual(mergeRetrievalHits([ten, ten]).length, 20, '两个库各 10 条 ⇒ 20 条')
+  assertEqual(mergeRetrievalHits([ten])[0].chunkId, 'c-00', '不改字段、不改顺序')
+})
+
+await it('引用卡：`score` 取**融合分** `rrfScore`（不是任何一路原始分），且只带三列', () => {
+  // `§九` 的口径是"对外只给融合分"：`vectorScore`（余弦）与 `bigm_similarity` 量纲不可比，
+  // 混在一张卡上会让用户无法解释自己看到的数字。三个数刻意取成各不相同，取错必然被抓。
+  const items = toCitationItems([makeHit({ rrfScore: 0.0328, vectorScore: 0.91, fulltextScore: 0.17 })])
+  assertSameObject(
+    items[0],
+    { docName: '报销制度.txt', snippet: '出差住宿标准为每晚上限 500 元。', score: 0.0328 },
+    '三列逐字',
+  )
+  assertSameSet(Object.keys(items[0]), ['docName', 'snippet', 'score'], '恰好三列（多带 chunkId/page 会与 sse.ts 分叉）')
+  assertSameObject(toCitationItems([]), [], '零命中 ⇒ 空数组（调用方据此决定"不发 citations 事件"）')
+})
+
+await it('`textOfHistoryRow`：跨版本读 jsonb 的唯一兜底点，脏值一律 `""` 且永不抛错', () => {
+  // `messages.content` 的形状由**写入时的版本**决定，而历史是跨版本读的。一个解析不出来的行
+  // 不该让整轮对话失败 —— 那意味着"三年前的一条脏数据让今天的提问用不了"。
+  // ⚠️ 只做**类型收敛**，不做任何猜测（不去猜数组里第几个、不去猜 html）。
+  assertEqual(textOfHistoryRow({ role: 'USER', content: '裸字符串' }), '裸字符串', '历史里可能存过裸串')
+  assertEqual(textOfHistoryRow({ role: 'USER', content: { text: '正常' } }), '正常', '本批写入的形态')
+  assertEqual(textOfHistoryRow({ role: 'USER', content: { text: '', thinking: 'x' } }), '', '有 thinking 无 text ⇒ 空')
+  for (const [value, label] of [
+    [null, 'null'],
+    [[], '数组'],
+    ['', '空串'],
+    [{}, '空对象'],
+    [{ text: 1 }, 'text 不是串'],
+    [42, '数字'],
+  ]) {
+    assertEqual(textOfHistoryRow({ role: 'USER', content: value }), '', `降级：${label}`)
+  }
+})
+
+await it('历史截断：取 `rounds × 2` 条（一轮 = 一问一答）且截断后**从 user 开始**', () => {
+  // 两条口径各对应一种"看不太出来"的坏结果：
+  //   ① 只按"条"取 `rounds` 条 = 只给一半轮数（`02` §六 写的是"最近 N 轮"）；
+  //   ② 截点常落在助手回答中间 ⇒ 开头是一条没有问题的回答，模型会把它当"要继续写下去的上文"
+  //      （症状是回答莫名其妙地接着上一轮的结论说）。
+  const rows = [
+    { role: 'USER', content: { text: 'u1' } },
+    { role: 'ASSISTANT', content: { text: 'a1' } },
+    { role: 'USER', content: { text: 'u2' } },
+    { role: 'ASSISTANT', content: { text: 'a2' } },
+    { role: 'USER', content: { text: 'u3' } },
+    { role: 'ASSISTANT', content: { text: 'a3' } },
+    { role: 'USER', content: { text: 'u4' } },
+  ]
+  assertSameObject(
+    selectHistoryMessages(rows, 1),
+    [{ role: 'user', content: 'u4' }],
+    '1 轮 = 最近 2 条；截到 assistant 开头就把它丢掉',
+  )
+  const two = selectHistoryMessages(rows, 2)
+  assertEqual(two.length, 3, '2 轮：最近 4 条里开头的 assistant 被丢 ⇒ 3 条')
+  assertEqual(two[0].content, 'u3', '起点是 user')
+  assertEqual(two[0].role, 'user', '角色映射成小写（LLM 入参口径）')
+  assertEqual(selectHistoryMessages(rows, 99).length, 7, '轮数超出全量就全给')
+  assertSameObject(selectHistoryMessages(rows, 0), [], '⚠️ 0 轮 ⇒ 空（不是"全给"）')
+})
+
+await it('历史截断：丢掉空文本的助手行与 SYSTEM 行', () => {
+  // 停止得很早的一轮会留下"有 thinking 没 text"的助手行（P0-1-27 停止时"已生成部分保留"）。
+  // 它对上下文没有贡献，却会让严格的实现在上游直接 400（一条空 content 的 assistant 消息是非法的）。
+  const rows = [
+    { role: 'SYSTEM', content: { text: '不该进上下文' } },
+    { role: 'USER', content: { text: '问' } },
+    { role: 'ASSISTANT', content: { text: '', thinking: '想到了但没吐字' } },
+    { role: 'ASSISTANT', content: { text: '答' } },
+  ]
+  assertSameObject(
+    selectHistoryMessages(rows, 10),
+    [
+      { role: 'user', content: '问' },
+      { role: 'assistant', content: '答' },
+    ],
+    '唯二留下的两行（SYSTEM 与空助手行都出局）',
+  )
+})
+
+await it('落库形态：`text` 恒写（可以是空串）；空的 `thinking`/`citations` **不加键**', () => {
+  // 省掉键 = "这一段本来就没有"，与"有但是空"在界面上是两件事（思考折叠区/引用区都是"有才出现"，`03` §五）。
+  // ⚠️ 反过来：`text` 不能省 —— 它是历史重建时唯一进上下文的部分，缺键会被 P0-1-28 当成"旧版本的行"。
+  assertSameObject(buildAssistantContent({ text: '', thinking: '', citations: [] }), { text: '' }, '全空 ⇒ 只有 text 一个键')
+  assertSameObject(
+    buildAssistantContent({
+      text: '答案',
+      thinking: '推理',
+      citations: [{ docName: 'A.txt', snippet: 'S', score: 0.0328 }],
+    }),
+    { text: '答案', thinking: '推理', citations: [{ docName: 'A.txt', snippet: 'S', score: 0.0328 }] },
+    '三段齐全',
+  )
+  assertSameObject(
+    buildAssistantContent({ text: '答', thinking: '  ', citations: [] }),
+    { text: '答', thinking: '  ' },
+    '空白 thinking 不是空 ⇒ 照写（与"不 trim"同口径）',
+  )
+})
+
+await it('落库形态：返回的 `citations` 是**副本**（改返回值不得回写调用方的数组）', () => {
+  const citations = [{ docName: 'A.txt', snippet: 'S', score: 1 }]
+  const content = buildAssistantContent({ text: 't', thinking: '', citations })
+  content.citations.push({ docName: 'B.txt', snippet: 'S', score: 2 })
+  assertEqual(citations.length, 1, '入参数组长度不变')
+})
+
+await it('并发闸：满则 `tryAcquire()` 返回 `null`（**不是 Promise**）—— 不排队', () => {
+  // `02` §六 给两个编排器的口径**不同**，别照着邻居抄：ChatBot 满 ⇒ `BUSY`（用户可以重发，
+  // 且立刻知道自己被拒）；TaskAgent（P0-3）满 ⇒ `queued` + 排队位次（沙箱最贵、等待是常态）。
+  // 给 ChatBot 也做排队只会造出"前端不知道该画什么"的中间态（`03` §五 的 queued 行写的是沙箱并发满）。
+  const sem = createSemaphore(2)
+  assertEqual(sem.limit, 2, '上限可读（日志要写 x/limit）')
+  assertEqual(typeof sem.tryAcquire(), 'function', '第 1 个拿到释放函数')
+  assertEqual(typeof sem.tryAcquire(), 'function', '第 2 个拿到释放函数')
+  assertEqual(sem.inFlight, 2, '在飞 2')
+  assertEqual(sem.tryAcquire(), null, '第 3 个立刻被拒')
+  assert(!(sem.tryAcquire() instanceof Promise), '⚠️ 必须同步返回 null（返回 Promise 等于偷偷排了队）')
+})
+
+await it('并发闸：`release` **幂等**（否则计数减负 ⇒ 上限被悄悄放到无穷）', () => {
+  const sem = createSemaphore(1)
+  const release = sem.tryAcquire()
+  release()
+  assertEqual(sem.inFlight, 0, '释放后计数归零')
+  release()
+  release()
+  assertEqual(sem.inFlight, 0, '重复释放不再减（不能变成 -2）')
+  assertEqual(typeof sem.tryAcquire(), 'function', '计数没有减负 ⇒ 名额仍然只有 1 个')
+  assertEqual(sem.tryAcquire(), null, '第 2 个仍被拒')
+})
+
+await it('并发闸：`limit < 1` 抬到 1、小数向下取整（0 会让所有请求都被拒 = 永远打不开的服务）', () => {
+  assertEqual(createSemaphore(0).limit, 1, '0 → 1（要停服务应该走停机，不是把闸门关成 0）')
+  assertEqual(createSemaphore(-5).limit, 1, '负数 → 1')
+  assertEqual(createSemaphore(2.9).limit, 2, '小数向下取整')
+  assertEqual(typeof createSemaphore(0).tryAcquire(), 'function', '抬高后确实能占到一个名额')
+})
+
+await it('契约同源：引用卡形状只定义一次，SSE 事件与落库共用同一份', () => {
+  // 流里现画的引用卡与刷新后从 `messages.content.citations` 重画的卡必须长得一样（`03` §五 单一渲染路径）。
+  // 各写一份的后果没有编译期错误、只有肉眼能发现 —— 与 P0-1-27 把 `sseCitationsPayloadSchema`
+  // 改成引用 `citationItemSchema` 是同一条。
+  assertSameSet(Object.keys(citationItemSchema.shape), ['docName', 'snippet', 'score'], '引用卡三列')
+  assertEqual(citationItemSchema.safeParse({ docName: 'a', snippet: 'b', score: 0.1 }).success, true, '合法引用')
+  assertEqual(citationItemSchema.safeParse({ docName: 'a', snippet: 'b' }).success, false, 'score 必填（缺了没法显示融合分）')
+  assertSameSet(
+    Object.keys(messageContentSchema.shape),
+    ['text', 'thinking', 'citations'],
+    '消息 content 三列（tool_calls / attachments 属 P0-2 / P1，本版本刻意不定型）',
+  )
+  assertEqual(messageContentSchema.safeParse({ thinking: '只有思考' }).success, false, '⚠️ text 必填 —— 历史重建唯一进上下文的部分')
+  assertEqual(messageContentSchema.safeParse({ text: '' }).success, true, 'text 可以是空串（停止得很早的那一轮）')
+  // ⚠️ 这条不是"要求报错"，而是把**坑本身**钉住：Zod 默认会**静默剥掉**未声明的键。
+  //    将来给 content 加字段时，忘了同时改 shared 不会报任何错，只让历史渲染缺一块。
+  const stripped = messageContentSchema.safeParse({ text: 't', ext: 1 })
+  assertEqual(stripped.success, true, '未声明的键不会让解析失败')
+  assertSameSet(Object.keys(stripped.data), ['text'], '⚠️ 而是被**静默剥掉**')
 })
 
 await app.close()

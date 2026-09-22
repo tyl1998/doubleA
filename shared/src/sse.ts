@@ -59,6 +59,7 @@
 
 import { z } from 'zod'
 
+import { citationItemSchema } from './conversation.js'
 import { ERROR_CODES } from './errors.js'
 
 // ───────────────────────────── 事件名与取值域 ─────────────────────────────
@@ -144,15 +145,15 @@ export const sseConfirmPayloadSchema = z.object({
 })
 export type SseConfirmPayload = z.infer<typeof sseConfirmPayloadSchema>
 
-/** `citations`：本轮知识库引用（文档名 + 片段原文 + 分数；`01` 决策 12） */
+/**
+ * `citations`：本轮知识库引用（文档名 + 片段原文 + 分数；`01` 决策 12）。
+ *
+ * ⚠️ `items[]` 的形状来自 `conversation.ts#citationItemSchema`（**只定义一次**）：
+ * 同一个引用卡既由本事件现画、又由 `messages.content.citations` 在刷新后重画，
+ * 两处各写一份会让"流里看到的卡"与"历史恢复出来的卡"悄悄分叉（`03` §五 的单一渲染路径）。
+ */
 export const sseCitationsPayloadSchema = z.object({
-  items: z.array(
-    z.object({
-      docName: z.string(),
-      snippet: z.string(),
-      score: z.number(),
-    }),
-  ),
+  items: z.array(citationItemSchema),
 })
 export type SseCitationsPayload = z.infer<typeof sseCitationsPayloadSchema>
 

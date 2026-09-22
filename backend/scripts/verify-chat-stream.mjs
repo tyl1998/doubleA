@@ -21,13 +21,19 @@
  * `x-accel-buffering: no` / `connection: keep-alive`（`06` 坑预判「SSE 响应头要禁缓冲」）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ⚠️ 本批的 chat producer 是**占位**的 ⇒ 本脚本验的是"通道"，不是"回答"
+ * ⚠️ 本脚本验的是"通道"，不是"回答"（P0-1-26 立的规矩；P0-1-27 起手段换了一个）
  * ─────────────────────────────────────────────────────────────────────
- * `docs/06` P0-1-26 的产出只有 `orchestrator/sse.ts`（通道 / 互斥 / 停止 / 心跳）；真正的编排循环
- * （检索、LLM 流式调用、`citations`、落库）属 **P0-1-27**。于是本批的流是"**空流**"：
- * **只发 `ping`，不发任何内容事件，也不落库**（占位实现见 `orchestrator/index.ts` 的文件头）。
- * 因此本脚本**断言"没有任何非 ping 事件"**（A 组）—— 这不是"没测到答案"，而是把
- * "本批不该有答案"也变成一条守门断言（`docs/06` 的边界写进 README 之前，先钉在这里）。
+ * `docs/06` P0-1-26 的产出只有 `orchestrator/sse.ts`（通道 / 互斥 / 停止 / 心跳），真正的编排循环
+ * （检索、LLM 流式调用、`citations`、落库）属 **P0-1-27**。
+ * 📌 **P0-1-26 时** producer 是占位实现（只发 `ping`、不发内容事件、不落库），所以 A 组曾把
+ * "本批不该有答案"做成一条守门断言。**P0-1-27 落地后这条断言的前提消失了** —— 本档不再靠
+ * "producer 是空壳"来造那条空流，而是把 **Provider 的 `base_url` 指向假对话上游的 `stall` 模式**：
+ * 上游收下请求后**只发 SSE 注释行、不回内容** ⇒ 流里仍然**只有 `ping`**，
+ * 于是"通道"这一层的每条断言（时间轴 / 句柄 / 互斥 / 停止 / 断线）原样成立，
+ * 而**回答本身**由 `verify:chatbot` 负责验（它才是 P0-1-27 的那一档）。
+ * ⚠️ 留痕（P0-1-27 起）：A 组那条断言的**文字**从"本批不该有内容事件"改成
+ * "上游挂着不回 ⇒ 事件集合只有 ping"—— 它守的东西没变（**通道不许自己造内容事件**），
+ * 变的是**怎么把上游按住**。**再用"producer 是占位"当前提的写法，到这一批就该翻。**
  *
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 注入小窗口（P0-1-6 的教训：窗口类配置必须注入小值，否则结果随窗口随机成败）
@@ -41,8 +47,8 @@
  * 依赖与前置
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 跑之前先起依赖并迁移：`pnpm infra:up && pnpm db:deploy`。**不需要 MinIO**（本批不碰对象存储）、
- * **不需要 `EMBEDDING_*`**（不建知识库）、**不需要任何真实上游**（占位 producer 不发请求，
- * 故 Provider 的 `baseUrl` 随便填一个合法 URL 即可）。
+ * **不需要 `EMBEDDING_*`**（不建知识库）、**不需要任何真实上游**（P0-1-27 起用**本仓夹具**
+ * `fixtures/chat-upstream.mjs` 的 `stall` 模式当上游，它随脚本起、随脚本关）。
  *
  * 端口：默认 **13097**（刻意避开用户 dev 的 13000 与 verify:e2e 的 13099）；
  * 被占时 `CHAT_STREAM_PORT=13096 node scripts/verify-chat-stream.mjs`。
@@ -79,6 +85,12 @@ const {
   ssePingPayloadSchema,
   stopConversationResultSchema,
 } = await import('@doubulea/shared')
+// P0-1-27 起编排循环会**真的调上游** ⇒ Provider 的 `base_url` 必须有个能收下请求的东西。
+// 用本仓夹具的 `stall` 模式：收下、挂住、只发 SSE 注释行（不回内容）—— 这正是"通道在跑、
+// 但一个内容事件都不该有"所需要的形状（P0-1-26 时靠"producer 是占位实现"达成同一件事）。
+const { startFakeChatUpstream } = await import('./fixtures/chat-upstream.mjs')
+const chatUpstream = await startFakeChatUpstream()
+chatUpstream.setMode('stall')
 
 // ───────────────────────────── 断言脚手架（与其余脚本同一套）─────────────────────────────
 
@@ -281,8 +293,8 @@ function parseFrame(raw) {
 /**
  * 开一条 SSE 流并在**后台**持续抽帧（帧到达时刻记进 `frames[].at`）。
  *
- * 后台抽帧而不是"断言时现读"：本批的流**永不自己结束**（占位 producer），
- * 而断言是"过一会儿看收到了什么"—— 边读边存是最贴合这件事的形状。
+ * 后台抽帧而不是"断言时现读"：本档的流**永不自己结束**（上游处于 `stall`：只发注释行、不回内容，
+ * 于是编排层一直等着首个增量），而断言是"过一会儿看收到了什么"—— 边读边存是最贴合这件事的形状。
  */
 function openStream(response, requestedAt) {
   const state = {
@@ -506,16 +518,18 @@ try {
     return response.body.data
   }
 
-  // baseUrl 只是个合法 URL：本批是空流，没有任何上游调用（占位 producer 不发请求）
+  // ⚠️ P0-1-27 起上游是**真在跑的**（编排循环接回后必然要调它）⇒ base_url 必须指向假上游。
+  //    夹具停在 `stall`：收下请求、回 SSE 注释行，**不回内容** ⇒ 流里仍然只有 `ping`
+  //    （这正是本档要的形状："通道在跑、但一个内容事件都不许有"）。
   const providerWithKey = await createProvider({
     name: `SSE 验证 Provider（有 Key）${suffix}`,
-    baseUrl: 'https://api.example.com/v1',
+    baseUrl: chatUpstream.url,
     type: 'CHAT',
     apiKey: `sk-verify-chat-${suffix}`,
   })
   const providerNoKey = await createProvider({
     name: `SSE 验证 Provider（无 Key）${suffix}`,
-    baseUrl: 'https://api.example.com/v1',
+    baseUrl: chatUpstream.url,
     type: 'CHAT',
   })
 
@@ -574,7 +588,7 @@ try {
   groupStart(
     'A',
     '流形态与心跳（`02` §五：帧格式 + 响应头禁缓冲 + 空闲期 ping）',
-    '验收原文："手动发一个空流观察 ping 按间隔到达" —— 本组同时钉住"不该有内容事件"（P0-1-27 之前恒为空流）',
+    '验收原文："手动发一个空流观察 ping 按间隔到达" —— 本组同时钉住"通道不许自己造内容事件"（上游被摁在 stall）',
   )
   // ═══════════════════════════════════════════════════════════════════
 
@@ -629,9 +643,9 @@ try {
     )
   })
 
-  await it('空流：只发 `ping`，没有任何内容事件（P0-1-27 之前这是**预期**行为）', async () => {
+  await it('上游挂着不回 ⇒ 只发 `ping`，没有任何内容事件（P0-1-26 时靠"producer 是占位"，P0-1-27 起靠 stall 上游）', async () => {
     await waitUntil(() => streamA.frames.length >= 3, 6000, '至少收到 3 帧')
-    assertOnlyEvents(streamA.frames, ['ping'], '事件集合（本批只允许出现 ping）')
+    assertOnlyEvents(streamA.frames, ['ping'], '事件集合（本组只允许出现 ping）')
     assertEqual(streamA.malformed, 0, '畸变帧数（data 应当都是合法 JSON）')
     for (const frame of streamA.frames) {
       const parsed = ssePingPayloadSchema.safeParse(frame.data)
@@ -658,9 +672,9 @@ try {
   await it('`updateActiveSnapshot`（写侧）→ `/active` 读得到（P0-1-27 的 `currentTool` 走同一条路）', async () => {
     const active = await readActive(ownerJar, conversationMain.id)
     const startedAt = active.startedAt
-    // 直接调模块级函数（当前的 producer 是占位实现、不会调用它 —— 与 P0-1-25 的
-    // `touchConversation` 同一种取证手法：**把口径做成可单独调用的函数**，否则这一条
-    // 要等到 P0-1-27 才有第一条 HTTP 路径）
+    // 直接调模块级函数（**编排层不调用它** —— `chatBot.ts` 的 `currentTool` 属 P0-2 的工具循环；
+    // 与 P0-1-25 的 `touchConversation` 同一种取证手法：**把口径做成可单独调用的函数**，
+    // 否则这条断言要等到有第一条真实调用路径的那一批才验得上）
     await updateActiveSnapshot(conversationMain.id, startedAt, { currentTool: 'search_knowledge' })
     const after = await readActive(ownerJar, conversationMain.id)
     assertEqual(after.currentTool, 'search_knowledge', 'currentTool（写侧→读侧）')
@@ -1062,6 +1076,7 @@ try {
   await stopServer()
   await closePrisma()
   await closeRedis()
+  await chatUpstream.close().catch(() => undefined)
 }
 
 // ───────────────────────────── 结论表 ─────────────────────────────
@@ -1074,11 +1089,11 @@ for (const group of groups) {
   )
 }
 console.log(
-  `  ${c.y}⚠️${c.x} 本批的 producer 是**占位**的（orchestrator/index.ts）：流里**只有 ping**、` +
-    `不落库、不会自己结束 —— 编排循环属 P0-1-27，别把"没有回答"当 bug`,
+  `  ${c.y}⚠️${c.x} 本档的上游被摁在 **stall**（scripts/fixtures/chat-upstream.mjs）：流里**只有 ping**、` +
+    `这一个字都不是"没有回答"的证据 —— 回答本身归 **verify:chatbot**（P0-1-27）`,
 )
 console.log(
-  `  ${c.d}边界：并发闸（CHATBOT_CONCURRENCY → 429 BUSY）属 P0-1-27；` +
+  `  ${c.d}边界：并发闸满 ⇒ 流内 error{BUSY} 属 P0-1-27（见 verify:chatbot 的 D 组）；` +
     `消息历史 POST /:id/messages 属 P0-1-28；浏览器里仍是占位页（P0-1-30）${c.x}`,
 )
 

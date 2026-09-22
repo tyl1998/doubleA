@@ -43,6 +43,7 @@
   "verify:agent-package": "pnpm --filter @doubulea/backend verify:agent-package",
   "verify:conversations": "pnpm --filter @doubulea/backend verify:conversations",
   "verify:chat-stream": "pnpm --filter @doubulea/backend verify:chat-stream",
+  "verify:chatbot": "pnpm --filter @doubulea/backend verify:chatbot",
   "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

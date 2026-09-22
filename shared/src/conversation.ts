@@ -262,3 +262,44 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
       typeof startedAt === 'string' && !Number.isNaN(Date.parse(startedAt)) ? startedAt : null,
   }
 }
+
+// ───────────────────────────── 消息落库形态（P0-1-27 写入端 / P0-1-28 读取端）─────────────────────────────
+
+/**
+ * 一条**引用**（`items[]` 的元素）。
+ *
+ * ⚠️ 这份形状被**两个出口**共用，故必须只定义一次：
+ *   · SSE 的 `citations` 事件（`shared/src/sse.ts` 的 `sseCitationsPayloadSchema`，本轮现算现发）；
+ *   · `messages.content.citations`（jsonb，落库后由历史接口读出来重绘引用卡）。
+ * 两处各写一份的后果很具体：**流里出现的引用卡与刷新后恢复出来的引用卡长得不一样**
+ * （`03` §五 要求"单一渲染路径"），而且没有编译期错误、只有肉眼能发现。
+ *
+ * `score` 是**融合分**（`rrfScore`）而不是任何一路的原始分：`§九` 的口径是"对外只给融合分"
+ * （两路量纲不可比，把 `vectorScore` 与 `bigm_similarity` 混在一张卡上会让数字无法解释）。
+ */
+export const citationItemSchema = z.object({
+  docName: z.string(),
+  snippet: z.string(),
+  score: z.number(),
+})
+export type CitationItem = z.infer<typeof citationItemSchema>
+
+/**
+ * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
+ *
+ * 设计口径（三条，都是"改了就会让历史读不出来"的）：
+ *   · **`text` 必填**（可以是空串）：它是历史重建时唯一进入 LLM 上下文的部分
+ *     （`orchestrator/chatContext.ts#selectHistoryMessages`）—— 缺了它，多轮对话就断了。
+ *   · `thinking` / `citations` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
+ *     与"它有但是空的"在界面上是两件事（思考折叠区该不该出现、引用区该不该出现）。
+ *   · `tool_calls` / `attachments` **本版本刻意不定型**：工具属 **P0-2**（MCP）、附件属 **P1**
+ *     （`files` 表），现在写进去只会是"猜的形状"，而 `02` §三 已写明"结构一经写入**不改语义**"。
+ *     ⚠️ 故本 schema 是 **passthrough** 之外的严格形状：将来加字段时要**同时**回到这里加，
+ *     否则 P0-1-28 的读取端会把它当未知字段丢掉（历史渲染缺一块，且不报错）。
+ */
+export const messageContentSchema = z.object({
+  text: z.string(),
+  thinking: z.string().optional(),
+  citations: z.array(citationItemSchema).optional(),
+})
+export type MessageContent = z.infer<typeof messageContentSchema>

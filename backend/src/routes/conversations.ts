@@ -178,6 +178,9 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         reply,
         conversationId: sendable.conversationId,
         agentId: sendable.agentId,
+        // `content` 已由路由级 schema（`chatRequestBodySchema`）trim 过；它**同时**是
+        // 检索的 query 与落库时用户消息的正文（P0-1-27 的编排循环两处都要用）
+        content: request.body.content,
         target: sendable.target,
         producer: resolveChatProducer(),
       })

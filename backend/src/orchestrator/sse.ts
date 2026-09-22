@@ -360,6 +360,15 @@ export interface ChatProducerResult {
 export interface ChatProducerInput {
   conversationId: string
   agentId: string
+  /**
+   * 本轮用户消息的正文（**已 trim**）—— 来自请求体（`shared` 的 `chatRequestBodySchema`）。
+   *
+   * 为什么由出口层转交、而不是让编排层回头查库：这条消息**此刻还没落库**
+   * （落库发生在 `done`，见 `02` §5.2"事件即真相"），而它同时是"检索的 query"与
+   * "落库时用户消息的正文"（P0-1-27 的编排循环两处都要用）。
+   * 传引用/传引用类型（而不是整个 body）是刻意的：附件（P1）之类的新字段不会顺着这里流进去。
+   */
+  content: string
   /** 已解析的上游目标（含明文 Key ⇒ 只进内存，日志用 `describeTarget`） */
   target: LlmTarget
   /** 本次流的开始时刻（ISO 8601）—— 同时也是锁的归属标识（见文件头 ③） */
@@ -641,6 +650,8 @@ export interface StreamChatReplyInput {
   /** 会话与上游目标（由 `services/conversation.service.ts#assertConversationSendable` 产出） */
   conversationId: string
   agentId: string
+  /** 本轮用户消息正文（`shared` 的 `chatRequestBodySchema` 已 trim）—— 转交给 producer */
+  content: string
   target: LlmTarget
   /** 编排循环（P0-1-27）；本批是占位实现，见 `orchestrator/index.ts` */
   producer: ChatProducer
@@ -694,7 +705,7 @@ async function writeSseErrorReply(reply: FastifyReply, payload: SseErrorPayload)
  * （ALS 会传播到其后创建的异步资源）⇒ 心跳与收尾日志天然与发起请求对齐（`02` §十三）。
  */
 export async function streamChatReply(input: StreamChatReplyInput): Promise<void> {
-  const { reply, conversationId, agentId, target, producer } = input
+  const { reply, conversationId, agentId, content, target, producer } = input
   const logger = getLogger()
   const startedAt = new Date().toISOString()
 
@@ -756,6 +767,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
       const result = await producer({
         conversationId,
         agentId,
+        content,
         target,
         startedAt,
         signal: channel.signal,
