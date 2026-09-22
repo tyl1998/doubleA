@@ -5,9 +5,9 @@
  *      + §四 约定（信封 / offset-limit 分页）+ §五（SSE 协议全文）+ §5.2（互斥 / 心跳 / 停止 / 断线）
  *      + `01` §3.3 功能表第 9 条 + `03` §4.1（会话侧栏与输入区状态机）/ §七（会话删除是级联删除）。
  *
- * 七条已落地（P0-1-25 五条 + P0-1-26 两条）：Agent 会话列表 / 新建 / 重命名 / 删除 / `/active` /
- * **`/chat`（SSE）** / **`/stop`**。仍缺两条：`/:id/messages`（**P0-1-28**）、
- * `/:id/confirm`（**P0-2**，要 `mcp_servers` 表）。
+ * 八条已落地（P0-1-25 五条 + P0-1-26 两条 + **P0-1-28 的消息历史**）：Agent 会话列表 / 新建 /
+ * 重命名 / 删除 / `/active` / **`/chat`（SSE）** / **`/stop`** / **`/messages`**。
+ * `02` §4.5 那张表的九条路由至此只剩一条没有出口：`/:id/confirm`（**P0-2**，要 `mcp_servers` 表）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 权限：**只有本人**，且靠"查询条件里带 userId"实现，路由层没有任何判据
@@ -37,6 +37,7 @@ import {
   conversationIdParamsSchema,
   createConversationBodySchema,
   listConversationsQuerySchema,
+  listMessagesQuerySchema,
   ok,
   renameConversationBodySchema,
   agentIdParamsSchema,
@@ -45,6 +46,7 @@ import {
   type ConversationIdParams,
   type CreateConversationBody,
   type ListConversationsQuery,
+  type ListMessagesQuery,
   type RenameConversationBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -57,6 +59,7 @@ import {
   createConversation,
   getConversationActive,
   listConversationsForAgent,
+  listMessages,
   removeConversation,
   renameConversation,
   type ConversationViewer,
@@ -142,6 +145,33 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     '/api/conversations/:id/active',
     { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
     async (request) => ok(await getConversationActive(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * 消息历史（`GET /api/conversations/:id/messages`，P0-1-28）。
+   *
+   * 游标分页（`02` §四 的约定：**只有 messages 用游标**，其余列表是 offset/limit）：
+   * `?beforeId=&limit=` —— 都不传就是"最新一页"。响应 `{ items, nextCursor, hasMore }`，
+   * 其中 `items` 是**时间正序（旧 → 新）**、`nextCursor` 指向**更早**那一页
+   * （= 本页第一条的 id）。⚠️ 这两句必须一起看，理由写在 `shared` 的
+   * `messagePageResultSchema` 注释里（正序是为了与事件流的"追加"语义共用一套渲染）。
+   * 断线重连的完整恢复流程是 `/active`（拿进度）→ 本端点（补齐消息），见 §5.2。
+   *
+   * 三处刻意：
+   *   · **不返回进行中的消息**：`02` §5.2 明写"历史不含进行中消息，进行中状态由 `/active` 提供"
+   *     —— 半条回答只存在于那条 SSE 连接上，落库发生在 `done` 时（`chatBot.ts` 的收尾）。
+   *   · **`content` 原样透出**（不过 `messageContentSchema`）：`tool_calls`（P0-2）与
+   *     `attachments`（P1）将来要能随历史一起还原（`01` §3.4「完整还原」），
+   *     用写入端的 schema 过滤会把它们**静默**剥掉。
+   *   · **不查 `status`**：`FINISHED`（Agent 被软删 ⇒ 会话转只读**保留**）的历史照样看得见。
+   */
+  app.get<{ Params: ConversationIdParams; Querystring: ListMessagesQuery }>(
+    '/api/conversations/:id/messages',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, querystring: listMessagesQuerySchema },
+    },
+    async (request) => ok(await listMessages(request.params.id, request.query, viewerOf(request))),
   )
 
   /**

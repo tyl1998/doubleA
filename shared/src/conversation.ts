@@ -48,12 +48,20 @@
  * 响应里由键**是否存在**派生出 `streaming`（{@link conversationActiveSchema}）。
  * ⚠️ 写侧归 **P0-1-26**（`orchestrator/sse.ts` 在流开始时写、结束时删）；本批只实现读侧，
  * 所以现在**恒为 `{streaming:false}`** —— 这一条在 `docs/06` P0-1-25 里明写，并作为验收断言。
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑥ 消息历史（P0-1-28）：**读取端不解释 `content`**，原样透出
+ * ─────────────────────────────────────────────────────────────────────
+ * `messageItemSchema.content` 刻意是 `z.unknown()`（**不是** `messageContentSchema`）：
+ * 那个 schema 会把未声明的键**静默剥掉**（见其注释）—— 用它过滤一遍，P0-2 写进去的 `tool_calls`
+ * 就会在"刷新后重放历史"时凭空消失，而**没有任何报错**（`01` §3.4「完整还原」要求的正是
+ * "工具卡 / 引用卡都能还原"）。服务端的职责只有一条：**把那一列原封不动地交出去**。
+ * 前端渲染时再按已知的三段取值（未知段原样留着）。
  */
 
 import { z } from 'zod'
 
 import { AGENT_TYPES } from './agent.js'
-import { offsetPageOf } from './envelope.js'
+import { cursorPageOf, offsetPageOf } from './envelope.js'
 
 // ───────────────────────────── 取值域与判据 ─────────────────────────────
 
@@ -294,8 +302,12 @@ export type CitationItem = z.infer<typeof citationItemSchema>
  *     与"它有但是空的"在界面上是两件事（思考折叠区该不该出现、引用区该不该出现）。
  *   · `tool_calls` / `attachments` **本版本刻意不定型**：工具属 **P0-2**（MCP）、附件属 **P1**
  *     （`files` 表），现在写进去只会是"猜的形状"，而 `02` §三 已写明"结构一经写入**不改语义**"。
- *     ⚠️ 故本 schema 是 **passthrough** 之外的严格形状：将来加字段时要**同时**回到这里加，
- *     否则 P0-1-28 的读取端会把它当未知字段丢掉（历史渲染缺一块，且不报错）。
+ *     ⚠️ 本 schema **不是 `passthrough` 也**不是 `.strict()` —— 未声明的键会被 Zod **静默剥掉**
+ *     （不报错）。P0-1-27 在这里留下的告诫是"将来加字段必须同时回到 shared 加"；
+ *     **P0-1-28 落地读取端时按更彻底的办法处置**：读取端**根本不用这个 schema 过滤**
+ *     （`messageItemSchema.content` 是 `z.unknown()`，原样透出，见文件头 ⑥）⇒
+ *     P0-2/P1 加段时**不必回头改这里**，也不会有"刷新之后卡片少了一块"的风险。
+ *     本 schema 的用途因此收窄为：**写入端**（`chatBot.ts#buildAssistantContent`）的形态约束。
  */
 export const messageContentSchema = z.object({
   text: z.string(),
@@ -303,3 +315,97 @@ export const messageContentSchema = z.object({
   citations: z.array(citationItemSchema).optional(),
 })
 export type MessageContent = z.infer<typeof messageContentSchema>
+
+// ───────────────────────────── 消息历史（P0-1-28）─────────────────────────────
+
+/**
+ * 消息角色（`schema.prisma` 的 `enum MessageRole`，取值**逐字一致**）。
+ *
+ * 用 DB 的原值（大写）而不是 LLM 入参口径的小写：这是**存储层的取值域**，
+ * 与 `CONVERSATION_STATUSES` / `DOCUMENT_STATUSES` / `COMPONENT_TYPES` 同一写法。
+ * 小写映射发生在"组装上游请求"那一处（`orchestrator/chatContext.ts#selectHistoryMessages`），
+ * 别把它漏到这里来 —— 两处各有一份小写映射，就会出现"历史渲染出的角色"与
+ * "接口返回的角色"对不上的那种**没有编译期错误**的偏差。
+ */
+export const MESSAGE_ROLES = ['USER', 'ASSISTANT', 'SYSTEM'] as const
+export type MessageRole = (typeof MESSAGE_ROLES)[number]
+
+/** 一页最多几条（与其余列表的上限一致；`02` §四 只定了 messages 用游标，没定上下限） */
+export const MESSAGE_PAGE_LIMIT_MAX = 100
+/** 不传 `limit` 时的默认条数（与其余列表的"默认 20"对齐） */
+export const MESSAGE_PAGE_LIMIT_DEFAULT = 20
+
+/**
+ * `GET /api/conversations/:id/messages` 的查询参数（`02` §四：messages 用**游标**分页）。
+ *
+ * `beforeId` **不传 = 取最新一页**（对话页首次进入的形态）；传了就取"比它更早"的一页。
+ * ⚠️ 它是 **id 而不是时间戳**：`created_at` 是毫秒精度，而同一轮问答的用户消息与助手消息
+ * **在同一个事务里写入** ⇒ `created_at` 完全可能相同（`now()` 取的是事务开始时刻），
+ * 用时间戳当游标会漏掉同毫秒的另一条。故游标必须是一个**具体行的 id**，
+ * 服务端再拿它的 `(created_at, id)` 去做字典序比较（见 `backend` 的 `listMessages`）。
+ *
+ * `limit` **不设默认之外的"全量"取值**：上限 100 是为了让"一次拉太多导致首屏卡住"
+ * 这件事有一个确定的上界（前端要全量就自己翻页）。
+ */
+export const listMessagesQuerySchema = z.object({
+  beforeId: z.string().uuid('beforeId 不是合法 UUID').optional(),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, 'limit 至少为 1')
+    .max(MESSAGE_PAGE_LIMIT_MAX, `limit 最多 ${MESSAGE_PAGE_LIMIT_MAX}`)
+    .default(MESSAGE_PAGE_LIMIT_DEFAULT),
+})
+export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>
+
+/**
+ * 一条历史消息（`GET /api/conversations/:id/messages` 的最小投影）。
+ *
+ * **`content` 原样透出**（`z.unknown()`）—— 这是本端点最重要的一条契约，理由见文件头 ⑥：
+ * `03` §五 要求"历史还原与事件流同一套渲染组件"（单一渲染路径），而事件流里的
+ * `tool_call` / `citations` / `attachments` 最终都要落到 `content` 的各个段上。
+ * 服务端一旦"按已知的三段过滤一遍"，那些段就在**刷新之后**消失（流里看得见、历史里没有），
+ * 且没有任何报错 —— 前端只能靠肉眼发现。
+ *
+ * **刻意不带的列**：`conversationId`（同一个请求里的消息必然属于同一个会话，带上只是冗余）、
+ * `tokensIn`/`tokensOut`（用量统计属 **P1**，届时会有专门的端点；这里多带两列等于
+ * "悄悄扩大契约"，而 P0-1-22 起每个投影都有一条**键集合**断言在守这件事）。
+ */
+export const messageItemSchema = z.object({
+  id: z.string(),
+  role: z.enum(MESSAGE_ROLES),
+  /**
+   * jsonb 原文（`{ text, thinking?, citations?, …未知段 }`），服务端**不解释**，见文件头 ⑥。
+   *
+   * ⚠️ 用 `z.custom` 而不是 `z.unknown()`：`z.unknown()` **连 `undefined` 都接受**，而 `undefined`
+   * 会被 `JSON.stringify` 直接丢掉整个键 ⇒ 客户端拿到的是"这个字段不存在"。
+   * 列是 `NOT NULL`、服务端也恒有值，所以这一条在正常路径上永远不会触发；
+   * 它守的是"某天有人改成条件 select（如只在有引用时带 content）"这种**静默变窄**。
+   * （顺带：`z.unknown().refine(...)` 会把推断出的类型收成 `{} | null`，那就不叫"原样透出"了。）
+   */
+  content: z.custom<unknown>((value) => value !== undefined, {
+    message: 'content 必须存在（jsonb 列是 NOT NULL；`undefined` 会在序列化时丢掉这一列）',
+  }),
+  /** ISO 8601 */
+  createdAt: z.string(),
+})
+export type MessageItem = z.infer<typeof messageItemSchema>
+
+/**
+ * 消息分页响应 = `{ items, nextCursor, hasMore }`（`shared/src/envelope.ts#cursorPageOf`）。
+ *
+ * ⚠️ **`items` 是时间正序（旧 → 新）**，而 `nextCursor` 指向的是**更早**的那一页
+ * （= 本页**第一条**的 id）。这两句话必须一起看，否则会得到"翻页翻反了"的实现：
+ *
+ *   · 正序的理由是 `03` §五 的渲染语义 —— 对话流是"新消息追加在末尾"，历史与流式必须落在
+ *     **同一个数据结构**上（单一渲染路径）；服务端把它摆正，前端就不必在两处各写一次
+ *     `reverse`（那种"一处正、一处反"的 bug 只在"翻第二页"时才显形）。
+ *   · `nextCursor` 指向更早那一页，因为对话页的翻页永远是**向历史深处走**（没有"更新的一页"
+ *     这个概念 —— 新的内容走 SSE 事件流，不走分页）。
+ *
+ * `nextCursor === null` ⟺ `hasMore === false`（已到最早一条）。两者**刻意都给**：
+ * `hasMore` 是"要不要继续加载"的直接判据（前端只需它），`nextCursor` 是"用什么去加载"
+ * —— 少给一个，客户端就得自己从 `items` 里推（而 `items` 为空时推不出来）。
+ */
+export const messagePageResultSchema = cursorPageOf(messageItemSchema)
+export type MessagePageResult = z.infer<typeof messagePageResultSchema>

@@ -77,6 +77,18 @@
  *              "满 ⇒ 同步 `null`（不排队）+ `release` 幂等"。
  *              两个被测文件**不 import 任何运行期模块**（手法同 `pipeline/chunk/`）⇒ 本档直验；
  *              行为侧（真检索 + 真假上游 + SSE 出口 + 落库）归 `verify-chatbot.mjs`。
+ *   · P0-1-28：**消息历史的契约与取页逻辑** —— `/messages` 已注册（**翻转 P0-1-25 留下的
+ *              "刻意未注册"断言**，并补一条"消息只有读取出口"）、消息投影的键集合
+ *              （不带 `tokensIn`/`conversationId`）、以及**最重要的一条**：`content` 是
+ *              `z.unknown()` **原样透出**（含反向对照：写入端的 `messageContentSchema`
+ *              会把 `tool_calls` 静默剥掉 ⇒ 读取端不许用它）、游标参数
+ *              （`beforeId` 可选且必须是 UUID、`limit` 的默认与上下限、**没有"全量"取值**）、
+ *              分页响应三件套（`items`/`nextCursor`/`hasMore`，**刻意没有 `total`**）。
+ *              取页逻辑 `toMessagePage` 是**纯函数** ⇒ 一并在这里断言："多取的那一条只用来判
+ *              `hasMore`"、"恰好取满 ⇒ `nextCursor:null`"、"逐页翻到底不重不漏（且拼接方向是
+ *              **新页在前**）"、"同毫秒的两条不会被吞掉"、以及时间口径常量
+ *              `MESSAGE_CHRONO_ORDER`（与上下文窗口**同源**）。
+ *              行为侧（真 PG 上的游标 SQL 与跨页翻取）归 `verify-conversations.mjs` 的 H 组。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -189,6 +201,14 @@ import {
   // 消息落库形态（P0-1-27 写入端 / P0-1-28 读取端）
   citationItemSchema,
   messageContentSchema,
+  // 消息历史（P0-1-28）
+  MESSAGE_PAGE_LIMIT_DEFAULT,
+  MESSAGE_PAGE_LIMIT_MAX,
+  MESSAGE_ROLES,
+  cursorPageOf,
+  listMessagesQuerySchema,
+  messageItemSchema,
+  messagePageResultSchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -262,6 +282,11 @@ import {
   toCitationItems,
 } from '../dist/backend/src/orchestrator/chatContext.js'
 import { createSemaphore } from '../dist/backend/src/orchestrator/semaphore.js'
+// 消息历史（P0-1-28）的**取页逻辑**是纯函数（多取一条判 hasMore、反转成正序、
+// nextCursor 指向本页最旧）⇒ 与 `pipeline/chunk/`、`chatContext.ts` 同款：这一档直接断言。
+// "不重不漏"这条验收的**全部**正确性就在这几行里，而它在真库上只表现为"某次翻页少/多一条"
+// —— 一个 SQL 写对的实现配一个错的取页逻辑，照样能顺利跑完。行为侧归 `verify-conversations` 的 H 组。
+import { MESSAGE_CHRONO_ORDER, toMessagePage } from '../dist/backend/src/services/conversation.service.js'
 // 夹具是纯 JS 生成器（手写 PDF/DOCX/ZIP 字节），不引依赖、不读外部文件 ⇒ 仍然满足本档"无依赖"
 import * as fixtures from './fixtures/documents.mjs'
 
@@ -2596,7 +2621,7 @@ await it('输出投影的键集合固定：没有 `deletedAt` 之类的内部列
 // ── 25. 会话契约与路由（P0-1-25）──
 console.log(`\n${c.b}── 会话契约与路由（权限「仅本人」/ active 的派生字段 / last_message_at 的时点）──${c.x}`)
 
-await it('七条已注册（P0-1-25 五条 + P0-1-26 两条）；P0-1-28 / P0-2 的两条**刻意不存在**', () => {
+await it('八条已注册（P0-1-25 五条 + P0-1-26 两条 + P0-1-28 的消息历史）；P0-2 的那一条**刻意不存在**', () => {
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), true, '某 Agent 的会话列表')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations' }), true, '新建会话')
   assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/conversations/:id' }), true, '重命名')
@@ -2605,20 +2630,28 @@ await it('七条已注册（P0-1-25 五条 + P0-1-26 两条）；P0-1-28 / P0-2 
   // `GET /api/conversations/:id`（详情）**没有**被设计过 —— 会话的全部信息都在列表项里，
   // 多一条"取单条"只会变成一个没人维护的第二套投影
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id' }), false, '不该有会话详情端点')
-  // 属后续批次：消息分页 P0-1-28。**提前注册一条返回空数组的
-  // `/messages` 会让"历史恢复"看起来已交付**（P0-1-16 的同款断言，那次是列表/下载）
-  assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id/messages' }), false, '消息分页属 P0-1-28')
-  // ⚠️ 「刻意未注册」型断言**有保质期**（README §六）：下面两条在 P0-1-25 时是 `false`，
-  //    P0-1-26 落地 SSE 出口与停止之后**在这里翻转成 `true`**。翻转必须留痕 ——
-  //    否则将来读的人会以为这两条从来就是 true，也就丢掉了"它们曾经是刻意不做的"。
+  // ⚠️ 「刻意未注册」型断言**有保质期**（`06` 的施工纪律）：下面这一条在 P0-1-25 时是 `false`
+  //    （原文："**提前注册一条返回空数组的 `/messages` 会让'历史恢复'看起来已交付**"），
+  //    **P0-1-28 落地后在这里翻转成 `true`**。翻转必须留痕 ——
+  //    否则将来读的人会以为它从来就是 true，也就丢掉了"它曾经是刻意不做的"。
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/conversations/:id/messages' }),
+    true,
+    '消息历史（P0-1-28 已落地）',
+  )
+  // ⚠️ 同一族的第二次翻转（P0-1-25 时是 `false`，P0-1-26 落地 SSE 出口与停止后翻成 `true`）
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/chat' }), true, 'SSE 出口（P0-1-26 落地）')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/stop' }), true, '停止（P0-1-26 落地）')
   // `confirm` 的应答端点要 `mcp_servers` 表（工具确认属工具系统）⇒ 归 **P0-2**，不是 P0-1-26。
   // （P0-1-25 时这句写的是"属 P0-1-26"；P0-1-26 落地时发现它的真实前置是 P0-2，一并改正。）
+  // ⚠️ P0-1-28 落地后，这一条成了**九条路由里唯一没有出口的那条**（上面八条都已注册）。
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/confirm' }), false, '确认属 P0-2（要 mcp_servers）')
   // ⚠️ 会话是**私有资源**：一条 `requireAdmin` 都不该出现 ⇒ 用一个普通 MEMBER 的 403 是验不出的，
   //    这里能验的是"路由本身只挂 requireAuth"（真权限判定在服务层的 `where` 里，归 verify-conversations）
   assertEqual(app.hasRoute({ method: 'PUT', url: '/api/conversations/:id' }), false, '重命名只走 PATCH（不提供整对象 PUT）')
+  // 消息历史只提供 GET：`POST /:id/messages` 这种"手工塞一条消息"的入口**刻意不存在**
+  // （消息的唯一写者是编排循环；开出口就等于让历史可以被伪造 —— 与上面"没有会话详情"同一判断）
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/messages' }), false, '消息只有读取出口')
 })
 
 await it('建/改请求体契约：`agentId` 必填且是 UUID；`topic` **不是三态**（null/空串/超长各自有文案）', () => {
@@ -2743,6 +2776,187 @@ await it('判据与文案收在 shared：「只读」是纯函数、未命名会
   assertEqual(isConversationReadOnly('ACTIVE'), false, 'ACTIVE 可写')
   assertEqual(isConversationReadOnly('FINISHED'), true, 'FINISHED 只读（Agent 软删留下的标记）')
   assertEqual(CONVERSATION_UNTITLED_HINT, '新会话', 'topic 为 null 时的界面回落文案')
+})
+
+// ── 25·b 消息历史（P0-1-28）的契约 + 取页逻辑（纯函数）──
+console.log(`\n${c.b}── 消息历史（P0-1-28）：游标口径 / content 原样透出 / 取页不重不漏 ──${c.x}`)
+
+await it('消息投影：键集合固定（**不带 tokens / conversationId**），`content` 原样透出且不许缺键', () => {
+  assertSameSet(Object.keys(messageItemSchema.shape), ['id', 'role', 'content', 'createdAt'], '消息投影键集合')
+  assertEqual(Object.keys(messageItemSchema.shape).includes('conversationId'), false, '同一会话里的消息不必重复带会话 id')
+  assertEqual(Object.keys(messageItemSchema.shape).includes('tokensIn'), false, 'token 计量属 P1 的用量端点，这里不带')
+
+  // ⚠️ 本批最重要的一条契约：`content` 必须是"服务端不解释"的**原文**。
+  //    用写入端那个 schema 过滤一遍的话，P0-2 写进去的 `tool_calls` 会在**刷新之后**消失
+  //    （流里看得见、历史里没有），而且**没有任何报错** —— 前端只能靠肉眼发现。
+  const raw = {
+    id: '01930000-0000-7000-8000-000000000001',
+    role: 'ASSISTANT',
+    content: {
+      text: '答案',
+      thinking: '推理',
+      citations: [{ docName: 'A.txt', snippet: 'S', score: 0.03 }],
+      // ↓ 这两个段本版本**刻意不定型**（工具属 P0-2、附件属 P1），但读取端必须照样原样交出去
+      tool_calls: [{ callId: 'c1', toolName: 'search' }],
+      attachments: [{ fileId: 'f1' }],
+    },
+    createdAt: '2026-09-22T06:30:00.000Z',
+  }
+  const parsed = messageItemSchema.safeParse(raw)
+  assertEqual(parsed.success, true, '含未知段的消息仍是合法响应')
+  assertSameSet(
+    Object.keys(parsed.data.content),
+    ['text', 'thinking', 'citations', 'tool_calls', 'attachments'],
+    '⚠️ 未定型的段（tool_calls / attachments）必须原样保留',
+  )
+  // 反向对照：**写入端**那个 schema 会静默剥掉它们 —— 两处放在一起，才不会有人"顺手统一一下 schema"
+  assertSameSet(
+    Object.keys(messageContentSchema.parse(raw.content)),
+    ['text', 'thinking', 'citations'],
+    '对照：写入端 schema 会把未声明的键静默剥掉（故读取端不许用它）',
+  )
+
+  assertEqual(messageItemSchema.safeParse({ ...raw, role: 'TOOL' }).success, false, '角色取值域来自 DB 枚举')
+  assertSameSet(MESSAGE_ROLES, ['USER', 'ASSISTANT', 'SYSTEM'], '与 schema.prisma 的 MessageRole 同源')
+  // ⚠️ `z.unknown()` 连 `undefined` 都接受，而 `undefined` 会被 JSON.stringify 丢掉整个键
+  //    ⇒ 客户端看到的是"这个字段不存在"。故必须有那条 refine。
+  assertEqual(
+    messageItemSchema.safeParse({ id: 'x', role: 'USER', createdAt: 'y' }).success,
+    false,
+    '⚠️ content 缺键必须被拒（否则它会静默从响应里消失）',
+  )
+  assertEqual(messageItemSchema.safeParse({ ...raw, content: null }).success, true, 'jsonb 里存 JSON null 是合法值')
+  assertEqual(messageItemSchema.safeParse({ ...raw, content: '裸字符串' }).success, true, '旧版本可能写入过裸串（历史是跨版本读的）')
+})
+
+await it('查询参数：`beforeId` 可选且必须是 UUID；`limit` 有默认与上下限（**没有"全量"这个取值**）', () => {
+  const bare = listMessagesQuerySchema.safeParse({})
+  assertEqual(bare.success, true, '都不传 = 取最新一页（对话页首次进入的形态）')
+  assertEqual(bare.data.limit, MESSAGE_PAGE_LIMIT_DEFAULT, `默认 ${MESSAGE_PAGE_LIMIT_DEFAULT} 条`)
+  assertEqual('beforeId' in bare.data, false, '⚠️ 不传就是**没有这个键**（与"传了空串"是两件事）')
+
+  // querystring 到手都是字符串 ⇒ coercion 是必须的，不是可选项
+  assertEqual(listMessagesQuerySchema.safeParse({ limit: '5' }).data.limit, 5, '字符串能收敛成数字')
+  assertEqual(listMessagesQuerySchema.safeParse({ limit: '0' }).success, false, '0 条没有意义')
+  assertEqual(listMessagesQuerySchema.safeParse({ limit: '101' }).success, false, `超过上限 ${MESSAGE_PAGE_LIMIT_MAX} 被拒`)
+  assertEqual(listMessagesQuerySchema.safeParse({ limit: '100' }).data.limit, 100, '上限本身合法')
+  assertEqual(listMessagesQuerySchema.safeParse({ limit: '2.5' }).success, false, '非整数被拒')
+
+  assertEqual(listMessagesQuerySchema.safeParse({ beforeId: '01930000-0000-7000-8000-000000000000' }).success, true, '合法游标')
+  assertEqual(listMessagesQuerySchema.safeParse({ beforeId: 'nope' }).success, false, '非 UUID 被拒')
+  assertEqual(listMessagesQuerySchema.safeParse({ beforeId: '' }).success, false, '空串被拒（"不带"才是"最新一页"）')
+  // 逐字段文案（前端要挂到输入框上，靠 message / path 找）
+  assertEqual(
+    JSON.stringify(listMessagesQuerySchema.safeParse({ beforeId: 'nope' }).error.issues[0].path),
+    JSON.stringify(['beforeId']),
+    '错误路径精确到字段',
+  )
+})
+
+await it('分页响应契约：`items` + `nextCursor` + `hasMore` 三件套（缺一不可，且都比"total"更需要）', () => {
+  assertEqual(
+    messagePageResultSchema.safeParse({ items: [], nextCursor: null, hasMore: false }).success,
+    true,
+    '完整响应',
+  )
+  assertEqual(messagePageResultSchema.safeParse({ items: [], nextCursor: null }).success, false, '缺 hasMore')
+  assertEqual(messagePageResultSchema.safeParse({ items: [] }).success, false, '缺 nextCursor + hasMore')
+  // ⚠️ 游标分页**刻意没有 `total`**（见 `envelope.ts#cursorPageOf`）：在按月分区的表上多跑一次 count
+  //    只为显示一个随时会变的数字，而这个端点真正要回答的只是"还有没有更早的"。
+  assertEqual('total' in messagePageResultSchema.shape, false, '游标分页不带 total')
+  assertSameSet(Object.keys(messagePageResultSchema.shape), ['items', 'nextCursor', 'hasMore'], '三件套')
+  // 工厂本身与 offset 版**并存**：两套分页各有各的适用面（`02` §四 只让 messages 用游标）
+  assertEqual(cursorPageOf(z.string()).safeParse({ items: ['a'], nextCursor: 'b', hasMore: true }).success, true, '工厂可用')
+})
+
+/** 造一条待分页的原始行（只有取页逻辑真正读的四列） */
+const pageRow = (n, createdAt = `2026-09-22T06:30:${String(n).padStart(2, '0')}.000Z`) => ({
+  id: `01930000-0000-7000-8000-00000000000${n}`,
+  role: n % 2 === 0 ? 'USER' : 'ASSISTANT',
+  content: { text: `第 ${n} 条` },
+  createdAt: new Date(createdAt),
+})
+
+await it('`toMessagePage`：`take: limit+1` 的那一条只用来判 `hasMore`，不返回', () => {
+  // 入参约定：rows 已按 `MESSAGE_CHRONO_ORDER`（新 → 旧）排好，且**多取了 1 条**
+  const page = toMessagePage([pageRow(3), pageRow(2), pageRow(1)], 2)
+  assertEqual(page.hasMore, true, '多出来那一条 ⇒ 还有更早的')
+  assertEqual(page.items.length, 2, '只返回 limit 条（多取的那条不许漏出来）')
+  assertEqual(page.nextCursor, page.items[0].id, '⚠️ nextCursor = 本页**最旧**那条（正序之后就是第一条）')
+  assertEqual(page.items.map((item) => item.content.text).join('|'), '第 2 条|第 3 条', '⚠️ 对外是正序（旧 → 新）')
+  assertEqual(page.items[0].createdAt, '2026-09-22T06:30:02.000Z', '时间序列化成 ISO 8601')
+})
+
+await it('`toMessagePage`：恰好取满 ⇒ `hasMore:false` 且 `nextCursor:null`（两者**同真同假**）', () => {
+  const full = toMessagePage([pageRow(2), pageRow(1)], 2)
+  assertEqual(full.hasMore, false, '没有多出来 ⇒ 到底了')
+  assertEqual(full.nextCursor, null, '⚠️ 到底了就给 null，而不是给一个"用不上的游标"')
+  const empty = toMessagePage([], 5)
+  assertSameObject(empty, { items: [], hasMore: false, nextCursor: null }, '空会话的第一页')
+  // 退化输入（端点不会产生：schema 的 limit 最小是 1）也不许自相矛盾
+  const degenerate = toMessagePage([pageRow(1)], 0)
+  assertEqual(degenerate.hasMore, false, 'limit 为 0 时不许说"还有更多"（那个 nextCursor 会没法给）')
+  assertEqual(degenerate.nextCursor, null, '与 hasMore 一致')
+})
+
+await it('`toMessagePage`：逐页翻到底**不重不漏**，且拼起来就是完整的时间正序序列', () => {
+  // 这是验收原文"分页拉取不重不漏"在**纯函数层**的形态：把一条 5 条的序列按 limit=2 走完，
+  // 逐页断言，最后把所有页拼起来与完整序列逐字比。
+  // ⚠️ 页与页之间"从哪里继续"由 SQL 的游标条件决定（归 verify-conversations 的 H 组），
+  //    这里模拟的是"SQL 给对了切片之后，取页逻辑会不会漏/重"—— 一个 SQL 写对的实现
+  //    配一个错的取页逻辑，照样能顺利跑完，且只在翻第二页时才显形。
+  // ⚠️⚠️ 拼接方向是**页序倒过来**（第 3 页 → 第 2 页 → 第 1 页）：各页本身是"更早的一页"，
+  //    页内正序 ⇒ 界面上"往上加载"＝把新拿到的页**前插**。写成 `[page1, page2, page3]` 顺序拼接
+  //    会得到 [4,5,2,3,1] —— 这正是"加载更多把消息插错位置"那个 bug 的形态。
+  const all = [pageRow(5), pageRow(4), pageRow(3), pageRow(2), pageRow(1)] // 新 → 旧
+  const pages = []
+  const cursors = []
+  let offset = 0
+  for (let round = 0; round < 10; round += 1) {
+    const slice = all.slice(offset, offset + 3) // 3 = limit(2) + 1：SQL 的 take
+    const page = toMessagePage(slice, 2)
+    pages.push(page.items)
+    cursors.push(page.nextCursor)
+    if (!page.hasMore) break
+    assertEqual(page.nextCursor, page.items[0].id, `第 ${round + 1} 页的游标 = 本页最旧那条`)
+    offset += page.items.length // 真实实现里是"从游标那一条之后继续"，等价于消费掉本页
+  }
+  assertEqual(cursors.length, 3, '5 条按 2 条一页 ⇒ 恰好 3 页（不是 4 页、也不是死循环）')
+  const assembled = pages.slice().reverse().flat()
+  assertEqual(
+    JSON.stringify(assembled.map((item) => item.content.text)),
+    JSON.stringify(['第 1 条', '第 2 条', '第 3 条', '第 4 条', '第 5 条']),
+    '⚠️ 各页按"新页在前"拼起来与完整序列**逐字相同**（不重、不漏、顺序对）',
+  )
+  assertEqual(new Set(assembled.map((item) => item.id)).size, 5, '5 个 id 互不相同（无重复）')
+  assertEqual(cursors[2], null, '最后一页的游标是 null')
+})
+
+await it('`toMessagePage`：**同一毫秒**的两条不会被一起吞掉（真实存在：一轮问答是一个事务）', () => {
+  // `chatBot.ts#persistRoundQuietly` 把用户消息与助手消息写在**同一个事务**里，而 PG 的 `now()`
+  // 是事务开始时刻 ⇒ 这两条的 `created_at` **逐字相同**。取页逻辑对同毫秒必须一视同仁，
+  // 而"用时间戳当游标"的那类实现会在这里丢掉一条。
+  const same = '2026-09-22T06:30:00.000Z'
+  const first = toMessagePage([pageRow(2, same), pageRow(1, same)], 1)
+  assertEqual(first.items.length, 1, 'limit=1 时同毫秒的两条只给一条')
+  assertEqual(first.hasMore, true, '另一条还在后面（这就是"不许吞掉"的意思）')
+  const second = toMessagePage([pageRow(1, same)], 1)
+  assertSameObject(
+    second.items.map((item) => item.content.text),
+    ['第 1 条'],
+    '第二页拿到的是另一条（两个 id 不同 ⇒ SQL 的 id tie-break 才有意义）',
+  )
+})
+
+await it('时间口径 `MESSAGE_CHRONO_ORDER`：`(created_at desc, id desc)` —— 上下文窗口与历史分页**同源**', () => {
+  // 两处消费方（`chatBot.ts` 的"最近 N 轮"与本批的历史分页）共用这一个常量。
+  // 漂了的症状很具体：**模型看到的最近几轮与界面上显示的最近几条不是同一批**
+  // （用户说"你刚才明明说过"，而模型那边是另一段对话）。
+  assertSameObject(
+    MESSAGE_CHRONO_ORDER,
+    [{ createdAt: 'desc' }, { id: 'desc' }],
+    '新 → 旧；`id desc` 只做 tie-break（同毫秒时没有第二排序键，顺序就是不确定的）',
+  )
 })
 
 // ═══════════════════════════════════════════════════════════════════════════════════════

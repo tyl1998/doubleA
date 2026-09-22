@@ -60,7 +60,7 @@ import {
   type ChatStreamSummary,
   type ChatUsage,
 } from '../llm/client.js'
-import { touchConversation } from '../services/conversation.service.js'
+import { MESSAGE_CHRONO_ORDER, touchConversation } from '../services/conversation.service.js'
 import { searchKnowledgeBase } from '../services/retrieval.js'
 import {
   buildAssistantContent,
@@ -169,9 +169,13 @@ export const chatBotProducer: ChatProducer = async (input) => {
     const rounds = config.limits.contextRounds
     const historyRows = await db.message.findMany({
       where: { conversationId },
-      // `id desc` 是**确定性**的兜底：`created_at` 是毫秒精度，同一事务里写的两条可能同值
-      // （messages 的主键是 `(id, created_at)`，`id` 是 uuid(7) ⇒ 时间有序）
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      // ⚠️ 排序口径**与 `GET /:id/messages`（P0-1-28）共用同一个常量** ——
+      //    "模型看到的最近几轮"与"界面上显示的最近几条"必须是同一批。
+      //    这里原来手写过一遍 `[{ createdAt: 'desc' }, { id: 'desc' }]`（P0-1-27），
+      //    两处各写一份就会有"改了一处忘了另一处"的漂移，故 P0-1-28 收成一个常量。
+      //    `id desc` 是**确定性**的兜底：`created_at` 是毫秒精度，同一事务里写的两条可能同值
+      //    （messages 的主键是 `(id, created_at)`，`id` 是 uuid(7) ⇒ 时间有序）
+      orderBy: [...MESSAGE_CHRONO_ORDER],
       take: rounds * 2,
       select: { role: true, content: true },
     })

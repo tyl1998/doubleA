@@ -105,6 +105,27 @@ export function offsetPageOf<T extends z.ZodTypeAny>(item: T) {
 }
 
 /**
+ * 游标分页的 zod schema 工厂（P0-1-28 起；`{@link CursorPage}` 是它的类型形态）。
+ *
+ * 用法：`cursorPageOf(messageItemSchema)` → `{ items, nextCursor, hasMore }` 的 schema + 类型。
+ * 与 {@link offsetPageOf} 的差别是**没有 `total`**：游标分页的"还剩多少"要么多跑一次 `count`
+ * （在分区表上就是多扫一遍，而用户真正需要的只是"还有没有更早的"），要么就得承认它随时在变
+ * —— 干脆不给，用 `hasMore` 表达唯一要回答的那个问题。
+ *
+ * ⚠️ `nextCursor` 的**方向**由各端点自己定义（本仓目前只有消息历史一处，见
+ * `conversation.ts#messagePageResultSchema`：它是"**更早**那一页"的游标）。
+ * 工厂只固定字段名与取值域，不替调用方决定方向 —— 但方向的语义必须写进该端点的契约注释。
+ */
+export function cursorPageOf<T extends z.ZodTypeAny>(item: T) {
+  return z.object({
+    items: z.array(item),
+    /** 下一页游标；`null` 表示已到末尾（与 `hasMore` 同真同假，见各端点的契约） */
+    nextCursor: z.string().nullable(),
+    hasMore: z.boolean(),
+  })
+}
+
+/**
  * 任意错误 → 失败信封（后端 errorHandler 与前端拦截器共用同一条收敛规则）。
  *
  * 语义：

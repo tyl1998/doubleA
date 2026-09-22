@@ -55,13 +55,24 @@
  *    接回方式写在那两个函数上：P0-3 建了 `artifacts` 之后，只需在**收集**那一处加一句查询，
  *    删除路径本身不用改。⚠️ 现在写一段"先假定键在哪里"的代码，只会在 P0-3 变成需要重写的猜测。
  *
+ * **⑦ 消息历史（P0-1-28）的游标是"行 id"，不是时间戳；且排序必须与上下文窗口同源。**
+ *    `messages.created_at` 是毫秒精度，而**同一轮问答的两条消息在同一个事务里写入**
+ *    （`chatBot.ts#persistRoundQuietly`：用户消息 + 助手消息 + `touchConversation` 一个事务）
+ *    —— PG 的 `now()` 取的是**事务开始时刻** ⇒ 这两条的 `created_at` **必然相同**。
+ *    用时间戳当游标就会漏掉同毫秒的另一条（"翻页漏一条"只在长会话里偶发，最难查）。
+ *    故游标是**一个具体行的 id**，服务端拿它的 `(created_at, id)` 做**字典序**比较
+ *    （`(a,b) < (c,d)` ⟺ `a < c` 或 `a = c 且 b < d`），这正是
+ *    {@link MESSAGE_CHRONO_ORDER} 那个总序下的"更早"。
+ *    ⚠️ 两个消费方（本文件的 {@link listMessages} 与 P0-1-27 的"最近 N 轮"）**共用同一个排序常量**
+ *    ⇒ "模型看到的最近几轮"与"用户在界面上看到的最近几条"不可能对不上。
+ *
  * ⚠️ 各批**刻意不做**的（属后续批次，不要顺手补）：
- *   · `GET /:id/messages`（分页历史）→ **P0-1-28**；
  *   · `POST /:id/confirm`（elicitation）→ 随 MCP 工具循环落地（**P0-2**，需要 `mcp_servers` 表）；
- *   · `/api/conversations/:id/artifacts` → **P0-3**（`artifacts` 表）；
- *   · 消息的写入 / 上下文组装 / 引用 → **P0-1-27**（`orchestrator/chatBot.ts`）。
+ *   · `/api/conversations/:id/artifacts` → **P0-3**（`artifacts` 表）。
  * ⚠️ P0-1-26 起**已落地**（不再是"刻意不做"）：`POST /:id/chat`（SSE，闸门见
  *   {@link assertConversationSendable}）与 `POST /:id/stop`（停止信号）。
+ * ⚠️ P0-1-28 起**已落地**：`GET /:id/messages`（{@link listMessages}，游标分页）。
+ *   于是 `02` §4.5 那张表的九条路由只剩 `POST /:id/confirm` 一条没有出口（属 P0-2）。
  */
 
 import {
@@ -74,6 +85,9 @@ import {
   type ConversationListResult,
   type CreateConversationBody,
   type ListConversationsQuery,
+  type ListMessagesQuery,
+  type MessageItem,
+  type MessagePageResult,
   type RemoveConversationResult,
   type RenameConversationBody,
 } from '@doubulea/shared'
@@ -440,6 +454,157 @@ export async function getConversationActive(
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
   return { streaming: true, ...snapshot }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 消息历史（`GET /:id/messages`，P0-1-28）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 消息的**时间口径**（唯一实现）：**新 → 旧**，`id` 只做 tie-break。
+ *
+ * `id desc` 不是装饰：`messages.created_at` 是毫秒精度，而同一轮问答的两条消息在**同一个事务**
+ * 里写入（`chatBot.ts#persistRoundQuietly`）⇒ PG 的 `now()` 是事务开始时刻 ⇒ 它们的
+ * `created_at` **逐字相同**。没有第二排序键，这两条之间的顺序就是不确定的，
+ * 而"不确定"在分页上等于"可能漏一条、又可能重复一条"—— 且只在长会话里偶发。
+ *
+ * ⚠️ **两个消费方共用它**（判据："同一条序列被两处分别排序，就一定会漂"）：
+ *   · 本文件的 {@link listMessages}（历史分页）；
+ *   · `orchestrator/chatBot.ts` 的"最近 N 轮"（上下文窗口）。
+ * 漂了的症状很具体：**模型看到的最近几轮与界面上显示的最近几条不是同一批**
+ * （用户说"你刚才明明说过"，而模型那边是另一段对话）。
+ */
+export const MESSAGE_CHRONO_ORDER = [{ createdAt: 'desc' }, { id: 'desc' }] as const
+
+/**
+ * {@link toMessagePage} 的入参行 —— 只要求它真正读的四列（少给一列是编译错误，多给无所谓）。
+ */
+export interface MessageRowForPage {
+  id: string
+  role: MessageItem['role']
+  content: unknown
+  createdAt: Date
+}
+
+/**
+ * 原始行 → 一页（**纯函数**，`verify:app` 的无依赖档直接断言它）。
+ *
+ * 为什么把"取页"这件事从 DB 查询里拆出来："不重不漏"这条验收的**全部**正确性都在这几行里
+ * （多取一条判断 `hasMore`、反转成正序、`nextCursor` 指向本页第一条），而它在真库上
+ * 只表现为"某次翻页少/多一条"—— 一个 SQL 写对的实现配一个错的取页逻辑，照样能顺利跑完。
+ *
+ * 入参约定（调用方负责）：`rows` 已按 {@link MESSAGE_CHRONO_ORDER} 排好（**新 → 旧**），
+ * 且**多取了 1 条**（`take: limit + 1`）—— 多出来的那条只用来说明"还有更早的"。
+ *
+ * ⚠️ `content` **原样透出**，**绝不**过 `messageContentSchema`：那个 schema 会把未声明的键
+ * 静默剥掉（P0-2 的 `tool_calls` 会因此在"刷新后重放历史"时消失且不报错）。
+ * 本函数是读取端唯一一处"能把它过滤掉"的机会，故把这条写在这里。
+ */
+export function toMessagePage(rows: MessageRowForPage[], limit: number): MessagePageResult {
+  const size = Math.max(0, Math.trunc(limit))
+  const page = rows.slice(0, size)
+  // `page.length > 0` 是给退化输入（size = 0）兜底的：那种情况下"还有更多"没有意义，
+  // 而且会让 `nextCursor` 与 `hasMore` 这对同真同假的字段自相矛盾。
+  const hasMore = page.length > 0 && rows.length > page.length
+  const items = page
+    .slice()
+    // 对外是**正序**（旧 → 新）：对话流"新消息追加在末尾"（`03` §五），历史与流式渲染必须
+    // 落在同一个数据结构上（单一渲染路径）—— 把这一反转收在服务端，前端就不必在两处
+    // 各写一次 reverse（"一处正一处反"的 bug 只在翻第二页时才显形）。
+    .reverse()
+    .map((row) => ({
+      id: row.id,
+      role: row.role,
+      content: row.content,
+      createdAt: row.createdAt.toISOString(),
+    }))
+  return {
+    items,
+    hasMore,
+    // 本页**最旧**那条的 id（正序之后就是第一条）= "再往前一页"的游标。
+    // 与 `hasMore` 同真同假：没有更多了就给 `null`，而不是给一个"用不上的游标"
+    // （前端只能靠 `hasMore` 判断，多给一个值等于给它多一个可能写错的分支）。
+    nextCursor: hasMore ? (items[0]?.id ?? null) : null,
+  }
+}
+
+/**
+ * 消息历史（`GET /api/conversations/:id/messages`；`02` §4.5 / §四 的游标分页）。
+ *
+ * 三条口径：
+ *
+ * ① **权限复用"取我的一条会话"**（{@link findMyConversation}）：别人的会话与不存在的 id
+ *    一律 **404**（文件头 ①）。刻意**不**在这里另写一段 `where: { userId }` ——
+ *    所有权判据一旦有第二个实现，就会漂（P0-1-21 的"同一份数据不许有第二种形状"同款）。
+ *    ⚠️ 代价是它顺带多做一次 `_count(messages)`（P0-1-25 留下的、目前**没有消费方**的字段）。
+ *    一次历史拉取多一条只读子查询，比"给所有权判据开第二个实现"划算得多；等它在
+ *    `/active` 轮询路径上真的成为瓶颈，再把这一个字段摘掉即可（纯减法，不涉及契约）。
+ *    也刻意**不查 `status`**：`FINISHED` 只表示"不能再产生消息"，**历史照样要看得见**
+ *    （文件头 ⑤，`02` §4.4 的"只读保留"）。
+ *
+ * ② **游标必须属于这个会话**（`where` 里带 `conversationId`）。少了这一条，
+ *    拿**别人会话**的消息 id 当游标就会命中，等于用一个可猜的 id 探出"另一条会话的某条消息
+ *    发生在什么时刻"（以及分页会从那个位置开始 —— 虽然内容仍被本会话的过滤挡住）。
+ *    游标查不到时回 **400**（而不是"当成没有游标"）：后者会让前端把**最新一页又拿一遍**，
+ *    在界面上表现为消息**重复**，而用户只会觉得"翻页坏了"。
+ *    会话本身不存在/不是我的仍是 **404**（先查库，见 ①）—— 两者的主语不同，
+ *    与 §4.5 ⑧ 的"两类失败、两个出口"是同一条判断。
+ *
+ * ③ **`take: limit + 1`**：多取的那一条不返回，只用来判"还有没有更早的" ——
+ *    这样不必为"还剩多少"再跑一次 `count`（在按月分区的表上就是再扫一遍）。
+ *    分页单位是**消息行**，不是 `content` 里的段 ⇒ "单条消息的结构被截断"在形态上不可能发生
+ *    （`06` P0-1-28 的坑预判，见落地要点）。
+ *
+ * 刻意**不打日志**：这是对话页每次进入/每次翻页都会打的只读请求，打一行 INFO 会让
+ * 日志里真正的事件（TTFT、落库、失败）淹掉。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 会话不存在或不是我的；`VALIDATION`(400) beforeId 无效
+ */
+export async function listMessages(
+  id: string,
+  query: ListMessagesQuery,
+  viewer: ConversationViewer,
+): Promise<MessagePageResult> {
+  const target = await findMyConversation(id, viewer)
+  const db = getPrisma()
+
+  let before: { id: string; createdAt: Date } | null = null
+  if (query.beforeId !== undefined) {
+    before = await db.message.findFirst({
+      where: { id: query.beforeId, conversationId: target.id },
+      select: { id: true, createdAt: true },
+    })
+    if (before === null) throw AppError.validation('beforeId 不是该会话的消息（游标无效）')
+  }
+
+  /**
+   * 游标的比较是**二元组的字典序**：`(created_at, id) < (游标)`，展开就是
+   * `created_at < 游标时刻` **或** `created_at = 游标时刻 且 id < 游标 id`。
+   * 少了后一半就正好丢掉"同一毫秒的另一条"（文件头 ⑦ 说的那两条）。
+   *
+   * ⚠️ 第一页（无游标）只按 `conversationId` 过滤 ⇒ PG 会扫到每个月的分区（分区键是
+   * `created_at`，没有时间下界就裁不掉）。这是分区表的固有代价，不是写错了：
+   * 每个分区上都有 `(conversation_id, created_at desc)` 索引，`LIMIT 21` 走的是
+   * "各分区各取前 21 条再归并"，代价与分区数成正比、与表大小无关。
+   * 验收里有一条墙钟断言盯着它，真变慢时会先在那里红（P0-1-20 的同款做法）。
+   */
+  const rows = await db.message.findMany({
+    where:
+      before === null
+        ? { conversationId: target.id }
+        : {
+            conversationId: target.id,
+            OR: [
+              { createdAt: { lt: before.createdAt } },
+              { createdAt: before.createdAt, id: { lt: before.id } },
+            ],
+          },
+    select: { id: true, role: true, content: true, createdAt: true },
+    orderBy: [...MESSAGE_CHRONO_ORDER],
+    take: query.limit + 1,
+  })
+
+  return toMessagePage(rows, query.limit)
 }
 
 // ═════════════════════════════════════════════════════════════════════

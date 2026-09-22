@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * verify-conversations.mjs —— P0-1-25（会话管理）的验收（需要真实 PG + Redis）
+ * verify-conversations.mjs —— P0-1-25（会话管理）与 P0-1-28（消息历史）的验收（需要真实 PG + Redis）
  *
- * 验的是 `02` §4.5 的五条端点 + `02` §5.2 的 `/active`（断线重连的读侧）：
+ * 验的是 `02` §4.5 的**八条**已落地端点中的六条 + `02` §5.2 的 `/active`（断线重连的读侧）：
  *   · `POST /api/conversations`（`{agentId}` → 新会话，`topic`/`lastMessageAt` 都是 `null`）；
  *   · `GET /api/agents/:id/conversations`（**我**的会话，按最近活跃排序）；
  *   · `PATCH /api/conversations/:id`（重命名）/ `DELETE /api/conversations/:id`（级联删消息）；
- *   · `GET /api/conversations/:id/active`（无流时恒 `{streaming:false, …null}`）。
+ *   · `GET /api/conversations/:id/active`（无流时恒 `{streaming:false, …null}`）；
+ *   · `GET /api/conversations/:id/messages`（**H 组**，P0-1-28：游标分页 + `content` 原样还原）。
+ * （另两条 `/chat` 与 `/stop` 的验收在 `verify-chat-stream.mjs` / `verify-chatbot.mjs`。）
  *
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 本脚本最想钉死的五件事
@@ -31,6 +33,16 @@
  * ⑤ **删会话是级联**：`deletedMessages` 必须是**删前在同一个事务里数出来的**真数（`03` §七 的
  *    确认框要用它），且 `messages` 真的连带消失（两方向都断：行没了 **且** 消息没了）。
  *    还顺带钉一条容易漏的连带清理：会话删了，它的活跃流锁（`chat.active:{id}`）也要清掉。
+ * ⑥ **（H 组，P0-1-28）消息历史的三件事**：
+ *    · **不重不漏**：把一页一页真的用 `nextCursor` 翻到底，与**脚本自己复算**的序列逐条对照
+ *      （集合双向相同 + 顺序逐条相同 + "正序 ⇒ 时间戳不减、同毫秒内 id 递增"这条自证不变式）。
+ *      这条用的是"独立复算"而不是"看起来对"——排序类/分页类输出最容易糊过去的正是这一块。
+ *    · **⚠️ 同一毫秒的多条不许漏**：一轮问答的两条消息在**同一个事务**里写入 ⇒ `created_at`
+ *      **逐字相同**（`now()` 是事务开始时刻）。用时间戳当游标的实现会在翻页接缝处丢一条，
+ *      而"翻页漏一条"只在长会话里偶发、最难查。用例专门把翻页边界落在同毫秒那一组内部。
+ *    · **`content` 原样透出**：造一条带 `tool_calls` / `attachments` 的行（P0-2 / P1 才会写入的段），
+ *      断言读回来**键序无关逐字相同**且未知段还在 —— 用写入端的 `messageContentSchema` 过滤一遍的
+ *      实现会静默剥掉它们（流里看得见、历史里没有，且不报错）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 依赖与前置
@@ -71,16 +83,17 @@ const {
   sessionKey,
 } = await import('../dist/backend/src/infra/redis.js')
 const { touchConversation } = await import('../dist/backend/src/services/conversation.service.js')
-const {
-  CONVERSATION_STATUSES,
-  CONVERSATION_UNTITLED_HINT,
-  conversationActiveSchema,
-  conversationItemSchema,
-  conversationListResultSchema,
-  isConversationReadOnly,
-  parseActiveSnapshot,
-  removeConversationResultSchema,
-} = await import('@doubulea/shared')
+  const {
+    CONVERSATION_STATUSES,
+    CONVERSATION_UNTITLED_HINT,
+    conversationActiveSchema,
+    conversationItemSchema,
+    conversationListResultSchema,
+    isConversationReadOnly,
+    messagePageResultSchema,
+    parseActiveSnapshot,
+    removeConversationResultSchema,
+  } = await import('@doubulea/shared')
 
 // ───────────────────────────── 断言脚手架（与另几个脚本同一套）─────────────────────────────
 
@@ -256,9 +269,92 @@ async function readActive(cookie, conversationId) {
   return parsed.data
 }
 
+// ───────────────────────────── 消息历史（P0-1-28）的助手 ─────────────────────────────
+
+/**
+ * 递归按键名排序后序列化。
+ *
+ * ⚠️ 凡"经 jsonb 往返过的值"都**必须**用它比：PG 会把对象键重排，直接 `JSON.stringify`
+ * 两个语义相同的对象会得到**逐字不同**的字符串（P0-1-27 实测踩到），而报告里期望值与实际值
+ * **长得一模一样**，是典型假红。本组整组都在比读回来的 `content`，故这是前提而不是优化。
+ */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'undefined'
+}
+
+/** 消息历史（契约化；`query` 形如 `?limit=7&beforeId=…`） */
+async function listMessages(cookie, conversationId, query = '') {
+  const response = await api('GET', `/api/conversations/${conversationId}/messages${query}`, { cookie })
+  assertEqual(response.statusCode, 200, `消息历史状态码（${query || '无参数'}）`)
+  const parsed = messagePageResultSchema.safeParse(response.json().data)
+  assert(parsed.success, `消息历史不符合契约：${JSON.stringify(parsed.error?.issues)}`)
+  return parsed.data
+}
+
+/**
+ * 直接造一条消息 —— **绕过端点**。
+ *
+ * `messages` 没有写入出口（唯一的写者是编排循环，`chatBot.ts#persistRoundQuietly`），
+ * 而本组要**精确控制 `created_at`**（含"同一毫秒的四条"这种真实但难碰巧造出来的形态），
+ * 故只能直接落库。这与 P0-1-24 的 R4"会话行由脚本直接造"是同一种做法。
+ */
+async function seedMessage(conversationId, { role, content, createdAt }) {
+  return prisma.message.create({
+    data: { conversationId, role, content, ...(createdAt === undefined ? {} : { createdAt }) },
+  })
+}
+
+/** 库里这个会话的全部消息（**时间正序**，脚本自己的口径）—— 与端点独立对照用 */
+async function allMessagesAsc(conversationId) {
+  const rows = await prisma.message.findMany({
+    where: { conversationId },
+    select: { id: true, role: true, content: true, createdAt: true },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+  })
+  return rows
+    .slice()
+    .reverse()
+    .map((row) => ({ id: row.id, role: row.role, content: row.content, createdAt: row.createdAt.toISOString() }))
+}
+
+/**
+ * 从最新一页开始逐页翻到底（真实地"用 nextCursor 接着翻"）。
+ *
+ * 返回的 `items` 是**按页序倒过来**拼接的（第 N 页 → … → 第 1 页）：各页本身是"更早的一页"、
+ * 页内正序，界面上"往上加载"＝把新拿到的页**前插** —— 这正是前端要做的动作
+ * （写成"按页序拼接"会得到 [4,5,2,3,1]，即"加载更多把消息插错位置"的那个 bug）。
+ */
+async function walkAllPages(cookie, conversationId, limit) {
+  const pages = []
+  let cursor = null
+  let guard = 0
+  const startedAt = Date.now()
+  for (;;) {
+    guard += 1
+    assert(guard <= 50, '翻页次数异常（疑似 `hasMore` 恒真或游标没有前进 ⇒ 会死循环）')
+    const query = `?limit=${limit}${cursor === null ? '' : `&beforeId=${cursor}`}`
+    const page = await listMessages(cookie, conversationId, query)
+    pages.push(page)
+    if (!page.hasMore) break
+    assertEqual(page.nextCursor, page.items[0].id, '⚠️ hasMore 为真时 nextCursor 必须是本页**最旧**那条')
+    assert(page.items.length > 0, '⚠️ 说"还有更多"却给了空页 ⇒ 前端会永远转圈')
+    cursor = page.nextCursor
+  }
+  return {
+    pages,
+    items: pages.slice().reverse().flatMap((page) => page.items),
+    elapsedMs: Date.now() - startedAt,
+  }
+}
+
 // ───────────────────────────── 预检 + 数据准备 ─────────────────────────────
 
-console.log(`\n${c.b}══ P0-1-25 会话验收：新建/列表排序/重命名/级联删除 + /active 读侧 ══${c.x}`)
+console.log(`\n${c.b}══ P0-1-25 会话验收（+ P0-1-28 消息历史）：新建/列表排序/重命名/级联删除 + /active 读侧 + /messages 游标分页 ══${c.x}`)
 
 try {
   await app.ready()
@@ -992,6 +1088,377 @@ try {
     const page = await listConversations(ownerCookie, agent.id)
     assertEqual(page.items[0].lastMessageAt, at.toISOString(), '列表里的 lastMessageAt 与库里一致')
   })
+
+  // ═══════════════════════════════════════════════════════════════════
+  groupStart(
+    'H',
+    '消息历史 `GET /:id/messages`（P0-1-28）：游标分页不重不漏 + `content` 原样还原',
+    '翻页用**独立复算**取证；`content` 用 jsonb 逐字比（键序无关）；含"同一毫秒的多条"',
+  )
+  // ═══════════════════════════════════════════════════════════════════
+
+  await it('空会话：`{items:[], hasMore:false, nextCursor:null}`，且**没有 `total`**', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史空-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const page = await listMessages(ownerCookie, conversation.id)
+    assertSameObject(page, { items: [], hasMore: false, nextCursor: null }, '空会话的第一页')
+    // ⚠️ 游标分页刻意不给 `total`：在按月分区的表上多跑一次 count 只为显示一个随时会变的数字，
+    //    而这个端点真正要回答的只是"还有没有更早的"（`envelope.ts#cursorPageOf`）
+    assertEqual('total' in page, false, '不带 total')
+    assertSameSet(Object.keys(page), ['items', 'nextCursor', 'hasMore'], '恰好三件套')
+  })
+
+  await it('默认一页 20 条：不传 `limit` 时恰好给 20 条 + `hasMore:true`，再翻一页拿到剩下的 2 条', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史默认-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const base = Date.now() - 60_000
+    for (let i = 0; i < 22; i += 1) {
+      await seedMessage(conversation.id, {
+        role: i % 2 === 0 ? MessageRole.USER : MessageRole.ASSISTANT,
+        content: { text: `第 ${i + 1} 条` },
+        createdAt: new Date(base + i * 1000),
+      })
+    }
+    const first = await listMessages(ownerCookie, conversation.id)
+    assertEqual(first.items.length, 20, '默认 20 条（`02` §四：其余列表也是默认 20）')
+    assertEqual(first.hasMore, true, '22 条 ⇒ 第一页之后还有')
+    assertEqual(first.items[0].content.text, '第 3 条', '⚠️ 正序：第一页的第一条是最早的**第 3 条**（最旧那两条要等下一页）')
+    assertEqual(first.items[19].content.text, '第 22 条', '第一页的最后一条是最新的')
+
+    const second = await listMessages(ownerCookie, conversation.id, `?beforeId=${first.nextCursor}`)
+    assertSameObject(
+      second.items.map((item) => item.content.text),
+      ['第 1 条', '第 2 条'],
+      '第二页恰好是剩下的两条（游标那条本身**不在**结果里）',
+    )
+    assertEqual(second.hasMore, false, '到底了')
+    assertEqual(second.nextCursor, null, '到底了游标就是 null')
+  })
+
+  await it('逐页翻到底**不重不漏**：与库里独立复算的序列逐条对照（含 `content` 的键序归一）', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史翻页-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    // 25 条、时间各不相同（同毫秒那一路由下一条用例专门验）
+    const base = Date.now() - 120_000
+    for (let i = 0; i < 25; i += 1) {
+      await seedMessage(conversation.id, {
+        role: i % 2 === 0 ? MessageRole.USER : MessageRole.ASSISTANT,
+        content: { text: `历史第 ${i + 1} 条`, seq: i },
+        createdAt: new Date(base + i * 1000),
+      })
+    }
+
+    const walk = await walkAllPages(ownerCookie, conversation.id, 7)
+    const expected = await allMessagesAsc(conversation.id)
+
+    // ① 条数、页数、每页上界
+    assertEqual(walk.pages.length, Math.ceil(25 / 7), '25 条按 7 条一页 ⇒ 恰好 4 页')
+    for (const [index, page] of walk.pages.entries()) {
+      assert(page.items.length <= 7, `第 ${index + 1} 页不得超过 limit（实际 ${page.items.length}）`)
+      assert(page.items.length > 0, `第 ${index + 1} 页不该是空的`)
+    }
+    assertEqual(walk.items.length, 25, '拼起来恰好 25 条')
+
+    // ② **不重**：id 集合大小 == 条数；**不漏**：集合两边相同（这一对是验收原文的核心）
+    const walkedIds = walk.items.map((item) => item.id)
+    assertEqual(new Set(walkedIds).size, walkedIds.length, '⚠️ 没有重复的 id（各页之间的接缝处最容易重）')
+    assertSameSet(walkedIds, expected.map((item) => item.id), '⚠️ 与库里的 id 集合**双向相同**（一条不多、一条不少）')
+
+    // ③ 顺序：与库里按 `(created_at desc, id desc)` 独立复算的结果逐条相同
+    assertEqual(
+      JSON.stringify(
+        walk.items.map((item) => [item.id, item.role, item.createdAt, canonicalJson(item.content)]),
+      ),
+      JSON.stringify(
+        expected.map((item) => [item.id, item.role, item.createdAt, canonicalJson(item.content)]),
+      ),
+      '逐条四列（含 content）与库里复算的结果一致',
+    )
+
+    // ④ 顺序的**自证**不变式：正序 ⇒ `created_at` 不减；同一毫秒内必须按 id 递增（tie-break 生效）。
+    //    这一条不依赖上面的"期望值"，故它单独就能挡住"整体倒序/乱序"的实现。
+    for (let i = 0; i + 1 < walk.items.length; i += 1) {
+      const a = walk.items[i]
+      const b = walk.items[i + 1]
+      assert(a.createdAt <= b.createdAt, `第 ${i} 与 ${i + 1} 条的时间戳逆序（应当是正序）`)
+      assert(
+        a.createdAt < b.createdAt || a.id < b.id,
+        `第 ${i} 与 ${i + 1} 条同一毫秒却按 id 递减（tie-break 没生效）`,
+      )
+    }
+
+    // ⑤ 墙钟基线（P0-1-20 的同款做法：阈值给得很松，作用是"下次有人改 SQL 时能看到数字跳变"）
+    console.log(
+      `   ${c.d}[信息] 4 页 / 25 条共 ${walk.elapsedMs}ms（含 5 次 HTTP 往返）；库中复算 ${expected.length} 条${c.x}`,
+    )
+    assert(walk.elapsedMs < 5000, `翻完 25 条不该超过 5s（实际 ${walk.elapsedMs}ms）`)
+  })
+
+  await it('⚠️ **同一毫秒**的四条被翻页切开时仍然不重不漏（真实形态：一轮问答是一个事务）', async () => {
+    // `chatBot.ts#persistRoundQuietly` 把用户消息与助手消息写在**同一个事务**里，而 PG 的 `now()`
+    // 是事务开始时刻 ⇒ 同一条消息对的两条 `created_at` **逐字相同**；同一毫秒内还可能有第三、第四条
+    // （并发落库）。这不是构造出来的极端值，而是**每一条多轮对话都会产生**的形态。
+    // 用时间戳当游标的实现会在这里丢掉同毫秒的其他条 —— 而"翻页漏一条"只在长会话里偶发，最难查。
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史同毫秒-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const base = Date.now() - 120_000
+    const sameMs = new Date(base + 6_000) // 4 条完全相同的时刻
+    let seq = 0
+    const order = []
+    for (let i = 1; i <= 5; i += 1) order.push({ createdAt: new Date(base + i * 1000), text: `早 ${i}` })
+    for (let i = 0; i < 4; i += 1) order.push({ createdAt: sameMs, text: `同毫秒 ${i + 1}` })
+    for (let i = 7; i <= 16; i += 1) order.push({ createdAt: new Date(base + i * 1000), text: `晚 ${i - 6}` })
+    for (const entry of order) {
+      seq += 1
+      await seedMessage(conversation.id, {
+        role: seq % 2 === 0 ? MessageRole.USER : MessageRole.ASSISTANT,
+        content: { text: entry.text },
+        createdAt: entry.createdAt,
+      })
+    }
+
+    // limit = 3 保证翻页边界**落在同毫秒那一组内部**
+    const walk = await walkAllPages(ownerCookie, conversation.id, 3)
+    const expected = await allMessagesAsc(conversation.id)
+    assertEqual(walk.items.length, order.length, `19 条一条都不能少（实际 ${walk.items.length}）`)
+    assertEqual(new Set(walk.items.map((item) => item.id)).size, order.length, '没有重复')
+    assertSameSet(walk.items.map((item) => item.id), expected.map((item) => item.id), '与库里的集合双向相同')
+    assertEqual(
+      JSON.stringify(walk.items.map((item) => item.content.text)),
+      JSON.stringify(expected.map((item) => item.content.text)),
+      '四条同毫秒的消息**全部在**且顺序与库一致（用时间戳当游标会在这里少一条）',
+    )
+    // 同毫秒那 4 条必须**相邻**出现（否则说明排序口径里混进了别的东西）
+    const positions = walk.items
+      .map((item, index) => ({ index, text: item.content.text }))
+      .filter((entry) => entry.text.startsWith('同毫秒'))
+      .map((entry) => entry.index)
+    assertEqual(positions.length, 4, '四条同毫秒的消息都在结果里')
+    assertEqual(positions[3] - positions[0], 3, '它们必须连续（中间不插别的消息）')
+  })
+
+  await it('`content` **原样透出**：`tool_calls` / `attachments` 不被剥掉，`citations` 三列逐字还原', async () => {
+    // 这是 `01` §3.4「含工具卡 / 引用的完整还原」在 P0-1 阶段**唯一能验到的那一半**：
+    // 工具卡（`tool_calls`）的**写入方**是 P0-2 的 MCP 工具循环 —— 本版本没有路径能产生它，
+    // 故这里直接造一条"P0-2 会写出来的形状"的行，验读取端**原样交出去**。
+    // 用 `messageContentSchema` 过滤一遍的实现会在这里红（它会把未知段静默剥掉）。
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史结构-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const richContent = {
+      text: '带引用与工具卡的回答',
+      thinking: '先检索知识库，再调用工具',
+      citations: [
+        { docName: '报销制度.txt', snippet: '出差住宿标准为每晚上限 500 元。', score: 0.0328 },
+        { docName: '员工手册.md', snippet: '年假按工龄计算。', score: 0.0164 },
+      ],
+      // ⚠️ 下面两段**本版本刻意不定型**（`shared/src/conversation.ts` 的注释），但读取端必须原样带出来
+      tool_calls: [
+        {
+          callId: 'call-1',
+          toolName: 'search_kb',
+          serverName: 'demo-server',
+          kind: 'MCP',
+          status: 'SUCCESS',
+          inputSummary: 'q=住宿标准',
+          output: '2 hits',
+        },
+      ],
+      attachments: [{ fileId: 'f-1', fileName: 'a.png', mime: 'image/png', size: 1234 }],
+    }
+    await seedMessage(conversation.id, { role: MessageRole.USER, content: { text: '出差住宿标准？' } })
+    await seedMessage(conversation.id, { role: MessageRole.ASSISTANT, content: richContent })
+
+    const page = await listMessages(ownerCookie, conversation.id)
+    assertEqual(page.items.length, 2, '两条都在')
+    const assistant = page.items[1]
+    assertEqual(assistant.role, 'ASSISTANT', '角色是 DB 枚举原值（大写）')
+    assertEqual(
+      canonicalJson(assistant.content),
+      canonicalJson(richContent),
+      '⚠️ `content` 与库里的 jsonb **键序无关逐字相同**（PG 会重排对象键 ⇒ 必须用 canonicalJson 比）',
+    )
+    assertSameSet(
+      Object.keys(assistant.content),
+      ['text', 'thinking', 'citations', 'tool_calls', 'attachments'],
+      '⚠️ 未知段（tool_calls / attachments）必须还在 —— 被剥掉的实现只会"刷新后卡片少一块"，不报错',
+    )
+    assertEqual(assistant.content.tool_calls[0].callId, 'call-1', '工具卡的关键字段可读（前端按 callId upsert）')
+    assertEqual(assistant.content.attachments[0].fileName, 'a.png', '附件段可读（P1 才写入）')
+    // 引用卡三列与 SSE 的 `citations` 事件同形（`03` §五 单一渲染路径）
+    assertSameSet(Object.keys(assistant.content.citations[0]), ['docName', 'snippet', 'score'], '引用卡三列')
+    assertEqual(assistant.content.citations[0].score, 0.0328, '融合分**数值逐字**（不被劣化成字符串或整数）')
+    assertEqual(assistant.content.citations.length, 2, '两条引用都在（顺序也保持）')
+  })
+
+  await it('游标语义：只返回**严格更早**的，游标那条本身不在结果里', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史游标-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const base = Date.now() - 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await seedMessage(conversation.id, {
+        role: MessageRole.USER,
+        content: { text: `游标第 ${i + 1} 条` },
+        createdAt: new Date(base + i * 1000),
+      })
+    }
+    const expected = await allMessagesAsc(conversation.id)
+    const cursor = expected[7] // 正序里的第 8 条（下标 7）⇒ 更早的是下标 0..6
+    assertEqual(cursor.content.text, '游标第 8 条', '前提：游标行的正文（这一条错了后面全无意义）')
+
+    const older = await listMessages(ownerCookie, conversation.id, `?beforeId=${cursor.id}&limit=100`)
+    assertEqual(older.items.length, 7, '游标之前的 7 条')
+    assertEqual(
+      JSON.stringify(older.items.map((item) => item.content.text)),
+      JSON.stringify(expected.slice(0, 7).map((item) => item.content.text)),
+      '恰好是游标之前那 7 条（正序）',
+    )
+    assertEqual(
+      older.items.some((item) => item.id === cursor.id),
+      false,
+      '⚠️ 游标那条本身**不在**结果里（否则前端会显示重复的一条）',
+    )
+    assertEqual(older.hasMore, false, '已经没有更早的了')
+    assertEqual(older.nextCursor, null, '到底了')
+
+    // 再看 limit 边界：limit=3 时给"游标之前的最近 3 条"，且游标指向这 3 条里最旧的那条
+    const tail = await listMessages(ownerCookie, conversation.id, `?beforeId=${cursor.id}&limit=3`)
+    assertEqual(
+      JSON.stringify(tail.items.map((item) => item.content.text)),
+      JSON.stringify(['游标第 5 条', '游标第 6 条', '游标第 7 条']),
+      '⚠️ 是"紧挨着游标的那 3 条"，不是"最早那 3 条"',
+    )
+    assertEqual(tail.nextCursor, expected[4].id, 'nextCursor = 本页最旧那条（第 5 条）')
+    assertEqual(tail.hasMore, true, '前面还有 4 条')
+  })
+
+  await it('游标失效一律 **400**（而不是"当成没有游标"——那会让前端把最新一页又拿一遍 ⇒ 消息重复）', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史坏游标-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    const otherOwned = await createConversation(ownerCookie, agent.id) // 同一个人的**另一个**会话
+    const foreign = await createConversation(otherCookie, agent.id) // 别人的会话
+    const mine = await seedMessage(conversation.id, { role: MessageRole.USER, content: { text: '我的' } })
+    const sibling = await seedMessage(otherOwned.id, { role: MessageRole.USER, content: { text: '我的另一个会话' } })
+    const theirs = await seedMessage(foreign.id, { role: MessageRole.USER, content: { text: '别人的' } })
+    assertEqual(mine.id === sibling.id, false, '前提：两条消息的 id 不同')
+
+    const expectValidation = async (query, label) => {
+      const response = await api('GET', `/api/conversations/${conversation.id}/messages${query}`, {
+        cookie: ownerCookie,
+      })
+      assertEqual(response.statusCode, 400, `${label}：应当 400`)
+      assertEqual(response.json().code, 'VALIDATION', `${label}：错误码`)
+      return response.json()
+    }
+
+    // ① 语法合法但库里不存在 ⇒ 400（不是 404：主语是"这个**请求参数**"，会话本身是存在的）
+    const missing = await expectValidation(`?beforeId=${MISSING_UUID}`, '不存在的游标')
+    assertIncludes(missing.msg, '游标无效', '文案要指向"游标"，否则调用方会以为是会话的问题')
+
+    // ② ⚠️ **同一个人的另一个会话**的消息也不行 —— 这是"游标必须属于本会话"那条 where 的取证
+    await expectValidation(`?beforeId=${sibling.id}`, '同会话之外（我的另一个会话）的游标')
+
+    // ③ ⚠️ **别人的会话**的消息更不行（没有会话维度过滤的实现会在这里命中并泄露时序）
+    await expectValidation(`?beforeId=${theirs.id}`, '别人的会话里的游标')
+
+    // ④ 格式非法：由路由级 schema 拦（字段级明细是**字符串**形态，带请求部位前缀）
+    const badFormat = await expectValidation('?beforeId=not-a-uuid', '非 UUID 的游标')
+    assertEqual(badFormat.data.fields[0].path, 'querystring.beforeId', '字段级明细指到 querystring.beforeId')
+    // ⑤ limit 的边界也走同一条 400（0 条没有意义 / 上限 100）
+    await expectValidation('?limit=0', 'limit=0')
+    await expectValidation('?limit=101', 'limit=101')
+
+    // 反向的一半：**合法游标必须 200**（只验 400 的话，"接口恒 400"的实现也全绿）
+    const okPage = await listMessages(ownerCookie, conversation.id, `?beforeId=${mine.id}`)
+    assertSameObject(okPage, { items: [], hasMore: false, nextCursor: null }, '游标就是最早那条 ⇒ 空页而不是报错')
+  })
+
+  await it('权限三方向 + 会话不存在：他人 404 / ADMIN 404 / 未登录 401 / 不存在的会话 404', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史权限-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const conversation = await createConversation(ownerCookie, agent.id)
+    await seedMessage(conversation.id, { role: MessageRole.USER, content: { text: '只该我看到' } })
+
+    // ① 第三方 MEMBER：404（不是 403 —— 403 等于确认这个 id 有效）
+    assertEqual((await api('GET', `/api/conversations/${conversation.id}/messages`, { cookie: otherCookie })).statusCode, 404, '他人')
+    // ② ⚠️ **连 ADMIN 也不给后门**：会话这一族的判据是 `user_id`，不是角色
+    //    （四族权限刻意各不相同；只验"他人 404"的话，"ADMIN 能看所有人聊天记录"的实现会全绿）
+    assertEqual((await api('GET', `/api/conversations/${conversation.id}/messages`, { cookie: adminCookie })).statusCode, 404, 'ADMIN')
+    // ③ 未登录 401（⚠️ 必须给**语法合法**的 params：Fastify 的路由级 schema 跑在 preHandler 之前，
+    //    给一个非 UUID 的 id 会先拿到 400 —— P0-1-22 记过的坑）
+    assertEqual((await api('GET', `/api/conversations/${conversation.id}/messages`)).statusCode, 401, '未登录')
+    // ④ 不存在的会话：404（与"不是我的"同一个响应）
+    assertEqual(
+      (await api('GET', `/api/conversations/${MISSING_UUID}/messages`, { cookie: ownerCookie })).statusCode,
+      404,
+      '不存在的会话',
+    )
+    // ⑤ 反向：本人的必须是 200 且看得到内容（否则"接口恒 404"的实现也全绿）
+    const mine = await listMessages(ownerCookie, conversation.id)
+    assertSameObject(mine.items.map((item) => item.content.text), ['只该我看到'], '本人可读')
+  })
+
+  await it('只读（`FINISHED`）的会话**历史照样看得见**；在流中的会话历史只有已落库的那些', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `会话验证智能体-历史只读-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    // ① `FINISHED` = "Agent 被软删"留下的标记（`02` §4.4 的"只读**保留**"）——
+    //    "只读"只表示**不能再产生消息**，历史必须看得见（改名/删除也刻意不按它拦，D 组已验）
+    const frozen = await createConversation(ownerCookie, agent.id)
+    await seedMessage(frozen.id, { role: MessageRole.USER, content: { text: '冻结前的问题' } })
+    await seedMessage(frozen.id, { role: MessageRole.ASSISTANT, content: { text: '冻结前的回答' } })
+    await prisma.conversation.update({ where: { id: frozen.id }, data: { status: ConversationStatus.FINISHED } })
+    const frozenPage = await listMessages(ownerCookie, frozen.id)
+    assertSameObject(
+      frozenPage.items.map((item) => item.content.text),
+      ['冻结前的问题', '冻结前的回答'],
+      '⚠️ 只读会话的历史照样能读（按 `status` 拦的实现会在这里红）',
+    )
+
+    // ② "历史不含进行中消息，进行中状态由 `/active` 提供"（`02` §5.2）：
+    //    半条回答只存在于那条 SSE 连接上，落库发生在 `done` 时 ⇒ 在流中的会话，
+    //    历史 = **已落库的那些**，而"正在生成"这件事由 `/active` 回答。两者合起来才是断线重连。
+    const streaming = await createConversation(ownerCookie, agent.id)
+    await seedMessage(streaming.id, { role: MessageRole.USER, content: { text: '落库了的' } })
+    await putActiveKey(streaming.id, JSON.stringify({ queuedPosition: null, currentTool: 'search_kb', startedAt: new Date().toISOString() }))
+    const streamingPage = await listMessages(ownerCookie, streaming.id)
+    assertSameObject(streamingPage.items.map((item) => item.content.text), ['落库了的'], '历史里没有"半条回答"')
+    const active = await readActive(ownerCookie, streaming.id)
+    assertEqual(active.streaming, true, '而"在流"由 /active 回答（`startedAt`/`currentTool` 也在那儿）')
+    assertEqual(active.currentTool, 'search_kb', '当前工具')
+  })
 } finally {
   // ───────────────────────────── 清理 + 复核残留 ─────────────────────────────
   console.log(`\n${c.b}── 清理（自清理 + 复核残留）──${c.x}`)
@@ -1087,9 +1554,9 @@ console.log(`  ${c.d}覆盖：` + groups.map((group) => `${group.id}(${group.pas
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-1-25 会话验收通过：${passed} 项全通过${c.x}`)
+  console.log(`${c.g}${c.b}✅ P0-1-25 会话验收通过（含 P0-1-28 消息历史）：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-1-25 会话验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ P0-1-25 会话验收未通过（含 P0-1-28 消息历史）：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }

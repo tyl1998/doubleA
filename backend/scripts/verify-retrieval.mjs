@@ -362,6 +362,16 @@ const LONG_QUERY = '关键字锚点'
 /** 码点数组（本批所有长度/切片断言一律走它 —— `slice()` 会劈开代理对且本层不报错） */
 const cps = (text) => [...text]
 
+// ⚠️ 两份独立复算都必须带**副键 `id` 升序**：实现口径是"SQL 只按主键取池、
+//    tie-break 交给 JS 的 `stableOrder`（score 降 + id 升）"——见
+//    `src/services/retrieval.ts` 的 {@link stableOrder} 与 `vectorSearch` 的第 3 条
+//    （SQL 里加第二键会让 HNSW 退化成显式排序，所以那一步只能在 JS 做）。
+//    ⚠️ 少了这个副键，"逐条对照"就是一次**抛硬币**：假上游是词面重叠型向量 ⇒
+//    与 query 无共同 bigram 的对照块**相似度恰好是 0**（不止一条并列）⇒ 两份查询
+//    在并列段上的先后由 PG 的不稳定快排决定。P0-1-28 的全量回归就据此假红过一次
+//    （本档单跑立刻复绿）。PG 的 uuid 比较是**无符号字节序**，而 `id::text` 是定宽小写
+//    十六进制 ⇒ 与 JS 的字符串 `<` 同序，两边可以逐条对齐。
+
 /** 独立复算：向量路（与实现同一条 SQL 形状，但不经任何业务代码） */
 async function expectedVectorRows(kbId, query, limit) {
   const literal = `[${semanticVectorFor(query, config.embedding.dim).join(',')}]`
@@ -369,7 +379,7 @@ async function expectedVectorRows(kbId, query, limit) {
     SELECT c.id::text AS id, (1 - (c.embedding <=> ${literal}::vector))::float8 AS score
     FROM chunks c
     WHERE c.kb_id = ${kbId}::uuid AND c.embedding IS NOT NULL
-    ORDER BY c.embedding <=> ${literal}::vector
+    ORDER BY c.embedding <=> ${literal}::vector, c.id
     LIMIT ${limit}
   `
 }
@@ -380,7 +390,7 @@ async function expectedFulltextRows(kbId, needle, limit) {
     SELECT c.id::text AS id, bigm_similarity(c.content, ${needle})::float8 AS score
     FROM chunks c
     WHERE c.kb_id = ${kbId}::uuid AND c.content LIKE '%' || ${needle} || '%'
-    ORDER BY score DESC
+    ORDER BY score DESC, c.id
     LIMIT ${limit}
   `
 }

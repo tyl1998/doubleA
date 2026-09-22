@@ -60,6 +60,7 @@ const { config } = await import('../dist/backend/src/config.js')
 const {
   conversationItemSchema,
   conversationListResultSchema,
+  messagePageResultSchema,
   uploadDocumentResultSchema,
 } = await import('@doubulea/shared')
 
@@ -379,14 +380,30 @@ async function waitStreamEnd(stream, label, timeoutMs = 15_000) {
   return stream
 }
 
-/** 落库的消息（按时间正序）—— 本批还没有 `GET /:id/messages`（属 P0-1-28），故直接读库 */
-async function messagesOf(conversationId) {
-  const rows = await prisma.message.findMany({
-    where: { conversationId },
-    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    select: { id: true, role: true, content: true, tokensIn: true, tokensOut: true, createdAt: true },
-  })
-  return rows
+/**
+ * 落库的消息（**按时间正序**）—— 走**真端点** `GET /api/conversations/:id/messages`（P0-1-28）。
+ *
+ * ⚠️ 这里原来写的是"直接读库"（P0-1-27 当时还没有历史端点，属于**临时等价取证**）。
+ * P0-1-28 落地后换成真链路：本档的会话动辄几十条消息，顺带把"翻页取全"这件事在
+ * **真实的编排落库数据**上再走一遍（`verify-conversations` 的 H 组用的是脚本自己造的行）。
+ * 投影与形状由 `messagePageResultSchema` 收口，故这里顺带也验了信封与契约。
+ */
+async function messagesOf(jar, conversationId, limit = 100) {
+  const items = []
+  let cursor = null
+  for (;;) {
+    const query = `?limit=${limit}${cursor === null ? '' : `&beforeId=${cursor}`}`
+    const response = await request(jar, 'GET', `/api/conversations/${conversationId}/messages${query}`)
+    assertEqual(response.status, 200, '消息历史状态码')
+    const parsed = messagePageResultSchema.safeParse(response.body?.data)
+    assert(parsed.success, `消息历史不符合契约：${JSON.stringify(parsed.error?.issues)}`)
+    // ⚠️ 各页是"更早的一页"、页内正序 ⇒ 拼接方向是**新页在前**（`unshift`），
+    //    写成 `push` 会得到 [4,5,2,3,1] 那种"加载更多插错位置"的顺序
+    items.unshift(...parsed.data.items)
+    if (!parsed.data.hasMore) break
+    cursor = parsed.data.nextCursor
+  }
+  return items
 }
 
 // ───────────────────────────── 业务助手（全部走真 HTTP）─────────────────────────────
@@ -697,14 +714,23 @@ try {
   })
 
   await it('落库：用户消息 + 助手消息各一条，`lastMessageAt` 前进（同一事务）', async () => {
-    const rows = await messagesOf(convA.id)
+    const rows = await messagesOf(ownerJar, convA.id)
     assertEqual(rows.length, 2, '恰好两条消息')
     assertEqual(rows[0].role, 'USER', '第一条是用户消息')
     assertEqual(rows[0].content.text, QUERY, '用户消息正文 = 提问原文')
     assertEqual(rows[1].role, 'ASSISTANT', '第二条是助手消息')
     assertEqual(rows[1].content.text, deltaTextOf(streamA), '助手消息正文 = 收到的增量拼接（不多不少）')
-    assertEqual(rows[1].tokensIn, 123, 'tokens_in 落库')
-    assertEqual(rows[1].tokensOut, 45, 'tokens_out 落库')
+    // ⚠️ 这两条**故意直接读库**（不走上面那个真端点）：断言的主语是"**落库**"。
+    //    `GET /:id/messages` 的投影刻意**不带** token 计量（用量统计属 P1 的独立端点，
+    //    `shared/src/conversation.ts` 的 `messageItemSchema` 注释写了理由）—— 拿它验"落库"
+    //    是把两件事混在一起。P0-1-28 把 `messagesOf` 从"直接读库"换成真链路时，这一条立刻红了，
+    //    正好说明当初的写法是**借了读库的便**（📌 这类连带影响只有真跑一遍才看得见）。
+    const persisted = await prisma.message.findFirst({
+      where: { conversationId: convA.id, role: 'ASSISTANT' },
+      select: { tokensIn: true, tokensOut: true },
+    })
+    assertEqual(persisted?.tokensIn, 123, 'tokens_in 落库')
+    assertEqual(persisted?.tokensOut, 45, 'tokens_out 落库')
     assertEqual(
       canonicalJson(rows[1].content.citations),
       canonicalJson(firstFrameOf(streamA.frames, 'citations').data.items),
@@ -776,7 +802,7 @@ try {
   })
 
   await it('未命中：落库的助手消息里**不含 `citations` 键**（空数组与"没有"是两件事）', async () => {
-    const rows = await messagesOf(convB.id)
+    const rows = await messagesOf(ownerJar, convB.id)
     assertEqual(rows.length, 2, '两条消息')
     assert(!('citations' in rows[1].content), `落库的 content 不该有 citations 键：${JSON.stringify(rows[1].content)}`)
     assert(!('thinking' in rows[1].content), '上游没给思考增量 ⇒ 也不该有 thinking 键')
@@ -817,7 +843,7 @@ try {
   await it('停止真的生效（增量数 < 上游脚本段数）且**已生成的部分**原样落库', async () => {
     const deltas = framesOf(streamC.frames, 'delta')
     assert(deltas.length < longPieces.length, `应当被中断，实际收到 ${deltas.length}/${longPieces.length} 段`)
-    const rows = await messagesOf(convC.id)
+    const rows = await messagesOf(ownerJar, convC.id)
     assertEqual(rows.length, 2, '两条消息（用户 + 已生成的部分回答）')
     assertEqual(rows[1].role, 'ASSISTANT', '第二条是助手消息')
     assertEqual(rows[1].content.text, deltaTextOf(streamC), '落库正文 = 已生成的增量拼接（正好那么多）')
@@ -837,7 +863,7 @@ try {
     assertEqual(messages[messages.length - 2].role, 'assistant', '倒数第二条是上一轮的回答（历史还原）')
     assertIncludes(messages[messages.length - 2].content, '第1段。', '上一轮的已生成内容进了历史')
     assertEqual(messages[messages.length - 3].content, QUERY, '再往前是本轮的第一句提问')
-    const rows = await messagesOf(convC.id)
+    const rows = await messagesOf(ownerJar, convC.id)
     assertEqual(rows.length, 4, '落库累计 4 条')
   })
 
@@ -882,7 +908,7 @@ try {
   })
 
   await it('被拒的那一轮**一个字都没落库**（前置失败 ⇒ 这一轮没发生）', async () => {
-    const rows = await messagesOf(convD2.id)
+    const rows = await messagesOf(ownerJar, convD2.id)
     assertEqual(rows.length, 0, '被拒的会话里不该有任何消息')
     const active = await readActive(ownerJar, convD2.id)
     assertEqual(active.streaming, false, '锁也应当已经释放')
@@ -897,7 +923,7 @@ try {
       '断开后锁释放',
     )
     // 断线不是"什么都没发生"：已经生成的内容（这里是 0 字）与用户消息照常落库
-    const rows = await messagesOf(convD1.id)
+    const rows = await messagesOf(ownerJar, convD1.id)
     assertEqual(rows.length, 1, '只落库了用户消息（这一轮没有产生任何内容）')
     assertEqual(rows[0].role, 'USER', '落库的是用户消息')
   })
@@ -934,7 +960,7 @@ try {
         },
       })
     }
-    const rows = await messagesOf(convE.id)
+    const rows = await messagesOf(ownerJar, convE.id)
     assertEqual(rows.length, TOTAL_ROUNDS * 2, '历史消息条数')
   })
 
@@ -958,7 +984,7 @@ try {
       '取的是**最近** CONTEXT_ROUNDS 轮的第一条（不是最早的）',
     )
     assertEqual(messages[messages.length - 1].content, '总结一下上面所有轮次', '末条是本轮提问')
-    const rows = await messagesOf(convE.id)
+    const rows = await messagesOf(ownerJar, convE.id)
     assertEqual(rows.length, TOTAL_ROUNDS * 2 + 2, '本轮也落库了（50 + 用户 + 助手）')
   })
 
@@ -981,7 +1007,7 @@ try {
   })
 
   await it('故障轮：用户消息落库、**没有**助手消息（已生成的内容为空）', async () => {
-    const rows = await messagesOf(convF.id)
+    const rows = await messagesOf(ownerJar, convF.id)
     assertEqual(rows.length, 1, '只有用户消息（这一轮真的发生过）')
     assertEqual(rows[0].role, 'USER', '落库的是用户消息')
     assertEqual(rows[0].content.text, '上游坏掉时的提问', '正文 = 提问原文')
