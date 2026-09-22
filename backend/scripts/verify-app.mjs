@@ -60,6 +60,14 @@
  *              会话转只读）与 403/200 这两族都要真 PG + Redis，归 `verify-agents.mjs`。
  *              权限判据是**纯函数**、且改坏了不会有任何接口报错（最坏是静默越权）⇒ 这一档
  *              是它唯一的守门处；行为侧还要靠那一档的"两个真实 MEMBER + 一个 ADMIN"。
+ *   · P0-1-25：**会话契约与路由** —— 五条路由已注册 + **四条刻意不注册**（会话详情、消息分页、
+ *              SSE、停止/确认）；`topic` **不是三态**（`null` 被拒）；输出投影的键集合固定
+ *              （**没有 `userId`/`deletedAt`**）；以及两处"派生/判据"的守门 ——
+ *              **`streaming` 只出现在响应契约里、不在 Redis 快照里**（锁与"在流"必须是同一件事）
+ *              与 `parseActiveSnapshot` 的降级矩阵（断线重连路径最不能 500）。
+ *              ⚠️ 这里**不**断言任何"库里有几行"的东西：四族权限的差别（**会话 = 仅本人，
+ *              连 ADMIN 也不开后门**）、`last_message_at` 的排序与 CAS、级联删除的真数
+ *              都要真 PG + Redis，归 `verify-conversations.mjs`。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -156,6 +164,19 @@ import {
   normalizeGuideQuestions,
   replaceAgentComponentsBodySchema,
   updateAgentBodySchema,
+  // 会话（P0-1-25）
+  CONVERSATION_STATUSES,
+  CONVERSATION_UNTITLED_HINT,
+  conversationActiveSchema,
+  conversationActiveSnapshotSchema,
+  conversationIdParamsSchema,
+  conversationItemSchema,
+  conversationListResultSchema,
+  createConversationBodySchema,
+  isConversationReadOnly,
+  parseActiveSnapshot,
+  removeConversationResultSchema,
+  renameConversationBodySchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -251,6 +272,30 @@ function assertClose(actual, expected, label, epsilon = 1e-12) {
     typeof actual === 'number' && Math.abs(actual - expected) <= epsilon,
     `${label}：期望 ≈ ${expected}，实际 ${actual}`,
   )
+}
+
+/**
+ * 集合类比较**两侧先排序再比**（`06` P0-1-17 的教训：别把"书写顺序"也当成契约）。
+ * P0-1-25 起本档也要比键集合，故补上（与其余几个验收脚本同名同义）。
+ */
+function assertSameSet(actual, expected, label) {
+  const a = [...actual].sort()
+  const b = [...expected].sort()
+  assert(JSON.stringify(a) === JSON.stringify(b), `${label}：期望集合 ${JSON.stringify(b)}，实际 ${JSON.stringify(a)}`)
+}
+
+/**
+ * 对象比较：**按排序后的键**逐字段比（对象键序不是契约 —— `JSON.stringify` 两个对象会把
+ * "键的书写顺序"也判成不一致，那是最难分辨的一类假失败：输出里两者"看着一样"）。
+ */
+function assertSameObject(actual, expected, label) {
+  const norm = (value) =>
+    JSON.stringify(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, value[key]]),
+    )
+  assert(norm(actual) === norm(expected), `${label}：期望 ${norm(expected)}，实际 ${norm(actual)}`)
 }
 
 /** 跑一条用例：失败不中断（一次跑完，把问题看全） */
@@ -2304,7 +2349,7 @@ await it('下载的口径表与上传白名单**不脱节**（下载给的类型
 // ── 24. 智能体契约与路由（P0-1-22；组件绑定写侧 P0-1-23）──
 console.log(`\n${c.b}── 智能体契约与路由（权限判据 / 三态 / 引导问题 / 组件绑定整体替换）──${c.x}`)
 
-await it('六条路由已注册；P1 与 P0-1-25 的两条**刻意不存在**（不提前做下一批的活）', () => {
+await it('六条路由已注册；复制（P1）**刻意不存在**（会话列表在 P0-1-25 已落地，见本节末尾）', () => {
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
@@ -2316,9 +2361,16 @@ await it('六条路由已注册；P1 与 P0-1-25 的两条**刻意不存在**（
     true,
     '组件绑定整体替换（P0-1-23）',
   )
-  // 复制是 **P1**（`02` §4.4 与 `01` §3.3 都标了 P1）；会话列表归 P0-1-25
+  // 复制是 **P1**（`02` §4.4 与 `01` §3.3 都标了 P1）
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
-  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), false, '会话列表属 P0-1-25')
+  // ⚠️ P0-1-22 时这条写的是 `false`（"属 P0-1-25"）；**P0-1-25 落地后翻转为 `true`**
+  //    （注册在 `routes/conversations.ts`，它读的是 conversations 表）。断言翻转是"刻意不做"清单
+  //    的例行收尾：留着旧的 `false` 会让下一批的"已落地"变成一条假红。
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }),
+    true,
+    '会话列表（P0-1-25）',
+  )
 })
 
 await it('权限判据 `canEditAgent`：四个方向（创建者 / ADMIN / 第三方 / 已软删）', () => {
@@ -2508,6 +2560,153 @@ await it('输出投影的键集合固定：没有 `deletedAt` 之类的内部列
     'offset/limit/total 缺一不可',
   )
   assertEqual(agentListResultSchema.safeParse({ items: [], total: 0, offset: 0, limit: 20 }).success, true, '完整响应')
+})
+
+// ── 25. 会话契约与路由（P0-1-25）──
+console.log(`\n${c.b}── 会话契约与路由（权限「仅本人」/ active 的派生字段 / last_message_at 的时点）──${c.x}`)
+
+await it('五条路由已注册；P0-1-26/27/28 的三条**刻意不存在**（不提前做下一批的活）', () => {
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), true, '某 Agent 的会话列表')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations' }), true, '新建会话')
+  assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/conversations/:id' }), true, '重命名')
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/conversations/:id' }), true, '删除')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id/active' }), true, '活跃流状态')
+  // `GET /api/conversations/:id`（详情）**没有**被设计过 —— 会话的全部信息都在列表项里，
+  // 多一条"取单条"只会变成一个没人维护的第二套投影
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id' }), false, '不该有会话详情端点')
+  // 属后续批次：消息分页 P0-1-28、SSE/停止/确认 P0-1-26。**提前注册一条返回空数组的
+  // `/messages` 会让"历史恢复"看起来已交付**（P0-1-16 的同款断言，那次是列表/下载）
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id/messages' }), false, '消息分页属 P0-1-28')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/chat' }), false, 'SSE 属 P0-1-26')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/stop' }), false, '停止属 P0-1-26')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/confirm' }), false, '确认属 P0-1-26')
+  // ⚠️ 会话是**私有资源**：一条 `requireAdmin` 都不该出现 ⇒ 用一个普通 MEMBER 的 403 是验不出的，
+  //    这里能验的是"路由本身只挂 requireAuth"（真权限判定在服务层的 `where` 里，归 verify-conversations）
+  assertEqual(app.hasRoute({ method: 'PUT', url: '/api/conversations/:id' }), false, '重命名只走 PATCH（不提供整对象 PUT）')
+})
+
+await it('建/改请求体契约：`agentId` 必填且是 UUID；`topic` **不是三态**（null/空串/超长各自有文案）', () => {
+  assertEqual(createConversationBodySchema.safeParse({ agentId: '01930000-0000-7000-8000-000000000000' }).success, true, '合法 body')
+  assertEqual(createConversationBodySchema.safeParse({}).success, false, '缺 agentId')
+  assertEqual(createConversationBodySchema.safeParse({ agentId: 'nope' }).success, false, '非 UUID')
+
+  assertEqual(renameConversationBodySchema.safeParse({ topic: '标题' }).success, true, '合法标题')
+  assertEqual(renameConversationBodySchema.safeParse({ topic: ' 前后有空白 ' }).data?.topic, '前后有空白', 'trim')
+  assertEqual(renameConversationBodySchema.safeParse({ topic: '   ' }).success, false, '全空白被拒（trim 后为空）')
+  // ⚠️ `null` 必须被拒：`topic` 不是三态（"清空标题"没有交互，见 shared 的注释）
+  assertEqual(renameConversationBodySchema.safeParse({ topic: null }).success, false, '`null` 被拒')
+  assertEqual(renameConversationBodySchema.safeParse({ topic: 'x'.repeat(256) }).success, false, '超长被拒（列是 255）')
+  assertEqual(renameConversationBodySchema.safeParse({}).success, false, '必填')
+  // 逐字段文案（前端要挂到输入框上，靠 message 找；`.refine()` 那种 path 为空串的写法在这里没有）
+  assertIncludes(
+    renameConversationBodySchema.safeParse({ topic: null }).error.issues.map((issue) => issue.message).join(' '),
+    '必须是字符串',
+    'null 的文案',
+  )
+  assertEqual(
+    JSON.stringify(renameConversationBodySchema.safeParse({}).error.issues[0].path),
+    JSON.stringify(['topic']),
+    '必填的错误路径精确到 topic（不是 `.refine()` 的空串）',
+  )
+})
+
+await it('输出投影：键集合固定（**没有 `deletedAt` 之类的内部列**），列表响应是同一套分页三件套', () => {
+  const keys = Object.keys(conversationItemSchema.shape)
+  // 软删是 Agent 的概念，会话表没有这一列；而 `userId` **刻意不**下发
+  // （它就是"这是我的会话"的依据，下发出去只会诱使前端拿它做判断 —— 那是服务端的事）
+  assertSameSet(
+    keys,
+    ['id', 'agentId', 'agentName', 'agentType', 'topic', 'status', 'lastMessageAt', 'createdAt', 'updatedAt'],
+    '会话投影键集合',
+  )
+  assertEqual(keys.includes('userId'), false, '不该下发 userId')
+  assertEqual(keys.includes('deletedAt'), false, '不该下发 deletedAt')
+  assertEqual(
+    conversationListResultSchema.safeParse({ items: [], total: 0, offset: 0 }).success,
+    false,
+    'offset/limit/total 缺一不可',
+  )
+  assertEqual(
+    conversationListResultSchema.safeParse({ items: [], total: 0, offset: 0, limit: 20 }).success,
+    true,
+    '完整响应',
+  )
+  // 删除响应必须带 `deletedMessages`（`03` §七 的级联确认框要用它）
+  assertEqual(
+    removeConversationResultSchema.safeParse({ id: 'a', agentId: 'b', topic: null, deletedMessages: 3 }).success,
+    true,
+    '删除响应',
+  )
+  assertEqual(
+    removeConversationResultSchema.safeParse({ id: 'a', agentId: 'b', topic: null }).success,
+    false,
+    '缺 deletedMessages',
+  )
+  assertEqual(conversationIdParamsSchema.safeParse({ id: 'not-a-uuid' }).success, false, '路径参数要是 UUID')
+})
+
+await it('⚠️ `streaming` 是**派生**字段：它只出现在响应契约里，**不在** Redis 快照里', () => {
+  // 这条断言守的是"锁与在流是同一件事"（`shared` 文件头 ⑤）：一旦有人把 `streaming` 也写进
+  // 快照（存起来），就会出现"键在但快照说不在"的矛盾态，而两种读法都能在某些页面显得正常。
+  assertEqual(
+    Object.keys(conversationActiveSnapshotSchema.shape).includes('streaming'),
+    false,
+    '⚠️ 快照里不许有 streaming（它由"键在不在"派生）',
+  )
+  assertSameSet(
+    Object.keys(conversationActiveSnapshotSchema.shape),
+    ['queuedPosition', 'currentTool', 'startedAt'],
+    '快照三件套',
+  )
+  assertSameSet(
+    Object.keys(conversationActiveSchema.shape),
+    ['queuedPosition', 'currentTool', 'startedAt', 'streaming'],
+    '响应 = 快照 + streaming',
+  )
+  assertEqual(
+    conversationActiveSchema.safeParse({ queuedPosition: null, currentTool: null, startedAt: null }).success,
+    false,
+    '响应里 streaming 必填（缺了就是"没告诉我在不在流"）',
+  )
+})
+
+await it('`parseActiveSnapshot` 纯函数：合法值逐字保留，脏值**逐字段**降级且永不抛错', () => {
+  // 它是 `/active` 的读取端唯一兜底点（`normalizeGuideQuestions` 同族）。**断线重连**路径最不能 500，
+  // 所以"值坏了也要给出能用的东西"这条只能在这里守（真 Redis 那一档归 verify-conversations 的 F 组）。
+  assertSameObject(
+    parseActiveSnapshot(JSON.stringify({ queuedPosition: 2, currentTool: 'bash', startedAt: '2026-09-22T06:30:00.000Z' })),
+    { queuedPosition: 2, currentTool: 'bash', startedAt: '2026-09-22T06:30:00.000Z' },
+    '合法值逐字保留',
+  )
+  for (const [raw, label] of [
+    [null, 'null'],
+    [undefined, 'undefined'],
+    ['', '空串'],
+    ['{oops', '非法 JSON'],
+    ['[]', '顶层是数组'],
+    ['"字符串"', '顶层是字符串'],
+  ]) {
+    assertSameObject(
+      parseActiveSnapshot(raw),
+      { queuedPosition: null, currentTool: null, startedAt: null },
+      `降级：${label}`,
+    )
+  }
+  // 坏字段自己降级、**好字段留下**（整条丢弃会让"只有时间戳坏了"变成"什么都看不到"）
+  assertSameObject(
+    parseActiveSnapshot(JSON.stringify({ queuedPosition: 0, currentTool: 'bash', startedAt: 'x' })),
+    { queuedPosition: null, currentTool: 'bash', startedAt: null },
+    '字段级收敛',
+  )
+})
+
+await it('判据与文案收在 shared：「只读」是纯函数、未命名会话的回落文案是常量', () => {
+  assertEqual(JSON.stringify(CONVERSATION_STATUSES), JSON.stringify(['ACTIVE', 'FINISHED']), '状态取值域')
+  // ⚠️ 判据只回答"能不能再产生消息"（P0-1-26 的闸门 + P0-1-34 的输入区禁用），
+  //    **不是**"什么都不能改" —— 改名/删除刻意不按它拦（verify-conversations 的 D 组有反向断言）
+  assertEqual(isConversationReadOnly('ACTIVE'), false, 'ACTIVE 可写')
+  assertEqual(isConversationReadOnly('FINISHED'), true, 'FINISHED 只读（Agent 软删留下的标记）')
+  assertEqual(CONVERSATION_UNTITLED_HINT, '新会话', 'topic 为 null 时的界面回落文案')
 })
 
 await app.close()

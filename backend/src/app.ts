@@ -22,6 +22,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerAgentRoutes } from './routes/agents.js'
+import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
@@ -150,6 +151,11 @@ export function buildApp(): FastifyInstance {
   //     `01` 决策 18（创建者 + ADMIN）做成**行级**判定 —— 路由只挂 `requireAuth`，
   //    一个 `requireAdmin` 都没有（与模型池那一族刻意相反，理由见 routes/agents.ts 文件头）。
   registerAgentRoutes(app)
+  // ⑪ 会话（P0-1-25）。权限是**仅创建者本人**（`conversations.user_id`）—— 与会话相关的一切
+  //    都只挂 `requireAuth`，判据落在服务层查询的 `where` 里（连 ADMIN 也不开后门，
+  //    理由见 routes/conversations.ts 文件头）。注意其中一条挂在前缀 `/api/agents/:id/conversations`
+  //    （某智能体的会话列表）—— 它读的是 conversations 表，故归属本文件而不是 routes/agents.ts。
+  registerConversationRoutes(app)
 
   return app
 }

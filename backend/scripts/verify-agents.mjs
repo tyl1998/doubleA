@@ -990,9 +990,9 @@ try {
   // ═══════════════════════════════════════════════════════════════════
   // F 组 · 路由表（注册了什么、刻意**没**注册什么）
   // ═══════════════════════════════════════════════════════════════════
-console.log(`\n${c.b}── F 组 · 路由表：六条已注册，P1 / P0-1-25 的刻意不存在 ──${c.x}`)
+console.log(`\n${c.b}── F 组 · 路由表：七条已注册（含 P0-1-25 的会话列表），仅"复制"（P1）刻意不存在 ──${c.x}`)
 
-await it('六条路由都在，且"尚未做"的两条一律 404（不提前注册）', async () => {
+await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P1；不存在的 agent 一律 404', async () => {
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
@@ -1004,14 +1004,15 @@ await it('六条路由都在，且"尚未做"的两条一律 404（不提前注�
     true,
     '组件整体替换（P0-1-23）',
   )
-
-  // 复制是 **P1**（`02` §4.4 已标）；某 Agent 的会话列表归 P0-1-25
-  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
+  // ⚠️ 同上：P0-1-24 时这里写的是 `false`（"会话列表属 P0-1-25"）；P0-1-25 落地后翻转为 `true`
   assertEqual(
     app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }),
-    false,
-    '会话列表属 P0-1-25',
+    true,
+    '会话列表（P0-1-25 已落地）',
   )
+
+  // 复制是 **P1**（`02` §4.4 已标），至今刻意未注册
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
 
   for (const [method, url] of [
     ['POST', `/api/agents/${MISSING_UUID}/copy`],

@@ -27,9 +27,12 @@
  * ─────────────────────────────────────────────────────────────────────
  *   · `POST /api/agents/:id/copy` —— **P1**（`02` §4.4 已标 P1、`01` §3.3 复制 Agent 也是 P1）。
  *     P0 不做，验收脚本里有一条"它必须 404"守着，防止有人"顺手"把它实现出来。
- *   · `GET /api/agents/:id/conversations` —— **P0-1-25**（包 F 的会话管理）。
- *     ⚠️ `PUT …/components` 是 **P0-1-23 本批落地的**（上一批的"刻意不做"清单里还有它，
- *     本批已从"不做"变成"已注册"—— 两档验收里的对应断言都已同步翻转）。
+ *   · `GET /api/agents/:id/conversations` —— **P0-1-25 已落地**（包 F 的会话管理），
+ *     注册在 `routes/conversations.ts`（它读的是 `conversations` 表，见该文件头）。
+ *     ⚠️ P0-1-22 时这一条在"刻意不做"清单里，P0-1-23 时 `PUT …/components` 也翻转过一次 ——
+ *     两档无依赖验收（`verify-app.mjs`）里的对应断言都已同步翻转。
+ *   · `GET /api/conversations/:id/messages`、`POST …/chat`、`POST …/stop` 仍属后续批次
+ *     （P0-1-26/27/28），本批**不要顺手补**。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */

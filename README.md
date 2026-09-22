@@ -84,13 +84,13 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 从 P0-1-22 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 与组件绑定从 P0-1-22/23 起；**会话管理从 P0-1-25 起**）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
-pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（85 项；CI 加 EXPECT_DEGRADED=1 为 86 项）
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（92 项；CI 加 EXPECT_DEGRADED=1 为 93 项）
 pnpm verify:embedding  # embedding 双模式验收：真 HTTP 假上游 + stub 推理运行时，**不占端口、不启 docker**（27 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
@@ -109,6 +109,7 @@ pnpm verify:retrieval  # 检索验收：三模式/六列分数/**与独立 SQL �
 pnpm verify:kb-package # **包级验收**：逐行跑 `子方案①` §十二 的 8 行（CRUD/四格式/扫描件/重试/重建/检索/引用/性能），**需要真实 PG + Redis + MinIO**（11 项）
 pnpm verify:agents     # Agent 验收：两种类型 CRUD/`canEdit` 三方向/绑定模型四态/三态字段/软删三件套/**组件绑定整体替换**，**需要真实 PG + Redis（不需要 MinIO）**（35 项）
 pnpm verify:agent-package # **包级验收**：逐行跑 P0-1-24 的四条门槛（两类型 CRUD/绑 2 库→解绑 1/权限三方向/删除的连带 + 跨包链路），**需要真实 PG + Redis（不需要 MinIO）**（13 项）
+pnpm verify:conversations # 会话验收：仅本人权限（含 ADMIN 也没有后门）/建会话初始值/按最近活跃排序（nulls-first）/软删 Agent 的会话仍可见/改名四态/级联删除与 deletedMessages/`/active` 读侧与降级/touchConversation 只前进不后退，**需要真实 PG + Redis（不需要 MinIO）**（15 项）
 pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的批次号 vs `index.ts` 启动信封的 step（不一致即 exit 1）
 ```
 
@@ -745,17 +746,67 @@ pnpm verify:pipeline
 pnpm verify:ingest
 #  → 23 项全通过（同样需要 PG + Redis + MinIO）。这一档专验"入库之后的形态"：
 #    chunk 真的落库且都有向量、id 版本位是 7、覆盖重建换内容不换 id、重试能救回 FAILED、删除三清。
+
+# ⑮ 会话管理（P0-1-25）—— 包 F 起步：某 Agent 的会话列表 / 建 / 改名 / 删 / 活跃态
+#    ⚠️ 权限是**第四族**：会话 = **仅创建者本人**（连 ADMIN 也看不到别人的会话，一律 404）。
+#    前置：一个**未软删**的智能体（⑭-a 建的那个）与它的 agent-id。
+AGENT=<⑭-a 的 agent-id>
+
+# ⑮-a 新建会话 → topic:null、lastMessageAt:null（本批没有自动命名）
+curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/conversations \
+  -H 'content-type: application/json' -d "{\"agentId\":\"$AGENT\"}" \
+  | jq '.data | {id, agentName, agentType, topic, status, lastMessageAt}'
+#  → status:"ACTIVE"；topic 与 lastMessageAt 都是 null（"还没说过话"与"刚说了话"必须分得开）
+#    建会话只校验"Agent 存在且未软删"——**刻意不校验**模型可用/Provider 有没有配 Key
+#    （那是"发消息"的前置，属 P0-1-26/27；否则模型停用后连自己的历史都进不去）
+
+# ⑮-b 列表：**新会话排最前**（`lastMessageAt desc` 且 `nulls:'first'`）
+curl -sS --noproxy '*' -b "$COOKIE" "http://127.0.0.1:13000/api/agents/$AGENT/conversations?limit=20" \
+  | jq '.data | {total, items: [.items[] | {topic, lastMessageAt}]}'
+#  → ⚠️ 最容易误判成"新建没成功"的一条：新会话的 lastMessageAt 是 null，
+#    若实现漏写 `nulls:'first'` 它会被排到列表**最后**（PG 的 DESC 默认是 NULLS FIRST，
+#    但这条口径必须**显式**写出来，见 `docs/02` §4.5 ③）。
+#    另外**软删的 Agent 照样能查**（会话"只读保留"），但"Agent 不存在"回 404 而不是空列表。
+
+# ⑮-c 改名（行内编辑）→ 200；`topic` **不是三态**：传 null 会被 400 拒（界面没有"清空标题"）
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH http://127.0.0.1:13000/api/conversations/<conversation-id> \
+  -H 'content-type: application/json' -d '{"topic":"差旅费怎么报"}' | jq '.data.topic'
+#  → 已结束（FINISHED）的会话也照样能改名/删除（"只读"只拦"产生消息"，见 `docs/02` §4.5 ⑦）
+
+# ⑮-d 活跃流状态 → **恒为无流**（写侧 `chat.active:{id}` 属 P0-1-26）
+curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/<conversation-id>/active | jq '.data'
+#  → {streaming:false, queuedPosition:null, currentTool:null, startedAt:null}
+#    ⚠️ `streaming` 是**派生**的（Redis 键在 ⇒ true）⇒ 不可能出现"键在但 streaming:false"；值坏也只降级不 500。
+#       本批没有发消息的端点 ⇒ 一直 false 是**预期行为，不是 bug**。
+
+# ⑮-e 权限守门：用**别的账号**（ADMIN 也一样）读/改/删同一个会话 → 一律 **404**（不是 403）
+curl -sS --noproxy '*' -b /tmp/member.jar http://127.0.0.1:13000/api/conversations/<conversation-id> | jq .msg
+#  → 404「会话不存在」（`PATCH` / `DELETE` / `/active` 同理）。**刻意不是 403**：
+#    403 等于确认这个 id 有效，而会话 id 不出现在任何对他人可见的列表里，藏得住。
+
+# ⑮-f 删除 → 级联删消息，响应给出**同事务"先数后删"**得出的 deletedMessages
+curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/conversations/<conversation-id> | jq '.data'
+#  → {id, agentId, topic, deletedMessages}；会话从列表里消失，活跃流锁一并清掉。
+#    ⚠️ P0-1 阶段**没有会话级的 S3 对象**（产物属 P0-3、附件属 P1）⇒ 这一步不进 S3，
+#       是**诚实的空操作**（接回点在 `collectConversationObjectKeys`，见 `docs/02` §4.5 ⑥）。
+
+pnpm verify:conversations
+#  → 15 项全通过（需要 PG + Redis，**不需要 MinIO**）。
 ```
 
-**已知边界（别当 bug）**：① 接口只有五组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
+**已知边界（别当 bug）**：① 接口只有六组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
 （`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员 + P0-1-12 新增的
 `GET /api/model-providers/:id/remote-models` 仅 ADMIN）、**知识库 `/api/knowledge-bases`（P0-1-15，
 登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
 `reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**、**智能体 `/api/agents`（P0-1-22，
-登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**。
+登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**、
+**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404）**。
 **"MEMBER 能用的业务接口"现在有三处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
-以及 `/api/agents` 的列表/详情/创建 —— 三者**权限口径刻意各不相同**（模型池全程 ADMIN；
-知识库**没有 owner 列**故登录即可读写；智能体有 `created_by` 列故编删按行判定）。
+以及 `/api/agents` 的列表/详情/创建 —— 四族**权限口径刻意各不相同**（模型池全程 ADMIN；
+知识库**没有 owner 列**故登录即可读写；智能体有 `created_by` 列故编删按行判定；
+**会话有 `user_id` 列故仅本人**）。**⚠️ 会话现在只有"管理"没有"说话"**：`POST /:id/chat`（SSE）、
+`POST /:id/stop` 属 P0-1-26，`GET /:id/messages` 属 P0-1-28 ⇒ `/active` 恒返回
+`{streaming:false}` 是**预期行为**。
 照抄邻居必错，本仓已因此踩过两次"顺手加 `requireAdmin`"。
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
 **文档上传专项边界（P0-1-16）**：本批能验的是"进门校验"与"解析器本身"（`pnpm verify:documents`
@@ -894,6 +945,7 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-18-空文本检测+分块.md` | **本批的两个真问题都不在坑预判里**：① **PDF 夹具的单行文本必须折行** —— 单条超长 `Tj` 会超出 `MediaBox`（612pt），而 pdf.js **只提取页面框内的文本** ⇒ 内容被**静默截断**（实测 561 字的单行只析出 85 字、且截在半个单词上），拿它去断言"分块边界/阈值"会得到假数据（不是实现问题，但会让人查错地方）；② **新增的空文本门槛把两处旧夹具"判死"了** —— P0-1-17 留下的 `verify-pipeline` 夹具（docx 20 字、txt 29 字、F 组 PDF 43 字）在 50 字阈值下会被判「疑似扫描件」，让"四篇全 READY"和"重投救回"**假失败**（这是**刻意的行为变化**，不是回归；处置是把夹具写长并在此留档，否则下一个人会以为夹具本来就该这么长）。**分块上最容易静默做错的四条**：切片的单位必须是**码点**（`text.slice()` 会**劈开代理对**，产出非法字符串且**本层毫无报错**，下游 embedding 才炸 ⇒ 全流程建在 `[...text]` 上，验收用 600 个 emoji 逐码点断言）；Section 必须按"**连续**同名标题"切（按 `headingPath` 分组会让 chunk **顺序与原文不一致**，而这在检索层几乎发现不了 —— 片段读起来通顺、只是位置不对）；**每块必须是原文的逐字子串**（重叠取前块尾部而不是新造句子，这是 P0-1-20"引用与原文一致"的前提）；**页码 meta 取"块起点所在段"**（一个 Section 可能跨页 PDF，"整块用 Section 首页"会把页码全说成第 1 页）。**另一处刻意的实现-文档偏离**：`ChunkStrategy.split` 收 `ParseResult` 而不是 `(text, meta)` —— 标题层级只在 `blocks` 里，只给 `text` 会让 hybrid 退化成 fixed。**口径定案**：`chunk_min`（50）是**代码常量**（§十一 的配置表里没有它，加环境变量属于自己发明契约）；空文本检测失败文案里的数字**取实测阈值**（写死 50 会让管理员调阈值后用户按错数字重传）；判据是 `<` 而**恰好等于阈值通过**（验收用例按**当前阈值**生成）；**④ 必须排在 ⑤ 之前**，用产物的缺席取证（`ctx.chunks === undefined` 而 `ctx.parsed !== undefined`）。**⚠️ 本批只"算"不"存"**：`chunk_count` 刻意仍是 0（`schema.prisma` 对它的定义是"**已入库**的 chunk 数"，提前写会造出"说有 N 块却搜不到"的假象，P0-1-19 还得回头改） |
 | `issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` | **本批跑出来的两个"假失败"其实都是断言自己写错**：① `VECTOR` 用例里写了"每条的 `vectorScore > 0`"，而**正交向量的余弦相似度恰好是 0**（合法取值）⇒ 改成"含关键词的那一块必须**严格更近**"（这才是想验的东西）；② "长 query 截断到 64 字符后仍应命中"的**前提本身是错的** —— 截断只保证 LIKE 的模式不长，**不保证**那 64 个字符连续出现在正文里（自然语言问句几乎必然不连续）⇒ 改成"从原文里取 64 字子串当 query + 加长后缀"，并用一次**不截断的独立 SQL 复算**证明"命中只能来自那次截断"。**真问题与设计订正**：③ **RRF 示例数值文档写错了**（0.0323 → 实测 **0.0320**）⇒ 已订正并写成断言（文档与代码从此互为守门）；④ **`§6-1` 的"去停用词"必须收窄**（只剥句首/句尾的提问脚手架）—— LIKE 要连续子串，删掉中间的"的"会把"报销的标准"变成"报销标准"，**降低**命中率；⑤ **`%`/`_` 是 LIKE 的通配符**，必须在 query 预处理阶段剔掉，否则"字面包含"会静默变成模式匹配（判别式：正文里同时有 `5` 和 `0`、但两者永不相邻，用 `5%0` 去搜 —— 两种实现的期望值不同，断言才有判别力）；⑥ **`score` 阈值只作用于向量路且过滤放在候选池之后**（距离单调 ⇒ 两种顺序等价，少传一份 20KB 的向量字面量）；⑦ **`ORDER BY embedding <=> $1, id` 会让 HNSW 退化** ⇒ 二级 tie-break 必须在 JS 侧做（否则 P0-1-14 的索引取证白做）；⑧ `§八` 的降级路径本批就位（`HYBRID` 跳向量路 + 告警 / `VECTOR` 409 / `FULLTEXT` 不受影响，两种原因分开报）；⑨ 顺手加了 `pnpm check:batch` —— `step` 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性 |
 | `issue_fix/问题记录-P0-1-21-知识库包验收.md` | **本批的"坑"主要不在实现里，而在"包级验收"这件事本身**：① **前面每档都绿，不等于串起来还成立** —— R4 的"检索返回 v2"在 P0-1-19 只能靠 `<=>` SQL 做**等价取证**（当时检索端点还没落地），本批用真端点重验，并且把断言从"正文含 v2"改成**"新关键词命中重建后的块 + v1 的旧词查不到"**（前者在"新旧两份都留着"的坏数据上照样通过）；② **`getObject` 对不存在的键不在 `await` 时抛错**（错误发生在**读流**时）⇒ 只调它的话响应头已经发出、客户端看到"下到一半断了"；必须先 `statObject` 才能在发头前干净地回 404（顺带拿 `Content-Length`，而两者之间仍有 TOCTOU 窗口，那时**只能断流**，不假装能回 JSON）；③ **下载是本仓唯一不套 `ok()` 信封的端点**（成功是字节流、失败才是信封），这条必须显式写进注释与 README，否则下一个照抄别的路由的人会把它包进信封；④ **`Content-Disposition` 是纯函数但错误静默**：中文名要靠 `filename*`（否则另存为 `____.pdf`）、CR/LF 不删就是**响应头注入**、RFC 5987 里 `'`/`(`/`)`/`*` 这四个字符 `encodeURIComponent` **不转义但规范不认** ⇒ 五组边界断言全在无依赖档；⑤ **列表排序刻意反序**（`createdAt desc`）与"库不存在回 404 而不是空列表"两条都是**产品口径**，写进 `02` §4.6 而不是只留在代码里 |
+| `issue_fix/问题记录-P0-1-25-会话管理.md` | **本批的坑集中在"权限第四族"与"一个没有 HTTP 出口的口径"上**：① **会话是私有资源，连 ADMIN 也不给后门** —— 三族资源的口径此前各不相同（模型池 = ADMIN / 知识库 = 登录即可 / 智能体 = 创建者 + ADMIN 行级），会话是**第四族 = 仅本人**；`01`/`02`/`03` 没有一处说管理员要读别人的聊天记录，开口子就是**自己发明权限**且方向是隐私升级。落地手法是**让越权写不出来**：`ConversationViewer` 只有 `id` 一个字段（**连 `role` 都不给**）、判据落在 `where: { id, userId }` 而不是一个 `canEditXxx` 布尔函数（它只有"是不是你的"一种答案）、别人的会话与不存在的 id 返回**同一个 404**（403 等于确认这个 id 有效）。 ② **`last_message_at` 的维护点是"消息落库时"**（本批的坑预判原文），而本批**没有写消息的端点** ⇒ 这个时点**没有 HTTP 出口**能验；处置是把它做成**可单独调用的函数** `touchConversation`（签名收 `Pick<PrismaClientInstance,'conversation'>` 是为了能被 P0-1-27 的 `$transaction(tx)` 直接传入 —— 否则"消息落库"与"活跃时间"会变成两次写入），并由验收脚本直接调用断言"**只前进不后退**"：用 CAS（`OR:[null,{lt:at}]`）而非"先读再比"—— 后者在并发落库时会让**后到的旧值把新值盖回去**（时间倒流、会话在侧栏里"掉下去"）。 ③ **排序必须显式写 `nulls:'first'`**：`last_message_at` 可空**且新建时就是 `null`**，PG 的 `DESC` 默认虽是 `NULLS FIRST`，但靠默认值等于把顺序语义寄存在数据库实现细节上；这条错了的症状是"**新建了会话却在侧栏看不见它**"（用户第一反应是"新建没成功"）。 ④ **`/active` 的 `streaming` 是派生的、不单独存**（键在 ⇒ true ⇒ "键在但 false"这种矛盾态在形态上不可能出现）；值坏 ⇒ 逐字段降级为全 `null` + warn、**永不 500**（断线重连路径上不能因为一个脏值把用户卡住）；且**先查库再查 Redis** —— 不是我的会话一律 404（回 `{streaming:false}` 会让前端把"会话被删了"当成"当前没在生成"，用户盯着一个**永远不会有回复**的页面）。 ⑤ **第三处"临时边界"**：`06` 原文的"删除时异步清理 S3"在 P0-1 是**空操作**（`artifacts` 属 P0-3 / `files` 属 P1，两表都不存在）⇒ 收集函数返回 `[]` 且**空数组时连桶都不探**（验收因此**不需要 MinIO**），接回点只在一处 —— 现在写"先假定键在哪"的代码只会在 P0-3 变成要重写的猜测。 ⑥ **顺手回补 + 顺手订正**：E 包门槛④ 的"只读"从 **DB 层等价取证升级为打真端点**（`verify-agent-package.mjs` 的 R4），P0-1-24 那条 ⚠️ 就此收掉；包进度总表的 E 行此前停在"进行中 2/3"（上一批回写漏改），本批改为"已收口"。 ⑦ **⚠️ 全量回归抓到一条上一批留下的陈旧断言**（本批最值钱的一条）：`verify-agents.mjs` 里 P0-1-22 写的"`GET /api/agents/:id/conversations` 必须 `false`（属 P0-1-25）"在本批落地后**由守门变成陈旧** —— 它报的红**不是回归，是"该翻转了"**；而**本批相关的三档全绿、只有它红**（它不在"本批相关"清单里）⇒ 两条规矩：**翻转要留痕迹**（注释写明"P0-1-24 时是 `false`，本批落地后翻转"）、**收尾必须跑全量回归**（"只跑相关的"会漏掉由本批引起但不落在本批脚本里的断言）；凡验收里出现"属 P0-1-XX（未来批次）"的断言，那个批次落地时**必须**回来翻它 |
 | `issue_fix/问题记录-P0-1-24-Agent包验收.md` | **本批的"坑"全在"包级验收"这件事本身**：① **每档都绿 ≠ 串起来还成立** —— 门槛② 的"解绑立即反映"必须让 **写端点 / 详情端点 / 列表端点三个出口的绑定数组逐字相同（含顺序）**，各验各的时候"`PUT` 回 A 形状、`GET` 回 B 形状"的实现可以两处都绿；再配建/详情/列表三处的**键集合断言**（同一份数据不许有第二种形状）。② **门槛④ 的"只读"只能验一半** —— `conversations` 端点属 **P0-1-25**，现在**没有任何 HTTP 出口**能观察"读得到、写不进"，故在 **DB 层**取证（行还在 / `status=FINISHED` / 消息还在 / `finishedConversations` 只数真被改的行）并**标 ⚠️ 部分完成写进结论表，不混进 ✅**（会话行由脚本直接造 `02` §三 同形数据，F 包之后应换成打端点）。③ **包里唯一一条跨包链路**：删库守卫数 `agent_components`（D）× 软删要顺手解绑（E）⇒ 用**一对反向断言**：**绑着 → 删库 409**、**软删那个 Agent → 同一句删库请求 200**；只做一半时界面上 Agent 已"没了"、删库却提示"正被 1 个 Agent 绑定"，**用户无路可走**。④ **权限那组三个方向都写** + 403 之后断言 **"一个字节都没写"**（`name` 相同 **且 `updated_at` 逐字不变** —— 内容断言漏得掉"写了但值相同"）。⑤ **"两种类型都能 CRUD"要真的两种各跑一遍**（只跑 CHATBOT 的话"只放行 CHATBOT"的实现照样全绿），且"删了的不再出现在列表里"要**两个方向**（软删的不在 **且** 没删的还在）。⑥ **清场那组放 `finally`**（用例抛错也要给残留结论），代价是**分组计数要手工补一次**（断言不走 `it()` 包装，忘了补结论表里那行会永远显示 "(0 项全通过)"）。⚠️ 另：本批**首次**在同一个脚本里同时用 `agent_components` 与 `messages`（分区表）⇒ 清理顺序按 RESTRICT 自下而上，且**先查会话 id 再删**（不依赖 `deleteMany` 的关系过滤） |
 | `issue_fix/问题记录-P0-1-23-组件绑定.md` | **本批的坑是"顺序即正确性"与一条计划级口径冲突**：① **整体替换里"校验"必须排在"删除"之前** —— 直觉写法（先清空再重建）在"引用了不存在的知识库"这条路上会**删光旧绑定再报错**：请求失败、用户没有任何理由认为它改动了什么，而绑定已经没了（取证不看状态码，看旧行的 **`id` 是否逐字不变** —— `id` 是 uuid7、重写一遍也会换 id）；② **计划要求"绑定多 MCP"，但 `mcp_servers` 表属 P0-2** ⇒ P0-1 阶段**没有路径**造出真实 server，收到的 MCP 引用必然是伪造 id，写进去就是"永远修不好的孤儿绑定"（`ref_id` 是无 FK 的多态外键，数据库不会拦）⇒ 处置是**明确拒绝**（400 + 文案指向 P0-2）+ 把 P0-1-24 的验收门槛第 2 条改写成可执行版本 + 记明 P0-2 的接回方式（同一处换成存在性校验）；③ **`.refine()` 给不出 `path`、`superRefine` + `addIssue({path})` 给得出** ⇒ 重复项的 400 能精确指到 `['components', 1, 'refId']`，前端可高亮那一行（P0-1-22 那条"空 path"的正面写法，两档验收刻意放在一起对照）；④ **集合类接口的两条静默口径**：`components` **必填**（"省略 = 清空"会让前端忘带字段变成**静默解绑全部**）、**集合相同就不写库**（否则每次保存都无谓刷新行的 `id`/`created_at`；判等是集合语义，换顺序提交不算改动）+ `createMany({skipDuplicates})` 只兜并发双击 |
 | `issue_fix/问题记录-P0-1-22-Agent-CRUD.md` | **本批的坑集中在"三处写反了会静默出错"的口径上**：① **权限判据 `USER_ROLES[0]`** 把语义藏在数组顺序里（重排即**静默**把管理员判成别人）⇒ 改成带类型标注的字面量 `const ADMIN_ROLE: UserRole = 'ADMIN'`（删掉 `ADMIN` 时**编译报错**）；② **`.refine()` 的校验失败 `path` 是空串** ⇒ 那条错误是"表单级"而非"字段级"，前端挂不到输入框上，验收只能遍历 `message` 找（要逐字段高亮就得改用 `superRefine` + `addIssue({path})`）；③ **Fastify 的 schema 校验跑在 `preHandler` 之前** ⇒ 验"未登录 401"必须给**语法合法**的载荷（空 body 会先拿 400，把"鉴权挂没挂上"验成假的）。**两条最隐蔽的实现口径**：④ **软删只打标记会让绑过的知识库永远删不掉**（删库守卫数的是 `agent_components`，而界面上那个 Agent 已经"没了"）⇒ 三件事一个事务 + 一条链取证（绑 KB → 删 KB 409 → 软删 Agent → 同一 KB 删得掉 200）；⑤ **绑定模型不能复用 `resolveChatTarget()`**（它带 424 `NEED_CREDENTIAL`，会逼管理员**先配 Key 才能建智能体**）⇒ 只三条校验 + 与可选列表的一致性断言。"换绑才校验"与"`type` 可传不可改"两条是同一族（**不会报错、只会静默做错事**，故全部落进 `verify-agents` 而不只是注释） |
@@ -1047,3 +1099,4 @@ doubuleA/
 | 2026-09-22 | — | **P0-1-22 完成（包 E 起步 1/3）**：Agent CRUD —— `shared/src/agent.ts`（`AGENT_TYPES`/`COMPONENT_TYPES` + **权限判据唯一实现 `canEditAgent`** + **读取端唯一兜底点 `normalizeGuideQuestions`** + **唯一一套 `AgentItem` 投影** + 五段 schema）、`backend/src/services/agent.service.ts`（列表/建/详情/改/软删 + 绑定模型三条校验 + **软删三件套**）、`backend/src/routes/agents.ts`（五条路由，**只用 `requireAuth`**）、`backend/scripts/verify-agents.mjs`（新增）、`verify-app.mjs` 第 24 节。**零新增依赖、零新增环境变量**。**三条最值得记的**：① **权限是"全员可建可看可用；创建者 + ADMIN 可编删"**（`01` §3.3 决策 18）—— 与知识库（无 owner 列、登录即可）和模型池（全程 ADMIN）**三族口径各不相同**，照抄邻居必错（本仓已踩过两次"顺手加 `requireAdmin`"）；判据只有一处实现，**路由侧不用 `requireAdmin`**（否则"创建者本人也改不了自己的东西"），验收用 **MEMBER** 跑建/改/删 + **ADMIN 改他人必须 200** 的反向守卫；判据里管理员取**字面量**而非 `USER_ROLES[0]`（后者重排即静默改判）。② **软删是"三件事一个事务"**（打 `deleted_at` + 删 `agent_components` + 会话转 `FINISHED` 只读保留），**先 CAS 打标记**再解绑；**只打标记的实现会让绑过的知识库永远删不掉**（删库守卫数 `agent_components`），故用一条链取证：**「绑 KB → 删 KB 409 → 软删 Agent → 同一 KB 删得掉 200」**。③ **绑定模型刻意不复用 `resolveChatTarget()`** —— 它带 424 `NEED_CREDENTIAL`（"调用上游"的前置），拿来校"绑定"会**逼管理员先配 Key 才能建智能体**；本批只三条（存在 + `type=CHAT` + 模型与 Provider 都启用），与 `GET /api/models/available` **逐条对应**并加一致性断言。另两条**静默口径**：**换绑才校验**（否则模型被停用后连改名都 409，症状是"这个智能体改不动了"，此时靠新增的 `modelAvailable` 字段提示）与 **`type` 可传不可改**（放进 schema 正是为了把静默 no-op 变成显式 409）。**验收**：新增 **`pnpm verify:agents`（26 项；需 PG + Redis、**不需要 MinIO**，注入 `EMBEDDING_*` 以便建真 KB 取快照）** —— A 投影/两种类型/`canEdit` **三方向** + 列表 `updatedAt desc`、B 绑定模型**四态**（门槛：绑 disabled 模型被拒）+ 与可选列表一致性 + "模型停用后仍能改名"、C 权限双向（MEMBER 与 ADMIN 各跑一遍）、D 四个文本字段三态 + `guideQuestions` 四边界 + `type` 不可改、E 软删三件套 + "已软删一律 404（不是 403）" + **跨批次引用计数口径**、F 路由表（P0-1-23 与 P1 的三条**必须 404**）、G 纯函数；`verify:app` **79 → 85 项**（CI 86 项）；**既有 17 档全部未回归**（含会碰 `agent_components` 的 `verify:pipeline` 与 `verify:knowledge-bases`），lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 10 条落地要点 + 坑预判取证 + **P0-1-23 坑预判回写** + E 包 **1/3**）、`docs/02` §4.4（**契约增量 · Agent** 八条：三族权限对照表、投影与 `canEdit`/`modelAvailable`、软删三件套、绑定校验四态表、换绑幂等、请求体口径、读取端兜底点、**五个列表的排序口径对照表**）·§十四、README（验收表、`verify:agents` 说明段、手工端测 **⑭**、已知边界"智能体专项"、缺陷索引、本行）同步。**⚠️ 边界**：组件绑定的**写侧**（`PUT /api/agents/:id/components`）是 **P0-1-23**、`POST /api/agents/:id/copy` 是 **P1**、Agent 界面是 **P0-1-31** ⇒ 本批**仍不是可端测里程碑**（浏览器首站仍是 P0-1-30）。归档：`issue_fix/问题记录-P0-1-22-Agent-CRUD.md` |
 | 2026-09-22 | — | **P0-1-23 完成（包 E 2/3）**：组件绑定 + 权限 —— `shared/src/agent.ts` 增写侧契约（`agentComponentInputSchema` + `replaceAgentComponentsBodySchema`）、`backend/src/services/agent.service.ts` 增 `replaceAgentComponents`（+ `componentKey`/`compareComponents`/`sameComponentSet` 三个集合助手）、`backend/src/routes/agents.ts` 挂**第六条路由** `PUT /api/agents/:id/components`、`verify-agents.mjs` 增 **H 组 9 项**、`verify-app.mjs` 第 24 节 **+1 项**。**零新增依赖、零新增环境变量**。**四条最值得记的**：① **"校验"必须排在"删除"之前 —— 顺序即正确性**：先清空再重建的实现在"引用了不存在的知识库"这条路上会**删光旧绑定再报错**（请求失败、用户没有任何理由认为它改动了什么，而绑定已经没了）；取证**不看状态码**，看旧行的 **`id` 是否逐字不变**（`id` 是 uuid7、重写一遍也会换 id）—— 这是 P0-1-19「要证明某件事没发生，必须用删得掉证据的方式」的第三次应用。② **⚠️ 口径变更：P0-1 阶段明确拒绝 `MCP` 引用**（400 + 文案指向 P0-2）—— `mcp_servers` 表属 P0-2，当前**没有路径**造出真实 server，收到的 MCP 引用必然是伪造/过期 id，写进去就是"永远修不好的孤儿绑定"（`ref_id` 是**无 FK 的多态外键**，数据库不会拦）；影响面已同步：`docs/06` P0-1-24 的验收门槛第 2 条改成可执行版本（MCP 那半由 P0-2 接回，接回方式 = 同一处 `assertComponentRefsBindable` 换成存在性校验，接口形态不变）、README 边界写明"含 MCP → 400 是预期"。③ **`.refine()` 给不出 `path`、`superRefine` + `addIssue({path})` 给得出** ⇒ 重复项的 400 精确指到 `['components', 1, 'refId']`，前端能高亮那一行（P0-1-22 那条"空 path"的正面写法，两档验收**刻意放在一起对照**）。④ **集合类接口的两条静默口径**：`components` **必填**（"省略 = 清空"会让前端忘带字段变成**静默解绑全部**）、**集合相同就不写库**（判等是集合语义 ⇒ 换顺序提交不算改动；否则每次保存都无谓刷新行的 `id`/`created_at`），`createMany({skipDuplicates})` 只兜并发双击。**另一条反向的连带语义**：整体替换**包含"清掉不在提交集合里的手工脏行"**（手工 `INSERT` 的绑定会在下次保存时被清干净）。**验收**：`pnpm verify:agents` **26 → 35 项全通过**（H 组：全量替换/`[]` 解绑/详情立即反映/跨模块 `agentCount` 联动/**失败时旧绑定逐字不变**/MCP 被拒/请求体形态/`updated_at` 逐字不变且列表顺序不跳/**幂等行 id 不变**/权限双向/软删 404 与未登录 401/脏行清理），`verify:app` **85 → 86 项**；**既有 17 档全部未回归**（重点盯的是同样数 `agent_components` 的 `verify:knowledge-bases` 19 项与 `verify:kb-package` 11 项 —— 本批**第一次**能用真端点造成绑定关系），lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致；`docs/06`（状态 + 「口径变更」段 + 9 条落地要点 + P0-1-24 门槛改写 + E 包 **2/3**）、`docs/02` §4.4（**⑨ 组件绑定的写侧**：状态码对照表 + 四条实现口径 + MCP 拒绝理由与 P0-2 接回方式）·§十四、README（验收表、`verify:agents` 说明段扩到八组、手工端测 **⑭-h**、已知边界、索引、本行）同步。**⚠️ 边界**：本批**不是可端测里程碑**（命令行可验的路径见 README **⑭-h**；浏览器首站仍是 **P0-1-30**，Agent 界面是 P0-1-31）；`POST …/copy` 是 **P1**。归档：`issue_fix/问题记录-P0-1-23-组件绑定.md` |
 | 2026-09-22 | — | **P0-1-24 完成（包 E 收口 ✅ 3/3）**：Agent 包验收 —— `backend/scripts/verify-agent-package.mjs`（新增：**一行一组逐行跑 4 条验收门槛**，R1 两类型 CRUD / R2 绑 2 库→详情完整回显→解绑 1 个 / R3 权限三方向 / R4 删除的连带 + 跨包链路 / R5 清场；末尾给一张 **结论表**）、根与后端 package.json 各加 **`pnpm verify:agent-package`**。**纯验收批次：零新增接口、零新增依赖、零新增环境变量**。**四条最值得记的**：① **包级脚本问的是"串起来还成不成立"**，不重复 `verify:agents` 的细粒度断言 —— 其中 **R2 要求写端点/详情/列表三个出口的绑定数组逐字相同（含顺序）**，各验各的时候"`PUT` 回 A 形状、`GET` 回 B 形状"的实现可以两处都绿；另配建/详情/列表三处的**键集合断言**（同一份数据不许有第二种形状）。② **⚠️ 门槛④ 的"只读"只能验一半** —— `conversations` 端点属 **P0-1-25**，现在**没有 HTTP 出口**能观察"读得到、写不进"，故在 **DB 层**取证（行还在 / `status=FINISHED` / 消息还在 / `finishedConversations` 只数真被改的行）并**标 ⚠️ 部分完成写进结论表，不混进 ✅**；会话行由脚本直接造（`02` §三 同形数据），F 包之后应换成打端点。③ **R4 里藏着本包唯一一条跨包链路**（删库守卫数 `agent_components`（D）× 软删要顺手解绑（E））⇒ 用**一对反向断言**：**绑着 → 删库 409**、**软删那个 Agent → 同一句删库请求 200**；只做一半时界面上 Agent 已"没了"、删库却提示"正被 1 个 Agent 绑定"，**用户无路可走**。④ **权限那组三个方向都写**（他人 403 / 本人 200 / **ADMIN 改他人 200**）+ 403 后断言 **"一个字节都没写"**（`name` 相同 **且 `updated_at` 逐字不变**）。**验收**：新增 `pnpm verify:agent-package`（**13 项全通过**，需真实 PG + Redis、**不需要 MinIO**；R1 3 / R2 3 / R3 3 / R4 3 / R5 1）；**既有 18 档全部未回归（19/19 退出码 0）**，lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（§七 待决事项 7 的第二个端测点仍是 **P0-1-30**）；`POST /api/agents/:id/copy` 是 **P1**、`GET /api/agents/:id/conversations` 属 **F 包**。归档：`issue_fix/问题记录-P0-1-24-Agent包验收.md` |
+| 2026-09-22 | — | **P0-1-25 完成（包 F 起步 1/5）**：会话管理 —— `shared/src/conversation.ts`（新增）、`backend/src/services/conversation.service.ts`、`backend/src/routes/conversations.ts`、`backend/src/infra/redis.ts`（`chatActiveKey`）、`app.ts` 接线、`backend/scripts/verify-conversations.mjs`（新增）、`verify-app.mjs` 第 25 节、`verify-agent-package.mjs`（**R4 回补为打端点**）。**零新增依赖、零新增环境变量**。**四条最值得记的**：① **权限第四族定案：会话 = 仅创建者本人，连 ADMIN 也不给后门**（判据 = `conversations.user_id`；`ConversationViewer` **只有 `id`、连 `role` 都不给** ⇒ 越权实现无处落脚；别人的会话与不存在的 id 返回**同一个 404**）。② **`last_message_at` 的维护点 = 消息落库时**（本批的坑预判）⇒ 因本批没有写消息的端点，它被做成**可单独调用的函数** `touchConversation`（P0-1-27 在落库事务里调，**只前进不后退**用 CAS 表达）。③ **排序显式写 `nulls:'first'`** —— 新会话的 `last_message_at` 是 `null`，这条错了的症状是"**新建了会话却在侧栏看不见它**"。④ **`/active` 的 `streaming` 是派生的**（键在 ⇒ true，矛盾态不可能出现）、值坏**逐字段降级永不 500**、且**先查库再查 Redis**（不是我的会话回 404 而不是"没有流"）。**⚠️ 第三处"临时边界"（不混进 ✅）**：原文的"删除时异步清理 S3"在 P0-1 是**空操作**（`artifacts` 属 P0-3 / `files` 属 P1），接回点在 `collectConversationObjectKeys` 一处，验收因此**不需要 MinIO**。**顺手回补**：E 包门槛④ 的"只读"从 DB 层等价取证**升级为打真端点**，P0-1-24 的 ⚠️ 就此收掉。**验收**：新增 `pnpm verify:conversations` **15 项全通过**；`verify:app` **86 → 92 项**（CI 93）；`verify:agent-package` **13 项仍全通过**；**全量回归 20 档全部退出码 0** —— 其中 `verify-agents`（35 项）是本批**翻转一条陈旧断言**之后才绿的（P0-1-22 写下的"会话列表必须 404/未注册"在本批落地后变成陈旧，**只有全量回归能抓到它**）；lint + typecheck/build 全绿。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（下一个仍是 **P0-1-30**），本批之后**发消息还没有出口** ⇒ `/active` 恒为无流是**预期行为**；`GET /:id/messages` 属 P0-1-28、`/:id/chat` 与 `/:id/stop` 属 P0-1-26。另顺手订正包进度总表 E 行（此前停在"2/3"，上一批漏改）。归档：`issue_fix/问题记录-P0-1-25-会话管理.md` |

@@ -32,10 +32,14 @@
  * ① **门槛② 的 MCP 那一半**：`docs/06` 原文写的是"绑 2 个知识库 + **1 个 MCP server**"，
  *    但 `mcp_servers` 表要到 **P0-2** 才建（P0-1-23 已定案并回写三处文档）。本包验的是
  *    **对偶形态**："含 MCP 的提交被明确拒绝，且文案指向 P0-2" —— 这才是现在能成立的事实。
- * ② **门槛④ 的"只读"**：会话端点属 **P0-1-25**（F 包），现在**没有**任何 HTTP 出口能观察
- *    "这个会话读得到、写不进去"。故本组在 **DB 层**取证（`conversations` 行还在、
- *    `status=FINISHED`、消息还在、`finishedConversations` 数得对），并在结论里标 ⚠️。
- *    「只读」的**运行时**表现（发消息被拒）要等 F 包 —— 那时应当把这一条换成打端点。
+ * ② **门槛④ 的"只读"**：P0-1-24 收口时**没有**任何 HTTP 出口能观察"这个会话读得到"，
+ *    故当时只在 **DB 层**取证（`conversations` 行还在、`status=FINISHED`、消息还在、
+ *    `finishedConversations` 数得对）并标了 ⚠️。**P0-1-25 落地后本组已换成打端点**：
+ *    会话经 `POST /api/conversations` 建，删掉 Agent 之后再用 `GET /api/agents/:id/conversations`
+ *    读回来（这正是"只读保留"的端点级证据）。
+ *    ⚠️ 但"**写不进去**"这一半仍要等 **P0-1-26** —— 唯一会让会话产生消息的端点是
+ *    `POST /:id/chat`（SSE 闸门），本批刻意不注册（`verify-app.mjs` 有断言守着它 404）。
+ *    故结论表里这一条仍**单列一行**说明，不混进 ✅。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 依赖与前置
@@ -78,6 +82,9 @@ const { closeRedis, ensureRedisConnected, getRedis, invalidateUserSnapshot, sess
 const {
   agentItemSchema,
   agentListResultSchema,
+  conversationActiveSchema,
+  conversationItemSchema,
+  conversationListResultSchema,
   removeAgentResultSchema,
 } = await import('@doubulea/shared')
 
@@ -528,7 +535,8 @@ try {
   groupStart(
     'R4',
     '门槛④ 删除 Agent 后其会话仍在（只读），组件绑定已解除',
-    '⚠️ 会话端点属 P0-1-25 ⇒ 本组在 **DB 层**取证；"只读"的运行时表现要等 F 包（见文件头 ⚠️②）',
+    '会话走 `POST /api/conversations` 建、删 Agent 后用会话列表端点读回来（P0-1-25 回补）；' +
+      '"写不进去"仍归 P0-1-26 的 chat 闸门（见文件头 ⚠️②）',
   )
   // ═══════════════════════════════════════════════════════════════════
 
@@ -545,18 +553,17 @@ try {
     ])
     assertEqual(bind.statusCode, 200, '先绑上')
 
-    // 会话与消息：**端点还没有**（P0-1-25），只能直接造行 —— 这是本组唯一一处"等价取证"，
-    // 造的是与 `02` §三 完全一样的形状（topic/status/lastMessageAt/一条 USER 消息）
-    const conversation = await prisma.conversation.create({
-      data: {
-        agentId: target.item.id,
-        userId: owner.id,
-        topic: mkName('历史会话'),
-        status: ConversationStatus.ACTIVE,
-        lastMessageAt: new Date(),
-      },
+    // 会话：**走真端点建**（P0-1-25 起会话管理已落地）—— 这样"只读保留"的取证就落在接口上，
+    // 而不是"脚本直接造行"。消息仍然只能直接造：写消息的端点属 P0-1-27（SSE 落地时才有）。
+    // 造的是与 `02` §三 完全一样的形状（role/content）
+    const createConversation = await api('POST', '/api/conversations', {
+      cookie: ownerCookie,
+      payload: { agentId: target.item.id },
     })
+    assertEqual(createConversation.statusCode, 200, '建会话状态码')
+    const conversation = conversationItemSchema.parse(createConversation.json().data)
     createdConversationIds.push(conversation.id)
+    assertEqual(conversation.lastMessageAt, null, '新建会话还没有消息')
     const message = await prisma.message.create({
       data: {
         conversationId: conversation.id,
@@ -592,13 +599,19 @@ try {
       'agent_components 必须清空',
     )
 
-    // ③ 会话仍在、已转只读、消息还在（`02` §4.4 的"只读保留"）
-    const conversationRow = await prisma.conversation.findUnique({
-      where: { id: conversation.id },
-      select: { status: true, agentId: true },
-    })
-    assert(conversationRow !== null, '⚠️ 会话必须**保留**（业务留痕，不允许随 Agent 消失）')
-    assertEqual(conversationRow.status, ConversationStatus.FINISHED, '会话必须转成 FINISHED（只读）')
+    // ③ 会话仍在、已转只读、消息还在（`02` §4.4 的"只读保留"）—— **端点级取证**（P0-1-25 回补）：
+    //    "它读得到"现在有 HTTP 出口了（会话列表端点），不必再只看库
+    const listed = await api('GET', `/api/agents/${target.item.id}/conversations`, { cookie: ownerCookie })
+    assertEqual(listed.statusCode, 200, '⚠️ 软删的 Agent 也要能列出历史会话（列表刻意不按 deletedAt 过滤）')
+    const page = conversationListResultSchema.parse(listed.json().data)
+    assertEqual(page.total, 1, '会话必须**保留**（业务留痕，不允许随 Agent 消失）')
+    assertEqual(page.items[0].id, conversation.id, '就是那一条')
+    assertEqual(page.items[0].status, 'FINISHED', '会话必须转成 FINISHED（只读）')
+    assertEqual(page.items[0].agentName, target.item.name, 'Agent 名走 join 出来的**快照**（详情端点这时候已是 404）')
+    //    活跃流状态端点也要能读（会话还在 ⇒ 不是 404；没在流 ⇒ streaming:false）
+    const active = await api('GET', `/api/conversations/${conversation.id}/active`, { cookie: ownerCookie })
+    assertEqual(active.statusCode, 200, '活跃流状态端点')
+    assertEqual(conversationActiveSchema.parse(active.json().data).streaming, false, '没有流')
     assertEqual(
       await prisma.message.count({ where: { conversationId: conversation.id } }),
       1,
@@ -609,6 +622,12 @@ try {
       1,
       '刚造的那条消息必须还在',
     )
+    //    （DB 层再复核一次"行的状态"：端点的投影可能是"写死的 FINISHED"，库里才是真相）
+    const conversationRow = await prisma.conversation.findUnique({
+      where: { id: conversation.id },
+      select: { status: true, agentId: true },
+    })
+    assertEqual(conversationRow?.status, ConversationStatus.FINISHED, '库里也是 FINISHED')
 
     // ④ 重复删除 → 404（不是 200，也不是 500）：并发双击的语义要干净
     assertEqual(
@@ -772,8 +791,8 @@ console.log(
     `由 P0-2 接回 —— 本包验的是**对偶形态**`,
 )
 console.log(
-  `  ${c.y}⚠️${c.x} 门槛④ 的"只读"：会话端点属 P0-1-25 ⇒ 本包在 **DB 层**取证（行还在 / ` +
-    `status=FINISHED / 消息还在）；"发消息被拒"要等 F 包`,
+  `  ${c.y}⚠️${c.x} 门槛④ 的"只读"：**读得到**已换成端点取证（会话列表仍返回、status=FINISHED，` +
+    `**P0-1-25 回补**）；"**写不进去**"要等 P0-1-26 的 chat 闸门（该端点刻意未注册）`,
 )
 console.log(
   `  ${c.d}边界：本包收口时**浏览器仍是占位页**（前端里程碑 P0-1-30、Agent 界面 P0-1-31）；` +

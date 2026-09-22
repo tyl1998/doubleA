@@ -235,6 +235,23 @@ export function userSnapshotKey(userId: string): string {
 }
 
 /**
+ * `chat.active:{conversationId}` 键名 —— **会话的活跃流锁，同时也是活跃流状态**（P0-1-25）。
+ *
+ * 依据：`02` §5.2「会话互斥：Redis 锁 `chat.active:{conversationId}`；持锁期间同一会话再次发送
+ * 返回 `error{code: CONFLICT}`」+ §5.1/§5.2 的 `ping` 心跳（空闲期保活）。
+ *
+ * 三条口径（P0-1-25 定案，写进 `02` §4.5/§5.2 的契约增量）：
+ *   ① **只有一个键**：锁与"是否在流"必须是同一件事（分成两个键就会有两套真相）；
+ *   ② 值是 `conversationActiveSnapshotSchema` 的 JSON（`queuedPosition`/`currentTool`/`startedAt`）,
+ *      故 `GET /:id/active` 能一次读全"在流 / 排队位次 / 当前工具"；
+ *   ③ **写侧归 P0-1-26**（流开始时写、结束时删，且必须带 TTL —— 进程被杀时锁要能自己过期，
+ *      否则这个会话会永久 `CONFLICT`）。本批（P0-1-25）只实现读侧。
+ */
+export function chatActiveKey(conversationId: string): string {
+  return `chat.active:${conversationId}`
+}
+
+/**
  * 新建会话并返回 `sid`。
  *
  * `sid` **由本函数生成**（而不是由调用方传入）：会话 ID 是安全令牌，
