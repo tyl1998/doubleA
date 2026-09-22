@@ -461,8 +461,17 @@ macOS/Linux 走系统代理时 **curl 必须加 `--noproxy '*'`**，否则会被
 ```bash
 BASE=http://127.0.0.1:13000
 COOKIE=/tmp/jar        # ①②③ 用的登录 cookie 罐；下文统一用 $COOKIE 引用它
-                       # 另有 <agent-id> / <conversation-id> / <id> 这类**占位符**，请换成上一步真实的 id
-                       # （⑪⑫ 里的 $KB / $DOC 同属占位，第一次跑请先换成真值）
+                       # ⭐ **只有密码类是"要你自己填"的占位符**：<初始密码> / <你的新密码> /
+                       #    <member的初始密码> / <member的新密码>（`pnpm db:seed` 给的那几个）。
+                       #    其余每个 `$变量` 都是**上一段 curl 的产物**，本段已逐个接上：
+                       #      $ALICE(上面第 ④ 步建号) · $PROVIDER/$MODEL(附·模型池①②) · $KB(⑧建库) ·
+                       #      $DOC(⑨传文档) · $AGENT(⑭-a建智能体) · $CONV(⑮-a建会话)
+                       #    ⇒ **全程在同一个 shell 里跑**（换终端这些就全没了）；只想单跑某一段时，
+                       #      按同一思路补一行"取现成值"，例如 ⑪⑫ 要的这两个：
+                       #        KB=$(curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/knowledge-bases?limit=100" | jq -r '.data.items[-1].id')
+                       #        DOC=$(curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/knowledge-bases/$KB/documents?limit=100" | jq -r '.data.items[0].id')
+                       #    ⚠️ 另有 **4 条删除会让后面的步骤"没东西可查"**，别顺手先跑（各自位置都标了 ⚠️）：
+                       #      ⑧ 删知识库 · ⑪ 删文档 · ⑭-f 软删智能体 · ⑮-f 删会话
 
 # ① 用初始密码登录（用户名大小写不敏感）→ data.mustChangePassword=true
 curl -s --noproxy '*' -c /tmp/jar -X POST $BASE/api/auth/login \
@@ -477,12 +486,16 @@ curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/auth/password \
   -d '{"oldPassword":"<初始密码>","newPassword":"<你的新密码>"}' | jq .
 
 # ④ 建号 → data.initialPassword 只出现这一次
-curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/users \
-  -H 'content-type: application/json' -d '{"username":"alice","nickname":"爱丽丝"}' | jq .
+#    ⚠️ 这一条的响应**比其他 create 多包一层**：`data` = `{ user:{…}, initialPassword }`
+#       （不是裸 item）⇒ 取 id 要写 `.data.user.id`，别顺手抄成 `.data.id`（会得到 null）
+ALICE=$(curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/users \
+  -H 'content-type: application/json' -d '{"username":"alice","nickname":"爱丽丝"}' \
+  | tee /tmp/alice.json | jq -r '.data.user.id')
+jq . /tmp/alice.json ; echo "ALICE=$ALICE"   # initialPassword 就在这份响应里，只出现这一次 —— 抄下来
 
 # ⑤ 用 ④ 拿到的初始密码登录 alice → 同样是首登态（必须改密）；改密后 403 的理由变成「仅限管理员」
 # ⑥ 停用 alice → 她**手里已有的会话下一个请求就 401**（无需等 60s）
-curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/users/<alice-id> \
+curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/users/$ALICE \
   -H 'content-type: application/json' -d '{"status":"DISABLED"}' | jq .
 
 # ⑦ 连打 6 次错密码 → 第 6 次 429「账号已锁定，请 10 分钟后重试」
@@ -505,31 +518,40 @@ curl -s --noproxy '*' -b /tmp/member.jar -X POST $BASE/api/auth/password \
   -d '{"oldPassword":"<member的初始密码>","newPassword":"<member的新密码>"}' | jq .
 
 # ① 建一个带 Key 的 Provider → 响应里只有掩码，**没有明文**
-curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/model-providers \
+#    ⭐ 顺手把 id 抓进 $PROVIDER（②④⑤ 都要用它；⑭ 的 $MODEL 也是同一套套路）
+PROVIDER=$(curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/model-providers \
   -H 'content-type: application/json' \
-  -d '{"name":"OpenAI","baseUrl":"https://api.openai.com/v1","type":"CHAT","apiKey":"sk-proj-abcdefghijklmnop"}' | jq .
+  -d '{"name":"OpenAI","baseUrl":"https://api.openai.com/v1","type":"CHAT","apiKey":"sk-proj-abcdefghijklmnop"}' \
+  | tee /tmp/prov.json | jq -r '.data.id')
+jq . /tmp/prov.json ; echo "PROVIDER=$PROVIDER"
 #  → apiKeyPreview 形如 "sk-****mnop"，hasKey:true（明文只进不出）
 
-# ② 在它下面建一个模型
-curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/models \
+# ② 在它下面建一个模型（id 抓进 $MODEL）
+MODEL=$(curl -s --noproxy '*' -b /tmp/jar -X POST $BASE/api/models \
   -H 'content-type: application/json' \
-  -d '{"providerId":"<①的id>","modelName":"gpt-4o-mini","label":"小钢炮","type":"CHAT","maxContext":128000}' | jq .
+  -d "{\"providerId\":\"$PROVIDER\",\"modelName\":\"gpt-4o-mini\",\"label\":\"小钢炮\",\"type\":\"CHAT\",\"maxContext\":128000}" \
+  | tee /tmp/model.json | jq -r '.data.id')
+jq . /tmp/model.json ; echo "MODEL=$MODEL"
 
 # ③ 全员可选列表（MEMBER 会话也能读；用 ADMIN 会话打同一地址，结果必须一模一样）
 curl -s --noproxy '*' -b /tmp/member.jar "$BASE/api/models/available?type=CHAT" | jq .
 #  → 只含 enabled 且 Provider 也 enabled 的模型；缺 ?type= 会得到 400（type 必填）
 
 # ④ 停用那个模型 → 立刻从 ③ 消失，但管理列表里还看得见（两套投影的差别）
-curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/models/<②的id> \
+curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/models/$MODEL \
   -H 'content-type: application/json' -d '{"enabled":false}' | jq .
 curl -s --noproxy '*' -b /tmp/jar "$BASE/api/models?limit=100" | jq '.data.items[] | {modelName, enabled}'
+# ④-b 看完差别就**启用回来** —— ⑭ 要的是"启用中的 CHAT 模型"，停着的它取不到
+#      （库里只有这一个模型时尤其致命；本批 ⑤ 的 remote-models 是只读探测、不看 enabled，不受影响）：
+curl -s --noproxy '*' -b /tmp/jar -X PATCH $BASE/api/models/$MODEL \
+  -H 'content-type: application/json' -d '{"enabled":true}' | jq '.data | {modelName, enabled}'
 
 # ⑤ 拉取"这个 Provider 上游实际有哪些模型"（P0-1-12）—— 省得手敲 modelName 敲错
 #    ⚠️ 这一条会**真的出网**打到 baseUrl；想在本机零成本验，可先建一个指向本地服务的 Provider：
 #       # 起一个假上游：node -e "require('http').createServer((q,s)=>{s.writeHead(200,{'content-type':'application/json'});s.end(JSON.stringify({object:'list',data:[{id:'demo-model',owned_by:'local',created:1}]}))}).listen(18080)"
 #       # 然后 POST /api/model-providers {"name":"本地假上游","baseUrl":"http://127.0.0.1:18080/v1","type":"CHAT"}
 #    再打：
-curl -s --noproxy '*' -b /tmp/jar "$BASE/api/model-providers/<①的id>/remote-models" | jq .
+curl -s --noproxy '*' -b /tmp/jar "$BASE/api/model-providers/$PROVIDER/remote-models" | jq .
 #  → { providerId, providerName, baseUrl, total, truncated, items:[{id, ownedBy, created}] }
 #    只读探测、不落库（库里模型条数一条都不变）；上游 401/超时会得到 502/504 + 可读文案，
 #    且**错误消息里不会出现你的 Key**（上游把 Authorization 回显进 body 时也照样被抹掉）。
@@ -560,31 +582,40 @@ pnpm verify:embedding                     # 只看它有没有 ready=true 的结
 #  → 若 ready=false，填好 EMBEDDING_API_URL/KEY/MODEL 再往下（否则建库会 500，这是刻意的）
 
 # 用 MEMBER 账号走一遍 —— 知识库是**登录即可**，不是 ADMIN（与模型池相反）：
+#   本段刻意用 /tmp/kb.jar 而不是 $COOKIE 就是为了演示这一点；两个罐看到的是**同一个库**，
+#   因为 `knowledge_bases` **没有 owner 列**（⑪⑫ 用 admin 罐取 $KB/$DOC 一样能过）。
 curl --noproxy '*' -c /tmp/kb.jar -X POST http://127.0.0.1:13000/api/auth/login \
   -H 'content-type: application/json' -d '{"username":"verify-kb-member","password":"…"}'
 #  → 首登会 403 要求改密，先走 /api/auth/change-password 再登一次（见上面 ② 的步骤）
 
-curl --noproxy '*' -b /tmp/kb.jar -X POST http://127.0.0.1:13000/api/knowledge-bases \
-  -H 'content-type: application/json' -d '{"name":"我的知识库"}'
+# ⭐ 这一行的 `KB=$(…)` 顺手把新库的 id 抓进 $KB —— 下面 ⑨⑩⑪⑫ 全靠它：
+KB=$(curl -sS --noproxy '*' -b /tmp/kb.jar -X POST http://127.0.0.1:13000/api/knowledge-bases \
+  -H 'content-type: application/json' -d '{"name":"我的知识库"}' | tee /tmp/kb.json | jq -r '.data.id')
+jq . /tmp/kb.json ; echo "KB=$KB"
 #  → 201/200，**省略的参数全部快照自 `infra/.env` 的环境默认值**（不是硬编码）：
 #      chunkSize / chunkOverlap / retrievalConfig{topK,score,mode,splitStrategy,rrfK,weights}
 #      以及 embeddingModel（= 当前 provider 的 name()，如 api:<模型名>）+ embeddingModelChanged
+#      · `tee` 那截是"既看完整响应、又把 id 抓出来"；列表按 `createdAt asc` 排
+#        ⇒ 直接取"最新那个库"要写 `.data.items[-1].id`（`items[0]` 是**最老**的）
 
-curl --noproxy '*' -b /tmp/kb.jar -X PATCH http://127.0.0.1:13000/api/knowledge-bases/<id> \
+curl --noproxy '*' -b /tmp/kb.jar -X PATCH http://127.0.0.1:13000/api/knowledge-bases/$KB \
   -H 'content-type: application/json' -d '{"retrievalConfig":{"topK":12}}'
 #  → 200；**只调 topK 不会把 mode 打回默认值**（局部合并，不是整体覆盖）。
 #     试试 `{"description":null}`（清空）与不传 description（保持不动）—— 三态。
 
-curl --noproxy '*' -b /tmp/kb.jar -X DELETE http://127.0.0.1:13000/api/knowledge-bases/<id>
+# ⚠️ 删除**留到最后**再跑：删了它 ⑨⑩⑪⑫ 就没库可用了（本段是"看形状"，不是"跑完就删"）
+curl --noproxy '*' -b /tmp/kb.jar -X DELETE http://127.0.0.1:13000/api/knowledge-bases/$KB
 #  → 200 { id, name, deletedDocuments, deletedObjects }；再 GET 该 id 应 404。
 #     若这个库被某个 Agent 绑定 → **409 且什么都不删**（`agent_components.ref_id` 是多态引用、没有外键兜底）。
 
 pnpm verify:knowledge-bases
 #  → 19 项全通过（需要 PG + Redis + **MinIO**，因为验的是"删库时 S3 原文件真的消失"）。
 
-# ⑨ 文档上传（P0-1-16）—— 四格式进门前的**四道前置校验**。先有库（用 ⑧ 建的那个 <id>）：
-curl --noproxy '*' -b /tmp/kb.jar -F 'file=@./员工手册.pdf' \
-  http://127.0.0.1:13000/api/knowledge-bases/<id>/documents
+# ⑨ 文档上传（P0-1-16）—— 四格式进门前的**四道前置校验**。先有库（用 ⑧ 抓到的 $KB）：
+# ⭐ 这一行的 `DOC=$(…)` 顺手把新文档的 id 抓进 $DOC —— 下面 ⑩⑪⑫ 全靠它：
+DOC=$(curl -sS --noproxy '*' -b /tmp/kb.jar -F 'file=@./员工手册.pdf' \
+  http://127.0.0.1:13000/api/knowledge-bases/$KB/documents | tee /tmp/doc.json | jq -r '.data.document.id')
+jq . /tmp/doc.json ; echo "DOC=$DOC"
 #  → 200 { document:{ id, kbId, fileName, status:"PARSING", chunkCount:0, errorMsg:null, … },
 #           deduplicated:false }
 #     status 是**响应那一刻**的值，恒为 PARSING —— 解析是异步的，交给队列（P0-1-17）。
@@ -592,19 +623,20 @@ curl --noproxy '*' -b /tmp/kb.jar -F 'file=@./员工手册.pdf' \
 #     但"传完就能检索"仍**不成立** —— 分块/向量化是 P0-1-18/19、检索是 P0-1-20。
 #     同一个文件再传一次 → 200 且 deduplicated=true、**document.id 与上次相同**（不新建行，
 #     且**不重复入队**）。
+#     · 文档列表按 `createdAt desc` 排 ⇒ 上面"取最新一篇"的写法是 `.data.items[0].id`
 
 # 反例三条：都是 400，但**文案不同** —— 区别在于"用户能不能自己解决"
 curl --noproxy '*' -b /tmp/kb.jar -F 'file=@./老合同.doc' \
-  http://127.0.0.1:13000/api/knowledge-bases/<id>/documents
+  http://127.0.0.1:13000/api/knowledge-bases/$KB/documents
 #  → 400「暂不支持 .doc（旧版 Word 二进制格式），请另存为 .docx 后重传」
 cp ./某张截图.png ./笔记.txt      # 改名：扩展名说 txt、内容还是 PNG
 curl --noproxy '*' -b /tmp/kb.jar -F 'file=@./笔记.txt' \
-  http://127.0.0.1:13000/api/knowledge-bases/<id>/documents
+  http://127.0.0.1:13000/api/knowledge-bases/$KB/documents
 #  → 400「文件内容与扩展名不符：内容是「图片」，却被命名为 .txt」
 #     ⭐ 改名绕过靠**文件头**抓，不靠 MIME —— 改名后浏览器照样声明 text/plain，
 #        单靠"扩展名 × MIME"交叉校验这条路是**一路绿灯**的。
 curl --noproxy '*' -b /tmp/kb.jar -F 'file=@./大于100MB.pdf' \
-  http://127.0.0.1:13000/api/knowledge-bases/<id>/documents
+  http://127.0.0.1:13000/api/knowledge-bases/$KB/documents
 #  → 413（超 `UPLOAD_BODY_LIMIT`，默认 100MB）；漏掉 -F 用 JSON 发 → 406
 
 pnpm verify:documents
@@ -620,8 +652,10 @@ psql "$(grep -E '^DATABASE_URL=' infra/.env | cut -d= -f2- | tr -d '"')" \
   -c "select id, file_name, status, chunk_count, error_msg from documents order by created_at desc limit 5"
 #  → 刚传完是 PARSING；**几秒内变成 READY**，error_msg 为 null，chunk_count 是**真数**
 #     （P0-1-19 起 = chunks 表里这篇的行数 ⇒ **READY 就是"可检索"**；检索端点本身是 P0-1-20）。
-#     想看块的内容：`select seq, left(content, 40), (embedding is not null) as has_vec
-#     from chunks where doc_id='<id>' order by seq;`
+#     想看块的内容（$DOC 是 ⑨ 抓到的那个 id；**双引号**裹 -c 才会把 $DOC 展开成真值）：
+#       psql "$(grep -E '^DATABASE_URL=' infra/.env | cut -d= -f2- | tr -d '"')" \
+#         -c "select seq, left(content, 40), (embedding is not null) as has_vec
+#             from chunks where doc_id='$DOC' order by seq limit 20"
 #  → 一直停在 PARSING：worker 没起来，看后端启动日志里有没有 worker 那行；
 #    变 FAILED 时 error_msg 就是原因（人话，例：S3 对象不见了 → "原文件读取失败…"）。
 #
@@ -636,11 +670,15 @@ psql "$(grep -E '^DATABASE_URL=' infra/.env | cut -d= -f2- | tr -d '"')" \
 
 # ⚠️ 手动重试 / 覆盖重建 / 删除现在**都有 HTTP 入口**了（P0-1-19）；
 #    界面上的按钮（列表页的"重建/重试/删除"）才是 P0-1-21 的事。
-#    ⑪ 覆盖重建 / 重试 / 删除文档（P0-1-19）—— 三条端点的 curl 与预期
+#    ⑪ 覆盖重建 / 重试 / 删除文档（P0-1-19）—— 三条端点的 curl 与预期。
+#    $KB 是 ⑧ 建库时抓的、$DOC 是 ⑨ 上传时抓的（换成 $COOKIE 这个 admin 罐照样能过：
+#    知识库没有 owner 列，谁登录都看得到同一个库 —— ⑧ 用 member 罐只是演示"登录即可"）。
 curl -sS --noproxy '*' -b "$COOKIE" -X POST \
   "http://127.0.0.1:13000/api/knowledge-bases/$KB/documents/$DOC/retry"
 #  → 200 {document:{... status:"PARSING", errorMsg:null}}；⚠️ 已是 READY 时回 **409**「无需重试」
 #    （没有东西可重试；回 200 会让界面以为在重新处理）
+#    所以：刚走完 ⑨⑩（文档已 READY）时这条**按预期就是 409**，别当 bug；
+#    想看到上面那个 200，就在 ⑨ 传完**马上**重试（PARSING 放行），或按本段末尾删掉重传一篇。
 
 curl -sS --noproxy '*' -b "$COOKIE" -F "file=@./报销制度-v2.txt" \
   "http://127.0.0.1:13000/api/knowledge-bases/$KB/documents/$DOC/reupload"
@@ -649,13 +687,15 @@ curl -sS --noproxy '*' -b "$COOKIE" -F "file=@./报销制度-v2.txt" \
 #  → 再传**一模一样**的内容 → 200 且 **unchanged:true**（「内容未变化，已跳过」）：
 #    不落新对象、不删旧 chunk、不入队 —— 三个"没做"
 
+# ⚠️ 删文档这一步同样**留到最后**（⑫ 的检索就靠 $DOC 这篇在库里 —— 删了它 ⑫ 只会搜到空结果）
 curl -sS --noproxy '*' -b "$COOKIE" -X DELETE \
   "http://127.0.0.1:13000/api/knowledge-bases/$KB/documents/$DOC"
 #  → 200 {id, fileName, deletedChunks:N}；DB 行 + 其 chunk（级联）+ S3 原文件都清掉
 #  → 再删一次 → 404（不是 500，也不是静默成功）
 
 # ⑫ 双路检索 / RRF 融合（P0-1-20）—— D 包这条链路的终点：上传 → READY → **检索得到**
-#    前置：库里有 `READY` 的文档（⑨⑩ 做完），且 `EMBEDDING_*` 已配好（检索要算 query 向量）
+#    前置：库里有 `READY` 的文档（⑨⑩ 做完，**且没跑上一条删除**），且 `EMBEDDING_*` 已配好（检索要算 query 向量）
+#    $KB 沿用 ⑧ 抓到的那个库（检索按 `kbId` 圈定范围，跑错库会得到一堆空结果）
 curl -sS --noproxy '*' -b "$COOKIE" -H 'content-type: application/json' \
   -X POST "http://127.0.0.1:13000/api/knowledge-bases/$KB/search" \
   -d '{"query":"出差住宿标准"}' | jq .
@@ -699,20 +739,29 @@ grep -iE 'content-type|content-length|content-disposition' /tmp/dl-headers
 #  ⚠️ 这是本仓唯一**不返回 JSON 信封**的端点：成功时是字节流，失败时才是信封 —— 客户端要按状态码分支。
 
 # ⑭ 智能体 CRUD（P0-1-22）—— 包 E 起步：列表 / 建 / 详情 / 改 / 软删 + 权限
-#    前置：需要一个**可用的对话模型**（启用了的 `type=CHAT` 模型，用 ①② 建的那个或库里已有的）；
-#    本机 `.env` 没配 embedding 也不影响这一组（智能体不碰流水线）。
+#    前置：需要一个**启用中的对话模型**（`type=CHAT` 且 Provider 也启用）。
+#    下面这行**现取**一个，不写死 ①② 那个 id（它中途被"附·模型池④"停用、④-b 又启用回来）：
 MODEL=$(curl -sS --noproxy '*' -b "$COOKIE" \
-  "http://127.0.0.1:13000/api/models/available?type=CHAT" | jq -r '.data[0].id')
+  "http://127.0.0.1:13000/api/models/available?type=CHAT" | jq -r '.data.items[0].id')
+#    本机 `.env` 没配 embedding 也不影响这一组（智能体不碰流水线）。
+#  ⚠️ 这条响应是 `{items:[…]}` 而**不是**裸数组 —— 写成 `.data[0].id` 会得到 `null`，
+#     于是下面建智能体时 modelId="null" → 400「模型 ID 不是合法 UUID」。
+#     （同一类"信封多包一层"的坑：`/api/users` 建号返回的是 `{user:{…}, initialPassword}`）
+#  ⚠️ 若 `$MODEL` 取到**空**，就是库里没有启用中的 CHAT 模型（常见原因：④ 停用后没跑 ④-b）
+#     ⇒ `echo $MODEL` 确认一下，空的话回去启用一个再往下。
 
 # ⑭-a 建一个 ChatBot（字段全覆盖：图标 / 系统提示词 / 开场白 / 引导问题）
-curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/agents \
+# ⭐ 这一行的 `AGENT=$(…)` 顺手把新智能体的 id 抓进 $AGENT —— 下面的 ⑭-d/⑭-f/⑭-h 与整个 ⑮⑯ 全靠它：
+AGENT=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/agents \
   -H 'content-type: application/json' -d "{
     \"name\":\"报销小助手\",\"type\":\"CHATBOT\",\"modelId\":\"$MODEL\",
     \"description\":\"回答报销制度问题\",\"icon\":\"🧾\",
     \"systemPrompt\":\"你是报销制度助手，只依据知识库回答。\",
     \"openingRemarks\":\"你好，问我报销的事吧。\",
     \"guideQuestions\":[\"差旅费怎么报？\",\"发票丢了怎么办？\"] }" \
-  | jq '.data | {id, name, type, modelLabel, modelAvailable, canEdit, guideQuestions}'
+  | tee /tmp/agent.json | jq -r '.data.id')
+jq '.data | {id, name, type, modelLabel, modelAvailable, canEdit, guideQuestions}' /tmp/agent.json
+echo "AGENT=$AGENT"
 #  → canEdit:true（自己建的）、modelAvailable:true、guideQuestions 是**数组**（列默认 []）
 
 # ⑭-b 列表：**对全员开放**，每项带 canEdit（自己真 / 他人假 / ADMIN 真）
@@ -724,17 +773,20 @@ curl -sS --noproxy '*' -b "$COOKIE" 'http://127.0.0.1:13000/api/agents?limit=20'
 #      · 不存在 → 404 ｜ 是 EMBEDDING 模型 → 409 ｜ 模型停用 → 409 ｜ 所属 Provider 停用 → 409
 
 # ⑭-d 三态：只改名字（不带 description）→ description **原样不动**；显式传 null → 清空
-curl -sS --noproxy '*' -b "$COOKIE" -X PATCH http://127.0.0.1:13000/api/agents/<agent-id> \
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH http://127.0.0.1:13000/api/agents/$AGENT \
   -H 'content-type: application/json' -d '{"name":"报销助手 v2"}' | jq '.data | {name, description}'
 #  → description 还是"回答报销制度问题"（**不是**被清空）—— `.nullable().optional()` 且**没加** `.default()`
 
 # ⑭-e 改 type → 409「智能体类型创建后不可修改」（可传但不可改；传同值 200，幂等）
 # ⑭-f 删除（**软删**）：返回两个连带数字；随后详情/编辑/再删一律 404（**不是** 403）
-curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/agents/<agent-id> \
+#      ⚠️ 也**留到最后**再跑：删了它 ⑮⑯ 就没 agent 可用了（会话建不了 ⇒ ⑯ 也没会话可发）
+curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/agents/$AGENT \
   | jq '.data'   # → {id, name, removedComponents, finishedConversations}
 #  → 会话没被删（只转 FINISHED「只读保留」）、组件绑定已解除（否则**绑过的知识库会永远删不掉**）
 
 # ⑭-g 权限守门（用 MEMBER 会话）：改**别人**的智能体 → 403；改**自己**的 → 200
+#      ⚠️ "别人的 id"要**真人工**：最省事的做法是直接把上面 admin 的 $AGENT 填进去
+#         （member 改 admin 建的 = 反方向），想验"改自己的 200"就用 member 罐自己 POST 一个
 curl -sS --noproxy '*' -b /tmp/member.jar -X PATCH \
   http://127.0.0.1:13000/api/agents/<别人的 agent-id> \
   -H 'content-type: application/json' -d '{"name":"偷改"}' | jq .msg
@@ -742,11 +794,14 @@ curl -sS --noproxy '*' -b /tmp/member.jar -X PATCH \
 #    （只验"普通用户 403"的话，一个"仅创建者"的实现会全绿 —— 所以两个方向都要亲手试一次）
 
 # ⑭-h 组件绑定（P0-1-23）—— **整体替换**：提交什么，库里就有什么
+# （$KB1/$KB2 是**为这条用例另取的两个**库 id，跟 ⑧ 的 $KB 不是一回事；名字像，别混）
+# ⚠️ 要**至少两个**知识库：清单按 `createdAt asc` 排，所以这两行拿的是**最老的两个**；
+#    库里不足两个时 `.data.items[1]` 是 null ⇒ 下面 PUT 会得到 400「refId 不是合法 UUID」
 KB1=$(curl -sS --noproxy '*' -b "$COOKIE" 'http://127.0.0.1:13000/api/knowledge-bases?limit=20' | jq -r '.data.items[0].id')
 KB2=$(curl -sS --noproxy '*' -b "$COOKIE" 'http://127.0.0.1:13000/api/knowledge-bases?limit=20' | jq -r '.data.items[1].id')
 
 curl -sS --noproxy '*' -b "$COOKIE" -X PUT \
-  http://127.0.0.1:13000/api/agents/<agent-id>/components \
+  http://127.0.0.1:13000/api/agents/$AGENT/components \
   -H 'content-type: application/json' \
   -d "{\"components\":[{\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB1\"},
                        {\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB2\"}]}" \
@@ -754,7 +809,7 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PUT \
 #  → 两条绑定（顺序恒为 componentType+refId 升序）；响应就是**详情那一套投影**（不是只回 components）
 
 curl -sS --noproxy '*' -b "$COOKIE" -X PUT \
-  http://127.0.0.1:13000/api/agents/<agent-id>/components \
+  http://127.0.0.1:13000/api/agents/$AGENT/components \
   -H 'content-type: application/json' -d "{\"components\":[{\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB1\"}]}" \
   | jq '.data.components'   # → 只剩 KB1：**全量替换**，没提交的那条立即消失
 #  → 传 [] 即"解绑全部"（清空**只有**这一种写法：省略 components 是 400，不是清空 ——
@@ -782,13 +837,16 @@ pnpm verify:ingest
 
 # ⑮ 会话管理（P0-1-25）—— 包 F 起步：某 Agent 的会话列表 / 建 / 改名 / 删 / 活跃态
 #    ⚠️ 权限是**第四族**：会话 = **仅创建者本人**（连 ADMIN 也看不到别人的会话，一律 404）。
-#    前置：一个**未软删**的智能体（⑭-a 建的那个）与它的 agent-id。
-AGENT=<⑭-a 的 agent-id>
+#    前置：一个**未软删**的智能体与它的 agent-id —— 就是 ⑭-a 抓到的 $AGENT
+#    （所以别先跑 ⑭-f 那条软删，删了它这里建会话会 404）。
 
 # ⑮-a 新建会话 → topic:null、lastMessageAt:null（本批没有自动命名）
-curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/conversations \
+#    ⭐ 同样顺手把会话 id 抓进 $CONV —— ⑮-c 到 ⑯ 全靠它：
+CONV=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/conversations \
   -H 'content-type: application/json' -d "{\"agentId\":\"$AGENT\"}" \
-  | jq '.data | {id, agentName, agentType, topic, status, lastMessageAt}'
+  | tee /tmp/conv.json | jq -r '.data.id')
+jq '.data | {id, agentName, agentType, topic, status, lastMessageAt}' /tmp/conv.json
+echo "CONV=$CONV"
 #  → status:"ACTIVE"；topic 与 lastMessageAt 都是 null（"还没说过话"与"刚说了话"必须分得开）
 #    建会话只校验"Agent 存在且未软删"——**刻意不校验**模型可用/Provider 有没有配 Key
 #    （那是"发消息"的前置，属 P0-1-26/27；否则模型停用后连自己的历史都进不去）
@@ -802,23 +860,24 @@ curl -sS --noproxy '*' -b "$COOKIE" "http://127.0.0.1:13000/api/agents/$AGENT/co
 #    另外**软删的 Agent 照样能查**（会话"只读保留"），但"Agent 不存在"回 404 而不是空列表。
 
 # ⑮-c 改名（行内编辑）→ 200；`topic` **不是三态**：传 null 会被 400 拒（界面没有"清空标题"）
-curl -sS --noproxy '*' -b "$COOKIE" -X PATCH http://127.0.0.1:13000/api/conversations/<conversation-id> \
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH http://127.0.0.1:13000/api/conversations/$CONV \
   -H 'content-type: application/json' -d '{"topic":"差旅费怎么报"}' | jq '.data.topic'
 #  → 已结束（FINISHED）的会话也照样能改名/删除（"只读"只拦"产生消息"，见 `docs/02` §4.5 ⑦）
 
 # ⑮-d 活跃流状态 → **恒为无流**（写侧 `chat.active:{id}` 属 P0-1-26）
-curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/<conversation-id>/active | jq '.data'
+curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/$CONV/active | jq '.data'
 #  → {streaming:false, queuedPosition:null, currentTool:null, startedAt:null}
 #    ⚠️ `streaming` 是**派生**的（Redis 键在 ⇒ true）⇒ 不可能出现"键在但 streaming:false"；值坏也只降级不 500。
 #       本批没有发消息的端点 ⇒ 一直 false 是**预期行为，不是 bug**。
 
 # ⑮-e 权限守门：用**别的账号**（ADMIN 也一样）读/改/删同一个会话 → 一律 **404**（不是 403）
-curl -sS --noproxy '*' -b /tmp/member.jar http://127.0.0.1:13000/api/conversations/<conversation-id> | jq .msg
+curl -sS --noproxy '*' -b /tmp/member.jar http://127.0.0.1:13000/api/conversations/$CONV | jq .msg
 #  → 404「会话不存在」（`PATCH` / `DELETE` / `/active` 同理）。**刻意不是 403**：
 #    403 等于确认这个 id 有效，而会话 id 不出现在任何对他人可见的列表里，藏得住。
 
 # ⑮-f 删除 → 级联删消息，响应给出**同事务"先数后删"**得出的 deletedMessages
-curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/conversations/<conversation-id> | jq '.data'
+#      ⚠️ 这是本段**唯一会毁掉后续步骤**的一条（⑯ 还要用 $CONV 发消息）⇒ 放到 ⑯ 之后再删
+curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/conversations/$CONV | jq '.data'
 #  → {id, agentId, topic, deletedMessages}；会话从列表里消失，活跃流锁一并清掉。
 #    ⚠️ P0-1 阶段**没有会话级的 S3 对象**（产物属 P0-3、附件属 P1）⇒ 这一步不进 S3，
 #       是**诚实的空操作**（接回点在 `collectConversationObjectKeys`，见 `docs/02` §4.5 ⑥）。
@@ -826,7 +885,7 @@ curl -sS --noproxy '*' -b "$COOKIE" -X DELETE http://127.0.0.1:13000/api/convers
 # ⑯ SSE 出口（P0-1-26）—— 发消息 / 停止 / 互斥 / 心跳
 #    ⚠️ 必须带 `curl -N`（关掉 curl 自己的输出缓冲），否则你看到的永远是空
 curl -N -sS --noproxy '*' -b "$COOKIE" -X POST \
-  http://127.0.0.1:13000/api/conversations/<conversation-id>/chat \
+  http://127.0.0.1:13000/api/conversations/$CONV/chat \
   -H 'content-type: application/json' -d '{"content":"你好"}'
 #  → 响应头 **text/event-stream 立刻到达**（不是等到第一帧），然后**每 20s 一条**：
 #      event: ping
@@ -834,7 +893,7 @@ curl -N -sS --noproxy '*' -b "$COOKIE" -X POST \
 #    ⚠️ 本批流里**只有 ping、没有回答、也不落库** —— 编排循环属 P0-1-27，别当 bug。
 #    想快点看到心跳：把后端用 `SSE_PING_INTERVAL_SEC=2` 起。
 #    此时另开终端看活跃态（`streaming` 是**派生**的：键在 ⇒ true）：
-curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/<conversation-id>/active | jq '.data'
+curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/$CONV/active | jq '.data'
 #  → {streaming:true, startedAt:"…", queuedPosition:null, currentTool:null}
 
 # ⑯-b 互斥：**流还跑着**的时候再发一次
@@ -845,7 +904,7 @@ curl -sS --noproxy '*' -b "$COOKIE" http://127.0.0.1:13000/api/conversations/<co
 #    第一条流**不受影响**，仍在发心跳。
 
 # ⑯-c 停止（第三个终端）→ 200 {"signaled":true}
-curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/conversations/<conversation-id>/stop | jq '.data'
+curl -sS --noproxy '*' -b "$COOKIE" -X POST http://127.0.0.1:13000/api/conversations/$CONV/stop | jq '.data'
 #  → 5s 内第一条流收到**最后一帧** `event: done` / `data: {"finishReason":"STOPPED",…}` 后关闭；
 #    再打一次 `/stop` → {"signaled":false}。⚠️ **幂等**：对"没有流"的会话也是 200，
 #    点了两次不该报错，停止信号也不会残留（紧接着新开一条流不会被上一轮秒停）。
@@ -1171,3 +1230,4 @@ doubuleA/
 | 2026-09-22 | — | **P0-1-24 完成（包 E 收口 ✅ 3/3）**：Agent 包验收 —— `backend/scripts/verify-agent-package.mjs`（新增：**一行一组逐行跑 4 条验收门槛**，R1 两类型 CRUD / R2 绑 2 库→详情完整回显→解绑 1 个 / R3 权限三方向 / R4 删除的连带 + 跨包链路 / R5 清场；末尾给一张 **结论表**）、根与后端 package.json 各加 **`pnpm verify:agent-package`**。**纯验收批次：零新增接口、零新增依赖、零新增环境变量**。**四条最值得记的**：① **包级脚本问的是"串起来还成不成立"**，不重复 `verify:agents` 的细粒度断言 —— 其中 **R2 要求写端点/详情/列表三个出口的绑定数组逐字相同（含顺序）**，各验各的时候"`PUT` 回 A 形状、`GET` 回 B 形状"的实现可以两处都绿；另配建/详情/列表三处的**键集合断言**（同一份数据不许有第二种形状）。② **⚠️ 门槛④ 的"只读"只能验一半** —— `conversations` 端点属 **P0-1-25**，现在**没有 HTTP 出口**能观察"读得到、写不进"，故在 **DB 层**取证（行还在 / `status=FINISHED` / 消息还在 / `finishedConversations` 只数真被改的行）并**标 ⚠️ 部分完成写进结论表，不混进 ✅**；会话行由脚本直接造（`02` §三 同形数据），F 包之后应换成打端点。③ **R4 里藏着本包唯一一条跨包链路**（删库守卫数 `agent_components`（D）× 软删要顺手解绑（E））⇒ 用**一对反向断言**：**绑着 → 删库 409**、**软删那个 Agent → 同一句删库请求 200**；只做一半时界面上 Agent 已"没了"、删库却提示"正被 1 个 Agent 绑定"，**用户无路可走**。④ **权限那组三个方向都写**（他人 403 / 本人 200 / **ADMIN 改他人 200**）+ 403 后断言 **"一个字节都没写"**（`name` 相同 **且 `updated_at` 逐字不变**）。**验收**：新增 `pnpm verify:agent-package`（**13 项全通过**，需真实 PG + Redis、**不需要 MinIO**；R1 3 / R2 3 / R3 3 / R4 3 / R5 1）；**既有 18 档全部未回归（19/19 退出码 0）**，lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（§七 待决事项 7 的第二个端测点仍是 **P0-1-30**）；`POST /api/agents/:id/copy` 是 **P1**、`GET /api/agents/:id/conversations` 属 **F 包**。归档：`issue_fix/问题记录-P0-1-24-Agent包验收.md` |
 | 2026-09-22 | — | **P0-1-25 完成（包 F 起步 1/5）**：会话管理 —— `shared/src/conversation.ts`（新增）、`backend/src/services/conversation.service.ts`、`backend/src/routes/conversations.ts`、`backend/src/infra/redis.ts`（`chatActiveKey`）、`app.ts` 接线、`backend/scripts/verify-conversations.mjs`（新增）、`verify-app.mjs` 第 25 节、`verify-agent-package.mjs`（**R4 回补为打端点**）。**零新增依赖、零新增环境变量**。**四条最值得记的**：① **权限第四族定案：会话 = 仅创建者本人，连 ADMIN 也不给后门**（判据 = `conversations.user_id`；`ConversationViewer` **只有 `id`、连 `role` 都不给** ⇒ 越权实现无处落脚；别人的会话与不存在的 id 返回**同一个 404**）。② **`last_message_at` 的维护点 = 消息落库时**（本批的坑预判）⇒ 因本批没有写消息的端点，它被做成**可单独调用的函数** `touchConversation`（P0-1-27 在落库事务里调，**只前进不后退**用 CAS 表达）。③ **排序显式写 `nulls:'first'`** —— 新会话的 `last_message_at` 是 `null`，这条错了的症状是"**新建了会话却在侧栏看不见它**"。④ **`/active` 的 `streaming` 是派生的**（键在 ⇒ true，矛盾态不可能出现）、值坏**逐字段降级永不 500**、且**先查库再查 Redis**（不是我的会话回 404 而不是"没有流"）。**⚠️ 第三处"临时边界"（不混进 ✅）**：原文的"删除时异步清理 S3"在 P0-1 是**空操作**（`artifacts` 属 P0-3 / `files` 属 P1），接回点在 `collectConversationObjectKeys` 一处，验收因此**不需要 MinIO**。**顺手回补**：E 包门槛④ 的"只读"从 DB 层等价取证**升级为打真端点**，P0-1-24 的 ⚠️ 就此收掉。**验收**：新增 `pnpm verify:conversations` **15 项全通过**；`verify:app` **86 → 92 项**（CI 93）；`verify:agent-package` **13 项仍全通过**；**全量回归 20 档全部退出码 0** —— 其中 `verify-agents`（35 项）是本批**翻转一条陈旧断言**之后才绿的（P0-1-22 写下的"会话列表必须 404/未注册"在本批落地后变成陈旧，**只有全量回归能抓到它**）；lint + typecheck/build 全绿。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（下一个仍是 **P0-1-30**），本批之后**发消息还没有出口** ⇒ `/active` 恒为无流是**预期行为**；`GET /:id/messages` 属 P0-1-28、`/:id/chat` 与 `/:id/stop` 属 P0-1-26。另顺手订正包进度总表 E 行（此前停在"2/3"，上一批漏改）。归档：`issue_fix/问题记录-P0-1-25-会话管理.md` |
 | 2026-09-22 | — | **P0-1-26 完成（包 F 2/5）**：SSE 出口 + 停止 + 互斥 + 心跳 —— `shared/src/sse.ts`（**新增契约、唯一事实来源**：10 事件全集 + payload schema + `chatRequestBodySchema`）、`backend/src/orchestrator/sse.ts`（`SseChannel`）、`backend/src/orchestrator/index.ts`（**producer 入口，本批是空流占位**）、`backend/src/routes/conversations.ts`（`POST /:id/chat`、`POST /:id/stop`）、`backend/src/services/conversation.service.ts`（**四类前置闸门收一处**）、`backend/src/infra/redis.ts`（`chatStopKey` + `CHAT_STOP_TTL_SEC`）、`app.ts` 接线注释、`index.ts` 启动信封、`backend/scripts/verify-chat-stream.mjs`（新增）、`verify-app.mjs`（**翻转两条"刻意未注册"断言** + `confirm` 归属改正）、`verify-agent-package.mjs`（**R4 补齐门槛④ 的"写不进去"**）、`verify-conversations.mjs`（注释订正）。**零新增依赖、零新增环境变量**。**四条最值得记的**：① **⚠️ 本批最严重的坑（只有真 HTTP 能抓到）：`#waitDrain()` 会永久挂住 ⇒ 活跃流锁不释放** —— 背压等待用 `once('drain')` + `once('close')` 两个**将来**事件，而客户端**已经断开**时 `close` 早已触发 ⇒ `once('close')` 再也不会触发 ⇒ `await` 永久挂住 ⇒ 收尾回不来 ⇒ `finally` 走不到 ⇒ **锁一直不释放直到 3 个心跳周期的 TTL**；症状极具欺骗性（"关掉标签页后 30s 内一直报 CONFLICT"看起来像锁泄漏），唯一线索是 `MaxListenersExceededWarning: 11 close listeners`。② **`lock-lost` 必须由出口层改判成 `error`**：producer **正常返回 ≠ 流正常结束**（锁丢了它可能压根没察觉）⇒ 否则前端把"服务端状态异常、零产出"显示成"**你点了停止**"。③ **停止键的生命周期要闭环，且清键的位置是正确性的一部分**（收尾清必须在**释放锁之前**，否则和新流的 `/stop` 抢键 ⇒ "点了停止但停不下来"）。④ **⚠️ CONFLICT 是流内 `error` 事件，不是 409 信封**（**实现时先写错、回写前按契约改正**；`02`/`03`/`06` 四处一致）⇒ **分界线是主语**：401/400/404/只读 409/424 的主语是"请求/目标" ⇒ 信封；CONFLICT 的主语是"这一轮生成" ⇒ 事件（前端按"消息流内错误卡"单一渲染路径收口）。**另三条结构性决定**：**心跳"无条件周期"**（"空闲才发"要求每个等待点都记得重置计时器，等于把正确性寄托在记性上；副作用是好的：这个周期同时就是**锁的续期节拍**）；**锁 = `SET NX EX` 一步原子 + TTL 跟 3 个心跳 + 按归属释放**；**`flushHeaders()` 必须显式调**（否则 `fetch` 要等到 20s 后第一个心跳才 resolve，症状是"前端以为请求没发出去"，验收做成可测量的两条）。**跨批次回补**：E 包门槛④ 的"**写不进去**"补齐（软删 Agent 后打 `POST /:id/chat` → **409 信封**（只读闸门在 hijack 之前）**且不是 event-stream**）⇒ 门槛④ 两半齐全，P0-1-24 的 ⚠️ 就此收掉。**验收**：新增 `pnpm verify:chat-stream` **28 项全通过**（⚠️ **真进程 + 真 TCP**，默认端口 13097，需 PG + Redis，**不需 MinIO、不需任何上游**）；`verify:app` **92 项**、`verify:agent-package` **13 项**仍全通过；**全量回归 21 档全部退出码 0**。lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（下一个仍是 **P0-1-30**）；本批之后**命令行/HTTP 已能亲手跑通本批的验收原文**（`curl -N` 打 `POST /:id/chat` 看 `ping` 每 20s 一条、`/stop` 看 5s 内 `done{STOPPED}`），但**流里只有 ping、没有回答、不落库** ⇒ 刷新后历史不会多（P0-1-27/28 的事，**别当 bug**）；`GET /:id/messages` 属 P0-1-28。归档：`issue_fix/问题记录-P0-1-26-SSE出口与停止.md` |
+| 2026-09-22 | — | **README 手工端测可跑化（非计划内）**：①②③…⑯ 段里 `<id>` / `$KB` / `$DOC` / `<agent-id>` / `<conversation-id>` / `<①的id>` 这类"看着像占位符、其实是**上一段 curl 的产物**"的记号，全部改成**当场抓取的真变量** —— `$ALICE`(④) · `$PROVIDER`/`$MODEL`(附·模型池①②) · `$KB`(⑧) · `$DOC`(⑨) · `$AGENT`(⑭-a) · `$CONV`(⑮-a)，用 `tee` 兼顾"看完整响应"与"抓 id"；只剩密码类与"别人的 agent-id"是真人工。**同时订正两条会直接卡住链路的取值错误**：建号响应是 `{user:{…}, initialPassword}` ⇒ 要写 `.data.user.id`（写 `.data.id` 得 null）、`/api/models/available` 是 `{items:[…]}` 不是裸数组 ⇒ 要写 `.data.items[0].id`（写 `.data[0].id` 会让 ⑭-a 的 `modelId` 变成字符串 `"null"` → 400）。另补 4 条 ⚠️（**⑧ 删库 · ⑪ 删文档 · ⑭-f 软删智能体 · ⑮-f 删会话** 都会让后面的步骤"没东西可查"，别顺手先跑）、④-b（停用看完差别要**启用回来**，否则 ⑭ 取不到可用的 CHAT 模型）、⑭-h 的"至少两个知识库"、⑪ 的"刚走完 ⑨⑩ 时 retry 按预期就是 409" |
