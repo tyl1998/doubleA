@@ -39,6 +39,7 @@
     "verify:knowledge-bases": "pnpm --filter @doubulea/backend verify:knowledge-bases",
     "verify:retrieval": "pnpm --filter @doubulea/backend verify:retrieval",
     "verify:kb-package": "pnpm --filter @doubulea/backend verify:kb-package",
+    "verify:agents": "pnpm --filter @doubulea/backend verify:agents",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

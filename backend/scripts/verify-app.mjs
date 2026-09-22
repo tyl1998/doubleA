@@ -51,6 +51,15 @@
  *              **CR/LF 头注入被剔除**、路径分隔符与引号被替换、RFC 5987 的额外转义）
  *              与**下载类型表与上传白名单不脱节**。行为侧（真 S3 取字节、流式响应、对象丢失）
  *              归 `verify-documents.mjs` 的 F/G 组。
+ *   · P0-1-22：**智能体契约与路由** —— 五条路由已注册 + 三条**刻意不注册**（P0-1-23 的
+ *              组件整体替换、P1 的复制、P0-1-25 的会话列表）；权限判据 `canEditAgent` 的
+ *              **四个方向**（创建者 / ADMIN / 第三方 / 已软删）；`guideQuestions` 的上限与
+ *              元素类型；`normalizeGuideQuestions`（读取端补默认值，永不抛错、**不截断**）；
+ *              建/改 body 的**三态**与"不可改的 type"；输出投影的键集合固定（**没有 `deletedAt`**）。
+ *              ⚠️ 这里刻意**不**断言任何"库里有几行"的东西：软删三件套（打标记 / 解绑组件 /
+ *              会话转只读）与 403/200 这两族都要真 PG + Redis，归 `verify-agents.mjs`。
+ *              权限判据是**纯函数**、且改坏了不会有任何接口报错（最坏是静默越权）⇒ 这一档
+ *              是它唯一的守门处；行为侧还要靠那一档的"两个真实 MEMBER + 一个 ADMIN"。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -135,6 +144,17 @@ import {
   searchKnowledgeBaseBodySchema,
   searchKnowledgeBaseResultSchema,
   SPLIT_STRATEGIES,
+  // 智能体（P0-1-22）
+  AGENT_TYPES,
+  agentItemSchema,
+  agentListResultSchema,
+  canEditAgent,
+  COMPONENT_TYPES,
+  createAgentBodySchema,
+  GUIDE_QUESTIONS_MAX,
+  guideQuestionsSchema,
+  normalizeGuideQuestions,
+  updateAgentBodySchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -247,7 +267,7 @@ async function it(name, fn) {
 
 const expectDegraded = process.env.EXPECT_DEGRADED === '1'
 
-console.log(`\n${c.b}══ 接口级验收：信封 / /health / 密码与会话 / 认证 / 用户管理 / 模型池 ══${c.x}`)
+console.log(`\n${c.b}══ 接口级验收：信封 / /health / 密码与会话 / 认证 / 用户管理 / 模型池 / 知识库 / 智能体 ══${c.x}`)
 console.log(`  ${c.d}模式：${expectDegraded ? '依赖全部不可达（断言 degraded）' : '本机依赖（断言 /health 全绿）'}${c.x}`)
 
 const app = buildApp()
@@ -2278,6 +2298,156 @@ await it('下载的口径表与上传白名单**不脱节**（下载给的类型
   assertEqual(downloadContentType('a.pdf'), 'application/pdf', 'pdf 不带 charset')
   assertEqual(downloadContentType('无扩展名'), 'application/octet-stream', '未知扩展名回落二进制')
   assertEqual(downloadContentType('a.md'), 'text/markdown; charset=utf-8', 'md 的类型')
+})
+
+// ── 24. 智能体契约与路由（P0-1-22）──
+console.log(`\n${c.b}── 智能体契约与路由（权限判据 / 三态 / 引导问题 / 一套投影）──${c.x}`)
+
+await it('五条路由已注册；P0-1-23 与 P1 的三条**刻意不存在**（不提前做下一批的活）', () => {
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
+  assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/agents/:id' }), true, '编辑')
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/agents/:id' }), true, '删除')
+  // 组件整体替换归 P0-1-23；复制是 **P1**（`02` §4.4 与 `01` §3.3 都标了 P1）；会话列表归 P0-1-25
+  assertEqual(
+    app.hasRoute({ method: 'PUT', url: '/api/agents/:id/components' }),
+    false,
+    '组件整体替换属 P0-1-23',
+  )
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), false, '会话列表属 P0-1-25')
+})
+
+await it('权限判据 `canEditAgent`：四个方向（创建者 / ADMIN / 第三方 / 已软删）', () => {
+  // ⚠️ 这条规则在 `01` §3.3 决策 18 里写作"创建者 + admin 可编删"，是**或**关系。
+  //    写成"仅 ADMIN"或"仅创建者"都能让**一半**断言通过 ⇒ 四个方向必须都给。
+  //    行为侧（403 / 200）由 `verify-agents.mjs` 用两个真实 MEMBER + 一个 ADMIN 覆盖：
+  //    那里还有一个只在**这一档**能守的点 —— 判据是纯函数，改坏了不会有任何接口报错。
+  const row = { createdBy: 'user-owner', deletedAt: null }
+  assertEqual(canEditAgent(row, { id: 'user-owner', role: 'MEMBER' }), true, '创建者本人')
+  assertEqual(canEditAgent(row, { id: 'user-admin', role: 'ADMIN' }), true, 'ADMIN 改别人的')
+  assertEqual(canEditAgent(row, { id: 'user-other', role: 'MEMBER' }), false, '第三方普通用户')
+  assertEqual(
+    canEditAgent({ ...row, deletedAt: new Date() }, { id: 'user-admin', role: 'ADMIN' }),
+    false,
+    '软删的一律不可（它连详情都查不到）',
+  )
+  // 验收脚本从 JSON 里拿到的是**字符串**，判据必须同时认（否则"可编辑"会有第二份实现）
+  assertEqual(
+    canEditAgent({ ...row, deletedAt: '2026-09-22T00:00:00.000Z' }, { id: 'user-owner', role: 'MEMBER' }),
+    false,
+    'deletedAt 传字符串的形态',
+  )
+})
+
+await it('`guideQuestions` 契约：上限 / 元素类型 / 空白项都给**字段级文案**', () => {
+  assertEqual(guideQuestionsSchema.safeParse([]).success, true, '空数组合法（就是"清空"）')
+  assertEqual(
+    guideQuestionsSchema.safeParse(Array.from({ length: GUIDE_QUESTIONS_MAX }, (_, i) => `问${i}`)).success,
+    true,
+    `恰好 ${GUIDE_QUESTIONS_MAX} 条要放行`,
+  )
+  assertEqual(
+    guideQuestionsSchema.safeParse(Array.from({ length: GUIDE_QUESTIONS_MAX + 1 }, (_, i) => `问${i}`)).success,
+    false,
+    `超过 ${GUIDE_QUESTIONS_MAX} 条要拒`,
+  )
+  assertEqual(guideQuestionsSchema.safeParse(['好', 3]).success, false, '元素必须是字符串')
+  assertEqual(guideQuestionsSchema.safeParse('不是数组').success, false, '必须是数组')
+  assertEqual(guideQuestionsSchema.safeParse(['   ']).success, false, '空白项要拒（渲染出来是个点不了的按钮）')
+  assertEqual(guideQuestionsSchema.parse([' 空格 '])[0], '空格', '元素要 trim')
+})
+
+await it('`normalizeGuideQuestions`（读取端唯一入口）：永不抛错、只做类型收敛、**不截断**', () => {
+  // jsonb 列可能是任何形状（手工改库 / 老数据），而前端对它 `.map()` ⇒ 拿到一个数字就是白屏。
+  // 这是"读取端补默认值"（P0-1-15 的 `normalizeRetrievalConfig` 是同族问题）。
+  assertEqual(JSON.stringify(normalizeGuideQuestions(undefined)), '[]', 'undefined')
+  assertEqual(JSON.stringify(normalizeGuideQuestions(null)), '[]', 'null')
+  assertEqual(JSON.stringify(normalizeGuideQuestions({ a: 1 })), '[]', '对象')
+  assertEqual(JSON.stringify(normalizeGuideQuestions('字符串')), '[]', '字符串（`.map` 会炸在字符串上）')
+  assertEqual(
+    JSON.stringify(normalizeGuideQuestions([' a ', 3, null, '', '   ', 'b'])),
+    JSON.stringify(['a', 'b']),
+    '丢非字符串、丢 trim 后的空串、其余保持顺序',
+  )
+  assertEqual(
+    normalizeGuideQuestions(Array.from({ length: GUIDE_QUESTIONS_MAX + 5 }, (_, i) => `问${i}`)).length,
+    GUIDE_QUESTIONS_MAX + 5,
+    '⚠️ 刻意**不截断**：截断等于静默丢数据（上限只在写入口拦）',
+  )
+})
+
+await it('建/改 body 的三态与"不可改的 type"：`undefined`（不动）与 `null`（清空）必须分得开', () => {
+  const validId = '01930000-0000-7000-8000-000000000001'
+  const created = createAgentBodySchema.safeParse({ name: '探针', type: 'CHATBOT', modelId: validId })
+  assertEqual(created.success, true, '三个必填给齐就能过')
+  // ⚠️ 省略的可选字段**不能**被补成 `null`：补了就等于"创建时没给"与"显式清空"合并
+  assertEqual(
+    JSON.stringify(Object.keys(created.data).sort()),
+    JSON.stringify(['modelId', 'name', 'type']),
+    '省略项应**不出现**在解析结果里',
+  )
+  assertEqual(createAgentBodySchema.safeParse({ name: '缺类型', modelId: validId }).success, false, 'type 必填')
+  assertEqual(createAgentBodySchema.safeParse({ name: '坏 id', type: 'CHATBOT', modelId: 'x' }).success, false, 'modelId 必须是 UUID')
+
+  // 改：三态 + 至少一个字段
+  assertEqual(updateAgentBodySchema.safeParse({}).success, false, '空 body 要拒')
+  assertEqual(updateAgentBodySchema.safeParse({}).error.issues[0].message, '至少要提供一个要修改的字段', '空 body 的文案')
+  assertEqual(updateAgentBodySchema.safeParse({}).error.issues[0].path.length, 0, '`.refine()` 的 path 是空串（只能靠 message 定位）')
+  assertEqual(updateAgentBodySchema.safeParse({ description: null }).success, true, '`null` 算"给了字段"（清空）')
+  assertEqual(updateAgentBodySchema.safeParse({ guideQuestions: [] }).success, true, '`[]` 算"给了字段"（清空）')
+  assertEqual(
+    updateAgentBodySchema.safeParse({ name: 'x' }).data.description,
+    undefined,
+    '⚠️ 三态：不带 description ⇒ `undefined`（绝不能有 `.default(null)`）',
+  )
+  assertEqual(updateAgentBodySchema.safeParse({ description: null }).data.description, null, '`null` 要保持是 null')
+})
+
+await it('输出投影的键集合固定：没有 `deletedAt` 之类的内部列（防"以后有人顺手 select 出去"）', () => {
+  // 取值域的字面量钉在这里（与真实数据库枚举的一致性由 `verify-agents.mjs` 对 `Object.values` 断言）
+  assertEqual(JSON.stringify(AGENT_TYPES), JSON.stringify(['CHATBOT', 'TASK_AGENT']), 'Agent 类型取值域')
+  assertEqual(JSON.stringify(COMPONENT_TYPES), JSON.stringify(['KNOWLEDGE', 'MCP']), '组件类型取值域')
+
+  const keys = Object.keys(agentItemSchema.shape)
+  // 软删标记是**内部**状态：列表默认过滤掉软删的行，把它下发出去只会诱使前端写
+  // `if (agent.deletedAt)` 这种永远为假的分支。
+  assertEqual(keys.includes('deletedAt'), false, '不该下发 deletedAt')
+  for (const expected of [
+    'id',
+    'name',
+    'description',
+    'icon',
+    'type',
+    'systemPrompt',
+    'openingRemarks',
+    'guideQuestions',
+    'modelId',
+    'modelName',
+    'modelLabel',
+    'modelAvailable',
+    'createdBy',
+    'creatorName',
+    'canEdit',
+    'components',
+    'createdAt',
+    'updatedAt',
+  ]) {
+    assert(keys.includes(expected), `投影里应有 ${expected}`)
+  }
+  assertEqual(
+    keys.length,
+    18,
+    `新增字段要连这条断言一起改（否则等于悄悄扩大了契约）：实际 ${JSON.stringify(keys.sort())}`,
+  )
+  // 列表响应：分页三件套一个都不能少（前端分页器靠它）
+  assertEqual(
+    agentListResultSchema.safeParse({ items: [], total: 0, offset: 0 }).success,
+    false,
+    'offset/limit/total 缺一不可',
+  )
+  assertEqual(agentListResultSchema.safeParse({ items: [], total: 0, offset: 0, limit: 20 }).success, true, '完整响应')
 })
 
 await app.close()

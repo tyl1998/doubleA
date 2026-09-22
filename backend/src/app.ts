@@ -21,6 +21,7 @@ import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
+import { registerAgentRoutes } from './routes/agents.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
@@ -145,6 +146,10 @@ export function buildApp(): FastifyInstance {
   // ⑨ 知识库文档（P0-1-16）。权限与知识库一致（登录即可），上传走 multipart。
   //    端点数按批次增长：本批只有上传；reupload/retry/delete 在 P0-1-19，列表/下载在 P0-1-21。
   registerDocumentRoutes(app)
+  // ⑩ 智能体（P0-1-22）。权限**不是 ADMIN**：全员可建可看可用，编删由服务层按
+  //     `01` 决策 18（创建者 + ADMIN）做成**行级**判定 —— 路由只挂 `requireAuth`，
+  //    一个 `requireAdmin` 都没有（与模型池那一族刻意相反，理由见 routes/agents.ts 文件头）。
+  registerAgentRoutes(app)
 
   return app
 }
