@@ -8,9 +8,14 @@
  * 本模块只做"机制"，不做"处理"
  * ─────────────────────────────────────────────────────────────────────
  * 机制 = 取件、并发闸、幂等判定、状态机写入、失败落 `error_msg`、可观测计数；
- * 处理 = 具体步骤（解析 / 分块 / 入库），在 `stages.ts`，可以整组替换（验收就是这么注入慢阶段的）。
- * 分开的直接收益：P0-1-18/19 各插一个阶段，**本文件一行都不用改** —— 而它恰好是风险最高的那段
+ * 处理 = 具体步骤（解析 / 空文本检测 / 分块 / 入库），在 `stages.ts`，可以整组替换（验收就是这么注入慢阶段的）。
+ * 分开的直接收益：P0-1-18/19 各插一个阶段，**本文件一处都不用改** —— 而它恰好是风险最高的那段
  * （状态写坏、并发写重、失败没落库，任何一条都很难在事后发现）。
+ *
+ * ⚠️ P0-1-18 的实证（把这句"一处都不用改"订正得更准）：插入 ④⑤ 两个阶段时，本文件**只改了
+ * 一处** —— `JOB_DOCUMENT_SELECT` 多带了 `kb` 的分块参数（`PipelineDocument` 的字段增量，
+ * 是阶段间的数据契约，不是机制）。真正的机制（并发闸、四道幂等、CAS 写状态、失败翻译）
+ * **一行未动** —— 这正是当初拆阶段数组要买到的东西。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 幂等有四道，缺一不可（`子方案①` §三 只写了第一道）
@@ -41,7 +46,7 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, canTransitionDocumentStatus, type DocumentStatus } from '@doubulea/shared'
+import { AppError, canTransitionDocumentStatus, normalizeRetrievalConfig, type DocumentStatus } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -66,6 +71,13 @@ const JOB_DOCUMENT_SELECT = {
   fileName: true,
   contentHash: true,
   status: true,
+  /**
+   * 分块参数住在**知识库**上（`chunk_size` / `chunk_overlap` 两列 + `retrieval_config.splitStrategy`），
+   * 而处理一份文档离不开它们（P0-1-18 的 chunk 阶段要用）。
+   * 用一次联表带出来，而不是让阶段自己再查一遍库：三个阶段各查一次就是"同一份数据、三种读法"
+   * 的开始，而且那三次查询都发生在**已经拿到行之后**，纯粹是白花的往返。
+   */
+  kb: { select: { chunkSize: true, chunkOverlap: true, retrievalConfig: true } },
 } as const
 
 /** 可观测计数（验收断言并发与幂等靠它；也是将来 `/health` 或运维面板的雏形） */
@@ -349,6 +361,11 @@ async function handleJob(job: PipelineJob): Promise<void> {
       fileKey: row.fileKey,
       fileName: row.fileName,
       contentHash: row.contentHash,
+      chunkSize: row.kb.chunkSize,
+      chunkOverlap: row.kb.chunkOverlap,
+      // jsonb 里可能缺键（老数据 / PATCH 只改了一半）⇒ 一律走 shared 的补默认值，
+      // **不在这里写 `?? 'hybrid'`**（那是"散落的第二个真相"，见 `shared/src/knowledgeBase.ts` 文件头 ②）
+      splitStrategy: normalizeRetrievalConfig(row.kb.retrievalConfig).splitStrategy,
     }
     const ctx: PipelineContext = { job, document, log }
     let status: DocumentStatus = row.status
@@ -373,11 +390,14 @@ async function handleJob(job: PipelineJob): Promise<void> {
         {
           chars: ctx.parsed?.meta.charCount ?? null,
           blocks: ctx.parsed?.blocks.length ?? null,
+          // 切出来的块数 vs 落库的块数（二者本批**必然不等**：落库属 P0-1-19）
+          chunks: ctx.chunks?.length ?? 0,
           chunkCount: ctx.chunkCount ?? 0,
         },
-        // 本批只到"解析成功"：chunk 入库是 P0-1-18/19 ⇒ 此刻 chunkCount 恒为 0，
-        // READY 的含义是"解析这一关过了"，还不是"可检索"（见 stages.ts 文件头）
-        '文档处理完成（解析阶段）',
+        // 本批补上了 ④ 空文本检测与 ⑤ 分块，但**块还没入库**（⑥⑦ 属 P0-1-19）⇒
+        // `chunkCount` 恒为 0、`chunks` 表一行也没有。于是 READY 的含义是
+        // "解析与分块都过了"，**仍不是"可检索"**（见 `stages.ts` 的 `chunkStage` 注释）。
+        '文档处理完成（解析 + 空文本检测 + 分块）',
       )
     } catch (error) {
       const message = describeFailure(error)

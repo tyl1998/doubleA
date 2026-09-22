@@ -1,17 +1,28 @@
 #!/usr/bin/env node
 /**
- * verify-pipeline.mjs —— P0-1-17 的**异步队列 + 状态机 + worker 骨架**验收
+ * verify-pipeline.mjs —— **文档流水线**验收（P0-1-17 队列/状态机/worker + P0-1-18 空文本检测/分块）
  *
- * 对 `docs/06` 该批的三条验收逐条落成可执行断言：
+ * P0-1-17 的三条验收逐条落成可执行断言：
  *   ① 上传后立即返回 docId 且 `status=PARSING`（→ C 组）
  *   ② worker 消费后转 `READY`/`FAILED`（→ C 组成功路、F 组失败路）
- *   ③ 重复投递同一 job 不产生重复处理（→ D 组；本批还没有 chunk，所以把"不产生重复 chunk"
+ *   ③ 重复投递同一 job 不产生重复处理（→ D 组；当时还没有 chunk，所以把"不产生重复 chunk"
  *      落成更严的等价物：**一个字节都不写库** + 阶段**只跑一次**）
  * `docs/06` 的坑预判（"List 无 ack ⇒ 必须有重试入口"）也在这里取证：F 组证明
  * **重投同一个 job 能把 FAILED 救回 READY**，这就是那条"重试入口"在协议层的最小形态。
  *
+ * P0-1-18 的两条验收（→ H 组）：
+ *   ④ 传扫描版 PDF → `FAILED` 且 `error_msg` 含「疑似扫描件」
+ *   ⑤ 短通知恰好 1 个 chunk（不被切开）、结构清晰的 docx 边界落在句末
+ *       ⚠️ ⑤ 只能在**模块级**验：分块产物本批不落库（HTTP 层看不到"切了几块"），
+ *          详细理由见下面 H 组那段。
+ *
+ * ⚠️ P0-1-18 起"能走完流水线"多了一道门槛：有效字符 ≥ `EMPTY_TEXT_THRESHOLD`（默认 50）。
+ *    本文件里凡**真跑默认阶段**的夹具都已按此写长（C 组的 docx/txt、F 组的 PDF 在 P0-1-18
+ *    被加长过 —— 这一点记在 `issue_fix/问题记录-P0-1-18-*.md`，免得下一个人以为"夹具本来就该这么长"）。
+
+ *
  * ─────────────────────────────────────────────────────────────────────
- * 分八组，各自守一件容易做错的事
+ * 分九组，各自守一件容易做错的事
  * ─────────────────────────────────────────────────────────────────────
  * A 组 **纯函数**（不需要服务）：job 编解码往返 + 非法 payload + 状态机转换矩阵。
  *    "READY 不得被打回 FAILED"这条不变式只有这一组能守（HTTP 层永远看不到它）。
@@ -22,7 +33,21 @@
  * E 组 **并发闸**：8 个慢任务，峰值并发恰为 2，且总耗时说明真的分批而不是全放行。
  * F 组 **失败与重试**：S3 对象缺失 → `FAILED` + 可读 `error_msg`；补回对象并重投 → 回到 `READY`。
  * G 组 **上传与入队的原子性**（子进程 A/B 对照）：真 Redis 成功 / 死 Redis 失败且**整次上传回滚**。
- * H 组 **自清理 + 残留复核**：删库后 DB 与 S3 双清、队列键不残留、会话与快照归零。
+ * H 组 **空文本检测 + 分块**（P0-1-18）：扫描件 → `FAILED` 且原因含「疑似扫描件」、
+ *    阈值边界（恰好达标通过 / 少一个字符失败）、**真字节重跑阶段数组**验分块边界与重叠、
+ *    以及"空文本检测拦在分块之前"的顺序取证。
+ * I 组 **自清理 + 残留复核**：删库后 DB 与 S3 双清、队列键不残留、会话与快照归零。
+ *    （本组是 P0-1-17 的 "H 组"；P0-1-18 在它前面插了新组，故顺延为 I 组。）
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * H 组为什么"一半走 HTTP、一半走模块级"
+ * ─────────────────────────────────────────────────────────────────────
+ * 空文本检测把文档打成 `FAILED` + `error_msg` ⇒ **HTTP 层看得见**，所以走真上传 → 真 worker。
+ * 而分块的产物本批**不落库**（`chunk_count` 恒为 0、`chunks` 表为空，见 `stages.ts` 的
+ * `chunkStage` 注释）⇒ 没有任何响应能看到"切了几块"。于是用 `runStagesOnDocument()` 把
+ * **存储里的真字节**再喂给同一条 `load-source → parse → detect-empty-text → chunk` ——
+ * 不是桩、不是复制一份逻辑，只是换了个调用入口。这与 P0-1-16 处理"解析结果"的手法同源。
+
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三处注入，都是为了让断言有真假之分
@@ -77,10 +102,17 @@ const {
   startPipelineWorker,
   stopPipelineWorker,
 } = await import('../dist/backend/src/pipeline/worker.js')
+// P0-1-18：空文本检测与分块阶段（H 组要拿真字节重跑这条数组）
+const { defaultPipelineStages } = await import('../dist/backend/src/pipeline/stages.js')
+const { countChars } = await import('../dist/backend/src/pipeline/parse/index.js')
+const { DEFAULT_CHUNK_MIN_CHARS, SENTENCE_BOUNDARY_CHARS } = await import(
+  '../dist/backend/src/pipeline/chunk/index.js'
+)
 const {
   DOCUMENT_STATUSES,
   DOCUMENT_STATUS_TRANSITIONS,
   canTransitionDocumentStatus,
+  normalizeRetrievalConfig,
   uploadDocumentResultSchema,
 } = await import('@doubulea/shared')
 const fixtures = await import('./fixtures/documents.mjs')
@@ -218,6 +250,70 @@ async function upload(kbId, { cookie, bytes, fileName, contentType }) {
 async function uploadFresh(kbId, cookie, tag) {
   const bytes = Buffer.from(`# ${tag}\n\n${tag} 的正文内容，用于流水线幂等与并发用例（${suffix}）。\n`, 'utf8')
   return upload(kbId, { cookie, bytes, fileName: `${tag}.md`, contentType: 'text/markdown' })
+}
+
+/**
+ * 上传若干夹具 + 用**默认阶段序列**跑完 worker，返回 docId 数组。
+ *
+ * ⚠️ P0-1-18 起"能走完流水线"多了一道门槛：**有效字符必须 ≥ `EMPTY_TEXT_THRESHOLD`**
+ * （默认 50）。本组（H 组）之前那些只在 D/E 组里当"幂等靶子"的短文档不受影响（那两组注入的是
+ * 慢速假阶段，根本不跑 ④⑤），但**真跑默认阶段的用例**必须给足内容 —— 否则失败原因会是
+ * "疑似扫描件"，看着像被测代码坏了，其实是夹具太短。
+ */
+async function uploadAndProcess(kbId, cookie, items) {
+  const ids = []
+  for (const item of items) {
+    const { docId } = await upload(kbId, { cookie, ...item })
+    ids.push(docId)
+  }
+  startPipelineWorker()
+  await waitFor(
+    '本批上传的文档全部离开 PARSING',
+    async () => (await prisma.document.count({ where: { id: { in: ids }, status: 'PARSING' } })) === 0,
+    { timeoutMs: 30_000, intervalMs: 25 },
+  )
+  await waitDrained({ timeoutMs: 10_000 })
+  await stopPipelineWorker(2_000)
+  return ids
+}
+
+/**
+ * **模块级**重跑默认阶段数组（P0-1-18 的 H 组用）。
+ *
+ * 为什么不看接口：分块的产物本批**不落库**（`chunk_count` 恒为 0、`chunks` 表为空，见
+ * `stages.ts` 的 `chunkStage` 注释）⇒ 没有任何 HTTP 响应能看到"切了几块"。于是像
+ * P0-1-16 处理"解析结果"那样，把阶段数组拿**存储里的真字节**再跑一遍：
+ * 走的是同一条 `load-source → parse → detect-empty-text → chunk`，不是桩。
+ *
+ * 返回 `{ ctx, error }`：失败也返回（而不是抛），因为"在哪一步失败"本身就是要断言的东西
+ * ——`ctx.chunks === undefined` 恰好证明空文本检测**拦在分块之前**。
+ */
+async function runStagesOnDocument(docId) {
+  const row = await prisma.document.findUnique({ where: { id: docId }, include: { kb: true } })
+  assert(row !== null, `文档 ${docId} 应存在`)
+  const ctx = {
+    job: { docId: row.id, kbId: row.kbId, contentHash: row.contentHash, mode: 'NEW' },
+    document: {
+      id: row.id,
+      kbId: row.kbId,
+      fileKey: row.fileKey,
+      fileName: row.fileName,
+      contentHash: row.contentHash,
+      chunkSize: row.kb.chunkSize,
+      chunkOverlap: row.kb.chunkOverlap,
+      splitStrategy: normalizeRetrievalConfig(row.kb.retrievalConfig).splitStrategy,
+    },
+    // 静音日志：阶段里的 debug/warn 对本组没有信息量，反而会打散断言输出
+    log: { debug() {}, info() {}, warn() {}, error() {}, child() { return this } },
+  }
+  for (const stage of defaultPipelineStages) {
+    try {
+      await stage.run(ctx)
+    } catch (error) {
+      return { ctx, error }
+    }
+  }
+  return { ctx, error: undefined }
 }
 
 async function docRow(docId) {
@@ -487,15 +583,31 @@ try {
       contentType: 'application/pdf',
     },
     {
+      // ⚠️ 本夹具在 P0-1-18 被**写长**了：原先只有"报销制度 + 一句话"（20 个有效字符），
+      //    而本批的空文本检测（§五，阈值 50）会把它判成"疑似扫描件" ⇒ 本组的"四篇全 READY"
+      //    必然假失败。这是**刻意的行为变化**（不是回归），处置是让夹具满足门槛 ——
+      //    "太短会被拦"这件事由 H 组用专门的用例去验，不混在这里。
       bytes: fixtures.makeDocx([
         { level: 1, text: '报销制度' },
-        { text: '出差住宿标准为每晚上限 500 元。' },
+        { text: '出差住宿标准为每晚上限 500 元，超额部分需部门负责人审批后报销。' },
+        { text: '交通费与住宿费分开填写，票据按发生时间顺序附在报销单之后。' },
+        { text: '跨月费用以发票日期为准，当月未提交的顺延至下月一并处理。' },
       ]),
       fileName: '制度.docx',
       contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     },
     { bytes: fixtures.makeMarkdown(), fileName: '员工手册.md', contentType: 'text/markdown' },
-    { bytes: fixtures.makeTxtUtf8(), fileName: '巡检.txt', contentType: 'text/plain' },
+    {
+      // 同上：`makeTxtUtf8()` 只有 29 个有效字符，作为"真跑默认阶段"的夹具已不够用
+      bytes: Buffer.from(
+        '第一行：设备巡检记录 —— 主机房温度 22 度，相对湿度 45%。\n' +
+          '第二行：UPS 电池组电压正常，逐节测量未发现鼓包与漏液。\n' +
+          '第三行：空调回风滤网已更换，下次更换时间为下月一日之前。\n',
+        'utf8',
+      ),
+      fileName: '巡检.txt',
+      contentType: 'text/plain',
+    },
   ]
   const realDocIds = []
 
@@ -515,8 +627,8 @@ try {
     assertEqual(started.concurrency, config.concurrency.pipeline, '并发上限取 PIPELINE_CONCURRENCY')
     assertEqual(
       JSON.stringify(started.stages),
-      JSON.stringify(['load-source', 'parse']),
-      '默认阶段序列（④⑤ 属 P0-1-18、⑥⑦ 属 P0-1-19）',
+      JSON.stringify(['load-source', 'parse', 'detect-empty-text', 'chunk']),
+      '默认阶段序列（P0-1-18 起四步；⑥⑦ 属 P0-1-19）',
     )
 
     await waitFor(
@@ -531,9 +643,10 @@ try {
     for (const row of rows) {
       assertEqual(row.status, 'READY', `${row.fileName} 的状态`)
       assertEqual(row.errorMsg, null, `${row.fileName} 的 error_msg（成功路径必须是 null，不是空串）`)
-      // ⚠️ 刻意断言 0：本批只到"解析成功"，chunk 入库是 P0-1-18/19。此刻 READY 的含义是
-      //    "解析这一关过了"，**还不是**"可检索"（见 `stages.ts` 文件头）
-      assertEqual(row.chunkCount, 0, `${row.fileName} 的 chunk_count（P0-1-18/19 才填，这里是预期值）`)
+      // ⚠️ 刻意断言 0：P0-1-18 已经把块**切出来**了，但**没有落库**（⑥⑦ 属 P0-1-19）
+      //    ⇒ 此刻 READY 的含义是"解析与分块都过了"，**还不是**"可检索"
+      //    （见 `stages.ts` 的 `chunkStage` 注释：写 0 而不是块数是刻意的）。
+      assertEqual(row.chunkCount, 0, `${row.fileName} 的 chunk_count（P0-1-19 才填，这里是预期值）`)
     }
 
     const stats = getPipelineWorkerStats()
@@ -678,7 +791,11 @@ try {
   // ═══════════════════════════════════════════════════════════════════
   console.log(`\n${c.b}── F 组 · FAILED 与重投救回（"List 无 ack ⇒ 必须有重试入口"）──${c.x}`)
 
-  const fBytes = fixtures.makePdf([['Retry Policy', 'Body text for the retry case']])
+  // ⚠️ 这份夹具也必须够长（≥ `EMPTY_TEXT_THRESHOLD`）：下面"补回对象 + 重投"那一条要求它
+  //    走到 READY，若内容不足 50 个有效字符，失败原因会变成"疑似扫描件"（P0-1-18 起）
+  const fBytes = fixtures.makePdf([
+    ['Retry Policy', 'Body text for the retry case', 'Second line for the retry case'],
+  ])
   const missing = await upload(kb.id, {
     cookie: adminCookie,
     bytes: fBytes,
@@ -802,9 +919,140 @@ try {
   })
 
   // ═══════════════════════════════════════════════════════════════════
-  // H 组 · 自清理 + 残留复核
+  // H 组 · 空文本检测（§五）+ 分块（§4-2）—— P0-1-18
   // ═══════════════════════════════════════════════════════════════════
-  console.log(`\n${c.b}── H 组 · 清场：删库双清、队列键不残留 ──${c.x}`)
+  // 本组为什么长这样（两条"验不到"的坑各自绕开）：
+  //  · 空文本检测**能**在 HTTP 层验（它把状态打成 FAILED + error_msg），所以走真上传 → 真 worker；
+  //  · 分块的产物**不落库**（本批刻意如此，见 `stages.ts`）⇒ 没有任何响应能看到"切了几块"，
+  //    于是用 `runStagesOnDocument()` 把阶段数组拿**存储里的真字节**再跑一遍 ——
+  //    不是桩，是同一条 `load-source → parse → detect-empty-text → chunk`。
+  console.log(`\n${c.b}── H 组 · 空文本检测（§五）与分块（§4-2，真字节重跑阶段数组）──${c.x}`)
+
+  const [blankDocId] = await uploadAndProcess(kb.id, adminCookie, [
+    {
+      bytes: fixtures.makeBlankPdf(2),
+      fileName: '扫描件.pdf',
+      contentType: 'application/pdf',
+    },
+  ])
+
+  await it('扫描件（有页面、无文本的 PDF）→ FAILED，error_msg 含「疑似扫描件」，且一块都没切', async () => {
+    // `docs/06` 该批验收原句："传扫描版 PDF → FAILED 且 error_msg 含「疑似扫描件」"
+    const row = await docRow(blankDocId)
+    assertEqual(row.status, 'FAILED', '状态')
+    assertIncludes(row.errorMsg ?? '', '疑似扫描件', '失败原因')
+    assertIncludes(row.errorMsg ?? '', '50', '失败原因里应带上**实测阈值**（阈值可配，写死 50 会与判据不一致）')
+    assertEqual(row.chunkCount, 0, 'chunk_count')
+    assertEqual(await prisma.chunk.count({ where: { docId: blankDocId } }), 0, 'chunks 表不该有任何一行')
+    // 原文件**必须保留**：用户要能下载回去核对"我传的到底是不是扫描件"（§五）
+    assertEqual(
+      (await listKeys(`kb/${kb.id}/`)).includes(row.fileKey),
+      true,
+      '失败文档的原始文件应留在 S3（便于用户核对）',
+    )
+  })
+
+  await it('顺序取证：空文本检测拦在**分块之前**（重跑阶段数组时 ctx.chunks 仍是 undefined）', async () => {
+    // 条顺序有实际后果：反过来的话扫描件会先被切一遍再判失败（白干），
+    // 且"chunk 数为 0 却报了句子级错误"会让排查方向跑偏。用阶段产物的**缺席**来取证最直接。
+    const { ctx, error } = await runStagesOnDocument(blankDocId)
+    assert(error !== undefined, '这份扫描件应当抛出（空文本检测）')
+    assertIncludes(String(error.message), '疑似扫描件', '抛出的原因')
+    assert(ctx.parsed !== undefined, 'parse 阶段确实跑过了（不是提前失败）')
+    assertEqual(ctx.chunks, undefined, 'chunk 阶段**未执行** ⇒ ④ 排在 ⑤ 之前')
+  })
+
+  await it('阈值边界：有效字符恰好 = EMPTY_TEXT_THRESHOLD 通过；少一个字符即 FAILED（判据是 `<` 不是 `<=`）', async () => {
+    const threshold = config.pipeline.emptyTextThreshold
+    // 阈值可配 ⇒ 不能写死 50；两条用例的内容按当前阈值生成
+    const atBoundary = Buffer.from('甲'.repeat(threshold), 'utf8')
+    const belowBoundary = Buffer.from('乙'.repeat(threshold - 1), 'utf8')
+    const [atId, belowId] = await uploadAndProcess(kb.id, adminCookie, [
+      { bytes: atBoundary, fileName: '恰好达阈值.txt', contentType: 'text/plain' },
+      { bytes: belowBoundary, fileName: '差一个字符.txt', contentType: 'text/plain' },
+    ])
+
+    const atRow = await docRow(atId)
+    const belowRow = await docRow(belowId)
+    assertEqual(atRow.status, 'READY', `恰好 ${threshold} 个有效字符应通过`)
+    assertEqual(atRow.errorMsg, null, '通过时不该有 error_msg')
+    assertEqual(belowRow.status, 'FAILED', `只有 ${threshold - 1} 个有效字符应失败`)
+    assertIncludes(belowRow.errorMsg ?? '', '疑似扫描件', '失败原因')
+
+    // 边界与判据同源：拿同一个 `countChars` 复核一遍（防"文案里的数字与判定用的数字不是一个"）
+    assertEqual(countChars('甲'.repeat(threshold)), threshold, '达标那篇的有效字符数')
+    assertEqual(countChars('乙'.repeat(threshold - 1)), threshold - 1, '未达标那篇的有效字符数')
+  })
+
+  /** 结构清晰的长 docx：1 个标题 + 6 段各 105 字（同一 Section 内 ~646 字 ⇒ 必然切两刀以上） */
+  const longDocxBlocks = [{ level: 1, text: '员工手册' }]
+  for (let i = 1; i <= 6; i += 1) longDocxBlocks.push({ text: `第${i}条规定：${'甲'.repeat(98)}。` })
+
+  const [longDocxId] = await uploadAndProcess(kb.id, adminCookie, [
+    {
+      bytes: fixtures.makeDocx(longDocxBlocks),
+      fileName: '长制度.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    },
+  ])
+
+  await it('分块真跑（结构清晰 docx）：2 块、首块边界落在句末，且 `chunk_count` 仍为 0（本批只算不落库）', async () => {
+    const row = await docRow(longDocxId)
+    assertEqual(row.status, 'READY', '状态')
+    assertEqual(row.chunkCount, 0, 'chunk_count 必须仍是 0（写了它就会"说有 2 块、检索却搜不到"）')
+    assertEqual(await prisma.chunk.count({ where: { docId: longDocxId } }), 0, 'chunks 表仍然为空')
+
+    const { ctx, error } = await runStagesOnDocument(longDocxId)
+    assertEqual(error, undefined, '这份文档应当走完四个阶段')
+    const chunks = ctx.chunks ?? []
+    assertEqual(chunks.length, 2, '按默认参数应切 2 块')
+    assertEqual(chunks.map((chunk) => chunk.seq).join(','), '0,1', 'seq 连续且从 0 起')
+
+    const firstChars = [...chunks[0].content]
+    assert(
+      firstChars.length < ctx.document.chunkSize,
+      `首块长度 ${firstChars.length} 应小于 chunk_size ${ctx.document.chunkSize}（回退到句末才会小于）`,
+    )
+    const lastChar = firstChars[firstChars.length - 1]
+    assert(
+      SENTENCE_BOUNDARY_CHARS.includes(lastChar),
+      `首块末字符应是句末边界，实际 ${JSON.stringify(lastChar)}（硬切会落在"甲"上）`,
+    )
+    // 重叠：第 2 块以第 1 块末 chunk_overlap 个字符开头（真实链路上的重叠，不只是纯函数里那一条）
+    const secondChars = [...chunks[1].content]
+    assertEqual(
+      secondChars.slice(0, ctx.document.chunkOverlap).join(''),
+      firstChars.slice(firstChars.length - ctx.document.chunkOverlap).join(''),
+      '第 2 块的重叠前缀',
+    )
+    // 每块都是**存储里那份原文**的逐字子串（引用片段能与原文核对的前提，P0-1-20 要用）
+    for (const chunk of chunks) {
+      assert(ctx.parsed.text.includes(chunk.content), `第 ${chunk.seq} 块不是原文的逐字子串`)
+    }
+  })
+
+  await it('分块真跑（200 字短通知）：**恰好 1 块**且与原文逐字相同（小文档特例）', async () => {
+    const notice = '通'.repeat(200)
+    const [noticeId] = await uploadAndProcess(kb.id, adminCookie, [
+      { bytes: Buffer.from(notice, 'utf8'), fileName: '短通知.txt', contentType: 'text/plain' },
+    ])
+
+    const { ctx, error } = await runStagesOnDocument(noticeId)
+    assertEqual(error, undefined, '这份文档应当走完四个阶段')
+    const chunks = ctx.chunks ?? []
+    assertEqual(chunks.length, 1, '200 字短通知应恰好 1 块（不被切开）')
+    assertEqual(chunks[0].content, ctx.parsed.text, '单块内容应与解析出的原文逐字相同')
+    assertEqual(chunks[0].meta.headingPath.length, 0, '纯文本无标题 ⇒ headingPath 为空数组')
+    assertEqual(chunks[0].meta.page, null, '非分页格式的 page 应为 null（不是 0、不是 undefined）')
+    assertEqual(DEFAULT_CHUNK_MIN_CHARS, 50, 'chunk_min 取 §二 的 50')
+  })
+
+  // ═══════════════════════════════════════════════════════════════════
+  // I 组 · 自清理 + 残留复核
+  // ═══════════════════════════════════════════════════════════════════
+  // ⚠️ 本组是 P0-1-17 的 "H 组"：P0-1-18 在它前面插了新的 H 组（空文本检测 + 分块），
+  //    故顺延为 I 组。组号的用处只是"文档里指哪一组"，含义（清场）未变。
+  console.log(`\n${c.b}── I 组 · 清场：删库双清、队列键不残留 ──${c.x}`)
 
   await it('删库（API）→ 该库 documents 行与 S3 对象全部清空（包括 worker 处理过的那些）', async () => {
     assert((await listKeys(`kb/${kb.id}/`)).length >= 8, '前置：库内对象应 ≥8 个')
@@ -862,9 +1110,9 @@ try {
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-1-17 异步队列 + 状态机 + worker 骨架验收通过：${passed} 项全通过${c.x}`)
+  console.log(`${c.g}${c.b}✅ 文档流水线验收通过（P0-1-17 队列/状态机/worker + P0-1-18 空文本检测/分块）：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-1-17 异步队列 + 状态机 + worker 骨架验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ 文档流水线验收未通过（P0-1-17 + P0-1-18）：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }

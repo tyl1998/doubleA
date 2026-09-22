@@ -32,6 +32,13 @@
  *   · P0-1-17：**文档状态机的转换表**（合法转换恰好 5 条；`READY` 不得被打回 `FAILED`、也不能
  *              自转 `READY` —— 这是"过期 job 把已成功的文档写坏"的唯一防线，没有任何 HTTP 路径
  *              能验到它，只能在这一档守）。队列与 worker 的行为要真 Redis/PG/S3，归 `verify-pipeline`。
+ *   · P0-1-18：**分块策略的纯函数契约**（`hybrid`/`fixed`）—— 小文档特例（全文 ≤ chunk_size
+ *              恰好 1 块）、边界回退到句末（而不是硬切）、**每块都是原文的逐字子串**、
+ *              重叠 64 字符、尾块合并、定长滑窗、**按码点切（不劈开代理对）**、
+ *              页码 meta 取"块起点所在页"、同名标题不相邻时**顺序保持**、未知策略回落默认。
+ *              分块模块不 import `config`/logger ⇒ 这一档（无依赖、可进 CI）能直接断言它；
+ *              夹具（手写 PDF/DOCX 字节）也是纯生成器。行为侧（真上传 → 真解析 → 真分块）
+ *              归 `verify-pipeline` 的 H 组。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -98,6 +105,7 @@ import {
   ok,
   retrievalConfigInputSchema,
   remoteModelListResultSchema,
+  SPLIT_STRATEGIES,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -123,8 +131,20 @@ import {
 } from '../dist/backend/src/infra/crypto.js'
 import { closePg } from '../dist/backend/src/infra/pg.js'
 import { closeRedis } from '../dist/backend/src/infra/redis.js'
-import { countChars, detectFormat } from '../dist/backend/src/pipeline/parse/index.js'
+import { countChars, detectFormat, parseDocument } from '../dist/backend/src/pipeline/parse/index.js'
+// 分块模块刻意**不依赖 config/logger**（见其文件头）⇒ 它可以在这一档（无依赖、可进 CI）里被断言，
+// 这也是本档第一条"纯函数契约必须有无依赖断言"的实践：分块的三种典型错误（劈开代理对、
+// 硬切在 chunk_size、跨段乱序合并）都不会被 lint/typecheck/build 拦下，也不会让接口 400。
+import {
+  DEFAULT_CHUNK_MIN_CHARS,
+  SENTENCE_BOUNDARY_CHARS,
+  chunkStrategyNames,
+  resolveChunkStrategy,
+  splitIntoChunks,
+} from '../dist/backend/src/pipeline/chunk/index.js'
 import { providerKeyAad } from '../dist/backend/src/services/model.service.js'
+// 夹具是纯 JS 生成器（手写 PDF/DOCX/ZIP 字节），不引依赖、不读外部文件 ⇒ 仍然满足本档"无依赖"
+import * as fixtures from './fixtures/documents.mjs'
 
 const useColor = process.stdout.isTTY === true
 const c = {
@@ -1532,6 +1552,197 @@ await it('状态机转换表：合法转换恰好 5 条，且 **READY 不得被�
     const computed = DOCUMENT_STATUSES.filter((to) => canTransitionDocumentStatus(from, to)).sort().join(',')
     assertEqual(computed, declared, `${from} 的后继集合应与 DOCUMENT_STATUS_TRANSITIONS 一致`)
   }
+})
+
+// ── 20. 分块策略契约（P0-1-18；纯函数 + 真夹具，不需要任何依赖）──
+console.log(`\n${c.b}── 分块策略契约（hybrid / fixed：逐条盯"做错会静默"的地方）──${c.x}`)
+
+/** 分块参数取 §二 的默认值（KB 建库时快照的就是这几个数） */
+const CHUNK_OPT = { chunkSize: 512, chunkOverlap: 64, chunkMin: DEFAULT_CHUNK_MIN_CHARS }
+/** 码点数（`chunk_size` 的单位是字符，见 §二 B8 —— 断言也必须用它，否则量错了对象） */
+const cps = (text) => [...text]
+/** 造一份"一段文本 + 无标题"的解析结果（纯函数入参，不经过解析器） */
+const flatDoc = (text, headingPath = [], page = null) => ({
+  blocks: [{ text, headingPath, page }],
+  text,
+  meta: {
+    format: 'txt',
+    pageCount: page === null ? null : 1,
+    charCount: countChars(text),
+    hasHeadings: headingPath.length > 0,
+    encoding: 'utf-8',
+  },
+})
+/** 解析一个夹具（真跑解析器：分块的上游就是它，桩掉等于把"能接到真数据"这件事漏掉） */
+const parseFixture = (fileName, bytes) => parseDocument(detectFormat({ fileName, bytes }), bytes)
+
+/** 结构清晰 docx：1 个标题 + 6 段各 105 字（同一 Section 内共 ~646 字 ⇒ 必须切两刀以上） */
+const LONG_DOCX_BLOCKS = [{ level: 1, text: '员工手册' }]
+for (let i = 1; i <= 6; i += 1) LONG_DOCX_BLOCKS.push({ text: `第${i}条规定：${'甲'.repeat(98)}。` })
+
+await it('小文档特例：全文 ≤ chunk_size → **恰好 1 块**，且与原文逐字相同（不被切开）', async () => {
+  // `docs/06` 该批验收原句："传 200 字短通知 → 恰好 1 个 chunk（不被切开）"
+  const notice = '通'.repeat(200)
+  const noticeChunks = splitIntoChunks(flatDoc(notice), CHUNK_OPT)
+  assertEqual(noticeChunks.length, 1, '200 字短通知应恰好 1 块')
+  assertEqual(noticeChunks[0].content, notice, '单块的内容应与原文逐字相同')
+  assertEqual(noticeChunks[0].seq, 0, '首块 seq 从 0 起（`chunks.seq` 的口径）')
+
+  // 带 3 个标题但全文只有 80 字（去空白后）的 md：小文档特例判在"全文"而不是"每个 Section"
+  // ⇒ 仍然是 1 块（按 Section 判会切出 4 块，与验收原句矛盾）
+  const markdown = fixtures.makeMarkdown()
+  const mdParsed = await parseFixture('staff.md', markdown)
+  assertEqual(mdParsed.meta.hasHeadings, true, 'md 夹具应当解析出标题结构（否则下一条断言失去意义）')
+  const mdChunks = splitIntoChunks(mdParsed, CHUNK_OPT)
+  assertEqual(mdChunks.length, 1, '全文 ≤ chunk_size 时即使有多个标题也只出 1 块')
+  assertEqual(mdChunks[0].content, mdParsed.text, '整块内容应与 parsed.text 逐字相同')
+})
+
+await it('hybrid：边界**回退到句末**（首块长度小于 chunk_size，末字符是句末边界）', async () => {
+  // 这条是 hybrid 与 fixed 的分水岭：不做回退的实现会在 chunk_size 处硬切（首块恰好 512 字、
+  // 且末字符是"甲"），而 `docs/06` 的验收要求"chunk 边界落在句末"。
+  const docx = fixtures.makeDocx(LONG_DOCX_BLOCKS)
+  const parsed = await parseFixture('staff.docx', docx)
+  const chunks = splitIntoChunks(parsed, CHUNK_OPT)
+  assert(chunks.length >= 2, `长文档应切成多块，实际 ${chunks.length} 块`)
+
+  const first = chunks[0]
+  const firstChars = cps(first.content)
+  assert(
+    firstChars.length < CHUNK_OPT.chunkSize,
+    `首块长度应小于 chunk_size（回退过），实际 ${firstChars.length}`,
+  )
+  const lastChar = firstChars[firstChars.length - 1]
+  assert(
+    SENTENCE_BOUNDARY_CHARS.includes(lastChar),
+    `首块末字符应是句末边界，实际 ${JSON.stringify(lastChar)}（硬切会落在"甲"上）`,
+  )
+  // 回退到段末 ⇒ 末字符就是段间分隔符（`\n`）—— 顺带证明"段间分隔符也算边界"这个扩充分支生效
+  assertEqual(lastChar, '\n', '本夹具的最近边界是段间换行')
+  // 每段的句号都完整保留（没有把某一段的句号切到下一块去）
+  assert(cps(first.content).filter((ch) => ch === '。').length === 4, '首块应完整包含前 4 段的句号')
+})
+
+await it('不变式：每一块都是 `parsed.text` 的**逐字子串**（P0-1-20 的引用片段靠它）', async () => {
+  // 整条链只做"取连续区间"（重叠也是取前一块尾部）⇒ 不存在"重新拼接出原文里没有的句子"。
+  // P0-1-20 要输出"snippet 与原文逐字一致"，这条不变式就是它的前提；破了则引用无法核对。
+  for (const [fileName, bytes] of [
+    ['staff.docx', fixtures.makeDocx(LONG_DOCX_BLOCKS)],
+    ['staff.md', fixtures.makeMarkdown()],
+    ['staff.txt', fixtures.makeTxtUtf8()],
+  ]) {
+    const parsed = await parseFixture(fileName, bytes)
+    const chunks = splitIntoChunks(parsed, CHUNK_OPT)
+    assert(chunks.length > 0, `${fileName} 应至少产出 1 块`)
+    for (const chunk of chunks) {
+      assert(
+        parsed.text.includes(chunk.content),
+        `${fileName} 的第 ${chunk.seq} 块不是原文的逐字子串：${JSON.stringify(chunk.content.slice(0, 40))}…`,
+      )
+    }
+  }
+})
+
+await it('重叠：第 2 块以第 1 块末尾 chunk_overlap 个字符开头，且块长 ≤ chunk_size + overlap', async () => {
+  const parsed = await parseFixture('staff.docx', fixtures.makeDocx(LONG_DOCX_BLOCKS))
+  const chunks = splitIntoChunks(parsed, CHUNK_OPT)
+  assert(chunks.length >= 2, '本夹具应至少 2 块')
+  const first = cps(chunks[0].content)
+  const second = cps(chunks[1].content)
+  const expectedPrefix = first.slice(first.length - CHUNK_OPT.chunkOverlap).join('')
+  assertEqual(
+    second.slice(0, CHUNK_OPT.chunkOverlap).join(''),
+    expectedPrefix,
+    '第 2 块开头应是第 1 块的末 chunk_overlap 个字符（重叠是"取前块尾"，不是新造的句子）',
+  )
+  // 上界：重叠前缀 + 段体 ≤ chunk_size + overlap（尾块合并那一条会再放宽 chunk_min，见下一例）
+  for (const chunk of chunks) {
+    assert(
+      cps(chunk.content).length <= CHUNK_OPT.chunkSize + CHUNK_OPT.chunkOverlap,
+      `块长 ${cps(chunk.content).length} 越界（应 ≤ ${CHUNK_OPT.chunkSize + CHUNK_OPT.chunkOverlap}）`,
+    )
+  }
+})
+
+await it('尾块合并：尾块 < chunk_min 并入前块（与 fixed 的对照证明是 hybrid 的行为）', async () => {
+  // 561 字：chunkSize(512) + 49（< chunk_min 50）且**通篇没有句读**
+  // ⇒ hybrid 应并成 1 块 561 字；fixed 不做合并，会切成 512 + 113（重叠后）
+  const flat = flatDoc('丙'.repeat(561))
+  const hybridChunks = splitIntoChunks(flat, CHUNK_OPT)
+  assertEqual(hybridChunks.length, 1, 'hybrid：49 字的尾块应并入前块 ⇒ 只剩 1 块')
+  assertEqual(cps(hybridChunks[0].content).length, 561, '合并后的块应包含全部 561 字')
+
+  const fixedChunks = splitIntoChunks(flat, CHUNK_OPT, 'fixed')
+  assertEqual(fixedChunks.length, 2, 'fixed 不做尾块合并 ⇒ 2 块（这正是两者的差别）')
+})
+
+await it('fixed：定长滑窗，块长恒 ≤ chunk_size（+重叠），且首块就是 chunk_size', async () => {
+  const chunks = splitIntoChunks(flatDoc('丁'.repeat(1000)), CHUNK_OPT, 'fixed')
+  // 1000 = 512 + 488，步长 = 512 − 64 = 448 ⇒ 起点 0 / 448 / 896 → 3 块
+  assertEqual(chunks.map((chunk) => cps(chunk.content).length).join(','), '512,512,104', '定长滑窗的块长序列')
+  assertEqual(chunks.map((chunk) => chunk.seq).join(','), '0,1,2', 'seq 连续且从 0 起')
+})
+
+await it('单位是**码点**：长 emoji 文本按 fixed 切不会劈开代理对', () => {
+  // `.length` 会把 emoji 数成 2，用 `text.slice()` 就可能只取到半个代理对 ——
+  // 产出的是**非法字符串**（下游 embedding 直接报错），而**本层没有任何报错**。
+  const emoji = '😀'.repeat(600)
+  const chunks = splitIntoChunks(flatDoc(emoji), CHUNK_OPT, 'fixed')
+  assertEqual(chunks.map((chunk) => cps(chunk.content).length).join(','), '512,152', '按码点计的长度')
+  for (const chunk of chunks) {
+    assert(
+      cps(chunk.content).every((char) => char === '😀'),
+      `第 ${chunk.seq} 块里出现了半个代理对（说明是按 UTF-16 下标切的）`,
+    )
+  }
+})
+
+await it('页码 meta 取"块起点所在页"：跨页的块不会被说成第 1 页', async () => {
+  // PDF 夹具每页 20 行（必须**折行**：单条超长 `Tj` 会超出 MediaBox，pdf.js 只提取页面框内的文本，
+  // 于是被静默截断 —— 见 `issue_fix/问题记录-P0-1-18-*.md`）
+  const lines = (tag) => Array.from({ length: 20 }, (_, i) => `${tag} line ${i + 1} ${'x'.repeat(20)}`)
+  const parsed = await parseFixture('two-pages.pdf', fixtures.makePdf([lines('alpha'), lines('bravo')]))
+  assertEqual(parsed.meta.pageCount, 2, 'PDF 夹具应有 2 页')
+  assertEqual(parsed.blocks.map((block) => block.page).join(','), '1,2', '每个段应带上自己的页码')
+
+  const chunks = splitIntoChunks(parsed, CHUNK_OPT)
+  assertEqual(chunks.length, 3, '1222 字按默认参数应切 3 块')
+  assertEqual(chunks[0].meta.page, 1, '首块的起点落在第 1 页')
+  assertEqual(chunks[chunks.length - 1].meta.page, 2, '末块的起点落在第 2 页（按 Section 取页码的实现会说成 1）')
+})
+
+await it('同名标题**不相邻**时不合并（顺序保持 = 与原文一致）', () => {
+  // 按 `headingPath` 分组（Map）的实现会把两段"考勤"并到一起，于是第二段被排到"报销"前面。
+  // 这种错位在检索层几乎无法发现：命中的片段读起来通顺，只是位置不对。
+  const body = '甲'.repeat(300)
+  const blocks = [
+    { text: body, headingPath: ['考勤'], page: null },
+    { text: '乙'.repeat(300), headingPath: ['报销'], page: null },
+    { text: body, headingPath: ['考勤'], page: null },
+  ]
+  const parsed = {
+    blocks,
+    text: blocks.map((block) => block.text).join('\n\n'),
+    meta: { format: 'docx', pageCount: null, charCount: 900, hasHeadings: true, encoding: 'utf-8' },
+  }
+  const chunks = splitIntoChunks(parsed, CHUNK_OPT)
+  assertEqual(chunks.length, 3, '三个同名/异名交替的段各占一块')
+  assertEqual(
+    chunks.map((chunk) => chunk.meta.headingPath.join('/')).join(','),
+    '考勤,报销,考勤',
+    '标题路径应随原文顺序（合并实现的输出是"考勤,考勤,报销"或少一块）',
+  )
+})
+
+await it('策略注册表：默认与回落都是 hybrid，且策略名集合与 shared 的 `SPLIT_STRATEGIES` 同源', () => {
+  assertEqual([...chunkStrategyNames()].sort().join(','), [...SPLIT_STRATEGIES].sort().join(','), '策略名集合')
+  assertEqual(resolveChunkStrategy('hybrid').name, 'hybrid', '按名取 hybrid')
+  assertEqual(resolveChunkStrategy('fixed').name, 'fixed', '按名取 fixed')
+  // 未知值退默认而不是抛错：补默认值的口径由 `normalizeRetrievalConfig` 定死（"永不抛错"），
+  // 这里再抛一次等于同一件事两个相反口径；且报错代价是"文档被标成 FAILED、用户去重传"。
+  assertEqual(resolveChunkStrategy('nope').name, 'hybrid', '未知策略回落 hybrid')
+  assertEqual(splitIntoChunks(flatDoc('戊'.repeat(100)), CHUNK_OPT).length, 1, '省略策略参数时走默认 hybrid')
+  assertEqual(DEFAULT_CHUNK_MIN_CHARS, 50, 'chunk_min 是 §二 的 50（它不是环境变量，见 strategy.ts 注释）')
 })
 
 await app.close()
