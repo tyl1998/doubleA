@@ -30,6 +30,17 @@
  * 就要拉这些列表来渲染多选框（`03` §4.2 第 4 条）。
  *
  * ─────────────────────────────────────────────────────────────────────
+ * ②·bis 组件绑定的**写侧**是"整体替换"，且只放行**能验证存在**的引用（P0-1-23）
+ * ─────────────────────────────────────────────────────────────────────
+ * `PUT /api/agents/:id/components` 收**全量集合**（`02` §4.4 原文："全量提交，避免增量 diff"）——
+ * 增量 diff 要在服务端算差集，而差集算错的表现是"点了解绑没生效"或"别人的绑定被顺带删了"。
+ * 引用完整性由服务层负责（`agent_components.ref_id` 是**多态外键、没有 FK**），
+ * 而"能验证的"只有 KNOWLEDGE 一侧：`mcp_servers` 表要到 **P0-2** 才建，
+ * 现在给一个 MCP 引用**无从验证真伪** ⇒ **明确拒绝**（400 + 指向 P0-2 的文案），
+ * 而不是先写进去、等 P0-2 再收拾孤儿绑定 —— `kb.service.ts` 文件头 ④ 已经把
+ * "库里说绑着某物、那个物已经不存在"的场景定性为最难查的一类坏法。
+ *
+ * ─────────────────────────────────────────────────────────────────────
  * ③ 删除是**软删**（`02` §4.4），且是"三件事一起做"
  * ─────────────────────────────────────────────────────────────────────
  * 「删除（软删：会话转只读保留、组件绑定解除）」—— 三件事缺一不可，且必须在**一个事务**里：
@@ -242,13 +253,78 @@ export const agentItemSchema = z.object({
   creatorName: z.string(),
   /** `01` §3.3 决策 18：创建者 + ADMIN 可编删（见 {@link canEditAgent}） */
   canEdit: z.boolean(),
-  /** 已绑定的组件（`02` §4.4 详情"含组件绑定"）；解绑由 P0-1-23 的 PUT 整体替换负责 */
+  /** 已绑定的组件（`02` §4.4 详情"含组件绑定"）；解绑走 P0-1-23 的 `PUT …/components` 整体替换 */
   components: z.array(agentComponentRefSchema),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),
 })
 export type AgentItem = z.infer<typeof agentItemSchema>
+
+// ───────────────────────────── 组件绑定（写侧，P0-1-23） ─────────────────────────────
+
+/**
+ * 一条要**写入**的组件引用（`PUT /api/agents/:id/components` 的元素）。
+ *
+ * 与读侧的 {@link agentComponentRefSchema} 刻意分开，两处约束不同：
+ *   · 读侧是"库里有什么就回显什么"，`refId` 只要求是字符串（万一库里被人手工塞了脏值，
+ *     读取端也不该因为它而 500 —— 与 `normalizeGuideQuestions` 同族的思路）；
+ *   · 写侧要**先拦形态**：`ref_id` 是 `@db.Uuid` 列，非 uuid 的串到 DB 才炸就是一个 500
+ *     （而且报错文案是 Prisma 的，用户看不出哪里错了）。
+ */
+export const agentComponentInputSchema = z.object({
+  componentType: z.enum(COMPONENT_TYPES, {
+    errorMap: () => ({ message: `componentType 只能是 ${COMPONENT_TYPES.join('/')}` }),
+  }),
+  refId: z
+    .string({ required_error: '请提供组件引用 ID' })
+    .uuid('组件引用 ID 不是合法 UUID（KNOWLEDGE 必须是知识库 id）'),
+})
+export type AgentComponentInput = z.infer<typeof agentComponentInputSchema>
+
+/**
+ * `PUT /api/agents/:id/components` 请求体：**整体替换**（`02` §4.4 的"全量提交，避免增量 diff"）。
+ *
+ * **`components` 必填**，清空要显式传 `[]`。刻意不把"省略"当作"清空"：
+ * 前端保存时会串行发 `PATCH` + `PUT`（`03` §4.2 第 5 条），一旦某次忘了带这个字段，
+ * "省略 = 清空"就会**静默解绑所有知识库**，而用户看到的是"保存成功"。
+ * 这与 `guideQuestions` 用 `[]` 表达清空是同一套口径 —— 清空只有一种写法。
+ *
+ * **重复项直接 400**（而不是去重或让 DB 的唯一索引兜）：`agent_components` 上有
+ * `@@unique([agentId, componentType, refId])`，重复项落库会得到 P2002 ⇒ 500；
+ * 而"提交了一份带重复项的集合"本就是调用方的 bug（多选框选不出重复值），
+ * 说清楚比悄悄去重好 —— 悄悄去重会让"我提交的 ≠ 我拿到响应的"变成一件查不出来的事。
+ * ⚠️ 用 `superRefine` 而不是 `.refine()`：前者能给出**真的字段路径**
+ * （`['components', 1, 'refId']`），前端可以精确高亮到那一行；`.refine()` 的 `path` 是空串
+ * （P0-1-22 在"空 body"那条上踩过，只能靠遍历 message 定位）。
+ *
+ * **刻意不设条数上限**：可绑的知识库数量本身没有业务上限，加一个"看起来合理"的数字
+ * 就会把"有 60 个库想全绑上"变成一件做不到的事（P0-1-11 的教训：自己发明约束会把合法配置挡在门外）。
+ * 报文大小由框架的 bodyLimit 兜。
+ */
+export const replaceAgentComponentsBodySchema = z
+  .object({
+    components: z.array(agentComponentInputSchema, {
+      required_error: '请提供 components（全量替换；要清空请传空数组）',
+      invalid_type_error: 'components 必须是数组',
+    }),
+  })
+  .superRefine((body, ctx) => {
+    const seen = new Set<string>()
+    body.components.forEach((item, index) => {
+      const key = `${item.componentType}:${item.refId}`
+      if (seen.has(key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['components', index, 'refId'],
+          message: '同一条绑定重复提交了（全量替换里每对 componentType + refId 只能出现一次）',
+        })
+        return
+      }
+      seen.add(key)
+    })
+  })
+export type ReplaceAgentComponentsBody = z.infer<typeof replaceAgentComponentsBodySchema>
 
 // ───────────────────────────── 列表 ─────────────────────────────
 

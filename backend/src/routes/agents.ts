@@ -1,8 +1,8 @@
 /**
- * 智能体路由（P0-1-22）
+ * 智能体路由（P0-1-22 / P0-1-23）
  *
- * 依据：`docs/02-后端设计.md` §4.4（`/api/agents[…/:id]` 五端点）+ §四 约定
- *      + `01` §3.3（决策 18：全员可建可看可用；创建者 + ADMIN 可编删）
+ * 依据：`docs/02-后端设计.md` §4.4（`/api/agents[…/:id]` 六端点）+ §四 约定
+ *      + `01` §3.3（决策 18：全员可建可看可用；创建者 + ADMIN 可编删；决策 7：组件只有知识库 + MCP）
  *      + `03` §二 的路由权限列（`/`、`/agents/new` 是「登录」，`/agents/:id/edit` 是「创建者/ADMIN」）。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -25,10 +25,11 @@
  * ─────────────────────────────────────────────────────────────────────
  * 刻意**尚未注册**的两条路由（不要顺手补）
  * ─────────────────────────────────────────────────────────────────────
- *   · `PUT /api/agents/:id/components` —— P0-1-23（组件整体替换）。本批只在**读侧**
- *     回显绑定（详情/列表里的 `components`），写侧留给下一批，验收也随之分开。
  *   · `POST /api/agents/:id/copy` —— **P1**（`02` §4.4 已标 P1、`01` §3.3 复制 Agent 也是 P1）。
  *     P0 不做，验收脚本里有一条"它必须 404"守着，防止有人"顺手"把它实现出来。
+ *   · `GET /api/agents/:id/conversations` —— **P0-1-25**（包 F 的会话管理）。
+ *     ⚠️ `PUT …/components` 是 **P0-1-23 本批落地的**（上一批的"刻意不做"清单里还有它，
+ *     本批已从"不做"变成"已注册"—— 两档验收里的对应断言都已同步翻转）。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
@@ -38,10 +39,12 @@ import {
   createAgentBodySchema,
   listAgentsQuerySchema,
   ok,
+  replaceAgentComponentsBodySchema,
   updateAgentBodySchema,
   type AgentIdParams,
   type CreateAgentBody,
   type ListAgentsQuery,
+  type ReplaceAgentComponentsBody,
   type UpdateAgentBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -52,6 +55,7 @@ import {
   getAgent,
   listAgents,
   removeAgent,
+  replaceAgentComponents,
   updateAgent,
   type AgentViewer,
 } from '../services/agent.service.js'
@@ -122,5 +126,26 @@ export function registerAgentRoutes(app: FastifyInstance): void {
     '/api/agents/:id',
     { preHandler: app.requireAuth, schema: { params: agentIdParamsSchema } },
     async (request) => ok(await removeAgent(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * 组件绑定**整体替换**（**登录即可进入，行级判定：创建者或 ADMIN**，否则 403）。
+   *
+   * `PUT` 而不是 `PATCH`：语义是"这个集合就是全部"（`02` §4.4 的"全量提交，避免增量 diff"），
+   * 幂等地重复提交同一份不产生任何副作用（服务层会跳过写库）。
+   * ⚠️ `components` **必填**，清空要传 `[]` —— "省略 = 清空"会让前端某次忘带字段
+   * 变成静默解绑（见 `shared` 的 `replaceAgentComponentsBodySchema`）。
+   *
+   * 响应是**同一套 `AgentItem` 投影**（不是只回一个 components 数组）：
+   * 组件绑定只是这个资源的一部分，`03` §4.2 的保存流程拿到它就能直接刷新本地状态。
+   */
+  app.put<{ Params: AgentIdParams; Body: ReplaceAgentComponentsBody }>(
+    '/api/agents/:id/components',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: agentIdParamsSchema, body: replaceAgentComponentsBodySchema },
+    },
+    async (request) =>
+      ok(await replaceAgentComponents(request.params.id, request.body, viewerOf(request))),
   )
 }

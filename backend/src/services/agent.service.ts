@@ -1,12 +1,12 @@
 /**
- * 智能体服务（P0-1-22）
+ * 智能体服务（P0-1-22 / P0-1-23）
  *
- * 依据：`docs/02-后端设计.md` §4.4（`/api/agents[…/:id]` 五端点）+ §三（`agents` /
- *      `agent_components` 表与删除语义）+ `01` §3.3（功能清单 + 决策 18 权限）
+ * 依据：`docs/02-后端设计.md` §4.4（`/api/agents[…/:id]` 六端点）+ §三（`agents` /
+ *      `agent_components` 表与删除语义）+ `01` §3.3（功能清单 + 决策 18 权限、决策 7 组件范围）
  *      + `03` §二（路由与权限列）/ §4.2（智能体编辑页）/ §七（级联删除确认框）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件的五条口径
+ * 本文件的六条口径（①~⑤ 出自 P0-1-22，⑥ 是 P0-1-23 追加的组件绑定口径）
  * ─────────────────────────────────────────────────────────────────────
  *
  * **① 权限是「全员可建可看可用；创建者 + ADMIN 可编删」，判据只有一处。**
@@ -49,18 +49,31 @@
  *    只被**用户自己的编辑**改 —— 刚编辑完的排在最前面正是期望行为。
  *    P0-1-23 的组件整体替换只写 `agent_components`、**不动** `agents.updated_at`，
  *    所以"解绑即生效"不会顺手把某个智能体弹到列表顶部。
+ *
+ * **⑥ 组件绑定走「整体替换」，且只放行能验证存在的引用（P0-1-23）。**
+ *    `PUT /api/agents/:id/components` 收**全量集合**（`02` §4.4："全量提交，避免增量 diff"）：
+ *    增量 diff 的差集算错会表现成"点了解绑没生效"或"顺手删掉别人的绑定"，而全量替换的语义
+ *    简单到可以一句话说清 —— **提交什么，库里就有什么**（包含顺手清掉手工塞进去的脏行）。
+ *    三条：
+ *      ① `KNOWLEDGE` 逐条查 `knowledge_bases` 存在性（`ref_id` 是多态外键、**没有 FK 兜底**，
+ *         引用完整性只能由服务层负责 —— `kb.service.ts` 文件头 ④ 已把"孤儿绑定"定性为难查的坏法）；
+ *      ② `MCP` **明确拒绝**（`mcp_servers` 表要到 P0-2 才建，现在无从验证真伪 ⇒ 不写进去）；
+ *      ③ **集合相同就不写库**（同一份绑定重复提交不产生任何副作用，见 {@link replaceAgentComponents}）。
+ *    全程**不动 `agents.updated_at`**（它只是列表排序键，见 ⑤）。
  */
 
 import {
   AppError,
   canEditAgent,
   normalizeGuideQuestions,
+  type AgentComponentInput,
   type AgentComponentRef,
   type AgentItem,
   type CreateAgentBody,
   type ListAgentsQuery,
   type OffsetPage,
   type RemoveAgentResult,
+  type ReplaceAgentComponentsBody,
   type UpdateAgentBody,
   type UserRole,
 } from '@doubulea/shared'
@@ -479,4 +492,164 @@ export async function removeAgent(
     '已删除智能体（软删：组件解绑、会话转只读保留）',
   )
   return { id: target.id, name: target.name, removedComponents, finishedConversations }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 组件绑定（写侧：整体替换，P0-1-23；口径见文件头 ⑥）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 集合键 —— 与 `agent_components` 的 `@@unique([agentId, componentType, refId])` 同一口径。
+ *
+ * 拼字符串而不是嵌套 Map/Set：绑定集合的规模是个位数，可读性比"省几次字符串拼接"重要；
+ * 而"两条绑定相同"这件事在**整个服务层只有这一个定义**，不会出现两处判等各自漂移。
+ */
+function componentKey(component: { componentType: string; refId: string }): string {
+  return `${component.componentType}:${component.refId}`
+}
+
+/** 与 {@link componentsOf} 的 `orderBy` 同序（`componentType asc, refId asc`）—— 写库顺序与读取顺序一致 */
+function compareComponents(
+  a: { componentType: string; refId: string },
+  b: { componentType: string; refId: string },
+): number {
+  if (a.componentType !== b.componentType) return a.componentType < b.componentType ? -1 : 1
+  if (a.refId !== b.refId) return a.refId < b.refId ? -1 : 1
+  return 0
+}
+
+/** 两个绑定集合是否**完全相同**（与顺序无关；条数相同且逐条能对上） */
+function sameComponentSet(a: AgentComponentRef[], b: AgentComponentInput[]): boolean {
+  if (a.length !== b.length) return false
+  const keys = new Set(a.map(componentKey))
+  return b.every((item) => keys.has(componentKey(item)))
+}
+
+/**
+ * 校验"这批引用能不能落库"。**两道，且都在写库之前**（见 {@link replaceAgentComponents} 的顺序）。
+ *
+ * ① **`MCP` 一律拒绝**：`mcp_servers` 表要到 **P0-2** 才建（`02` §3.1 已写明），
+ *    现在收到一个 MCP 引用**无从验证真伪** —— 既不可能是界面里选出来的（没有 server 列表端点），
+ *    也修不了（用户看不到那个 server）。放行等于往库里写"永远修不好的孤儿绑定"，
+ *    而 `kb.service.ts` 文件头 ④ 已经把这类数据定性为"症状是检索时才炸且查不出来"。
+ *    ⇒ **宁可现在明确拒绝，等 P0-2 有了 `mcp_servers` 再把这条换成存在性校验**。
+ *    文案要指向 P0-2（用户能理解"功能还没上线"），而不是甩一句"参数不合法"。
+ *
+ * ② **`KNOWLEDGE` 逐条查存在性**：`ref_id` 是多态外键、**刻意没有 FK**（`02` §3.1），
+ *    数据库不会拦 —— 引用完整性只能由这一层负责。查不到就整体拒绝（`02` §4.4 的坑预判：
+ *    "引用不存在的 KB 必须拒绝而非静默丢弃"）：静默丢弃会让"我提交了 3 个库"变成
+ *    "库里只有 2 个"而用户以为自己选上了。文案里带上具体 id，前端 `message.error` 能直接说清。
+ *
+ * ⚠️ 刻意**不校验**知识库的"有没有文档 / 是否可检索"：那是检索层的事（`02` §八 的
+ * `vectorPathSkipped` / 告警负责表达），绑一个还没传文档的库完全合法（刚建好、马上要传）。
+ *
+ * @throws {AppError} `VALIDATION`(400) 含 MCP 引用 / `NOT_FOUND`(404) 引用的知识库不存在
+ */
+async function assertComponentRefsBindable(components: AgentComponentInput[]): Promise<void> {
+  const mcpCount = components.filter((item) => item.componentType === 'MCP').length
+  if (mcpCount > 0) {
+    throw AppError.validation(
+      `MCP 服务器功能尚未开放（P0-2 才提供注册与绑定）：本次提交里有 ${mcpCount} 条 MCP 绑定，请先移除`,
+    )
+  }
+
+  // 去重后再查：同一批里"同一个库"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
+  const refIds = [...new Set(components.map((item) => item.refId))]
+  if (refIds.length === 0) return
+
+  const rows = await getPrisma().knowledgeBase.findMany({
+    where: { id: { in: refIds } },
+    select: { id: true },
+  })
+  const found = new Set(rows.map((row) => row.id))
+  const missing = refIds.filter((refId) => !found.has(refId))
+  if (missing.length > 0) {
+    throw AppError.notFound(`知识库不存在或已被删除：${missing.join('、')}`)
+  }
+}
+
+/**
+ * 整体替换组件绑定（`PUT /api/agents/:id/components`，**创建者或 ADMIN**）。
+ *
+ * `02` §4.4 原文："整体替换（全量提交，避免增量 diff）"。语义一句话：
+ * **提交什么，库里就有什么** —— 包括"提交集合里没有的行会被删掉"，因此手工塞进库的脏行
+ * （比如 P0-1-22 的验收脚本直接 `createMany` 造的那条 MCP）会在下一次保存时被清干净。
+ *
+ * 顺序（**每一环的位置都有理由**）：
+ *   ① 查目标（`deletedAt: null`）→ 404：软删的连详情都 404，不该能改。
+ *   ② 判权限（`canEditAgent`）→ 403：**先 404 再 403**，与 `PATCH` 同口径（id 本来就全员可见）。
+ *   ③ **校验引用 → 再写库**：校验失败**必须**发生在 `deleteMany` 之前。
+ *      反过来的实现（先删后校验）在"引用不存在"这条路上会**把原有绑定删光再报错**，
+ *      用户重试时看到的是"我的绑定没了"——而请求是失败的，他没有任何理由认为它改动了什么。
+ *      验收里专门有一条盯着它：校验失败后库里那几行的 `id` 必须**逐字不变**。
+ *   ④ **集合相同则不写库**（`02` §4.4 的"绑定即启用"没有别的副作用要发生）：
+ *      保存按钮每次都发 `PUT`（`03` §4.2 第 5 条：`PATCH` + `PUT` 串行），若每次都删了重建，
+ *      `agent_components.id`（uuid7）与 `created_at` 会被无谓刷新 —— 那是"看不见的改写"，
+ *      P0-1-10 已经为同类问题立过规矩（"P0-1-10 就靠「密文逐字不变」抓住了这类实现"）。
+ *   ⑤ 写库在**一个事务**里（`deleteMany` + `createMany`）：中途失败不会留下"删了没建"的空绑定。
+ *      `createMany({ skipDuplicates: true })`（`ON CONFLICT DO NOTHING`）只针对**并发**：
+ *      两个同时到达的相同 `PUT` 会在插入时撞唯一索引，跳过即得正确结果，
+ *      而不会把一次双击变成一个 500。payload 内的重复项由 schema 拦（`superRefine`），
+ *      所以这里的"跳过"不会掩盖调用方的错误。
+ *   ⑥ 重新读行再返回（不是复用 ① 读到的行）：响应要反映**库里现在的样子**，
+ *      与详情/列表同一套投影（P0-1-21 的教训：同一份数据不许有第二种形状）。
+ *
+ * ⚠️ 刻意**不动 `agents.updated_at`**（文件头 ⑤ / `06` P0-1-23 坑预判）：它只是 `/api/agents`
+ * 的列表排序键，而"解绑一个知识库"跟"编辑智能体"是两件事 —— 动了它，用户会看到
+ * "列表自己跳了一下"。验收里有一条断言 `updated_at` **逐字不变**守着。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 智能体不存在或已软删 / 引用的知识库不存在
+ *                    / `FORBIDDEN`(403) 非创建者且非 ADMIN / `VALIDATION`(400) 含 MCP 引用
+ */
+export async function replaceAgentComponents(
+  id: string,
+  input: ReplaceAgentComponentsBody,
+  viewer: AgentViewer,
+): Promise<AgentItem> {
+  const db = getPrisma()
+  const target = await db.agent.findFirst({
+    where: { id, deletedAt: null },
+    select: AGENT_SELECT,
+  })
+  if (target === null) throw AppError.notFound('智能体不存在')
+
+  if (!canEditAgent(target, viewer)) {
+    throw AppError.forbidden('只有该智能体的创建者或管理员可以修改它的组件绑定')
+  }
+
+  // 归一化顺序：写库顺序 = 读取端 `componentsOf` 的顺序（同序让"行 id 的先后"也稳定，
+  // 便于用"id 逐字不变"取证，见 ④）
+  const desired = [...input.components].sort(compareComponents)
+
+  // ③ 校验在写之前
+  await assertComponentRefsBindable(desired)
+
+  const current = await componentsOf(id)
+  if (!sameComponentSet(current, desired)) {
+    await db.$transaction(async (tx) => {
+      await tx.agentComponent.deleteMany({ where: { agentId: id } })
+      if (desired.length > 0) {
+        await tx.agentComponent.createMany({
+          data: desired.map((item) => ({
+            agentId: id,
+            componentType: item.componentType,
+            refId: item.refId,
+          })),
+          skipDuplicates: true,
+        })
+      }
+    })
+    getLogger().info(
+      { agentId: id, from: current.length, to: desired.length },
+      '已整体替换智能体组件绑定',
+    )
+  } else {
+    // ⑤ 没有变化时不写库（这句日志是"确实没写"的可观测痕迹，验收靠行 id 取证，不靠它）
+    getLogger().info({ agentId: id, count: desired.length }, '组件绑定未变化，不写库')
+  }
+
+  // ⑥ 重读（极短窗口内被并发软删的话，按"不存在"回 —— 与详情口径一致）
+  const fresh = await db.agent.findFirst({ where: { id, deletedAt: null }, select: AGENT_SELECT })
+  if (fresh === null) throw AppError.notFound('智能体不存在')
+  return toItem(fresh, await componentsOf(id), viewer)
 }

@@ -144,7 +144,7 @@ import {
   searchKnowledgeBaseBodySchema,
   searchKnowledgeBaseResultSchema,
   SPLIT_STRATEGIES,
-  // 智能体（P0-1-22）
+  // 智能体（P0-1-22 / P0-1-23）
   AGENT_TYPES,
   agentItemSchema,
   agentListResultSchema,
@@ -154,6 +154,7 @@ import {
   GUIDE_QUESTIONS_MAX,
   guideQuestionsSchema,
   normalizeGuideQuestions,
+  replaceAgentComponentsBodySchema,
   updateAgentBodySchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
@@ -2300,21 +2301,22 @@ await it('下载的口径表与上传白名单**不脱节**（下载给的类型
   assertEqual(downloadContentType('a.md'), 'text/markdown; charset=utf-8', 'md 的类型')
 })
 
-// ── 24. 智能体契约与路由（P0-1-22）──
-console.log(`\n${c.b}── 智能体契约与路由（权限判据 / 三态 / 引导问题 / 一套投影）──${c.x}`)
+// ── 24. 智能体契约与路由（P0-1-22；组件绑定写侧 P0-1-23）──
+console.log(`\n${c.b}── 智能体契约与路由（权限判据 / 三态 / 引导问题 / 组件绑定整体替换）──${c.x}`)
 
-await it('五条路由已注册；P0-1-23 与 P1 的三条**刻意不存在**（不提前做下一批的活）', () => {
+await it('六条路由已注册；P1 与 P0-1-25 的两条**刻意不存在**（不提前做下一批的活）', () => {
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
   assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/agents/:id' }), true, '编辑')
   assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/agents/:id' }), true, '删除')
-  // 组件整体替换归 P0-1-23；复制是 **P1**（`02` §4.4 与 `01` §3.3 都标了 P1）；会话列表归 P0-1-25
+  // ⚠️ P0-1-22 时这条写的是 `false`（"属 P0-1-23，本批不提前注册"）；本批落地后翻转为 `true`
   assertEqual(
     app.hasRoute({ method: 'PUT', url: '/api/agents/:id/components' }),
-    false,
-    '组件整体替换属 P0-1-23',
+    true,
+    '组件绑定整体替换（P0-1-23）',
   )
+  // 复制是 **P1**（`02` §4.4 与 `01` §3.3 都标了 P1）；会话列表归 P0-1-25
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), false, '会话列表属 P0-1-25')
 })
@@ -2403,6 +2405,64 @@ await it('建/改 body 的三态与"不可改的 type"：`undefined`（不动）
     '⚠️ 三态：不带 description ⇒ `undefined`（绝不能有 `.default(null)`）',
   )
   assertEqual(updateAgentBodySchema.safeParse({ description: null }).data.description, null, '`null` 要保持是 null')
+})
+
+await it('组件绑定 body 契约（P0-1-23）：`components` 必填、重复项给**真 path**（与 `.refine()` 的空 path 对照）', () => {
+  const kbId = '01930000-0000-7000-8000-000000000001'
+  const mcpId = '01930000-0000-7000-8000-000000000002'
+  const bind = (componentType, refId) => ({ componentType, refId })
+
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: [] }).success,
+    true,
+    '空数组合法（**唯一**一种"解绑全部"的写法）',
+  )
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: [bind('KNOWLEDGE', kbId)] }).success,
+    true,
+    '一条合法绑定',
+  )
+
+  // 必填：省略 `components` 若被当作"清空"，前端某次忘带字段就会**静默解绑所有知识库**
+  const missing = replaceAgentComponentsBodySchema.safeParse({})
+  assertEqual(missing.success, false, '`components` 必填（清空要显式传 `[]`）')
+  assertEqual(
+    JSON.stringify(missing.error.issues[0].path),
+    JSON.stringify(['components']),
+    '缺字段的 path 指到 components',
+  )
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: 'x' }).success,
+    false,
+    '非数组要拒',
+  )
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: [bind('SANDBOX', kbId)] }).success,
+    false,
+    '枚举外的 componentType 要拒（组件范围只有知识库 + MCP）',
+  )
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: [bind('KNOWLEDGE', 'x')] }).success,
+    false,
+    'refId 必须是 UUID（列是 `@db.Uuid`，放非 uuid 过去只会变成一个 DB 500）',
+  )
+
+  // ⚠️ 与上面"空 body"那条**刻意对照**：`.refine()` 的 path 是空串（只能遍历 message 找），
+  //    而 `superRefine` + `addIssue({ path })` 能给出真正的下标 —— 前端可以高亮到具体那一行。
+  const dup = replaceAgentComponentsBodySchema.safeParse({
+    components: [bind('KNOWLEDGE', kbId), bind('KNOWLEDGE', kbId)],
+  })
+  assertEqual(dup.success, false, '重复项要拒（否则落库撞 `@@unique(agentId, componentType, refId)` → P2002 → 500）')
+  assertEqual(
+    JSON.stringify(dup.error.issues[0].path),
+    JSON.stringify(['components', 1, 'refId']),
+    '重复项的 path 要精确到第 2 项',
+  )
+  assertEqual(
+    replaceAgentComponentsBodySchema.safeParse({ components: [bind('MCP', mcpId)] }).success,
+    true,
+    'MCP 在**形态上**合法 —— 拒绝它是服务层的能力状态（`mcp_servers` 表属 P0-2），归 `verify-agents.mjs` H 组',
+  )
 })
 
 await it('输出投影的键集合固定：没有 `deletedAt` 之类的内部列（防"以后有人顺手 select 出去"）', () => {

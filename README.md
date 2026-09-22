@@ -107,7 +107,7 @@ pnpm verify:pipeline   # 流水线验收：队列语义/状态机/幂等四道/�
 pnpm verify:ingest     # 入库验收：真 embedding（假上游）/chunk 落库与向量/id 版本位/覆盖重建/内容未变化/失败重试/删除文档，**需要真实 PG + Redis + MinIO**（23 项）
 pnpm verify:retrieval  # 检索验收：三模式/六列分数/**与独立 SQL 逐条等价**/RRF 数值反算/引用片段三分支/阈值与候选池/降级路径，**需要真实 PG + Redis + MinIO**（27 项）
 pnpm verify:kb-package # **包级验收**：逐行跑 `子方案①` §十二 的 8 行（CRUD/四格式/扫描件/重试/重建/检索/引用/性能），**需要真实 PG + Redis + MinIO**（11 项）
-pnpm verify:agents     # Agent 验收：两种类型 CRUD/`canEdit` 三方向/绑定模型四态/三态字段/软删三件套，**需要真实 PG + Redis（不需要 MinIO）**（26 项）
+pnpm verify:agents     # Agent 验收：两种类型 CRUD/`canEdit` 三方向/绑定模型四态/三态字段/软删三件套/**组件绑定整体替换**，**需要真实 PG + Redis（不需要 MinIO）**（35 项）
 pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的批次号 vs `index.ts` 启动信封的 step（不一致即 exit 1）
 ```
 
@@ -215,9 +215,9 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 > R6 片段 ⊆ 原文 / R7 性能 / R8 `FULLTEXT` 单跑非空），每行打印结论。它**不重复**各档的细粒度断言，
 > 只跑"串起来之后还成不成立"的证据。
 >
-> `pnpm verify:agents` 是 **P0-1-22** 的 Agent 验收（需要 PG + Redis，**不需要 MinIO** —— 它不上传文档；
-> 但要注入一组 `EMBEDDING_*`，因为 E 组要建一个**真知识库**来验"解绑之后才删得掉"，建库要取
-> embedding 快照 —— 那是**纯配置计算**，不发网络请求）。七组：**A 组**枚举同源 + 两种类型都能建 +
+> `pnpm verify:agents` 是 **P0-1-22 / P0-1-23** 的 Agent 验收（需要 PG + Redis，**不需要 MinIO** —— 它不上传文档；
+> 但要注入一组 `EMBEDDING_*`，因为 E/H 组要建**真知识库**来验"解绑之后才删得掉"，建库要取
+> embedding 快照 —— 那是**纯配置计算**，不发网络请求）。八组：**A 组**枚举同源 + 两种类型都能建 +
 > `type`/`modelId` 必填 + 列表**对全员开放**且 `canEdit` **三个方向都对**；**B 组**绑定模型的可用性
 > 校验（绑 **disabled 模型被拒** 是本批验收门槛；另含向量模型 / Provider 停用 / 不存在的模型三条，
 > 以及**"可选列表里出现过的模型都能建成功、不在列表里的一律被拒"的一致性断言**；还有一条
@@ -229,8 +229,17 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 > **「绑 KB 的 Agent 让该 KB 删不掉（409）→ 软删这个 Agent → 同一个 KB 立刻能删（200）」**，
 > 只打标记的实现会让那条 409 **永久卡住**；外加"详情 404 但行还在""软删后不出现在列表"
 > "已软删的一律 404（不是 403）""**软删的 Agent 仍占模型引用计数**"（跨批次口径一致性）；
-> **F 组**路由表（五条在，`PUT …/components` 与 `POST …/copy` **必须 404**）；**G 组**纯函数
-> （`canEditAgent` 矩阵、`normalizeGuideQuestions` 永不抛错、输出键集合里**没有**内部列）。
+> **F 组**路由表（六条在，`POST …/copy` 与 `GET …/conversations` **必须 404**）；
+> **G 组**纯函数（`canEditAgent` 矩阵、`normalizeGuideQuestions` 永不抛错、输出键集合里**没有**内部列）；
+> **H 组（P0-1-23 新增，9 项）· 组件绑定的整体替换** —— 这一组里最值钱的两条是：
+> ① **"校验失败时旧绑定逐字不变"**（拿 `agent_components` 那几行的 **`id`** 取证：
+> "先删后校验"的实现会在这里红，而这正是整体替换最容易写错的地方）；
+> ② **"重复提交同一份绑定（换顺序）→ 行 `id` 逐字不变"**（"集合没变就不写库"，
+> 换成"删了重建"的实现在这里红）。另含：全量替换的语义（改小后旧的消失、`[]` 解绑全部、
+> 详情立即反映、跨模块 `agentCount` 联动）、**被拒的 MCP 引用**（400 + 文案指向 P0-2）、
+> 请求体形态（缺 `components` / 非数组 / 坏枚举 / 坏 uuid / **重复项且 `path` 精确到下标**）、
+> **`agents.updated_at` 逐字不变 + 列表顺序不跳**、权限三方向（**ADMIN 改他人 → 200**）、
+> 软删后 404 与未登录 401、以及"整体替换会清掉手工塞进库的脏行"。
 
 > `pnpm verify:ingest` 是 **P0-1-19** 的入库验收（需要 PG + Redis + **MinIO**，同样自起**假 embedding 上游**）。
 > 七组用例：① **A 组·入库** —— `chunk_count` 与 `chunks` 表**逐行一致**、每行都有向量、维度 1024、
@@ -683,6 +692,33 @@ curl -sS --noproxy '*' -b /tmp/member.jar -X PATCH \
 #  → 「只有该智能体的创建者或管理员可以修改它」；用 admin 的会话改**同一个** id 必须 200
 #    （只验"普通用户 403"的话，一个"仅创建者"的实现会全绿 —— 所以两个方向都要亲手试一次）
 
+# ⑭-h 组件绑定（P0-1-23）—— **整体替换**：提交什么，库里就有什么
+KB1=$(curl -sS --noproxy '*' -b "$COOKIE" 'http://127.0.0.1:13000/api/knowledge-bases?limit=20' | jq -r '.data.items[0].id')
+KB2=$(curl -sS --noproxy '*' -b "$COOKIE" 'http://127.0.0.1:13000/api/knowledge-bases?limit=20' | jq -r '.data.items[1].id')
+
+curl -sS --noproxy '*' -b "$COOKIE" -X PUT \
+  http://127.0.0.1:13000/api/agents/<agent-id>/components \
+  -H 'content-type: application/json' \
+  -d "{\"components\":[{\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB1\"},
+                       {\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB2\"}]}" \
+  | jq '.data.components'
+#  → 两条绑定（顺序恒为 componentType+refId 升序）；响应就是**详情那一套投影**（不是只回 components）
+
+curl -sS --noproxy '*' -b "$COOKIE" -X PUT \
+  http://127.0.0.1:13000/api/agents/<agent-id>/components \
+  -H 'content-type: application/json' -d "{\"components\":[{\"componentType\":\"KNOWLEDGE\",\"refId\":\"$KB1\"}]}" \
+  | jq '.data.components'   # → 只剩 KB1：**全量替换**，没提交的那条立即消失
+#  → 传 [] 即"解绑全部"（清空**只有**这一种写法：省略 components 是 400，不是清空 ——
+#    否则前端某次忘带字段就会**静默解绑所有知识库**而界面显示"保存成功"）
+
+#  ⚠️ 三条会踩到的（都是**预期**，不是 bug）：
+#    · 引用了**不存在**的知识库 → 404，且**旧的绑定一条都不会动**（校验排在删除之前；文案带上是哪个 id）；
+#    · 提交里含 `MCP` → 400「MCP 服务器功能尚未开放（P0-2 才提供注册与绑定）」——
+#      `mcp_servers` 表要到 P0-2 才建，现在**不可能**选出一个真实 server，写进去只会留下修不好的孤儿绑定；
+#    · 重复提交同一份（哪怕换个顺序）→ 200 但**什么都不写**（幂等：`agent_components` 的行 `id` 不变）。
+#  另一条容易忽略的：这个请求**不会**改智能体的 `updated_at`
+#  ⇒ 首页列表顺序不跳（"解绑一个知识库"跟"编辑智能体"是两件事）。
+
 pnpm verify:kb-package
 #  → 11 项全通过（包 D 收口）：一行一组逐行跑 `子方案①` §十二 的 8 行，每行打印结论。
 
@@ -701,7 +737,7 @@ pnpm verify:ingest
 `GET /api/model-providers/:id/remote-models` 仅 ADMIN）、**知识库 `/api/knowledge-bases`（P0-1-15，
 登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
 `reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**、**智能体 `/api/agents`（P0-1-22，
-登录即可"建与看"，编/删收窄到创建者 + ADMIN）**。
+登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**。
 **"MEMBER 能用的业务接口"现在有三处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
 以及 `/api/agents` 的列表/详情/创建 —— 三者**权限口径刻意各不相同**（模型池全程 ADMIN；
 知识库**没有 owner 列**故登录即可读写；智能体有 `created_by` 列故编删按行判定）。
@@ -718,11 +754,18 @@ pnpm verify:ingest
 **下载成功时不是 JSON**（是字节流，失败才是信封），`Content-Type` 按扩展名唯一确定、
 `Content-Disposition` 用 RFC 5986/5987 双写（中文名靠 `filename*`）；
 **"行还在但对象丢了"是 404 + 另一句文案**且不动数据库 —— 遇到它请重新上传该文档；
-**智能体专项边界（P0-1-22）**：
-· **组件绑定目前只有"读"**：详情/列表会回显 `components`（`{componentType, refId}`，**刻意不带目标名**
-—— `mcp_servers` 表要到 P0-2 才建），而**写侧**（`PUT /api/agents/:id/components` 整体替换）是
-**P0-1-23**，现在打它会 404（不是坏了）；`POST /api/agents/:id/copy` 是 **P1**，同样 404；
-· **删除是软删**：`DELETE` 之后**详情/编辑/再删一律 404**（不是 403、也不是"还能改回来"）——
+**智能体专项边界（P0-1-22 起；P0-1-23 补组件绑定写侧）**：
+· **组件绑定**：写侧（`PUT /api/agents/:id/components`）已在 **P0-1-23** 落地 —— **整体替换**（全量提交），
+回显 `{componentType, refId}`、**刻意不带目标名**（前端从各自的列表端点映射名字）；
+⚠️ **本阶段只支持 `KNOWLEDGE`**：提交里含 `MCP` 会拿到 **400**「MCP 服务器功能尚未开放（P0-2 才提供注册与绑定）」
+—— `mcp_servers` 表要到 P0-2 才建、也没有 server 列表端点，**不可能**选出一个真实 server，
+放行只会留下修不好的孤儿绑定（P0-2 建表后接回，接口形态不变）。这是**预期行为**；
+· **整体替换的三条反直觉处**（都是刻意的，见 `docs/02` §4.4「契约增量 · Agent」⑨）：
+省略 `components` 是 **400 而不是清空**（清空要显式传 `[]`）；引用了不存在的知识库时**旧绑定一条都不动**
+（校验排在删除之前）；重复提交同一份（哪怕换顺序）**什么都不写**（幂等）；
+· **它不会改智能体的 `updated_at`** ⇒ 首页列表顺序不跳（"解绑一个库"与"编辑智能体"是两件事）；
+· `POST /api/agents/:id/copy` 是 **P1**（404 不是坏了）；`GET /api/agents/:id/conversations` 归 **P0-1-25**；
+· **删除是软删**：`DELETE` 之后**详情/编辑/再删/改组件绑定一律 404**（不是 403、也不是"还能改回来"）——
 留一个"看起来还能改"的页面等于诱导用户去改一条作废记录。会话**不删**、只转 `FINISHED` 只读保留；
 · **软删的智能体仍占模型的引用计数**（`ModelItem.agentCount` 刻意不按 `deletedAt` 过滤）⇒
 "删了智能体为什么模型还删不掉"是**预期行为**（它要的是 `ON DELETE RESTRICT`）；
@@ -832,10 +875,10 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-18-空文本检测+分块.md` | **本批的两个真问题都不在坑预判里**：① **PDF 夹具的单行文本必须折行** —— 单条超长 `Tj` 会超出 `MediaBox`（612pt），而 pdf.js **只提取页面框内的文本** ⇒ 内容被**静默截断**（实测 561 字的单行只析出 85 字、且截在半个单词上），拿它去断言"分块边界/阈值"会得到假数据（不是实现问题，但会让人查错地方）；② **新增的空文本门槛把两处旧夹具"判死"了** —— P0-1-17 留下的 `verify-pipeline` 夹具（docx 20 字、txt 29 字、F 组 PDF 43 字）在 50 字阈值下会被判「疑似扫描件」，让"四篇全 READY"和"重投救回"**假失败**（这是**刻意的行为变化**，不是回归；处置是把夹具写长并在此留档，否则下一个人会以为夹具本来就该这么长）。**分块上最容易静默做错的四条**：切片的单位必须是**码点**（`text.slice()` 会**劈开代理对**，产出非法字符串且**本层毫无报错**，下游 embedding 才炸 ⇒ 全流程建在 `[...text]` 上，验收用 600 个 emoji 逐码点断言）；Section 必须按"**连续**同名标题"切（按 `headingPath` 分组会让 chunk **顺序与原文不一致**，而这在检索层几乎发现不了 —— 片段读起来通顺、只是位置不对）；**每块必须是原文的逐字子串**（重叠取前块尾部而不是新造句子，这是 P0-1-20"引用与原文一致"的前提）；**页码 meta 取"块起点所在段"**（一个 Section 可能跨页 PDF，"整块用 Section 首页"会把页码全说成第 1 页）。**另一处刻意的实现-文档偏离**：`ChunkStrategy.split` 收 `ParseResult` 而不是 `(text, meta)` —— 标题层级只在 `blocks` 里，只给 `text` 会让 hybrid 退化成 fixed。**口径定案**：`chunk_min`（50）是**代码常量**（§十一 的配置表里没有它，加环境变量属于自己发明契约）；空文本检测失败文案里的数字**取实测阈值**（写死 50 会让管理员调阈值后用户按错数字重传）；判据是 `<` 而**恰好等于阈值通过**（验收用例按**当前阈值**生成）；**④ 必须排在 ⑤ 之前**，用产物的缺席取证（`ctx.chunks === undefined` 而 `ctx.parsed !== undefined`）。**⚠️ 本批只"算"不"存"**：`chunk_count` 刻意仍是 0（`schema.prisma` 对它的定义是"**已入库**的 chunk 数"，提前写会造出"说有 N 块却搜不到"的假象，P0-1-19 还得回头改） |
 | `issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` | **本批跑出来的两个"假失败"其实都是断言自己写错**：① `VECTOR` 用例里写了"每条的 `vectorScore > 0`"，而**正交向量的余弦相似度恰好是 0**（合法取值）⇒ 改成"含关键词的那一块必须**严格更近**"（这才是想验的东西）；② "长 query 截断到 64 字符后仍应命中"的**前提本身是错的** —— 截断只保证 LIKE 的模式不长，**不保证**那 64 个字符连续出现在正文里（自然语言问句几乎必然不连续）⇒ 改成"从原文里取 64 字子串当 query + 加长后缀"，并用一次**不截断的独立 SQL 复算**证明"命中只能来自那次截断"。**真问题与设计订正**：③ **RRF 示例数值文档写错了**（0.0323 → 实测 **0.0320**）⇒ 已订正并写成断言（文档与代码从此互为守门）；④ **`§6-1` 的"去停用词"必须收窄**（只剥句首/句尾的提问脚手架）—— LIKE 要连续子串，删掉中间的"的"会把"报销的标准"变成"报销标准"，**降低**命中率；⑤ **`%`/`_` 是 LIKE 的通配符**，必须在 query 预处理阶段剔掉，否则"字面包含"会静默变成模式匹配（判别式：正文里同时有 `5` 和 `0`、但两者永不相邻，用 `5%0` 去搜 —— 两种实现的期望值不同，断言才有判别力）；⑥ **`score` 阈值只作用于向量路且过滤放在候选池之后**（距离单调 ⇒ 两种顺序等价，少传一份 20KB 的向量字面量）；⑦ **`ORDER BY embedding <=> $1, id` 会让 HNSW 退化** ⇒ 二级 tie-break 必须在 JS 侧做（否则 P0-1-14 的索引取证白做）；⑧ `§八` 的降级路径本批就位（`HYBRID` 跳向量路 + 告警 / `VECTOR` 409 / `FULLTEXT` 不受影响，两种原因分开报）；⑨ 顺手加了 `pnpm check:batch` —— `step` 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性 |
 | `issue_fix/问题记录-P0-1-21-知识库包验收.md` | **本批的"坑"主要不在实现里，而在"包级验收"这件事本身**：① **前面每档都绿，不等于串起来还成立** —— R4 的"检索返回 v2"在 P0-1-19 只能靠 `<=>` SQL 做**等价取证**（当时检索端点还没落地），本批用真端点重验，并且把断言从"正文含 v2"改成**"新关键词命中重建后的块 + v1 的旧词查不到"**（前者在"新旧两份都留着"的坏数据上照样通过）；② **`getObject` 对不存在的键不在 `await` 时抛错**（错误发生在**读流**时）⇒ 只调它的话响应头已经发出、客户端看到"下到一半断了"；必须先 `statObject` 才能在发头前干净地回 404（顺带拿 `Content-Length`，而两者之间仍有 TOCTOU 窗口，那时**只能断流**，不假装能回 JSON）；③ **下载是本仓唯一不套 `ok()` 信封的端点**（成功是字节流、失败才是信封），这条必须显式写进注释与 README，否则下一个照抄别的路由的人会把它包进信封；④ **`Content-Disposition` 是纯函数但错误静默**：中文名要靠 `filename*`（否则另存为 `____.pdf`）、CR/LF 不删就是**响应头注入**、RFC 5987 里 `'`/`(`/`)`/`*` 这四个字符 `encodeURIComponent` **不转义但规范不认** ⇒ 五组边界断言全在无依赖档；⑤ **列表排序刻意反序**（`createdAt desc`）与"库不存在回 404 而不是空列表"两条都是**产品口径**，写进 `02` §4.6 而不是只留在代码里 |
+| `issue_fix/问题记录-P0-1-23-组件绑定.md` | **本批的坑是"顺序即正确性"与一条计划级口径冲突**：① **整体替换里"校验"必须排在"删除"之前** —— 直觉写法（先清空再重建）在"引用了不存在的知识库"这条路上会**删光旧绑定再报错**：请求失败、用户没有任何理由认为它改动了什么，而绑定已经没了（取证不看状态码，看旧行的 **`id` 是否逐字不变** —— `id` 是 uuid7、重写一遍也会换 id）；② **计划要求"绑定多 MCP"，但 `mcp_servers` 表属 P0-2** ⇒ P0-1 阶段**没有路径**造出真实 server，收到的 MCP 引用必然是伪造 id，写进去就是"永远修不好的孤儿绑定"（`ref_id` 是无 FK 的多态外键，数据库不会拦）⇒ 处置是**明确拒绝**（400 + 文案指向 P0-2）+ 把 P0-1-24 的验收门槛第 2 条改写成可执行版本 + 记明 P0-2 的接回方式（同一处换成存在性校验）；③ **`.refine()` 给不出 `path`、`superRefine` + `addIssue({path})` 给得出** ⇒ 重复项的 400 能精确指到 `['components', 1, 'refId']`，前端可高亮那一行（P0-1-22 那条"空 path"的正面写法，两档验收刻意放在一起对照）；④ **集合类接口的两条静默口径**：`components` **必填**（"省略 = 清空"会让前端忘带字段变成**静默解绑全部**）、**集合相同就不写库**（否则每次保存都无谓刷新行的 `id`/`created_at`；判等是集合语义，换顺序提交不算改动）+ `createMany({skipDuplicates})` 只兜并发双击 |
 | `issue_fix/问题记录-P0-1-22-Agent-CRUD.md` | **本批的坑集中在"三处写反了会静默出错"的口径上**：① **权限判据 `USER_ROLES[0]`** 把语义藏在数组顺序里（重排即**静默**把管理员判成别人）⇒ 改成带类型标注的字面量 `const ADMIN_ROLE: UserRole = 'ADMIN'`（删掉 `ADMIN` 时**编译报错**）；② **`.refine()` 的校验失败 `path` 是空串** ⇒ 那条错误是"表单级"而非"字段级"，前端挂不到输入框上，验收只能遍历 `message` 找（要逐字段高亮就得改用 `superRefine` + `addIssue({path})`）；③ **Fastify 的 schema 校验跑在 `preHandler` 之前** ⇒ 验"未登录 401"必须给**语法合法**的载荷（空 body 会先拿 400，把"鉴权挂没挂上"验成假的）。**两条最隐蔽的实现口径**：④ **软删只打标记会让绑过的知识库永远删不掉**（删库守卫数的是 `agent_components`，而界面上那个 Agent 已经"没了"）⇒ 三件事一个事务 + 一条链取证（绑 KB → 删 KB 409 → 软删 Agent → 同一 KB 删得掉 200）；⑤ **绑定模型不能复用 `resolveChatTarget()`**（它带 424 `NEED_CREDENTIAL`，会逼管理员**先配 Key 才能建智能体**）⇒ 只三条校验 + 与可选列表的一致性断言。"换绑才校验"与"`type` 可传不可改"两条是同一族（**不会报错、只会静默做错事**，故全部落进 `verify-agents` 而不只是注释） |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
-
 > SSE 编排协议已并入 `docs/02-后端设计.md` 第五~七节，不单独拆分。
 
 ---
@@ -982,3 +1025,4 @@ doubuleA/
 | 2026-09-22 | — | **P0-1-20 完成（包 D 继续）**：双路检索 + RRF 融合 —— `backend/src/services/retrieval.ts`（新增：向量路 `1 - (embedding <=> $1)`（候选池 `topK × CANDIDATE_POOL_FACTOR`、**相似度下限只作用于这一路且过滤在池之后**）+ 全文路 `content LIKE '%词%'` + `bigm_similarity`（query 预处理：剔标点（**含 `%`/`_` 两个 LIKE 通配符**）→ **只剥句首/句尾**的提问脚手架 → 按码点截断 64 → `< 2` 字整条跳过并告警）+ `mode` 三值分流 + **RRF 融合**（`w = 1/(rrfK + rank)` 两路相加、缺失记 0、同分按 `chunkId` 升序）+ 引用对象构造（`docName` / `snippet` ±80 字符**不加工**窗口 / `rrfScore`）+ **`§八` 的降级路径**（模型变更 / embedding 未就绪 ⇒ `HYBRID` 跳向量路 + `warnings` 与 `vectorPathSkipped`、`VECTOR` 报 409 或 500、`FULLTEXT` 不受影响）；纯函数 `normalizeFulltextQuery` / `buildSnippet` / `fuseRrf` / `rrfScoreOf` **导出**以便无依赖档断言）、`backend/src/routes/knowledgeBases.ts`（挂 `POST /:id/search`，**登录即可**）、`shared/src/knowledgeBase.ts`（新增 `FULLTEXT_QUERY_MAX_CHARS`/`FULLTEXT_QUERY_MIN_CHARS`/`SNIPPET_WINDOW_CHARS` + 三条提示常量 + `searchKnowledgeBaseBodySchema`/`retrievalHitSchema`/`searchKnowledgeBaseResultSchema`）。**零新增依赖、零新增环境变量**（`RRF_K`/`CANDIDATE_POOL_FACTOR`/`RETRIEVAL_*` 都是 P0-1-15 已登记的）。**四条最值得记的**：① **"两路各自与独立 SQL 等价"是唯一能证明分数不是编出来的手段** —— 验收把端点返回的名次/分数跟独立复算同形状 SQL 的结果**逐条对照**（只断言"非空 + 有六列"时，一个"按 seq 排序"的假实现照样全绿）；② **RRF 的数值可以用返回的两路名次逐条反算**（`1/(k+rv) + 1/(k+rf)`，缺失记 0）；③ **`%`/`_` 必须在预处理阶段剔掉**，否则"字面包含"静默变成模式匹配（验收用"正文里有 `5` 和 `0` 但永不相邻"的夹具做判别 —— 两种实现的期望值不同，断言才有判别力）；④ **`§6-1` 的"去停用词"收窄为"只剥首尾脚手架"**（LIKE 要连续子串，删中间的"的"会**降低**命中率）。**两处文档订正**：`§6-2` 的 RRF 示例数值 0.0323 → **实测 0.0320**（并写成断言，文档与代码互为守门）、`§六` 的响应示例改成实际契约（`chunkId` 是 uuid(7)、补 `page`/`headingPath`/`rrfK`/`candidatePool`/`vectorPathSkipped`/`warnings`、`snippet` 不加工）。**验收**：新增 **`pnpm verify:retrieval`（27 项，需 PG + Redis + MinIO，自起 `semantic: true` 的词面重叠型假 embedding 上游）** —— A 三模式与六列（`FULLTEXT` 单独跑中文 query 非空、`VECTOR` 里含关键词的块**严格更近**、`HYBRID` 里两路都第 1 的块排第一、与独立 SQL 逐条等价、RRF 反算、`finalRank` 连续、引用片段三分支且都是原文子串、**`elapsedMs` 与墙钟都 < 500ms**（实测 3ms/4ms））／B 生效配置（阈值只作用于向量路、`topK`/`mode` 覆盖**不落库**、参数回显分别为该库快照 77 与环境特征值 5）／C 降级路径（模型变更 ⇒ 降级 + 告警 / `VECTOR` 409；未就绪 ⇒ 降级 / `VECTOR` 500，**子进程注入空配置**）／D 权限（MEMBER 可检索）+ 边界（空库、纯标点、跨库隔离、不存在 404）／E 清场；`verify:app` **64 → 72 项**（新增"检索契约与 RRF 纯函数"整段）；**既有 14 档全部未回归**（`retrieval 27`＋`embedding 27 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / knowledge 23 / documents 32 / pipeline 29 / ingest 23 / knowledge-bases 19 / e2e 17`），lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 11 条落地要点 + 坑预判取证 + P0-1-21 前置与坑预判回写 + D 包 **7/8**）、`docs/02` §4.6（检索端点契约表）·§十四、`子方案①` §6-1/§6-2/§六/§八/§十四 同步；**顺手补 `pnpm check:batch`**（`infra/scripts/check-batch-marker.mjs`：比对 `docs/06` 最后一个 `[✓]` 的批次号与 `index.ts` 启动信封的 `step` —— 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性）。**⚠️ 边界**：**这仍不是浏览器可端测的里程碑**（列表/下载端点是 P0-1-21、界面是 P0-1-30），但 **API 级已经"上传 → 入库 → 检索"整条打通**：`curl POST .../search` 现在能真的拿回带双路分数与 RRF 名次的片段；手工跑需要先配好 `EMBEDDING_*`（本机 .env 三项为空 ⇒ `HYBRID` 会降级为纯全文并告警），零配置的完整跑法是 `pnpm verify:retrieval`。归档：`issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` |
 | 2026-09-22 | — | **P0-1-21 完成（包 D 收口 ✅）**：知识库包验收 —— 补 `documents` **列表**与**下载原始文件**两条端点（`listDocuments` / `openDocumentSource` / 纯函数 `buildContentDisposition` / `downloadContentType`），并逐行跑通 `子方案①` §十二 的 8 行。**四条最值得记的**：① **列表排序刻意与其余三个列表相反**（文档用 `createdAt desc`：刚传的那篇要在第一条，否则用户以为上传没成功；**不按 `updatedAt`** —— 覆盖重建会让它在翻页时"跳到最前面"）；② **库不存在回 404 而不是空列表**（"库没了"与"库里没文档"是两件事，前端要跳的地方都不一样）；③ **必须先 `statObject` 再 `getObject`** —— 后者对不存在的键**不在 `await` 时抛错**（错误发生在读流时）⇒ 只调它的话响应头已经发出、客户端看到"下到一半断了"；先 stat 才能在发头前干净地回 404（顺带拿 `Content-Length`）；④ **`Content-Disposition` 的头注入防护**（CR/LF 删除、引号/反斜杠/路径分隔符替换、RFC 5987 里 `'`/`(`/`)`/`*` 还得自己编码 —— `encodeURIComponent` 会放过它们）+ **下载类型表与上传白名单的跨表一致性断言**。两条界面规则收进 `shared`：`DOCUMENT_PARSING_HINT`（"更新中，暂不参与检索" —— `§七` 的检索空窗不能不说）与 `isDocumentSearchable`（`READY ⟺ 可检索`，且 `PARSING ≠ FAILED`）。**验收**：新增 **`pnpm verify:kb-package`（11 项，需 PG + Redis + MinIO）** —— **一行一组逐行跑 §十二 的 8 行**（其中 R4"检索返回 v2"改用**真检索端点**验：新关键词命中**重建后**的块、**v1 的旧词查不到**，比"正文含 v2"强得多；R2 的 `PARSING→READY` 改用**列表端点**观察）；`verify:documents` **32 → 44 项**（F 组列表：分页/最新在前/键集合/跨库隔离/三态提示；G 组下载：**字节逐字相等**/Content-Type/中文名还原/对象丢失 404/幽灵与跨库与未登录/MEMBER 守门）、`verify:app` **72 → 79 项**（第 23 节：两条路由 + 列表 schema + 同一套投影 + 三态判据 + `Content-Disposition` 五组边界 + 跨表一致性）；**既有 15 档全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 8 条落地要点 + 坑预判取证 + **D 包 8/8**）、`docs/02` §4.6（列表/下载契约表）·§十四、`子方案①` §十二（**8 行逐行验收结论表**）·§十四、README（验收表、手工端测 ⑬、已知边界、索引、版本记录）同步。**⚠️ 边界**：`§七` 待决事项 7 的第二个端测点（**P0-1-30 浏览器首站**）与知识库界面（P0-1-35）都还没做 ⇒ 本批之后**命令行可跑完整条链路**（建库 → 上传 → 列表 → 检索 → 下载），浏览器里仍是占位页；单条 embedding 的真实推理时延仍卡在 `LOCAL_EMBEDDING_RUNTIME_MODULE`（`06` §七 待决事项 2）。归档：`issue_fix/问题记录-P0-1-21-知识库包验收.md` |
 | 2026-09-22 | — | **P0-1-22 完成（包 E 起步 1/3）**：Agent CRUD —— `shared/src/agent.ts`（`AGENT_TYPES`/`COMPONENT_TYPES` + **权限判据唯一实现 `canEditAgent`** + **读取端唯一兜底点 `normalizeGuideQuestions`** + **唯一一套 `AgentItem` 投影** + 五段 schema）、`backend/src/services/agent.service.ts`（列表/建/详情/改/软删 + 绑定模型三条校验 + **软删三件套**）、`backend/src/routes/agents.ts`（五条路由，**只用 `requireAuth`**）、`backend/scripts/verify-agents.mjs`（新增）、`verify-app.mjs` 第 24 节。**零新增依赖、零新增环境变量**。**三条最值得记的**：① **权限是"全员可建可看可用；创建者 + ADMIN 可编删"**（`01` §3.3 决策 18）—— 与知识库（无 owner 列、登录即可）和模型池（全程 ADMIN）**三族口径各不相同**，照抄邻居必错（本仓已踩过两次"顺手加 `requireAdmin`"）；判据只有一处实现，**路由侧不用 `requireAdmin`**（否则"创建者本人也改不了自己的东西"），验收用 **MEMBER** 跑建/改/删 + **ADMIN 改他人必须 200** 的反向守卫；判据里管理员取**字面量**而非 `USER_ROLES[0]`（后者重排即静默改判）。② **软删是"三件事一个事务"**（打 `deleted_at` + 删 `agent_components` + 会话转 `FINISHED` 只读保留），**先 CAS 打标记**再解绑；**只打标记的实现会让绑过的知识库永远删不掉**（删库守卫数 `agent_components`），故用一条链取证：**「绑 KB → 删 KB 409 → 软删 Agent → 同一 KB 删得掉 200」**。③ **绑定模型刻意不复用 `resolveChatTarget()`** —— 它带 424 `NEED_CREDENTIAL`（"调用上游"的前置），拿来校"绑定"会**逼管理员先配 Key 才能建智能体**；本批只三条（存在 + `type=CHAT` + 模型与 Provider 都启用），与 `GET /api/models/available` **逐条对应**并加一致性断言。另两条**静默口径**：**换绑才校验**（否则模型被停用后连改名都 409，症状是"这个智能体改不动了"，此时靠新增的 `modelAvailable` 字段提示）与 **`type` 可传不可改**（放进 schema 正是为了把静默 no-op 变成显式 409）。**验收**：新增 **`pnpm verify:agents`（26 项；需 PG + Redis、**不需要 MinIO**，注入 `EMBEDDING_*` 以便建真 KB 取快照）** —— A 投影/两种类型/`canEdit` **三方向** + 列表 `updatedAt desc`、B 绑定模型**四态**（门槛：绑 disabled 模型被拒）+ 与可选列表一致性 + "模型停用后仍能改名"、C 权限双向（MEMBER 与 ADMIN 各跑一遍）、D 四个文本字段三态 + `guideQuestions` 四边界 + `type` 不可改、E 软删三件套 + "已软删一律 404（不是 403）" + **跨批次引用计数口径**、F 路由表（P0-1-23 与 P1 的三条**必须 404**）、G 纯函数；`verify:app` **79 → 85 项**（CI 86 项）；**既有 17 档全部未回归**（含会碰 `agent_components` 的 `verify:pipeline` 与 `verify:knowledge-bases`），lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 10 条落地要点 + 坑预判取证 + **P0-1-23 坑预判回写** + E 包 **1/3**）、`docs/02` §4.4（**契约增量 · Agent** 八条：三族权限对照表、投影与 `canEdit`/`modelAvailable`、软删三件套、绑定校验四态表、换绑幂等、请求体口径、读取端兜底点、**五个列表的排序口径对照表**）·§十四、README（验收表、`verify:agents` 说明段、手工端测 **⑭**、已知边界"智能体专项"、缺陷索引、本行）同步。**⚠️ 边界**：组件绑定的**写侧**（`PUT /api/agents/:id/components`）是 **P0-1-23**、`POST /api/agents/:id/copy` 是 **P1**、Agent 界面是 **P0-1-31** ⇒ 本批**仍不是可端测里程碑**（浏览器首站仍是 P0-1-30）。归档：`issue_fix/问题记录-P0-1-22-Agent-CRUD.md` |
+| 2026-09-22 | — | **P0-1-23 完成（包 E 2/3）**：组件绑定 + 权限 —— `shared/src/agent.ts` 增写侧契约（`agentComponentInputSchema` + `replaceAgentComponentsBodySchema`）、`backend/src/services/agent.service.ts` 增 `replaceAgentComponents`（+ `componentKey`/`compareComponents`/`sameComponentSet` 三个集合助手）、`backend/src/routes/agents.ts` 挂**第六条路由** `PUT /api/agents/:id/components`、`verify-agents.mjs` 增 **H 组 9 项**、`verify-app.mjs` 第 24 节 **+1 项**。**零新增依赖、零新增环境变量**。**四条最值得记的**：① **"校验"必须排在"删除"之前 —— 顺序即正确性**：先清空再重建的实现在"引用了不存在的知识库"这条路上会**删光旧绑定再报错**（请求失败、用户没有任何理由认为它改动了什么，而绑定已经没了）；取证**不看状态码**，看旧行的 **`id` 是否逐字不变**（`id` 是 uuid7、重写一遍也会换 id）—— 这是 P0-1-19「要证明某件事没发生，必须用删得掉证据的方式」的第三次应用。② **⚠️ 口径变更：P0-1 阶段明确拒绝 `MCP` 引用**（400 + 文案指向 P0-2）—— `mcp_servers` 表属 P0-2，当前**没有路径**造出真实 server，收到的 MCP 引用必然是伪造/过期 id，写进去就是"永远修不好的孤儿绑定"（`ref_id` 是**无 FK 的多态外键**，数据库不会拦）；影响面已同步：`docs/06` P0-1-24 的验收门槛第 2 条改成可执行版本（MCP 那半由 P0-2 接回，接回方式 = 同一处 `assertComponentRefsBindable` 换成存在性校验，接口形态不变）、README 边界写明"含 MCP → 400 是预期"。③ **`.refine()` 给不出 `path`、`superRefine` + `addIssue({path})` 给得出** ⇒ 重复项的 400 精确指到 `['components', 1, 'refId']`，前端能高亮那一行（P0-1-22 那条"空 path"的正面写法，两档验收**刻意放在一起对照**）。④ **集合类接口的两条静默口径**：`components` **必填**（"省略 = 清空"会让前端忘带字段变成**静默解绑全部**）、**集合相同就不写库**（判等是集合语义 ⇒ 换顺序提交不算改动；否则每次保存都无谓刷新行的 `id`/`created_at`），`createMany({skipDuplicates})` 只兜并发双击。**另一条反向的连带语义**：整体替换**包含"清掉不在提交集合里的手工脏行"**（手工 `INSERT` 的绑定会在下次保存时被清干净）。**验收**：`pnpm verify:agents` **26 → 35 项全通过**（H 组：全量替换/`[]` 解绑/详情立即反映/跨模块 `agentCount` 联动/**失败时旧绑定逐字不变**/MCP 被拒/请求体形态/`updated_at` 逐字不变且列表顺序不跳/**幂等行 id 不变**/权限双向/软删 404 与未登录 401/脏行清理），`verify:app` **85 → 86 项**；**既有 17 档全部未回归**（重点盯的是同样数 `agent_components` 的 `verify:knowledge-bases` 19 项与 `verify:kb-package` 11 项 —— 本批**第一次**能用真端点造成绑定关系），lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致；`docs/06`（状态 + 「口径变更」段 + 9 条落地要点 + P0-1-24 门槛改写 + E 包 **2/3**）、`docs/02` §4.4（**⑨ 组件绑定的写侧**：状态码对照表 + 四条实现口径 + MCP 拒绝理由与 P0-2 接回方式）·§十四、README（验收表、`verify:agents` 说明段扩到八组、手工端测 **⑭-h**、已知边界、索引、本行）同步。**⚠️ 边界**：本批**不是可端测里程碑**（命令行可验的路径见 README **⑭-h**；浏览器首站仍是 **P0-1-30**，Agent 界面是 P0-1-31）；`POST …/copy` 是 **P1**。归档：`issue_fix/问题记录-P0-1-23-组件绑定.md` |

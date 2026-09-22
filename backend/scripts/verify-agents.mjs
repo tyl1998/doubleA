@@ -1,30 +1,35 @@
 #!/usr/bin/env node
 /**
- * verify-agents.mjs —— P0-1-22 的**智能体 CRUD 验收**（需要真实 PG + Redis）
+ * verify-agents.mjs —— P0-1-22（智能体 CRUD）+ P0-1-23（组件绑定）的验收（需要真实 PG + Redis）
  *
- * 验的是 `02` §4.4 的五条端点 + `01` §3.3 决策 18 的权限 + 三条容易做错的语义：
+ * 验的是 `02` §4.4 的六条端点 + `01` §3.3 决策 18 的权限 + 几条容易做错的语义：
  *   · **软删**的三件套：打 `deleted_at` 标记 / 解除组件绑定 / 会话转只读保留（`02` §4.4）；
  *   · **绑定模型**必须"存在 + `type=CHAT` + 模型与 Provider 都启用"（`01` §3.2 验收要点）；
- *   · **`canEdit`**：创建者 + ADMIN 为真，其余为假（列表是全员可见的）。
+ *   · **`canEdit`**：创建者 + ADMIN 为真，其余为假（列表是全员可见的）；
+ *   · **组件绑定整体替换**（P0-1-23）：全量语义、引用校验、失败不动旧数据、集合相同不写库。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ⚠️ 本脚本最想钉死的两件事
+ * ⚠️ 本脚本最想钉死的三件事
  * ─────────────────────────────────────────────────────────────────────
  * ① **权限是「全员可建可看可用；创建者 + ADMIN 可编删」，不是 ADMIN、也不是"仅创建者"**。
- *    所以这里**特意用 MEMBER 身份**把"建 / 改 / 删"各跑一遍：模型池那一族是 `(A)` 仅 ADMIN，
- *    若有人"顺手"给智能体也加上 `requireAdmin`（本仓已踩过两次这种直觉），
+ *    所以这里**特意用 MEMBER 身份**把"建 / 改 / 删 / 改组件绑定"各跑一遍：模型池那一族是
+ *    `(A)` 仅 ADMIN，若有人"顺手"给智能体也加上 `requireAdmin`（本仓已踩过两次这种直觉），
  *    本脚本会立刻红。反向的那一半同样要钉：**ADMIN 改别人的智能体必须成功**
  *    —— 只验"普通用户 403"的话，一个"仅创建者"的实现会全绿。
  * ② **软删不是"打个标记就完了"**：只打标记的实现会让**被绑的知识库永远删不掉**
  *    （`kb.service.ts` 的删库守卫数的是 `agent_components`），而界面上那个智能体已经"没了"
  *    —— 这是最隐蔽的一种坏法。故本脚本用"**删库 409 → 软删智能体 → 删库 200**"这条链取证。
+ * ③ **组件整体替换里"校验"必须发生在"删除"之前**：反过来的实现在"引用了不存在的知识库"
+ *    这条路上会**先删光旧绑定再报错** —— 请求是失败的，用户没有任何理由认为它改动了什么，
+ *    但绑定已经没了。故 H 组不看"状态码对不对"，而是看**旧行的 `id` 是否逐字不变**
+ *    （"某件事没发生"只能用"删得掉证据"的方式证明，见 `06` P0-1-19 的教训）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 依赖与前置
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 跑之前必须先起依赖并迁移：`pnpm infra:up && pnpm db:deploy`。
  * **不需要 S3**：本脚本不上传文档（建库/删库都不碰对象存储 —— 空文件列表时代码直接返回）。
- * 为什么要注入 `EMBEDDING_*`：E 组要建一个**真知识库**来验"解绑之后才删得掉"，
+ * 为什么要注入 `EMBEDDING_*`：E/H 组要建**真知识库**来验"解绑之后才删得掉"，
  * 而建库要取 `EmbeddingProvider.name()` 快照（**纯配置计算**，不发网络请求，见 P0-1-15）。
  * 注入一个永不会被访问的 URL 即可（`127.0.0.1:1`）。
  *
@@ -192,9 +197,37 @@ async function myAgentIdsInList(cookie) {
   return parsed.data.items.filter((item) => mine.has(item.id)).map((item) => item.id)
 }
 
+/**
+ * 某个智能体的组件绑定**行**（带 id）。
+ *
+ * ⚠️ 带 `id` 是关键：`agent_components.id` 是 uuid7、由 Prisma 在插入时生成，
+ * 于是"整份替换"与"原封不动"可以靠 **id 逐字是否变化**区分开 ——
+ * 这正是 `06` P0-1-19 的"删得掉证据"手法（只看内容的话，"重写了一遍但内容相同"会被漏掉）。
+ */
+function componentRowsOf(agentId) {
+  return prisma.agentComponent.findMany({
+    where: { agentId },
+    select: { id: true, componentType: true, refId: true },
+    // 与实现里的读取顺序同序，便于把两次快照直接比对
+    orderBy: [{ componentType: 'asc' }, { refId: 'asc' }],
+  })
+}
+
+/** `PUT /api/agents/:id/components`（整体替换） */
+function putComponents(cookie, agentId, components) {
+  return api('PUT', `/api/agents/${agentId}/components`, { cookie, payload: { components } })
+}
+
+/** 把组件行快照压成一行字符串（用于"逐字不变"的断言） */
+function rowsFingerprint(rows) {
+  return JSON.stringify(rows)
+}
+
 // ───────────────────────────── 预检 + 数据准备 ─────────────────────────────
 
-console.log(`\n${c.b}══ P0-1-22 智能体 CRUD 验收：软删三件套 / 绑定校验 / 创建者+ADMIN 权限 ══${c.x}`)
+console.log(
+  `\n${c.b}══ P0-1-22/23 智能体验收：CRUD 与软删 / 绑定模型校验 / 权限 / 组件绑定整体替换 ══${c.x}`,
+)
 
 try {
   await app.ready()
@@ -823,14 +856,19 @@ try {
     })
     const kb = await createKb(ownerCookie, { name: `智能体验证库-软删-${suffix}` })
 
-    // 组件写侧归 P0-1-23（PUT 整体替换），本批只在**读侧**回显 ⇒ 这里直接插库来造"已有绑定"的状态。
-    // ⚠️ MCP 那一行的 refId 是任意 uuid：`agent_components.ref_id` 是**多态外键、刻意没有 FK**
-    //    （`02` §3.1），而 `mcp_servers` 表要到 P0-2 才建 —— 这正是"解绑必须在服务层做"的原因。
+    // 组件写侧（P0-1-23）本批已落地：知识库那条走**真端点**
+    // （上一批这里还是"直接插库"的等价取证 —— 现在没有理由再插库了）
+    const bound = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+    ])
+    assertEqual(bound.statusCode, 200, '用真端点 PUT 绑定知识库')
+
+    // ⚠️ MCP 那一行**只能手工插**：P0-1-23 起 `PUT …/components` 会**明确拒绝** MCP 引用
+    //    （`mcp_servers` 表要到 P0-2 才建、当前无从验证真伪）。这恰好造出一个更狠的取证对象 ——
+    //    **手工塞进库的脏行也必须被软删清干净**，否则那条悬空引用会永远留在库里
+    //    （`kb.service.ts` 文件头 ④ 说的"孤儿绑定"就是这个形状）。
     await prisma.agentComponent.createMany({
-      data: [
-        { agentId: agent.id, componentType: ComponentType.KNOWLEDGE, refId: kb.id },
-        { agentId: agent.id, componentType: ComponentType.MCP, refId: other.id },
-      ],
+      data: [{ agentId: agent.id, componentType: ComponentType.MCP, refId: other.id }],
     })
 
     // 读侧：详情应回显两条绑定（本批"详情含组件绑定"的验收点）
@@ -952,37 +990,37 @@ try {
   // ═══════════════════════════════════════════════════════════════════
   // F 组 · 路由表（注册了什么、刻意**没**注册什么）
   // ═══════════════════════════════════════════════════════════════════
-  console.log(`\n${c.b}── F 组 · 路由表：五条已注册，P0-1-23 / P1 的刻意不存在 ──${c.x}`)
+console.log(`\n${c.b}── F 组 · 路由表：六条已注册，P1 / P0-1-25 的刻意不存在 ──${c.x}`)
 
-  await it('五条路由都在，且"尚未做"的三条一律 404（不提前注册）', async () => {
-    assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
-    assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
-    assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
-    assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/agents/:id' }), true, '编辑')
-    assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/agents/:id' }), true, '删除')
+await it('六条路由都在，且"尚未做"的两条一律 404（不提前注册）', async () => {
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents' }), true, '列表')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents' }), true, '创建')
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id' }), true, '详情')
+  assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/agents/:id' }), true, '编辑')
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/agents/:id' }), true, '删除')
+  // ⚠️ 上一批（P0-1-22）这条断言写的是 `false`（"属 P0-1-23，不提前注册"）；本批落地后翻转为 `true`
+  assertEqual(
+    app.hasRoute({ method: 'PUT', url: '/api/agents/:id/components' }),
+    true,
+    '组件整体替换（P0-1-23）',
+  )
 
-    // 组件写侧归 P0-1-23；复制是 **P1**（`02` §4.4 已标）；会话列表归 P0-1-25
-    assertEqual(
-      app.hasRoute({ method: 'PUT', url: '/api/agents/:id/components' }),
-      false,
-      '组件整体替换属 P0-1-23，本批不提前注册',
-    )
-    assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
-    assertEqual(
-      app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }),
-      false,
-      '会话列表属 P0-1-25',
-    )
+  // 复制是 **P1**（`02` §4.4 已标）；某 Agent 的会话列表归 P0-1-25
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/agents/:id/copy' }), false, '复制是 P1')
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }),
+    false,
+    '会话列表属 P0-1-25',
+  )
 
-    for (const [method, url] of [
-      ['PUT', `/api/agents/${MISSING_UUID}/components`],
-      ['POST', `/api/agents/${MISSING_UUID}/copy`],
-      ['GET', `/api/agents/${MISSING_UUID}/conversations`],
-    ]) {
-      const response = await api(method, url, { cookie: ownerCookie, payload: method === 'GET' ? undefined : {} })
-      assertEqual(response.statusCode, 404, `${method} ${url} 应 404`)
-    }
-  })
+  for (const [method, url] of [
+    ['POST', `/api/agents/${MISSING_UUID}/copy`],
+    ['GET', `/api/agents/${MISSING_UUID}/conversations`],
+  ]) {
+    const response = await api(method, url, { cookie: ownerCookie, payload: method === 'GET' ? undefined : {} })
+    assertEqual(response.statusCode, 404, `${method} ${url} 应 404`)
+  }
+})
 
   // ═══════════════════════════════════════════════════════════════════
   // G 组 · 纯函数（契约层，与依赖无关，但放在这里顺带真跑一次）
@@ -1037,6 +1075,370 @@ try {
       updateAgentBodySchema.safeParse({ name: 'x' }).data.description,
       undefined,
       '⚠️ 绝不能有 `.default(null)`：那会把"不动"与"清空"合并',
+    )
+  })
+  // ═══════════════════════════════════════════════════════════════════
+  // H 组 · 组件绑定整体替换（P0-1-23）
+  // ═══════════════════════════════════════════════════════════════════
+  console.log(
+    `\n${c.b}── H 组 · 组件绑定：PUT 全量替换 / 引用校验（先校验后删）/ 幂等 / 权限 ──${c.x}`,
+  )
+
+  await it('整体替换：空 → 2 个库 → 详情立即反映；改小后旧的消失（+ 跨模块引用计数联动）', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-组件-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kbA = await createKb(ownerCookie, { name: `智能体验证库-A-${suffix}` })
+    const kbB = await createKb(ownerCookie, { name: `智能体验证库-B-${suffix}` })
+
+    const bound = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kbA.id },
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+    ])
+    assertEqual(bound.statusCode, 200, '绑定 2 个知识库的状态码')
+    const afterBind = agentItemSchema.parse(bound.json().data)
+    assertEqual(
+      JSON.stringify(Object.keys(afterBind).sort()),
+      JSON.stringify(Object.keys(agentItemSchema.shape).sort()),
+      '响应仍是**同一套投影**（不是只回 components；集合比较先排序）',
+    )
+    assertEqual(afterBind.components.length, 2, '响应应回显 2 条绑定')
+
+    // 响应 = 详情那套投影：与 `GET /api/agents/:id` **逐字一致**（P0-1-21 的教训：同一份数据不许有两种形状）
+    const detail = await api('GET', `/api/agents/${agent.id}`, { cookie: ownerCookie })
+    assertEqual(detail.statusCode, 200, '详情状态码')
+    assertEqual(
+      JSON.stringify(agentItemSchema.parse(detail.json().data)),
+      JSON.stringify(afterBind),
+      'PUT 的响应应与详情逐字一致',
+    )
+    // 顺序稳定（`componentType asc, refId asc`）：前端把这两组分别灌进多选框，顺序跳会让界面闪
+    assertEqual(
+      JSON.stringify(afterBind.components.map((item) => item.refId)),
+      JSON.stringify([kbA.id, kbB.id].sort()),
+      '绑定顺序应是 (componentType, refId) 升序（与读取端 orderBy 同序）',
+    )
+
+    // 跨模块：`kb.service.ts` 的 agentCount 数的是 `agent_components`（`02` §3.1 的多态引用）
+    const kbList = await api('GET', '/api/knowledge-bases?limit=100', { cookie: ownerCookie })
+    assertEqual(kbList.statusCode, 200, '知识库列表状态码')
+    const counts = new Map(kbList.json().data.items.map((item) => [item.id, item.agentCount]))
+    assertEqual(counts.get(kbA.id), 1, 'A 的 agentCount 应为 1（刚绑上）')
+    assertEqual(counts.get(kbB.id), 1, 'B 的 agentCount 应为 1（刚绑上）')
+
+    // 改小：只留 B —— A 那条必须**立即**消失（验收门槛原文："解绑后详情立即反映"）
+    const replaced = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+    ])
+    assertEqual(replaced.statusCode, 200, '替换状态码')
+    assertEqual(
+      JSON.stringify(agentItemSchema.parse(replaced.json().data).components.map((c) => c.refId)),
+      JSON.stringify([kbB.id]),
+      '⚠️ 只该剩 B（全量替换＝提交什么库里就有什么）',
+    )
+    assertEqual(
+      await prisma.agentComponent.count({ where: { agentId: agent.id, refId: kbA.id } }),
+      0,
+      '⚠️ A 的绑定行必须被删除（不是"留在库里但不下发"）',
+    )
+  })
+
+  await it('解绑之后**被绑的库才删得掉**（真链路版：PUT 绑定 → 删库 409 → PUT [] → 删库 200）', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-解绑-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-解绑-${suffix}` })
+
+    assertEqual(
+      (await putComponents(ownerCookie, agent.id, [{ componentType: 'KNOWLEDGE', refId: kb.id }]))
+        .statusCode,
+      200,
+      '先绑上',
+    )
+    const blocked = await api('DELETE', `/api/knowledge-bases/${kb.id}`, { cookie: ownerCookie })
+    assertEqual(blocked.statusCode, 409, '被绑定时删库应 409')
+    assertIncludes(blocked.json().msg, '正被 1 个 Agent 绑定', '文案要给出数字（用户才知道去哪儿解绑）')
+
+    const cleared = await putComponents(ownerCookie, agent.id, [])
+    assertEqual(cleared.statusCode, 200, '`[]` = 解绑全部')
+    assertEqual(agentItemSchema.parse(cleared.json().data).components.length, 0, '详情立即反映为空')
+
+    assertEqual(
+      (await api('DELETE', `/api/knowledge-bases/${kb.id}`, { cookie: ownerCookie })).statusCode,
+      200,
+      '⚠️ 解绑之后这个库必须删得掉',
+    )
+    // 已删的库从清理清单里剔掉（清理段的 deleteMany 不会因此报错，但清单要诚实）
+    const index = createdKbIds.indexOf(kb.id)
+    if (index >= 0) createdKbIds.splice(index, 1)
+  })
+
+  await it('⚠️ 校验失败时**旧绑定逐字不变**（校验必须在删除之前）+ MCP 引用被明确拒绝', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-失败不动-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-失败不动-${suffix}` })
+    assertEqual(
+      (await putComponents(ownerCookie, agent.id, [{ componentType: 'KNOWLEDGE', refId: kb.id }]))
+        .statusCode,
+      200,
+      '前置：先绑上一条',
+    )
+    const before = await componentRowsOf(agent.id)
+    assertEqual(before.length, 1, '前置：应恰好一条绑定')
+
+    // ① 引用一个**语法合法但库里不存在**的知识库
+    const missing = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+      { componentType: 'KNOWLEDGE', refId: MISSING_UUID },
+    ])
+    assertEqual(missing.statusCode, 404, '引用不存在的知识库应 404')
+    assertIncludes(missing.json().msg, MISSING_UUID, '文案要带上是哪个 id（前端 message.error 直接能说清）')
+    assertEqual(
+      rowsFingerprint(await componentRowsOf(agent.id)),
+      rowsFingerprint(before),
+      '⚠️ 失败的 PUT 不该动任何一行（**含 `id`**：先删后校验的实现会在这里红）',
+    )
+
+    // ② 含 MCP 引用 → 400（`mcp_servers` 表要到 P0-2 才建，现在无从验证 ⇒ 明确拒绝而不是写进去）
+    const withMcp = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+      { componentType: 'MCP', refId: other.id },
+    ])
+    assertEqual(withMcp.statusCode, 400, '含 MCP 引用应 400')
+    assertEqual(withMcp.json().code, 'VALIDATION', '信封 code')
+    assertIncludes(withMcp.json().msg, 'P0-2', '⚠️ 文案要指向"功能还没上线"，而不是甩一句"参数不合法"')
+    assertEqual(
+      rowsFingerprint(await componentRowsOf(agent.id)),
+      rowsFingerprint(before),
+      '⚠️ 被拒的 PUT 也不该动任何一行',
+    )
+  })
+
+  await it('请求体形态：`components` 必填、重复项 **path 精确到下标**、坏枚举/坏 uuid 各 400', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-形态-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-形态-${suffix}` })
+
+    // ① 缺 `components`：清空必须显式传 `[]` —— "省略 = 清空"会让前端某次忘带字段变成**静默解绑**
+    const missing = await api('PUT', `/api/agents/${agent.id}/components`, {
+      cookie: ownerCookie,
+      payload: {},
+    })
+    assertEqual(missing.statusCode, 400, '缺 components 应 400')
+    assertEqual(missing.json().data.fields[0].path, 'body.components', '字段路径应指到 body.components')
+    assertIncludes(missing.json().data.fields[0].message, '空数组', '文案要说清"要清空请传空数组"')
+
+    // ② 非数组 / 坏 uuid / 坏枚举：路径都要能指到出问题的那一层
+    for (const [label, components, path] of [
+      ['非数组', 'x', 'body.components'],
+      ['坏 uuid', [{ componentType: 'KNOWLEDGE', refId: 'not-a-uuid' }], 'body.components.0.refId'],
+      ['坏枚举', [{ componentType: 'SANDBOX', refId: kb.id }], 'body.components.0.componentType'],
+    ]) {
+      const response = await api('PUT', `/api/agents/${agent.id}/components`, {
+        cookie: ownerCookie,
+        payload: { components },
+      })
+      assertEqual(response.statusCode, 400, `${label} 应 400`)
+      assertEqual(response.json().data.fields[0].path, path, `${label} 的字段路径`)
+    }
+
+    // ③ 重复项：`superRefine` 给出**真 path**（P0-1-22 在 `.refine()` 上踩过"path 是空串、只能遍历 message"）
+    const dup = await api('PUT', `/api/agents/${agent.id}/components`, {
+      cookie: ownerCookie,
+      payload: {
+        components: [
+          { componentType: 'KNOWLEDGE', refId: kb.id },
+          { componentType: 'KNOWLEDGE', refId: kb.id },
+        ],
+      },
+    })
+    assertEqual(dup.statusCode, 400, '重复项应 400（不能让它变成 DB 唯一索引的 500）')
+    assertEqual(
+      dup.json().data.fields[0].path,
+      'body.components.1.refId',
+      '⚠️ path 要精确到第 2 项，前端才能高亮那一行（`.refine()` 只能给空串）',
+    )
+    assertIncludes(dup.json().data.fields[0].message, '重复', '文案要点破"重复提交"')
+  })
+
+  await it('组件替换**不动 `agents.updated_at`**：列表顺序不跳（解绑一个库不该把智能体弹到顶部）', async () => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const older = await createAgent(ownerCookie, {
+      name: `验证智能体-排序-旧-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    await sleep(5)
+    const newer = await createAgent(ownerCookie, {
+      name: `验证智能体-排序-新-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-排序-${suffix}` })
+
+    const beforeOrder = await myAgentIdsInList(ownerCookie)
+    assert(
+      beforeOrder.indexOf(newer.id) < beforeOrder.indexOf(older.id),
+      '前置：新建的应排在前面（列表按 `updatedAt desc`）',
+    )
+    const before = await prisma.agent.findUnique({
+      where: { id: older.id },
+      select: { updatedAt: true },
+    })
+
+    await sleep(5)
+    const bound = await putComponents(ownerCookie, older.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+    ])
+    assertEqual(bound.statusCode, 200, '绑定状态码')
+
+    const after = await prisma.agent.findUnique({
+      where: { id: older.id },
+      select: { updatedAt: true },
+    })
+    assertEqual(
+      after.updatedAt.toISOString(),
+      before.updatedAt.toISOString(),
+      '⚠️ `updated_at` 必须**逐字不变**（它同时是列表排序键；"只写 agent_components"是刻意口径）',
+    )
+    assertEqual(
+      agentItemSchema.parse(bound.json().data).updatedAt,
+      before.updatedAt.toISOString(),
+      '响应里的 updatedAt 也要是旧值',
+    )
+    const afterOrder = await myAgentIdsInList(ownerCookie)
+    assert(
+      afterOrder.indexOf(newer.id) < afterOrder.indexOf(older.id),
+      '⚠️ 组件替换后顺序不能变（否则用户看到"列表自己跳了一下"）',
+    )
+  })
+
+  await it('幂等：重复提交同一份绑定（**换顺序**再提交）→ 行的 `id` 逐字不变', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-幂等-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kbA = await createKb(ownerCookie, { name: `智能体验证库-幂等A-${suffix}` })
+    const kbB = await createKb(ownerCookie, { name: `智能体验证库-幂等B-${suffix}` })
+
+    const first = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kbA.id },
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+    ])
+    assertEqual(first.statusCode, 200, '第一次状态码')
+    const snapshot = await componentRowsOf(agent.id)
+    assertEqual(snapshot.length, 2, '前置：两条绑定')
+
+    // ⚠️ 换个顺序再提交：集合语义与顺序无关，因此这**不是**一次改动
+    const second = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+      { componentType: 'KNOWLEDGE', refId: kbA.id },
+    ])
+    assertEqual(second.statusCode, 200, '第二次状态码')
+    assertEqual(
+      rowsFingerprint(await componentRowsOf(agent.id)),
+      rowsFingerprint(snapshot),
+      '⚠️ 集合没变就不该重写：行的 `id` 必须逐字不变（"删了重建"会换新 id，一验就出来）',
+    )
+  })
+
+  await it('权限：第三方 MEMBER → 403（且不写入）；创建者 → 200；**ADMIN 改他人 → 200**', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-组件权限-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-组件权限-${suffix}` })
+
+    const denied = await putComponents(otherCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+    ])
+    assertEqual(denied.statusCode, 403, '第三方普通用户改他人组件绑定')
+    assertEqual(denied.json().code, 'FORBIDDEN', '信封 code')
+    assertEqual(
+      await prisma.agentComponent.count({ where: { agentId: agent.id } }),
+      0,
+      '被拒时不该写入任何绑定',
+    )
+
+    assertEqual(
+      (await putComponents(ownerCookie, agent.id, [{ componentType: 'KNOWLEDGE', refId: kb.id }]))
+        .statusCode,
+      200,
+      '创建者本人可以改',
+    )
+
+    const byAdmin = await putComponents(adminCookie, agent.id, [])
+    assertEqual(
+      byAdmin.statusCode,
+      200,
+      '⚠️ ADMIN 必须能改别人的组件绑定（"创建者 + ADMIN"里的后半句）',
+    )
+    assertEqual(agentItemSchema.parse(byAdmin.json().data).components.length, 0, 'ADMIN 的解绑要生效')
+  })
+
+  await it('软删的一律 404；未登录 401（**必须给语法合法的 body**，否则先拿 400 验成假的）', async () => {
+    assert(softDeletedAgentId !== null, '前置：E 组必须已经软删了一个智能体')
+    const kb = await createKb(ownerCookie, { name: `智能体验证库-软删组件-${suffix}` })
+
+    const gone = await putComponents(ownerCookie, softDeletedAgentId, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+    ])
+    assertEqual(gone.statusCode, 404, '软删后 PUT 组件应 404（创建者也不行 —— 详情都查不到的东西不该能改）')
+    assertEqual(
+      (await putComponents(adminCookie, softDeletedAgentId, [])).statusCode,
+      404,
+      'ADMIN 也一样',
+    )
+
+    // ⚠️ Fastify 的 schema 校验跑在 `preHandler` **之前** ⇒ 空 body 会先拿 400，那样"401 挂没挂上"就验成假的
+    const anon = await api('PUT', `/api/agents/${MISSING_UUID}/components`, {
+      payload: { components: [] },
+    })
+    assertEqual(anon.statusCode, 401, '未登录')
+  })
+
+  await it('整体替换会清掉**不在提交集合里的手工脏行**（"提交什么，库里就有什么"）', async () => {
+    const agent = await createAgent(ownerCookie, {
+      name: `验证智能体-脏行-${suffix}`,
+      type: 'CHATBOT',
+      modelId: chatModel.id,
+    })
+    const kbKeep = await createKb(ownerCookie, { name: `智能体验证库-留-${suffix}` })
+    const kbStale = await createKb(ownerCookie, { name: `智能体验证库-旧-${suffix}` })
+
+    // 手工造两条"历史遗留"：一条指向另一个库、一条 MCP（P0-1-23 起 PUT 已**不可能**写入它）
+    await prisma.agentComponent.createMany({
+      data: [
+        { agentId: agent.id, componentType: ComponentType.KNOWLEDGE, refId: kbStale.id },
+        { agentId: agent.id, componentType: ComponentType.MCP, refId: other.id },
+      ],
+    })
+
+    const bound = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kbKeep.id },
+    ])
+    assertEqual(bound.statusCode, 200, '状态码')
+    const rows = await componentRowsOf(agent.id)
+    assertEqual(rows.length, 1, '只该剩提交的那一条')
+    assertEqual(rows[0].refId, kbKeep.id, '剩下的应是提交的那条')
+    assertEqual(
+      await prisma.agentComponent.count({
+        where: { agentId: agent.id, componentType: ComponentType.MCP },
+      }),
+      0,
+      '⚠️ 脏的 MCP 行也要被清掉（那条引用永远修不好，留着就是孤儿绑定）',
     )
   })
 } finally {
@@ -1106,9 +1508,9 @@ try {
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-1-22 智能体 CRUD 验收通过：${passed} 项全通过${c.x}`)
+  console.log(`${c.g}${c.b}✅ P0-1-22/23 智能体验收通过：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-1-22 智能体 CRUD 验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ P0-1-22/23 智能体验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }
