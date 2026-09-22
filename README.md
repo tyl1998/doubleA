@@ -112,6 +112,7 @@ pnpm verify:agent-package # **包级验收**：逐行跑 P0-1-24 的四条门槛
 pnpm verify:conversations # 会话验收：仅本人权限（含 ADMIN 也没有后门）/建会话初始值/按最近活跃排序（nulls-first）/软删 Agent 的会话仍可见/改名四态/级联删除与 deletedMessages/`/active` 读侧与降级/touchConversation 只前进不后退 + **消息历史（P0-1-28）**：空会话无 `total`/默认 20 条分两页/**25 条翻页不重不漏**/**同毫秒四条一条不漏**/`content` 原样透出（`tool_calls` 不被剥）/游标只返回严格更早/游标失效 400/权限三方向/**只读会话历史仍看得见**，**需要真实 PG + Redis（不需要 MinIO）**（24 项）
 pnpm verify:chat-stream # **SSE 出口验收（P0-1-26）**：帧格式/响应头禁缓冲/`flushHeaders` 可测量/心跳按间隔/互斥（流内 `error{code:CONFLICT}`）/停止 5s 内 `done{STOPPED}`/断线即解锁/锁丢失必须 `error` 收口/发消息前置五类。⚠️ **真进程 + 真 TCP**（`app.inject` 观察不到时间轴），**需要真实 PG + Redis（不需要 MinIO、不需要任何上游）**，默认端口 13097（`CHAT_STREAM_PORT` 可换）（28 项）
 pnpm verify:chatbot    # **ChatBot 编排循环验收（P0-1-27）**：检索块真的进了 prompt（夹具从 system 里抄文档名）+ `citations` 事件与库里片段**逐字相同** + 增量原样透传 + 整轮落库（含 `lastMessageAt` 前进）/ 未命中**不发** `citations` 且回答不编造来源 / 停止后已生成部分保留且可直接追问 / 并发闸满 ⇒ **流内** `error{BUSY}`（不是 429 信封）且被拒的那轮不落库 / 超长会话按 `CONTEXT_ROUNDS` 截断 / 上游故障 ⇒ 流内 `error{UPSTREAM_ERROR}`，并打点 TTFT。⚠️ **真进程 + 真 TCP + 两个假上游（对话 + embedding）**，**需要真实 PG + Redis（不需要 MinIO）**，默认端口 13098（`CHATBOT_PORT` 可换）（21 项）。**P0-1-28 起**本档的取历史改为**真打 `GET /:id/messages` 端点**（不再是直接读库）⇒ 端点口径与编排口径分不开，两侧任何一边改错都会红
+pnpm verify:chat-package # **包级验收**：逐行跑 P0-1-29 的七条门槛（建号→登录→建库传 3 篇 PDF→建 ChatBot 绑库→带引用回答 / 停止→已生成部分保留→可直接追问 / 刷新→历史含引用卡完整恢复 / 同会话并发 → `CONFLICT` / 25 轮超长会话不报错 / 首字延迟 < 3s（以服务端 TTFT 日志为准）/ 全程无手工干预数据），**跨 B→C→D→E→F 五个包串一遍**。⚠️ **真进程 + 真 TCP + 两个假上游 + 3 篇真 PDF**，**需要真实 PG + Redis + MinIO**，默认端口 13096（`CHAT_PACKAGE_PORT` 可换）（24 项）
 pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的批次号 vs `index.ts` 启动信封的 step（不一致即 exit 1）
 ```
 
@@ -141,8 +142,8 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 > `pnpm verify:session` / `verify:auth` / `verify:users` / `verify:e2e` / `verify:model-providers`
 > / `verify:models` / `verify:llm` / `verify:knowledge-bases` / `verify:documents` / `verify:pipeline`
 > / `verify:ingest` / `verify:retrieval` / `verify:kb-package` / `verify:agents` / `verify:agent-package`
-> / `verify:conversations` / `verify:chat-stream` / `verify:chatbot`
-> 是**必须**先起依赖 + 迁移的**十八档**
+> / `verify:conversations` / `verify:chat-stream` / `verify:chatbot` / `verify:chat-package`
+> 是**必须**先起依赖 + 迁移的**十九档**
 > （`pnpm infra:up && pnpm db:deploy`），因为验的正是"真实 Redis/PG 上的行为"：
 > 会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
 > 四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、以及
@@ -287,7 +288,34 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 > **E** 锁被外部清掉时必须用 `error` 收口（**而不是假装"已停止"**）；**F** 发消息的五类前置
 > （401/400/404/只读 409/424，附件字段指向 P1）；**G** 契约自检（事件全集与 `02` §5.1 逐字一致、
 > 顺序也一致）与残留复核。跑完自清所有会话/消息/智能体/模型/Provider/账号与两个 Redis 键。
-
+>
+> `pnpm verify:chatbot`（**P0-1-27**）验的是**编排循环本身**（检索块真的进了 prompt、`citations` 与
+> 库里片段逐字相同、增量原样透传、整轮落库、未命中不发引用卡且不编造来源、停止后已生成部分保留、
+> **流内** `error{BUSY}` 而不是 429 信封、超长会话按 `CONTEXT_ROUNDS` 截断、上游故障收口并打点 TTFT）；
+> 它同样**真进程 + 真 TCP + 两个假上游**（对话 + embedding），默认端口 13098。
+> **P0-1-28 起**它的取历史改为**真打 `GET /:id/messages` 端点**（不再是直接读库）——
+> 端点口径与编排口径从此分不开，两侧任何一边改错都会红。
+>
+> `pnpm verify:chat-package` 是 **P0-1-29 的包级验收（包 F 收口 / 阶段一出口）**：**一行一组**逐行跑
+> 七条门槛（R1 建号→登录→建库传 3 篇 PDF→建 ChatBot 绑库→**带引用回答** / R2 停止→已生成部分保留→
+> 可直接追问 / R3 刷新→历史含引用卡完整恢复 / R4 同会话并发 → `CONFLICT` / R5 25 轮超长会话不报错 /
+> R6 首字延迟 < 3s / R7 全程无手工干预数据 / R8 清场），**跨 B→C→D→E→F 五个包串一遍**，末尾给结论表。
+> 它**不重复**上面四档的细粒度断言，只跑"从头串一遍还成不成立"的证据 —— 其中两条是设计重点：
+> ① **R1 是五包联动**（B 建号 → C Provider/模型 → D 建库 + 上传 + 流水线 → E 建 Agent + 绑库 →
+> F 提问 → 检索 → 流式 → 引用 → 落库）：五个包各自的验收都绿，也不等于**一个新建的账号能自己把这条链走完**
+> （本仓踩过两次"顺手加 `requireAdmin`"，那类实现每档单独跑都可能绿）；
+> ② **R3 要求写入端的落库形态与读取端的投影逐字对得上**（`content` 是 jsonb、键序会被 PG 重排 ⇒
+> 必须**键序无关**地比 —— 用 `canonicalJson`）：只验一端时，"存 A 形状、回 B 形状"的实现可以两处都绿。
+> ⚠️ **R7「全程无手工干预数据」刻意不写成"我们没插 SQL"**（那是**恒真**的废断言）—— 拆成**四条
+> 只有服务端能产生的证据** + 一份端点台账：① 自选密码登这个新号必须 **401**、而 `POST /api/users`
+> 回的 `initialPassword` 必须 **200**（且长度/字母表对得上）；② 每篇文档的 chunk 正文里含**各自的特征短语**
+> （只可能来自上传字节）且列表端点报的 `chunkCount` == `chunks` 表实际行数；③ 助手消息正文 == 事件流增量拼接；
+> ④ `agent.createdBy` == 会话用户 id。⚠️ **三处"部分完成"在结论表里单列、不混进 ✅**：R3 的"刷新页面"
+> 只到 **HTTP 层**（浏览器渲染属 P0-1-32~34，现在前端仍是占位页）；R1 的 3 篇 PDF 是 **ASCII 夹具**
+> （本仓 `makePdf` 走 Helvetica + latin1，**装不下中文**，真中文 PDF 由 `verify:documents` 的 A 组单独验）；
+> R6 的 TTFT 是**链路值**不是模型值（上游是本地假夹具，证明的是"打点存在 + 口径正确 + 全链路没有隐藏等待"）。
+> 跑完自清 7 张表 + 4 族 Redis 键（含 `login-fail:{username}`）并断言残留为零。
+>
 > `pnpm verify:ingest` 是 **P0-1-19** 的入库验收（需要 PG + Redis + **MinIO**，同样自起**假 embedding 上游**）。
 > 七组用例：① **A 组·入库** —— `chunk_count` 与 `chunks` 表**逐行一致**、每行都有向量、维度 1024、
 > `meta` 三键齐备、⚠️ **id 的版本位必须是 `7`**（`uuid(7)` 只有 Prisma 的 `@default` 一个实现，
@@ -999,11 +1027,29 @@ curl -s --noproxy '*' -b "$COOKIE" "http://127.0.0.1:13000/api/conversations/$CO
 #        而且状态码全是 200、日志里什么都没有）。
 #   ⚠️ 权限：只读**自己**的会话，别人的 / 不存在的 / ADMIN 看别人的 **一律 404**（403 等于确认 id 有效）。
 
+# ⑲ 对话包验收（P0-1-29 —— 包 F 收口 / 阶段一出口）：七条门槛一次串跑
+#     与 ⑰⑱ 的区别：那两段是"一个端点一个端点地看"，这一段是**把整条链从头串一遍** ——
+#       B 建号 → C Provider/模型 → D 建库+上传+流水线 → E 建 Agent+绑库 → F 提问→检索→流式→引用→落库。
+#     这也是**唯一**一条能一次验完七条门槛的路径；⑰（提问带引用）+ ⑱（刷新后历史含引用卡恢复）
+#     两条合起来正是门槛①②③，其余四条（并发 CONFLICT / 25 轮超长 / 首字 < 3s / 无手工干预数据）在 ⑯⑰ 里各有一角。
+#     ⚠️ 前置：依赖全起（**PG + Redis + MinIO** —— 三篇 PDF 要真落 S3）+ 迁移（`pnpm infra:up && pnpm db:deploy`）；
+#        脚本**自己**起真进程（默认 **13096**）+ 真 TCP + 两个假上游 + 3 篇真 PDF，**不碰你 13000 的后端**，跑完自清。
+pnpm verify:chat-package
+#  → 24 项全通过，末尾一张结论表（R1~R7 逐行 PASS/FAIL；三处"部分完成"**单列、不混进 ✅**）。
+#    ⚠️ 想手工走这条链而不是跑脚本：按 ①→④→⑧→⑨→⑩→⑭→⑮→⑰→⑱ 的顺序照抄即可。
+#    ⚠️ 门槛⑦「全程无手工干预数据」是**意图**、不是一句可断言的话 —— 脚本把它拆成四条
+#       "只有服务端能产生"的证据（自选密码登这个新号 401 / `POST /api/users` 回的 `initialPassword` 200 /
+#       chunk 正文含上传特征短语且 `chunkCount` == 表行数 / 助手正文 == 事件流增量拼接）；
+#       手工端测时对应做法就是**全程不碰 SQL**（⑰-c 的 psql 只为看结果、不为改数据）。
+
 pnpm verify:conversations
 #  → 24 项全通过（需要 PG + Redis，**不需要 MinIO**；含 P0-1-28 的 H 组 9 项）。
 
 pnpm verify:chatbot
 #  → 21 项全通过（需要 PG + Redis，**不需要 MinIO**；脚本自己起进程 + 两个假上游，跑完删净）。
+
+pnpm verify:chat-package
+#  → 24 项全通过（需要 PG + Redis + **MinIO**；脚本自己起进程 + 两个假上游 + 3 篇真 PDF，跑完删净）。
 ```
 
 **已知边界（别当 bug）**：① 接口只有六组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
@@ -1020,8 +1066,30 @@ pnpm verify:chatbot
 `POST /:id/chat`（P0-1-26）是 SSE 流，真正的编排循环（检索 → LLM 流式 → `citations` → 落库）
 在 **P0-1-27** 落地；**`GET /:id/messages`（P0-1-28）** 就是"刷新页面重新画出整个对话页"的那**一个**请求
 （游标分页 + `content` 原样透出，连 `citations` 引用卡都在），手工跑法见 ⑱。
+**P0-1-29 把包 F 的五步串成一遍**（跨 B→C→D→E→F 五个包：建号 → 建库传 3 篇 PDF → 建 ChatBot 绑库 →
+带引用回答 → 停止 → 刷新恢复 → 并发冲突 → 超长会话 → 首字 < 3s → 全程无手工干预数据），
+自动版 `pnpm verify:chat-package`、手工版见 ⑲。
 ⚠️ 但**浏览器里仍是 P0-1-1 的占位页** —— 界面渲染属 **P0-1-32~34**，现在要看只能走 ⑯⑰⑱ 的 curl。
 照抄邻居必错，本仓已因此踩过两次"顺手加 `requireAdmin`"。
+**会话 / 对话专项边界（P0-1-25 起；P0-1-26 补 SSE 出口；P0-1-27 补编排循环；P0-1-28 补消息历史；**P0-1-29 包收口 ✅ 5/5**）**：
+· **四类失败、两个出口**（分界线是**主语**，见 `docs/02` §4.5 ⑧）——"请求 / 目标"的问题
+（401 / 400 / 404 / 只读 409 / 424）走 **JSON 信封**；"**这一轮生成**"的问题（**并发冲突 `CONFLICT`**、
+**并发闸满 `BUSY`**、锁丢失）走**流内 `error{code}` 单帧**（HTTP **200**）⇒ **收到 200 不等于成功了**，
+要读事件；反过来前端也不该把 `CONFLICT` 当"请求被拒"去弹全局错误条（它属对话区，见 `03` §五 的"消息流内错误卡"）。
+· **停止 ≠ 丢弃**：`POST /:id/stop` 之后那**半条回答照常落库**（`done.messageId` 非空），紧接着**直接追问**即可
+（追问不用重来）；只有"一个字都没吐就停"时才没有助手消息（此时 `messageId` 是 `null`）。**中断与上游故障都会落库**，
+**唯一不落库的例外是锁丢失**（那时可能已有另一条流在写同一份历史）。
+· **落库单位是"一轮问答"** ⇒ 被前置闸门拒掉的请求（Agent 被软删 / `BUSY` / 404）**一个字都不落**；
+但在**绑了知识库**的 Agent 上，"开流后被拒 / 空回答"这一轮**仍会留下一条"正文空 + 带引用卡"的助手消息**
+（检索跑在 LLM 之前，引用卡是真产出的）—— 这不是脏数据，而是"这一轮真的发生过"，**别当 bug**。
+· **`/active` 的 `streaming` 是派生的**（Redis 键在 ⇒ `true`），值坏**逐字段降级、永不 500**；
+不是自己的会话一律 **404**（而不是回 `{streaming:false}` —— 那会让"会话被删了"看起来像"当前没在生成"）。
+· **`GET /:id/messages` 刻意没有 `total`**（`messages` 是 14 个分区的按月分区表，数一次要在每个分区上各跑一遍），
+分页靠 `hasMore` + `nextCursor`；游标是**严格更早**（上一页的游标那条不会在下一页重复出现）；
+`beforeId` 给到**别的会话的 id 或一个非 UUID** 会 **400**（不是"当成没有游标"静默回第一页）。
+· **`usage_records` 表属 P1** ⇒ `done.usage` 只是**透传计量、不落表**；本版本**不做 token 级裁剪**（只按轮数截断，
+因为库里没有可用的 tokenizer —— 按字符估算等于"假保护"）。
+· **`POST /:id/confirm`（HITL 确认）属 P0-2**（它真正的前置是 `mcp_servers` 表），现在打它得到统一信封 404，**不是坏了**。
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
 **文档上传专项边界（P0-1-16）**：本批能验的是"进门校验"与"解析器本身"（`pnpm verify:documents`
 的 A/C/D 组真跑四个夹具文件）；`.doc` 是刻意拒收（提示另存为 `.docx`），不是没做完；
@@ -1167,6 +1235,7 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-22-Agent-CRUD.md` | **本批的坑集中在"三处写反了会静默出错"的口径上**：① **权限判据 `USER_ROLES[0]`** 把语义藏在数组顺序里（重排即**静默**把管理员判成别人）⇒ 改成带类型标注的字面量 `const ADMIN_ROLE: UserRole = 'ADMIN'`（删掉 `ADMIN` 时**编译报错**）；② **`.refine()` 的校验失败 `path` 是空串** ⇒ 那条错误是"表单级"而非"字段级"，前端挂不到输入框上，验收只能遍历 `message` 找（要逐字段高亮就得改用 `superRefine` + `addIssue({path})`）；③ **Fastify 的 schema 校验跑在 `preHandler` 之前** ⇒ 验"未登录 401"必须给**语法合法**的载荷（空 body 会先拿 400，把"鉴权挂没挂上"验成假的）。**两条最隐蔽的实现口径**：④ **软删只打标记会让绑过的知识库永远删不掉**（删库守卫数的是 `agent_components`，而界面上那个 Agent 已经"没了"）⇒ 三件事一个事务 + 一条链取证（绑 KB → 删 KB 409 → 软删 Agent → 同一 KB 删得掉 200）；⑤ **绑定模型不能复用 `resolveChatTarget()`**（它带 424 `NEED_CREDENTIAL`，会逼管理员**先配 Key 才能建智能体**）⇒ 只三条校验 + 与可选列表的一致性断言。"换绑才校验"与"`type` 可传不可改"两条是同一族（**不会报错、只会静默做错事**，故全部落进 `verify-agents` 而不只是注释） |
 | `issue_fix/问题记录-P0-1-27-ChatBot编排循环.md` | **本批最值钱的两条都不在本批新写的脚本里，是"收尾跑全量回归"抓出来的**：① **旧档的守门断言有保质期（第三次复发）** —— `verify:chat-stream`（P0-1-26）第一次跑 **13 项失败 / 15 项通过**，看着发散（A/B/C/D/E 五组同时红）而**根因只有一个**：它把 Provider 的 `base_url` 填成 `https://api.example.com/v1`（"反正占位 producer 不会去调"），而接回点兑现后编排循环**真的会调上游** ⇒ 每条流立刻以 `error{UPSTREAM_ERROR}` 收口 ⇒ 所有"流还活着时"的断言一起塌；处置两处缺一不可（上游换成本仓夹具的 `stall` 模式 + **翻转守门断言并四处留痕**）。📌 判据：**一档里"大面积同时红"且分布在不同分组 ⇒ 先找共同前置，不要逐条去改断言**。② **实现层真缺陷：锁丢时抛错对象选错 ⇒ 用户看到「服务内部错误」** —— 出口层 `abort('lock-lost')` 会掐断在飞的上游 `fetch`，`failure` 是个**没有用户文案**的 `LlmAbortError`，它盖住了 `signal.reason` 里那句"…请重新发送消息"；修法是 lock-lost 分支**优先抛 `signal.reason`** ⇒ 启示 **"错误码 + 文案"要成对断言**（只断言码时这条会全绿，它正是被**另一批的档**抓出来的）。**四条口径**：③ **落库判据是"这一轮真的发生过"而不是"成功了才写"**（中断/故障都落库、**唯一例外 `lock-lost`**、前置失败一个字都不落，且**刻意没有标志位** —— 判据是控制流）；④ **帧透传必须走一条串行队列**（`chatStream` 回调是同步的而 `emit` 是异步的 ⇒ `void emit()` 会打乱帧序 + 吞掉 rejection）；⑤ **未命中 KB 是"不发 `citations` 事件"+"prompt 里禁止编造"两半**（只做前一半，模型照样会凭空写"根据《XX制度》"而界面上没有引用卡）；⑥ **`BUSY` 与 `CONFLICT` 同源**（都是流内 `error`，分界线是**主语**）；另：闸门**不排队**、`release` **幂等**、`limit<1` 抬到 1、逐库重复 embed 刻意、**`usage_records` 属 P1 本版只做计量透传**、**不做 token 级裁剪**（没有 tokenizer 的估算裁剪是假保护）。**⚠️ 三个验收脚本自身的伤**（都不是被测代码的问题）：`startServer()` **写好了但漏了调用** ⇒ 第一句 `fetch` 打空气并被包装成"脚本异常"；`redis.mGet` 在本仓客户端上**不存在** ⇒ 复核残留整块被 `try/catch` **静默吞掉**（故清理段必须打印一行显式的 `✔ 复核残留：已删净`）；**jsonb 的键序让 `JSON.stringify` 直比出假红**（PG 会重排对象键 ⇒ 报告里期望与实际**长得一模一样**）⇒ 用 `canonicalJson()` 递归排序后再比 |
 | `issue_fix/问题记录-P0-1-28-消息历史与上下文窗口.md` | **本批的坑有两条共性：一是"静默返回错东西"，二是"两处口径分叉"**：① **游标必须取"行 id"而不是时间戳** —— `messages` 主键是 `(id, created_at)`，而同一轮问答的两条消息在**同一个事务**里落库 ⇒ `created_at` **逐字相同**；用时间戳当游标会让并列的那条在翻页时**蒸发**（`01` §3.4「完整还原」直接破功），且症状极轻（少一条消息，没有报错）。② **`beforeId` 不属于本会话时必须 400，不能当"没有游标"** —— 后者会**静默返回第一页**，客户端拿旧游标翻页陷入"永远在第一页"的死循环，而**状态码全 200、日志里什么都没有**。③ **`content` 的 zod 写法两个陷阱**：`z.unknown().refine(...)` 会把推断类型收成 `{} | null`（与 `unknown` 不兼容 ⇒ `tsc` 报错），裸 `z.unknown()` 又**接受 `undefined`** ⇒ `JSON.stringify` 时**整个键消失**；定案 `z.custom<unknown>((v) => v !== undefined)`。④ **读取端一律不用 `messageContentSchema` 过滤**（它是**写侧**形状，只认 text/thinking/citations，会把 `tool_calls`/`attachments` **静默剥掉**）⇒ 用**反向对照**取证：同一条含 `tool_calls` 的行，过 schema 掉键、过端点不掉。⑤ **排序常量必须同源**（历史分页与上下文窗口是同一语义，两处各写一份 `orderBy` 迟早分叉）⇒ `MESSAGE_CHRONO_ORDER` 由 service 导出、编排侧导入。⑥ **分页取 `limit+1` 条而不是再数一次总数**（`messages` 是 14 个分区的**按月分区表**，`count` 要在每个分区上各跑一遍 —— 本仓最贵的查询形态），顺带**天然**得到下一页游标。⑦ **⚠️ 全量回归抓到一个跨档 flake**（不是本批代码，但会污染每一批的收尾）：`verify-retrieval`（P0-1-20）的"向量路名次 == 独立复算 `<=>` SQL"在**并列段**上是一次**抛硬币** —— 假上游是词面重叠型向量 ⇒ 与 query 无共同 bigram 的对照块**相似度恰好是 0**（不止一条并列），而实现**刻意**不在 SQL 里加第二排序键（会让 HNSW 退化成显式排序）⇒ tie-break 落在 JS 的 `stableOrder`（**score 降 + id 升**），**独立复算的 SQL 少了这个副键**；处置是两份复算 SQL 各补 `, c.id`（**镜像实现口径，不动被测代码**）⇒ 判据：**"两份查询只在某个并列段上不一致"先怀疑对照条件不等价，别急着改断言** |
+| `issue_fix/问题记录-P0-1-29-对话包验收.md` | **本批的「坑」全在「包级验收」这件事本身，而且六条里有五条是「断言写错了」而不是「代码坏了」** —— 这正是包级脚本与单端点脚本的分工：单端点脚本验「这个端点对不对」，包级脚本验「串起来还成不成立」，而后者最容易把「夹具碰巧成立」当成契约。① **引用片段不是整块正文** —— 上一批的夹具里 `snippet` 恰好等于整块 chunk 正文（块比 ±80 码点的窗口短），于是顺手写成 `snippet === chunk.content`；换成三篇真 PDF 立刻红。真实契约是三条：**片段 ⊆ 原文**（子串）、**片段含查询词**、**长度不超 `SNIPPET_WINDOW_CHARS` 上界**。② **「被拒的那一轮不落库」只对了一半** —— 绑了知识库的 Agent 上，**检索跑在 LLM 之前** ⇒ 即使这一轮被并发闸拒掉 / 一个字都没吐，`citations` 已经发出去、**这一轮真的发生过** ⇒ 库里多一条「正文空 + 带引用卡」的助手消息（那不是脏数据，落库判据是「这一轮真的发生过」）；断言要写 `rows.length === 2`、第 2 条是 `ASSISTANT`、正文 `''`、`citations.length >= 1`。③ **历史里数错第几条** —— 被中断的那半条回答是 `rows[1]`（USER 与 ASSISTANT 成对），写 `rows[3]` 会拿到下一条用户消息。④ **密码字母表的注释与常量不一致** —— `crypto.ts` 的注释写「剔除 0/O/o/1/l/I」，而常量其实**保留小写 `o`** ⇒ 验收里那条 `!/[0Oo1lI]/` 正则约 **1/4 概率随机红**；两处置法：断言改成与常量同源的 `!/[01IlO]/`（且长度取 `INITIAL_PASSWORD_LENGTH`），并**删掉同一件事的第二处写法** —— 同一口径在两处各写一遍，必有一处先腐烂。⑤ **证据要在断言之前收集** —— R7 的 `chosenPasswordLoginStatus` 写在 R1 的断言之后 ⇒ R1 一红，R7 就报「期望 401 实际 undefined」，把「一个失败」放大成「两个失败」。⑥ **门槛⑦「全程无手工干预数据」不能写成「我们没插 SQL」**（那是**恒真**的废断言，同族陷阱见技能里「断言形态」那一档）⇒ 拆成**四条只有服务端能产生的证据** + 一份端点台账：自选密码登这个新号 **401**、`POST /api/users` 回的 `initialPassword` **200**（长度/字母表对得上）、每篇 chunk 正文含**各自的上传特征短语**且列表端点 `chunkCount` == `chunks` 表行数、助手正文 == 事件流增量拼接、`agent.createdBy` == 会话用户 id；唯一直接写库的地方是自举管理员账号。**⚠️ 三处「部分完成」在结论表里单列、不混进 ✅**：R3「刷新页面」只到 **HTTP 层**（浏览器渲染属 P0-1-32~34）、R1 的 3 篇 PDF 是 **ASCII 夹具**（`makePdf` 走 Helvetica + latin1，**装不下中文**；真中文 PDF 由 `verify:documents` 的 A 组单独验）、R6 的 TTFT 是**链路值**不是模型值（上游是本地假夹具，证明的是「打点存在 + 口径正确 + 全链路没有隐藏等待」）。 |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 > SSE 编排协议已并入 `docs/02-后端设计.md` 第五~七节，不单独拆分。
@@ -1322,3 +1391,4 @@ doubuleA/
 | 2026-09-22 | — | **P0-1-27 完成（包 F 3/5）**：ChatBot 编排循环 —— `backend/src/orchestrator/chatBot.ts`（**接回点兑现**：并发闸 → 查 agent + 绑定 KB → 逐库检索 → 合并/引用卡 → 组装（system + 检索块 + 历史 + 用户消息）→ `chatStream` 流式透传 → 收尾落库 + TTFT 打点）、`backend/src/orchestrator/chatContext.ts`（**纯函数**：`buildSystemPrompt`/`formatRetrievalBlock`/`mergeRetrievalHits`/`toCitationItems`/`selectHistoryMessages`/`textOfHistoryRow`/`buildAssistantContent`）、`backend/src/orchestrator/semaphore.ts`（**纯函数**：进程级并发闸）、`shared/src/conversation.ts`（新增 **`citationItemSchema` + `messageContentSchema`**）、`shared/src/sse.ts`（`citations.items` 改为复用同一份 schema）、`orchestrator/index.ts`（**删占位**，`resolveChatProducer()` 单点替换）、`orchestrator/sse.ts`（`StreamChatReplyInput` + `ChatProducerInput` **新增 `content`** 并把路由的正文转交下去）、`routes/conversations.ts`（零结构改动，只多传一个字段）、`backend/src/index.ts`（启动信封 `step`）、`backend/scripts/{verify-chatbot.mjs,fixtures/chat-upstream.mjs}`（均新增）、`verify-app.mjs`（**第 26 节 17 条无依赖断言**）、**`verify-chat-stream.mjs`（P0-1-26 的那一档，本批改过 —— 见下）**。**零新增依赖、零新增环境变量**（`CHATBOT_CONCURRENCY`/`CONTEXT_ROUNDS` 都是 P0-1-3 已登记）。**三条结构决定**（都不是顺手这么写）：① **纯逻辑刻意拆到"零依赖"文件**（`chatContext.ts`/`semaphore.ts` 不 import `config`/`prisma`/日志，手法同 P0-1-18 的分块）⇒ 它们的错**没有 HTTP 表现**（流照常 200 结束），只有无依赖档能守住；`chatBot.ts` 只留"必须碰 DB/上游/日志"的那一半。② **落库的判据是"这一轮真的发生过"，不是"成功了才写"**（`01` 决策 15）：**中断（用户停止 / 客户端断开）照样落库**（否则刷新后用户看到"我停了一下，问题没了"，而 `02` §5.2 的断线恢复正是"拉历史补齐"）、**上游故障时已生成的内容也落库**再抛错，**唯一例外是 `lock-lost`**（那时可能已有另一个流在写同一份历史）；反之**前置失败一个字都不落**（落库单位是"一轮问答"，而这轮没发生）。实现上**刻意没有"是否落库"的标志位** —— 判据是控制流本身。③ **`BUSY` 是流内 `error` 事件，不是 429 信封**（与 P0-1-26 给 `CONFLICT` 的判断同源：**分界线是主语** —— 满/冲突的主语是"这一轮生成"，401/400/404/只读 409/424 的主语是"这个请求/目标"）；闸门**不排队**（`tryAcquire()` 满时**同步**返回 `null`：ChatBot 这侧没有 `queued` 的 UI）、`release` **幂等**（不幂等 ⇒ 计数减负 ⇒ 上限被悄悄放到无穷）。**另七条口径**：`citations` 事件**未命中一个都不发**（不是 `items: []`；且它与 prompt 里的"不许编造来源"是 `01` 决策 12 的**两半**）；检索块**片段不二次截断**（否则"卡片里显示的"与"模型看到的"不是一回事，而卡片的意义就是让人核对）；历史取 **`rounds × 2` 条且截断后必须从 `user` 开始**（截点落在助手回答中间会让模型把它当"要继续写下去的上文"）、丢掉空文本助手行与 SYSTEM 行；多库合并 `rrfScore desc` + `chunkId asc` 且**不设条数上限**；**帧透传要一条串行队列**（`chatStream` 回调是同步的而 `emit` 是异步的 ⇒ `void emit()` 会打乱帧序 + 吞掉 rejection）；**TTFT 在第一个 `delta` 上打点**（`02` §十三 是"首字 < 3s"的**唯一**测量依据，实测 53ms），上游结束原因不是 `stop` 时按 `COMPLETE` 收尾但必须 warn 留痕；**`usage_records` 属 P1** ⇒ 本版只做计量**透传**（`done.usage` + 结束日志）；**刻意不做 token 级裁剪**（没有可用的 tokenizer，按字符估算是"假保护"，比"明确只按轮数裁"更坏）。**⚠️ 全量回归抓到两条（详见归档）**：**① 旧档的守门断言有保质期** —— `verify:chat-stream`（P0-1-26）第一次跑 **13 项失败**，根因只有一个：它把 Provider 的 `base_url` 填成 `https://api.example.com/v1`（"反正占位 producer 不会去调"），而接回点兑现后编排循环**真的会调上游** ⇒ 每条流以 `error{UPSTREAM_ERROR}` 收口，所有"流还活着时"的断言一起塌；处置是把上游换成**本仓夹具 `chat-upstream.mjs` 的 `stall` 模式**（收下请求、只发 SSE 注释行、不回内容 ⇒ 流里仍只有 `ping`，"通道"这一层的断言原样成立，"回答"归 `verify:chatbot`）并**翻转那条守门断言 + 四处留痕**。**② 实现层真缺陷：锁丢时抛错对象选错** ⇒ 出口层 `abort('lock-lost')` 会掐断在飞的上游 `fetch`，`failure` 是个**没有用户文案**的 `LlmAbortError`，它盖住了 `signal.reason` 里那句"…请重新发送消息" ⇒ 用户看到的是「服务内部错误」；修法是在 lock-lost 分支**优先抛 `signal.reason`**。📌 启示：**"错误码 + 文案"要成对断言**（只断言码时这条会全绿 —— 它正是被**另一批的档**抓出来的）。**验收**：新增 `pnpm verify:chatbot` **21 项全通过**（A 命中/引用卡/透传/落库/上游报文/TTFT 7 项、B 未命中 3、C 停止 3、D 并发闸 4、E 超长会话 2、F 上游故障 2；⚠️ **真进程 + 真 TCP + 两个假上游**，默认端口 13098，需 PG + Redis，**不需 MinIO**）；`verify:app` **92 → 109 项**（CI 110）；`verify:chat-stream` 改成 **28 项全通过**；**全量回归 22 档全部退出码 0**。lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（下一个仍是 **P0-1-30 浏览器首站**）；但**命令行/HTTP 现在能真的完整跑通 `06` 的验收原文 ①②③**（绑库提问 → 带引用回答 + 事件 `citations` 先于 `delta`；`/stop` → `done{STOPPED}` 且已生成部分**保留在库里**、可直接追问；25 轮超长会话不报错），手工跑法见 README **⑰**（含三条前置：Provider 配 Key / 模型启用且 `type=CHAT` / Agent **绑了这个模型** —— 缺了会在**开流之前**拿到 424/409 的 JSON 信封）；`GET /:id/messages` 属 **P0-1-28** ⇒ **刷新页面看历史仍只能查库**（`psql`），浏览器里仍是占位页。归档：`issue_fix/问题记录-P0-1-27-ChatBot编排循环.md` |
 | 2026-09-22 | — | **README 手工端测可跑化（非计划内）**：①②③…⑯ 段里 `<id>` / `$KB` / `$DOC` / `<agent-id>` / `<conversation-id>` / `<①的id>` 这类"看着像占位符、其实是**上一段 curl 的产物**"的记号，全部改成**当场抓取的真变量** —— `$ALICE`(④) · `$PROVIDER`/`$MODEL`(附·模型池①②) · `$KB`(⑧) · `$DOC`(⑨) · `$AGENT`(⑭-a) · `$CONV`(⑮-a)，用 `tee` 兼顾"看完整响应"与"抓 id"；只剩密码类与"别人的 agent-id"是真人工。**同时订正两条会直接卡住链路的取值错误**：建号响应是 `{user:{…}, initialPassword}` ⇒ 要写 `.data.user.id`（写 `.data.id` 得 null）、`/api/models/available` 是 `{items:[…]}` 不是裸数组 ⇒ 要写 `.data.items[0].id`（写 `.data[0].id` 会让 ⑭-a 的 `modelId` 变成字符串 `"null"` → 400）。另补 4 条 ⚠️（**⑧ 删库 · ⑪ 删文档 · ⑭-f 软删智能体 · ⑮-f 删会话** 都会让后面的步骤"没东西可查"，别顺手先跑）、④-b（停用看完差别要**启用回来**，否则 ⑭ 取不到可用的 CHAT 模型）、⑭-h 的"至少两个知识库"、⑪ 的"刚走完 ⑨⑩ 时 retry 按预期就是 409" |
 | 2026-09-22 | — | **P0-1-28 完成（包 F 4/5）**：消息历史 + 上下文窗口 —— `shared/src/envelope.ts`（**新增游标分页工厂 `cursorPageOf`**，本仓第一个游标分页端点）、`shared/src/conversation.ts`（**新增契约**：`MESSAGE_ROLES` / `MESSAGE_PAGE_LIMIT_MAX=100` / `MESSAGE_PAGE_LIMIT_DEFAULT=20` / `listMessagesQuerySchema` / `messageItemSchema` / `messagePageResultSchema`；文件头新增第 ⑥ 条"读取端不解释 `content`，原样透出"）、`backend/src/services/conversation.service.ts`（`MESSAGE_CHRONO_ORDER` / `MessageRowForPage` / **纯函数 `toMessagePage`** / `listMessages`）、`backend/src/routes/conversations.ts`（**第八条路由** `GET /api/conversations/:id/messages`，只挂 `requireAuth`）、`backend/src/orchestrator/chatBot.ts`（历史 `orderBy` 改为**复用** `MESSAGE_CHRONO_ORDER`）、三个验收脚本（`verify-app` / `verify-conversations` / `verify-chatbot`）。**零新增依赖、零新增环境变量、零 schema 改动**。**四条最值得记的**：① **游标必须取"行 id"而不是时间戳** —— `messages` 主键是 `(id, created_at)`，同一轮问答的两条消息在**同一个事务**里落库 ⇒ `created_at` **逐字相同**，"拿时间戳当游标"会让并列的那条在翻页时**蒸发**（症状极轻：少一条消息、没有报错）⇒ 游标写成 `(created_at, id)` 字典序（PG 对 `id:{lt:uuid}` 的类型推断**先用一次性探针证过**才落笔），H 组专门造"同毫秒四条"证明一条不漏。② **`beforeId` 不属于本会话时必须 400，不能当"没有游标"** —— 后者会**静默返回第一页**，客户端拿旧游标翻页陷入"永远在第一页"的死循环，而**状态码全 200、日志里什么都没有**。③ **`content` 的 zod 写法两个陷阱**：`z.unknown().refine(...)` 把推断类型收成 `{} | null`（与 service 的 `unknown` 不兼容 ⇒ `tsc` 报错），裸 `z.unknown()` 又**接受 `undefined`** ⇒ `JSON.stringify` 时**整个 `content` 键消失**（"没有正文"与"正文是 undefined"线上无法区分）；定案 `z.custom<unknown>((v) => v !== undefined)`，并**刻意不用写侧的 `messageContentSchema` 过滤**（它会把 `tool_calls`/`attachments` **静默剥掉**）⇒ 验收用**反向对照**取证。④ **排序常量必须同源** —— 历史分页与上下文窗口是**同一个语义**，两处各写一份 `orderBy` 迟早分叉 ⇒ `MESSAGE_CHRONO_ORDER` 由 service 导出、编排侧导入。**另两条**：**分页取 `limit+1` 条判 `hasMore`**（`messages` 是 14 个分区的**按月分区表**，`count` 要在每个分区上各跑一遍 —— 本仓最贵的查询形态），同时**天然**得到下一页游标（= 返回页第一条）；**`toMessagePage` 刻意是纯函数**（切片 → 判 `hasMore` → 倒序 → ISO 时间）⇒ 进无依赖档，六条断言守住"多取的那条不进结果 / 取满 ⇒ 游标 `null` / 两次拼接不重不漏"。**⚠️ 全量回归抓到一个「跨档 flake」**（不是本批代码，但会污染每一批的收尾）：`verify-retrieval`（P0-1-20）的"向量路名次 == 独立复算 `<=>` SQL"在**并列段**上逐条对照是一次**抛硬币** —— 假上游是词面重叠型向量 ⇒ 与 query 无共同 bigram 的对照块**相似度恰好是 0**（不止一条并列），而实现**刻意**不在 SQL 里加第二排序键（会让 HNSW 退化成显式排序）⇒ tie-break 落在 JS 的 `stableOrder`（**score 降 + id 升**），**独立复算的 SQL 少了这个副键**；处置：两份复算 SQL 各补 `, c.id`（**镜像实现口径、不动被测代码**），连跑两次全绿。📌 判据：**"两份查询只在某个并列段上不一致"先怀疑对照条件不等价，别急着改断言**。**验收**：`verify:conversations` **15 → 24 项**（新增 **H 组 9 项**：空会话无 `total` / 默认 20 条分两页 / **25 条翻页不重不漏**（集合双向相同 + 顺序逐条 + 自证不变式）/ **同毫秒四条一条不漏** / `content` 原样透出 / 游标只返回**严格更早** / 游标失效 400 / 权限三方向（他人 404 · ADMIN 404 · 未登录 401 · 不存在 404）/ **只读会话历史仍看得见**）；`verify:app` **109 → 117 项**（第 25 节把"`GET /:id/messages` **刻意未注册**"这条守门断言**翻转为已注册**并留痕，另补契约与 `toMessagePage` 纯函数断言）；`verify:chatbot` **21 项**（`messagesOf` 从"直接读库"改为**真打该端点** ⇒ 端点口径从此是编排档的取数方式）；**全量回归 22 档全部退出码 0**。lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致。**⚠️ 边界**：仍**不是浏览器可端测的里程碑**（下一个仍是 **P0-1-30 浏览器首站**，不提前做）；但**本批之后"刷新页面 → 历史完整恢复"这条链路在命令行/HTTP 层已经真的跑通了**（手工跑法见 README **⑱**：登录 → 建会话 → 发一句 → `GET /:id/messages` 翻页取回，连 `citations` 引用卡结构都完整），浏览器里**仍是 P0-1-1 的占位页**（界面渲染属 P0-1-32~34）。归档：`issue_fix/问题记录-P0-1-28-消息历史与上下文窗口.md` |
+| 2026-09-22 | — | **P0-1-29 完成（包 F 收口 ✅ 5/5 —— 🎯 阶段一出口的七条门槛在命令行/HTTP 层全部成立）**：对话包验收 —— `backend/scripts/verify-chat-package.mjs`（**新增，1289 行**：**一行一组逐行跑七条门槛**，R1 建号→登录→建库传 3 篇 PDF→建 ChatBot 绑库→**带引用回答** / R2 停止→已生成部分保留→可直接追问 / R3 刷新→历史含引用卡完整恢复 / R4 同会话并发 → `CONFLICT` / R5 25 轮超长会话不报错 / R6 首字延迟 < 3s（读服务端 TTFT 日志）/ R7 全程无手工干预数据 / R8 清场；末尾给结论表）、`backend/package.json` + 根 `package.json`（加 `verify:chat-package`）、`backend/src/index.ts`（启动信封 `step`）、`backend/src/infra/crypto.ts`（**注释订正**：`PASSWORD_ALPHABET` 其实**保留小写 `o`**）、`docs/06-实施计划.md`（状态 `[✓]` + 落地要点 6 条 + 包进度总表 F 行 → ✅ 已收口）、`README.md`。**纯验收批次：零新增接口、零新增依赖、零新增环境变量、零 schema 改动。** **三条最值得记的**：① **包级脚本问的是「跨包串一遍还成不成立」** —— R1 一路跨 B（建号 + 首登强制改密 + 会话）→ C（Provider/模型）→ D（建库 + 上传 + 流水线）→ E（建 Agent + 绑库）→ F（提问 → 检索 → 流式 → 引用 → 落库）；**五个包各自的验收都绿，也不等于「一个新建的账号能自己把这条链走完」**（本仓踩过两次「顺手加 `requireAdmin`」，那类实现每档单独跑都可能绿）；R3 则要求**写入端的落库形态与读取端的投影逐字对得上**（`content` 是 jsonb、键序会被 PG 重排 ⇒ 必须用 `canonicalJson` **键序无关**地比），只验一端时「存 A 形状、回 B 形状」的实现可以两处都绿。② **R7「全程无手工干预数据」是「意图」不是「断言」** —— 直接写「我们没插 SQL」是**恒真**的（脚本里当然没有那句 SQL），故拆成**四条只有服务端能产生的证据** + 端点台账（自选密码登不进 401 / 服务端发的初始密码能进 200 / chunk 正文含上传特征短语且 `chunkCount` == 表行数 / 助手正文 == 事件流增量拼接 / `createdBy` == 会话用户 id）；唯一直接写库处是**自举管理员**（否则整条链没有起点）。③ **六条「坑」里五条是断言写错、只有一条是被测口径的连带后果** —— 最贵的是「**拿夹具碰巧成立当契约**」：`snippet === chunk.content` 在上一批成立只因那块的正文比 ±80 码点窗口短，换成真 PDF 立刻红；真实契约是「片段 ⊆ 原文 + 含查询词 + 不超窗口上界」三条。**另记一条连带语义**（R4 断言从「1 条」改成「2 条」的根因）：**绑了知识库的 Agent 上，检索跑在 LLM 之前** ⇒ 即使这一轮被并发闸拒掉 / 一个字都没吐，`citations` 已经发出去、**这一轮真的发生过** ⇒ 库里会多一条「正文空 + 带引用卡」的助手消息 —— 这不是脏数据，是 P0-1-27 那条「落库判据 = 这一轮真的发生过」的直接后果。**验收**：新增 `pnpm verify:chat-package`（**24 项全通过**；⚠️ **真进程 + 真 TCP + 两个假上游 + 3 篇真 PDF**，默认端口 **13096**，需真实 **PG + Redis + MinIO**，跑完自清 7 张表 + 4 族 Redis 键并断言残留为零）；**全量回归 23 档全部退出码 0**（含本批新增的这一档；且把新档连跑 3 次确认无随机 flake —— 第 ④ 条那个密码正则正是靠这一步抓出来的）；lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致；**`docs/02` 本批无需增量**（零新增接口/契约 —— 七条门槛验的全是既有契约）。**⚠️ 边界**：本批**仍不是浏览器可端测的里程碑**（`06` §七 待决事项 7 的第二个端测点仍是 **P0-1-30 浏览器首站**，**不提前做**）；但**阶段一的七条门槛现在命令行/HTTP 层已全部成立**（自动版 `pnpm verify:chat-package`，手工版 README **⑲**），浏览器里**仍是 P0-1-1 的占位页**（界面渲染属 P0-1-32~34）。归档：`issue_fix/问题记录-P0-1-29-对话包验收.md` |
