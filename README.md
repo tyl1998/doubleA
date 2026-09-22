@@ -1047,9 +1047,6 @@ pnpm verify:conversations
 
 pnpm verify:chatbot
 #  → 21 项全通过（需要 PG + Redis，**不需要 MinIO**；脚本自己起进程 + 两个假上游，跑完删净）。
-
-pnpm verify:chat-package
-#  → 24 项全通过（需要 PG + Redis + **MinIO**；脚本自己起进程 + 两个假上游 + 3 篇真 PDF，跑完删净）。
 ```
 
 **已知边界（别当 bug）**：① 接口只有六组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
