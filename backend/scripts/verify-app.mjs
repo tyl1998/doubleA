@@ -39,6 +39,11 @@
  *              分块模块不 import `config`/logger ⇒ 这一档（无依赖、可进 CI）能直接断言它；
  *              夹具（手写 PDF/DOCX 字节）也是纯生成器。行为侧（真上传 → 真解析 → 真分块）
  *              归 `verify-pipeline` 的 H 组。
+ *   · P0-1-20：**检索的三条规则 + 契约** —— 全文路的 query 预处理（只剥首尾脚手架、剔标点
+ *              （含 `%` / `_` 这两个 LIKE 通配符）、按码点截断 64、`< 2` 字跳过）、
+ *              引用片段（±80 字符、按码点、**不加工**）、**RRF 融合公式**（两路/单路/权重 0 的
+ *              数值逐项反算 + 同分确定性）。行为侧（真库 + 真 SQL + 假 embedding 上游）
+ *              归 `verify-retrieval.mjs`。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -81,11 +86,17 @@ import {
   canTransitionDocumentStatus,
   documentItemSchema,
   documentParamsSchema,
+  FULLTEXT_PATH_SKIPPED_TOO_SHORT,
+  FULLTEXT_QUERY_MAX_CHARS,
+  FULLTEXT_QUERY_MIN_CHARS,
   LEGACY_DOC_EXTENSION,
   LEGACY_DOC_HINT,
   MIME_BY_EXTENSION,
+  SNIPPET_WINDOW_CHARS,
   UPLOAD_EXTENSIONS,
   UPLOAD_FILE_FIELD,
+  VECTOR_PATH_SKIPPED_MODEL_CHANGED,
+  VECTOR_PATH_SKIPPED_NOT_READY,
   initialPasswordResultSchema,
   knowledgeBaseItemSchema,
   knowledgeBaseListResultSchema,
@@ -104,11 +115,14 @@ import {
   offsetPageOf,
   ok,
   retrievalConfigInputSchema,
+  retrievalHitSchema,
   remoteModelListResultSchema,
   REUPLOAD_UNCHANGED_HINT,
   reuploadDocumentResultSchema,
   removeDocumentResultSchema,
   retryDocumentResultSchema,
+  searchKnowledgeBaseBodySchema,
+  searchKnowledgeBaseResultSchema,
   SPLIT_STRATEGIES,
   updateModelBodySchema,
   updateModelProviderBodySchema,
@@ -147,6 +161,16 @@ import {
   splitIntoChunks,
 } from '../dist/backend/src/pipeline/chunk/index.js'
 import { providerKeyAad } from '../dist/backend/src/services/model.service.js'
+// 检索的**规则本身**（query 预处理 / 引用窗口 / RRF 融合公式）是纯函数 ⇒ 在这一档就能断言。
+// 它们的错误不会被 lint/typecheck/build 拦下、也不会让接口 400，症状是"结果不对但界面正常"
+// （命中少几条、片段截错位置、融合排名看着随机）—— 与 P0-1-18 把分块做成纯函数是同一条理由。
+// 行为侧（真库 + 真 SQL）归 `verify-retrieval.mjs`。
+import {
+  buildSnippet,
+  fuseRrf,
+  normalizeFulltextQuery,
+  rrfScoreOf,
+} from '../dist/backend/src/services/retrieval.js'
 // 夹具是纯 JS 生成器（手写 PDF/DOCX/ZIP 字节），不引依赖、不读外部文件 ⇒ 仍然满足本档"无依赖"
 import * as fixtures from './fixtures/documents.mjs'
 
@@ -171,6 +195,22 @@ function assertEqual(actual, expected, label) {
   assert(
     actual === expected,
     `${label}：期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`,
+  )
+}
+
+/** 字符串包含（P0-1-20 起在别处脚本里也有同名助手，保持一致以免看错方向） */
+function assertIncludes(haystack, needle, label) {
+  assert(
+    typeof haystack === 'string' && haystack.includes(needle),
+    `${label}：应含 ${JSON.stringify(needle)}，实际 ${JSON.stringify(haystack)}`,
+  )
+}
+
+/** 浮点近似（RRF 的分子分母都是整数，容差只为吃掉 JS 数字的表示误差） */
+function assertClose(actual, expected, label, epsilon = 1e-12) {
+  assert(
+    typeof actual === 'number' && Math.abs(actual - expected) <= epsilon,
+    `${label}：期望 ≈ ${expected}，实际 ${actual}`,
   )
 }
 
@@ -1849,6 +1889,235 @@ await it('「内容未变化，已跳过」是 shared 里的常量（前后端�
   // 与 `LEGACY_DOC_HINT` 同款：这条提示是"用户的下一步动作"（别传了 / 去改内容），
   // 措辞漂了就会让人以为是两种问题
   assertEqual(REUPLOAD_UNCHANGED_HINT, '内容未变化，已跳过', '提示文案')
+})
+
+// ── 22. 双路检索 + RRF 融合的契约与纯函数（P0-1-20）──
+console.log(`\n${c.b}── 检索契约与 RRF 纯函数（双路分数 / 融合公式 / 引用片段）──${c.x}`)
+
+await it('检索路由已注册；列表与下载那两条仍**刻意没有**（属 P0-1-21，猜出来的契约会先错一遍）', () => {
+  assertEqual(
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/search' }),
+    true,
+    '检索路由（`02` §4.6）',
+  )
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }),
+    false,
+    '不应有文档列表',
+  )
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents/:docId/download' }),
+    false,
+    '不应有下载',
+  )
+})
+
+await it('检索请求体契约：`query` 必填非空、`mode` 三值、`topK` 有界（覆盖只对本次请求生效）', () => {
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: '报销标准' }).success, true, '最小请求体')
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({}).success, false, 'query 必填')
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: '   ' }).success, false, 'trim 后为空 ⇒ 不合法')
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: 'a'.repeat(1000) }).success, true, '上限边界')
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: 'a'.repeat(1001) }).success, false, '超上限')
+  assertEqual(
+    searchKnowledgeBaseBodySchema.safeParse({ query: '报销', mode: 'SEMANTIC' }).success,
+    false,
+    '`mode` 只能是 HYBRID/VECTOR/FULLTEXT',
+  )
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: '报销', topK: 0 }).success, false, 'topK 下界')
+  assertEqual(searchKnowledgeBaseBodySchema.safeParse({ query: '报销', topK: 101 }).success, false, 'topK 上界')
+  assertEqual(
+    searchKnowledgeBaseBodySchema.safeParse({ query: '报销', topK: 3, mode: 'FULLTEXT' }).success,
+    true,
+    '试查页要能"同一 query 试三种模式"（覆盖只影响本次请求，服务层有用例证明不落库）',
+  )
+  // 必填语义的**文案**也要断言（P0-1-11 的教训：只断言"校验失败"会让"必填被降级成通用类型错误"漏过去）
+  const missing = searchKnowledgeBaseBodySchema.safeParse({})
+  assertIncludes(JSON.stringify(missing.error.issues), '请输入检索内容', '必填文案')
+})
+
+await it('结果契约：六列齐备，且 `null`（未命中）与 `0`（命中但分数为 0）是两件事', () => {
+  const hit = {
+    chunkId: DOC_SAMPLE.id,
+    docId: DOC_SAMPLE.id,
+    docName: '报销制度.txt',
+    seq: 3,
+    page: null,
+    headingPath: [],
+    snippet: '……出差住宿标准为……',
+    vectorScore: 0,
+    vectorRank: 3,
+    fulltextScore: 0.31,
+    fulltextRank: 1,
+    rrfScore: 0.032,
+    finalRank: 1,
+  }
+  assertEqual(retrievalHitSchema.safeParse(hit).success, true, '完整命中')
+  assertEqual(
+    retrievalHitSchema.safeParse({ ...hit, vectorScore: null, vectorRank: null }).success,
+    true,
+    '一路未命中是 `null`（不是 0 —— 前端据此显示 `—`）',
+  )
+  const withoutRrf = { ...hit }
+  delete withoutRrf.rrfScore
+  assertEqual(retrievalHitSchema.safeParse(withoutRrf).success, false, '`rrfScore` 必填（融合分是排序依据）')
+  assertEqual(
+    retrievalHitSchema.safeParse({ ...hit, headingPath: undefined }).success,
+    false,
+    '`headingPath` 必填（引用卡要显示"在哪一节"，空数组表示无标题）',
+  )
+
+  assertEqual(
+    searchKnowledgeBaseResultSchema.safeParse({
+      items: [hit],
+      mode: 'HYBRID',
+      topK: 5,
+      rrfK: 60,
+      candidatePool: 15,
+      elapsedMs: 12,
+      vectorPathSkipped: false,
+      warnings: [],
+    }).success,
+    true,
+    '完整响应',
+  )
+  assertEqual(
+    searchKnowledgeBaseResultSchema.safeParse({
+      items: [],
+      mode: 'HYBRID',
+      topK: 5,
+      rrfK: 60,
+      candidatePool: 15,
+      elapsedMs: -1,
+      vectorPathSkipped: false,
+      warnings: [],
+    }).success,
+    false,
+    '`elapsedMs` 不能为负',
+  )
+})
+
+await it('RRF 融合公式：两路都在、只在单路、权重为 0 —— 逐项按 §6-2 的公式反算', () => {
+  const weights = { vector: 1, fulltext: 1 }
+  // 三个数值同时也是 `子方案①` §6-2 那个"反直觉但正确"的例子（**实测值**，不是纸上推的）
+  assertEqual(
+    rrfScoreOf({ vectorRank: 1, fulltextRank: null, rrfK: 60, weights }).toFixed(4),
+    '0.0164',
+    '单路第 1 名：1/(60+1)',
+  )
+  assertEqual(
+    rrfScoreOf({ vectorRank: 1, fulltextRank: 1, rrfK: 60, weights }).toFixed(4),
+    '0.0328',
+    '两路都第 1：2/61',
+  )
+  assertEqual(
+    rrfScoreOf({ vectorRank: 1, fulltextRank: 4, rrfK: 60, weights }).toFixed(4),
+    '0.0320',
+    '向量第 1 + 全文第 4：1/61 + 1/64（⚠️ 文档原写 0.0323，实测是 0.0320，已回写订正）',
+  )
+  assertEqual(
+    rrfScoreOf({ vectorRank: null, fulltextRank: null, rrfK: 60, weights }),
+    0,
+    '两路都没命中 ⇒ 0（但**不会出现在结果里**：融合的输入就是两路命中的并集）',
+  )
+  assertEqual(
+    rrfScoreOf({ vectorRank: 1, fulltextRank: null, rrfK: 60, weights: { vector: 0, fulltext: 1 } }),
+    0,
+    '权重为 0 ⇒ 该路不贡献（权重是"要不要算这一路"，不是"降权"）',
+  )
+  assertEqual(
+    rrfScoreOf({ vectorRank: null, fulltextRank: 1, rrfK: 60, weights: { vector: 0, fulltext: 1 } }).toFixed(4),
+    '0.0164',
+    '权重只影响各自那一项',
+  )
+})
+
+await it('融合排序：并集去重、按 `rrfScore` 降序、同分按 `chunkId` 升序（**只看排名，不看原始分**）', () => {
+  const weights = { vector: 1, fulltext: 1 }
+  const fused = fuseRrf({ vector: ['b', 'a', 'c'], fulltext: ['c'], rrfK: 60, weights })
+  // c：向量第 3 + 全文第 1 ⇒ 1/63 + 1/61 = 0.0323（**双路共同认可能压过单路第 1 名**，§6-2 的设计意图）
+  // b：向量第 1 ⇒ 1/61 = 0.0164；a：向量第 2 ⇒ 1/62 = 0.0161
+  assertEqual(fused.map((row) => row.chunkId).join(','), 'c,b,a', '排序结果')
+  assertClose(fused[0].rrfScore, 1 / 63 + 1 / 61, '双路命中的融合分')
+  assertClose(fused[1].rrfScore, 1 / 61, '单路命中的融合分（缺失的一路记 0）')
+  assert(fused[0].rrfScore > fused[1].rrfScore, '「两路都在」应当赢「单路第 1」—— 这正是混合检索相比单路的价值')
+  assertEqual(fused.length, 3, '并集去重：c 只出现一条（同一块在两路命中不会变成两条）')
+  assertEqual(fused.find((row) => row.chunkId === 'c').vectorRank, 3, '同一块的两路名次并存')
+  assertEqual(fused.find((row) => row.chunkId === 'c').fulltextRank, 1, '同一块的两路名次并存')
+
+  // 同分时必须**确定**（否则"同一 query 两次调用顺序不同"会让分页与问题复现全部失去意义）
+  const tieA = fuseRrf({ vector: ['zz'], fulltext: ['aa'], rrfK: 60, weights })
+  const tieB = fuseRrf({ vector: ['aa'], fulltext: ['zz'], rrfK: 60, weights })
+  assertEqual(tieA.map((row) => row.chunkId).join(','), 'aa,zz', '同分按 id 升序')
+  assertEqual(
+    tieB.map((row) => row.chunkId).join(','),
+    tieA.map((row) => row.chunkId).join(','),
+    '同分结果与输入顺序无关（这就是"确定性"的含义）',
+  )
+})
+
+await it('全文路 query 预处理：**只剥首尾脚手架**、剔标点（含 LIKE 通配符）、按码点截断', () => {
+  assertEqual(normalizeFulltextQuery('请问出差住宿标准是多少？').text, '出差住宿标准', '剥掉首尾的提问脚手架')
+  assertEqual(
+    normalizeFulltextQuery('报销的标准是什么').text,
+    '报销的标准',
+    '⚠️ **不删中间的停用词**：LIKE 要连续子串，把中间的"的"删掉会把能命中的变成命中不了',
+  )
+  assertEqual(normalizeFulltextQuery('报销的标准与流程').text, '报销的标准与流程', '两端没有脚手架 ⇒ 原样')
+  assertEqual(normalizeFulltextQuery('呀呀呀报销呀呀').text, '报销', '两端可反复剥（循环到稳定）')
+  assertEqual(normalizeFulltextQuery('5%0').text, '50', '`%` 被剔除（否则 LIKE 会变成模式匹配）')
+  assertEqual(normalizeFulltextQuery('100_元').text, '100元', '`_` 同样是 LIKE 通配符')
+  assertEqual(normalizeFulltextQuery('😀😀').skipped, true, '表情属 `\\p{S}` ⇒ 剔除后没有有效字符')
+  assertEqual(normalizeFulltextQuery('的').skipped, true, '单个虚词剥到等长就不剥 ⇒ 交给"过短"判定（不静默变空）')
+  assertEqual(normalizeFulltextQuery('报').skipped, true, '`< 2` 字跳过全文路（§十三 待决事项 2）')
+  assertEqual(normalizeFulltextQuery('报销').skipped, false, '恰好 2 字 ⇒ 走全文路')
+
+  // 截断单位是**码点**：`slice()` 会把 64 切在 32 个代理对上（本层毫无报错，下游才对不上）
+  const astral = '𠮷'.repeat(100)
+  const truncated = normalizeFulltextQuery(astral).text
+  assertEqual([...truncated].length, FULLTEXT_QUERY_MAX_CHARS, '截断到 64 个**字符**')
+  assertEqual(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(truncated),
+    false,
+    '不得劈开代理对（否则产出非法字符串）',
+  )
+  assertEqual(FULLTEXT_QUERY_MAX_CHARS, 64, '上限值（§6-1 定案）')
+  assertEqual(FULLTEXT_QUERY_MIN_CHARS, 2, '下限值（§十三 待决事项 2 定案）')
+})
+
+await it('引用片段：窗口 ±80 字符、按码点、**不加工**（加了省略号就不再是原文子串）', () => {
+  const content = '零一二三四五六七八九'
+  assertEqual(buildSnippet(content, '五六', 2), '三四五六七八', '命中居中：前后各 2 个字符')
+  assertEqual(buildSnippet(content, '零', 2), '零一二', '命中贴文首：窗口在 0 处裁剪')
+  assertEqual(buildSnippet(content, '九', 2), '七八九', '命中贴文末：窗口在末尾裁剪')
+  assertEqual(buildSnippet(content, '不存在', 2), '零一二三', '字面未命中 ⇒ 取块首窗口（没有"命中位置"可取）')
+  for (const needle of ['五六', '零', '九', '不存在']) {
+    assert(content.includes(buildSnippet(content, needle, 2)), `“${needle}” 的片段必须是原文的**逐字子串**`)
+  }
+  assertEqual(
+    buildSnippet(content, '五六', SNIPPET_WINDOW_CHARS),
+    content,
+    '夹具比窗口短时整块返回（窗口不会越界）',
+  )
+  assertEqual(SNIPPET_WINDOW_CHARS, 80, '窗口半径（§九 定案）')
+
+  // 窗口边界落在代理对中间时也必须合法（P0-1-18 的同款教训）
+  const astralContent = `前面是普通文字${'𠮷'.repeat(20)}后面也是普通文字`
+  const astralSnippet = buildSnippet(astralContent, '前面', 1)
+  assertEqual(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(astralSnippet),
+    false,
+    '窗口切片不得劈开代理对',
+  )
+})
+
+await it('降级的提示文案是 shared 常量（前后端共用同一句），且两种原因**不混用**', () => {
+  assert(VECTOR_PATH_SKIPPED_MODEL_CHANGED.length > 0, '模型变更的提示')
+  assert(VECTOR_PATH_SKIPPED_NOT_READY.length > 0, '未就绪的提示')
+  assert(
+    VECTOR_PATH_SKIPPED_MODEL_CHANGED !== VECTOR_PATH_SKIPPED_NOT_READY,
+    '两种原因必须分开：一个要运维修配置，一个要业务重建（合成一句会让用户去做治不好的动作）',
+  )
+  assertIncludes(FULLTEXT_PATH_SKIPPED_TOO_SHORT, String(FULLTEXT_QUERY_MIN_CHARS), '过短的提示里要带上阈值')
 })
 
 await app.close()

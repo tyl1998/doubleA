@@ -109,9 +109,10 @@ try {
   const bootEnvelope: Envelope<{ service: string; step: string; address: string }> = ok({
     service: 'doubulea-backend',
     // ⚠️ 每批必须顺手改成当前批次（P0-1-6 起连漏三批：P0-1-7/8/9 都忘改，
-    //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版）。
+    //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
+    //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-1-18 空文本检测 + 分块（可插拔策略）',
+    step: 'P0-1-20 双路检索 + RRF 融合',
     address,
   })
   logger.info(

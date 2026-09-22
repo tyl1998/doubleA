@@ -368,3 +368,156 @@ export const removeKnowledgeBaseResultSchema = z.object({
   deletedObjects: z.number().int().min(0),
 })
 export type RemoveKnowledgeBaseResult = z.infer<typeof removeKnowledgeBaseResultSchema>
+
+// ───────────────────────────── 检索（P0-1-20）─────────────────────────────
+
+/**
+ * 全文路查询的**最大长度**（`子方案①` §6-1："长 query 截断到 64 字符"）。
+ *
+ * 为什么是字符而不是 token：全文路是 `content LIKE '%<子串>%'` 的字面匹配 ——
+ * 子串越长越不可能字面命中。64 字符已经是"一整句话"的量级，再长的 query
+ * 本来就该由向量路负责（语义相似），继续字面匹配只会颗粒无收。
+ */
+export const FULLTEXT_QUERY_MAX_CHARS = 64
+
+/**
+ * 全文路查询的**最小有效长度**（`子方案①` §十三 待决事项 2 定案：`< 2` 字时全文路自动跳过）。
+ *
+ * 理由：pg_bigm 用 2-gram 建倒排索引，**1 个字符**既构不成一个 bigram、也几乎没有区分度
+ * （"的"能命中半个库）。此时不是"可能不准"，而是"必然是无意义的召回" ——
+ * 跳过它并**明确告诉调用方**（`FULLTEXT_PATH_SKIPPED_TOO_SHORT`），比返回一屏垃圾好。
+ */
+export const FULLTEXT_QUERY_MIN_CHARS = 2
+
+/**
+ * 引用片段的窗口半径（`子方案①` §九："命中位置前后各取 **80 字符**窗口的原文"）。
+ *
+ * ⚠️ 单位是**字符（码点）**，不是 `String.length` —— 与 P0-1-18 的分块同一口径：
+ * 用 `slice()` 取窗口会**劈开代理对**，产出非法字符串且本层毫无报错。
+ */
+export const SNIPPET_WINDOW_CHARS = 80
+
+/**
+ * 向量路被跳过时的提示之一：**库里的向量与当前模型不是同一个模型产的**。
+ *
+ * 对应 `子方案①` §八 的降级路径（"探测与告警要在 P0 就位，否则换模型时会静默出错"）：
+ * 快照的 `embedding_model` 与当前 provider 的 `name()` 不一致 ⇒ 库里的向量与"将要算出来的
+ * query 向量"不在同一个语义空间，比出来的距离**没有意义**。此时**不报 500**，
+ * 而是跳过向量路并附上这条警告（`HYBRID` 退化成纯全文检索）。
+ */
+export const VECTOR_PATH_SKIPPED_MODEL_CHANGED =
+  '该知识库使用的 embedding 模型已变更，向量路已跳过（该库需重建后才能参与向量检索）'
+
+/**
+ * 向量路被跳过时的提示之二：**服务端 embedding 未就绪**（配置缺项 / 本地模型未就位）。
+ *
+ * 与上一条区分开：这条是"我们这台机器还没配好"（运维要修），
+ * 上一条是"这个库需要重建"（业务要处理）。合成一条会让用户去重做一个治不好的动作。
+ */
+export const VECTOR_PATH_SKIPPED_NOT_READY = '服务端 embedding 未就绪，向量路已跳过（请先完成 embedding 配置）'
+
+/** 全文路被跳过时的提示：有效字符不足（见 {@link FULLTEXT_QUERY_MIN_CHARS}） */
+export const FULLTEXT_PATH_SKIPPED_TOO_SHORT = `检索内容不足 ${FULLTEXT_QUERY_MIN_CHARS} 个有效字符，全文路已跳过`
+
+/**
+ * `POST /api/knowledge-bases/:id/search` 请求体（**检索测试页**用，`03` §4.3）。
+ *
+ * `mode` / `topK` 可在**单次请求里覆盖**（不必先 PATCH 知识库）：检索测试页的价值就在于
+ * "拿同一个 query 试三种模式、看双路得分"，若每次都要改库配置再改回来，页面就没法用了
+ * （而且会**污染**该库的真实检索配置）。省略时取该库快照的 `retrieval_config`。
+ *
+ * `score` / `rrfK` / `weights` **刻意不可覆盖**：它们是"这个库的检索口径"，
+ * 属于配置而不是试查参数 —— 让试查页能改阈值，等于让一次点击就改掉别人的召回率
+ * （页面看到的结果与线上不一致，比看不到更坏）。
+ */
+export const searchKnowledgeBaseBodySchema = z.object({
+  query: z
+    .string({ required_error: '请输入检索内容' })
+    .trim()
+    .min(1, '请输入检索内容')
+    /**
+     * 上限 1000 字符：query 最终要变成一次 embedding 调用（`bge-m3` 输入上限 8192 token，
+     * 1000 字符远在其内），也是防误操作的门槛（把整篇文章粘进搜索框）。
+     */
+    .max(1000, '检索内容最多 1000 个字符'),
+  topK: z
+    .number({ invalid_type_error: 'topK 必须是数字' })
+    .int('topK 必须是整数')
+    .min(1, 'topK 至少为 1')
+    .max(100, 'topK 最多 100')
+    .optional(),
+  mode: z
+    .enum(RETRIEVAL_MODES, { errorMap: () => ({ message: `mode 只能是 ${RETRIEVAL_MODES.join('/')}` }) })
+    .optional(),
+})
+export type SearchKnowledgeBaseBody = z.infer<typeof searchKnowledgeBaseBodySchema>
+
+/**
+ * 一条检索结果（**同时是"检索测试页"的一行，也是引用卡的来源**，`子方案①` §六·§九）。
+ *
+ * ⚠️ 两条口径要一起读：
+ *   · 双路原始分（`vectorScore` / `fulltextScore`）**只在本端点出口** ——
+ *     §九 说"对外只给融合分"，那是指**引用卡**（F 包的 `citations` 事件）；
+ *     检索测试页的价值恰恰是"看到每一路各自的判断"（`03` §4.3 的结果表就带这两列）。
+ *   · `rrfScore` 就是 §九 的 `score`（引用对象的融合分），`snippet` 就是 §九 的 `snippet`。
+ *
+ * `null` 的语义是**"这一路没命中"**（而不是"分数为 0"）：RRF 的规则是"缺失即无贡献"，
+ * 前端要据此把该列显示成 `—`（显示 0 会让人以为"两路都算了，只是很低"）。
+ */
+export const retrievalHitSchema = z.object({
+  /** `chunks.id`（uuid(7)） */
+  chunkId: z.string(),
+  docId: z.string(),
+  /** 文档名（= `documents.file_name`）：引用卡要显示"来自哪一篇" */
+  docName: z.string(),
+  /** 块在该文档内的序号（从 0 开始） */
+  seq: z.number().int(),
+  /** `meta.page`：PDF 才有页码，其余为 `null`（`子方案①` §十三 待决事项 1：P0 只给页码） */
+  page: z.number().int().nullable(),
+  /** `meta.headingPath`：块所属的标题层级（引用卡显示"在哪一节"） */
+  headingPath: z.array(z.string()),
+  /** 命中片段（原文窗口，**不加工**，见 {@link SNIPPET_WINDOW_CHARS}） */
+  snippet: z.string(),
+  /** 向量路原始相似度 `1 - (embedding <=> query)`；该路未命中为 `null` */
+  vectorScore: z.number().nullable(),
+  /** 向量路名次（从 1 开始）；该路未命中为 `null` */
+  vectorRank: z.number().int().nullable(),
+  /** 全文路 `bigm_similarity`；该路未命中为 `null` */
+  fulltextScore: z.number().nullable(),
+  fulltextRank: z.number().int().nullable(),
+  /** RRF 融合分（`子方案①` §6-2 的公式） */
+  rrfScore: z.number(),
+  /** 融合后的名次（从 1 开始）—— `03` §4.3 的"融合排名"列 */
+  finalRank: z.number().int(),
+})
+export type RetrievalHit = z.infer<typeof retrievalHitSchema>
+
+/**
+ * `POST /api/knowledge-bases/:id/search` 响应。
+ *
+ * `mode` / `topK` / `rrfK` / `candidatePool` 回显**生效值**（请求可覆盖前两个）：
+ * 试查页要能一眼看出"这次用的是哪套口径"（`rrfScore` 的具体数值只有配上 `rrfK` 才可解释）。
+ */
+export const searchKnowledgeBaseResultSchema = z.object({
+  items: z.array(retrievalHitSchema),
+  /** 本次**生效**的检索模式（请求体给了就是它） */
+  mode: z.enum(RETRIEVAL_MODES),
+  /** 本次**生效**的返回条数上限 */
+  topK: z.number().int(),
+  /** 本次**生效**的 RRF 平滑常数（`子方案①` §6-2） */
+  rrfK: z.number().int(),
+  /** 每路的候选池大小 = `topK × CANDIDATE_POOL_FACTOR`（融合后再截断到 `topK`） */
+  candidatePool: z.number().int(),
+  /** 端到端耗时（毫秒，含 query 的 embedding 调用与两次 SQL） */
+  elapsedMs: z.number().int().min(0),
+  /**
+   * 向量路是否**没有运行**（`HYBRID` 下模型变更 / embedding 未就绪时降级；`FULLTEXT` 下恒为 `true`）。
+   *
+   * 给机器看的布尔：界面据此挂"本次只走了全文检索"的横幅。
+   * 原因文案在 `warnings` 里 —— 用字符串让前端去匹配文案是最脆的一种契约。
+   */
+  vectorPathSkipped: z.boolean(),
+  /** 人读的警告（已降级的原因、全文路被跳过的原因）；空数组 = 一切正常 */
+  warnings: z.array(z.string()),
+})
+export type SearchKnowledgeBaseResult = z.infer<typeof searchKnowledgeBaseResultSchema>

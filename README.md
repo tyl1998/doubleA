@@ -84,13 +84,13 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
-pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（64 项）
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（72 项）
 pnpm verify:embedding  # embedding 双模式验收：真 HTTP 假上游 + stub 推理运行时，**不占端口、不启 docker**（27 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
@@ -105,6 +105,8 @@ pnpm verify:knowledge-bases  # 知识库 CRUD 验收：建库快照/局部合并
 pnpm verify:documents  # 文档上传验收：四道前置校验/文件头魔数/四格式解析/上传即入队/按库判重/删库双清，**需要真实 PG + Redis + MinIO**（32 项）
 pnpm verify:pipeline   # 流水线验收：队列语义/状态机/幂等四道/并发闸门/失败可重试/入队原子性/扫描件与分块，**需要真实 PG + Redis + MinIO**（29 项）
 pnpm verify:ingest     # 入库验收：真 embedding（假上游）/chunk 落库与向量/id 版本位/覆盖重建/内容未变化/失败重试/删除文档，**需要真实 PG + Redis + MinIO**（23 项）
+pnpm verify:retrieval  # 检索验收：三模式/六列分数/**与独立 SQL 逐条等价**/RRF 数值反算/引用片段三分支/阈值与候选池/降级路径，**需要真实 PG + Redis + MinIO**（27 项）
+pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的批次号 vs `index.ts` 启动信封的 step（不一致即 exit 1）
 ```
 
 > `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、领域错误、
@@ -132,7 +134,7 @@ pnpm verify:ingest     # 入库验收：真 embedding（假上游）/chunk 落�
 >
 > `pnpm verify:session` / `verify:auth` / `verify:users` / `verify:e2e` / `verify:model-providers`
 > / `verify:models` / `verify:llm` / `verify:knowledge-bases` / `verify:documents` / `verify:pipeline`
-> / `verify:ingest` 是**必须**先起依赖 + 迁移的**十一档**
+> / `verify:ingest` / `verify:retrieval` 是**必须**先起依赖 + 迁移的**十二档**
 > （`pnpm infra:up && pnpm db:deploy`），因为验的正是"真实 Redis/PG 上的行为"：
 > 会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
 > 四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、以及
@@ -173,15 +175,29 @@ pnpm verify:ingest     # 入库验收：真 embedding（假上游）/chunk 落�
 > 且首块边界落在句末、重叠前缀逐字相等于前块末尾；P0-1-19 起它还多验一条**HTTP 层看不到**的事 ——
 > **重跑一遍是"整次替换"而不是追加**（库里仍是 2 行，不是 4 行））；
 > I **收尾**（删库后 DB 与 S3 双清、注入的队列键删净。本组是 P0-1-17 的 "H 组"，P0-1-18 在它前面插了新组故顺延）。
-> ⚠️ 它验不到的东西：**检索端点本身**（P0-1-20）与文档列表/下载端点（P0-1-21）⇒ 进度仍只能查库
+> ⚠️ 它验不到的东西：文档列表/下载端点（P0-1-21）⇒ 进度仍只能查库
 > （但 `chunk_count` 已是真的，`psql` 一眼能看出"入库了几块"）。
 > 它**跑得起来的前提**之一：P0-1-19 起 ⑥ 会真的调用 embedding，故脚本自己起了一个
 > **假 embedding 上游**（第四档口径）—— 本机 `.env` 的三项是空的，不接上所有"走到 READY"的用例都会红。
-> `pnpm verify:app`（无依赖档）里另有两段纯函数契约：**分块策略**（小文档特例、句末回退、
+> `pnpm verify:app`（无依赖档）里另有三段纯函数契约：**分块策略**（小文档特例、句末回退、
 > **每块都是原文的逐字子串**、重叠与块长上界、尾块合并、定长滑窗、**按码点切不劈开代理对**、
-> PDF 页码 meta、同名标题不相邻时顺序保持、未知策略回落）与**三条新端点的契约**
-> （路由注册、`deduplicated` ≠ `unchanged` 不串味、重试/删除形状、提示常量）——
+> PDF 页码 meta、同名标题不相邻时顺序保持、未知策略回落）、**三条新端点的契约**
+> （路由注册、`deduplicated` ≠ `unchanged` 不串味、重试/删除形状、提示常量）与
+> **检索的规则本身**（P0-1-20：query 预处理、引用窗口、RRF 融合公式）——
 > 它们刻意不 import `config`，所以能进 CI。
+>
+> `pnpm verify:retrieval` 是 **P0-1-20** 的双路检索验收（需要 PG + Redis + **MinIO**，自起
+> **假 embedding 上游**、且用 `semantic: true` 的"词面重叠型"向量，好让"含关键词的那一块"
+> 在向量路里真的排第一）。五组用例：① **A 组·三模式** —— `FULLTEXT` 单独跑中文 query 非空
+> （证明 pg_bigm 生效）、`VECTOR` 里含关键词的块**严格更近**、`HYBRID` 里"两路都第 1"的块排第一，
+> 且**向量路/全文路的名次与分数都跟"独立跑一遍同形状 SQL"逐条相等**（只断言"非空 + 有六列"时，
+> 一个"按 seq 排序"的假实现照样全绿）；② RRF 的 `rrfScore` 用返回的两路名次**逐条反算**、
+> `finalRank` 连续且降序、`topK` 截断；③ 引用片段三条分支（命中居中 ±80 完整窗口 / 命中贴边在 0 裁剪 /
+> 字面未命中取块首）且**每一条都是它那块正文的逐字子串**；④ **B 组·生效配置**（相似度下限只作用于
+> 向量路、`topK`/`mode` 覆盖**不落库**、参数回显来自该库快照与环境特征值 77/5）；⑤ **C 组·降级路径**
+> （模型变更 ⇒ `HYBRID` 跳向量路 + 告警 / `VECTOR` 409；embedding 未就绪 ⇒ 同样降级 / `VECTOR` 500，
+> 用**子进程注入空配置**验）；另加 D 组权限（MEMBER 可检索）与 E 组清场。
+> 性能一条：`elapsedMs` 与墙钟都要求 < 500ms（本机实测 3ms / 4ms）。
 >
 > `pnpm verify:ingest` 是 **P0-1-19** 的入库验收（需要 PG + Redis + **MinIO**，同样自起**假 embedding 上游**）。
 > 七组用例：① **A 组·入库** —— `chunk_count` 与 `chunks` 表**逐行一致**、每行都有向量、维度 1024、
@@ -547,10 +563,35 @@ curl -sS --noproxy '*' -b "$COOKIE" -X DELETE \
 #  → 200 {id, fileName, deletedChunks:N}；DB 行 + 其 chunk（级联）+ S3 原文件都清掉
 #  → 再删一次 → 404（不是 500，也不是静默成功）
 
+# ⑫ 双路检索 / RRF 融合（P0-1-20）—— D 包这条链路的终点：上传 → READY → **检索得到**
+#    前置：库里有 `READY` 的文档（⑨⑩ 做完），且 `EMBEDDING_*` 已配好（检索要算 query 向量）
+curl -sS --noproxy '*' -b "$COOKIE" -H 'content-type: application/json' \
+  -X POST "http://127.0.0.1:13000/api/knowledge-bases/$KB/search" \
+  -d '{"query":"出差住宿标准"}' | jq .
+#  → 200 {code:0, msg:"ok", data:{items:[{…六列分数…, rrfScore, finalRank}], mode:"HYBRID", topK, rrfK,
+#          candidatePool, elapsedMs, vectorPathSkipped:false, warnings:[]}}
+#    · items 里每一条都带：vectorScore/vectorRank、fulltextScore/fulltextRank（**没命中的那一路是 null**）、
+#      rrfScore（= RRF 融合分）、finalRank；`snippet` 是命中位置前后各 80 字符的**原文**（可直接核对）
+#    · 同一句话加上 `"mode":"FULLTEXT"` / `"mode":"VECTOR"` 可以分别只跑单路（试查页就靠它）
+#    · 加 `"topK":1` 只返回一条；**这两个覆盖项不会写进库配置**（库的检索口径不受影响）
+
+curl -sS --noproxy '*' -b "$COOKIE" -H 'content-type: application/json' \
+  -X POST "http://127.0.0.1:13000/api/knowledge-bases/$KB/search" \
+  -d '{"query":"请问出差住宿标准是多少？","mode":"FULLTEXT"}' | jq '.data.items[0].fulltextRank,.data.items[0].snippet'
+#  → 全文路 1 与原文片段：证明①**标点与"请问/是多少"这类脚手架被剥掉了**（否则字面匹配必空）、
+#    ② pg_bigm 中文 bigram 真的生效（⚠️ 若这里恒为空，先看 `pnpm verify:knowledge` 的索引断言）
+#    ⚠️ 全文路是**字面子串**匹配 ⇒ 只适合短查询。一句长问句（哪怕截断到 64 字符）几乎不可能连续
+#       出现在正文里，那是**预期行为**不是 bug；长问句请用 HYBRID/VECTOR。
+
+pnpm verify:retrieval
+#  → 27 项全通过（需要 PG + Redis + MinIO；脚本自己起"词面重叠型"的假 embedding 上游）。
+#    它额外钉死两件事：**两条路的名次/分数与独立 SQL 逐条相等**（证明分数不是编出来的）、
+#    **RRF 的数值可以用返回的两路名次反算出来**（证明融合就是那个公式）。
+
 pnpm verify:pipeline
 #  → 29 项全通过（需要 PG + Redis + MinIO）。它用**随机队列键**（`verify:pipeline:jobs:<rand>`）
 #    跑，不碰你开发队列里的任务，收尾会删掉该键并断言残留为零。
-#    ⚠️ 它和 ⑪ 都会自己起一个**假 embedding 上游**（本机 .env 的三项是空的也能跑）。
+#    ⚠️ 它和 ⑪ ⑫ 都会自己起一个**假 embedding 上游**（本机 .env 的三项是空的也能跑）。
 
 pnpm verify:ingest
 #  → 23 项全通过（同样需要 PG + Redis + MinIO）。这一档专验"入库之后的形态"：
@@ -560,7 +601,8 @@ pnpm verify:ingest
 **已知边界（别当 bug）**：① 接口只有四组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
 （`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员 + P0-1-12 新增的
 `GET /api/model-providers/:id/remote-models` 仅 ADMIN）、**知识库 `/api/knowledge-bases`（P0-1-15，
-登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传）**。
+登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
+`reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**。
 **"MEMBER 能用的业务接口"现在有两处**：`/api/models/available` 与整个 `/api/knowledge-bases/*`
 —— 后者是**第一个完整的业务资源 CRUD**，所以"改密后能正常用"可以真的建/改/删一个知识库来验，
 不必只靠 403 文案的变化；
@@ -569,7 +611,21 @@ pnpm verify:ingest
 的 A/C/D 组真跑四个夹具文件）；`.doc` 是刻意拒收（提示另存为 `.docx`），不是没做完；
 **异步流水线专项边界（P0-1-17 起；P0-1-18 补 ④⑤、P0-1-19 补 ⑥⑦）**：八步齐全后 `READY` 的语义
 才是**"可检索"**（`chunks` 表有这篇的行、每行都有向量、`chunk_count` 与之一致）；
-**但"检索"这件事本身还没有端点**（P0-1-20），**文档列表/下载也没有**（P0-1-21）⇒ 进度仍只能查库；
+**检索有端点了（P0-1-20 的 `POST .../search`），"文档列表/下载"还没有（P0-1-21）**
+⇒ 建了哪些文档、每篇什么状态，仍然只能查库（`chunk_count` 是真数，`psql` 一眼能看出入库了几块）；
+**检索专项边界（P0-1-20）**：
+· **全文路只适合短查询** —— 它是 `content LIKE '%词%'` 的**字面子串**匹配，自然语言长问句（哪怕截断到
+64 字符）几乎不可能连续出现在正文里，`mode=FULLTEXT` 因此可能返回空。**这是预期行为**（长问句请用
+`HYBRID`/`VECTOR`），不是索引坏了 —— 索引本身由 `pnpm verify:knowledge` 的 EXPLAIN 断言守着；
+· **手工跑 ⑫ 需要配好 `EMBEDDING_*`**（要算 query 向量）：本机 `.env` 三项为空时 `HYBRID` 会
+**降级为纯全文检索并给 warning**（不报 500），`mode=VECTOR` 则明确报 500；想看完整三模式，
+直接跑 `pnpm verify:retrieval`（脚本自起假上游，零配置）；
+· **库里没有向量就搜不到**（空库 / 全失败 / 正在 `PARSING`）⇒ `items: []` 是"真的没有"，不报错；
+· **换了 embedding 模型**（库快照的 `embedding_model` ≠ 当前 provider）时：`HYBRID` 跳过向量路并告警、
+`VECTOR` 回 **409**（"请等待重建完成"）—— 这是 `子方案①` §八 的降级路径，P0 只到"探测 + 告警"，
+真正的重新向量化（`chunks_v2` 换表）是 P1；
+· 返回的 `snippet` **不加工、不加省略号**（省略号由前端按需加）—— 这样它一定是原文的子串，可逐字核对；
+· `rrfScore` 的数值只有配上同时返回的 `rrfK` 才可比（不同库的 `rrfK` 可以不同）；
 worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—— 所以 worker 崩了后端一起崩，
 "失败可重试"就是为 List 队列**没有 ack**（worker 崩在中途任务就丢了）兜底的；
 **⚠️ 手动端测前必须先配好 embedding**（P0-1-19 起流水线真的会调它，而本机 `infra/.env` 的三项是空的）——
@@ -600,7 +656,9 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 > 文档上传（四道前置校验 + 四格式解析 + 按库判重 + 删库双清，同样要 MinIO）：`pnpm verify:documents`；
 > 异步流水线（队列语义 + 状态机 + 幂等四道 + 并发闸门 + 失败重试 + 入队原子性 + 扫描件与分块，同样要 MinIO）：
 > `pnpm verify:pipeline`；**入库之后**的形态（chunk 落库/向量/id 版本位/覆盖重建/内容未变化/重试/删除）：
-> `pnpm verify:ingest`；分块策略与三条新端点的**纯函数契约**在 `pnpm verify:app` 里（不需要任何依赖，可进 CI）。
+> `pnpm verify:ingest`；**检索**（三模式 + 六列分数 + 与独立 SQL 等价 + RRF 反算 + 引用片段 + 降级路径）：
+> `pnpm verify:retrieval`；分块策略、三条新端点与**检索的纯函数规则**都在 `pnpm verify:app` 里
+> （不需要任何依赖，可进 CI）。
 
 > 进程支持 SIGINT/SIGTERM 优雅退出：**先停 worker**（等手上的任务收尾，最多 5s）→ 停止接流 →
 > 关闭 PG/Redis 连接 → flush 日志 → 退出（10s 兜底强退）。
@@ -654,6 +712,7 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-19-入库+覆盖重建+失败重试.md` | **本批最值钱的一条是"写入语句换了形态"**：`§4-4` 草稿写的 `INSERT ... SELECT unnest(...)` 要求"自带 id 数组"，而 `chunks.id` 的口径是 `uuid(7)`、P0-1-16 又已定案 **不手搓 uuid7** ⇒ 该值只有 Prisma 的 `@default` 一个实现 ⇒ 实际落地为「Prisma 建行（拿 id）+ 手写 `UPDATE ... unnest` 回填向量」（同一事务、每批 200 行）。**`uuid(7)` 这件事会静默降级**（手搓出来的仍是合法 uuid，只是版本位是 4）⇒ 验收里有一条 **"id 的版本位必须是 7"** 专门守它，那是唯一抓得住的东西。**第二条是"文档漏了一列"**：`§七` 的 `UPDATE` 列清单里没有 `file_name`，而它在本仓还承担下载端点的 `Content-Disposition` 文件名 —— 旧名留着就会"列表显示旧名、下载得到新内容"，且用户没有别的入口改名 ⇒ 本批补上并回写文档。**第三条是"两类入口的补偿能力不对称"**：上传时入队失败能整次回滚（行是它刚建的），**重建做不到**（旧 chunk 删了就回不来）⇒ 重建只能如实报告并指向 `POST .../retry`，**不伪装成"什么都没变"**；这也是 `retry` 必须**放行 `PARSING`** 的原因（它是"worker 崩了/入队丢了"的恢复入口，若因"看起来正在处理"就 409，卡住的文档将没有出路），而 `READY` 上 retry 回 **409**。**"跳过"类断言的写法**：`content_hash` 相同时的三个"没做"，要用**删得掉证据**的方式取证 —— chunk 行 `id` 逐字不变（重写过就会换新 id）、`updated_at` 不变、对象数不变、队列深度 0；只断言"内容还在"验不出"重写了一遍"。**embedding 的重试粒度**：provider 的 `embed()` 内部自己切批、看到的永远是"一次调用"，故 `§4-3` 的"**单批**失败重试 2 次"必须由流水线侧先按 `EMBEDDING_BATCH_SIZE` 切好再喂，重试边界才与"批"对齐；一批仍失败 ⇒ **整篇 FAILED**（跳过这批会留下"有块没向量"的坏数据，而那些 chunk 在检索里永远排不上号、界面上却一切正常）。**顺带踩到自己记过的坑**：新验收脚本的夹具一开始只有 48 个有效字符，被 P0-1-18 的空文本门槛判成"疑似扫描件"，导致 16 条断言连环假失败 —— **给流水线加内容门槛之后，任何"要让文档走到 READY"的夹具都必须先过门槛**，这条已写进批次施工技能 |
 | `issue_fix/问题记录-P0-1-17-异步队列+状态机+worker骨架.md` | **「List 队列没有 ack」是本批全部设计的起点**：`BRPOP` **取出即消失**，worker 崩在中途任务就永久丢失 ⇒ 可靠性落点不在"不丢"，而在"**幂等**（重复投递无害）+ **可重放**（状态机允许 `FAILED`/`PARSING → PARSING`）"。另有：**`BRPOP` 独占整条 Redis 连接** ⇒ 队列空时阻塞读会把会话与健康检查一起钉住，必须走 `createRedisConnection()` 的**专用连接**，且关闭用 `disconnect()` 而非 `quit()`（`quit` 要等挂起的 `BRPOP` 返回，优雅退出会白等满 5s）；**幂等是四道不是一道**（在途去重 / 文档已删 / `contentHash` 不匹配 / 已是 `READY`），四道全命中时必须**一个字节都不写** ⇒ 断言方式是 **`updated_at` 不变**（"没写"看得见，而"写了但值相同"会被漏掉）；**状态迁移写成 CAS**（`updateMany({ where: { id, status: from } })`）⇒ 靠"影响行数"分辨而不是"先查再写"（后者在两个 worker 都读到旧态时会把违法的迁移写进去），非法迁移**只 `warn` 不写**；**`READY → FAILED` 刻意非法**（陈旧的队列任务会把一份已就绪的文档改写坏）、**`FAILED → READY` 刻意非法**（重试必须经过可见的 `PARSING`，否则列表里看不出"正在重试"）；**上传即入队的原子性**（入队失败要连 DB 行带 S3 对象一起回滚，否则文档永远卡 `PARSING` 且没人消费）—— 取证靠**子进程 A/B 控制**（`REDIS_URL=redis://127.0.0.1:1` 的子进程**必须失败且回滚**；真 Redis 的子进程**必须成功**）而不是把父进程的连接打断；**worker 生命周期挂 `index.ts` 而非 `buildApp()`**（否则 `app.inject` 那套接口级验收会被迫连 Redis）；**队列键可配**（`PIPELINE_QUEUE_KEY`）⇒ 共享 Redis 上隔离消费方，验收脚本因此不碰开发队列；**并发闸门要同时测峰值与总耗时**（只测"峰值 ≤ 2"的实现，把它写成串行也能过） |
 | `issue_fix/问题记录-P0-1-18-空文本检测+分块.md` | **本批的两个真问题都不在坑预判里**：① **PDF 夹具的单行文本必须折行** —— 单条超长 `Tj` 会超出 `MediaBox`（612pt），而 pdf.js **只提取页面框内的文本** ⇒ 内容被**静默截断**（实测 561 字的单行只析出 85 字、且截在半个单词上），拿它去断言"分块边界/阈值"会得到假数据（不是实现问题，但会让人查错地方）；② **新增的空文本门槛把两处旧夹具"判死"了** —— P0-1-17 留下的 `verify-pipeline` 夹具（docx 20 字、txt 29 字、F 组 PDF 43 字）在 50 字阈值下会被判「疑似扫描件」，让"四篇全 READY"和"重投救回"**假失败**（这是**刻意的行为变化**，不是回归；处置是把夹具写长并在此留档，否则下一个人会以为夹具本来就该这么长）。**分块上最容易静默做错的四条**：切片的单位必须是**码点**（`text.slice()` 会**劈开代理对**，产出非法字符串且**本层毫无报错**，下游 embedding 才炸 ⇒ 全流程建在 `[...text]` 上，验收用 600 个 emoji 逐码点断言）；Section 必须按"**连续**同名标题"切（按 `headingPath` 分组会让 chunk **顺序与原文不一致**，而这在检索层几乎发现不了 —— 片段读起来通顺、只是位置不对）；**每块必须是原文的逐字子串**（重叠取前块尾部而不是新造句子，这是 P0-1-20"引用与原文一致"的前提）；**页码 meta 取"块起点所在段"**（一个 Section 可能跨页 PDF，"整块用 Section 首页"会把页码全说成第 1 页）。**另一处刻意的实现-文档偏离**：`ChunkStrategy.split` 收 `ParseResult` 而不是 `(text, meta)` —— 标题层级只在 `blocks` 里，只给 `text` 会让 hybrid 退化成 fixed。**口径定案**：`chunk_min`（50）是**代码常量**（§十一 的配置表里没有它，加环境变量属于自己发明契约）；空文本检测失败文案里的数字**取实测阈值**（写死 50 会让管理员调阈值后用户按错数字重传）；判据是 `<` 而**恰好等于阈值通过**（验收用例按**当前阈值**生成）；**④ 必须排在 ⑤ 之前**，用产物的缺席取证（`ctx.chunks === undefined` 而 `ctx.parsed !== undefined`）。**⚠️ 本批只"算"不"存"**：`chunk_count` 刻意仍是 0（`schema.prisma` 对它的定义是"**已入库**的 chunk 数"，提前写会造出"说有 N 块却搜不到"的假象，P0-1-19 还得回头改） |
+| `issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` | **本批跑出来的两个"假失败"其实都是断言自己写错**：① `VECTOR` 用例里写了"每条的 `vectorScore > 0`"，而**正交向量的余弦相似度恰好是 0**（合法取值）⇒ 改成"含关键词的那一块必须**严格更近**"（这才是想验的东西）；② "长 query 截断到 64 字符后仍应命中"的**前提本身是错的** —— 截断只保证 LIKE 的模式不长，**不保证**那 64 个字符连续出现在正文里（自然语言问句几乎必然不连续）⇒ 改成"从原文里取 64 字子串当 query + 加长后缀"，并用一次**不截断的独立 SQL 复算**证明"命中只能来自那次截断"。**真问题与设计订正**：③ **RRF 示例数值文档写错了**（0.0323 → 实测 **0.0320**）⇒ 已订正并写成断言（文档与代码从此互为守门）；④ **`§6-1` 的"去停用词"必须收窄**（只剥句首/句尾的提问脚手架）—— LIKE 要连续子串，删掉中间的"的"会把"报销的标准"变成"报销标准"，**降低**命中率；⑤ **`%`/`_` 是 LIKE 的通配符**，必须在 query 预处理阶段剔掉，否则"字面包含"会静默变成模式匹配（判别式：正文里同时有 `5` 和 `0`、但两者永不相邻，用 `5%0` 去搜 —— 两种实现的期望值不同，断言才有判别力）；⑥ **`score` 阈值只作用于向量路且过滤放在候选池之后**（距离单调 ⇒ 两种顺序等价，少传一份 20KB 的向量字面量）；⑦ **`ORDER BY embedding <=> $1, id` 会让 HNSW 退化** ⇒ 二级 tie-break 必须在 JS 侧做（否则 P0-1-14 的索引取证白做）；⑧ `§八` 的降级路径本批就位（`HYBRID` 跳向量路 + 告警 / `VECTOR` 409 / `FULLTEXT` 不受影响，两种原因分开报）；⑨ 顺手加了 `pnpm check:batch` —— `step` 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性 |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 
@@ -800,3 +859,4 @@ doubuleA/
 | 2026-09-21 | — | **P0-1-17 完成（包 D 继续）**：异步队列 + 状态机 + worker 骨架 —— `shared/src/document.ts` 补**状态机契约**（`DOCUMENT_STATUS_TRANSITIONS` + `canTransitionDocumentStatus`；⚠️ **刻意禁止 `READY→FAILED`**，否则一个陈旧的队列任务就能把已就绪的文档改写坏；**也禁止 `FAILED→READY`**，重试必须经过可见的 `PARSING`）、`backend/src/pipeline/queue.ts`（Redis List 队列：`LPUSH`/`BRPOP`、job 形状 `{docId,kbId,contentHash,mode}` 带 zod 校验、`parsePipelineJob` 对垃圾载荷**返回 `undefined` 而不抛**，⚠️ **`BRPOP` 独占连接** ⇒ 用 `createRedisConnection()` 的**专用连接**、关闭走 `disconnect()`）、`backend/src/pipeline/worker.ts`（**进程内 worker**：`PIPELINE_CONCURRENCY` 默认 2 的信号量闸门、**幂等四道**、CAS 状态迁移、失败落 `error_msg`）、`backend/src/pipeline/stages.ts`（stage 数组：读 S3 → 重跑 `detectFormat`+`parseDocument`，证明解析是**真跑**不是桩）、`backend/src/infra/redis.ts` 抽出 `createRedisConnection(role)`、`backend/src/services/document.service.ts` **上传后入队**（入队失败 → `rollbackRegistration()` 连 DB 行带 S3 对象一起回滚，否则文档永远卡 `PARSING` 且没人消费）、`backend/src/index.ts` worker 生命周期（`listen` 后 `startPipelineWorker()`；`shutdown()` 里**先 `stopPipelineWorker()`** 再关连接，等手上的任务最多 5s）。**新增 1 个环境变量** `PIPELINE_QUEUE_KEY`（默认 `pipeline:jobs`；共享 Redis ⇒ **可换键 = 可隔离消费方**，验收脚本因此各用随机键）。**⚠️ 本批的设计起点是"List 队列没有 ack"**：`BRPOP` 取出即消失，worker 崩在中途任务就丢 ⇒ 可靠性不靠"不丢"，靠**幂等（重复投递无害）+ 可重放**；四道幂等全命中时**一个字节都不写**（断言 `updated_at` 不变 —— "写了但值相同"会被漏掉）、**非法迁移只 `warn` 不写**（用 `updateMany` 的影响行数分辨，而不是"先查再写"那种有竞态的写法）。**worker 挂 `index.ts` 不挂 `buildApp()`**（否则 `app.inject` 那套验收会被迫连 Redis）。**验收**：新增 **`pnpm verify:pipeline`（24 项，需 PG + Redis + MinIO）**（A 纯函数 / B 队列语义含"**阻塞读不占用共享连接**" / C 端到端四格式全转 `READY` / D 幂等四道 / E 并发闸门**同时测峰值与总耗时** / F 失败→重试→救回 / G **入队原子性子进程 A/B**（死 Redis 必须回滚、真 Redis 必须成功）/ H 收尾双清），`verify:documents` **30 → 32 项**（补"新建一条文档就多一条任务"与"判重命中不入队"）、`verify:app` **49 → 50 项**（补状态机契约段）；既有 13 档（`db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / embedding 27 / knowledge 23 / knowledge-bases 19 / e2e 17` + 上面两档新计数）**全部未回归**，`lint` + 三包 `typecheck`/`build` 全绿；`docs/02` §二 补 worker 口径、§4.6 上传补第四步"入队"、§十一 补 `PIPELINE_QUEUE_KEY`；`docs/子方案/知识库流水线.md` 补 job 形状与幂等/失败口径；README 手工端测新增 ⑩ 异步流水线（含查库看状态的 psql）；新增缺陷归档 `issue_fix/问题记录-P0-1-17-异步队列+状态机+worker骨架.md`。⚠️ **本批不是可端测里程碑**：`READY` = "解析完成"，`chunk_count` 仍为 0（分块 P0-1-18、向量化 P0-1-19、检索 P0-1-20），且**没有列表端点**（P0-1-21）⇒ 进度只能查库 |
 | 2026-09-22 | — | **P0-1-18 完成（包 D 继续）**：空文本检测 + 分块（可插拔策略）—— `backend/src/pipeline/chunk/{strategy,hybrid,fixed,index}.ts`（`ChunkStrategy` 接口 + **纯函数**实现：`hybrid` 默认 = 按"连续同名标题"切 Section → 段内回退到句末边界 → 尾块合并 → 同 Section 内 64 字符重叠；`fixed` = 定长滑窗、不做边界回退）、`backend/src/pipeline/stages.ts` 插入 **④ `detect-empty-text`** 与 **⑤ `chunk`**（并导出 `buildEmptyTextMessage()` 供验收逐字断言）、`backend/src/pipeline/worker.ts` 的 `JOB_DOCUMENT_SELECT` 一次联表带出 KB 的分块参数（`chunkSize`/`chunkOverlap`/`splitStrategy`，后者经 `normalizeRetrievalConfig` 补默认值）。**零新增依赖、零新增环境变量**（分块参数与阈值都是 P0-1-15 已有的）。**三条最值得记的**：① **④ 必须排在 ⑤ 之前**（否则扫描件先白切一遍再判失败），用**产物的缺席**取证；失败文案里的数字**取实测阈值**（阈值可配）；**失败不删原文件**（用户要能下载核对）。② **一切切片建在 `[...text]` 的码点数组上** —— `chunk_size` 的单位是字符（B8），用 `text.slice()` 会**劈开代理对**（`'😀'.length === 2`）产出非法字符串且**本层毫无报错**（下游 embedding 才炸）。③ **⚠️ 只"算"不"存"**：块已切出（`ctx.chunks`）但**刻意不写 `chunk_count`**、更不写 `chunks` 表（⑥⑦ 属 P0-1-19）—— 那一列的定义是"**已入库**的 chunk 数"，提前写会造出"接口说这篇有 12 块、检索却什么都搜不到"的假象；停在 0 是为了把"`READY` = 解析与分块都过了、但仍不可检索"这个中间态**暴露出来**（块数进日志，仍可观测）。**验收**：`verify:app` **50 → 60 项**（新增整段"分块策略契约"：小文档特例恰好 1 块、句末回退（首块长度 < chunk_size 且末字符是句末边界）、**每块都是原文的逐字子串**、重叠 64 与块长上界、尾块合并与 `fixed` 对照、定长滑窗块长序列、**按码点切不劈开代理对**、PDF 页码 meta、同名标题不相邻时顺序保持、未知策略回落），`verify:pipeline` **24 → 29 项**（新增 **H 组**：扫描件 → `FAILED` 且含「疑似扫描件」+ 原文件仍保留、**阈值边界**（恰好达标通过 / 少一字符失败，按当前阈值生成用例）、**真字节重跑阶段数组**验分块边界与重叠、200 字短通知恰好 1 块；原"清场"组顺延为 **I 组**）；既有 13 档（60/17/13/21/17/18/17/22/27/23/32/19/17）**全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 11 条落地要点 + 坑预判取证 + P0-1-19 前置回写 + D 包 **5/8**）、`docs/02` §二·§十四、`子方案①` §4-2/§五/§十四 同步。**⚠️ 两处旧夹具因新门槛被加长**（`verify-pipeline` 的 docx 20→~80、txt 29→~70、F 组 PDF 43→~70 字）—— 有效字符 < 50 现在会判"疑似扫描件"，旧夹具会让"四篇全 READY"与"重投救回"假失败；这是刻意的行为变化，不是回归。**⚠️ 边界**：`chunk_count` 仍为 0、`chunks` 表仍为空 ⇒ **依然不可检索**，本批**仍不是可端测里程碑**。归档：`issue_fix/问题记录-P0-1-18-空文本检测+分块.md` |
 | 2026-09-22 | — | **P0-1-19 完成（包 D 继续）**：入库 + 覆盖重建 + 失败重试 —— `backend/src/pipeline/index/writer.ts`（`embedChunks()` 按 `EMBEDDING_BATCH_SIZE` 切批 + **单批失败重试 2 次**（退避 1s/3s）+ 条数不符即中止；`writeChunks()` 事务内 `DELETE WHERE doc_id` → `createManyAndReturn` → 手写 `UPDATE ... FROM unnest(...)` 回填向量，每批 200 行）、`backend/src/pipeline/stages.ts` 加 **⑥ `embed` / ⑦ `index`**（阶段数组至此八步齐全，`READY` 才等于"可检索"）、`shared/src/document.ts` 补三条响应契约与 `REUPLOAD_UNCHANGED_HINT`、`backend/src/services/document.service.ts` 补 `reuploadDocument` / `retryDocument` / `deleteDocument`、`backend/src/routes/documents.ts` 挂三条新端点（全部只需登录）。**四条最值得记的**：① **写入语句刻意偏离 `§4-4` 草稿** —— `INSERT ... SELECT unnest(...)` 要求"自带 id 数组"，而 `chunks.id` 是 `uuid(7)` 且已定案**不手搓 uuid7** ⇒ 改成「Prisma 建行（拿 id）+ 手写 `UPDATE ... unnest` 回填向量」（同一事务），验收里有一条 **"id 的版本位必须是 7"** 专守（手搓的 uuid 并不会报错，只是版本位变成 4，**静默**）；② **`file_name` 也一并更新**（`§七` 列清单漏了它）—— 它还承担下载端点的 `Content-Disposition`，旧名留着就会"列表显示旧名、下载得到新内容"；③ **重建的入队失败无法整次回滚**（旧 chunk 删了就回不来）⇒ 如实报告 + 指向 `POST .../retry`，**不伪装成"什么都没变"**；`retry` 因此必须**放行 `PARSING`**（"worker 崩了 / 入队丢了"的恢复入口），`READY` 上则回 **409**；④ **embedding 的重试粒度是"批"** —— provider 自己会切批、只看到"一次调用"，故由流水线侧先切好再喂；一批仍失败 ⇒ **整篇 FAILED**（跳过会留下"有块没向量"的坏数据，检索里永远排不上号而界面正常）。**覆盖重建的三个"没做"**（内容相同时：不落对象、不删 chunk、不入队）用**删得掉证据**的方式取证（chunk 行 id 逐字不变 + `updated_at` 不变 + 对象数不变 + 队列深度 0）—— 只断言"内容还在"验不出"重写了一遍"。**坑预判取证**：`§七` 的"先删后建 ⇒ 检索空窗"**成立**（窗口 = 一次流水线耗时），缓解落成"响应立刻 `PARSING` + `chunkCount` 归 0"，并把「列表页必须显示『更新中，暂不参与检索』」写进 **P0-1-21 的坑预判**（必做）。**验收**：新增 **`pnpm verify:ingest`（23 项，需 PG + Redis + MinIO，自起假 embedding 上游）**——A 入库真跑（`chunk_count` 与表逐行一致、每行有向量、维度 1024、meta 三键、**id 版本位 = 7**、上游侧取证只发 `model`/`input`）／B 覆盖重建（id 不变、旧 chunk id 一个不剩、全库无孤儿、内容是 v2、**`<=>` 近邻命中 v2 那块**作为"检索返回 v2"的数据层等价取证、旧对象被删）／C 内容未变化／D 失败重试（上游 500 → 「文本向量化失败（已重试 2 次）」→ 修好 → retry → READY → 再 retry 409；跨库 docId 404）／E 删除文档（`deletedChunks` + 三清 + 重复删 404）／F 边界与权限（**重建不能绕过前置校验**、未登录 401、**MEMBER 全通**）／G 清场双清；`verify:pipeline` **29 项**（阶段序列断言改六步、`chunkCount===0` 改成"与 `chunks` 表逐行一致"、新增"重跑是替换不是追加"、接入假 embedding 上游）、`verify:app` **60 → 64 项**（三条新路由 + `deduplicated` ≠ `unchanged` 不串味 + 重试/删除契约 + 提示常量）；既有 14 档**全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（P0-1-19 状态 + 11 条落地要点 + 坑预判取证 + **P0-1-21 坑预判回写** + D 包 **6/8**）、`docs/02` §二·§4.6·§十四、`子方案①` §4-3/§4-4/§七/§十四 同步。**⚠️ 边界**：`READY` 现在等于**可检索**（库里有带向量的 chunk），但**检索端点本身**是 P0-1-20、列表/下载端点是 P0-1-21 ⇒ 本批**仍不是可端测里程碑**（不过 `chunk_count` 已是真数，`psql` 一眼能看出入库了几块）。归档：`issue_fix/问题记录-P0-1-19-入库+覆盖重建+失败重试.md` |
+| 2026-09-22 | — | **P0-1-20 完成（包 D 继续）**：双路检索 + RRF 融合 —— `backend/src/services/retrieval.ts`（新增：向量路 `1 - (embedding <=> $1)`（候选池 `topK × CANDIDATE_POOL_FACTOR`、**相似度下限只作用于这一路且过滤在池之后**）+ 全文路 `content LIKE '%词%'` + `bigm_similarity`（query 预处理：剔标点（**含 `%`/`_` 两个 LIKE 通配符**）→ **只剥句首/句尾**的提问脚手架 → 按码点截断 64 → `< 2` 字整条跳过并告警）+ `mode` 三值分流 + **RRF 融合**（`w = 1/(rrfK + rank)` 两路相加、缺失记 0、同分按 `chunkId` 升序）+ 引用对象构造（`docName` / `snippet` ±80 字符**不加工**窗口 / `rrfScore`）+ **`§八` 的降级路径**（模型变更 / embedding 未就绪 ⇒ `HYBRID` 跳向量路 + `warnings` 与 `vectorPathSkipped`、`VECTOR` 报 409 或 500、`FULLTEXT` 不受影响）；纯函数 `normalizeFulltextQuery` / `buildSnippet` / `fuseRrf` / `rrfScoreOf` **导出**以便无依赖档断言）、`backend/src/routes/knowledgeBases.ts`（挂 `POST /:id/search`，**登录即可**）、`shared/src/knowledgeBase.ts`（新增 `FULLTEXT_QUERY_MAX_CHARS`/`FULLTEXT_QUERY_MIN_CHARS`/`SNIPPET_WINDOW_CHARS` + 三条提示常量 + `searchKnowledgeBaseBodySchema`/`retrievalHitSchema`/`searchKnowledgeBaseResultSchema`）。**零新增依赖、零新增环境变量**（`RRF_K`/`CANDIDATE_POOL_FACTOR`/`RETRIEVAL_*` 都是 P0-1-15 已登记的）。**四条最值得记的**：① **"两路各自与独立 SQL 等价"是唯一能证明分数不是编出来的手段** —— 验收把端点返回的名次/分数跟独立复算同形状 SQL 的结果**逐条对照**（只断言"非空 + 有六列"时，一个"按 seq 排序"的假实现照样全绿）；② **RRF 的数值可以用返回的两路名次逐条反算**（`1/(k+rv) + 1/(k+rf)`，缺失记 0）；③ **`%`/`_` 必须在预处理阶段剔掉**，否则"字面包含"静默变成模式匹配（验收用"正文里有 `5` 和 `0` 但永不相邻"的夹具做判别 —— 两种实现的期望值不同，断言才有判别力）；④ **`§6-1` 的"去停用词"收窄为"只剥首尾脚手架"**（LIKE 要连续子串，删中间的"的"会**降低**命中率）。**两处文档订正**：`§6-2` 的 RRF 示例数值 0.0323 → **实测 0.0320**（并写成断言，文档与代码互为守门）、`§六` 的响应示例改成实际契约（`chunkId` 是 uuid(7)、补 `page`/`headingPath`/`rrfK`/`candidatePool`/`vectorPathSkipped`/`warnings`、`snippet` 不加工）。**验收**：新增 **`pnpm verify:retrieval`（27 项，需 PG + Redis + MinIO，自起 `semantic: true` 的词面重叠型假 embedding 上游）** —— A 三模式与六列（`FULLTEXT` 单独跑中文 query 非空、`VECTOR` 里含关键词的块**严格更近**、`HYBRID` 里两路都第 1 的块排第一、与独立 SQL 逐条等价、RRF 反算、`finalRank` 连续、引用片段三分支且都是原文子串、**`elapsedMs` 与墙钟都 < 500ms**（实测 3ms/4ms））／B 生效配置（阈值只作用于向量路、`topK`/`mode` 覆盖**不落库**、参数回显分别为该库快照 77 与环境特征值 5）／C 降级路径（模型变更 ⇒ 降级 + 告警 / `VECTOR` 409；未就绪 ⇒ 降级 / `VECTOR` 500，**子进程注入空配置**）／D 权限（MEMBER 可检索）+ 边界（空库、纯标点、跨库隔离、不存在 404）／E 清场；`verify:app` **64 → 72 项**（新增"检索契约与 RRF 纯函数"整段）；**既有 14 档全部未回归**（`retrieval 27`＋`embedding 27 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / knowledge 23 / documents 32 / pipeline 29 / ingest 23 / knowledge-bases 19 / e2e 17`），lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 11 条落地要点 + 坑预判取证 + P0-1-21 前置与坑预判回写 + D 包 **7/8**）、`docs/02` §4.6（检索端点契约表）·§十四、`子方案①` §6-1/§6-2/§六/§八/§十四 同步；**顺手补 `pnpm check:batch`**（`infra/scripts/check-batch-marker.mjs`：比对 `docs/06` 最后一个 `[✓]` 的批次号与 `index.ts` 启动信封的 `step` —— 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性）。**⚠️ 边界**：**这仍不是浏览器可端测的里程碑**（列表/下载端点是 P0-1-21、界面是 P0-1-30），但 **API 级已经"上传 → 入库 → 检索"整条打通**：`curl POST .../search` 现在能真的拿回带双路分数与 RRF 名次的片段；手工跑需要先配好 `EMBEDDING_*`（本机 .env 三项为空 ⇒ `HYBRID` 会降级为纯全文并告警），零配置的完整跑法是 `pnpm verify:retrieval`。归档：`issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` |

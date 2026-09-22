@@ -27,10 +27,12 @@ import {
   knowledgeBaseIdParamsSchema,
   listKnowledgeBasesQuerySchema,
   ok,
+  searchKnowledgeBaseBodySchema,
   updateKnowledgeBaseBodySchema,
   type CreateKnowledgeBaseBody,
   type KnowledgeBaseIdParams,
   type ListKnowledgeBasesQuery,
+  type SearchKnowledgeBaseBody,
   type UpdateKnowledgeBaseBody,
 } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
@@ -42,6 +44,7 @@ import {
   removeKnowledgeBase,
   updateKnowledgeBase,
 } from '../services/kb.service.js'
+import { searchKnowledgeBase } from '../services/retrieval.js'
 
 export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
   /** 列表（登录即可；`03` §4.3 的列表页与 §4.2 的 KB 多选框共用） */
@@ -86,5 +89,25 @@ export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
     '/api/knowledge-bases/:id',
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
     async (request) => ok(await removeKnowledgeBase(request.params.id)),
+  )
+
+  /**
+   * 检索（登录即可；`02` §4.6 的"检索测试"，`子方案①` §六 的双路 + RRF）。
+   *
+   * ⚠️ 单库检索：本批的端点是 `/api/knowledge-bases/:id/search`，而检索内核
+   * （`services/retrieval.ts` 的 SQL）写的是 `kb_id = ANY($2)` —— 那是 `§6-1` 的形状，
+   * F 包的对话编排要一次查 Agent 绑定的多个库，届时只需改调用方，SQL 不必动。
+   *
+   * 三条口径（细节在服务层文件头）：`mode`/`topK` 可在请求里覆盖（试查页要能"同一 query
+   * 试三种模式"，且**不污染**库配置）；向量路在"库快照的 embedding 模型 ≠ 当前模型"时
+   * 跳过并告警（§八 的降级路径）而不是 500；`VECTOR` 模式没有可退的路，则报 409。
+   */
+  app.post<{ Params: KnowledgeBaseIdParams; Body: SearchKnowledgeBaseBody }>(
+    '/api/knowledge-bases/:id/search',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: knowledgeBaseIdParamsSchema, body: searchKnowledgeBaseBodySchema },
+    },
+    async (request) => ok(await searchKnowledgeBase({ kbId: request.params.id, ...request.body })),
   )
 }
