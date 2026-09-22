@@ -2565,7 +2565,7 @@ await it('输出投影的键集合固定：没有 `deletedAt` 之类的内部列
 // ── 25. 会话契约与路由（P0-1-25）──
 console.log(`\n${c.b}── 会话契约与路由（权限「仅本人」/ active 的派生字段 / last_message_at 的时点）──${c.x}`)
 
-await it('五条路由已注册；P0-1-26/27/28 的三条**刻意不存在**（不提前做下一批的活）', () => {
+await it('七条已注册（P0-1-25 五条 + P0-1-26 两条）；P0-1-28 / P0-2 的两条**刻意不存在**', () => {
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/agents/:id/conversations' }), true, '某 Agent 的会话列表')
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations' }), true, '新建会话')
   assertEqual(app.hasRoute({ method: 'PATCH', url: '/api/conversations/:id' }), true, '重命名')
@@ -2574,12 +2574,17 @@ await it('五条路由已注册；P0-1-26/27/28 的三条**刻意不存在**（�
   // `GET /api/conversations/:id`（详情）**没有**被设计过 —— 会话的全部信息都在列表项里，
   // 多一条"取单条"只会变成一个没人维护的第二套投影
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id' }), false, '不该有会话详情端点')
-  // 属后续批次：消息分页 P0-1-28、SSE/停止/确认 P0-1-26。**提前注册一条返回空数组的
+  // 属后续批次：消息分页 P0-1-28。**提前注册一条返回空数组的
   // `/messages` 会让"历史恢复"看起来已交付**（P0-1-16 的同款断言，那次是列表/下载）
   assertEqual(app.hasRoute({ method: 'GET', url: '/api/conversations/:id/messages' }), false, '消息分页属 P0-1-28')
-  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/chat' }), false, 'SSE 属 P0-1-26')
-  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/stop' }), false, '停止属 P0-1-26')
-  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/confirm' }), false, '确认属 P0-1-26')
+  // ⚠️ 「刻意未注册」型断言**有保质期**（README §六）：下面两条在 P0-1-25 时是 `false`，
+  //    P0-1-26 落地 SSE 出口与停止之后**在这里翻转成 `true`**。翻转必须留痕 ——
+  //    否则将来读的人会以为这两条从来就是 true，也就丢掉了"它们曾经是刻意不做的"。
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/chat' }), true, 'SSE 出口（P0-1-26 落地）')
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/stop' }), true, '停止（P0-1-26 落地）')
+  // `confirm` 的应答端点要 `mcp_servers` 表（工具确认属工具系统）⇒ 归 **P0-2**，不是 P0-1-26。
+  // （P0-1-25 时这句写的是"属 P0-1-26"；P0-1-26 落地时发现它的真实前置是 P0-2，一并改正。）
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/conversations/:id/confirm' }), false, '确认属 P0-2（要 mcp_servers）')
   // ⚠️ 会话是**私有资源**：一条 `requireAdmin` 都不该出现 ⇒ 用一个普通 MEMBER 的 403 是验不出的，
   //    这里能验的是"路由本身只挂 requireAuth"（真权限判定在服务层的 `where` 里，归 verify-conversations）
   assertEqual(app.hasRoute({ method: 'PUT', url: '/api/conversations/:id' }), false, '重命名只走 PATCH（不提供整对象 PUT）')

@@ -1,9 +1,13 @@
 /**
- * 会话路由（P0-1-25）
+ * 会话路由（P0-1-25 起；P0-1-26 加 SSE 出口与停止）
  *
- * 依据：`docs/02-后端设计.md` §4.5（`/api/conversations` 五端点 + `/api/agents/:id/conversations`）
- *      + §四 约定（信封 / offset-limit 分页）+ §5.2（断线重连查 `/active`）
- *      + `01` §3.3 功能表第 9 条 + `03` §4.1（会话侧栏）/ §七（会话删除是级联删除）。
+ * 依据：`docs/02-后端设计.md` §4.5（`/api/conversations` 九端点 + `/api/agents/:id/conversations`）
+ *      + §四 约定（信封 / offset-limit 分页）+ §五（SSE 协议全文）+ §5.2（互斥 / 心跳 / 停止 / 断线）
+ *      + `01` §3.3 功能表第 9 条 + `03` §4.1（会话侧栏与输入区状态机）/ §七（会话删除是级联删除）。
+ *
+ * 七条已落地（P0-1-25 五条 + P0-1-26 两条）：Agent 会话列表 / 新建 / 重命名 / 删除 / `/active` /
+ * **`/chat`（SSE）** / **`/stop`**。仍缺两条：`/:id/messages`（**P0-1-28**）、
+ * `/:id/confirm`（**P0-2**，要 `mcp_servers` 表）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 权限：**只有本人**，且靠"查询条件里带 userId"实现，路由层没有任何判据
@@ -29,6 +33,7 @@
  */
 
 import {
+  chatRequestBodySchema,
   conversationIdParamsSchema,
   createConversationBodySchema,
   listConversationsQuerySchema,
@@ -36,6 +41,7 @@ import {
   renameConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
+  type ChatRequestBody,
   type ConversationIdParams,
   type CreateConversationBody,
   type ListConversationsQuery,
@@ -43,8 +49,11 @@ import {
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
+import { resolveChatProducer } from '../orchestrator/index.js'
+import { signalStop, streamChatReply } from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
+  assertConversationSendable,
   createConversation,
   getConversationActive,
   listConversationsForAgent,
@@ -125,13 +134,78 @@ export function registerConversationRoutes(app: FastifyInstance): void {
   /**
    * 活跃流状态（`02` §4.5 / §5.2，断线重连先查它）。**无流时恒为 `{streaming:false, …null}`**。
    *
-   * ⚠️ 写侧（`chat.active:{id}` 的锁）归 **P0-1-26** ⇒ 本批这个端点**恒为无流**。
-   * 验收脚本直接往那个键里写一份快照来验读侧（等价取证的写法见 `verify-conversations.mjs` 的 F 组），
-   * 那时必须能读到"在流 / 排队位次 / 当前工具"三件套。
+   * ⚠️ 写侧（`chat.active:{id}` 的锁）在 **P0-1-26** 落地 ⇒ 本端点现在是**真的**能读到
+   * "在流 / 排队位次 / 当前工具"：一条 SSE 流在跑时它就是 `streaming:true`。
+   * 读侧的口径（派生 `streaming`、值坏逐字段降级、先查库再查 Redis）由 P0-1-25 定案并保持不变。
    */
   app.get<{ Params: ConversationIdParams }>(
     '/api/conversations/:id/active',
     { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
     async (request) => ok(await getConversationActive(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * 发起对话（SSE；`02` §五 全文 + §5.2）。**本仓第二个不返回 JSON 信封的端点**（第一个是文档下载）。
+   *
+   * ── 两类失败、两个出口（`shared/src/sse.ts` 文件头 ③ 的完整理由）──
+   * **前置失败走统一 JSON 信封** —— 它们的**主语是"这个请求/目标"**，与"这一轮流"无关：
+   *   ① 未登录 401 / body 非法 400 —— `preHandler` 与路由级 schema 拦下；
+   *   ② 会话不存在或不是我的 → 404；
+   *   ③ 会话只读（Agent 被软删）→ 409、绑定模型不可用 → 409 / 424。
+   * ⚠️ **会话互斥冲突（同会话已有流在跑）走 `error{code:CONFLICT}` 事件**，不是信封 ——
+   *    它的**主语是"这一轮生成"**：客户端已经发起了对话，被拒的是这一次生成。`02` §4.5/§5.2、
+   *    `03` §五（配了"消息流内错误卡"）、`06` 的验收原文**四处**都写的是流内 `error`
+   *    ⇒ 前端按单一渲染路径在对话区收口。实现落在 `orchestrator/sse.ts#writeSseErrorReply`。
+   * 成功则 `200 text/event-stream`：之后的一切（含流内故障）都走事件（`done` / `error`）。
+   *
+   * ⚠️ **handler 里不能 `await` 完之后再 `return` 任何值**：`streamChatReply` 内部已 `hijack`，
+   * 响应归它管（Fastify 的 `reply.sent` 因此恒为 true，不会再碰这个响应）。
+   *
+   * ⚠️ **本批的流是"空流"**（编排循环属 P0-1-27）：只发 `ping` 心跳，不发任何内容事件、
+   * 不落库，直到 `/stop` 或客户端断开。原因与接回点见 `orchestrator/index.ts` 的文件头。
+   */
+  app.post<{ Params: ConversationIdParams; Body: ChatRequestBody }>(
+    '/api/conversations/:id/chat',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: chatRequestBodySchema },
+    },
+    async (request, reply) => {
+      // 前置闸门（404 / 只读 409 / 424）在加锁与 hijack **之前**跑完，它们走 JSON 信封；
+      // 会话互斥的 CONFLICT 由 `streamChatReply` 内部以 `error` 事件收尾（见上面的分界说明）
+      const sendable = await assertConversationSendable(request.params.id, viewerOf(request))
+      await streamChatReply({
+        reply,
+        conversationId: sendable.conversationId,
+        agentId: sendable.agentId,
+        target: sendable.target,
+        producer: resolveChatProducer(),
+      })
+    },
+  )
+
+  /**
+   * 停止生成（`02` §5.2：写 `chat.stop:{id}`，TTL 60s，编排循环在可中断点检查）。
+   *
+   * **幂等**，两种结果都是 200：`signaled:true` = 有一个正在跑的流收到了信号；
+   * `signaled:false` = 当前没有在生成的回答（`03` §4.1 的停止按钮只在流中出现，
+   * 但"流刚好结束"的竞态必然存在 —— 把它做成 4xx 只会让用户看到一个没有信息量的报错）。
+   *
+   * 判据复用 P0-1-25 的 `/active` 读侧（**顺带完成"这不是我的会话就 404"**）：
+   * 先看 `streaming`，真的有流才写键。顺序反了（先写再判）会在"流刚结束"时留下一个
+   * **没人消费的停止键**，它会在 60s 内让用户的下一条消息**秒停**（见 `infra/redis.ts` 的
+   * `CHAT_STOP_TTL_SEC`）。
+   *
+   * 刻意**不按会话类型分流**（`02` §4.5 的表里写了"停流 / 停流+回收沙箱"）：沙箱与 TaskAgent
+   * 属 **P0-3**，现在没有第二种类型可分流；先写一个只有一条分支的分流器，只会在 P0-3 变成要改的猜测。
+   */
+  app.post<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/stop',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const active = await getConversationActive(request.params.id, viewerOf(request))
+      if (!active.streaming) return ok({ id: request.params.id, signaled: false })
+      return ok({ id: request.params.id, signaled: await signalStop(request.params.id) })
+    },
   )
 }

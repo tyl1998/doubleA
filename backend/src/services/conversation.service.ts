@@ -40,10 +40,11 @@
  *    与 P0-1-19 的 `deletedChunks` 同款；用事务是为了消掉这个 TOCTOU）。
  *
  * **⑤ 「只读」= 不能再产生消息；改名与删除**刻意不按 status 拦**。**
- *    {@@link isConversationReadOnly} 的消费方是 P0-1-26 的 `POST /:id/chat` 闸门（与 P0-1-34
- *    的输入区禁用）。本批的写端点（重命名、删除）**不查 `status`**：用户需要能清理自己的历史，
- *    而"改个标题"跟"产生消息"是两回事 —— 顺手加一条 `status === 'ACTIVE'` 才放行，
- *    就把"删除一个已结束会话"变成做不到的事（P0-1-11 的教训：自己发明约束会把合法操作挡在门外）。
+ *    {@link isConversationReadOnly} 的消费方是 P0-1-26 的 `POST /:id/chat` 闸门（见
+ *    {@link assertConversationSendable}）与 P0-1-34 的输入区禁用。**改名与删除不查 `status`**：
+ *    用户需要能清理自己的历史，而"改个标题"跟"产生消息"是两回事 —— 顺手加一条
+ *    `status === 'ACTIVE'` 才放行，就把"删除一个已结束会话"变成做不到的事
+ *    （P0-1-11 的教训：自己发明约束会把合法操作挡在门外）。
  *
  * **⑥ 没有"会话级的 S3 对象"（P0-1 阶段的诚实边界）。**
  *    `06` P0-1-25 的内容里写了"删除（异步清理 S3）"。但这一阶段**确实没有**属于会话的对象：
@@ -54,17 +55,19 @@
  *    接回方式写在那两个函数上：P0-3 建了 `artifacts` 之后，只需在**收集**那一处加一句查询，
  *    删除路径本身不用改。⚠️ 现在写一段"先假定键在哪里"的代码，只会在 P0-3 变成需要重写的猜测。
  *
- * ⚠️ 本批**刻意不做**（属后续批次，不要顺手补）：
+ * ⚠️ 各批**刻意不做**的（属后续批次，不要顺手补）：
  *   · `GET /:id/messages`（分页历史）→ **P0-1-28**；
- *   · `POST /:id/chat`（SSE）/ `POST /:id/stop` → **P0-1-26**；
- *   · `POST /:id/confirm`（elicitation）→ **P0-1-26** 之后随 MCP 工具循环落地；
+ *   · `POST /:id/confirm`（elicitation）→ 随 MCP 工具循环落地（**P0-2**，需要 `mcp_servers` 表）；
  *   · `/api/conversations/:id/artifacts` → **P0-3**（`artifacts` 表）；
- *   · `chat.active:{id}` 的**写侧**（活跃流锁）→ **P0-1-26**（本批只读，见下）。
+ *   · 消息的写入 / 上下文组装 / 引用 → **P0-1-27**（`orchestrator/chatBot.ts`）。
+ * ⚠️ P0-1-26 起**已落地**（不再是"刻意不做"）：`POST /:id/chat`（SSE，闸门见
+ *   {@link assertConversationSendable}）与 `POST /:id/stop`（停止信号）。
  */
 
 import {
   AppError,
   EMPTY_ACTIVE_SNAPSHOT,
+  isConversationReadOnly,
   parseActiveSnapshot,
   type ConversationActive,
   type ConversationItem,
@@ -80,6 +83,8 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma, type PrismaClientInstance } from '../infra/prisma.js'
 import { chatActiveKey, getRedis } from '../infra/redis.js'
 import { getS3Client } from '../infra/s3.js'
+import type { LlmTarget } from '../llm/client.js'
+import { resolveChatTarget } from './model.service.js'
 
 /**
  * 调用者 —— **只有 `id`，刻意没有 `role`**（见文件头 ①）。
@@ -435,6 +440,66 @@ export async function getConversationActive(
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
   return { streaming: true, ...snapshot }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 发消息的闸门（P0-1-26）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 一次「可发送」的会话上下文：闸门通过后的产物，交给 SSE 出口层。
+ *
+ * `target` 里带**明文 API Key**（`resolveChatTarget` 解出来的）⇒ 与 `LlmTarget` 一条纪律：
+ * 只许在进程内存里流转，进日志一律用 `describeTarget()`。
+ */
+export interface ChatSendContext {
+  conversationId: string
+  agentId: string
+  target: LlmTarget
+}
+
+/**
+ * 发消息的前置闸门（`POST /:id/chat` 的第一步，**在写出任何 SSE 帧之前**跑完）。
+ *
+ * 四道判据，**顺序即用户看到什么**：
+ *   ① 会话存在**且是我的** → 否则 **404**（口径与其余会话端点完全一致：别人的会话与不存在的
+ *      id 回同一个 404，见文件头 ①）；
+ *   ② **不是只读** → 否则 **409**。「只读」= `FINISHED`，当前唯一的来源是"Agent 被软删"
+ *      （`02` §4.4：会话转只读**保留**）—— 这正是 P0-1-24 门槛④ 里"写不进去"那一半的落点
+ *      （读得到由会话列表端点取证、写不进去由本函数取证）；
+ *   ③ 绑定模型**能用** → 404 模型不存在 / 409 已停用（模型或其 Provider）/ 424 缺 Key。
+ *      **整段复用 `services/model.service.ts#resolveChatTarget()`**（唯一实现）：
+ *      P0-1-22 建 Agent 时**刻意不复用它**（那个场景不该逼管理员先配 Key），而"发消息"正是
+ *      它被设计出来的场景 —— 两边各自实现一遍必然漂移。
+ *      ⚠️ 这些错误原样透出（含 `NOT_FOUND`）：与智能体换绑模型时同一套口径（那里也是 404），
+ *      不在这里另立一套。
+ *   ④ **会话互斥**（活跃流锁）**不在这里**：它是 Redis 上的一个原子操作，属 SSE 出口层
+ *      （`orchestrator/sse.ts#acquireConversationLock`），失败了走 **409 `CONFLICT`**。
+ *      ⚠️ 那一处**不查库**：加锁必须是一次 `SET NX`，而"用户的"判据已经由 ①② 保证了。
+ *
+ * ⚠️ **刻意不做**：并发闸（`CHATBOT_CONCURRENCY`，满则 429 `BUSY`）。它是**进程级**的信号量，
+ * 属 P0-1-27 的编排层 —— 放在这条路由上会让"打开一个流"与"占用一个编排名额"变成两件事
+ * （本批的流不消耗编排资源，占名额反而会把名额表变成假的）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 会话/模型不存在（或不是我的）/ `CONFLICT`(409) 会话只读或模型不可用
+ *                    / `NEED_CREDENTIAL`(424) Provider 未配 Key
+ */
+export async function assertConversationSendable(
+  id: string,
+  viewer: ConversationViewer,
+): Promise<ChatSendContext> {
+  const row = await getPrisma().conversation.findFirst({
+    where: { id, userId: viewer.id },
+    select: { id: true, agentId: true, status: true, agent: { select: { modelId: true } } },
+  })
+  if (row === null) throw AppError.notFound('会话不存在')
+
+  if (isConversationReadOnly(row.status)) {
+    throw AppError.conflict('该会话已结束，不能再发送消息')
+  }
+
+  const target = await resolveChatTarget(row.agent.modelId)
+  return { conversationId: row.id, agentId: row.agentId, target }
 }
 
 // ═════════════════════════════════════════════════════════════════════

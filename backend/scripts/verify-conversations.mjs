@@ -240,7 +240,8 @@ async function listConversations(cookie, agentId, query = '') {
   return parsed.data
 }
 
-/** 往活跃流锁里写一份快照（**写侧归 P0-1-26**；这里直接写键来验读侧，见文件头 ③ 的同类说明） */
+/** 往活跃流锁里写一份快照（**写侧归 P0-1-26**：`orchestrator/sse.ts#updateActiveSnapshot`；
+ *  本档验的是**读侧**，故直接写键 —— "键在 ⇒ streaming:true"这条口径与真实的写侧无关） */
 async function putActiveKey(conversationId, value, ttlSec = 60) {
   activeKeysWritten.add(conversationId)
   await redis.set(chatActiveKey(conversationId), value, 'EX', ttlSec)
@@ -656,7 +657,8 @@ try {
 
   await it('已结束（`FINISHED`）的会话**照样能改名**：只读 = 不能再产生消息，不是"什么都不能改"', async () => {
     // 这是"不自己发明约束"（P0-1-11 的教训）的反向守卫：顺手加一句 `status === 'ACTIVE'` 才放行，
-    // 就把"清理历史"变成做不到的事。真正该拦的是**发消息**，那是 P0-1-26 的 chat 闸门。
+    // 就把"清理历史"变成做不到的事。真正该拦的是**发消息** —— 那是 P0-1-26 的 chat 闸门
+    // （`POST /:id/chat`，只读会话回 409；落点在 `assertConversationSendable` 而不是这里）。
     const agent = await createAgent(ownerCookie, {
       name: `会话验证智能体-只读改名-${suffix}`,
       type: 'CHATBOT',
@@ -791,7 +793,9 @@ try {
     })
     const conversation = await createConversation(ownerCookie, agent.id)
 
-    // ⚠️ 写侧归 P0-1-26 ⇒ 本批**恒为无流**，这正是 `docs/06` 的验收原文
+    // ⚠️ 写侧（P0-1-26 的 `orchestrator/sse.ts`）**已落地**，但本档刻意不驱动它 ⇒ 这里
+    //    仍然是"**恒为无流**"（这正是 `docs/06` P0-1-25 的验收原文）。真流之下的形态
+    //    （锁在、心跳续期、/stop 消费）由 `verify-chat-stream.mjs` 负责，两档不重叠。
     const active = await readActive(ownerCookie, conversation.id)
     assertSameObject(
       active,

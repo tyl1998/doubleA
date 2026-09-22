@@ -155,6 +155,9 @@ export function buildApp(): FastifyInstance {
   //    都只挂 `requireAuth`，判据落在服务层查询的 `where` 里（连 ADMIN 也不开后门，
   //    理由见 routes/conversations.ts 文件头）。注意其中一条挂在前缀 `/api/agents/:id/conversations`
   //    （某智能体的会话列表）—— 它读的是 conversations 表，故归属本文件而不是 routes/agents.ts。
+  //    P0-1-26 起同一个文件里多了 `POST /:id/chat`（SSE，走 `orchestrator/sse.ts`：
+  //    互斥锁 + 心跳 + 停止信号；**handler 内会 hijack 响应**，故它不返回信封）
+  //    与 `POST /:id/stop`（写停止信号）。
   registerConversationRoutes(app)
 
   return app

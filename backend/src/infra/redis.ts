@@ -235,21 +235,39 @@ export function userSnapshotKey(userId: string): string {
 }
 
 /**
- * `chat.active:{conversationId}` 键名 —— **会话的活跃流锁，同时也是活跃流状态**（P0-1-25）。
+ * `chat.active:{conversationId}` 键名 —— **会话的活跃流锁，同时也是活跃流状态**（P0-1-25 定义，P0-1-26 落地写侧）。
  *
  * 依据：`02` §5.2「会话互斥：Redis 锁 `chat.active:{conversationId}`；持锁期间同一会话再次发送
- * 返回 `error{code: CONFLICT}`」+ §5.1/§5.2 的 `ping` 心跳（空闲期保活）。
+ * 返回错误（`code=CONFLICT`）」+ §5.1/§5.2 的 `ping` 心跳（空闲期保活）。
  *
  * 三条口径（P0-1-25 定案，写进 `02` §4.5/§5.2 的契约增量）：
  *   ① **只有一个键**：锁与"是否在流"必须是同一件事（分成两个键就会有两套真相）；
  *   ② 值是 `conversationActiveSnapshotSchema` 的 JSON（`queuedPosition`/`currentTool`/`startedAt`）,
  *      故 `GET /:id/active` 能一次读全"在流 / 排队位次 / 当前工具"；
- *   ③ **写侧归 P0-1-26**（流开始时写、结束时删，且必须带 TTL —— 进程被杀时锁要能自己过期，
- *      否则这个会话会永久 `CONFLICT`）。本批（P0-1-25）只实现读侧。
+ *   ③ **写侧归 P0-1-26**（本文件只放键名与常量；"锁怎么加、心跳怎么续期、怎么按归属释放"
+ *      都在 `orchestrator/sse.ts`，那些是**编排层的语义**，不是 Redis 客户端的事）：
+ *      流开始时 `SET … NX EX`（拿不到 ⇒ 409 `CONFLICT`）、每写一帧续期、结束时按归属 `DEL`。
+ *      ⚠️ **必须带 TTL**：进程被杀时锁要能自己过期，否则这个会话会永久 `CONFLICT`。
  */
 export function chatActiveKey(conversationId: string): string {
   return `chat.active:${conversationId}`
 }
+
+/** `chat.stop:{conversationId}` 键名（停止信号，见下） */
+export function chatStopKey(conversationId: string): string {
+  return `chat.stop:${conversationId}`
+}
+
+/**
+ * 停止信号的 TTL（秒）—— `02` §5.2 明文规定 60s，不是随手取的数。
+ *
+ * 它是**兜底**：正常路径下流结束时（`finally`）就把键删掉；TTL 只为"键写了、流却已经死了"
+ * 这种情况兜底（比如停止信号与流结束几乎同时、或进程中途被杀）。
+ * 之所以要兜底得这么紧：**残留的停止键会让下一个流秒停** —— 用户的症状是
+ * "刚发出去的回答立刻就停在原地"，且没有任何报错。故新流启动时还会**再清一次**
+ * （见 `orchestrator/sse.ts` 的 `clearStopSignal`），两道防线。
+ */
+export const CHAT_STOP_TTL_SEC = 60
 
 /**
  * 新建会话并返回 `sid`。

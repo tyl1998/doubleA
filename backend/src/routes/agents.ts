@@ -31,8 +31,9 @@
  *     注册在 `routes/conversations.ts`（它读的是 `conversations` 表，见该文件头）。
  *     ⚠️ P0-1-22 时这一条在"刻意不做"清单里，P0-1-23 时 `PUT …/components` 也翻转过一次 ——
  *     两档无依赖验收（`verify-app.mjs`）里的对应断言都已同步翻转。
- *   · `GET /api/conversations/:id/messages`、`POST …/chat`、`POST …/stop` 仍属后续批次
- *     （P0-1-26/27/28），本批**不要顺手补**。
+ *   · `GET /api/conversations/:id/messages` 仍属后续批次（**P0-1-28**），本批**不要顺手补**。
+ *     `POST /api/conversations/:id/chat`（SSE）与 `/:id/stop` 已在 **P0-1-26** 落地，
+ *     同样注册在 `routes/conversations.ts`（它们读写的都是 `conversations` 与 Redis 的活跃流锁）。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */

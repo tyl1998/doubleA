@@ -34,12 +34,13 @@
  *    **对偶形态**："含 MCP 的提交被明确拒绝，且文案指向 P0-2" —— 这才是现在能成立的事实。
  * ② **门槛④ 的"只读"**：P0-1-24 收口时**没有**任何 HTTP 出口能观察"这个会话读得到"，
  *    故当时只在 **DB 层**取证（`conversations` 行还在、`status=FINISHED`、消息还在、
- *    `finishedConversations` 数得对）并标了 ⚠️。**P0-1-25 落地后本组已换成打端点**：
- *    会话经 `POST /api/conversations` 建，删掉 Agent 之后再用 `GET /api/agents/:id/conversations`
- *    读回来（这正是"只读保留"的端点级证据）。
- *    ⚠️ 但"**写不进去**"这一半仍要等 **P0-1-26** —— 唯一会让会话产生消息的端点是
- *    `POST /:id/chat`（SSE 闸门），本批刻意不注册（`verify-app.mjs` 有断言守着它 404）。
- *    故结论表里这一条仍**单列一行**说明，不混进 ✅。
+ *    `finishedConversations` 数得对）并标了 ⚠️。
+ *    **P0-1-25 落地后**"读得到"这一半已换成打端点：会话经 `POST /api/conversations` 建，
+ *    删掉 Agent 之后再用 `GET /api/agents/:id/conversations` 读回来。
+ *    **P0-1-26 落地后**"**写不进去**"这一半也补齐了：唯一会让会话产生消息的端点是
+ *    `POST /:id/chat`（SSE 闸门），只读会话打它 → 409 `CONFLICT` 信封（R4 里已断言）。
+ *    ⇒ **本项现在是完整的 ✅，不再是"部分完成"**（P0-1-24 时那句"仍要等 P0-1-26、该端点
+ *    刻意未注册"到此作废，`verify-app.mjs` 里守着它 404 的断言同批翻转成 `true`）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 依赖与前置
@@ -536,7 +537,7 @@ try {
     'R4',
     '门槛④ 删除 Agent 后其会话仍在（只读），组件绑定已解除',
     '会话走 `POST /api/conversations` 建、删 Agent 后用会话列表端点读回来（P0-1-25 回补）；' +
-      '"写不进去"仍归 P0-1-26 的 chat 闸门（见文件头 ⚠️②）',
+      '"写不进去"已由 P0-1-26 的 chat 闸门补齐（409，见文件头 ⚠️② —— 本项至此完整）',
   )
   // ═══════════════════════════════════════════════════════════════════
 
@@ -629,7 +630,24 @@ try {
     })
     assertEqual(conversationRow?.status, ConversationStatus.FINISHED, '库里也是 FINISHED')
 
-    // ④ 重复删除 → 404（不是 200，也不是 500）：并发双击的语义要干净
+    // ④ **"写不进去"**（P0-1-26 回补，见文件头 ⚠️②）：会话唯一的写入口是 `POST /:id/chat`，
+    //    而 `FINISHED` ⇒ 闸门在写出任何 SSE 帧之前就 409（`isConversationReadOnly` 的消费方）。
+    //    它和上面 ③ 的"读得到"合起来，才把 `02` §4.4 的"只读保留"真正闭环 ——
+    //    P0-1-24 收口时这个端点刻意未注册，当时只能把这一半单列一行、不混进 ✅。
+    const blockedByReadOnly = await api('POST', `/api/conversations/${conversation.id}/chat`, {
+      cookie: ownerCookie,
+      payload: { content: '还能说吗' },
+    })
+    assertEqual(blockedByReadOnly.statusCode, 409, '"写不进去"：只读会话发消息应 409（P0-1-26 的 chat 闸门）')
+    assertEqual(blockedByReadOnly.json().code, 'CONFLICT', '错误码')
+    // ⚠️ 必须是 **JSON 信封**而不是 SSE 响应 —— 这道闸门跑在 `reply.hijack()` 之前
+    //    （`shared/src/sse.ts` 文件头 ③ 的分界线）
+    assert(
+      !(blockedByReadOnly.headers['content-type'] ?? '').includes('event-stream'),
+      '被闸门拦下的请求不该是 SSE 响应（应是 JSON 信封）',
+    )
+
+    // ⑤ 重复删除 → 404（不是 200，也不是 500）：并发双击的语义要干净
     assertEqual(
       (await api('DELETE', `/api/agents/${target.item.id}`, { cookie: ownerCookie })).statusCode,
       404,
@@ -791,8 +809,8 @@ console.log(
     `由 P0-2 接回 —— 本包验的是**对偶形态**`,
 )
 console.log(
-  `  ${c.y}⚠️${c.x} 门槛④ 的"只读"：**读得到**已换成端点取证（会话列表仍返回、status=FINISHED，` +
-    `**P0-1-25 回补**）；"**写不进去**"要等 P0-1-26 的 chat 闸门（该端点刻意未注册）`,
+  `  ${c.g}✅${c.x} 门槛④ 的"只读"：**读得到**走端点取证（P0-1-25 回补）+ **写不进去**走 chat 闸门 409` +
+    `（**P0-1-26 回补**，见文件头 ⚠️②）—— 两半齐了，本项不再单列`,
 )
 console.log(
   `  ${c.d}边界：本包收口时**浏览器仍是占位页**（前端里程碑 P0-1-30、Agent 界面 P0-1-31）；` +
