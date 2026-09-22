@@ -24,6 +24,7 @@
     "verify:knowledge": "pnpm run build:shared && pnpm run build && node scripts/verify-knowledge.mjs",
     "verify:documents": "pnpm run build:shared && pnpm run build && node scripts/verify-documents.mjs",
     "verify:pipeline": "pnpm run build:shared && pnpm run build && node scripts/verify-pipeline.mjs",
+    "verify:ingest": "pnpm run build:shared && pnpm run build && node scripts/verify-ingest.mjs",
     "verify:knowledge-bases": "pnpm run build:shared && pnpm run build && node scripts/verify-knowledge-bases.mjs",
     "verify:e2e": "pnpm run build:shared && pnpm run build && node scripts/verify-e2e.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",

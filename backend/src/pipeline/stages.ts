@@ -1,24 +1,29 @@
 /**
- * 流水线阶段（P0-1-17 定骨架；P0-1-18 插入空文本检测与分块；P0-1-19 再插 embedding 与入库）
+ * 流水线阶段（P0-1-17 定骨架；P0-1-18 插 ④⑤；P0-1-19 插 ⑥⑦ —— 至此八步齐全）
  *
  * 依据：`docs/子方案/知识库流水线.md` §三（流程总览 ③~⑧）、§4-1（解析）、§4-2（分块）、
- *      §五（空文本检测）、§4-4（入库）
+ *      §五（空文本检测）、§4-3（embedding）、§4-4（入库）
  *
  * ─────────────────────────────────────────────────────────────────────
  * 为什么把"处理步骤"从 worker 里拆出来
  * ─────────────────────────────────────────────────────────────────────
- * `子方案①` §三 的流水线是**八个步骤**，P0-1-17 只到 ③（解析），本批补上 ④（空文本检测）
- * 与 ⑤（分块），⑥ embedding 与 ⑦ 入库留给 P0-1-19。若把这几步直接写在 worker 的循环里，
- * 每批都要改那个循环（并发、幂等、状态机写入全在同一段代码里），风险最高的那部分代码
- * 会被改三次。拆成"阶段数组"之后：**每批只往数组中间插一个阶段**，worker 的并发/幂等/
- * 失败处理一行不动（P0-1-18 实证：`worker.ts` 本批只改了一处 select，见其注释）。
+ * `子方案①` §三 的流水线是**八个步骤**，分三批落地：P0-1-17 落 ③（解析）、
+ * P0-1-18 落 ④（空文本检测）与 ⑤（分块）、P0-1-19 落 ⑥（embedding）与 ⑦（入库）。
+ * 若把这几步直接写在 worker 的循环里，每批都要改那个循环（并发、幂等、状态机写入全在同一段
+ * 代码里），风险最高的那部分代码会被改三次。拆成"阶段数组"之后：**每批只往数组中间插阶段**，
+ * worker 的并发/幂等/失败处理一行不动。
+ * 三批的实证：P0-1-18 插 ④⑤ 时 worker 只改了选择字段（`JOB_DOCUMENT_SELECT` 多带 KB 参数）、
+ * P0-1-19 插 ⑥⑦ 时 worker **一行未改**（阶段要的数据全在上下文里）。
  * 另一个直接收益是验收可注入：`startPipelineWorker({ stages })` 能塞一组慢速假阶段，
  * 从而**确定性地**观测并发闸与幂等（见 `verify-pipeline.mjs` 的 E 组）。
  *
- * 阶段之间的数据传递只有一个方向：`load-source` 写 `ctx.source` → `parse` 读它、写 `ctx.parsed`
- * → `detect-empty-text`/`chunk` 读 `parsed`（后者写 `ctx.chunks`）→（P0-1-19 的 `index`
- * 读 `parsed`/`chunks`、写 `ctx.chunkCount`）。用可选的字段而不是"每阶段一个返回值"，
- * 是因为后续阶段往往要用到**前面好几步**的产物（入库要用 `parsed.blocks` 的 meta 与 KB 的入库参数）。
+ * 阶段之间的数据传递只有一个方向：
+ *   `load-source` 写 `ctx.source` → `parse` 读它、写 `ctx.parsed`
+ *   → `detect-empty-text` 读 `parsed` → `chunk` 读 `parsed`、写 `ctx.chunks`
+ *   → `embed` 读 `chunks`、写 `ctx.vectors`/`ctx.embeddingName`
+ *   → `index` 读前两者、写 `ctx.chunkCount`。
+ * 用可选的字段而不是"每阶段一个返回值"，是因为后续阶段往往要用到**前面好几步**的产物
+ * （入库要用 `parsed.blocks` 的 meta 与 KB 的入库参数）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 阶段抛出的错误会变成用户的 `error_msg` ⇒ 文案必须是**可展示**的
@@ -26,7 +31,7 @@
  * worker 把失败的 `AppError.message` 原样写进 `documents.error_msg`（前端展示），
  * 所以本文件里的每一条错误消息都按"用户能不能照着做点什么"来写：
  * "对象存储里找不到《x》，请重新上传" / "文件内容与扩展名不符，请确认没有被改名" /
- * "解析结果内容过少……疑似扫描件，请上传可复制文本的文件"。
+ * "解析结果内容过少……疑似扫描件，请上传可复制文本的文件" / "文本向量化失败（已重试 2 次）…"。
  * 技术细节（bucket、S3 键、阈值来源、堆栈）只进日志，不进消息。
  */
 
@@ -38,6 +43,7 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getS3Client } from '../infra/s3.js'
 import { DEFAULT_CHUNK_MIN_CHARS, splitIntoChunks, type Chunk } from './chunk/index.js'
+import { CHUNK_WRITE_BATCH, embedChunks, writeChunks } from './index/writer.js'
 import { detectFormat, parseDocument, type ParseResult } from './parse/index.js'
 import type { PipelineJob } from './queue.js'
 
@@ -69,14 +75,18 @@ export interface PipelineContext {
   source?: Buffer
   /** 解析结果（`parse` 写；空文本检测、分块、P0-1-19 的入库都读它） */
   parsed?: ParseResult
-  /** 已切好的块（`chunk` 写；P0-1-19 的 `index` 读它并落库） */
+  /** 已切好的块（`chunk` 写；`embed` 读它、`index` 落库） */
   chunks?: Chunk[]
+  /** 与 `chunks` 逐条对应的向量（`embed` 写；`index` 读它） */
+  vectors?: number[][]
+  /** 落库用的模型标识（`embed` 写 `EmbeddingProvider.name()`；`index` 写进每行 `meta.embeddingName`） */
+  embeddingName?: string
   /**
-   * 已入库的 chunk 数（P0-1-19 的 `index` 写）。
+   * 已入库的 chunk 数（`index` 写）。
    *
-   * ⚠️ **只有真的写进 `chunks` 表之后才可以写它** —— P0-1-18 已经把块算出来了，
-   * 但落库属 P0-1-19，故本批**刻意不写**（`chunks` 表一行也没有）。理由见
-   * {@link chunkStage} 的注释与 `schema.prisma` 对 `chunk_count` 的定义。
+   * ⚠️ **只有真的写进 `chunks` 表之后才可以写它** —— 它同时是 worker 落 `documents.chunk_count`
+   * 的唯一来源（`schema.prisma` 对那一列的定义是"**已入库**的 chunk 数"）。
+   * P0-1-18 曾刻意留空（那时只"算"不"存"），P0-1-19 起由 `indexStage` 填真数。
    */
   chunkCount?: number
   /** 带 docId 的子日志（阶段里别用 `getLogger()` —— 那会丢掉"哪个文档"这个最关键的信息） */
@@ -230,15 +240,12 @@ export function buildEmptyTextMessage(charCount: number, threshold: number): str
 /**
  * ⑤ 分块（`子方案①` §4-2，策略可插拔 —— 实现在 `chunk/`）。
  *
- * ⚠️ **本批只"算"不"存"**：块已经切出来了（`ctx.chunks`），但**刻意不写 `chunk_count`**
- * （更不写 `chunks` 表 —— 那是 P0-1-19 的 `index` 阶段，要连 embedding 一起事务写入）。
+ * 只负责"切"，**不负责"存"**：产物放 `ctx.chunks`，落库是 ⑦ {@link indexStage} 的事。
+ * 两者分开是因为失败归因完全不同 —— "切不出来"（文档的问题）与"写不进去"（库/存储的问题）
+ * 对用户的下一步动作毫无共同点。
  *
- * 为什么不让 worker 顺手把块数写进 `documents.chunk_count`：
- * `schema.prisma` 对那一列的定义是"**已入库**的 chunk 数"，而本批库里一行 chunk 都没有。
- * 写了它就会出现"接口说这个文档有 12 块、检索却什么也搜不到"，且 P0-1-19 还得回头把它
- * 改成"其实没入库"——不如让它老实停在 0，把"READY = 解析与分块都过了，但还不可检索"
- * 这个中间态**暴露出来**（这也是 `docs/06` 本批边界那一条的凭据）。
- * 分块结果进日志（`chunks` 条数），于是"切了几块"依然可观测。
+ * P0-1-18 时它连 `chunk_count` 都不写（那时 ⑦ 还没实现，写了就会造出"说有 N 块却搜不到"）；
+ * P0-1-19 起 `chunk_count` 由 ⑦ 写**真数**，本阶段仍然只碰 `ctx.chunks`。
  */
 export const chunkStage: PipelineStage = {
   name: 'chunk',
@@ -261,29 +268,91 @@ export const chunkStage: PipelineStage = {
         chunks: chunks.length,
         chars: parsed.meta.charCount,
       },
-      '分块完成（写入 chunks 表与 chunk_count 属 P0-1-19，本批不落库）',
+      '分块完成（向量化与落库属 ⑥⑦）',
+    )
+  },
+}
+
+/** 取 ⑤ 的产物；缺失说明阶段数组配错了（与 {@link requireParsed} 同款） */
+function requireChunks(ctx: PipelineContext, stage: string): Chunk[] {
+  const chunks = ctx.chunks
+  if (chunks === undefined) {
+    throw new Error(`流水线配置错误：${stage} 阶段之前必须有一个 chunk 阶段`)
+  }
+  return chunks
+}
+
+/**
+ * ⑥ embedding（`子方案①` §4-3）—— 批 32、单批失败重试 2 次（退避 1s/3s）。
+ *
+ * 实现在 `pipeline/index/writer.ts` 的 `embedChunks()`：本阶段只做"接线 + 失败归因"。
+ * 失败时抛的是 `AppError`，消息直接给用户看（"文本向量化失败（已重试 2 次）…"）——
+ * 失败最集中的这一环（配置缺项、上游不可达、维度不符）必须让用户看得出是**环境/上游**的问题，
+ * 而不是"我的文档坏了"，否则他会去重传一个没问题的文件。
+ */
+export const embedStage: PipelineStage = {
+  name: 'embed',
+  async run(ctx) {
+    const chunks = requireChunks(ctx, 'embed')
+    const { vectors, embeddingName } = await embedChunks(chunks, ctx.log)
+    ctx.vectors = vectors
+    ctx.embeddingName = embeddingName
+    ctx.log.debug({ chunks: chunks.length, embeddingName, dim: config.embedding.dim }, '向量化完成')
+  },
+}
+
+/**
+ * ⑦ 入库（`子方案①` §4-4/§三）—— 事务内"先删后建"，返回写入行数。
+ *
+ * 产物写进 `ctx.chunkCount`，worker 据此落 `documents.chunk_count`。**这是全仓唯一**
+ * 允许写那一列的地方（见 {@link PipelineContext.chunkCount} 的注释）。
+ *
+ * 与 ⑤ 的关系：⑦ 结束之后"库里的 chunk 集合"就等于 ⑤ 切出来的那一套 ——
+ * 这也是 `§七` 的"无重复、无孤儿"在**代码层面**的定义。
+ */
+export const indexStage: PipelineStage = {
+  name: 'index',
+  async run(ctx) {
+    const chunks = requireChunks(ctx, 'index')
+    const vectors = ctx.vectors
+    const embeddingName = ctx.embeddingName
+    if (vectors === undefined || embeddingName === undefined) {
+      throw new Error('流水线配置错误：index 阶段之前必须有一个 embed 阶段')
+    }
+    ctx.chunkCount = await writeChunks({
+      docId: ctx.document.id,
+      kbId: ctx.document.kbId,
+      chunks,
+      vectors,
+      embeddingName,
+    })
+    ctx.log.debug(
+      { chunkCount: ctx.chunkCount, embeddingName, batch: CHUNK_WRITE_BATCH },
+      'chunk 已入库（同一文档的 chunk 集合被整次替换）',
     )
   },
 }
 
 /**
- * 默认阶段序列：③ 解析 → ④ 空文本检测 → ⑤ 分块（⑥⑦ 由 P0-1-19 插进来）。
+ * 默认阶段序列：③ 解析 → ④ 空文本检测 → ⑤ 分块 → ⑥ embedding → ⑦ 入库。
  *
- * ⚠️ 顺序不可换：空文本检测必须在分块**之前**（§五 的流程图就是"解析完成 → 判空 → 继续分块"）。
- * 反过来的话，一份扫描件会先被切成若干块、再被判失败 —— 白干一遍，且失败文案里
- * "chunk 数为 0"的直觉会不成立。
+ * ⚠️ 顺序不可换，三条理由各不相同：
+ * · 空文本检测必须在分块**之前**（§五 的流程图）。反过来会先白切一遍再判失败，
+ *   且"块数为 0 却报句子级错误"会把排查方向带偏。
+ * · 分块必须在 embedding **之前**：embedding 的输入就是块（切法变了向量就该重算）。
+ * · 入库必须在 embedding **之后**且**只此一次**：向量与块是同一条记录的两半，
+ *   分开写会出现"有块没向量"（检索里它永远排不上号）或"有向量没块"。
  *
- * ⚠️ 本批的 `READY` 含义推进了半步：现在是"解析**与分块**都过了"，但**仍不是"可检索"**
- * （`chunk_count` 仍是 0、chunk 一行也没有 ⇒ ⑥⑦ 属 P0-1-19）。验收对这一点有明写的断言
- * （`verify-pipeline.mjs` 的 C 组：`chunkCount === 0` 是**预期**，不是漏了）。
- *
- * 本批之后仍未做的边界：扫描件**会被**正确拦下（本批补上 ④），但"解析出 0 字"以外的
- * 低质量解析（如全篇乱码、表格错行）不判；分块结果**不入库**，故检索要到 P0-1-20 才有。
+ * ⚠️ 至此 `READY` 的语义才完整：**"可检索"**（`chunks` 表有行、每行都有向量、
+ * `documents.chunk_count` 与之一致）。P0-1-18 那段"只算不存"到此结束。
+ * 仍差的一步是**检索端点本身**（P0-1-20）与文档列表端点（P0-1-21）。
  */
 export const defaultPipelineStages: readonly PipelineStage[] = [
   loadSourceStage,
   parseStage,
   detectEmptyTextStage,
   chunkStage,
+  embedStage,
+  indexStage,
 ]
 

@@ -105,6 +105,10 @@ import {
   ok,
   retrievalConfigInputSchema,
   remoteModelListResultSchema,
+  REUPLOAD_UNCHANGED_HINT,
+  reuploadDocumentResultSchema,
+  removeDocumentResultSchema,
+  retryDocumentResultSchema,
   SPLIT_STRATEGIES,
   updateModelBodySchema,
   updateModelProviderBodySchema,
@@ -1743,6 +1747,108 @@ await it('策略注册表：默认与回落都是 hybrid，且策略名集合与
   assertEqual(resolveChunkStrategy('nope').name, 'hybrid', '未知策略回落 hybrid')
   assertEqual(splitIntoChunks(flatDoc('戊'.repeat(100)), CHUNK_OPT).length, 1, '省略策略参数时走默认 hybrid')
   assertEqual(DEFAULT_CHUNK_MIN_CHARS, 50, 'chunk_min 是 §二 的 50（它不是环境变量，见 strategy.ts 注释）')
+})
+
+// ── 21. 覆盖重建 / 重试 / 删除的契约与路由（P0-1-19）──
+console.log(`\n${c.b}── 覆盖重建 / 重试 / 删除 endpoints（契约 + 路由注册）──${c.x}`)
+
+/** 文档项的样例（与 §18 那份同形，改动字段时两处都要看） */
+const DOC_SAMPLE = {
+  id: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+  kbId: '01a0c289-6738-715c-a10c-ef95c1286bf9',
+  fileName: '员工手册.pdf',
+  status: 'PARSING',
+  chunkCount: 0,
+  errorMsg: null,
+  createdAt: '2026-09-22T00:00:00.000Z',
+  updatedAt: '2026-09-22T00:00:00.000Z',
+}
+
+await it('三条新路由已注册（都是文档路径下的子路径，不是查询参数分流）', () => {
+  // 子路径而不是 `/reupload?id=...`：与 P0-1-11/12 同一条结论 —— 同路径同方法注册两次会在
+  // **启动期**抛 `FST_ERR_DUPLICATED_ROUTE`，能挂上就说明是干净的分流
+  assertEqual(
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents/:docId/reupload' }),
+    true,
+    '覆盖重建路由',
+  )
+  assertEqual(
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents/:docId/retry' }),
+    true,
+    '重试路由',
+  )
+  assertEqual(
+    app.hasRoute({ method: 'DELETE', url: '/api/knowledge-bases/:id/documents/:docId' }),
+    true,
+    '删除路由',
+  )
+  // 上传那条仍在（子路径不该把它挤掉）
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents' }), true, '上传路由')
+  // 列表与下载属 P0-1-21、检索属 P0-1-20 —— **刻意不提前注册**（猜出来的契约会先错一遍）
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }), false, '不应有列表')
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents/:docId/download' }),
+    false,
+    '不应有下载',
+  )
+})
+
+await it('上传与覆盖重建的响应字段名**刻意不同**：`deduplicated` ≠ `unchanged`', () => {
+  // 两者回答的问题不同（见 `shared/src/document.ts` 的注释）：上传的 `deduplicated` 是
+  // "库里已有同样内容 ⇒ 没产生新文档"；重建的 `unchanged` 是"**这一篇**没变 ⇒ 没跑流水线"。
+  // 串味的后果是前端分不清"要不要刷新列表"与"要不要提示内容没变"
+  assertEqual(
+    reuploadDocumentResultSchema.safeParse({ document: DOC_SAMPLE, unchanged: true }).success,
+    true,
+    '重建响应 schema',
+  )
+  assertEqual(
+    reuploadDocumentResultSchema.safeParse({ document: DOC_SAMPLE }).success,
+    false,
+    '`unchanged` 是必填（省略会让前端无法区分"没变"与"不知道"）',
+  )
+  assertEqual(
+    uploadDocumentResultSchema.safeParse({ document: DOC_SAMPLE, unchanged: true }).success,
+    false,
+    '上传响应不该接受 `unchanged`',
+  )
+  assertEqual(
+    reuploadDocumentResultSchema.safeParse({ document: DOC_SAMPLE, deduplicated: true }).success,
+    false,
+    '重建响应不该接受 `deduplicated`',
+  )
+})
+
+await it('重试与删除的响应契约（`retryDocumentResultSchema` / `removeDocumentResultSchema`）', () => {
+  assertEqual(retryDocumentResultSchema.safeParse({ document: DOC_SAMPLE }).success, true, '重试响应')
+  assertEqual(retryDocumentResultSchema.safeParse({}).success, false, '重试响应必须带 document')
+  assertEqual(
+    removeDocumentResultSchema.safeParse({ id: DOC_SAMPLE.id, fileName: 'a.txt', deletedChunks: 3 }).success,
+    true,
+    '删除响应',
+  )
+  assertEqual(
+    removeDocumentResultSchema.safeParse({ id: DOC_SAMPLE.id, fileName: 'a.txt', deletedChunks: -1 }).success,
+    false,
+    '`deletedChunks` 不能为负（界面要拿它给提示）',
+  )
+  // 路径参数：三个端点共用两个 UUID 的口径
+  assertEqual(
+    documentParamsSchema.safeParse({ id: DOC_SAMPLE.id, docId: DOC_SAMPLE.id }).success,
+    true,
+    '两段 UUID 合法',
+  )
+  assertEqual(
+    documentParamsSchema.safeParse({ id: DOC_SAMPLE.id, docId: 'not-a-uuid' }).success,
+    false,
+    'docId 必须是 UUID',
+  )
+})
+
+await it('「内容未变化，已跳过」是 shared 里的常量（前后端共用同一句，避免文案漂移）', () => {
+  // 与 `LEGACY_DOC_HINT` 同款：这条提示是"用户的下一步动作"（别传了 / 去改内容），
+  // 措辞漂了就会让人以为是两种问题
+  assertEqual(REUPLOAD_UNCHANGED_HINT, '内容未变化，已跳过', '提示文案')
 })
 
 await app.close()

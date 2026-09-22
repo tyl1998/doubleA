@@ -390,14 +390,15 @@ async function handleJob(job: PipelineJob): Promise<void> {
         {
           chars: ctx.parsed?.meta.charCount ?? null,
           blocks: ctx.parsed?.blocks.length ?? null,
-          // 切出来的块数 vs 落库的块数（二者本批**必然不等**：落库属 P0-1-19）
           chunks: ctx.chunks?.length ?? 0,
+          // 至 P0-1-19，这个数来自 ⑦ 入库的真实写入行数（不再是恒 0 的占位）——
+          // 它写进 `documents.chunk_count`，与 `chunks` 表逐行一致
           chunkCount: ctx.chunkCount ?? 0,
+          embeddingName: ctx.embeddingName ?? null,
         },
-        // 本批补上了 ④ 空文本检测与 ⑤ 分块，但**块还没入库**（⑥⑦ 属 P0-1-19）⇒
-        // `chunkCount` 恒为 0、`chunks` 表一行也没有。于是 READY 的含义是
-        // "解析与分块都过了"，**仍不是"可检索"**（见 `stages.ts` 的 `chunkStage` 注释）。
-        '文档处理完成（解析 + 空文本检测 + 分块）',
+        // 八步齐全：解析 → 空文本检测 → 分块 → embedding → 入库。此刻的 `READY` 才是
+        // 真正的"可检索"（库里已有带向量的 chunk）；仍差的是**检索端点本身**（P0-1-20）
+        '文档处理完成（解析 + 空文本检测 + 分块 + 向量化 + 入库）',
       )
     } catch (error) {
       const message = describeFailure(error)

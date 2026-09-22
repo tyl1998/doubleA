@@ -43,10 +43,12 @@
  * H 组为什么"一半走 HTTP、一半走模块级"
  * ─────────────────────────────────────────────────────────────────────
  * 空文本检测把文档打成 `FAILED` + `error_msg` ⇒ **HTTP 层看得见**，所以走真上传 → 真 worker。
- * 而分块的产物本批**不落库**（`chunk_count` 恒为 0、`chunks` 表为空，见 `stages.ts` 的
- * `chunkStage` 注释）⇒ 没有任何响应能看到"切了几块"。于是用 `runStagesOnDocument()` 把
- * **存储里的真字节**再喂给同一条 `load-source → parse → detect-empty-text → chunk` ——
- * 不是桩、不是复制一份逻辑，只是换了个调用入口。这与 P0-1-16 处理"解析结果"的手法同源。
+ * 而"切了几块、边界落在哪"在 P0-1-18 时 HTTP 层看不到（那时块不落库），于是用
+ * `runStagesOnDocument()` 把**存储里的真字节**再喂给同一条阶段数组 —— 不是桩、不是复制一份逻辑，
+ * 只是换了个调用入口（与 P0-1-16 处理"解析结果"的手法同源）。
+ * ⚠️ P0-1-19 起 `chunks` 表有真数据了，"切了几块"其实也能从库里读到；这里**仍然**保留模块级
+ * 那一半，因为它顺带证明了另一件 HTTP 层看不到的事：**重跑一遍是"整次替换"而不是追加**
+ * （库里仍是 2 行，不是 4 行）。
 
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -54,8 +56,10 @@
  * ─────────────────────────────────────────────────────────────────────
  * · `PIPELINE_QUEUE_KEY=verify:pipeline:jobs:<随机>` —— **必须**换一条队列：本机 Redis 是共享的，
  *   若沿用默认键，跑着的 dev server（它也有 worker）会把本脚本投的 job 抢走，症状是"时好时坏"。
- * · `EMBEDDING_MODE=api` 三项 —— 建库要取 `EmbeddingProvider.name()` 快照（P0-1-14/15 定案）。
- *   URL 指向 `127.0.0.1:1`（永不会被访问：本批不触发 embedding，那是 P0-1-19）。
+ * · **假 embedding 上游**（`fixtures/embedding-upstream.mjs`，P0-1-19 起）—— ⑥ 会真的调用
+ *   embedding，而本机 `.env` 的三项为空。按第四档口径自己起一个真 HTTP 服务（不是桩函数），
+ *   于是"批大小对不对、上面接的是不是它"都能取证。⚠️ 必须在 import 后端模块**之前**设好地址
+ *   （配置在模块加载期只读一次）。
  * · `LOG_LEVEL=fatal` —— 本脚本会**故意**制造三处故障（F 组的对象丢失与对象被换、G 组的死 Redis），
  *   而 worker 对每次处理失败都会打一条带堆栈的 error。不收的话，十几行堆栈会把断言清单冲散
  *   （`06` P0-1-6 定案的"收敛脚本自身日志"）。要看细节：`LOG_LEVEL=debug pnpm verify:pipeline`。
@@ -67,14 +71,20 @@
 
 process.env.LOG_LEVEL ??= 'fatal'
 process.env.LOG_PRETTY ??= 'false'
-process.env.EMBEDDING_MODE = 'api'
-process.env.EMBEDDING_API_URL = 'http://127.0.0.1:1/v1'
-process.env.EMBEDDING_API_KEY = 'verify-pipeline-key'
-process.env.EMBEDDING_API_MODEL = 'verify-embed-model'
 process.env.PIPELINE_QUEUE_KEY = `verify:pipeline:jobs:${Math.random().toString(36).slice(2, 8)}`
 
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+
+// ⚠️ **顺序要紧**：P0-1-19 起流水线的 ⑥ 会真的调用 embedding（本机 .env 是 `EMBEDDING_MODE=api`
+//    且三项为空 ⇒ 不接上就所有"走到 READY"的用例全红）。故先起**假上游**、把地址写进环境变量，
+//    再 `await import` 后端模块 —— 配置在模块加载期只读一次，反了就白设。
+const { startFakeEmbeddingUpstream } = await import('./fixtures/embedding-upstream.mjs')
+const embeddingUpstream = await startFakeEmbeddingUpstream()
+process.env.EMBEDDING_MODE = 'api'
+process.env.EMBEDDING_API_URL = embeddingUpstream.url
+process.env.EMBEDDING_API_KEY = 'verify-pipeline-key'
+process.env.EMBEDDING_API_MODEL = 'verify-embed-model'
 
 const { buildApp } = await import('../dist/backend/src/app.js')
 const { config } = await import('../dist/backend/src/config.js')
@@ -621,14 +631,14 @@ try {
     assertEqual(isPipelineWorkerRunning(), false, '前置：本组之前 worker 未启动（否则任务会被立刻吃掉）')
   })
 
-  await it('启动 worker → 四篇全部 READY，error_msg 为空，chunk_count=0（本批的预期中间态）', async () => {
+  await it('启动 worker → 四篇全部 READY，error_msg 为空，chunk 真的入库了（P0-1-19 起八步齐全）', async () => {
     const started = startPipelineWorker()
     assertEqual(started.running, true, 'worker 已启动')
     assertEqual(started.concurrency, config.concurrency.pipeline, '并发上限取 PIPELINE_CONCURRENCY')
     assertEqual(
       JSON.stringify(started.stages),
-      JSON.stringify(['load-source', 'parse', 'detect-empty-text', 'chunk']),
-      '默认阶段序列（P0-1-18 起四步；⑥⑦ 属 P0-1-19）',
+      JSON.stringify(['load-source', 'parse', 'detect-empty-text', 'chunk', 'embed', 'index']),
+      '默认阶段序列（P0-1-19 起六步 = `子方案①` §三 的 ③~⑦）',
     )
 
     await waitFor(
@@ -643,11 +653,20 @@ try {
     for (const row of rows) {
       assertEqual(row.status, 'READY', `${row.fileName} 的状态`)
       assertEqual(row.errorMsg, null, `${row.fileName} 的 error_msg（成功路径必须是 null，不是空串）`)
-      // ⚠️ 刻意断言 0：P0-1-18 已经把块**切出来**了，但**没有落库**（⑥⑦ 属 P0-1-19）
-      //    ⇒ 此刻 READY 的含义是"解析与分块都过了"，**还不是**"可检索"
-      //    （见 `stages.ts` 的 `chunkStage` 注释：写 0 而不是块数是刻意的）。
-      assertEqual(row.chunkCount, 0, `${row.fileName} 的 chunk_count（P0-1-19 才填，这里是预期值）`)
+      // ⚠️ P0-1-19 起 `chunk_count` 是**入库后的真数**（P0-1-18 时它刻意停在 0）：
+      //    它必须与 `chunks` 表逐行一致 —— 这条相等就是"READY = 可检索"的定义
+      const stored = await prisma.chunk.count({ where: { docId: row.id } })
+      assert(stored >= 1, `${row.fileName} 应至少入库 1 个 chunk，实际 ${stored}`)
+      assertEqual(row.chunkCount, stored, `${row.fileName} 的 chunk_count 必须等于 chunks 表行数`)
     }
+
+    // 全量核对：**没有缺向量的行**。缺向量的 chunk 在检索里永远排不上号（`<=>` 对 NULL 是 NULL），
+    // 而界面上完全看不出来 —— 这是 ⑥ 与 ⑦ 之间最容易漏的一种半成品
+    const vectorless = await prisma.$queryRaw`
+      SELECT count(*)::int AS n FROM chunks
+      WHERE doc_id = ANY(${realDocIds}::uuid[]) AND embedding IS NULL
+    `
+    assertEqual(vectorless[0].n, 0, '不应存在没有向量的 chunk')
 
     const stats = getPipelineWorkerStats()
     assertEqual(stats.processed, 4, 'processed')
@@ -996,17 +1015,30 @@ try {
     },
   ])
 
-  await it('分块真跑（结构清晰 docx）：2 块、首块边界落在句末，且 `chunk_count` 仍为 0（本批只算不落库）', async () => {
+  await it('分块真跑（结构清晰 docx）：2 块、首块边界落在句末，且**重跑一遍是替换而不是追加**', async () => {
     const row = await docRow(longDocxId)
     assertEqual(row.status, 'READY', '状态')
-    assertEqual(row.chunkCount, 0, 'chunk_count 必须仍是 0（写了它就会"说有 2 块、检索却搜不到"）')
-    assertEqual(await prisma.chunk.count({ where: { docId: longDocxId } }), 0, 'chunks 表仍然为空')
+    // P0-1-19 起这一列是**入库后的真数**（P0-1-18 时它刻意停在 0，见该批的落地要点 11）
+    assertEqual(row.chunkCount, 2, 'chunk_count')
+    assertEqual(await prisma.chunk.count({ where: { docId: longDocxId } }), 2, 'chunks 表行数')
 
     const { ctx, error } = await runStagesOnDocument(longDocxId)
-    assertEqual(error, undefined, '这份文档应当走完四个阶段')
+    assertEqual(error, undefined, '这份文档应当走完六个阶段')
     const chunks = ctx.chunks ?? []
     assertEqual(chunks.length, 2, '按默认参数应切 2 块')
     assertEqual(chunks.map((chunk) => chunk.seq).join(','), '0,1', 'seq 连续且从 0 起')
+    assertEqual(ctx.chunkCount, 2, '重跑一遍写入的行数')
+    // ⚠️ 重跑是"整次替换"：库里仍是 2 行而不是 4 行 —— `§七` 的"无重复、无孤儿"在代码层面的定义
+    assertEqual(
+      await prisma.chunk.count({ where: { docId: longDocxId } }),
+      2,
+      '重跑一遍后库里仍是 2 行（先删后建，不是追加）',
+    )
+    assertEqual(
+      await prisma.document.findUnique({ where: { id: longDocxId }, select: { chunkCount: true } }).then((r) => r.chunkCount),
+      2,
+      'chunk_count 与 chunks 表仍然一致',
+    )
 
     const firstChars = [...chunks[0].content]
     assert(
@@ -1031,14 +1063,18 @@ try {
     }
   })
 
-  await it('分块真跑（200 字短通知）：**恰好 1 块**且与原文逐字相同（小文档特例）', async () => {
+  await it('分块真跑（200 字短通知）：**恰好 1 块**、与原文逐字相同，且入库 1 行', async () => {
     const notice = '通'.repeat(200)
     const [noticeId] = await uploadAndProcess(kb.id, adminCookie, [
       { bytes: Buffer.from(notice, 'utf8'), fileName: '短通知.txt', contentType: 'text/plain' },
     ])
 
+    const storedRow = await docRow(noticeId)
+    assertEqual(storedRow.chunkCount, 1, 'chunk_count（1 块）')
+    assertEqual(await prisma.chunk.count({ where: { docId: noticeId } }), 1, 'chunks 表 1 行')
+
     const { ctx, error } = await runStagesOnDocument(noticeId)
-    assertEqual(error, undefined, '这份文档应当走完四个阶段')
+    assertEqual(error, undefined, '这份文档应当走完六个阶段')
     const chunks = ctx.chunks ?? []
     assertEqual(chunks.length, 1, '200 字短通知应恰好 1 块（不被切开）')
     assertEqual(chunks[0].content, ctx.parsed.text, '单块内容应与解析出的原文逐字相同')
@@ -1103,6 +1139,7 @@ try {
   } catch (error) {
     console.log(`  ${c.r}清理过程出错：${error instanceof Error ? error.message : String(error)}${c.x}`)
   }
+  await embeddingUpstream.close().catch(() => undefined)
   await app.close()
   await closePrisma()
   await closeRedis()
@@ -1110,9 +1147,13 @@ try {
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ 文档流水线验收通过（P0-1-17 队列/状态机/worker + P0-1-18 空文本检测/分块）：${passed} 项全通过${c.x}`)
+  console.log(
+    `${c.g}${c.b}✅ 文档流水线验收通过（P0-1-17 队列/状态机/worker + P0-1-18 空文本检测/分块 + P0-1-19 入库）：${passed} 项全通过${c.x}`,
+  )
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ 文档流水线验收未通过（P0-1-17 + P0-1-18）：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(
+    `${c.r}${c.b}❌ 文档流水线验收未通过（P0-1-17 + P0-1-18 + P0-1-19）：${failed} 项失败 / ${passed} 项通过${c.x}`,
+  )
   process.exit(1)
 }

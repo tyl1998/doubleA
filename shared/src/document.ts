@@ -124,9 +124,67 @@ export const uploadDocumentResultSchema = z.object({
 })
 export type UploadDocumentResult = z.infer<typeof uploadDocumentResultSchema>
 
-/** 路径参数：`:id` = 知识库，`:docId` = 文档（后续 reupload/retry/delete/download 共用） */
+/** 路径参数：`:id` = 知识库，`:docId` = 文档（reupload/retry/delete/download 共用） */
 export const documentParamsSchema = z.object({
   id: z.string().uuid('知识库 ID 不是合法 UUID'),
   docId: z.string().uuid('文档 ID 不是合法 UUID'),
 })
 export type DocumentParams = z.infer<typeof documentParamsSchema>
+
+// ───────────────────────────── 覆盖重建 / 重试 / 删除（P0-1-19）─────────────────────────────
+
+/**
+ * 覆盖重建命中"内容没变"时的提示（`子方案①` §七 的原文）。
+ *
+ * 与 `LEGACY_DOC_HINT` 同款理由：**前端与后端共用同一句**，避免两边文案漂移 ——
+ * 这条提示是"用户的下一步动作"（要么别传了，要么去改内容），措辞漂了就会让人以为是两种问题。
+ * 用常量而不是把它塞进响应体的 `message` 字段：本仓的"文案→界面"一直走 shared 常量
+ * （`DEFAULT_MESSAGE_BY_ERROR_CODE` 是同一套路），响应体里放一段中文等于给文案开了第二个出口。
+ */
+export const REUPLOAD_UNCHANGED_HINT = '内容未变化，已跳过'
+
+/**
+ * `POST /api/knowledge-bases/:id/documents/:docId/reupload` 的响应。
+ *
+ * 与上传响应刻意用**不同的字段名**（`unchanged` vs `deduplicated`），因为两者回答的问题不同：
+ * · 上传的 `deduplicated`：库里**已有**同样内容 ⇒ 这次没有产生新文档（也是上传端点的判重分支）；
+ * · 重建的 `unchanged`：**这一篇文档**的内容没变 ⇒ 没触发流水线、没换对象、没动 chunk。
+ * 复用同一个字段名会让"传了个新文档但内容与另一个文档相同"与"重建时内容没改"混成一种形状。
+ *
+ * `unchanged=true` 时：**不落新 S3 对象、不删旧 chunk、不入队** —— 三个"没做"都是刻意的
+ * （`子方案①` §七："视为用户误操作，直接返回 200"）。"没做"的证据在验收里逐条取证。
+ */
+export const reuploadDocumentResultSchema = z.object({
+  document: documentItemSchema,
+  unchanged: z.boolean(),
+})
+export type ReuploadDocumentResult = z.infer<typeof reuploadDocumentResultSchema>
+
+/**
+ * `POST /api/knowledge-bases/:id/documents/:docId/retry` 的响应。
+ *
+ * 只回一条文档（`status` 必为 `PARSING`）：重试**不做**同步处理，只是重新入队 ——
+ * 与上传同款（`子方案①` §三 的"登记/入队"与"处理"分离）。
+ *
+ * ⚠️ 状态守卫在服务层：`READY`（没东西可重试）与 `PARSING`（已经在处理中）都返回 **409**
+ * 而不是"装作入队成功"—— 后者会让用户在界面上看到一个永远不动的"正在重试"。
+ */
+export const retryDocumentResultSchema = z.object({
+  document: documentItemSchema,
+})
+export type RetryDocumentResult = z.infer<typeof retryDocumentResultSchema>
+
+/**
+ * `DELETE /api/knowledge-bases/:id/documents/:docId` 的响应。
+ *
+ * 带上 `deletedChunks`：删除会连带清掉 chunk（外键 CASCADE）与 S3 原文件，
+ * 只回 `ok` 会让调用方无从给一个有信息量的提示（与删库回 `deletedDocuments` 同款口径）。
+ */
+export const removeDocumentResultSchema = z.object({
+  id: z.string(),
+  fileName: z.string(),
+  /** 连带删除的 chunk 数（DB 侧 CASCADE 的结果，删前先数） */
+  deletedChunks: z.number().int().min(0),
+})
+export type RemoveDocumentResult = z.infer<typeof removeDocumentResultSchema>
+
