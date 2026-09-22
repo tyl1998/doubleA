@@ -6,7 +6,7 @@
  * 以及四个解析器（pdf/docx/md/txt）产出的 `text` + `meta`（页码 / 标题路径）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 分五组，各自守一件容易做错的事
+ * 分七组，各自守一件容易做错的事
  * ─────────────────────────────────────────────────────────────────────
  * A 组 **纯函数**：`detectFormat` 的判定矩阵（不需要服务、不占端口）——
  *    "改名绕过"能不能抓住，全看这一组；只做 HTTP 用例会漏掉"某个组合没人试过"。
@@ -17,7 +17,13 @@
  *    所以"解析对不对"只能在这一组验 —— 想在上传响应里等出 `READY` 是 P0-1-17 起的事。
  * D 组 **落库与存储取证**：`documents` 行（状态/`content_hash`/`file_key` 形状）+ S3 对象
  *    逐字节比对 + 同内容判重（同库命中、跨库不命中）+ 中文文件名 + MEMBER 权限。
- * E 组 **自清理 + 残留复核**：删库走 API，断言 DB 与 S3 两侧都回到基线。
+ * E 组 **上传即入队**：新建一条文档就多一条任务、判重命中不重复投（P0-1-17）。
+ * F 组 **列表**（P0-1-21）：分页三件套、**最新在前**的排序、键集合与上传响应同一套投影、
+ *    跨库不串、以及"`PARSING` = 更新中，暂不参与检索"这条**用户可见的**判据与文案。
+ * G 组 **下载**（P0-1-21）：字节逐字相等、`Content-Type` 按扩展名唯一确定、
+ *    `Content-Disposition` 的 RFC 6266 双写（中文名靠 `filename*` 还原）、
+ *    对象丢失 → 404 且**不动数据库**、幽灵/跨库/未登录一律拒绝。
+ * H 组 **自清理 + 残留复核**：删库走 API，断言 DB 与 S3 两侧都回到基线。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三处注入的"小值/特征值"，都是为了让断言有真假之分
@@ -64,7 +70,13 @@ const { detectFormat, parseDocument, countChars } = await import(
 const { pipelineQueueDepth, pipelineQueueKey } = await import(
   '../dist/backend/src/pipeline/queue.js'
 )
-const { documentItemSchema, uploadDocumentResultSchema } = await import('@doubulea/shared')
+const {
+  DOCUMENT_PARSING_HINT,
+  documentItemSchema,
+  documentListResultSchema,
+  isDocumentSearchable,
+  uploadDocumentResultSchema,
+} = await import('@doubulea/shared')
 const { createHash } = await import('node:crypto')
 const fixtures = await import('./fixtures/documents.mjs')
 
@@ -744,9 +756,250 @@ try {
   })
 
   // ═══════════════════════════════════════════════════════════════════
-  // F 组 · 自清理 + 残留复核
+  // F 组 · 文档列表（P0-1-21）：流水线进度的可视出口
   // ═══════════════════════════════════════════════════════════════════
-  console.log(`\n${c.b}── F 组 · 删库后 DB 与 S3 两侧都回到基线 ──${c.x}`)
+  console.log(`\n${c.b}── F 组 · 列表端点（分页 / 排序 / 投影 / 三态提示）──${c.x}`)
+
+  /** 列表请求（唯一入口：返回 `{response, data}`，`data` 只在 200 时解析） */
+  async function listDocs(kbId, { cookie, query, expectStatus = 200 } = {}) {
+    const suffixQuery = query === undefined ? '' : `?${new URLSearchParams(query)}`
+    const response = await api('GET', `/api/knowledge-bases/${kbId}/documents${suffixQuery}`, { cookie })
+    assertEqual(response.statusCode, expectStatus, `列表（${suffixQuery || '无参'}）的状态码`)
+    if (expectStatus !== 200) return { response }
+    return { response, data: documentListResultSchema.parse(response.json().data) }
+  }
+
+  /** 本组要用的"最新一篇"（排序断言用它做锚点） */
+  const newestName = `最新一篇-${suffix}.md`
+  const newestBytes = Buffer.from(`最新一篇的内容 ${suffix}：用于验列表排序。\n`, 'utf8')
+  await upload(kb.id, { cookie: adminCookie, bytes: newestBytes, fileName: newestName, contentType: 'text/markdown' })
+
+  await it('未登录 401 / 非法 UUID 400 / **库不存在 404（不是空列表）**', async () => {
+    const anonymous = await api('GET', `/api/knowledge-bases/${kb.id}/documents`)
+    assertEqual(anonymous.statusCode, 401, '未登录')
+
+    const badId = await api('GET', '/api/knowledge-bases/not-a-uuid/documents', { cookie: adminCookie })
+    assertEqual(badId.statusCode, 400, '非法知识库 id')
+
+    // ⚠️ "这个库不存在"与"这个库里没有文档"必须分得开：前者该跳回列表页，后者该显示上传引导
+    const ghost = await listDocs('0198f0aa-9999-7000-8000-0000000000ff', {
+      cookie: adminCookie,
+      expectStatus: 404,
+    })
+    assertIncludes(ghost.response.json().msg, '知识库不存在', '幽灵库的文案')
+  })
+
+  await it('响应形态：三项分页字段 + 每项与上传响应**同一套投影**（键集合逐字对照）', async () => {
+    const { data } = await listDocs(kb.id, { cookie: adminCookie })
+    // 键集合自检：列表不能悄悄多出/少掉字段（同一份数据在多个出口形状不同，是前端最容易踩的坑）
+    assertEqual(
+      Object.keys(data.items[0]).sort().join(','),
+      Object.keys(documentItemSchema.shape).sort().join(','),
+      '列表项的键集合应与 documentItemSchema 一致',
+    )
+    assertEqual(typeof data.total, 'number', 'total')
+    assertEqual(data.offset, 0, 'offset 回显默认值')
+    assertEqual(data.limit, 20, 'limit 回显默认值')
+    assert(data.total >= 6, `前置：本库应有多篇文档，实际 total=${data.total}`)
+    assertEqual(data.items.length, Math.min(20, data.total), '第一页的条数 = min(limit, total)')
+    for (const item of data.items) {
+      assertEqual(item.kbId, kb.id, '只应列出本库的文档')
+      assertEqual(item.status, 'PARSING', '⚠️ 本脚本不启动 worker ⇒ 所有文档都停在 PARSING（下面据此验"更新中"）')
+      assertEqual(item.chunkCount, 0, 'PARSING 期间 chunk 数就是 0（`schema.prisma` 的注释口径）')
+      assertEqual(item.errorMsg, null, 'PARSING 没有失败原因')
+    }
+  })
+
+  await it('排序：`createdAt desc`（**最新上传的在第一条**，与其余三个列表相反的理由见服务层注释）', async () => {
+    const { data } = await listDocs(kb.id, { cookie: adminCookie })
+    assertEqual(data.items[0].fileName, newestName, '刚上传的那一篇必须在第一条（否则用户以为上传没成功）')
+    const times = data.items.map((item) => Date.parse(item.createdAt))
+    for (let index = 1; index < times.length; index += 1) {
+      assert(
+        times[index - 1] >= times[index],
+        `应按创建时间降序：第 ${index} 条 ${data.items[index - 1].createdAt} < 第 ${index + 1} 条 ${data.items[index].createdAt}`,
+      )
+    }
+  })
+
+  await it('分页边界：`limit=2` / 末页 / `offset` 越界（空 items 但 total 不变）', async () => {
+    const first = await listDocs(kb.id, { cookie: adminCookie, query: { limit: 2 } })
+    assertEqual(first.data.items.length, 2, 'limit=2 的条数')
+    assertEqual(first.data.limit, 2, 'limit 回显')
+
+    const second = await listDocs(kb.id, { cookie: adminCookie, query: { limit: 2, offset: 2 } })
+    assertEqual(second.data.items.length, 2, '第二页条数')
+    assert(
+      first.data.items.every((item) => !second.data.items.some((other) => other.id === item.id)),
+      '两页之间不应有重复项',
+    )
+
+    const beyond = await listDocs(kb.id, { cookie: adminCookie, query: { offset: first.data.total + 5 } })
+    assertEqual(beyond.data.items.length, 0, '越界应返回空页')
+    assertEqual(beyond.data.total, first.data.total, 'total 不随 offset 变')
+
+    const tooBig = await listDocs(kb.id, { cookie: adminCookie, query: { limit: 101 }, expectStatus: 400 })
+    assertEqual(tooBig.response.statusCode, 400, 'limit 上限 100（与其余列表同口径）')
+  })
+
+  await it('只列本库：另一个库里的文档不会串进来', async () => {
+    // ⚠️ `otherKb` 里**已经有** D 组留下的文档（"跨库同内容不判重"那条），所以这里不能断言
+    //    "另一个库恰好 1 篇" —— 断言要写成本用例真正想验的东西：**同一个文件名只出现在它自己的库**
+    const otherDoc = await upload(otherKb.id, {
+      cookie: adminCookie,
+      bytes: Buffer.from(`另一个库的文档 ${suffix}\n`, 'utf8'),
+      fileName: '另一个库.md',
+      contentType: 'text/markdown',
+    })
+    assertEqual(otherDoc.statusCode, 200, '往另一个库传一篇')
+
+    const { data } = await listDocs(kb.id, { cookie: adminCookie, query: { limit: 100 } })
+    assertEqual(data.total, data.items.length, '前置：limit=100 时本页应覆盖全部（下面才能断言"没串进来"）')
+    assert(
+      data.items.every((item) => item.fileName !== '另一个库.md'),
+      '本库列表里不该出现另一个库的文档',
+    )
+
+    const other = await listDocs(otherKb.id, { cookie: adminCookie, query: { limit: 100 } })
+    assert(
+      other.data.items.some((item) => item.fileName === '另一个库.md'),
+      '它应当出现在**它自己的**库的列表里（否则上面那条"不串库"可能只是"两边都没列出来"）',
+    )
+  })
+
+  await it('三态提示：`PARSING` 靠 shared 的判据与文案显式说明"暂不参与检索"', async () => {
+    // 这条是 `06` P0-1-19 坑预判里"必须做"的那件事的可断言形态：
+    // `§七` 的"先删后建"有一段检索空窗（chunk 数为 0、检索自然返回不了它、**不报错**），
+    // 界面不提示的话用户会认为是 bug。判据与文案都放在 shared，前后端各写一遍必然漂。
+    assertEqual(DOCUMENT_PARSING_HINT, '更新中，暂不参与检索', '提示文案（前后端共用同一句）')
+    assertEqual(isDocumentSearchable('READY'), true, 'READY ⟺ 可检索')
+    assertEqual(isDocumentSearchable('PARSING'), false, 'PARSING 不可检索（还在处理）')
+    assertEqual(isDocumentSearchable('FAILED'), false, 'FAILED 不可检索（要人介入）')
+
+    const { data } = await listDocs(kb.id, { cookie: adminCookie })
+    for (const item of data.items) {
+      assertEqual(
+        isDocumentSearchable(item.status),
+        false,
+        `本脚本里的文档都应处于"不可检索"态（${item.fileName} 是 ${item.status}）`,
+      )
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════
+  // G 组 · 下载原始文件（P0-1-21）：字节流 + 两个头
+  // ═══════════════════════════════════════════════════════════════════
+  console.log(`\n${c.b}── G 组 · 下载端点（字节逐字相等 / Content-Type / Content-Disposition）──${c.x}`)
+
+  /** 下载（返回原始响应；`rawPayload` 是字节） */
+  function download(kbId, docId, { cookie } = {}) {
+    return api('GET', `/api/knowledge-bases/${kbId}/documents/${docId}/download`, { cookie })
+  }
+
+  /** 从 `Content-Disposition` 里取 `filename*=UTF-8''...` 解码后的原名 */
+  function dispositionName(header) {
+    const matched = /filename\*=UTF-8''([^;]+)/u.exec(header ?? '')
+    return matched === null ? null : decodeURIComponent(matched[1])
+  }
+
+  const downloadCase = `下载-中文名-${suffix}.txt`
+  const downloadBytes = Buffer.from(
+    `下载用例（${suffix}）：这一段正文要逐字节比对，包含中文、emoji 😀 与换行。\n第二行。\n`,
+    'utf8',
+  )
+  const downloadDoc = await upload(kb.id, {
+    cookie: adminCookie,
+    bytes: downloadBytes,
+    fileName: downloadCase,
+    contentType: 'text/plain',
+  })
+  const downloadDocId = uploadDocumentResultSchema.parse(downloadDoc.json().data).document.id
+
+  await it('下载到的**字节与上传的逐字相等**（不是"长度像"也不是"能打开"）', async () => {
+    const response = await download(kb.id, downloadDocId, { cookie: adminCookie })
+    assertEqual(response.statusCode, 200, '下载状态码')
+    assertEqual(Buffer.compare(response.rawPayload, downloadBytes), 0, '字节应逐字相等')
+    assertEqual(response.headers['content-length'], String(downloadBytes.length), 'Content-Length')
+  })
+
+  await it('`Content-Type` 按扩展名唯一确定：txt 带 charset，pdf 不带（口径表刻意与上传白名单分开）', async () => {
+    const text = await download(kb.id, downloadDocId, { cookie: adminCookie })
+    assertEqual(text.headers['content-type'], 'text/plain; charset=utf-8', 'txt 的 Content-Type')
+
+    const pdfDoc = await upload(kb.id, {
+      cookie: adminCookie,
+      bytes: PDF,
+      fileName: `下载-${suffix}.pdf`,
+      contentType: 'application/pdf',
+    })
+    const pdfDocId = uploadDocumentResultSchema.parse(pdfDoc.json().data).document.id
+    const pdf = await download(kb.id, pdfDocId, { cookie: adminCookie })
+    assertEqual(pdf.headers['content-type'], 'application/pdf', 'pdf 的 Content-Type')
+    assertEqual(Buffer.compare(pdf.rawPayload, PDF), 0, 'pdf 也逐字节相等（二进制不吃文本编码）')
+  })
+
+  await it('`Content-Disposition`：RFC 6266 双写 —— ASCII 回落 + `filename*` 还原中文原名', async () => {
+    const response = await download(kb.id, downloadDocId, { cookie: adminCookie })
+    const header = response.headers['content-disposition']
+    assertIncludes(header, 'attachment;', '必须是"另存为"而不是内联预览')
+    assertIncludes(header, 'filename="', '必须有 ASCII 回落（老客户端只认它）')
+    assertEqual(dispositionName(header), downloadCase, '`filename*` 解码后应还原原始中文名')
+    // 回落名里不该出现非 ASCII（它不是用来显示中文的，真名在 filename* 里）
+    const ascii = /filename="([^"]*)"/u.exec(header)?.[1] ?? ''
+    assert(/^[\u0020-\u007e]*$/u.test(ascii), `ASCII 回落不应含非 ASCII：${ascii}`)
+    assert(ascii.includes('_'), `非 ASCII 字符应被替换成 _：${ascii}`)
+  })
+
+  await it('对象丢失（行还在、存储里没了）→ 404 且**文案指向"重新上传"**', async () => {
+    const row = await prisma.document.findUnique({ where: { id: downloadDocId } })
+    assert(row !== null, '前置：文档行存在')
+    await s3.removeObject(bucket, row.fileKey)
+
+    const response = await download(kb.id, downloadDocId, { cookie: adminCookie })
+    assertEqual(response.statusCode, 404, '对象没了应是 404（而不是 500 或断流）')
+    assertIncludes(response.json().msg, '原始文件已不在存储中', '文案要说明是"文件丢了"而不是"文档不存在"')
+    assertEqual(
+      await prisma.document.count({ where: { id: downloadDocId } }),
+      1,
+      '⚠️ 下载失败**不该**动数据库（行仍在，用户可以重新上传）',
+    )
+  })
+
+  await it('幽灵 docId / **跨库** docId / 未登录 一律拒绝（不泄露"别的库里有什么"）', async () => {
+    const ghost = await download(kb.id, '0198f0aa-9999-7000-8000-0000000000ee', { cookie: adminCookie })
+    assertEqual(ghost.statusCode, 404, '不存在的文档')
+    assertIncludes(ghost.json().msg, '文档不存在', '文案')
+
+    const newestId = (await listDocs(kb.id, { cookie: adminCookie })).data.items[0].id
+    const cross = await download(otherKb.id, newestId, { cookie: adminCookie })
+    assertEqual(cross.statusCode, 404, '用别的库的 id 取这篇文档')
+
+    const anonymous = await download(kb.id, newestId)
+    assertEqual(anonymous.statusCode, 401, '未登录')
+  })
+
+  await it('**MEMBER 能下载与列表**（权限=登录即可，用最低权限账号守门）', async () => {
+    // 复用本脚本开头建的 MEMBER 会话：守门断言的写法见 `06` 的施工纪律 ——
+    // 用"恰好够用的角色"跑通，而不是用 ADMIN（ADMIN 在"误加了 requireAdmin"的实现上**依然通过**）
+    const listed = await listDocs(kb.id, { cookie: memberCookie })
+    assert(listed.data.items.length > 0, 'MEMBER 应能列出文档')
+
+    const target = await upload(kb.id, {
+      cookie: memberCookie,
+      bytes: Buffer.from(`成员下载用例 ${suffix}\n`, 'utf8'),
+      fileName: '成员下载.md',
+      contentType: 'text/markdown',
+    })
+    const targetId = uploadDocumentResultSchema.parse(target.json().data).document.id
+    const fetched = await download(kb.id, targetId, { cookie: memberCookie })
+    assertEqual(fetched.statusCode, 200, 'MEMBER 应能下载')
+    assert(fetched.rawPayload.length > 0, '下载内容不应为空')
+  })
+
+  // ═══════════════════════════════════════════════════════════════════
+  // H 组 · 自清理 + 残留复核
+  // ═══════════════════════════════════════════════════════════════════
+  console.log(`\n${c.b}── H 组 · 删库后 DB 与 S3 两侧都回到基线 ──${c.x}`)
 
   await it('删库（走 API）→ 该库的 documents 行与 S3 对象全部消失', async () => {
     const keyPrefix = `kb/${kb.id}/`
@@ -833,9 +1086,11 @@ try {
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-1-16 文档上传 + 四格式解析验收通过：${passed} 项全通过${c.x}`)
+  console.log(
+    `${c.g}${c.b}✅ 文档端点验收通过（P0-1-16 上传/解析/前置校验 + P0-1-17 入队 + P0-1-21 列表/下载）：${passed} 项全通过${c.x}`,
+  )
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-1-16 文档上传 + 四格式解析验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ 文档端点验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }

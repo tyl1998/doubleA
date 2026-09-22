@@ -84,13 +84,13 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
 pnpm -r typecheck      # tsc strict（三包）
 pnpm -r build          # 三包依次产出 dist
-pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（72 项）
+pnpm verify:app        # 接口级验收：用 app.inject 打请求，**不占端口、不启 docker**（79 项）
 pnpm verify:embedding  # embedding 双模式验收：真 HTTP 假上游 + stub 推理运行时，**不占端口、不启 docker**（27 项）
 pnpm verify:db         # 数据层验收：库结构 + Prisma 客户端，**需要真实 PG**（17 项）
 pnpm verify:session    # 会话验收：Cookie/Redis 会话/停用即失效，**需要真实 PG + Redis**（13 项）
@@ -102,10 +102,11 @@ pnpm verify:models     # 模型管理验收：两套投影/可选列表过滤/�
 pnpm verify:llm        # LLM client 验收：起真 HTTP 假上游，报文/流式边界/超时中断/上游模型列表，**需要真实 PG + Redis**（22 项）
 pnpm verify:knowledge  # 知识库数据层验收：扩展/算子类/两条特殊索引/migrate diff 无漂移/EXPLAIN 命中，**只需真实 PG**（23 项）
 pnpm verify:knowledge-bases  # 知识库 CRUD 验收：建库快照/局部合并/级联+S3/全员权限，**需要真实 PG + Redis + MinIO**（19 项）
-pnpm verify:documents  # 文档上传验收：四道前置校验/文件头魔数/四格式解析/上传即入队/按库判重/删库双清，**需要真实 PG + Redis + MinIO**（32 项）
+pnpm verify:documents  # 文档端点验收：四道前置校验/文件头魔数/四格式解析/上传即入队/按库判重/**列表分页与排序/下载字节流与两个头**，**需要真实 PG + Redis + MinIO**（44 项）
 pnpm verify:pipeline   # 流水线验收：队列语义/状态机/幂等四道/并发闸门/失败可重试/入队原子性/扫描件与分块，**需要真实 PG + Redis + MinIO**（29 项）
 pnpm verify:ingest     # 入库验收：真 embedding（假上游）/chunk 落库与向量/id 版本位/覆盖重建/内容未变化/失败重试/删除文档，**需要真实 PG + Redis + MinIO**（23 项）
 pnpm verify:retrieval  # 检索验收：三模式/六列分数/**与独立 SQL 逐条等价**/RRF 数值反算/引用片段三分支/阈值与候选池/降级路径，**需要真实 PG + Redis + MinIO**（27 项）
+pnpm verify:kb-package # **包级验收**：逐行跑 `子方案①` §十二 的 8 行（CRUD/四格式/扫描件/重试/重建/检索/引用/性能），**需要真实 PG + Redis + MinIO**（11 项）
 pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的批次号 vs `index.ts` 启动信封的 step（不一致即 exit 1）
 ```
 
@@ -134,7 +135,7 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 >
 > `pnpm verify:session` / `verify:auth` / `verify:users` / `verify:e2e` / `verify:model-providers`
 > / `verify:models` / `verify:llm` / `verify:knowledge-bases` / `verify:documents` / `verify:pipeline`
-> / `verify:ingest` / `verify:retrieval` 是**必须**先起依赖 + 迁移的**十二档**
+> / `verify:ingest` / `verify:retrieval` / `verify:kb-package` 是**必须**先起依赖 + 迁移的**十三档**
 > （`pnpm infra:up && pnpm db:deploy`），因为验的正是"真实 Redis/PG 上的行为"：
 > 会话基础设施（Cookie 属性、`session:{sid}` 的 TTL 与滑动续期、停用/删号失效路径）；
 > 四个认证端点（含**登录限速第 6 次 429**、**首登强制改密闸门 403**、以及
@@ -198,6 +199,21 @@ pnpm check:batch       # 批次标识自检：`docs/06` 最后一个 `[✓]` 的
 > （模型变更 ⇒ `HYBRID` 跳向量路 + 告警 / `VECTOR` 409；embedding 未就绪 ⇒ 同样降级 / `VECTOR` 500，
 > 用**子进程注入空配置**验）；另加 D 组权限（MEMBER 可检索）与 E 组清场。
 > 性能一条：`elapsedMs` 与墙钟都要求 < 500ms（本机实测 3ms / 4ms）。
+>
+> `pnpm verify:documents` 的 **F 组（列表）与 G 组（下载）** 是 P0-1-21 补的：F 组验分页三件套、
+> **`createdAt desc` 的"最新在前"**（刚上传的那篇必须在第一条）、列表项与上传响应**同一套投影**（键集合
+> 逐字对照）、跨库不串、以及"`PARSING` = 更新中，暂不参与检索"这条**用户可见**的判据；G 组验
+> **下载字节与上传逐字节相等**、`Content-Type` 按扩展名唯一确定、`Content-Disposition` 能还原中文名、
+> **对象丢失 → 404 且不动数据库**、幽灵/跨库 docId 与未登录一律拒绝，并用 **MEMBER** 账号守门。
+> `verify:app` 的第 23 节则把两条规则做成**纯函数断言**（`Content-Disposition` 的双写与**头注入防护**、
+> 下载类型表与上传白名单的跨表一致性）—— 那些错误不会让接口 400，只会让下载下来的名字乱码。
+>
+> `pnpm verify:kb-package` 是 **P0-1-21 的包级验收**：**一行一组**逐行跑 `子方案①` §十二 的 8 行
+> （R1 CRUD 级联删 / R2 四格式 READY + 扫描件 FAILED + `.doc` 拦截 / R3 FAILED→retry→READY /
+> R4 覆盖重建 + **用真检索端点验"只返回 v2"**（新词命中、旧词查不到）/ R5 双路得分 + 融合排名 /
+> R6 片段 ⊆ 原文 / R7 性能 / R8 `FULLTEXT` 单跑非空），每行打印结论。它**不重复**各档的细粒度断言，
+> 只跑"串起来之后还成不成立"的证据。
+
 >
 > `pnpm verify:ingest` 是 **P0-1-19** 的入库验收（需要 PG + Redis + **MinIO**，同样自起**假 embedding 上游**）。
 > 七组用例：① **A 组·入库** —— `chunk_count` 与 `chunks` 表**逐行一致**、每行都有向量、维度 1024、
@@ -588,6 +604,28 @@ pnpm verify:retrieval
 #    它额外钉死两件事：**两条路的名次/分数与独立 SQL 逐条相等**（证明分数不是编出来的）、
 #    **RRF 的数值可以用返回的两路名次反算出来**（证明融合就是那个公式）。
 
+# ⑬ 文档列表 / 下载原始文件（P0-1-21）—— 流水线进度的可视出口 + 取回原件核对
+curl -sS --noproxy '*' -b "$COOKIE" \
+  "http://127.0.0.1:13000/api/knowledge-bases/$KB/documents?limit=20" \
+  | jq '.data | {total, items: [.items[] | {fileName, status, chunkCount}]}'
+#  → {total, items:[{fileName,status,chunkCount},…]}：每篇的状态一眼可见
+#    · `PARSING` 必须显示「更新中，暂不参与检索」（shared 的 `DOCUMENT_PARSING_HINT`）——
+#      `§七` 的"先删后建"有一段检索空窗，这期间搜不到它**不是 bug**；
+#    · **最新上传的在第一条**（排序 `createdAt desc`，与 `/api/users` 等相反，理由见 `docs/02` §4.6）；
+#    · 库不存在 → 404（不是空列表）；`limit` 上限 100。
+
+curl -sS --noproxy '*' -b "$COOKIE" -D /tmp/dl-headers -o /tmp/orig.txt \
+  "http://127.0.0.1:13000/api/knowledge-bases/$KB/documents/$DOC/download"
+grep -iE 'content-type|content-length|content-disposition' /tmp/dl-headers
+#  → content-type: text/plain; charset=utf-8（按扩展名唯一确定，文本类型带 charset）
+#    content-disposition: attachment; filename="…"; filename*=UTF-8''%E6%8A%A5%E9%94%80…（中文名靠后一段）
+#    ✅ 取回来的字节与上传的**逐字节相等**（`cmp -s /tmp/orig.txt <你上传的文件>`）
+#  → 行还在但对象丢了（存储被清）→ 404「原始文件已不在存储中…请重新上传」（**不是** 500、也不动数据库）
+#  ⚠️ 这是本仓唯一**不返回 JSON 信封**的端点：成功时是字节流，失败时才是信封 —— 客户端要按状态码分支。
+
+pnpm verify:kb-package
+#  → 11 项全通过（包 D 收口）：一行一组逐行跑 `子方案①` §十二 的 8 行，每行打印结论。
+
 pnpm verify:pipeline
 #  → 29 项全通过（需要 PG + Redis + MinIO）。它用**随机队列键**（`verify:pipeline:jobs:<rand>`）
 #    跑，不碰你开发队列里的任务，收尾会删掉该键并断言残留为零。
@@ -611,8 +649,13 @@ pnpm verify:ingest
 的 A/C/D 组真跑四个夹具文件）；`.doc` 是刻意拒收（提示另存为 `.docx`），不是没做完；
 **异步流水线专项边界（P0-1-17 起；P0-1-18 补 ④⑤、P0-1-19 补 ⑥⑦）**：八步齐全后 `READY` 的语义
 才是**"可检索"**（`chunks` 表有这篇的行、每行都有向量、`chunk_count` 与之一致）；
-**检索有端点了（P0-1-20 的 `POST .../search`），"文档列表/下载"还没有（P0-1-21）**
-⇒ 建了哪些文档、每篇什么状态，仍然只能查库（`chunk_count` 是真数，`psql` 一眼能看出入库了几块）；
+**检索（P0-1-20）与列表/下载（P0-1-21）都已落地** ⇒ 建了哪些文档、每篇什么状态、内容对不对，
+用 ⑫⑬ 的 curl 就能全程看清，不必再查库（`psql` 仍是排查时的旁证）；
+**列表/下载专项边界（P0-1-21）**：排序是 `createdAt desc`（**最新在前**，与 `/api/users` 等相反）；
+**库不存在回 404 而不是空列表**（"库没了"与"库里没文档"是两件事）；
+**下载成功时不是 JSON**（是字节流，失败才是信封），`Content-Type` 按扩展名唯一确定、
+`Content-Disposition` 用 RFC 5986/5987 双写（中文名靠 `filename*`）；
+**"行还在但对象丢了"是 404 + 另一句文案**且不动数据库 —— 遇到它请重新上传该文档；
 **检索专项边界（P0-1-20）**：
 · **全文路只适合短查询** —— 它是 `content LIKE '%词%'` 的**字面子串**匹配，自然语言长问句（哪怕截断到
 64 字符）几乎不可能连续出现在正文里，`mode=FULLTEXT` 因此可能返回空。**这是预期行为**（长问句请用
@@ -713,6 +756,7 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-17-异步队列+状态机+worker骨架.md` | **「List 队列没有 ack」是本批全部设计的起点**：`BRPOP` **取出即消失**，worker 崩在中途任务就永久丢失 ⇒ 可靠性落点不在"不丢"，而在"**幂等**（重复投递无害）+ **可重放**（状态机允许 `FAILED`/`PARSING → PARSING`）"。另有：**`BRPOP` 独占整条 Redis 连接** ⇒ 队列空时阻塞读会把会话与健康检查一起钉住，必须走 `createRedisConnection()` 的**专用连接**，且关闭用 `disconnect()` 而非 `quit()`（`quit` 要等挂起的 `BRPOP` 返回，优雅退出会白等满 5s）；**幂等是四道不是一道**（在途去重 / 文档已删 / `contentHash` 不匹配 / 已是 `READY`），四道全命中时必须**一个字节都不写** ⇒ 断言方式是 **`updated_at` 不变**（"没写"看得见，而"写了但值相同"会被漏掉）；**状态迁移写成 CAS**（`updateMany({ where: { id, status: from } })`）⇒ 靠"影响行数"分辨而不是"先查再写"（后者在两个 worker 都读到旧态时会把违法的迁移写进去），非法迁移**只 `warn` 不写**；**`READY → FAILED` 刻意非法**（陈旧的队列任务会把一份已就绪的文档改写坏）、**`FAILED → READY` 刻意非法**（重试必须经过可见的 `PARSING`，否则列表里看不出"正在重试"）；**上传即入队的原子性**（入队失败要连 DB 行带 S3 对象一起回滚，否则文档永远卡 `PARSING` 且没人消费）—— 取证靠**子进程 A/B 控制**（`REDIS_URL=redis://127.0.0.1:1` 的子进程**必须失败且回滚**；真 Redis 的子进程**必须成功**）而不是把父进程的连接打断；**worker 生命周期挂 `index.ts` 而非 `buildApp()`**（否则 `app.inject` 那套接口级验收会被迫连 Redis）；**队列键可配**（`PIPELINE_QUEUE_KEY`）⇒ 共享 Redis 上隔离消费方，验收脚本因此不碰开发队列；**并发闸门要同时测峰值与总耗时**（只测"峰值 ≤ 2"的实现，把它写成串行也能过） |
 | `issue_fix/问题记录-P0-1-18-空文本检测+分块.md` | **本批的两个真问题都不在坑预判里**：① **PDF 夹具的单行文本必须折行** —— 单条超长 `Tj` 会超出 `MediaBox`（612pt），而 pdf.js **只提取页面框内的文本** ⇒ 内容被**静默截断**（实测 561 字的单行只析出 85 字、且截在半个单词上），拿它去断言"分块边界/阈值"会得到假数据（不是实现问题，但会让人查错地方）；② **新增的空文本门槛把两处旧夹具"判死"了** —— P0-1-17 留下的 `verify-pipeline` 夹具（docx 20 字、txt 29 字、F 组 PDF 43 字）在 50 字阈值下会被判「疑似扫描件」，让"四篇全 READY"和"重投救回"**假失败**（这是**刻意的行为变化**，不是回归；处置是把夹具写长并在此留档，否则下一个人会以为夹具本来就该这么长）。**分块上最容易静默做错的四条**：切片的单位必须是**码点**（`text.slice()` 会**劈开代理对**，产出非法字符串且**本层毫无报错**，下游 embedding 才炸 ⇒ 全流程建在 `[...text]` 上，验收用 600 个 emoji 逐码点断言）；Section 必须按"**连续**同名标题"切（按 `headingPath` 分组会让 chunk **顺序与原文不一致**，而这在检索层几乎发现不了 —— 片段读起来通顺、只是位置不对）；**每块必须是原文的逐字子串**（重叠取前块尾部而不是新造句子，这是 P0-1-20"引用与原文一致"的前提）；**页码 meta 取"块起点所在段"**（一个 Section 可能跨页 PDF，"整块用 Section 首页"会把页码全说成第 1 页）。**另一处刻意的实现-文档偏离**：`ChunkStrategy.split` 收 `ParseResult` 而不是 `(text, meta)` —— 标题层级只在 `blocks` 里，只给 `text` 会让 hybrid 退化成 fixed。**口径定案**：`chunk_min`（50）是**代码常量**（§十一 的配置表里没有它，加环境变量属于自己发明契约）；空文本检测失败文案里的数字**取实测阈值**（写死 50 会让管理员调阈值后用户按错数字重传）；判据是 `<` 而**恰好等于阈值通过**（验收用例按**当前阈值**生成）；**④ 必须排在 ⑤ 之前**，用产物的缺席取证（`ctx.chunks === undefined` 而 `ctx.parsed !== undefined`）。**⚠️ 本批只"算"不"存"**：`chunk_count` 刻意仍是 0（`schema.prisma` 对它的定义是"**已入库**的 chunk 数"，提前写会造出"说有 N 块却搜不到"的假象，P0-1-19 还得回头改） |
 | `issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` | **本批跑出来的两个"假失败"其实都是断言自己写错**：① `VECTOR` 用例里写了"每条的 `vectorScore > 0`"，而**正交向量的余弦相似度恰好是 0**（合法取值）⇒ 改成"含关键词的那一块必须**严格更近**"（这才是想验的东西）；② "长 query 截断到 64 字符后仍应命中"的**前提本身是错的** —— 截断只保证 LIKE 的模式不长，**不保证**那 64 个字符连续出现在正文里（自然语言问句几乎必然不连续）⇒ 改成"从原文里取 64 字子串当 query + 加长后缀"，并用一次**不截断的独立 SQL 复算**证明"命中只能来自那次截断"。**真问题与设计订正**：③ **RRF 示例数值文档写错了**（0.0323 → 实测 **0.0320**）⇒ 已订正并写成断言（文档与代码从此互为守门）；④ **`§6-1` 的"去停用词"必须收窄**（只剥句首/句尾的提问脚手架）—— LIKE 要连续子串，删掉中间的"的"会把"报销的标准"变成"报销标准"，**降低**命中率；⑤ **`%`/`_` 是 LIKE 的通配符**，必须在 query 预处理阶段剔掉，否则"字面包含"会静默变成模式匹配（判别式：正文里同时有 `5` 和 `0`、但两者永不相邻，用 `5%0` 去搜 —— 两种实现的期望值不同，断言才有判别力）；⑥ **`score` 阈值只作用于向量路且过滤放在候选池之后**（距离单调 ⇒ 两种顺序等价，少传一份 20KB 的向量字面量）；⑦ **`ORDER BY embedding <=> $1, id` 会让 HNSW 退化** ⇒ 二级 tie-break 必须在 JS 侧做（否则 P0-1-14 的索引取证白做）；⑧ `§八` 的降级路径本批就位（`HYBRID` 跳向量路 + 告警 / `VECTOR` 409 / `FULLTEXT` 不受影响，两种原因分开报）；⑨ 顺手加了 `pnpm check:batch` —— `step` 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性 |
+| `issue_fix/问题记录-P0-1-21-知识库包验收.md` | **本批的"坑"主要不在实现里，而在"包级验收"这件事本身**：① **前面每档都绿，不等于串起来还成立** —— R4 的"检索返回 v2"在 P0-1-19 只能靠 `<=>` SQL 做**等价取证**（当时检索端点还没落地），本批用真端点重验，并且把断言从"正文含 v2"改成**"新关键词命中重建后的块 + v1 的旧词查不到"**（前者在"新旧两份都留着"的坏数据上照样通过）；② **`getObject` 对不存在的键不在 `await` 时抛错**（错误发生在**读流**时）⇒ 只调它的话响应头已经发出、客户端看到"下到一半断了"；必须先 `statObject` 才能在发头前干净地回 404（顺带拿 `Content-Length`，而两者之间仍有 TOCTOU 窗口，那时**只能断流**，不假装能回 JSON）；③ **下载是本仓唯一不套 `ok()` 信封的端点**（成功是字节流、失败才是信封），这条必须显式写进注释与 README，否则下一个照抄别的路由的人会把它包进信封；④ **`Content-Disposition` 是纯函数但错误静默**：中文名要靠 `filename*`（否则另存为 `____.pdf`）、CR/LF 不删就是**响应头注入**、RFC 5987 里 `'`/`(`/`)`/`*` 这四个字符 `encodeURIComponent` **不转义但规范不认** ⇒ 五组边界断言全在无依赖档；⑤ **列表排序刻意反序**（`createdAt desc`）与"库不存在回 404 而不是空列表"两条都是**产品口径**，写进 `02` §4.6 而不是只留在代码里 |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 
@@ -860,3 +904,4 @@ doubuleA/
 | 2026-09-22 | — | **P0-1-18 完成（包 D 继续）**：空文本检测 + 分块（可插拔策略）—— `backend/src/pipeline/chunk/{strategy,hybrid,fixed,index}.ts`（`ChunkStrategy` 接口 + **纯函数**实现：`hybrid` 默认 = 按"连续同名标题"切 Section → 段内回退到句末边界 → 尾块合并 → 同 Section 内 64 字符重叠；`fixed` = 定长滑窗、不做边界回退）、`backend/src/pipeline/stages.ts` 插入 **④ `detect-empty-text`** 与 **⑤ `chunk`**（并导出 `buildEmptyTextMessage()` 供验收逐字断言）、`backend/src/pipeline/worker.ts` 的 `JOB_DOCUMENT_SELECT` 一次联表带出 KB 的分块参数（`chunkSize`/`chunkOverlap`/`splitStrategy`，后者经 `normalizeRetrievalConfig` 补默认值）。**零新增依赖、零新增环境变量**（分块参数与阈值都是 P0-1-15 已有的）。**三条最值得记的**：① **④ 必须排在 ⑤ 之前**（否则扫描件先白切一遍再判失败），用**产物的缺席**取证；失败文案里的数字**取实测阈值**（阈值可配）；**失败不删原文件**（用户要能下载核对）。② **一切切片建在 `[...text]` 的码点数组上** —— `chunk_size` 的单位是字符（B8），用 `text.slice()` 会**劈开代理对**（`'😀'.length === 2`）产出非法字符串且**本层毫无报错**（下游 embedding 才炸）。③ **⚠️ 只"算"不"存"**：块已切出（`ctx.chunks`）但**刻意不写 `chunk_count`**、更不写 `chunks` 表（⑥⑦ 属 P0-1-19）—— 那一列的定义是"**已入库**的 chunk 数"，提前写会造出"接口说这篇有 12 块、检索却什么都搜不到"的假象；停在 0 是为了把"`READY` = 解析与分块都过了、但仍不可检索"这个中间态**暴露出来**（块数进日志，仍可观测）。**验收**：`verify:app` **50 → 60 项**（新增整段"分块策略契约"：小文档特例恰好 1 块、句末回退（首块长度 < chunk_size 且末字符是句末边界）、**每块都是原文的逐字子串**、重叠 64 与块长上界、尾块合并与 `fixed` 对照、定长滑窗块长序列、**按码点切不劈开代理对**、PDF 页码 meta、同名标题不相邻时顺序保持、未知策略回落），`verify:pipeline` **24 → 29 项**（新增 **H 组**：扫描件 → `FAILED` 且含「疑似扫描件」+ 原文件仍保留、**阈值边界**（恰好达标通过 / 少一字符失败，按当前阈值生成用例）、**真字节重跑阶段数组**验分块边界与重叠、200 字短通知恰好 1 块；原"清场"组顺延为 **I 组**）；既有 13 档（60/17/13/21/17/18/17/22/27/23/32/19/17）**全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 11 条落地要点 + 坑预判取证 + P0-1-19 前置回写 + D 包 **5/8**）、`docs/02` §二·§十四、`子方案①` §4-2/§五/§十四 同步。**⚠️ 两处旧夹具因新门槛被加长**（`verify-pipeline` 的 docx 20→~80、txt 29→~70、F 组 PDF 43→~70 字）—— 有效字符 < 50 现在会判"疑似扫描件"，旧夹具会让"四篇全 READY"与"重投救回"假失败；这是刻意的行为变化，不是回归。**⚠️ 边界**：`chunk_count` 仍为 0、`chunks` 表仍为空 ⇒ **依然不可检索**，本批**仍不是可端测里程碑**。归档：`issue_fix/问题记录-P0-1-18-空文本检测+分块.md` |
 | 2026-09-22 | — | **P0-1-19 完成（包 D 继续）**：入库 + 覆盖重建 + 失败重试 —— `backend/src/pipeline/index/writer.ts`（`embedChunks()` 按 `EMBEDDING_BATCH_SIZE` 切批 + **单批失败重试 2 次**（退避 1s/3s）+ 条数不符即中止；`writeChunks()` 事务内 `DELETE WHERE doc_id` → `createManyAndReturn` → 手写 `UPDATE ... FROM unnest(...)` 回填向量，每批 200 行）、`backend/src/pipeline/stages.ts` 加 **⑥ `embed` / ⑦ `index`**（阶段数组至此八步齐全，`READY` 才等于"可检索"）、`shared/src/document.ts` 补三条响应契约与 `REUPLOAD_UNCHANGED_HINT`、`backend/src/services/document.service.ts` 补 `reuploadDocument` / `retryDocument` / `deleteDocument`、`backend/src/routes/documents.ts` 挂三条新端点（全部只需登录）。**四条最值得记的**：① **写入语句刻意偏离 `§4-4` 草稿** —— `INSERT ... SELECT unnest(...)` 要求"自带 id 数组"，而 `chunks.id` 是 `uuid(7)` 且已定案**不手搓 uuid7** ⇒ 改成「Prisma 建行（拿 id）+ 手写 `UPDATE ... unnest` 回填向量」（同一事务），验收里有一条 **"id 的版本位必须是 7"** 专守（手搓的 uuid 并不会报错，只是版本位变成 4，**静默**）；② **`file_name` 也一并更新**（`§七` 列清单漏了它）—— 它还承担下载端点的 `Content-Disposition`，旧名留着就会"列表显示旧名、下载得到新内容"；③ **重建的入队失败无法整次回滚**（旧 chunk 删了就回不来）⇒ 如实报告 + 指向 `POST .../retry`，**不伪装成"什么都没变"**；`retry` 因此必须**放行 `PARSING`**（"worker 崩了 / 入队丢了"的恢复入口），`READY` 上则回 **409**；④ **embedding 的重试粒度是"批"** —— provider 自己会切批、只看到"一次调用"，故由流水线侧先切好再喂；一批仍失败 ⇒ **整篇 FAILED**（跳过会留下"有块没向量"的坏数据，检索里永远排不上号而界面正常）。**覆盖重建的三个"没做"**（内容相同时：不落对象、不删 chunk、不入队）用**删得掉证据**的方式取证（chunk 行 id 逐字不变 + `updated_at` 不变 + 对象数不变 + 队列深度 0）—— 只断言"内容还在"验不出"重写了一遍"。**坑预判取证**：`§七` 的"先删后建 ⇒ 检索空窗"**成立**（窗口 = 一次流水线耗时），缓解落成"响应立刻 `PARSING` + `chunkCount` 归 0"，并把「列表页必须显示『更新中，暂不参与检索』」写进 **P0-1-21 的坑预判**（必做）。**验收**：新增 **`pnpm verify:ingest`（23 项，需 PG + Redis + MinIO，自起假 embedding 上游）**——A 入库真跑（`chunk_count` 与表逐行一致、每行有向量、维度 1024、meta 三键、**id 版本位 = 7**、上游侧取证只发 `model`/`input`）／B 覆盖重建（id 不变、旧 chunk id 一个不剩、全库无孤儿、内容是 v2、**`<=>` 近邻命中 v2 那块**作为"检索返回 v2"的数据层等价取证、旧对象被删）／C 内容未变化／D 失败重试（上游 500 → 「文本向量化失败（已重试 2 次）」→ 修好 → retry → READY → 再 retry 409；跨库 docId 404）／E 删除文档（`deletedChunks` + 三清 + 重复删 404）／F 边界与权限（**重建不能绕过前置校验**、未登录 401、**MEMBER 全通**）／G 清场双清；`verify:pipeline` **29 项**（阶段序列断言改六步、`chunkCount===0` 改成"与 `chunks` 表逐行一致"、新增"重跑是替换不是追加"、接入假 embedding 上游）、`verify:app` **60 → 64 项**（三条新路由 + `deduplicated` ≠ `unchanged` 不串味 + 重试/删除契约 + 提示常量）；既有 14 档**全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（P0-1-19 状态 + 11 条落地要点 + 坑预判取证 + **P0-1-21 坑预判回写** + D 包 **6/8**）、`docs/02` §二·§4.6·§十四、`子方案①` §4-3/§4-4/§七/§十四 同步。**⚠️ 边界**：`READY` 现在等于**可检索**（库里有带向量的 chunk），但**检索端点本身**是 P0-1-20、列表/下载端点是 P0-1-21 ⇒ 本批**仍不是可端测里程碑**（不过 `chunk_count` 已是真数，`psql` 一眼能看出入库了几块）。归档：`issue_fix/问题记录-P0-1-19-入库+覆盖重建+失败重试.md` |
 | 2026-09-22 | — | **P0-1-20 完成（包 D 继续）**：双路检索 + RRF 融合 —— `backend/src/services/retrieval.ts`（新增：向量路 `1 - (embedding <=> $1)`（候选池 `topK × CANDIDATE_POOL_FACTOR`、**相似度下限只作用于这一路且过滤在池之后**）+ 全文路 `content LIKE '%词%'` + `bigm_similarity`（query 预处理：剔标点（**含 `%`/`_` 两个 LIKE 通配符**）→ **只剥句首/句尾**的提问脚手架 → 按码点截断 64 → `< 2` 字整条跳过并告警）+ `mode` 三值分流 + **RRF 融合**（`w = 1/(rrfK + rank)` 两路相加、缺失记 0、同分按 `chunkId` 升序）+ 引用对象构造（`docName` / `snippet` ±80 字符**不加工**窗口 / `rrfScore`）+ **`§八` 的降级路径**（模型变更 / embedding 未就绪 ⇒ `HYBRID` 跳向量路 + `warnings` 与 `vectorPathSkipped`、`VECTOR` 报 409 或 500、`FULLTEXT` 不受影响）；纯函数 `normalizeFulltextQuery` / `buildSnippet` / `fuseRrf` / `rrfScoreOf` **导出**以便无依赖档断言）、`backend/src/routes/knowledgeBases.ts`（挂 `POST /:id/search`，**登录即可**）、`shared/src/knowledgeBase.ts`（新增 `FULLTEXT_QUERY_MAX_CHARS`/`FULLTEXT_QUERY_MIN_CHARS`/`SNIPPET_WINDOW_CHARS` + 三条提示常量 + `searchKnowledgeBaseBodySchema`/`retrievalHitSchema`/`searchKnowledgeBaseResultSchema`）。**零新增依赖、零新增环境变量**（`RRF_K`/`CANDIDATE_POOL_FACTOR`/`RETRIEVAL_*` 都是 P0-1-15 已登记的）。**四条最值得记的**：① **"两路各自与独立 SQL 等价"是唯一能证明分数不是编出来的手段** —— 验收把端点返回的名次/分数跟独立复算同形状 SQL 的结果**逐条对照**（只断言"非空 + 有六列"时，一个"按 seq 排序"的假实现照样全绿）；② **RRF 的数值可以用返回的两路名次逐条反算**（`1/(k+rv) + 1/(k+rf)`，缺失记 0）；③ **`%`/`_` 必须在预处理阶段剔掉**，否则"字面包含"静默变成模式匹配（验收用"正文里有 `5` 和 `0` 但永不相邻"的夹具做判别 —— 两种实现的期望值不同，断言才有判别力）；④ **`§6-1` 的"去停用词"收窄为"只剥首尾脚手架"**（LIKE 要连续子串，删中间的"的"会**降低**命中率）。**两处文档订正**：`§6-2` 的 RRF 示例数值 0.0323 → **实测 0.0320**（并写成断言，文档与代码互为守门）、`§六` 的响应示例改成实际契约（`chunkId` 是 uuid(7)、补 `page`/`headingPath`/`rrfK`/`candidatePool`/`vectorPathSkipped`/`warnings`、`snippet` 不加工）。**验收**：新增 **`pnpm verify:retrieval`（27 项，需 PG + Redis + MinIO，自起 `semantic: true` 的词面重叠型假 embedding 上游）** —— A 三模式与六列（`FULLTEXT` 单独跑中文 query 非空、`VECTOR` 里含关键词的块**严格更近**、`HYBRID` 里两路都第 1 的块排第一、与独立 SQL 逐条等价、RRF 反算、`finalRank` 连续、引用片段三分支且都是原文子串、**`elapsedMs` 与墙钟都 < 500ms**（实测 3ms/4ms））／B 生效配置（阈值只作用于向量路、`topK`/`mode` 覆盖**不落库**、参数回显分别为该库快照 77 与环境特征值 5）／C 降级路径（模型变更 ⇒ 降级 + 告警 / `VECTOR` 409；未就绪 ⇒ 降级 / `VECTOR` 500，**子进程注入空配置**）／D 权限（MEMBER 可检索）+ 边界（空库、纯标点、跨库隔离、不存在 404）／E 清场；`verify:app` **64 → 72 项**（新增"检索契约与 RRF 纯函数"整段）；**既有 14 档全部未回归**（`retrieval 27`＋`embedding 27 / db 17 / session 13 / auth 21 / users 17 / model-providers 18 / models 17 / llm 22 / knowledge 23 / documents 32 / pipeline 29 / ingest 23 / knowledge-bases 19 / e2e 17`），lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 11 条落地要点 + 坑预判取证 + P0-1-21 前置与坑预判回写 + D 包 **7/8**）、`docs/02` §4.6（检索端点契约表）·§十四、`子方案①` §6-1/§6-2/§六/§八/§十四 同步；**顺手补 `pnpm check:batch`**（`infra/scripts/check-batch-marker.mjs`：比对 `docs/06` 最后一个 `[✓]` 的批次号与 `index.ts` 启动信封的 `step` —— 这条"每批手改一次"的纪律**在 P0-1-19 又漏了一次**（第 4 次），能交给机器的就别留给记性）。**⚠️ 边界**：**这仍不是浏览器可端测的里程碑**（列表/下载端点是 P0-1-21、界面是 P0-1-30），但 **API 级已经"上传 → 入库 → 检索"整条打通**：`curl POST .../search` 现在能真的拿回带双路分数与 RRF 名次的片段；手工跑需要先配好 `EMBEDDING_*`（本机 .env 三项为空 ⇒ `HYBRID` 会降级为纯全文并告警），零配置的完整跑法是 `pnpm verify:retrieval`。归档：`issue_fix/问题记录-P0-1-20-双路检索+RRF融合.md` |
+| 2026-09-22 | — | **P0-1-21 完成（包 D 收口 ✅）**：知识库包验收 —— 补 `documents` **列表**与**下载原始文件**两条端点（`listDocuments` / `openDocumentSource` / 纯函数 `buildContentDisposition` / `downloadContentType`），并逐行跑通 `子方案①` §十二 的 8 行。**四条最值得记的**：① **列表排序刻意与其余三个列表相反**（文档用 `createdAt desc`：刚传的那篇要在第一条，否则用户以为上传没成功；**不按 `updatedAt`** —— 覆盖重建会让它在翻页时"跳到最前面"）；② **库不存在回 404 而不是空列表**（"库没了"与"库里没文档"是两件事，前端要跳的地方都不一样）；③ **必须先 `statObject` 再 `getObject`** —— 后者对不存在的键**不在 `await` 时抛错**（错误发生在读流时）⇒ 只调它的话响应头已经发出、客户端看到"下到一半断了"；先 stat 才能在发头前干净地回 404（顺带拿 `Content-Length`）；④ **`Content-Disposition` 的头注入防护**（CR/LF 删除、引号/反斜杠/路径分隔符替换、RFC 5987 里 `'`/`(`/`)`/`*` 还得自己编码 —— `encodeURIComponent` 会放过它们）+ **下载类型表与上传白名单的跨表一致性断言**。两条界面规则收进 `shared`：`DOCUMENT_PARSING_HINT`（"更新中，暂不参与检索" —— `§七` 的检索空窗不能不说）与 `isDocumentSearchable`（`READY ⟺ 可检索`，且 `PARSING ≠ FAILED`）。**验收**：新增 **`pnpm verify:kb-package`（11 项，需 PG + Redis + MinIO）** —— **一行一组逐行跑 §十二 的 8 行**（其中 R4"检索返回 v2"改用**真检索端点**验：新关键词命中**重建后**的块、**v1 的旧词查不到**，比"正文含 v2"强得多；R2 的 `PARSING→READY` 改用**列表端点**观察）；`verify:documents` **32 → 44 项**（F 组列表：分页/最新在前/键集合/跨库隔离/三态提示；G 组下载：**字节逐字相等**/Content-Type/中文名还原/对象丢失 404/幽灵与跨库与未登录/MEMBER 守门）、`verify:app` **72 → 79 项**（第 23 节：两条路由 + 列表 schema + 同一套投影 + 三态判据 + `Content-Disposition` 五组边界 + 跨表一致性）；**既有 15 档全部未回归**，lint + 三包 typecheck/build 全绿；`docs/06`（状态 + 8 条落地要点 + 坑预判取证 + **D 包 8/8**）、`docs/02` §4.6（列表/下载契约表）·§十四、`子方案①` §十二（**8 行逐行验收结论表**）·§十四、README（验收表、手工端测 ⑬、已知边界、索引、版本记录）同步。**⚠️ 边界**：`§七` 待决事项 7 的第二个端测点（**P0-1-30 浏览器首站**）与知识库界面（P0-1-35）都还没做 ⇒ 本批之后**命令行可跑完整条链路**（建库 → 上传 → 列表 → 检索 → 下载），浏览器里仍是占位页；单条 embedding 的真实推理时延仍卡在 `LOCAL_EMBEDDING_RUNTIME_MODULE`（`06` §七 待决事项 2）。归档：`issue_fix/问题记录-P0-1-21-知识库包验收.md` |

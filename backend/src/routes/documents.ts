@@ -3,13 +3,14 @@
  *
  * 依据：`docs/02-后端设计.md` §4.6（知识库文档端点表）+ `子方案/知识库流水线.md` §4-1/§七
  *
- * 本文件现有四条端点（**全部只需登录**，与知识库同口径）：
+ * 本文件现有六条端点（**全部只需登录**，与知识库同口径）：
  *   `POST   /api/knowledge-bases/:id/documents`                    上传（multipart，字段名 `file`）
+ *   `GET    /api/knowledge-bases/:id/documents`                    列表（分页；流水线进度的可视出口）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/reupload`    覆盖重建（multipart，同上）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/retry`       失败重试（无请求体）
+ *   `GET    /api/knowledge-bases/:id/documents/:docId/download`    下载原始文件（**返回字节流**）
  *   `DELETE /api/knowledge-bases/:id/documents/:docId`             删除（清 chunk + 原文件）
- * 其余端点按计划分批：`GET` 列表与 `download` 属 P0-1-21，`search` 属 P0-1-20。
- * **不提前实现**：列表要分页三态口径、下载要流式与 `Content-Disposition`，猜出来的契约会先错一遍。
+ * 至此 `02` §4.6 的文档端点表全部落地（`search` 属 P0-1-20，已挂）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 权限与知识库同口径：**登录即可**，不是 ADMIN
@@ -34,15 +35,20 @@ import {
   AppError,
   documentParamsSchema,
   knowledgeBaseIdParamsSchema,
+  listDocumentsQuerySchema,
   ok,
   type DocumentParams,
   type KnowledgeBaseIdParams,
+  type ListDocumentsQuery,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { config } from '../config.js'
 import {
+  buildContentDisposition,
   deleteDocument,
+  listDocuments,
+  openDocumentSource,
   retryDocument,
   reuploadDocument,
   uploadDocument,
@@ -160,5 +166,46 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
       ok(
         await deleteDocument({ kbId: request.params.id, docId: request.params.docId }),
       ),
+  )
+
+  /**
+   * 文档列表（登录即可；`03` §4.3 的文档表格：文件名 / 状态 / chunk 数 / 更新时间 / 操作）。
+   *
+   * 这是流水线进度的**唯一可视出口**（前四批只能查库）：`status` + `chunkCount` + `errorMsg`
+   * 就是列表页要的全部信息。两条界面规则写在 `shared`（前后端共用）：
+   * · `PARSING` 必须显示 `DOCUMENT_PARSING_HINT`（"更新中，暂不参与检索"）——
+   *   `§七` 的"先删后建"有一段检索空窗，不提示的话用户会以为"文档在、就是搜不到"是 bug；
+   * · 能不能被检索到用 `isDocumentSearchable(status)` 判（`READY ⟺ 可检索`）。
+   */
+  app.get<{ Params: KnowledgeBaseIdParams; Querystring: ListDocumentsQuery }>(
+    '/api/knowledge-bases/:id/documents',
+    { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema, querystring: listDocumentsQuerySchema } },
+    async (request) =>
+      ok(await listDocuments({ kbId: request.params.id, ...request.query })),
+  )
+
+  /**
+   * 下载原始文件（登录即可；`03` §4.3 的"下载原始文件"操作）。
+   *
+   * ⚠️ **本仓唯一一个不返回 JSON 信封的端点**：成功时回的是**字节流**（`reply.send(stream)`），
+   * 失败时**仍然**是标准信封（404/500 都是 JSON）—— 客户端要按状态码分支，而不是永远 `json()`。
+   *
+   * 三个头部都由服务层给：`Content-Type`（按扩展名唯一确定）、`Content-Length`（`statObject` 拿的）、
+   * `Content-Disposition`（RFC 6266/5987 双写，中文名靠 `filename*`）。
+   */
+  app.get<{ Params: DocumentParams }>(
+    '/api/knowledge-bases/:id/documents/:docId/download',
+    { preHandler: app.requireAuth, schema: { params: documentParamsSchema } },
+    async (request, reply) => {
+      const source = await openDocumentSource({
+        kbId: request.params.id,
+        docId: request.params.docId,
+      })
+      return reply
+        .header('content-type', source.contentType)
+        .header('content-length', String(source.contentLength))
+        .header('content-disposition', buildContentDisposition(source.fileName))
+        .send(source.body)
+    },
   )
 }

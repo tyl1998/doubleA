@@ -44,6 +44,13 @@
  *              引用片段（±80 字符、按码点、**不加工**）、**RRF 融合公式**（两路/单路/权重 0 的
  *              数值逐项反算 + 同分确定性）。行为侧（真库 + 真 SQL + 假 embedding 上游）
  *              归 `verify-retrieval.mjs`。
+ *   · P0-1-21：**文档列表 / 下载的契约** —— 两条路由注册（含"不该存在的 PATCH/GET 变体"）、
+ *              列表查询 schema（coercion + 上限）、列表响应与上传响应**同一套投影**、
+ *              `READY ⟺ 可检索` 的三态判据与「更新中，暂不参与检索」文案、以及
+ *              **`Content-Disposition` 的 RFC 6266 双写**（中文名靠 `filename*`、EOF 回落规则、
+ *              **CR/LF 头注入被剔除**、路径分隔符与引号被替换、RFC 5987 的额外转义）
+ *              与**下载类型表与上传白名单不脱节**。行为侧（真 S3 取字节、流式响应、对象丢失）
+ *              归 `verify-documents.mjs` 的 F/G 组。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -83,14 +90,18 @@ import {
   DEFAULT_RETRIEVAL_CONFIG,
   DOCUMENT_STATUSES,
   DOCUMENT_STATUS_TRANSITIONS,
+  DOCUMENT_PARSING_HINT,
   canTransitionDocumentStatus,
   documentItemSchema,
+  documentListResultSchema,
   documentParamsSchema,
   FULLTEXT_PATH_SKIPPED_TOO_SHORT,
   FULLTEXT_QUERY_MAX_CHARS,
   FULLTEXT_QUERY_MIN_CHARS,
+  isDocumentSearchable,
   LEGACY_DOC_EXTENSION,
   LEGACY_DOC_HINT,
+  listDocumentsQuerySchema,
   MIME_BY_EXTENSION,
   SNIPPET_WINDOW_CHARS,
   UPLOAD_EXTENSIONS,
@@ -161,6 +172,13 @@ import {
   splitIntoChunks,
 } from '../dist/backend/src/pipeline/chunk/index.js'
 import { providerKeyAad } from '../dist/backend/src/services/model.service.js'
+// 文档列表 / 下载的两条规则（`Content-Disposition` 的构造、下载类型的口径表）也是**纯函数**
+// ⇒ 同样在这一档断言：它们错了不会被 lint/typecheck/build 拦下，症状是"下载下来名字乱码"
+// 或者更糟 —— 头注入（P0-1-21）。
+import {
+  buildContentDisposition,
+  downloadContentType,
+} from '../dist/backend/src/services/document.service.js'
 // 检索的**规则本身**（query 预处理 / 引用窗口 / RRF 融合公式）是纯函数 ⇒ 在这一档就能断言。
 // 它们的错误不会被 lint/typecheck/build 拦下、也不会让接口 400，症状是"结果不对但界面正常"
 // （命中少几条、片段截错位置、融合排名看着随机）—— 与 P0-1-18 把分块做成纯函数是同一条理由。
@@ -1379,15 +1397,17 @@ await it('shared 知识库契约：retrieval_config 补默认值（唯一入口�
 })
 
 // ── 18. 文档上传：路由 + 前置校验四道 + 解析契约（P0-1-16）──
-await it('文档上传路由已注册且**只有这一条**：非法 UUID 400、匿名 401（校验先于鉴权，都不碰依赖）', async () => {
+await it('文档上传路由已注册：非法 UUID 400、匿名 401（校验先于鉴权，都不碰依赖）', async () => {
   // `02` §4.6：上传挂在知识库下的子路径
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents' }), true, '上传路由')
-  // 列表（P0-1-21）、下载（P0-1-21）、reupload/retry/delete（P0-1-19）都还不该存在：
-  // 提前注册一条"返回空列表"的 GET 会让"上传成功但列表里没有"被当成已交付
+  // ⚠️ P0-1-16 时这里还有两条"列表/下载**不该存在**"的断言（"提前注册一条返回空列表的 GET，
+  // 会让'上传成功但列表里没有'被当成已交付"）。**P0-1-21 把两条真端点补齐了**，
+  // 于是那两条负向断言完成了使命 —— 改成正向的：端点存在，且"只有这一条 POST"。
+  // （它们自身的契约在第 23 节；负向断言留在源码里只会变成"每次补端点都要改的噪声"。）
   assertEqual(
-    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }),
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents/:docId' }),
     false,
-    '列表端点属 P0-1-21，本批不应存在',
+    '不该出现 `POST /:docId` 这种"改文档"的路径（换内容只能靠覆盖重建）',
   )
 
   const badId = await app.inject({ method: 'POST', url: '/api/knowledge-bases/not-a-uuid/documents' })
@@ -1824,12 +1844,13 @@ await it('三条新路由已注册（都是文档路径下的子路径，不是�
   )
   // 上传那条仍在（子路径不该把它挤掉）
   assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents' }), true, '上传路由')
-  // 列表与下载属 P0-1-21、检索属 P0-1-20 —— **刻意不提前注册**（猜出来的契约会先错一遍）
-  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }), false, '不应有列表')
+  // 列表与下载在 P0-1-21 已落地（本节只断言"当时刻意没有"的那两条现在有了；
+  // 它们自身的契约在下面第 23 节）
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }), true, '列表路由')
   assertEqual(
     app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents/:docId/download' }),
-    false,
-    '不应有下载',
+    true,
+    '下载路由',
   )
 })
 
@@ -1894,22 +1915,14 @@ await it('「内容未变化，已跳过」是 shared 里的常量（前后端�
 // ── 22. 双路检索 + RRF 融合的契约与纯函数（P0-1-20）──
 console.log(`\n${c.b}── 检索契约与 RRF 纯函数（双路分数 / 融合公式 / 引用片段）──${c.x}`)
 
-await it('检索路由已注册；列表与下载那两条仍**刻意没有**（属 P0-1-21，猜出来的契约会先错一遍）', () => {
+await it('检索路由已注册（列表与下载在 P0-1-21 补上，本节只管检索这一条）', () => {
   assertEqual(
     app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/search' }),
     true,
     '检索路由（`02` §4.6）',
   )
-  assertEqual(
-    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }),
-    false,
-    '不应有文档列表',
-  )
-  assertEqual(
-    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents/:docId/download' }),
-    false,
-    '不应有下载',
-  )
+  // 检索是"读侧"的入口，不该顺带注册出别的写操作
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/knowledge-bases/:id/search' }), false, '不该有 DELETE /search')
 })
 
 await it('检索请求体契约：`query` 必填非空、`mode` 三值、`topK` 有界（覆盖只对本次请求生效）', () => {
@@ -2118,6 +2131,153 @@ await it('降级的提示文案是 shared 常量（前后端共用同一句）�
     '两种原因必须分开：一个要运维修配置，一个要业务重建（合成一句会让用户去做治不好的动作）',
   )
   assertIncludes(FULLTEXT_PATH_SKIPPED_TOO_SHORT, String(FULLTEXT_QUERY_MIN_CHARS), '过短的提示里要带上阈值')
+})
+
+// ── 23. 文档列表 / 下载 与"可检索"判据（P0-1-21，包 D 收口）──
+console.log(`\n${c.b}── 列表 / 下载契约 与 可检索判据（分页 / Content-Disposition / 三态提示）──${c.x}`)
+
+await it('两条新路由已注册；文档路径下不该出现第四条"同路径同方法"', () => {
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents' }), true, '列表路由')
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/knowledge-bases/:id/documents/:docId/download' }),
+    true,
+    '下载路由',
+  )
+  // 四条老路由仍在（新增子路径不该把它们挤掉）
+  assertEqual(app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents' }), true, '上传')
+  assertEqual(
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents/:docId/reupload' }),
+    true,
+    '覆盖重建',
+  )
+  assertEqual(
+    app.hasRoute({ method: 'POST', url: '/api/knowledge-bases/:id/documents/:docId/retry' }),
+    true,
+    '重试',
+  )
+  assertEqual(app.hasRoute({ method: 'DELETE', url: '/api/knowledge-bases/:id/documents/:docId' }), true, '删除')
+  // `PATCH /:docId` 之类**刻意不存在**：文档内容只能靠覆盖重建换，不存在"改个名字"的入口
+  assertEqual(
+    app.hasRoute({ method: 'PATCH', url: '/api/knowledge-bases/:id/documents/:docId' }),
+    false,
+    '不应有 PATCH 文档',
+  )
+})
+
+await it('列表查询契约：offset/limit 与其余列表同口径（含字符串 coercion 与上限 100）', () => {
+  assertEqual(listDocumentsQuerySchema.safeParse({}).success, true, '两个都可省')
+  assertEqual(listDocumentsQuerySchema.parse({}).offset, 0, 'offset 默认 0')
+  assertEqual(listDocumentsQuerySchema.parse({}).limit, 20, 'limit 默认 20')
+  assertEqual(listDocumentsQuerySchema.parse({ limit: '5' }).limit, 5, 'query string 要能 coerce')
+  assertEqual(listDocumentsQuerySchema.safeParse({ limit: 101 }).success, false, 'limit 上限 100')
+  assertEqual(listDocumentsQuerySchema.safeParse({ offset: -1 }).success, false, 'offset 不能为负')
+})
+
+await it('列表响应契约：与上传响应**同一套投影**（同一份数据不许有第二种形状）', () => {
+  const item = {
+    id: DOC_SAMPLE.id,
+    kbId: DOC_SAMPLE.kbId,
+    fileName: '报销制度.txt',
+    status: 'READY',
+    chunkCount: 3,
+    errorMsg: null,
+    createdAt: '2026-09-22T00:00:00.000Z',
+    updatedAt: '2026-09-22T00:00:00.000Z',
+  }
+  const parsed = documentListResultSchema.safeParse({ items: [item], total: 1, offset: 0, limit: 20 })
+  assertEqual(parsed.success, true, '完整响应')
+  assertEqual(
+    documentListResultSchema.safeParse({ items: [item], total: 1, offset: 0 }).success,
+    false,
+    '分页三件套一个都不能少（前端分页器靠它）',
+  )
+  // 同一个 `documentItemSchema`：把上传响应的样例直接塞进列表项也必须过
+  assertEqual(documentItemSchema.safeParse(item).success, true, '列表项应能被上传响应的 schema 解析')
+  assertEqual(
+    documentItemSchema.safeParse({ ...item, status: 'DONE' }).success,
+    false,
+    '状态只能是 PARSING/READY/FAILED',
+  )
+})
+
+await it('"可检索"的判据与"更新中"的文案：`READY` 是唯一可检索态，且 `PARSING` ≠ `FAILED`', () => {
+  // 这条判据的语义变过一次（P0-1-17 的 READY 只是"解析完成"，P0-1-19 起才是"可检索"），
+  // 故收进 shared 成一个函数，而不是让各处写 `status === 'READY'` 的字面量比较
+  assertEqual(DOCUMENT_STATUSES.filter((status) => isDocumentSearchable(status)).join(','), 'READY', '唯一可检索态')
+  assertEqual(isDocumentSearchable('PARSING'), false, '还在处理 ⇒ 查不到（`§七` 的检索空窗）')
+  assertEqual(isDocumentSearchable('FAILED'), false, '失败要人介入 ⇒ 也查不到')
+  assertEqual(DOCUMENT_PARSING_HINT, '更新中，暂不参与检索', '提示文案（前后端共用同一句）')
+  assert(!DOCUMENT_PARSING_HINT.includes('失败'), '⚠️ 这句话不能说成"失败"：PARSING 是我们还在干活')
+})
+
+await it('`Content-Disposition`：RFC 6266 双写、中文名可还原、路径与引号被清理', () => {
+  const chinese = buildContentDisposition('报销制度（2026版）.pdf')
+  assertIncludes(chinese, 'attachment;', '必须是另存为')
+  assertIncludes(chinese, "filename*=UTF-8''", '必须有 RFC 5987 形式')
+  assertEqual(
+    decodeURIComponent(/filename\*=UTF-8''([^;]+)/u.exec(chinese)[1]),
+    '报销制度（2026版）.pdf',
+    '`filename*` 必须能还原中文原名',
+  )
+  const ascii = /filename="([^"]*)"/u.exec(chinese)[1]
+  assert(/^[\u0020-\u007e]*$/u.test(ascii), `ASCII 回落里不该有非 ASCII：${ascii}`)
+  // 规则是"非 ASCII 逐个换 `_`、ASCII 原样保留"，故 `报销制度（2026版）.pdf` →
+  // `_____2026__.pdf`（前 5 个非 ASCII = 报销制度（，后 2 个 = 版））。写成**逐字期望值**
+  // 而不是"看着像就行"：这条回落规则一旦被改成音译/截断，下游的"另存为文件名"就变了。
+  assertEqual(ascii, '_____2026__.pdf', '非 ASCII 逐个替换成 _（不做音译：真名在 filename* 里）')
+
+  // ⚠️ 安全：文件名是用户给的（老浏览器还会塞进整条本地路径）⇒ 必须挡住头注入与路径逃逸。
+  //    注意 `\r\n` 是**删掉**而不是转义：CR/LF 在头部里没有任何正当用途，删掉就断了"响应拆分"
+  //    这条路；剩下的 `X-Evil: 1` 只是一段无害的文件名文本（它不再独占一行）。
+  const injected = buildContentDisposition('a\r\nX-Evil: 1.txt')
+  assert(
+    !injected.includes('\r') && !injected.includes('\n'),
+    `不得含 CR/LF（响应头注入）：${JSON.stringify(injected)}`,
+  )
+  assertEqual(injected.split('\n').length, 1, '清理后仍必须是**单行**（多一行就是注入成功）')
+  assertIncludes(injected, 'filename="aX-Evil: 1.txt"', '控制字符被删掉，其余文本原样保留')
+  const pathful = buildContentDisposition('../../etc/passwd')
+  assert(!pathful.includes('/'), `不得残留路径分隔符：${JSON.stringify(pathful)}`)
+  const quoted = buildContentDisposition('他说"你好".txt')
+  assertEqual(
+    /filename="([^"]*)"/u.exec(quoted)[1].includes('"'),
+    false,
+    '引号必须被替换（否则会提前闭合 filename="..." 这个引号串）',
+  )
+})
+
+await it('`Content-Disposition` 的边界：空名回落、RFC 5987 的额外转义（`\'`/`(`/`)`/`*`）', () => {
+  const empty = buildContentDisposition('   ')
+  assertIncludes(empty, 'filename="document.bin"', '空名要有可用的回落名')
+  assertIncludes(empty, "filename*=UTF-8''document.bin", '回落名同时进 filename*')
+
+  // `encodeURIComponent` 会放过 `!'()*`，而 RFC 5987 的 attr-char **不含** `'()*` ⇒ 必须自己转义
+  const tricky = buildContentDisposition("a'b(c)d*e.txt")
+  const encoded = /filename\*=UTF-8''([^;]+)/u.exec(tricky)[1]
+  for (const ch of ["'", '(', ')', '*']) {
+    assert(!encoded.includes(ch), `RFC 5987 的编码结果不该出现 ${ch}：${encoded}`)
+  }
+  assertEqual(decodeURIComponent(encoded), "a'b(c)d*e.txt", '转义之后仍要能解回原名')
+})
+
+await it('下载的口径表与上传白名单**不脱节**（下载给的类型必须是该扩展名允许的类型之一）', () => {
+  // 服务层刻意没复用 `MIME_BY_EXTENSION`（那张表是"允许客户端声明哪几种"，语义是**多选**，
+  // 而响应头只能有一个值）—— 代价是两张表可能漂移，这条断言就是防漂移的：
+  // 把下载给出的类型（去掉 `charset` 参数）反查回上传白名单，必须命中；
+  // 扩展名的集合则由 `UPLOAD_EXTENSIONS` 兜住（多一个扩展名而下载表没跟，这条会红）。
+  for (const extension of UPLOAD_EXTENSIONS) {
+    const type = downloadContentType(`样例.${extension}`)
+    const bare = type.split(';')[0]
+    assert(
+      MIME_BY_EXTENSION[extension].includes(bare),
+      `${extension} 的下载类型 ${type} 不在上传白名单 ${JSON.stringify(MIME_BY_EXTENSION[extension])} 里`,
+    )
+  }
+  // 文本类型带 charset 是刻意的（不带时浏览器猜编码，中文会乱码）；未知扩展名回落到二进制
+  assertIncludes(downloadContentType('a.txt'), 'charset=utf-8', 'txt 要声明编码')
+  assertEqual(downloadContentType('a.pdf'), 'application/pdf', 'pdf 不带 charset')
+  assertEqual(downloadContentType('无扩展名'), 'application/octet-stream', '未知扩展名回落二进制')
+  assertEqual(downloadContentType('a.md'), 'text/markdown; charset=utf-8', 'md 的类型')
 })
 
 await app.close()

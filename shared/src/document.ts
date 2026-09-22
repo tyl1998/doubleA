@@ -23,9 +23,20 @@
  * （如"疑似扫描件"）。`chunkCount` 默认 0 而非 null：`PARSING` 期间就是"当前有 0 个可用 chunk"
  * （schema 注释与 `子方案①` §七 的"更新中，暂不参与检索"都依赖它）。
  * 状态之间的**合法转换**见 {@link DOCUMENT_STATUS_TRANSITIONS}。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ③ 列表与"可不可检索"的判据（P0-1-21 增量）
+ * ─────────────────────────────────────────────────────────────────────
+ * 列表项与上传/重建响应**共用 `documentItemSchema` 一套投影**，并补两个"给界面用的规则"：
+ * {@link DOCUMENT_PARSING_HINT}（`PARSING` 态必须显式说明"暂不参与检索"）与
+ * {@link isDocumentSearchable}（`READY` ⟺ 可检索）。两个都写在 shared 而不是各自写在界面里：
+ * 前者是**用户看得见的一句话**（两边各写一遍必然漂），后者是一条**语义随批次变过的判据**
+ * （P0-1-17 时 `READY` 只是"解析完成"，P0-1-19 起才是"可检索"）。
  */
 
 import { z } from 'zod'
+
+import { offsetPageOf } from './envelope.js'
 
 /** 文档流水线状态（与 `schema.prisma` 的 `document_status` 枚举逐字一致） */
 export const DOCUMENT_STATUSES = ['PARSING', 'READY', 'FAILED'] as const
@@ -187,4 +198,54 @@ export const removeDocumentResultSchema = z.object({
   deletedChunks: z.number().int().min(0),
 })
 export type RemoveDocumentResult = z.infer<typeof removeDocumentResultSchema>
+
+// ───────────────────────────── 列表 / 下载（P0-1-21，包 D 收口）─────────────────────────────
+
+/**
+ * `GET /api/knowledge-bases/:id/documents` 查询参数（offset/limit，与 `/api/users`、
+ * `/api/knowledge-bases` 同口径）。
+ *
+ * 上限 100 与其余列表一致：那是"一屏看不过来的量"，真要看更多就该翻页 ——
+ * 知识库的文档数是千级（`01` §1.3 的规模假设），没有"一次拉全"的需求。
+ */
+export const listDocumentsQuerySchema = z.object({
+  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
+  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+})
+export type ListDocumentsQuery = z.infer<typeof listDocumentsQuerySchema>
+
+/**
+ * 列表响应：`{ items, total, offset, limit }`，每项与上传/重建响应里的 `document` **同一套投影**
+ * （`documentItemSchema`）—— 同一份数据在四个出口出现四种形状，是前端最容易踩的坑。
+ */
+export const documentListResultSchema = offsetPageOf(documentItemSchema)
+export type DocumentListResult = z.infer<typeof documentListResultSchema>
+
+/**
+ * `PARSING` 态在列表里的提示文案（`子方案①` §七 → `06` P0-1-19 的坑预判：**必须做**）。
+ *
+ * 为什么这句话不能省：`§七` 的"先删后建"意味着**一段检索空窗**（窗口 = 一次流水线耗时，
+ * 大 PDF 可达分钟级）—— 这期间该文档的 `chunk_count` 是 0，检索自然不返回它，**不报错、只是查不到**。
+ * 列表页不显式提示的话，用户看到的是"文档明明在、就是搜不到"，而这条从任何报错里都推不出来。
+ *
+ * 与 `LEGACY_DOC_HINT` / `REUPLOAD_UNCHANGED_HINT` 同款：**前后端共用同一句**，
+ * 免得两边文案各写一遍、漂了之后被当成两种问题。
+ */
+export const DOCUMENT_PARSING_HINT = '更新中，暂不参与检索'
+
+/**
+ * 这篇文档**能不能被检索到**（列表页据此把不可检索的行置灰/加提示）。
+ *
+ * 判据就是 `READY`：P0-1-19 起流水线的八步全过才置 `READY`，而 `chunk_count` 是同一个事务里
+ * 写入的真数 ⇒ **`READY` ⟺ 库里有带向量的 chunk**。
+ *   · `PARSING`：我们还在干活（可能正处在检索空窗里，见 {@link DOCUMENT_PARSING_HINT}）；
+ *   · `FAILED`：要人介入 —— **与 `PARSING` 必须用不同的样式**（一个"别急"、一个"要你处理"，
+ *     混成一种"失败"会让用户去重试一件其实正在正常进行的事）。
+ *
+ * 写成 shared 的纯函数而不是让前端各处写 `status === 'READY'`：这条判据的语义变过一次
+ * （P0-1-17 时 `READY` 只是"解析完成"），散落的字面量比较会在语义再变时漏掉。
+ */
+export function isDocumentSearchable(status: DocumentStatus): boolean {
+  return status === 'READY'
+}
 

@@ -5,15 +5,17 @@
  *      §三（流水线总览）、§4-1（四格式 + 上传前置校验）、§七（覆盖重建）、§十（队列）
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件里五个入口的"谁做什么"
+ * 本文件里各入口的"谁做什么"
  * ─────────────────────────────────────────────────────────────────────
- * · `uploadDocument`   —— 建行 + 落 S3 + 入队（首次入库）
- * · `reuploadDocument` —— **改**行 + 换 S3 对象 + 清旧 chunk + 入队（覆盖重建，不新建行）
- * · `retryDocument`    —— 只入队（外加把 FAILED 翻成 PARSING，让用户立刻看到"处理中"）
- * · `deleteDocument`   —— 删行（chunk 级联）+ 删 S3 对象
- * 四个入口都**不做**同步解析：大 PDF 的解析 + 向量化是分钟级的，挂在 HTTP 请求里会把上传
+ * · `uploadDocument`      —— 建行 + 落 S3 + 入队（首次入库）
+ * · `reuploadDocument`    —— **改**行 + 换 S3 对象 + 清旧 chunk + 入队（覆盖重建，不新建行）
+ * · `retryDocument`       —— 只入队（外加把 FAILED 翻成 PARSING，让用户立刻看到"处理中"）
+ * · `deleteDocument`      —— 删行（chunk 级联）+ 删 S3 对象
+ * · `listDocuments`       —— 只读：分页列出该库的文档（P0-1-21，进度的唯一可视出口）
+ * · `openDocumentSource`  —— 只读：打开原文件流（下载端点，P0-1-21）
+ * 前四个入口都**不做**同步解析：大 PDF 的解析 + 向量化是分钟级的，挂在 HTTP 请求里会把上传
  * 变成"转圈几分钟"，而 §十 引入队列正是为了解决它。所以响应的 `status` 恒为 `PARSING`，
- * 想知道结果得看列表接口（P0-1-21）或直接查库。
+ * 想知道结果就看 `listDocuments`（P0-1-21 起）或直接查库。
  *
  * ⚠️ ①（登记）与 ②（入队）是**同一件事的两半**：入队失败必须把 ① 一起撤掉，否则留下
  *    "永远转圈且重传无救"的文档 —— 见 `rollbackRegistration` 的注释。
@@ -54,11 +56,13 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import type { Readable } from 'node:stream'
 
 import {
   AppError,
   canTransitionDocumentStatus,
   type DocumentItem,
+  type DocumentListResult,
   type RemoveDocumentResult,
   type RetryDocumentResult,
   type ReuploadDocumentResult,
@@ -294,6 +298,210 @@ async function removeQuietly(bucket: string, fileKey: string): Promise<void> {
     getLogger().error({ err: error, bucket, fileKey }, '补偿删除 S3 对象失败，可能残留一个孤立对象')
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// 列表（P0-1-21）：文档进度唯一的可视出口
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 文档列表（`GET /api/knowledge-bases/:id/documents`，登录即可）。
+ *
+ * ── 排序：`createdAt desc, id desc`（**刻意与其余三个列表相反**）──
+ * `/api/users`、`/api/models`、`/api/knowledge-bases` 都是 `createdAt asc`（"按录入顺序"），
+ * 文档列表反过来是**因为使用场景不同**：知识库的文档是"边用边传"的 —— 用户传完一篇立刻要看
+ * 它的状态，按 asc 排的话新文档落在最后一页，界面上看起来像"上传没成功"（而它其实在 `PARSING`）。
+ * 用 `id desc` 兜底同毫秒插入：`uuid(7)` 时间有序，所以它与 `createdAt` 是同一个方向。
+ *
+ * ⚠️ **不按 `updatedAt` 排**：覆盖重建会更新 `updated_at`，那样一篇正在重建的文档会在用户
+ * 翻页的过程中**跳到最前面**，看起来像"列表自己在动"。`created_at` 一旦写下就不动。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 知识库不存在 —— 刻意**不返回空列表**：
+ *   "这个库不存在"与"这个库里没有文档"是两件事，前端要能区分（前者该跳回列表页）。
+ */
+export async function listDocuments(params: {
+  kbId: string
+  offset: number
+  limit: number
+}): Promise<DocumentListResult> {
+  const db = getPrisma()
+  const kb = await db.knowledgeBase.findUnique({ where: { id: params.kbId }, select: { id: true } })
+  if (kb === null) throw AppError.notFound('知识库不存在')
+
+  // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位（与知识库列表同款）
+  const [rows, total] = await db.$transaction([
+    db.document.findMany({
+      where: { kbId: params.kbId },
+      select: DOCUMENT_SELECT,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      skip: params.offset,
+      take: params.limit,
+    }),
+    db.document.count({ where: { kbId: params.kbId } }),
+  ])
+
+  return { items: rows.map(toItem), total, offset: params.offset, limit: params.limit }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 下载原始文件（P0-1-21）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 下载响应用的 `Content-Type`：**扩展名 → 唯一确定的一个类型**。
+ *
+ * 为什么**不**复用 `shared` 的 `MIME_BY_EXTENSION`：那张表是**上传白名单**
+ * （"允许客户端声明哪几种"，例如 `md` 允许 `text/markdown` / `text/x-markdown` / `text/plain`），
+ * 它的语义是**多选**；下载头只能有一个值。用 `[0]` 去取是"碰巧能跑"，一旦有人调整那三个值的
+ * 顺序（或往里加一个更"正确"的类型），下载的 Content-Type 就会**静默**跟着变。
+ * 两张表的一致性由验收守着（下载类型必须是该扩展名上传白名单的成员）。
+ *
+ * 文本类型**显式带 `charset=utf-8`**：不带时浏览器按自身猜测解，中文名/中文内容可能被解成乱码
+ * （而这些文件的真实编码是我们自己嗅探过并知道答案的）。
+ */
+const DOWNLOAD_MIME_BY_EXTENSION: Readonly<Record<UploadExtension, string>> = Object.freeze({
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  md: 'text/markdown; charset=utf-8',
+  txt: 'text/plain; charset=utf-8',
+})
+
+/** 从文件名取扩展名（小写、不含点）；取不到或不在白名单内时回落 `application/octet-stream` */
+export function downloadContentType(fileName: string): string {
+  const matched = /\.([^.\\/]+)$/u.exec(fileName)
+  const ext = matched?.[1]?.toLowerCase()
+  return (
+    (ext !== undefined && ext in DOWNLOAD_MIME_BY_EXTENSION
+      ? DOWNLOAD_MIME_BY_EXTENSION[ext as UploadExtension]
+      : undefined) ?? 'application/octet-stream'
+  )
+}
+
+/** RFC 5987 的 `attr-char` 之外还要转义这几个：`encodeURIComponent` 会放过它们 */
+const RFC5987_EXTRA = /['()*]/gu
+
+/**
+ * 构造 `Content-Disposition`（**RFC 6266 + RFC 5987 双写**）—— 纯函数，可直接断言。
+ *
+ * 两个都必须给，缺一不可：
+ *   · `filename="..."`：**ASCII 回落**（老客户端只认它）；
+ *   · `filename*=UTF-8''...`：**百分号编码的 UTF-8 原名**（中文名靠它，`报销制度.pdf` 才不会变成
+ *     `___.pdf` 或者乱码）。
+ *
+ * ⚠️ **安全**：文件名来自用户（`documents.file_name`，老式浏览器还会塞进整条本地路径）
+ * ⇒ 必须
+ *   ① 去掉 **CR / LF / 其余控制字符**：不清掉就是**响应头注入**（`a\r\nX-Evil: 1`），
+ *      这是比"文件名显示错"严重得多的问题；
+ *   ② 去掉**路径分隔符与引号/反斜杠**：前者会把"另存为"的文件名带出目录分隔符，后者会**提前闭合**
+ *      `filename="..."` 这个引号串（语法错误甚至注入）。
+ * 回落名里的非 ASCII 一律换成 `_`（不做音译）：宁可显示 `___.pdf`，也不要在一个格式严格受限的
+ * 头部里塞进需要解码的东西 —— 真名已经在 `filename*` 里了。
+ *
+ * @param fileName 原始文件名（可含路径、可为空）
+ * @param fallbackExtension 名字退化到无法给出扩展名时用的后缀（如 `bin`）
+ */
+/** 可打印字符判定（用于剔除控制字符）—— 写成函数而不是 `/[\u0000-\u001f]/` 正则：
+ *  eslint 的 `no-control-regex` 会拦下后者，而这里的"含控制字符"是**故意的**（安全过滤） */
+function isPrintable(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0
+  return code > 0x1f && code !== 0x7f
+}
+
+export function buildContentDisposition(fileName: string, fallbackExtension = 'bin'): string {
+  // ① 控制字符（含 CR/LF）与引号/反斜杠/路径分隔符一律剔除
+  const cleaned = [...fileName].filter(isPrintable).join('').replace(/["\\/]/gu, '_').trim()
+  const base = cleaned === '' ? `document.${fallbackExtension}` : cleaned
+  // ② ASCII 回落：非 ASCII 换 `_`，再把落到引号/反斜杠的字符清掉（上面已经清过，这里是兜底）
+  const ascii = base.replace(/[^\u0020-\u007e]/gu, '_').replace(/["\\]/gu, '_')
+  // ③ RFC 5987 形式（UTF-8 百分号编码）
+  const encoded = encodeURIComponent(base).replace(
+    RFC5987_EXTRA,
+    (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
+  )
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
+}
+
+export interface DocumentSource {
+  docId: string
+  fileName: string
+  contentType: string
+  contentLength: number
+  /** 对象内容（流）—— 路由层直接 `reply.send()`，**不读进内存** */
+  body: Readable
+}
+
+/**
+ * 打开原始文件用于下载（`GET .../documents/:docId/download`，登录即可）。
+ *
+ * 三步各有理由：
+ *   ① **行必须属于该知识库**（`findFirst({ id, kbId })`）：跨库的 docId 一律 404，
+ *      否则这个端点会变成"知道 id 就能取到任何库的文件"（与 retry/delete 同款口径）；
+ *   ② **先 `statObject` 再 `getObject`**：`getObject` 对不存在的键**不会**在 `await` 时抛错
+ *      （它返回一个流，错误在读取时才发生）⇒ 若只调它，路由层已经把 200 与响应头发出去了，
+ *      随后流报错只能断开连接（客户端看到"下载到一半断了"而不是"文件不存在"）。
+ *      `statObject` 是"发头之前"的检查，还能顺手拿到 `size`（`Content-Length` 靠它）；
+ *   ③ **流式返回**：`UPLOAD_BODY_LIMIT` 默认 100MB，读进内存等于让一个下载请求吃掉 100MB 堆。
+ *
+ * ⚠️ `statObject` 到 `getObject` 之间对象仍可能被删（TOCTOU）：那时流会报 NoSuchKey，
+ *    响应头已经发出，只能断流 —— 这是流式响应的固有边界，故**不**假装能回一个 JSON 错误。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 文档不存在 / 不属于该库 / **原文件已不在存储里**
+ *   （第三种给的是不同的文案：数据库行还在，只是对象没了 —— 用户该做的是重新上传）
+ *   `INTERNAL`(500) 存储不可用（连不上 MinIO 这类基础设施问题）
+ */
+export async function openDocumentSource(params: {
+  kbId: string
+  docId: string
+}): Promise<DocumentSource> {
+  const db = getPrisma()
+  const row = await db.document.findFirst({
+    where: { id: params.docId, kbId: params.kbId },
+    select: { id: true, fileName: true, fileKey: true },
+  })
+  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+
+  const bucket = config.s3.bucket
+  const s3 = getS3Client()
+
+  let size: number
+  try {
+    const stat = await s3.statObject(bucket, row.fileKey)
+    size = stat.size
+  } catch (error) {
+    if (isNoSuchKey(error)) {
+      getLogger().warn(
+        { kbId: params.kbId, docId: row.id, fileKey: row.fileKey },
+        '文档行存在但 S3 对象已丢失，下载返回 404',
+      )
+      throw AppError.notFound('原始文件已不在存储中（可能已被清理），请重新上传该文档')
+    }
+    getLogger().error({ err: error, docId: row.id, fileKey: row.fileKey }, '读取对象元数据失败')
+    throw AppError.internal('存储服务暂时不可用，请稍后重试')
+  }
+
+  const body = await s3.getObject(bucket, row.fileKey)
+  return {
+    docId: row.id,
+    fileName: row.fileName,
+    contentType: downloadContentType(row.fileName),
+    contentLength: size,
+    body,
+  }
+}
+
+/**
+ * 判断"对象不存在"这一类错误。
+ *
+ * minio SDK 抛的是 `S3Error`（带 `code`），但**不同版本/不同网关的措辞不一致**：
+ * 自建 MinIO 回 `NoSuchKey`，某些 S3 兼容实现回 `NotFound`/`NoSuchBucket`。故看 code 的
+ * 同时兜一层 message（`instanceof` 跨包不可靠，见 `hasPrismaCode` 同款注释）。
+ */
+function isNoSuchKey(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  if (code === 'NoSuchKey' || code === 'NotFound' || code === 'NoSuchBucket') return true
+  const message = error instanceof Error ? error.message : ''
+  return /NoSuchKey|not exist|does not exist/iu.test(message)
+}
+
 
 // ═══════════════════════════ 覆盖重建 / 重试 / 删除（P0-1-19）═══════════════════════════
 
