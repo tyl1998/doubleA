@@ -14,8 +14,10 @@
  * 所以这里出现的每一个错误，都属于"用户以为自己发了、其实这一轮没成"的语义，
  * 而它必须紧贴着那两条气泡出现，否则用户不知道是哪一轮失败了。
  *
- * ⚠️ `CONFLICT` 的专用文案（"该会话正在生成中"）在本批**已经生效**（`03` §五 明写的那句话）。
- * P0-1-33 要补的是"同标签页重复发送时的专用 toast + 输入区状态机"，与这里不重复。
+ * ⚠️ 文案**不在本文件**：`P0-1-33` 起 toast 也要说同一句话（"该会话正在生成中"），
+ * 于是那句专用文案被搬到 `streamErrors.ts`（一处定义、两个消费方）—— 见那个文件的文件头
+ * （`06` §六 第 ⑰ 条："同一口径在两处各写一遍，必有一处先腐烂"）。
+ * 本组件因此只剩"把 code/message 映射成 AntD `Alert` 的 message/description"这一件事。
  *
  * ⚠️ 错误码与文案都来自服务端（`sseErrorPayloadSchema` 的 `code` 必须是 `shared` 的错误码）
  * ⇒ 本组件**不发明文案**，只对 `CONFLICT` 这一个码做覆盖（因为契约点名了那句话）。
@@ -23,22 +25,23 @@
 
 import { Alert } from 'antd'
 
+import { chatErrorDescription, chatErrorTitle } from './streamErrors.js'
+
 export interface ErrorCardProps {
   /** `shared/src/errors.ts` 的错误码（客户端侧的网络故障用伪码 `NETWORK`） */
   code: string
   message: string
 }
 
-/** `03` §五 点名的专用文案：并发冲突时说人话，而不是让用户读 `CONFLICT` */
-const CONFLICT_TITLE = '该会话正在生成中'
-
 export function ErrorCard({ code, message }: ErrorCardProps) {
-  const title = code === 'CONFLICT' ? CONFLICT_TITLE : '这一轮没有生成成功'
-  const description = code === 'CONFLICT' ? message : `${code} · ${message}`
-
   return (
     <div data-testid="error-card">
-      <Alert type="error" showIcon message={title} description={description} />
+      <Alert
+        type="error"
+        showIcon
+        message={chatErrorTitle(code)}
+        description={chatErrorDescription(code, message)}
+      />
     </div>
   )
 }

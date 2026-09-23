@@ -19,6 +19,13 @@ export interface Feedback {
   /** 成功：轻提示。文案由调用方给（它才知道自己做成了什么），格式统一在这里 */
   ok: (text: string) => void
   /**
+   * **中性提示**（P0-1-33 新增）：既不是成功也不是失败的信息 ——
+   * 例如"对齐历史"的三种结论里，"服务端没有这一轮，界面上这份是唯一副本（保留）"
+   * 既不能说成成功（用户没做成一件事），也不能说成失败（什么都没坏）。
+   * 与 `fail` 的区别是它**不带错误码、不用红色**：用红色报一件正常的事会让用户去找并不存在的问题。
+   */
+  note: (text: string) => void
+  /**
    * 失败：带错误码的通知。
    * @param title 覆盖标题 —— 只在"服务端文案说不出这是什么操作"时才传
    *              （如「保存失败」「登录失败」），错误本身的说明仍来自服务端。
@@ -38,6 +45,9 @@ export function useFeedback(): Feedback {
     () => ({
       ok: (text) => {
         void message.success(text)
+      },
+      note: (text) => {
+        void message.info(text)
       },
       fail: (error, title) => {
         const { code, message: text } = describeError(error)

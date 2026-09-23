@@ -1,5 +1,5 @@
 /**
- * 对话流状态（zustand，P0-1-32）
+ * 对话流状态（zustand，P0-1-32；P0-1-33 加"停止收口"与"断线黄条"）
  *
  * 依据：`docs/03-前端设计.md` §六（"SSE 状态集中在 `useChatStream`（fetch 流解析 → store 分发），
  *      页面组件只读 store"、"`stores/` 放 zustand（会话侧栏、SSE 流状态、全局 UI）"）。
@@ -34,11 +34,30 @@ import { create } from 'zustand'
 import type { ClientErrorCode } from '../api/client.js'
 import { beginRound, reduceRound, type StreamRound } from '../features/chat/roundReducer.js'
 
+/**
+ * 顶部黄条（`03` §4.1："断线 → 顶部黄条提示，**点击黄条 = 立即拉取历史对齐**"）。
+ *
+ * ⚠️ **为什么它必须住在 store 里、而不是挂在轮次上**（P0-1-33 的一个顺序推导）：
+ * 点黄条 = 对齐历史，而对齐的结论之一就是"服务端存下来了 ⇒ **丢掉流式轮次**"。
+ * 若黄条跟着轮次走，那它会在用户点它的同一瞬间消失 —— 用户会看到"我点了一下，提示没了，
+ * 但页面到底对齐了没有、对齐成了什么，什么都不知道"。放进 store 之后：
+ *   · 轮次该丢就丢（避免同一轮渲染两遍）；
+ *   · 黄条留到**调用方显式清**（点击后清），于是"对齐完成"这件事有一个可见的收尾动作。
+ *
+ * 文案在 `features/chat/streamErrors.ts`（三种触发共用一个口径）；这里只存**具体线索**。
+ */
+export interface DisconnectState {
+  /** 附加一行线索（错误码 / 服务端答复）；没有具体线索时是 `null` */
+  extra: string | null
+}
+
 interface ChatStreamState {
   /** 本轮所属会话 id；`null` = 没有进行中的流（此时 `round` 也是 `null`） */
   streamFor: string | null
   /** 当前这一轮的归约态（`null` = 空闲） */
   round: StreamRound | null
+  /** 顶部黄条（`null` = 本地与后端状态一致） */
+  disconnect: DisconnectState | null
   /** 开一轮：**流已经成功建立之后**才调用（前置失败不该在界面上留下任何痕迹） */
   begin: (conversationId: string, userText: string, startedAt: string) => void
   /** 喂一帧（未开轮时静默忽略：`done` 之后仍可能有尾帧，那是正常现象） */
@@ -47,8 +66,25 @@ interface ChatStreamState {
    * **客户端侧**的收口失败（连接中断 / 读流抛错）—— 与流内 `error` 事件落到同一个出口
    * （消息流内错误卡），只是错误码可能来自 `api/client.ts` 的伪码 `NETWORK`。
    * 只有"这一轮已经开始过"时才该调它（见 `useChatStream.ts` 的三类失败表）。
+   *
+   * ⚠️ 它把 `errorSource` 标成 `'client'`（P0-1-33）：由此页面才知道该走**黄条**而不是 toast
+   * （`streamErrors.ts#shouldToastChatError`）。
    */
   fail: (error: { code: ClientErrorCode; message: string }) => void
+  /**
+   * 客户端侧把这一轮标成"已停止"（P0-1-33）：点了停止、`POST /stop` 也成功了，
+   * 但 **5s 窗口内没等到 `done{STOPPED}`** ⇒ 由 `stopController` 的 abort 兜底之后调用。
+   *
+   * 语义上它与收到 `done{STOPPED}` 等价（用户确实点了停止、服务端确实收到了信号），
+   * 差别只在**没有服务端的确认**：`persisted` 因此保持 `null`（不知道落没落库），
+   * 于是收尾行**不会**声称"刷新后不会出现在历史里"（那句只在 `persisted === false` 时说，
+   * 见 `AssistantMessage`）—— 不知道的事，界面不许说。
+   */
+  stoppedLocally: () => void
+  /** 亮顶部黄条（三条客户端侧中断路径调它，文案见 `streamErrors.ts`） */
+  showDisconnect: (payload: DisconnectState) => void
+  /** 收黄条（用户点过它 = 已经对齐过了；开新一轮时也清） */
+  clearDisconnect: () => void
   /** 清空（切换会话 / 卸载页面 / 前置失败回滚时调用） */
   reset: () => void
 }
@@ -56,9 +92,12 @@ interface ChatStreamState {
 export const useChatStreamStore = create<ChatStreamState>((set) => ({
   streamFor: null,
   round: null,
+  disconnect: null,
 
   begin: (conversationId, userText, startedAt) => {
-    set({ streamFor: conversationId, round: beginRound(userText, startedAt) })
+    // 开新一轮 ⇒ 上一轮的黄条自动消失（`03` §4.1 的状态机里，`idle → streaming` 是一个干净的起点；
+    // 留着旧黄条会让用户以为**这一轮**出问题了）
+    set({ streamFor: conversationId, round: beginRound(userText, startedAt), disconnect: null })
   },
 
   apply: (event) => {
@@ -67,11 +106,40 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
 
   fail: (error) => {
     set((state) =>
-      state.round === null ? state : { round: { ...state.round, status: 'error', error } },
+      state.round === null
+        ? state
+        : { round: { ...state.round, status: 'error', error, errorSource: 'client' } },
     )
   },
 
+  stoppedLocally: () => {
+    set((state) =>
+      state.round === null
+        ? state
+        : {
+            round: {
+              ...state.round,
+              status: 'stopped',
+              finishReason: 'STOPPED',
+              error: null,
+              errorSource: null,
+            },
+          },
+    )
+  },
+
+  showDisconnect: (payload) => {
+    set({ disconnect: payload })
+  },
+
+  clearDisconnect: () => {
+    set({ disconnect: null })
+  },
+
   reset: () => {
+    // ⚠️ 刻意**不动** `disconnect`：`reset()` 也被"对齐历史"这条路调用
+    //（丢掉流式版本），而那正是黄条该留下来的场景 —— 见 `DisconnectState` 的注释。
+    // 清黄条只有一个入口：`clearDisconnect()`（用户点过它）。
     set({ streamFor: null, round: null })
   },
 }))

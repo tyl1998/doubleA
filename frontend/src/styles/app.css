@@ -1084,8 +1084,7 @@
 }
 
 /* 输入区 */
-.composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }
-.composer__inner { width: min(760px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
+.composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }.composer__inner { width: min(760px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
 .composer__box {
   display: flex;
   align-items: flex-end;
@@ -1131,3 +1130,39 @@
   border-radius: var(--r-xs);
 }
 .composer__state { margin-left: auto; }
+/* 状态名的语义色（"色 + 文案"两重表达，见 `composerState.ts` 的 `led` 字段） */
+.composer__state[data-composer-led='run'] { color: var(--accent); }
+.composer__state[data-composer-led='warn'] { color: var(--warn); }
+
+/* 顶部黄条：断线 / 停止没收到服务端确认（P0-1-33，`03` §4.1 的"断线 → 顶部黄条提示"）。
+   ⚠️ 它是**一个 `<button>`**（整条可点 = 对齐历史，见 `DisconnectBanner.tsx`）⇒
+   必须把浏览器给按钮的默认外观全部抹平，否则它会显示成一条圆角小按钮而不是通栏提示条。
+   ⚠️ 只用 `tokens.css` 里**已有**的令牌：`--warn-wash` 管底、`--warn` 管字。
+   这里刻意**不**新建 `--warn-rule` 一类的令牌 —— 令牌的唯一来源是 `tokens.css`，
+   而它要为暗色再配一套（`--accent-rule` 就是这么做的）；本例用中性发丝线 `--rule` 就够，
+   多一个令牌只会多一处要维护的暗色映射。 */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3) var(--sp-5);
+  background: var(--warn-wash);
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  font: inherit;
+  color: var(--ink);
+  cursor: pointer;
+}
+.banner:disabled { cursor: progress; opacity: 0.7; }
+.banner__text { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.banner__detail { color: var(--muted); font-size: var(--fs-sm); line-height: 1.5; }
+.banner__action {
+  flex: none;
+  align-self: center;
+  padding: 2px var(--sp-3);
+  border: 1px solid var(--rule-control);
+  border-radius: var(--r-xs);
+  color: var(--warn);
+}

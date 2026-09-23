@@ -68,6 +68,20 @@ export interface StreamRound {
   status: RoundStatus
   /** 流内 `error` 事件的载荷（`status === 'error'` 时才有） */
   error: { code: string; message: string } | null
+  /**
+   * 这一轮的失败是**谁**发现的（P0-1-33 新增）—— 它决定用哪个通道告诉用户：
+   *   · `'server'` = 流内 `error` 事件（后端主动收口，含 `CONFLICT` / 上游故障）
+   *     ⇒ `03` §五 的 `error` 行：**错误 toast + 消息流内错误卡**（`shouldToastChatError`）；
+   *   · `'client'` = 本地读流失败 / 连接中断（`ChatStreamStore.fail`）
+   *     ⇒ 消息流内错误卡 + **顶部黄条**（`03` §4.1："断线 → 顶部黄条提示"），**不弹 toast**
+   *       （同一件事说三遍反而把黄条那句"点此对齐历史"淹掉）。
+   * `null` = 这一轮没有失败（含正常收尾与用户停止）。
+   *
+   * ⚠️ 为什么不能只看 `status === 'error'`：两种失败的**后续处置完全不同** ——
+   * 服务端故障要"释放输入区 + 报错"，客户端中断要"提示对齐历史"。
+   * 混在一起时最典型的表现是"断线的黄条不出现"或"断线弹一个没用的 toast"。
+   */
+  errorSource: 'server' | 'client' | null
   finishReason: ChatFinishReason | null
   usage: SseDonePayload['usage'] | null
   /**
@@ -106,6 +120,7 @@ export function beginRound(userText: string, startedAt: string): StreamRound {
     assistant: { text: '', thinking: '', citations: null, tools: [], artifacts: [] },
     status: 'streaming',
     error: null,
+    errorSource: null,
     finishReason: null,
     usage: null,
     persisted: null,
@@ -212,7 +227,11 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
         persisted: event.data.messageId !== null,
         assistantMessageId: event.data.messageId,
         ...(event.data.finishReason === 'ERROR'
-          ? { error: { code: 'INTERNAL', message: '生成过程中断，已生成的内容保留' } }
+          ? {
+              error: { code: 'INTERNAL', message: '生成过程中断，已生成的内容保留' },
+              // 这是**服务端**说的失败（它自己给的 `finishReason:ERROR`）⇒ 与流内 `error` 事件同一个通道
+              errorSource: 'server' as const,
+            }
           : {}),
       }
 
@@ -221,6 +240,7 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
         ...round,
         status: 'error',
         error: { code: event.data.code, message: event.data.message },
+        errorSource: 'server',
       }
 
     default:
