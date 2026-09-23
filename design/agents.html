@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能体列表｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" aria-current="page" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--ok" title="后端 :13000 连接正常"></span>
+          <span class="rail__serial num">S-02 · 智能体</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li><a class="nav__item" href="./agents.html" aria-current="page">智能体</a></li>
+              <li><a class="nav__item" href="./knowledge.html">知识库</a></li>
+              <li><a class="nav__item" href="./mcp.html">MCP<span class="nav__badge">2</span></a></li>
+              <li><a class="nav__item" href="./chat.html">对话</a></li>
+              <li><a class="nav__item" href="./index.html">管理</a></li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">浅色</button>
+            <button class="avatar" type="button" data-open="user-menu" aria-haspopup="menu">
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <button class="menu__item" type="button" data-close role="menuitem">用户管理</button>
+            <button class="menu__item" type="button" data-close role="menuitem">模型池管理</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <main class="page" data-state-root>
+          <nav class="crumb" aria-label="面包屑">
+            <a href="./index.html">工作台</a>
+            <span class="crumb__sep" aria-hidden="true">/</span>
+            <span class="crumb__here">智能体</span>
+          </nav>
+
+          <div class="page__head">
+            <div>
+              <h1>智能体</h1>
+              <p class="page__lead">
+                你可见的智能体共 <span class="num">5</span> 个：<span class="num">3</span> 个由你创建（可编辑／删除），
+                <span class="num">2</span> 个由他人创建（只读）。列表按最近更新排序。
+              </p>
+            </div>
+            <div class="page__head-actions">
+              <div class="seg" role="group" aria-label="切换列表状态">
+                <button type="button" data-state-btn="normal" aria-pressed="true">正常</button>
+                <button type="button" data-state-btn="loading" aria-pressed="false">加载</button>
+                <button type="button" data-state-btn="empty" aria-pressed="false">空</button>
+                <button type="button" data-state-btn="error" aria-pressed="false">错误</button>
+              </div>
+              <a class="btn btn--primary" href="./agent-edit.html">创建智能体</a>
+            </div>
+          </div>
+
+          <div class="row" style="margin-bottom: var(--sp-5)">
+            <div class="field" style="width: 260px">
+              <label class="field__label" for="agent-q" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">搜索智能体</label>
+              <input class="input" id="agent-q" type="search" placeholder="搜索名称或描述…" />
+            </div>
+            <div class="seg" role="group" aria-label="按类型筛选">
+              <button type="button" aria-pressed="true">全部</button>
+              <button type="button" aria-pressed="false">CHATBOT</button>
+              <button type="button" aria-pressed="false">TASKAGENT</button>
+            </div>
+            <span class="ratio u-right">数据来自 GET /api/agents · 缓存 30s</span>
+          </div>
+
+          <!-- 状态一：正常 -->
+          <div data-state="normal">
+            <div class="table-wrap reveal">
+              <table class="table" aria-label="智能体列表">
+                <thead>
+                  <tr>
+                    <th scope="col">名称</th>
+                    <th scope="col">类型</th>
+                    <th scope="col">模型</th>
+                    <th scope="col">组件绑定</th>
+                    <th scope="col">最近更新</th>
+                    <th scope="col" style="text-align: right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>
+                      <span class="table__name">运维问答助手</span>
+                      <span class="table__sub">回答部署与排障问题，只用内部手册作答</span>
+                    </td>
+                    <td><span class="tag tag--accent">CHATBOT</span></td>
+                    <td>
+                      <span class="num">deepseek-chat</span>
+                      <span class="table__sub num">64K · 不支持图片</span>
+                    </td>
+                    <td>
+                      <span class="row" style="gap: var(--sp-2)">
+                        <span class="tag">KB ×1</span>
+                        <span class="tag">MCP ×2</span>
+                      </span>
+                    </td>
+                    <td class="num">09-22 15:04</td>
+                    <td>
+                      <div class="table__ops">
+                        <a class="btn btn--link" href="./chat.html">对话</a>
+                        <a class="btn btn--link" href="./agent-edit.html">编辑</a>
+                        <button class="btn btn--link is-danger" type="button" data-open="cascade-modal">删除</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <span class="table__name">周报生成器</span>
+                      <span class="table__sub">汇总本周会话与任务产物，输出周报草稿</span>
+                    </td>
+                    <td><span class="tag">TASKAGENT</span></td>
+                    <td>
+                      <span class="num">deepseek-chat</span>
+                      <span class="table__sub num">64K · 不支持图片</span>
+                    </td>
+                    <td>
+                      <span class="row" style="gap: var(--sp-2)">
+                        <span class="tag">KB ×2</span>
+                        <span class="dot-badge"><span aria-hidden="true">●</span> MCP 未配置凭据</span>
+                      </span>
+                    </td>
+                    <td class="num">09-21 11:20</td>
+                    <td>
+                      <div class="table__ops">
+                        <a class="btn btn--link" href="./chat.html">对话</a>
+                        <a class="btn btn--link" href="./agent-edit.html">编辑</a>
+                        <button class="btn btn--link is-danger" type="button" data-open="cascade-modal">删除</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <span class="table__name">制度速查</span>
+                      <span class="table__sub">报销、请假、采购三类制度的问答入口</span>
+                    </td>
+                    <td><span class="tag tag--accent">CHATBOT</span></td>
+                    <td>
+                      <span class="num">gpt-4o-mini</span>
+                      <span class="table__sub num">128K · 支持图片</span>
+                    </td>
+                    <td><span class="tag">KB ×1</span></td>
+                    <td class="num">09-19 09:47</td>
+                    <td>
+                      <div class="table__ops">
+                        <a class="btn btn--link" href="./chat.html">对话</a>
+                        <a class="btn btn--link" href="./agent-edit.html">编辑</a>
+                        <button class="btn btn--link is-danger" type="button" data-open="cascade-modal">删除</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <span class="table__name">合同条款解读</span>
+                      <span class="table__sub">他人创建 · 只读</span>
+                    </td>
+                    <td><span class="tag tag--accent">CHATBOT</span></td>
+                    <td>
+                      <span class="num">gpt-4o-mini</span>
+                      <span class="table__sub num">128K · 支持图片</span>
+                    </td>
+                    <td><span class="tag">KB ×3</span></td>
+                    <td class="num">09-18 16:32</td>
+                    <td>
+                      <!-- 行级权限：非创建者的行不出现编辑/删除，只有对话入口 -->
+                      <div class="table__ops">
+                        <a class="btn btn--link" href="./chat.html">对话</a>
+                        <span class="ratio">无编辑权限</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <span class="table__name">测试脚手架</span>
+                      <span class="table__sub">他人创建 · 只读</span>
+                    </td>
+                    <td><span class="tag">TASKAGENT</span></td>
+                    <td>
+                      <span class="num">deepseek-chat</span>
+                      <span class="table__sub num">64K · 不支持图片</span>
+                    </td>
+                    <td><span class="tag">无绑定</span></td>
+                    <td class="num">09-15 20:08</td>
+                    <td>
+                      <div class="table__ops">
+                        <a class="btn btn--link" href="./chat.html">对话</a>
+                        <span class="ratio">无编辑权限</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="table__foot">
+                <span class="num">共 5 条 · 每页 20</span>
+                <div class="pager">
+                  <button type="button" aria-current="true">1</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 状态二：加载（骨架屏保留真实列宽比例，避免加载完成时的跳动） -->
+          <div data-state="loading" hidden>
+            <div class="table-wrap">
+              <div class="skeleton" style="padding: var(--sp-5)">
+                <span class="skel-line skel-line--w40"></span>
+                <span class="skel-line"></span>
+                <span class="skel-line skel-line--w70"></span>
+                <span class="skel-line skel-line--w55"></span>
+                <span class="skel-line"></span>
+                <span class="skel-line skel-line--w70"></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 状态三：空（必须带引导动作） -->
+          <div data-state="empty" hidden>
+            <div class="card">
+              <div class="empty">
+                <div class="empty__frame" aria-hidden="true"></div>
+                <p class="empty__title">还没有智能体</p>
+                <p class="empty__lead">
+                  创建一个智能体：选一个 CHAT 模型、写清它的角色与边界。需要私有知识就挂知识库，需要动手就挂 MCP 工具。
+                </p>
+                <a class="btn btn--primary" href="./agent-edit.html">创建智能体</a>
+              </div>
+            </div>
+          </div>
+
+          <!-- 状态四：错误（给错误码与重试，不给"出错了"三个字） -->
+          <div data-state="error" hidden>
+            <div class="card card--pad">
+              <div class="alert alert--danger" role="alert">
+                <span class="alert__icon" aria-hidden="true">▲</span>
+                <div class="alert__body">
+                  <p><strong>智能体列表加载失败</strong></p>
+                  <p class="ratio">500 INTERNAL_ERROR · request-id 8f31c2a0 · 已自动重试 2 次</p>
+                </div>
+                <div class="alert__actions">
+                  <button class="btn btn--sm" type="button" data-toast="重新请求中…" data-code="RETRY">重试</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 级联删除：危险动作走弹窗，明示影响范围，并输入名称二次确认 -->
+    <div class="scrim" id="cascade-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cascade-title">
+        <div class="modal__head">
+          <h2 class="modal__title" id="cascade-title">删除智能体「运维问答助手」</h2>
+          <span class="tag tag--danger">级联删除</span>
+        </div>
+        <div class="modal__body">
+          <div class="impact">
+            <p><strong>此操作将同时删除：</strong></p>
+            <ul>
+              <li>3 个会话及其全部消息（含工具调用记录与引用）</li>
+              <li>2 处组件绑定：知识库「运维手册」、MCP「git」「http-fetch」</li>
+            </ul>
+            <p style="margin-top: var(--sp-3)">
+              知识库文档与 MCP server 本身不受影响；删除后该智能体从列表与对话入口一起消失。
+            </p>
+          </div>
+          <div class="field">
+            <label class="field__label" for="cascade-confirm">请输入智能体名称以确认</label>
+            <input class="input" id="cascade-confirm" placeholder="运维问答助手" />
+            <p class="field__hint">名称需逐字一致，用于避免误删同名前缀的智能体</p>
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button class="btn" type="button" data-close>取消</button>
+          <button
+            class="btn btn--danger"
+            type="button"
+            data-close
+            data-toast="已删除，3 个会话一并移除"
+            data-code="200"
+            data-tone="ok"
+          >
+            确认删除
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+  </body>
+</html>

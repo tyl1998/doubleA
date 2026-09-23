@@ -12,9 +12,14 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
+    "@ant-design/icons": "^5.6.1",
     "@doubulea/shared": "workspace:*",
+    "@tanstack/react-query": "^5.103.2",
+    "antd": "^5.29.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.6",
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

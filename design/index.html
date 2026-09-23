@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>蓝图工作台 · 设计定调｜doubuleA 前端设计</title>
+    <meta
+      name="description"
+      content="doubuleA 内部 Agent 工作台前端设计定调：工业实用「蓝图工作台」方向、设计令牌、组件样张与页面索引。"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <!-- 仪表轨：全站最稳定的视觉锚点（序列号 + 全局状态） -->
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" aria-current="page" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--ok" title="后端 :13000 连接正常"></span>
+          <span class="rail__serial num">S-00 · 定调</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li><a class="nav__item" href="./agents.html">智能体</a></li>
+              <li><a class="nav__item" href="./knowledge.html">知识库</a></li>
+              <li><a class="nav__item" href="./mcp.html">MCP</a></li>
+              <li><a class="nav__item" href="./chat.html">对话</a></li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">
+              浅色
+            </button>
+            <button
+              class="avatar"
+              type="button"
+              data-open="user-menu"
+              aria-haspopup="menu"
+              aria-expanded="false"
+            >
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <button class="menu__item" type="button" data-close role="menuitem">用户管理</button>
+            <button class="menu__item" type="button" data-close role="menuitem">模型池管理</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <main class="page">
+          <!-- ============================ 定调 ============================ -->
+          <section class="hero reveal">
+            <span class="oversize" aria-hidden="true">00</span>
+            <p class="kicker">Design Direction · v1 · 2026-09-22</p>
+            <h1>蓝图&nbsp;工作台</h1>
+            <p class="hero__lead">
+              给内部 Agent 工作台一套「工程图纸」的视觉身份：暖纸底上的发丝网格、等宽标注、四角括号与单一靛蓝强调色。
+              它服务的是长时间驻留的运维与研发——所有装饰都必须回答同一个问题：<strong>这条信息是哪个状态、哪一步、谁在跑</strong>。
+            </p>
+            <div class="hero__facts">
+              <div class="fact">
+                <p class="fact__k">01 / 目的</p>
+                <p class="fact__v">
+                  让「智能体在做什么」可被一眼读出：思考、工具调用、引用、产物、排队与中断，六件事各有自己的视觉位置。
+                </p>
+              </div>
+              <div class="fact">
+                <p class="fact__k">02 / 调性</p>
+                <p class="fact__v">
+                  工业实用（Industrial / Utilitarian）。不混搭：不做霓虹终端，也不做圆角卡片流。
+                </p>
+              </div>
+              <div class="fact">
+                <p class="fact__k">03 / 约束</p>
+                <p class="fact__v">
+                  React 18 + AntD 5 落地（<code>docs/03</code>）；桌面基准 ≥1280px，&lt;1024px 只保证可用；
+                  正文对比度 ≥4.5:1、控件 ≥3:1。
+                </p>
+              </div>
+              <div class="fact">
+                <p class="fact__k">04 / 记忆点</p>
+                <p class="fact__v">
+                  <strong>仪表轨 + 序列号</strong>：左侧固定的序列栏把"第几屏、什么状态"写成仪器读数；卡片四角括号替代统一圆角阴影。
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============================ 令牌：色彩 ============================ -->
+          <section class="stack reveal" style="margin-top: var(--sp-8)">
+            <div class="page__head" style="margin-bottom: 0">
+              <div>
+                <p class="kicker">Tokens · 01</p>
+                <h2>色彩：一个主色，一个强调色</h2>
+              </div>
+              <div class="page__head-actions">
+                <span class="tag tag--accent">对比度已实测</span>
+              </div>
+            </div>
+
+            <div class="split split--2">
+              <div class="card card--pad">
+                <p class="kicker">墨与纸</p>
+                <div style="margin-top: var(--sp-4)">
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--paper)"></span>
+                    <span class="swatch__name">--paper</span>
+                    <span class="swatch__val">#EDEAE3 · 暖纸底，不用纯白</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--surface)"></span>
+                    <span class="swatch__name">--surface</span>
+                    <span class="swatch__val">#FAF9F5 · 卡片／面板</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--ink)"></span>
+                    <span class="swatch__name">--ink</span>
+                    <span class="swatch__val">#17181C · 正文 16.84:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--muted)"></span>
+                    <span class="swatch__name">--muted</span>
+                    <span class="swatch__val">#666A73 · 弱化信息 5.15:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--muted-2)"></span>
+                    <span class="swatch__name">--muted-2</span>
+                    <span class="swatch__val">#7D8189 · 仅装饰小字 3.71:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--rule-control)"></span>
+                    <span class="swatch__name">--rule-control</span>
+                    <span class="swatch__val">rgba(23,24,28,.5) · 控件边界 3.32:1</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card card--pad">
+                <p class="kicker">强调与状态</p>
+                <div style="margin-top: var(--sp-4)">
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--accent)"></span>
+                    <span class="swatch__name">--accent</span>
+                    <span class="swatch__val">#1D3FA8 · 蓝图靛蓝，8.56:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--accent-wash)"></span>
+                    <span class="swatch__name">--accent-wash</span>
+                    <span class="swatch__val">选中底／聚焦光环</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--ok)"></span>
+                    <span class="swatch__name">--ok</span>
+                    <span class="swatch__val">#1F6F4A · 成功 5.81:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--warn)"></span>
+                    <span class="swatch__name">--warn</span>
+                    <span class="swatch__val">#8A5A00 · 中断／需配置 5.63:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span class="swatch__chip" style="background: var(--danger)"></span>
+                    <span class="swatch__name">--danger</span>
+                    <span class="swatch__val">#B3261E · 失败／危险 6.20:1</span>
+                  </div>
+                  <div class="swatch">
+                    <span
+                      class="swatch__chip"
+                      style="background: linear-gradient(135deg, var(--paper) 40%, var(--accent) 40%)"
+                    ></span>
+                    <span class="swatch__name">--grid-line</span>
+                    <span class="swatch__val">8px 细网格 / 64px 加重</span>
+                  </div>
+                </div>
+                <p class="ratio" style="margin-top: var(--sp-4)">
+                  实测口径：WCAG 2.1 相对亮度公式，逐对计算（脚本见提交说明）。状态一律「色 + 图形 + 文案」三重表达，不靠颜色单独表意。
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============================ 令牌：字体 ============================ -->
+          <section class="stack reveal" style="margin-top: var(--sp-8)">
+            <div class="page__head" style="margin-bottom: 0">
+              <div>
+                <p class="kicker">Tokens · 02</p>
+                <h2>字体：展示 / 正文 / 等宽三等分</h2>
+              </div>
+              <div class="page__head-actions">
+                <span class="tag">Archivo</span>
+                <span class="tag">IBM Plex Sans</span>
+                <span class="tag">IBM Plex Mono</span>
+                <span class="tag">思源黑体</span>
+              </div>
+            </div>
+
+            <div class="card card--pad">
+              <div class="type-row">
+                <p class="kicker">--fs-5xl · 61</p>
+                <p style="font-family: var(--font-display); font-size: var(--fs-5xl); font-weight: 800; letter-spacing: var(--ls-display); line-height: var(--lh-tight)">
+                  蓝图工作台
+                </p>
+              </div>
+              <div class="type-row">
+                <p class="kicker">--fs-2xl · 31</p>
+                <p style="font-family: var(--font-display); font-size: var(--fs-2xl); font-weight: 800; letter-spacing: var(--ls-display)">
+                  智能体列表
+                </p>
+              </div>
+              <div class="type-row">
+                <p class="kicker">--fs-base · 14.5</p>
+                <p style="font-size: var(--fs-base); line-height: var(--lh-body)">
+                  正文：中文行高 1.75、字距 0.015em。助手消息走 Markdown 渲染，代码块左侧带 2px 强调色刻度。
+                </p>
+              </div>
+              <div class="type-row">
+                <p class="kicker">--font-mono · 11/12</p>
+                <p class="num" style="font-family: var(--font-mono); font-size: var(--fs-xs)">
+                  kb.search · 1 284 ms · 0.8712 · #S-032
+                </p>
+              </div>
+              <p class="ratio" style="margin-top: var(--sp-4)">
+                展示字 Archivo（工业骨架）专供标题与大字；等宽 IBM Plex Mono 承担全部状态、序列号与数值；中文用思源黑体，
+                拉丁正文用 IBM Plex Sans。全部 <code>font-display: swap</code>，离线时回退到本机系统字而非默认无衬线。
+              </p>
+            </div>
+          </section>
+
+          <!-- ============================ 令牌：节奏 ============================ -->
+          <section class="stack reveal" style="margin-top: var(--sp-8)">
+            <div class="page__head" style="margin-bottom: 0">
+              <div>
+                <p class="kicker">Tokens · 03</p>
+                <h2>节奏：间距、圆角、阴影、动效</h2>
+              </div>
+            </div>
+            <div class="split split--3">
+              <div class="card card--pad">
+                <p class="kicker">间距梯度</p>
+                <div class="row row--wrap" style="margin-top: var(--sp-4); align-items: flex-end; gap: var(--sp-3)">
+                  <span class="meter__val">4</span>
+                  <span style="width: 4px; height: 18px; background: var(--accent)"></span>
+                  <span class="meter__val">8</span>
+                  <span style="width: 8px; height: 18px; background: var(--accent)"></span>
+                  <span class="meter__val">12</span>
+                  <span style="width: 12px; height: 18px; background: var(--accent)"></span>
+                  <span class="meter__val">16</span>
+                  <span style="width: 16px; height: 18px; background: var(--accent)"></span>
+                  <span class="meter__val">24</span>
+                  <span style="width: 24px; height: 18px; background: var(--accent)"></span>
+                  <span class="meter__val">32</span>
+                  <span style="width: 32px; height: 18px; background: var(--accent)"></span>
+                </div>
+                <p class="ratio" style="margin-top: var(--sp-4)">
+                  纵向节奏只用 4 / 8 / 12 / 16 / 24 / 32 / 48 / 72 / 104 九档，禁止临时数值。
+                </p>
+              </div>
+              <div class="card card--pad">
+                <p class="kicker">圆角与阴影</p>
+                <div class="row" style="margin-top: var(--sp-4)">
+                  <span class="tag">2 / 4 / 6 / 10</span>
+                  <span class="tag">几乎不圆</span>
+                </div>
+                <div class="row" style="margin-top: var(--sp-5); align-items: flex-end">
+                  <div style="flex: 1; height: 48px; background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--sh-1)"></div>
+                  <div style="flex: 1; height: 48px; background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--sh-2)"></div>
+                  <div style="flex: 1; height: 48px; background: var(--surface); border: 1px solid var(--rule); box-shadow: var(--sh-3)"></div>
+                </div>
+                <p class="ratio" style="margin-top: var(--sp-4)">
+                  三级高度：Y 偏移 2 / 8 / 24px，阴影带墨色环境调，不用纯黑。
+                </p>
+              </div>
+              <div class="card card--pad">
+                <p class="kicker">动效时长</p>
+                <div class="stack stack--tight" style="margin-top: var(--sp-4)">
+                  <p class="meter__val">微交互 170ms · ease-out</p>
+                  <p class="meter__val">常规 320ms · ease-out</p>
+                  <p class="meter__val">场景 640ms · ease-out</p>
+                  <p class="meter__val">入场错峰 6 组 · 80ms</p>
+                </div>
+                <p class="ratio" style="margin-top: var(--sp-4)">
+                  只动 <code>transform</code> 与 <code>opacity</code>；<code>prefers-reduced-motion: reduce</code> 下全部关闭（本页可直接验证）。
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============================ 组件样张 ============================ -->
+          <section class="stack reveal" style="margin-top: var(--sp-8)">
+            <div class="page__head" style="margin-bottom: 0">
+              <div>
+                <p class="kicker">Components · 04</p>
+                <h2>组件：八种状态都在页面上</h2>
+              </div>
+              <div class="page__head-actions">
+                <button class="btn btn--sm" type="button" data-toast="已保存" data-code="200" data-tone="ok">
+                  试一条成功提示
+                </button>
+                <button class="btn btn--sm" type="button" data-toast="该会话正在生成中" data-code="CONFLICT" data-tone="err">
+                  试一条失败提示
+                </button>
+              </div>
+            </div>
+
+            <div class="split split--2">
+              <div class="card">
+                <div class="card__head">
+                  <p class="card__title">按钮 · 默认 / 悬停 / 按下 / 聚焦 / 禁用 / 加载</p>
+                </div>
+                <div class="card__body">
+                  <div class="row row--wrap">
+                    <button class="btn" type="button">次按钮</button>
+                    <button class="btn btn--primary" type="button">主行动</button>
+                    <button class="btn btn--danger" type="button">删除智能体</button>
+                    <button class="btn btn--quiet" type="button">安静按钮</button>
+                    <button class="btn btn--loading" type="button" aria-disabled="true" disabled>保存中</button>
+                    <button class="btn" type="button" disabled>不可用</button>
+                    <button class="btn btn--link" type="button">文字链</button>
+                  </div>
+                  <p class="ratio" style="margin-top: var(--sp-4)">
+                    悬停：底色加深 + 边框提到墨色；按下：整体下沉 1px。所有按钮最小 34px，独立图标按钮用隐形扩边补到 44×44。
+                  </p>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card__head">
+                  <p class="card__title">表单 · 默认 / 聚焦 / 校验失败 / 禁用</p>
+                </div>
+                <div class="card__body stack stack--tight">
+                  <div class="field">
+                    <label class="field__label" for="s1">智能体名称 <span class="req" aria-hidden="true">*</span></label>
+                    <input class="input" id="s1" value="运维问答助手" />
+                    <p class="field__hint">2–32 字，创建后可修改</p>
+                  </div>
+                  <div class="field">
+                    <label class="field__label" for="s2">模型</label>
+                    <select class="select" id="s2">
+                      <option>deepseek-chat · 上下文 64K · 不支持图片</option>
+                      <option>gpt-4o-mini · 上下文 128K · 支持图片</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label class="field__label" for="s3">系统提示词</label>
+                    <textarea class="textarea" id="s3" placeholder="描述这个智能体的角色、边界与输出格式…"></textarea>
+                    <p class="field__error">
+                      <span aria-hidden="true">▲</span> 系统提示词超过 8 000 字上限
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card__head">
+                  <p class="card__title">标签 · 状态灯 · 徽标</p>
+                </div>
+                <div class="card__body stack stack--tight">
+                  <div class="row row--wrap">
+                    <span class="tag tag--accent">CHATBOT</span>
+                    <span class="tag">TASKAGENT</span>
+                    <span class="tag tag--ok">已完成</span>
+                    <span class="tag tag--warn">解析中</span>
+                    <span class="tag tag--danger">失败</span>
+                    <span class="dot-badge"><span aria-hidden="true">●</span> 未配置凭据</span>
+                  </div>
+                  <div class="row row--wrap" style="margin-top: var(--sp-4)">
+                    <span class="row" style="gap: var(--sp-2)"><span class="led led--run"></span><span class="meter__val">运行中</span></span>
+                    <span class="row" style="gap: var(--sp-2)"><span class="led led--ok"></span><span class="meter__val">成功</span></span>
+                    <span class="row" style="gap: var(--sp-2)"><span class="led led--warn"></span><span class="meter__val">需配置</span></span>
+                    <span class="row" style="gap: var(--sp-2)"><span class="led led--fail"></span><span class="meter__val">失败</span></span>
+                    <span class="row" style="gap: var(--sp-2)"><span class="led led--idle"></span><span class="meter__val">空闲</span></span>
+                  </div>
+                  <div class="row row--wrap" style="margin-top: var(--sp-4)">
+                    <label class="switch">
+                      <input type="checkbox" checked />
+                      <span class="switch__track"><span class="switch__thumb"></span></span>
+                      启用该模型
+                    </label>
+                  </div>
+                  <div class="row row--wrap" style="margin-top: var(--sp-4)">
+                    <label class="check" style="width: 100%">
+                      <input type="checkbox" checked />
+                      <span>
+                        <span class="check__title">运维手册（v3）</span>
+                        <span class="check__meta">128 个片段 · 最近更新 2 天前</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card__head">
+                  <p class="card__title">浮层 · 弹窗 / 抽屉 / 行内确认</p>
+                </div>
+                <div class="card__body">
+                  <div class="row row--wrap">
+                    <button class="btn" type="button" data-open="demo-modal">级联删除弹窗</button>
+                    <button class="btn" type="button" data-open="demo-drawer">检索测试抽屉</button>
+                    <button class="btn" type="button" data-pop="demo-pop">行内确认</button>
+                  </div>
+                  <div class="popconfirm" id="demo-pop" hidden>
+                    <span class="popconfirm__arrow" aria-hidden="true"></span>
+                    <p>删除后该文档的所有片段与向量一并移除，确定继续？</p>
+                    <div class="popconfirm__foot">
+                      <button class="btn btn--sm" type="button" data-close>取消</button>
+                      <button class="btn btn--sm btn--danger" type="button" data-close data-toast="已删除，8 个片段一并移除" data-code="200" data-tone="ok">
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                  <p class="ratio" style="margin-top: var(--sp-4)">
+                    分级确认：普通删除走行内确认；级联删除（智能体／会话）走弹窗，必须明示影响范围并输入名称二次确认。
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <!-- 三态：空 / 加载 / 错误 -->
+            <div class="card" data-state-root style="margin-top: var(--sp-6)">
+              <div class="card__head">
+                <p class="card__title">列表三态 · 空 / 加载 / 错误</p>
+                <div class="card__head-right">
+                  <div class="seg" role="group" aria-label="切换列表状态">
+                    <button type="button" data-state-btn="normal" aria-pressed="true">正常</button>
+                    <button type="button" data-state-btn="loading" aria-pressed="false">加载</button>
+                    <button type="button" data-state-btn="empty" aria-pressed="false">空</button>
+                    <button type="button" data-state-btn="error" aria-pressed="false">错误</button>
+                  </div>
+                </div>
+              </div>
+              <div class="card__body">
+                <div data-state="normal">
+                  <div class="table-wrap">
+                    <table class="table" aria-label="智能体列表示例">
+                      <thead>
+                        <tr><th>名称</th><th>类型</th><th>模型</th><th>最近更新</th><th style="text-align: right">操作</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td class="table__name">运维问答助手<span class="table__sub">绑 1 个知识库</span></td>
+                          <td><span class="tag tag--accent">CHATBOT</span></td>
+                          <td class="num">deepseek-chat</td>
+                          <td class="num">09-22 15:04</td>
+                          <td>
+                            <div class="table__ops">
+                              <button class="btn btn--link" type="button">编辑</button>
+                              <button class="btn btn--link is-danger" type="button">删除</button>
+                            </div>
+                          </td>
+                        </tr>
+                        <tr>
+                          <td class="table__name">周报生成器<span class="table__sub">未绑定组件</span></td>
+                          <td><span class="tag">TASKAGENT</span></td>
+                          <td class="num">deepseek-chat</td>
+                          <td class="num">09-21 11:20</td>
+                          <td>
+                            <div class="table__ops">
+                              <button class="btn btn--link" type="button">编辑</button>
+                              <button class="btn btn--link is-danger" type="button">删除</button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <div class="table__foot">
+                      <span class="num">共 2 条 · 每页 20</span>
+                      <div class="pager">
+                        <button type="button" aria-current="true">1</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div data-state="loading" hidden>
+                  <div class="skeleton">
+                    <span class="skel-line skel-line--w40"></span>
+                    <span class="skel-line"></span>
+                    <span class="skel-line skel-line--w70"></span>
+                    <span class="skel-line skel-line--w55"></span>
+                    <span class="skel-line skel-line--w40"></span>
+                  </div>
+                </div>
+                <div data-state="empty" hidden>
+                  <div class="empty">
+                    <div class="empty__frame" aria-hidden="true"></div>
+                    <p class="empty__title">还没有智能体</p>
+                    <p class="empty__lead">先创建第一个智能体：选模型、写提示词，需要时再挂知识库与 MCP 工具。</p>
+                    <button class="btn btn--primary" type="button">创建智能体</button>
+                  </div>
+                </div>
+                <div data-state="error" hidden>
+                  <div class="alert alert--danger" role="alert">
+                    <span class="alert__icon" aria-hidden="true">▲</span>
+                    <div class="alert__body">
+                      <p><strong>列表加载失败</strong>（500 · INTERNAL_ERROR）</p>
+                      <p class="ratio">请求 ID 8f31c2 · 已重试 2 次</p>
+                    </div>
+                    <div class="alert__actions">
+                      <button class="btn btn--sm" type="button" data-toast="正在重试…" data-code="RETRY">重试</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============================ 页面索引 ============================ -->
+          <section class="stack reveal" style="margin-top: var(--sp-8)">
+            <div class="page__head" style="margin-bottom: 0">
+              <div>
+                <p class="kicker">Screens · 05</p>
+                <h2>页面索引：6 屏覆盖 5 类必做页面</h2>
+              </div>
+              <div class="page__head-actions">
+                <span class="tag">P0-1-30 ~ 36 的视觉基准</span>
+              </div>
+            </div>
+
+            <div class="split split--3">
+              <a class="card bracket" href="./login.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-01 / LOGIN</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    登录 · 首登强制改密
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">未登录守卫、5 次锁号、改密后进首页</p>
+                </div>
+              </a>
+              <a class="card bracket" href="./agents.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-02 / AGENTS</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    智能体列表
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">三态齐备、级联删除弹窗、行内确认</p>
+                </div>
+              </a>
+              <a class="card bracket" href="./agent-edit.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-03 / EDIT</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    智能体编辑
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">四区表单、双请求串行保存、失败标注</p>
+                </div>
+              </a>
+              <a class="card bracket" href="./chat.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-04 / CHAT · 最重页面</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    对话页
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">七种卡片、输入区状态机、停止与断线</p>
+                </div>
+              </a>
+              <a class="card bracket" href="./knowledge.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-05 / KNOWLEDGE</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    知识库详情
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">文档状态三态、检索测试双路得分</p>
+                </div>
+              </a>
+              <a class="card bracket" href="./mcp.html" style="text-decoration: none; color: inherit">
+                <div class="card__body">
+                  <p class="kicker">S-06 / MCP</p>
+                  <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                    MCP 与我的凭据
+                  </p>
+                  <p class="ratio" style="margin-top: var(--sp-2)">serverId 定位高亮、未配置置顶</p>
+                </div>
+              </a>
+            </div>
+
+            <div class="alert alert--info" style="margin-top: var(--sp-6)">
+              <span class="alert__icon" aria-hidden="true">i</span>
+              <div class="alert__body">
+                <p>
+                  原型用的都是真实文案与真实字段（对齐 <code>docs/02</code> 的信封与错误码），但<strong>不接后端</strong>：发消息、上传、检索都是本地模拟。
+                  落地时这些静态页只作视觉基准，实现仍按 <code>docs/03</code> §六 的目录落在 <code>frontend/src</code>。
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <footer style="margin-top: var(--sp-8); padding-top: var(--sp-5); border-top: 1px solid var(--rule)">
+            <p class="kicker">doubuleA / 内部 Agent 工作台 · 设计定调 v1 · 反 AI 味清单已逐项走查</p>
+          </footer>
+        </main>
+      </div>
+    </div>
+
+    <!-- 级联删除弹窗：危险动作用红色实底 + 明示影响范围 + 输入名称减速带 -->
+    <div class="scrim" id="demo-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="demo-modal-title">
+        <div class="modal__head">
+          <h2 class="modal__title" id="demo-modal-title">删除智能体</h2>
+          <span class="tag tag--danger">级联</span>
+        </div>
+        <div class="modal__body">
+          <div class="impact">
+            <p><strong>将同时删除：</strong></p>
+            <ul>
+              <li>3 个会话与其全部消息（含工具调用记录）</li>
+              <li>2 处组件绑定（知识库 / MCP）</li>
+            </ul>
+            <p style="margin-top: var(--sp-3)">知识库文档与 MCP server 本身不受影响。</p>
+          </div>
+          <div class="field">
+            <label class="field__label" for="demo-modal-input">输入智能体名称以确认</label>
+            <input class="input" id="demo-modal-input" placeholder="运维问答助手" />
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button class="btn" type="button" data-close>取消</button>
+          <button class="btn btn--danger" type="button" data-close data-toast="已删除，3 个会话一并移除" data-code="200" data-tone="ok">
+            确认删除
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 检索测试抽屉：得分列用刻度条，不用色块堆叠 -->
+    <div class="drawer" id="demo-drawer" hidden>
+      <div class="drawer__panel" role="dialog" aria-modal="true" aria-labelledby="demo-drawer-title">
+        <div class="drawer__head">
+          <h2 class="modal__title" id="demo-drawer-title">检索测试</h2>
+          <span class="tag">topK 5 · hybrid</span>
+          <button class="btn btn--sm btn--quiet u-right" type="button" data-close>关闭</button>
+        </div>
+        <div class="drawer__body stack">
+          <div class="field">
+            <label class="field__label" for="demo-drawer-q">查询</label>
+            <input class="input" id="demo-drawer-q" value="沙箱并发上限怎么调" />
+          </div>
+          <div class="table-wrap">
+            <table class="table table--dense">
+              <thead>
+                <tr><th>片段</th><th>向量分</th><th>全文分</th><th>融合排名</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>沙箱并发由 SANDBOX_MAX_CONCURRENCY 控制…</td>
+                  <td>
+                    <span class="meter"><span class="meter__track"><span class="meter__fill" style="width: 92%"></span></span><span class="meter__val">0.92</span></span>
+                  </td>
+                  <td>
+                    <span class="meter"><span class="meter__track"><span class="meter__fill meter__fill--alt" style="width: 61%"></span></span><span class="meter__val">0.61</span></span>
+                  </td>
+                  <td class="num">#1</td>
+                </tr>
+                <tr>
+                  <td>超出并发后新会话进入排队，queued 事件带位次…</td>
+                  <td>
+                    <span class="meter"><span class="meter__track"><span class="meter__fill" style="width: 78%"></span></span><span class="meter__val">0.78</span></span>
+                  </td>
+                  <td>
+                    <span class="meter"><span class="meter__track"><span class="meter__fill meter__fill--alt" style="width: 44%"></span></span><span class="meter__val">0.44</span></span>
+                  </td>
+                  <td class="num">#2</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="ratio">未命中的那一路返回空值而不是 0——表格里刻意留白，不用"0.00"伪装成有效分。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+  </body>
+</html>

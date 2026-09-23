@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="RwpUVVs4SwNCyfPxlbn6Pp" data-dm-ref="1"><head data-page-node-id="QE9JB2dVBkfBBSSYjAFyE8">
+    <meta charset="UTF-8" data-page-node-id="TcWaNMGb1DbQ59YZfRURGi">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="fPO1y2XXHj95zeGqNTQdMU">
+    <title>登录 · 首登改密｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" data-page-node-id="NcuMvXrVd4iBTSILO2BUAX">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" data-page-node-id="NJhufvDyYXd1sj9fXAzHYZ">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" data-page-node-id="TTukyKj6B1LSXGwdxhHEfj">
+    <link rel="stylesheet" href="./styles/tokens.css" data-page-node-id="27TNeenydphJpzzXDV4mCq">
+    <link rel="stylesheet" href="./styles/base.css" data-page-node-id="lXbyhJhMTErYp2uIWpvOu3">
+    <link rel="stylesheet" href="./styles/components.css" data-page-node-id="JpQnrVHZ7LpvuCaC9PwFEa">
+    <!--
+      页面级构成（仅登录页使用）：左"识别板" + 右"操作板"的非对称两栏。
+      登录页是公开路由，不带应用外壳（无仪表轨 / 无顶栏），但仍继承全部令牌。
+    -->
+    <style>
+      .auth {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(420px, 0.85fr);
+        min-height: 100vh;
+      }
+      .auth__ident {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-6);
+        padding: var(--sp-8) var(--sp-8) var(--sp-7);
+        border-right: 1px solid var(--rule-strong);
+      }
+      .auth__ident h1 {
+        font-size: clamp(39px, 5vw, 61px);
+        line-height: var(--lh-tight);
+        letter-spacing: -0.04em;
+      }
+      /* 破格元素：大号描边版本号压住分栏线 */
+      .auth__stamp {
+        position: absolute;
+        right: -18px;
+        bottom: var(--sp-7);
+        font-family: var(--font-display);
+        font-size: 112px;
+        font-weight: 800;
+        line-height: 1;
+        letter-spacing: -0.06em;
+        color: transparent;
+        -webkit-text-stroke: 1px var(--rule-strong);
+        background: var(--paper);
+        pointer-events: none;
+      }
+      .auth__reads {
+        display: grid;
+        gap: var(--sp-3);
+        margin-top: auto;
+        max-width: 46ch;
+      }
+      .auth__read {
+        display: grid;
+        grid-template-columns: 92px minmax(0, 1fr);
+        gap: var(--sp-4);
+        padding-top: var(--sp-3);
+        border-top: 1px solid var(--rule);
+      }
+      .auth__panel {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: var(--sp-5);
+        padding: var(--sp-8) var(--sp-8);
+        background: var(--surface);
+      }
+      .auth__form { max-width: 380px; }
+      .auth__foot {
+        margin-top: auto;
+        padding-top: var(--sp-6);
+      }
+      @media (max-width: 1024px) {
+        .auth { grid-template-columns: minmax(0, 1fr); }
+        .auth__ident { padding: var(--sp-7) var(--sp-6); border-right: 0; border-bottom: 1px solid var(--rule-strong); }
+        .auth__reads { margin-top: var(--sp-5); }
+        .auth__stamp { display: none; }
+        .auth__panel { padding: var(--sp-7) var(--sp-6) var(--sp-8); }
+        .auth__form { max-width: 100%; }
+      }
+    </style>
+  <style id="__dm_no_drag_style__">* { -webkit-user-drag: none !important; }</style><style id="__dm_bindable_badge_style__">[data-sp-bindable="database"]{outline:1px dashed #0088ff;outline-offset:2px;border-radius:4px;}[data-sp-bindable="database"] *{pointer-events:none !important;transition:none !important;animation:none !important;}[data-sp-bindable="database"]{transition:none !important;animation:none !important;}</style></head>
+  <body class="blueprint" data-page-node-id="g4XC0V6MosTcZaBZy9sbNP" style="">
+    <div class="auth" data-page-node-id="Ol3PQ61GFa0WZfN2GcegvA">
+      <!-- 左：识别板。这一屏要给"这是什么系统、谁在用、什么版本"一个答案 -->
+      <section class="auth__ident reveal is-in" data-page-node-id="mhCjH8dG06NG2lH39nixZu">
+        <div class="row" data-page-node-id="s1E6ClhG66NqtuEFYkCM2x">
+          <span class="rail__mark" aria-hidden="true" data-page-node-id="UnH271h7B4bBO21ZS7cEfo">A</span>
+          <div data-page-node-id="9nUPSsr7NUCFKjisYXv7qp">
+            <p style="font-family: var(--font-display); font-weight: 800; letter-spacing: -0.03em" data-page-node-id="NeuP4zaaYn00j5qqTNuYR6">doubuleA</p>
+            <p class="kicker" data-page-node-id="gKnXkTUyqHyQ3dkd4PHDG0">内部 Agent 工作台</p>
+          </div>
+        </div>
+
+        <h1 data-page-node-id="8mTGfXkZXKAvPfeDX00aC4">把智能体的<br data-page-node-id="ix2JKLVcRDIUTqmtGLVV6N">每一步<br data-page-node-id="MazJ3htOgwXMD2j8pYvOEh">都摊开看</h1>
+
+        <div class="auth__reads" data-page-node-id="FPFdUWws0PEuv6xYUixwYs">
+          <div class="auth__read" data-page-node-id="olUUY27Gxm3oJt6z8ze1i5">
+            <p class="kicker" data-page-node-id="NztnAw6jcrhxR0Kt2ijWjA">会话并发</p>
+            <p class="ratio" data-page-node-id="QKPPf1gBRM7T0ZCYk2HY9t">4 / 8 · 沙箱池 SANDBOX_MAX_CONCURRENCY</p>
+          </div>
+          <div class="auth__read" data-page-node-id="4kQhgZ6whKtHVNmqAkbcNX">
+            <p class="kicker" data-page-node-id="b4WjAMZpHnKHVdlsmrEyXG">知识库</p>
+            <p class="ratio" data-page-node-id="9MXOiLqPA8cMSDRwzbBLvR">6 个库 · 1 284 个片段 · 双路检索（向量 + 全文）</p>
+          </div>
+          <div class="auth__read" data-page-node-id="mFjfkGZmkD86qG1rtouaAD">
+            <p class="kicker" data-page-node-id="OGZ5M2f9EfBbu1MAPBbhbl">工具</p>
+            <p class="ratio" data-page-node-id="98Hf7I9gqVgVBgK8zj4bSi">MCP server 5 个 · 需个人凭据 2 个</p>
+          </div>
+        </div>
+
+        <span class="auth__stamp" aria-hidden="true" data-page-node-id="3nEYeit5aDZURIHIL6iNB2">v1.0</span>
+      </section>
+
+      <!-- 右：操作板。登录与「首登强制改密」是同一条链路的两态 -->
+      <main class="auth__panel" aria-label="登录表单" data-page-node-id="QfqPb9oNwmdxyHr2CDjKFl">
+        <div class="auth__form stack" data-state-root="" data-page-node-id="kdoAopBVCbdFUxj2BJf6G7">
+          <div class="row" data-page-node-id="98KHwy98C43uLOgjZc1YUm">
+            <h2 style="font-size: var(--fs-lg)" data-page-node-id="FTKDN9ieLqpijWBed8XAFc">登录工作台</h2>
+            <div class="seg u-right" role="group" aria-label="切换登录与改密视图" data-page-node-id="xrNFWS50NejWKGHIWUz0k3">
+              <button type="button" data-state-btn="login" aria-pressed="true" data-page-node-id="rRNtDe9BD2jHAEdNbmWlaV">登录</button>
+              <button type="button" data-state-btn="password" aria-pressed="false" data-page-node-id="ffoVQRBePAFjG9sxrlJ55X">首登改密</button>
+            </div>
+          </div>
+
+          <!-- 状态一：登录 -->
+          <div data-state="login" class="stack stack--tight" data-page-node-id="UpGHO7f4XDp8ByUW2HdyBI">
+            <div class="field" data-page-node-id="L0rEg42LKnoyBikKUl5nCq">
+              <label class="field__label" for="login-user" data-page-node-id="7sO6H2GBNzASuQmUhFMcqR">用户名</label>
+              <input class="input" id="login-user" autocomplete="username" value="zhangh" data-page-node-id="Ym5BHcYemFvi8C2ho30JsA">
+            </div>
+            <div class="field" data-page-node-id="sIUbGAnLIya8qRIgNdgeEF">
+              <label class="field__label" for="login-pass" data-page-node-id="BvPagniN71vM4cdKbGKXMF">密码</label>
+              <input class="input" id="login-pass" type="password" autocomplete="current-password" value="········">
+            </div>
+
+            <div class="alert alert--warn" role="alert" data-page-node-id="3nVjoo1fxzj5Uepk96kGyc">
+              <span class="alert__icon" aria-hidden="true" data-page-node-id="s7RM92sK44x4cIdZWKsdOp">▲</span>
+              <div class="alert__body" data-page-node-id="2KIr5GD79G4LTBDFeF1dMF">
+                <p data-page-node-id="Opefvz3Y5uudiVZIui9XCJ">用户名或密码不正确。已失败 <span class="num" data-page-node-id="k7ulT7wNCLXCYgwa8l75fQ">3</span> 次，连续 <span class="num" data-page-node-id="TGMNwSZunSfC12PK1EBVDD">5</span> 次将锁定账号 <span class="num" data-page-node-id="14rMHsIE6y4OYIVa1ZgQaa">15</span> 分钟。</p>
+              </div>
+            </div>
+
+            <button class="btn btn--primary" type="button" data-toast="正在校验…" data-code="POST /api/auth/login" data-page-node-id="jOOXruAro8Fz3CEctg9q6K">
+              登录
+            </button>
+
+            <div class="row" style="margin-top: var(--sp-2)" data-page-node-id="3HAgYYDv1bEK2GHz10yDIp">
+              <button class="btn btn--link" type="button" data-state-btn-jump="password" data-page-node-id="hZrXb3zslUxKWR1lyT3sVS">首次登录？先改初始密码</button>
+            </div>
+          </div>
+
+          <!-- 状态二：首登强制改密 -->
+          <div data-state="password" class="stack stack--tight" data-page-node-id="7XLbX85IG8QXtgGgksjBpb" hidden="">
+            <div class="alert alert--info" data-page-node-id="otNF032SsOvz7HMh9DOy77">
+              <span class="alert__icon" aria-hidden="true" data-page-node-id="DTfwTSsq8WBD0hX7WE8t70">i</span>
+              <div class="alert__body" data-page-node-id="eEOt60UCKs6Z1OOnp6f1ft">
+                <p data-page-node-id="XiVegQFjwRY7V4P58rD9Xy">你正在使用管理员下发的初始密码，<strong data-page-node-id="hCrNd0284ocfLSwjKQKbCZ">必须修改后才能进入工作台</strong>。改密成功后其他设备的会话会全部失效。</p>
+              </div>
+            </div>
+
+            <div class="field" data-page-node-id="C32T9UFG5Zt6FZwBn20QqW">
+              <label class="field__label" for="new-pass" data-page-node-id="0Jb47AeU0MRl4NM3G3OXVW">新密码 <span class="req" aria-hidden="true" data-page-node-id="y7SDzLKJkYt47yzpQdNbBS">*</span></label>
+              <input class="input" id="new-pass" type="password" aria-describedby="pass-meter" data-page-node-id="NxU5rhTS1lM2zo8ZmDcxcX">
+              <div class="row" id="pass-meter" data-page-node-id="mxHhRdHqyGEyqN3xj1UCiE">
+                <span class="meter" data-page-node-id="6BCFjSq1nwPiowHUj5L8xm">
+                  <span class="meter__track" style="width: 96px" data-page-node-id="bZlElWIjEwAp42VEoowGHJ">
+                    <span class="meter__fill" style="width: 72%" data-page-node-id="fiZldeAoRQSFmQArW2QFX3"></span>
+                  </span>
+                  <span class="meter__val" data-page-node-id="6lnDyXKLSBnKs7HRboqN7F">强度 良</span>
+                </span>
+                <span class="field__hint" data-page-node-id="mkQ2DIfhFfHvNTJz8ICbjY">≥10 位，含大小写字母与数字</span>
+              </div>
+            </div>
+
+            <div class="field" data-page-node-id="gFcCoE9zElupvsIgtSzRz3">
+              <label class="field__label" for="new-pass2" data-page-node-id="t0NVHK3yFJUnbjEq8DAyKA">确认新密码 <span class="req" aria-hidden="true" data-page-node-id="JDsxxtC1QJFBBQnePnnOaG">*</span></label>
+              <input class="input" id="new-pass2" type="password" aria-invalid="true" data-page-node-id="qMOuk9zcm481ry8EfFbbt2">
+              <p class="field__error" data-page-node-id="4tRnBFvn9h7R7ovYfih0o7"><span aria-hidden="true" data-page-node-id="lBYDxrAco7oEyosRDNHBkL">▲</span> 两次输入的密码不一致</p>
+            </div>
+
+            <div class="row" style="margin-top: var(--sp-2); gap: var(--sp-3)" data-page-node-id="YcjhByCkDNA7S6CNMbQ8Mr">
+              <button class="btn btn--primary" type="button" data-toast="密码已更新，正在进入工作台" data-code="200" data-tone="ok" data-page-node-id="o8sifwQqoh8J7FUaA6e5G8">
+                保存并进入
+              </button>
+              <button class="btn" type="button" data-state-btn-jump="login" data-page-node-id="nfNppPd4Rh88FPNoDSGaBn">返回登录</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="auth__foot" data-page-node-id="5bcTusLunBCCUTfZUI0Ys0">
+          <p class="kicker" data-page-node-id="I1XU5cJFBqv2ow0jW4GeVJ">仅限内部使用 · 操作留痕 · 忘记密码请联系管理员重置</p>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast-stack" aria-live="polite" data-page-node-id="e0DSwBPRjHPFoH30jVOZBW"></div>
+    <script src="./scripts/app.js"></script>
+    <script>
+      /* 登录页的两态切换：复用同一套分段控件语义（data-state-root） */
+      document.querySelectorAll('[data-state-btn-jump]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var name = btn.dataset.stateBtnJump
+          document.querySelectorAll('.auth__form [data-state]').forEach(function (pane) {
+            pane.hidden = pane.dataset.state !== name
+          })
+          document.querySelectorAll('.auth__form [data-state-btn]').forEach(function (b) {
+            b.setAttribute('aria-pressed', String(b.dataset.stateBtn === name))
+          })
+        })
+      })
+    </script>
+  
+
+</body></html>

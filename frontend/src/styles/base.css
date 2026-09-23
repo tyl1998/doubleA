@@ -1,0 +1,205 @@
+/* ============================================================================
+   base.css —— 重置、排版、氛围层、焦点与降级动效
+   ----------------------------------------------------------------------------
+   ⚠️ 与 `design/styles/base.css` 逐字对齐（视觉真相来源）。改动请同时改两边。
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--fs-base);
+  line-height: var(--lh-body);
+  letter-spacing: var(--ls-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* --- 氛围层 ①：蓝图网格。固定铺底，8px 细线 + 64px 加重，永不参与交互 ------------- */
+.blueprint::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--grid-line-major) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line-major) 1px, transparent 1px),
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 64px 64px, 64px 64px, 8px 8px, 8px 8px;
+}
+
+/* --- 氛围层 ②：颗粒。3.5% 不透明度叠加，去掉数字化的绝对平整 --------------------- */
+.blueprint::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.035;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* --- 排版 ------------------------------------------------------------------------ */
+h1, h2, h3, h4 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 800;
+  letter-spacing: var(--ls-display);
+  line-height: var(--lh-snug);
+}
+
+h1 { font-size: var(--fs-2xl); }
+h2 { font-size: var(--fs-lg); }
+h3 { font-size: var(--fs-md); }
+
+p { margin: 0 0 var(--sp-4); }
+p:last-child { margin-bottom: 0; }
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+a:hover { text-decoration: underline; text-decoration-thickness: 1px; }
+
+ul, ol { margin: 0 0 var(--sp-4); padding-left: 1.25em; }
+li { margin-bottom: var(--sp-1); }
+
+code, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
+
+::selection { background: var(--accent-wash); }
+
+/* --- 焦点：全局可见，2px + 2px 偏移 ------------------------------------------------ */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* --- 滚动条：细、无色、贴合图纸感 -------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--rule-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--r-full);
+}
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* --- 等宽标签 / 序列号（本设计的记忆点之一） -------------------------------------- */
+.kicker {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.seq {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.num { font-variant-numeric: tabular-nums; }
+
+/* --- 入场编排：统一 6 组、间隔 80ms、只动 opacity + translateY --------------------- */
+.reveal {
+  opacity: 0;
+  transform: translateY(18px);
+}
+.reveal.is-in {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+.reveal.is-in:nth-child(2) { transition-delay: 80ms; }
+.reveal.is-in:nth-child(3) { transition-delay: 160ms; }
+.reveal.is-in:nth-child(4) { transition-delay: 240ms; }
+.reveal.is-in:nth-child(5) { transition-delay: 320ms; }
+.reveal.is-in:nth-child(6) { transition-delay: 400ms; }
+
+/* --- 降级：系统要求减少动效时，全部关闭 -------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .reveal { opacity: 1; transform: none; }
+}
+
+/* --- Markdown 渲染（对话页助手消息，P0-1-32 起消费） ------------------------------- */
+.md {
+  font-size: var(--fs-base);
+  line-height: var(--lh-body);
+  word-break: break-word;
+}
+.md > * + * { margin-top: var(--sp-4); }
+.md h3 {
+  font-family: var(--font-body);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.md pre {
+  margin: 0;
+  padding: var(--sp-4);
+  overflow-x: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  line-height: 1.65;
+}
+.md code {
+  padding: 1px 5px;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-xs);
+}
+.md pre code { padding: 0; background: none; border: 0; }
+.md blockquote {
+  margin: 0;
+  padding: var(--sp-2) 0 var(--sp-2) var(--sp-5);
+  border-left: 2px solid var(--rule-strong);
+  color: var(--ink-2);
+}
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+.md th, .md td {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--rule);
+  text-align: left;
+}
+.md th { background: var(--surface-2); font-weight: 600; }
+.md a { text-decoration: underline; text-decoration-thickness: 1px; }

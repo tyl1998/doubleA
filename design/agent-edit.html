@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>编辑智能体｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+    <!-- 页面级构成：四区表单 + 右侧常驻摘要栏 + 底部吸底保存条（docs/03 §4.2 单页滚动，不做向导） -->
+    <style>
+      .form-section {
+        border-left: 2px solid var(--rule-strong);
+        padding-left: var(--sp-5);
+        transition: border-color var(--dur-base) ease-out;
+      }
+      /* 保存失败时：未保存的区块用左侧刻度变红标注，而不是弹一句"保存失败"了事 */
+      .form-section.is-dirty { border-left-color: var(--danger); }
+      .form-section__head {
+        display: flex;
+        align-items: baseline;
+        gap: var(--sp-3);
+        margin-bottom: var(--sp-4);
+      }
+      .savebar {
+        position: sticky;
+        bottom: 0;
+        z-index: 12;
+        display: flex;
+        align-items: center;
+        gap: var(--sp-3);
+        margin-top: var(--sp-7);
+        padding: var(--sp-4) var(--sp-5);
+        background: color-mix(in srgb, var(--surface) 92%, transparent);
+        backdrop-filter: blur(10px);
+        border-top: 1px solid var(--rule-strong);
+        border-radius: var(--r-sm) var(--r-sm) 0 0;
+      }
+      .aside-card { position: sticky; top: calc(var(--topbar-h) + var(--sp-5)); }
+      .guide-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-3); align-items: center; }
+    </style>
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" aria-current="page" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--ok" title="后端 :13000 连接正常"></span>
+          <span class="rail__serial num">S-03 · 编辑</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li><a class="nav__item" href="./agents.html" aria-current="page">智能体</a></li>
+              <li><a class="nav__item" href="./knowledge.html">知识库</a></li>
+              <li><a class="nav__item" href="./mcp.html">MCP<span class="nav__badge">2</span></a></li>
+              <li><a class="nav__item" href="./chat.html">对话</a></li>
+              <li><a class="nav__item" href="./index.html">管理</a></li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">浅色</button>
+            <button class="avatar" type="button" data-open="user-menu" aria-haspopup="menu">
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <button class="menu__item" type="button" data-close role="menuitem">用户管理</button>
+            <button class="menu__item" type="button" data-close role="menuitem">模型池管理</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <main class="page">
+          <nav class="crumb" aria-label="面包屑">
+            <a href="./agents.html">智能体</a>
+            <span class="crumb__sep" aria-hidden="true">/</span>
+            <span class="crumb__here">编辑 · 运维问答助手</span>
+          </nav>
+
+          <div class="page__head">
+            <div>
+              <h1>编辑智能体</h1>
+              <p class="page__lead">
+                保存会串行发出两个请求：先 <code>PATCH /api/agents/:id</code> 更新文本字段，再
+                <code>PUT /api/agents/:id/components</code> 整体替换组件绑定。任一失败都会停留本页，并标出未保存的区块。
+              </p>
+            </div>
+            <div class="page__head-actions">
+              <span class="tag tag--accent">CHATBOT</span>
+              <span class="tag" title="类型创建后不可修改">类型锁定</span>
+            </div>
+          </div>
+
+          <div class="split split--form">
+            <form class="stack" style="gap: var(--sp-7)" onsubmit="return false">
+              <!-- ① 基本信息 -->
+              <section class="form-section reveal">
+                <div class="form-section__head">
+                  <span class="kicker">01 / 基本信息</span>
+                  <span class="led led--ok" title="已同步"></span>
+                </div>
+                <div class="stack stack--tight">
+                  <div class="field">
+                    <label class="field__label" for="f-name">名称 <span class="req" aria-hidden="true">*</span></label>
+                    <input class="input" id="f-name" value="运维问答助手" />
+                  </div>
+                  <div class="field">
+                    <label class="field__label" for="f-desc">描述</label>
+                    <input class="input" id="f-desc" value="回答部署与排障问题，只用内部手册作答" />
+                    <p class="field__hint">留空即清空该字段（三态：不带 = 不改，null = 清空）</p>
+                  </div>
+                  <div class="field">
+                    <span class="field__label">类型</span>
+                    <div class="row" style="gap: var(--sp-3)">
+                      <label class="check" style="flex: 1">
+                        <input type="radio" name="agent-type" value="chatbot" checked />
+                        <span>
+                          <span class="check__title">ChatBot</span>
+                          <span class="check__meta">即时问答，一轮一轮对话</span>
+                        </span>
+                      </label>
+                      <label class="check" style="flex: 1; opacity: 0.6">
+                        <input type="radio" name="agent-type" value="taskagent" disabled />
+                        <span>
+                          <span class="check__title">TaskAgent</span>
+                          <span class="check__meta">带沙箱与产物面板，创建后不可改</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <!-- ② 模型 -->
+              <section class="form-section reveal">
+                <div class="form-section__head">
+                  <span class="kicker">02 / 模型</span>
+                  <span class="led led--ok" title="已同步"></span>
+                </div>
+                <div class="field">
+                  <label class="field__label" for="f-model">对话模型</label>
+                  <select class="select" id="f-model">
+                    <option selected>deepseek-chat · 上下文 64K · 不支持图片</option>
+                    <option>gpt-4o-mini · 上下文 128K · 支持图片</option>
+                  </select>
+                  <p class="field__hint">仅列出已启用的 CHAT 模型，与「模型池」里可用列表逐条一致</p>
+                </div>
+              </section>
+
+              <!-- ③ 提示词（演示"保存失败后标红"的区块） -->
+              <section class="form-section is-dirty">
+                <div class="form-section__head">
+                  <span class="kicker">03 / 提示词</span>
+                  <span class="tag tag--danger">未保存</span>
+                </div>
+                <div class="stack stack--tight">
+                  <div class="field">
+                    <label class="field__label" for="f-system">系统提示词</label>
+                    <textarea class="textarea" id="f-system" style="min-height: 148px">你是内部运维助手。只依据检索到的内部手册回答；检索不到就直说"手册中没有这条"，不要编造。
+回答用中文，先给结论，再给依据（引用文档名与章节）。</textarea>
+                    <p class="field__hint">不自动裁剪首尾空白；长度上限 8 000 字</p>
+                  </div>
+                  <div class="field">
+                    <label class="field__label" for="f-opening">开场白</label>
+                    <textarea class="textarea" id="f-opening" style="min-height: 76px">我是运维问答助手，可以解答部署、扩容与排障问题。你可以直接描述现象。</textarea>
+                  </div>
+                  <div class="field">
+                    <span class="field__label">引导问题</span>
+                    <div class="stack stack--tight">
+                      <div class="guide-row">
+                        <input class="input" value="扩容后新节点不接流量，怎么排查？" />
+                        <button class="btn btn--sm" type="button" data-toast="已移除该引导问题" data-code="200">移除</button>
+                      </div>
+                      <div class="guide-row">
+                        <input class="input" value="如何把沙箱并发从 4 调到 8？" />
+                        <button class="btn btn--sm" type="button" data-toast="已移除该引导问题" data-code="200">移除</button>
+                      </div>
+                      <button class="btn btn--sm" type="button" data-toast="已追加一条空引导问题" data-code="200">
+                        + 添加引导问题
+                      </button>
+                    </div>
+                    <p class="field__hint">点击后填入输入框、可编辑后再发送（不直接发送）</p>
+                  </div>
+                </div>
+              </section>
+
+              <!-- ④ 组件绑定 -->
+              <section class="form-section reveal">
+                <div class="form-section__head">
+                  <span class="kicker">04 / 组件绑定</span>
+                  <span class="led led--ok" title="已同步"></span>
+                </div>
+
+                <div class="stack">
+                  <div>
+                    <p class="field__label" style="margin-bottom: var(--sp-3)">知识库</p>
+                    <div class="stack stack--tight">
+                      <label class="check">
+                        <input type="checkbox" checked />
+                        <span>
+                          <span class="check__title">运维手册（v3）</span>
+                          <span class="check__meta">128 个片段 · 最近更新 2 天前</span>
+                        </span>
+                      </label>
+                      <label class="check">
+                        <input type="checkbox" />
+                        <span>
+                          <span class="check__title">网络拓扑与变更记录</span>
+                          <span class="check__meta">74 个片段 · 最近更新 3 周前</span>
+                        </span>
+                      </label>
+                      <label class="check">
+                        <input type="checkbox" />
+                        <span>
+                          <span class="check__title">历史事故复盘</span>
+                          <span class="check__meta">11 个片段 · 1 个文档解析失败</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div class="row" style="margin-bottom: var(--sp-3)">
+                      <p class="field__label" style="margin: 0">MCP 工具</p>
+                      <a class="btn btn--link" href="./mcp.html?serverId=git">去配置凭据</a>
+                      <span class="dot-badge u-right"><span aria-hidden="true">●</span> 1 个 server 未配置凭据</span>
+                    </div>
+                    <div class="stack stack--tight">
+                      <label class="check">
+                        <input type="checkbox" checked />
+                        <span>
+                          <span class="check__title">git · 3 个工具</span>
+                          <span class="check__meta">已配置凭据 · 代表你本人调用</span>
+                        </span>
+                      </label>
+                      <label class="check" style="border-color: color-mix(in srgb, var(--danger) 34%, transparent)">
+                        <input type="checkbox" checked />
+                        <span>
+                          <span class="check__title">jira · 5 个工具 <span class="dot-badge">● 未配置凭据</span></span>
+                          <span class="check__meta">未配置时调用会返回 <code>NEED_CREDENTIAL</code>，工具卡片会给出配置入口</span>
+                        </span>
+                      </label>
+                      <label class="check">
+                        <input type="checkbox" />
+                        <span>
+                          <span class="check__title">http-fetch · 1 个工具</span>
+                          <span class="check__meta">无需凭据</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="alert alert--info">
+                    <span class="alert__icon" aria-hidden="true">i</span>
+                    <div class="alert__body">
+                      <p>
+                        组件绑定保存时是<strong>整体替换</strong>：取消勾选即解除绑定，不会删除知识库或 server 本身。
+                        绑定信息写入独立的 <code>agent_components</code> 表。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <!-- 保存失败提示：明确指出哪个区块没保存成功 -->
+              <div class="alert alert--danger reveal" role="alert">
+                <span class="alert__icon" aria-hidden="true">▲</span>
+                <div class="alert__body">
+                  <p><strong>提示词未保存成功</strong>（422 VALIDATION_ERROR）</p>
+                  <p class="ratio">
+                    字段 <code>systemPrompt</code> 超过 8 000 字上限。组件绑定已保存成功，本次不会回滚——
+                    修正后只重发文本字段即可。
+                  </p>
+                </div>
+                <div class="alert__actions">
+                  <button class="btn btn--sm" type="button" data-toast="仅重发文本字段…" data-code="PATCH">仅重试该项</button>
+                </div>
+              </div>
+
+              <div class="savebar">
+                <span class="ratio">最后保存：09-22 15:04 · 由 张航</span>
+                <div class="row u-right" style="gap: var(--sp-3)">
+                  <a class="btn btn--quiet" href="./agents.html">取消</a>
+                  <button class="btn btn--primary" type="button" data-toast="两个请求已串行完成" data-code="200" data-tone="ok">
+                    保存
+                  </button>
+                </div>
+              </div>
+            </form>
+
+            <!-- 右侧常驻摘要：把"这个智能体是什么"固定住，滚动表单时始终可见 -->
+            <aside class="aside-card stack stack--tight">
+              <div class="card bracket card--pad reveal">
+                <p class="kicker">摘要</p>
+                <p style="font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 800; letter-spacing: -0.02em; margin-top: var(--sp-3)">
+                  运维问答助手
+                </p>
+                <div class="stack stack--tight" style="margin-top: var(--sp-4)">
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">类型</span>
+                    <span class="ratio">CHATBOT</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">模型</span>
+                    <span class="ratio">deepseek-chat</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">知识库</span>
+                    <span class="ratio">1 个</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">MCP 工具</span>
+                    <span class="ratio">2 个 server</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto; border-bottom: 0">
+                    <span class="swatch__name">会话数</span>
+                    <span class="ratio">12</span>
+                  </div>
+                </div>
+                <a class="btn btn--sm" href="./chat.html" style="margin-top: var(--sp-5); width: 100%">用这个智能体开一个会话</a>
+              </div>
+
+              <div class="card card--flat card--pad reveal">
+                <p class="kicker">危险区</p>
+                <p class="ratio" style="margin-top: var(--sp-3)">
+                  删除智能体会级联删除它的 12 个会话与全部消息，且不可恢复。
+                </p>
+                <button class="btn btn--sm btn--danger" type="button" style="margin-top: var(--sp-4)" data-toast="请在列表中确认影响范围后再删除" data-code="GUARD">
+                  删除该智能体
+                </button>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+  </body>
+</html>

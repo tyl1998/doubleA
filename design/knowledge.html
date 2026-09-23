@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>知识库详情 · 运维手册｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" aria-current="page" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--warn" title="1 个文档解析失败"></span>
+          <span class="rail__serial num">S-05 · 知识库</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li><a class="nav__item" href="./agents.html">智能体</a></li>
+              <li><a class="nav__item" href="./knowledge.html" aria-current="page">知识库</a></li>
+              <li><a class="nav__item" href="./mcp.html">MCP<span class="nav__badge">2</span></a></li>
+              <li><a class="nav__item" href="./chat.html">对话</a></li>
+              <li><a class="nav__item" href="./index.html">管理</a></li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">浅色</button>
+            <button class="avatar" type="button" data-open="user-menu" aria-haspopup="menu">
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <main class="page">
+          <nav class="crumb" aria-label="面包屑">
+            <a href="./knowledge.html">知识库</a>
+            <span class="crumb__sep" aria-hidden="true">/</span>
+            <span class="crumb__here">运维手册（v3）</span>
+          </nav>
+
+          <div class="page__head">
+            <div>
+              <h1>运维手册（v3）</h1>
+              <p class="page__lead">
+                4 个文档 · 213 个片段 · 被 2 个智能体引用。检索走向量 + 全文双路，RRF 融合后取 topK。
+              </p>
+            </div>
+            <div class="page__head-actions">
+              <button class="btn" type="button" data-open="test-drawer">检索测试</button>
+              <button class="btn btn--primary" type="button" data-open="upload-modal">上传文档</button>
+            </div>
+          </div>
+
+          <div class="split split--form">
+            <div class="stack">
+              <!-- 上传白名单拦截：选到 .doc 立即提示，不发请求 -->
+              <div class="alert alert--warn" role="alert">
+                <span class="alert__icon" aria-hidden="true">▲</span>
+                <div class="alert__body">
+                  <p><strong>「复盘-0908.doc」已拒收</strong>：本平台只解析 md / pdf / docx / txt 四类格式，旧版 .doc 不在白名单内。</p>
+                  <p class="ratio">拦截发生在前端 accept 白名单，未发起上传请求</p>
+                </div>
+                <div class="alert__actions">
+                  <button class="btn btn--sm btn--quiet" type="button" data-close>知道了</button>
+                </div>
+              </div>
+
+              <!-- 文档表格：三种状态同屏展示（解析中 / 完成 / 失败） -->
+              <div class="table-wrap reveal">
+                <table class="table" aria-label="知识库文档列表">
+                  <thead>
+                    <tr>
+                      <th scope="col">文件名</th>
+                      <th scope="col">状态</th>
+                      <th scope="col">片段数</th>
+                      <th scope="col">更新时间</th>
+                      <th scope="col" style="text-align: right">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        <span class="table__name">运维手册-v3.md</span>
+                        <span class="table__sub num">1.2 MB · md</span>
+                      </td>
+                      <td><span class="row" style="gap: var(--sp-2)"><span class="led led--ok"></span><span>已完成</span></span></td>
+                      <td class="num">128</td>
+                      <td class="num">09-20 14:12</td>
+                      <td>
+                        <div class="table__ops">
+                          <button class="btn btn--link" type="button" data-toast="开始下载原始文件" data-code="200">下载</button>
+                          <button class="btn btn--link" type="button" data-open="upload-modal">覆盖重传</button>
+                          <button class="btn btn--link is-danger" type="button" data-pop="doc-del">删除</button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <span class="table__name">变更记录-0918.pdf</span>
+                        <span class="table__sub num">3.4 MB · pdf</span>
+                      </td>
+                      <td><span class="row" style="gap: var(--sp-2)"><span class="led led--run"></span><span>解析中 · 42%</span></span></td>
+                      <td class="ratio">—</td>
+                      <td class="num">09-22 17:38</td>
+                      <td>
+                        <div class="table__ops">
+                          <button class="btn btn--link" type="button" data-toast="开始下载原始文件" data-code="200">下载</button>
+                          <button class="btn btn--link is-danger" type="button" data-pop="doc-del">删除</button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <span class="table__name">复盘-0912.pdf</span>
+                        <span class="table__sub num">8.9 MB · pdf · 扫描件</span>
+                      </td>
+                      <td>
+                        <span class="row" style="gap: var(--sp-2)">
+                          <span class="led led--fail"></span><span>失败</span>
+                        </span>
+                        <span class="table__sub">未抽取到文本（疑似扫描件）</span>
+                      </td>
+                      <td class="ratio">0</td>
+                      <td class="num">09-21 09:03</td>
+                      <td>
+                        <div class="table__ops">
+                          <button class="btn btn--link" type="button" data-toast="已重新入队解析" data-code="202" data-tone="ok">重试</button>
+                          <button class="btn btn--link" type="button" data-toast="开始下载原始文件" data-code="200">下载</button>
+                          <button class="btn btn--link is-danger" type="button" data-pop="doc-del">删除</button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <span class="table__name">网络拓扑.txt</span>
+                        <span class="table__sub num">62 KB · txt</span>
+                      </td>
+                      <td><span class="row" style="gap: var(--sp-2)"><span class="led led--ok"></span><span>已完成</span></span></td>
+                      <td class="num">23</td>
+                      <td class="num">09-14 16:41</td>
+                      <td>
+                        <div class="table__ops">
+                          <button class="btn btn--link" type="button" data-toast="开始下载原始文件" data-code="200">下载</button>
+                          <button class="btn btn--link" type="button" data-open="upload-modal">覆盖重传</button>
+                          <button class="btn btn--link is-danger" type="button" data-pop="doc-del">删除</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="table__foot">
+                  <span class="num">共 4 个文档 · 解析中的文档每 5s 自动刷新</span>
+                  <div class="pager"><button type="button" aria-current="true">1</button></div>
+                </div>
+              </div>
+
+              <!-- 行内确认：普通删除用 Popconfirm，不用弹窗 -->
+              <div style="position: relative; height: 0">
+                <div class="popconfirm" id="doc-del" hidden style="top: 8px; right: 0">
+                  <span class="popconfirm__arrow" aria-hidden="true"></span>
+                  <p>删除后该文档的 128 个片段与向量一并移除，绑定它的智能体将检索不到这些内容。</p>
+                  <div class="popconfirm__foot">
+                    <button class="btn btn--sm" type="button" data-close>取消</button>
+                    <button class="btn btn--sm btn--danger" type="button" data-close data-toast="已删除文档与 128 个片段" data-code="200" data-tone="ok">
+                      删除
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 检索配置 -->
+              <div class="card">
+                <div class="card__head">
+                  <p class="card__title">检索配置</p>
+                  <div class="card__head-right">
+                    <span class="tag">不落库 · 每次请求传入</span>
+                  </div>
+                </div>
+                <div class="card__body">
+                  <div class="split split--3" style="gap: var(--sp-5)">
+                    <div class="field">
+                      <label class="field__label" for="kb-mode">检索模式</label>
+                      <select class="select" id="kb-mode">
+                        <option selected>hybrid · 向量 + 全文</option>
+                        <option>vector · 仅向量</option>
+                        <option>fulltext · 仅全文</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label class="field__label" for="kb-topk">topK</label>
+                      <input class="input num" id="kb-topk" value="8" />
+                    </div>
+                    <div class="field">
+                      <label class="field__label" for="kb-chunk">分块字符数</label>
+                      <input class="input num" id="kb-chunk" value="800" />
+                      <p class="field__hint">下限 50（代码常量）</p>
+                    </div>
+                  </div>
+                  <div class="row" style="margin-top: var(--sp-5); gap: var(--sp-3)">
+                    <button class="btn btn--primary" type="button" data-toast="检索配置已保存" data-code="200" data-tone="ok">保存配置</button>
+                    <button class="btn" type="button" data-open="test-drawer">用当前配置试检索</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧摘要：知识库体量一眼可见 -->
+            <aside class="stack stack--tight">
+              <div class="card bracket card--pad">
+                <p class="kicker">体量</p>
+                <div class="stack stack--tight" style="margin-top: var(--sp-4)">
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">文档</span><span class="ratio num">4（1 失败）</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">片段</span><span class="ratio num">213</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto">
+                    <span class="swatch__name">向量维度</span><span class="ratio num">1 024</span>
+                  </div>
+                  <div class="swatch" style="grid-template-columns: 1fr auto; border-bottom: 0">
+                    <span class="swatch__name">引用它的智能体</span><span class="ratio num">2</span>
+                  </div>
+                </div>
+                <p class="ratio" style="margin-top: var(--sp-5)">
+                  删除知识库前需先解除这些智能体的绑定，否则接口返回 409。
+                </p>
+              </div>
+              <div class="card card--flat card--pad">
+                <p class="kicker">解析失败的原因怎么看</p>
+                <p class="ratio" style="margin-top: var(--sp-3)">
+                  扫描件、加密 PDF、纯图片文档都会落在 FAILED。表格里直接给出原因与「重试」，不需要去翻日志。
+                </p>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 检索测试抽屉：双路得分 + 融合排名 + 命中库（子方案① §六 B1 的新增列） -->
+    <div class="drawer" id="test-drawer" hidden>
+      <div class="drawer__panel" role="dialog" aria-modal="true" aria-labelledby="test-title">
+        <div class="drawer__head">
+          <h2 class="modal__title" id="test-title">检索测试</h2>
+          <span class="tag">topK 8 · hybrid</span>
+          <button class="btn btn--sm u-right" type="button" data-toast="已跑一次双路检索" data-code="200" data-tone="ok">重新检索</button>
+          <button class="btn btn--sm btn--quiet" type="button" data-close>关闭</button>
+        </div>
+        <div class="drawer__body stack">
+          <div class="field">
+            <label class="field__label" for="test-q">查询</label>
+            <input class="input" id="test-q" value="索引重建期间检索超时怎么处理" />
+            <p class="field__hint">检索参数不落库：topK / mode 每次请求随查询传入</p>
+          </div>
+
+          <div class="table-wrap">
+            <table class="table table--dense" aria-label="检索结果">
+              <thead>
+                <tr>
+                  <th scope="col">内容片段</th>
+                  <th scope="col">向量分</th>
+                  <th scope="col">全文分</th>
+                  <th scope="col">融合排名</th>
+                  <th scope="col">命中库</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>索引重建期间检索请求出现 3 次超时，均已由重试覆盖…</td>
+                  <td>
+                    <span class="meter">
+                      <span class="meter__track"><span class="meter__fill" style="width: 88%"></span></span>
+                      <span class="meter__val">0.88</span>
+                    </span>
+                  </td>
+                  <td class="ratio">—</td>
+                  <td class="num">#1</td>
+                  <td class="ratio">运维手册</td>
+                </tr>
+                <tr>
+                  <td>重建索引前建议先扩副本；超时阈值由 SEARCH_TIMEOUT_MS 控制…</td>
+                  <td>
+                    <span class="meter">
+                      <span class="meter__track"><span class="meter__fill" style="width: 74%"></span></span>
+                      <span class="meter__val">0.74</span>
+                    </span>
+                  </td>
+                  <td>
+                    <span class="meter">
+                      <span class="meter__track"><span class="meter__fill meter__fill--alt" style="width: 52%"></span></span>
+                      <span class="meter__val">0.52</span>
+                    </span>
+                  </td>
+                  <td class="num">#2</td>
+                  <td class="ratio">运维手册</td>
+                </tr>
+                <tr>
+                  <td>全文路独有命中：变更单里提到「检索」与「超时」两个词的段落</td>
+                  <td class="ratio">—</td>
+                  <td>
+                    <span class="meter">
+                      <span class="meter__track"><span class="meter__fill meter__fill--alt" style="width: 61%"></span></span>
+                      <span class="meter__val">0.61</span>
+                    </span>
+                  </td>
+                  <td class="num">#3</td>
+                  <td class="ratio">变更记录</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="ratio">
+            未命中的那一路显示为 <strong>—</strong>（接口返回空值而非 0），避免把"没参与排序"误读成"得分很低"。
+            融合排名是 RRF 复算后的最终顺序，与页面上的展示顺序一致。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 上传弹窗：白名单 + 拖拽区 + 覆盖重传语义 -->
+    <div class="scrim" id="upload-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+        <div class="modal__head">
+          <h2 class="modal__title" id="upload-title">上传文档</h2>
+          <span class="tag">md / pdf / docx / txt</span>
+        </div>
+        <div class="modal__body">
+          <div class="empty" style="padding: var(--sp-7) var(--sp-5); border: 1px dashed var(--rule-control); border-radius: var(--r-sm)">
+            <div class="empty__frame" aria-hidden="true"></div>
+            <p class="empty__title">把文件拖到这里</p>
+            <p class="empty__lead">单文件 ≤100 MB。同名文件将视为覆盖重传：旧片段先删后建，期间该文档不可检索。</p>
+            <button class="btn" type="button" data-toast="已选择 2 个文件" data-code="200">选择文件</button>
+          </div>
+          <div class="alert alert--warn">
+            <span class="alert__icon" aria-hidden="true">▲</span>
+            <div class="alert__body">
+              <p>「复盘-0908.doc」格式不在白名单内，已跳过（前端拦截，未发起请求）。</p>
+            </div>
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button class="btn" type="button" data-close>取消</button>
+          <button class="btn btn--primary" type="button" data-close data-toast="已入队 2 个文档，开始解析" data-code="202" data-tone="ok">
+            开始上传
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+  </body>
+</html>

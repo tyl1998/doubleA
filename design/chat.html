@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>对话 · 周报生成器｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <!-- 对话页全屏：仪表轨保留，其余导航收进「工作台」下拉，避免导航孤岛（docs/03 §三） -->
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" aria-current="page" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--run" title="本会话正在生成"></span>
+          <span class="rail__serial num">S-04 · 对话</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li>
+                <button class="nav__item" type="button" data-open="workspace-menu">
+                  工作台 ▾
+                </button>
+              </li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <span class="ratio num">沙箱并发 4 / 8</span>
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">浅色</button>
+            <button class="avatar" type="button" data-open="user-menu" aria-haspopup="menu">
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="workspace-menu" role="menu" hidden>
+            <p class="menu__label">工作台</p>
+            <a class="menu__item" href="./agents.html" role="menuitem">智能体列表</a>
+            <a class="menu__item" href="./knowledge.html" role="menuitem">知识库</a>
+            <a class="menu__item" href="./mcp.html" role="menuitem">MCP 与我的凭据</a>
+            <a class="menu__item" href="./index.html" role="menuitem">任务中心（P1）</a>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <!-- 断线黄条：点击 = 立即拉取历史对齐（本页可用顶部「演示」按钮唤出） -->
+        <button class="offline-bar" type="button" data-offline-bar hidden>
+          <span aria-hidden="true">▲</span> 连接已中断，正在使用本地已收到的内容 · 点击立即与后端对齐
+        </button>
+
+        <div class="chat chat--with-panel">
+          <!-- ==================== 会话侧栏 ==================== -->
+          <aside class="sidebar" aria-label="会话列表">
+            <div class="sidebar__head">
+              <button class="btn btn--primary" type="button" style="width: 100%" data-toast="已新建会话，等待第一条消息" data-code="201" data-tone="ok">
+                + 新会话
+              </button>
+            </div>
+            <ul class="sidebar__list">
+              <li class="sidebar__group">今天</li>
+              <li>
+                <div class="conv" aria-current="true" tabindex="0">
+                  <p class="conv__title">本周部署变更周报</p>
+                  <p class="conv__meta">
+                    <span class="led led--run"></span><span>生成中</span><span>·</span><span class="num">2 分钟前</span>
+                  </p>
+                  <div class="conv__ops">
+                    <button type="button" title="重命名" aria-label="重命名会话" data-toast="进入行内重命名" data-code="EDIT">✎</button>
+                    <button type="button" title="删除" aria-label="删除会话" data-open="conv-delete">✕</button>
+                  </div>
+                </div>
+              </li>
+              <li>
+                <!-- 行内重命名态：直接在原位编辑，不开弹窗 -->
+                <div class="conv">
+                  <input class="input" value="沙箱并发怎么调" aria-label="会话名称" style="min-height: 28px" />
+                  <div class="row" style="gap: var(--sp-2); margin-top: var(--sp-2)">
+                    <button class="btn btn--sm btn--primary" type="button" data-toast="已重命名" data-code="200" data-tone="ok">保存</button>
+                    <button class="btn btn--sm" type="button" data-toast="已取消" data-code="200">取消</button>
+                  </div>
+                </div>
+              </li>
+              <li>
+                <div class="conv" tabindex="0">
+                  <p class="conv__title">检索测试：RRF 融合排序</p>
+                  <p class="conv__meta"><span class="led led--idle"></span><span>已完成</span><span>·</span><span class="num">3 小时前</span></p>
+                  <div class="conv__ops">
+                    <button type="button" title="重命名" aria-label="重命名会话">✎</button>
+                    <button type="button" title="删除" aria-label="删除会话">✕</button>
+                  </div>
+                </div>
+              </li>
+              <li class="sidebar__group">更早</li>
+              <li>
+                <div class="conv" tabindex="0">
+                  <p class="conv__title">JIRA 凭据配置排查</p>
+                  <p class="conv__meta"><span class="led led--fail"></span><span>已失败</span><span>·</span><span class="num">昨天 18:20</span></p>
+                  <div class="conv__ops">
+                    <button type="button" title="重命名" aria-label="重命名会话">✎</button>
+                    <button type="button" title="删除" aria-label="删除会话">✕</button>
+                  </div>
+                </div>
+              </li>
+              <li>
+                <div class="conv" tabindex="0">
+                  <p class="conv__title">上线检查单模板</p>
+                  <p class="conv__meta"><span class="led led--idle"></span><span>已停止</span><span>·</span><span class="num">昨天 11:02</span></p>
+                  <div class="conv__ops">
+                    <button type="button" title="重命名" aria-label="重命名会话">✎</button>
+                    <button type="button" title="删除" aria-label="删除会话">✕</button>
+                  </div>
+                </div>
+              </li>
+            </ul>
+          </aside>
+
+          <!-- ==================== 消息流 ==================== -->
+          <main class="chat__main" aria-label="当前会话">
+            <div class="chat__head">
+              <div>
+                <h1 class="chat__title">周报生成器</h1>
+                <p class="ratio">TASKAGENT · deepseek-chat · 沙箱 linux/amd64</p>
+              </div>
+              <div class="chat__head-right">
+                <!-- 演示控制：把"非正常态"也做成可走查的样本，而不是只写进文档 -->
+                <div class="seg" role="group" aria-label="演示非常规状态">
+                  <button type="button" data-offline-toggle>断线</button>
+                  <button type="button" data-pop="queued-pop">排队</button>
+                  <button type="button" data-confirm-open>确认卡</button>
+                </div>
+                <span class="tag tag--accent">RUNNING</span>
+              </div>
+            </div>
+
+            <div class="stream">
+              <div class="stream__inner">
+                <!-- 开场白：纯文本，不解析 Markdown；新会话态即展示 -->
+                <article class="msg msg--agent reveal">
+                  <p class="msg__head"><span class="led led--idle"></span>周报生成器 · 开场白</p>
+                  <div class="bubble bubble--agent">
+                    我是周报生成器：把本周的部署、事故与会话记录整理成一份直接可发的周报草稿。
+                    我会先查内部记录，再在沙箱里汇总成 Markdown 文件。
+                  </div>
+                  <div class="stack stack--tight" style="margin-top: var(--sp-2)">
+                    <p class="kicker">引导问题 · 点击填入输入框</p>
+                    <ul class="stack stack--tight" style="list-style: none; padding: 0; margin: 0">
+                      <li>
+                        <button class="btn btn--sm" type="button" data-fill="把本周的部署变更整理成周报草稿，附上相关的事故复盘片段。">
+                          把本周的部署变更整理成周报草稿
+                        </button>
+                      </li>
+                      <li>
+                        <button class="btn btn--sm" type="button" data-fill="本周有哪些会话失败？逐个说明原因。">
+                          本周有哪些会话失败？逐个说明原因
+                        </button>
+                      </li>
+                    </ul>
+                  </div>
+                </article>
+
+                <!-- 用户消息 -->
+                <article class="msg msg--user reveal">
+                  <p class="msg__head"><span class="num">09-22 17:41</span>· 张航</p>
+                  <div class="bubble bubble--user" data-demo-user>
+                    把本周的部署变更整理成周报草稿，附上相关的事故复盘片段。
+                  </div>
+                </article>
+
+                <!-- 助手消息：思考 → 工具 → 正文 → 引用 → 产物（顺序即 SSE 事件到达顺序） -->
+                <article class="msg msg--agent reveal">
+                  <p class="msg__head"><span class="led led--run"></span>周报生成器</p>
+
+                  <details class="think" data-demo-think open>
+                    <summary class="think__head">
+                      <span>思考过程 · 4 步 · 2.1s</span>
+                      <span class="think__caret" aria-hidden="true">›</span>
+                    </summary>
+                    <div class="think__body">
+                      1. 先确认统计区间：本周一 00:00 至周日 24:00。<br />
+                      2. 需要两类材料：部署变更记录（知识库「变更记录」）与事故复盘（知识库「事故复盘」）。<br />
+                      3. 汇总属机械工作，放进沙箱写文件，避免占用上下文。<br />
+                      4. 事故复盘里有 1 个文档解析失败，需要在周报里标注"材料不全"。
+                    </div>
+                  </details>
+
+                  <!-- 工具卡：成功 -->
+                  <details class="tool tool--ok" style="margin-top: var(--sp-3)">
+                    <summary class="tool__head">
+                      <span class="tool__name">kb.search</span>
+                      <span class="tool__arg">query="本周 部署变更" · topK=8 · hybrid</span>
+                      <span class="tool__head-right">
+                        <span class="tag tag--ok">成功</span>
+                        <span class="ratio num">312ms</span>
+                        <span class="think__caret" aria-hidden="true">›</span>
+                      </span>
+                    </summary>
+                    <div class="tool__body">
+                      <div class="code-block">{
+  "mode": "hybrid",
+  "hits": 8,
+  "top": [
+    { "doc": "变更记录-0916.md", "rank": 1, "rrf": 0.0328 },
+    { "doc": "变更记录-0918.md", "rank": 2, "rrf": 0.0291 }
+  ]
+}</div>
+                    </div>
+                  </details>
+
+                  <!-- 工具卡：运行中（脉冲状态灯） -->
+                  <details class="tool tool--run" style="margin-top: var(--sp-3)" open>
+                    <summary class="tool__head">
+                      <span class="tool__name">sandbox.exec</span>
+                      <span class="tool__arg">python3 build_report.py --week 2026-W39</span>
+                      <span class="tool__head-right">
+                        <span class="row" style="gap: var(--sp-2)"><span class="led led--run"></span><span class="ratio">运行中</span></span>
+                        <span class="ratio num">1.4s</span>
+                        <span class="think__caret" aria-hidden="true">›</span>
+                      </span>
+                    </summary>
+                    <div class="tool__body">
+                      <div class="code-block">[sandbox] 正在汇总 14 条变更记录…</div>
+                    </div>
+                  </details>
+
+                  <!-- 工具卡：失败 + 需配置凭据 → 直达凭据页（带 serverId 定位） -->
+                  <div class="tool tool--fail" style="margin-top: var(--sp-3)">
+                    <div>
+                      <div class="tool__head">
+                        <span class="tool__name">mcp.jira.create_issue</span>
+                        <span class="tool__arg">project=OPS · summary="W39 部署变更"</span>
+                        <span class="tool__head-right">
+                          <span class="tag tag--danger">失败</span>
+                          <span class="ratio num">NEED_CREDENTIAL</span>
+                        </span>
+                      </div>
+                      <div class="tool__body">
+                        <p style="font-size: var(--fs-sm)">你还没有为 jira 配置个人凭据，因此这次调用没有发出。</p>
+                        <div class="row" style="margin-top: var(--sp-3)">
+                          <a class="btn btn--sm btn--primary" href="./mcp.html?serverId=jira">去配置凭据</a>
+                          <button class="btn btn--sm" type="button" data-toast="已跳过该工具，继续生成" data-code="200">跳过并继续</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 助手正文：Markdown 渲染 -->
+                  <div class="md" style="margin-top: var(--sp-4)">
+                    <p>本周（W39）共 <strong>14 条</strong>部署变更，其中 2 条需要关注：</p>
+                    <table>
+                      <thead>
+                        <tr><th>日期</th><th>变更</th><th>结果</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr><td class="num">09-16</td><td>网关限流阈值下调</td><td>正常</td></tr>
+                        <tr><td class="num">09-18</td><td>沙箱并发 4 → 8</td><td>正常</td></tr>
+                        <tr><td class="num">09-19</td><td>向量库索引重建</td><td>需关注：耗时 41 分钟</td></tr>
+                      </tbody>
+                    </table>
+                    <pre><code># 可暂时调大并发，但注意内存
+SANDBOX_MAX_CONCURRENCY=8</code></pre>
+                    <p data-delta-target>
+                      草稿已写入沙箱，稍后作为产物附上。事故复盘部分有一篇文档解析失败，下面引用里已标出，需要在发送前人工补一段。
+                    </p>
+                  </div>
+
+                  <div class="msg__tools">
+                    <button type="button" data-copy="msg-body-1">复制全文</button>
+                    <button type="button" data-toast="已打开重试菜单" data-code="RETRY">重新生成</button>
+                  </div>
+
+                  <!-- 引用卡：citations 事件到达时出现，未命中则整块不出现 -->
+                  <div class="cites" style="margin-top: var(--sp-3)">
+                    <div class="cites__head">
+                      <span class="kicker">引用 · 3 篇</span>
+                      <span class="ratio u-right">向量 + 全文双路，RRF 融合排序</span>
+                    </div>
+                    <details class="cite" open>
+                      <summary>
+                        <span class="cite__idx">01</span>
+                        <span>变更记录-0918.md</span>
+                        <span class="cite__score num">rrf 0.0328</span>
+                      </summary>
+                      <p class="cite__snippet">
+                        …将 <mark>SANDBOX_MAX_CONCURRENCY</mark> 由 4 调整为 8 后，压测峰值 TPS 提升 62%，内存占用上升至 78%…
+                      </p>
+                    </details>
+                    <details class="cite">
+                      <summary>
+                        <span class="cite__idx">02</span>
+                        <span>事故复盘-0919.md</span>
+                        <span class="cite__score num">rrf 0.0291</span>
+                      </summary>
+                      <p class="cite__snippet">…索引重建期间检索请求出现 3 次超时，均已由重试覆盖，未影响用户…</p>
+                    </details>
+                    <details class="cite">
+                      <summary>
+                        <span class="cite__idx">03</span>
+                        <span>事故复盘-0912.pdf</span>
+                        <span class="cite__tag"></span>
+                        <span class="cite__score num">解析失败 · 无片段</span>
+                      </summary>
+                      <p class="cite__snippet">
+                        <span class="tag tag--danger">FAILED</span>
+                        该文档解析失败（扫描件无可抽取文本），未进入检索。周报中已标注"材料不全"。
+                      </p>
+                    </details>
+                  </div>
+
+                  <!-- 产物卡 -->
+                  <div class="artifact" style="margin-top: var(--sp-3)">
+                    <span class="artifact__kind" aria-hidden="true">MD</span>
+                    <div>
+                      <p class="artifact__name">W39-周报草稿.md</p>
+                      <p class="artifact__meta num">8.4 KB · 刚生成</p>
+                    </div>
+                    <div class="artifact__ops">
+                      <button class="btn btn--sm" type="button" data-open="preview-drawer">预览</button>
+                      <button class="btn btn--sm" type="button" data-toast="开始下载 W39-周报草稿.md" data-code="200">下载</button>
+                    </div>
+                  </div>
+
+                  <p class="ratio num" style="margin-top: var(--sp-3)">
+                    done · COMPLETE · 12.4s · tokens 3 186 in / 942 out
+                  </p>
+                  <p class="ratio num" style="margin-top: var(--sp-1)" hidden data-stopped-badge>
+                    已停止 · finishReason=STOPPED · 已生成内容保留
+                  </p>
+                </article>
+              </div>
+            </div>
+
+            <!-- 输入区状态机：idle → streaming → (confirm 锁输入) → idle -->
+            <form class="composer" data-chat-demo onsubmit="return false">
+              <div class="composer__inner">
+                <!-- 确认卡：到达即锁输入区，带 120s 倒计时 -->
+                <div class="confirm-card" data-demo-confirm hidden>
+                  <div class="confirm-card__head">
+                    <span class="led led--warn"></span>
+                    <p class="confirm-card__title">工具请求确认：sandbox.exec</p>
+                    <span class="countdown" data-countdown>120s</span>
+                  </div>
+                  <div class="confirm-card__body">
+                    <p style="font-size: var(--fs-sm)">该操作会删除沙箱中的中间文件，可能影响本次生成的产物：</p>
+                    <div class="code-block">rm -rf /workspace/.cache/*</div>
+                    <p class="ratio">来源：工具 sandbox.exec · 请求 ID call_7f21 · 超时后按「取消」处理</p>
+                  </div>
+                  <div class="confirm-card__foot">
+                    <button class="btn btn--primary" type="button" data-confirm-close data-toast="已确认，继续执行" data-code="200" data-tone="ok">
+                      确认
+                    </button>
+                    <button class="btn" type="button" data-confirm-close>取消</button>
+                  </div>
+                </div>
+
+                <div class="composer__box">
+                  <button class="btn btn--quiet btn--sm tap" type="button" aria-label="附件（P1）" disabled title="附件功能 P1 交付">📎</button>
+                  <label for="chat-input" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">输入消息</label>
+                  <textarea id="chat-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"></textarea>
+                  <button class="btn btn--primary" type="button" data-send>发送</button>
+                  <button class="btn" type="button" data-stop hidden>停止</button>
+                </div>
+
+                <div class="composer__hint">
+                  <span><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+                  <span>流式中仍可输入，发送按钮暂不可用</span>
+                  <span class="composer__state num">state: <span data-chat-state>idle</span></span>
+                </div>
+              </div>
+            </form>
+          </main>
+
+          <!-- ==================== 产物面板（TaskAgent 独有） ==================== -->
+          <aside class="panel" aria-label="产物面板">
+            <div class="panel__head">
+              <div class="row">
+                <p class="kicker">产物 · 3</p>
+                <span class="led led--run u-right"></span>
+              </div>
+              <p class="ratio" style="margin-top: var(--sp-2)">artifact 事件驱动 · 会话级隔离</p>
+            </div>
+            <div class="panel__body">
+              <div class="artifact">
+                <span class="artifact__kind" aria-hidden="true">MD</span>
+                <div>
+                  <p class="artifact__name">W39-周报草稿.md</p>
+                  <p class="artifact__meta num">8.4 KB · 刚生成</p>
+                </div>
+              </div>
+              <div class="artifact">
+                <span class="artifact__kind" aria-hidden="true">CSV</span>
+                <div>
+                  <p class="artifact__name">变更清单.csv</p>
+                  <p class="artifact__meta num">2.1 KB · 6 分钟前</p>
+                </div>
+              </div>
+              <div class="artifact">
+                <span class="artifact__kind" aria-hidden="true">LOG</span>
+                <div>
+                  <p class="artifact__name">build_report.log</p>
+                  <p class="artifact__meta num">14 KB · 6 分钟前</p>
+                </div>
+              </div>
+              <div class="alert alert--info" style="margin-top: var(--sp-3)">
+                <span class="alert__icon" aria-hidden="true">i</span>
+                <div class="alert__body">
+                  <p class="ratio">产物保存在沙箱工作目录，空闲回收后仍可从对象存储下载。</p>
+                </div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <!-- 排队提示（F 包 queued 事件） -->
+    <div class="popconfirm" id="queued-pop" hidden style="position: fixed; top: 96px; right: 32px">
+      <span class="popconfirm__arrow" aria-hidden="true"></span>
+      <p class="ratio">沙箱并发已满时的提示形态（queued 事件携带位次）：</p>
+      <div class="queued" style="margin-top: var(--sp-3)">
+        <span class="led led--warn"></span> 排队第 2 位 · 前方 1 个会话
+      </div>
+    </div>
+
+    <!-- 删除会话：级联确认（Modal + 红色危险按钮 + 明示影响范围） -->
+    <div class="scrim" id="conv-delete" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="conv-delete-title">
+        <div class="modal__head">
+          <h2 class="modal__title" id="conv-delete-title">删除会话「本周部署变更周报」</h2>
+          <span class="tag tag--danger">级联</span>
+        </div>
+        <div class="modal__body">
+          <div class="impact">
+            <p><strong>将同时删除该会话的 6 条消息</strong>（含 4 次工具调用记录、3 条引用与 1 个产物索引）。</p>
+            <p style="margin-top: var(--sp-3)">删除会话不影响智能体、知识库与已下载到本地的产物文件。</p>
+          </div>
+          <div class="field">
+            <label class="field__label" for="conv-delete-confirm">该操作不可恢复，请输入「删除」以确认</label>
+            <input class="input" id="conv-delete-confirm" placeholder="删除" />
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button class="btn" type="button" data-close>取消</button>
+          <button class="btn btn--danger" type="button" data-close data-toast="已删除会话与 6 条消息" data-code="200" data-tone="ok">
+            确认删除
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 文件预览（MD 走 react-markdown 渲染，统一为抽屉） -->
+    <div class="drawer" id="preview-drawer" hidden>
+      <div class="drawer__panel" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+        <div class="drawer__head">
+          <h2 class="modal__title" id="preview-title">W39-周报草稿.md</h2>
+          <span class="tag">MD</span>
+          <button class="btn btn--sm u-right" type="button" data-toast="开始下载" data-code="200">下载</button>
+          <button class="btn btn--sm btn--quiet" type="button" data-close>关闭</button>
+        </div>
+        <div class="drawer__body">
+          <div class="card card--pad">
+            <div class="md">
+              <h3>W39 部署变更周报</h3>
+              <p>本周共 14 条变更，2 条需关注。</p>
+              <table>
+                <thead><tr><th>日期</th><th>变更</th><th>结果</th></tr></thead>
+                <tbody>
+                  <tr><td class="num">09-16</td><td>网关限流阈值下调</td><td>正常</td></tr>
+                  <tr><td class="num">09-18</td><td>沙箱并发 4 → 8</td><td>正常</td></tr>
+                </tbody>
+              </table>
+              <blockquote>材料不全：事故复盘-0912.pdf 解析失败，未纳入统计。</blockquote>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+    <script>
+      /* 引导问题：点击填入输入框，可编辑后再发送（不直接发送 —— docs/03 §4.1） */
+      document.querySelectorAll('[data-fill]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var input = document.getElementById('chat-input')
+          if (!input) return
+          input.value = btn.dataset.fill
+          input.focus()
+        })
+      })
+    </script>
+  </body>
+</html>

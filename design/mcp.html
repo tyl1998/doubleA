@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MCP 与我的凭据｜doubuleA 工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+    <style>
+      /* 凭据参数模板编辑器：行式编辑，三列固定（key / label / 注入位置） */
+      .tmpl-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 132px auto;
+        gap: var(--sp-3);
+        align-items: center;
+      }
+      .cred-group + .cred-group { margin-top: var(--sp-5); }
+    </style>
+  </head>
+  <body class="blueprint">
+    <div class="shell">
+      <aside class="rail" aria-label="全局导航">
+        <a class="rail__mark" href="./index.html" aria-label="doubuleA 工作台">A</a>
+        <div class="rail__rule" aria-hidden="true"></div>
+        <ul class="rail__nav">
+          <li><a class="rail__btn" href="./index.html" title="设计定调">00</a></li>
+          <li><a class="rail__btn" href="./login.html" title="登录 / 首登改密">LG</a></li>
+          <li><a class="rail__btn" href="./agents.html" title="智能体列表">AG</a></li>
+          <li><a class="rail__btn" href="./agent-edit.html" title="智能体编辑">ED</a></li>
+          <li><a class="rail__btn" href="./chat.html" title="对话页">CH</a></li>
+          <li><a class="rail__btn" href="./knowledge.html" title="知识库详情">KB</a></li>
+          <li><a class="rail__btn" href="./mcp.html" aria-current="page" title="MCP 与凭据">MC</a></li>
+        </ul>
+        <div class="rail__status">
+          <span class="led led--warn" title="2 个 server 未配置个人凭据"></span>
+          <span class="rail__serial num">S-06 · MCP</span>
+        </div>
+      </aside>
+
+      <div>
+        <header class="topbar">
+          <a class="topbar__brand" href="./index.html">doubuleA <span>工作台</span></a>
+          <nav aria-label="主导航">
+            <ul class="nav">
+              <li><a class="nav__item" href="./agents.html">智能体</a></li>
+              <li><a class="nav__item" href="./knowledge.html">知识库</a></li>
+              <li><a class="nav__item" href="./mcp.html" aria-current="page">MCP<span class="nav__badge">2</span></a></li>
+              <li><a class="nav__item" href="./chat.html">对话</a></li>
+              <li><a class="nav__item" href="./index.html">管理</a></li>
+            </ul>
+          </nav>
+          <div class="topbar__right">
+            <button class="btn btn--sm btn--quiet" type="button" data-theme-toggle aria-pressed="false">浅色</button>
+            <button class="avatar" type="button" data-open="user-menu" aria-haspopup="menu">
+              <span class="avatar__face" aria-hidden="true">ZH</span>
+              <span class="avatar__meta">
+                <span class="avatar__name">张航</span>
+                <span class="avatar__role">ADMIN</span>
+              </span>
+            </button>
+          </div>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <p class="menu__label">当前身份 · ADMIN</p>
+            <button class="menu__item" type="button" data-close role="menuitem">修改密码</button>
+            <div class="menu__sep" aria-hidden="true"></div>
+            <button class="menu__item" type="button" data-close role="menuitem">退出登录</button>
+          </div>
+        </header>
+
+        <main class="page">
+          <!-- ============ S-06a：/mcp —— server 管理 ============ -->
+          <nav class="crumb" aria-label="面包屑">
+            <a href="./index.html">工作台</a>
+            <span class="crumb__sep" aria-hidden="true">/</span>
+            <span class="crumb__here">MCP server</span>
+          </nav>
+
+          <div class="page__head">
+            <div>
+              <h1>MCP server</h1>
+              <p class="page__lead">
+                5 个已注册 server · 共 12 个工具。工具列表带缓存，点「测试」会重新握手并刷新工具数。
+              </p>
+            </div>
+            <div class="page__head-actions">
+              <a class="btn" href="#credentials">
+                我的凭据 <span class="dot-badge"><span aria-hidden="true">●</span> 2</span>
+              </a>
+              <button class="btn btn--primary" type="button" data-open="server-modal">注册 server</button>
+            </div>
+          </div>
+
+          <div class="table-wrap reveal">
+            <table class="table" aria-label="MCP server 列表">
+              <thead>
+                <tr>
+                  <th scope="col">名称</th>
+                  <th scope="col">endpoint</th>
+                  <th scope="col">工具数</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">我的凭据</th>
+                  <th scope="col" style="text-align: right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><span class="table__name">git</span><span class="table__sub">代码仓库读写</span></td>
+                  <td class="num" style="font-size: var(--fs-xs)">https://mcp.internal/git</td>
+                  <td class="num">3</td>
+                  <td><span class="row" style="gap: var(--sp-2)"><span class="led led--ok"></span><span>正常</span></span></td>
+                  <td><span class="tag tag--ok">已配置</span></td>
+                  <td>
+                    <div class="table__ops">
+                      <button class="btn btn--link" type="button" data-toast="握手成功，刷新到 3 个工具" data-code="200" data-tone="ok">测试</button>
+                      <button class="btn btn--link" type="button" data-open="server-modal">编辑</button>
+                      <button class="btn btn--link is-danger" type="button" data-pop="server-del">删除</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr id="server-jira">
+                  <td><span class="table__name">jira</span><span class="table__sub">工单查询与创建</span></td>
+                  <td class="num" style="font-size: var(--fs-xs)">https://mcp.internal/jira</td>
+                  <td class="num">5</td>
+                  <td><span class="row" style="gap: var(--sp-2)"><span class="led led--warn"></span><span>待配置凭据</span></span></td>
+                  <td><span class="dot-badge"><span aria-hidden="true">●</span> 未配置</span></td>
+                  <td>
+                    <div class="table__ops">
+                      <button class="btn btn--link" type="button" data-toast="握手成功，刷新到 5 个工具" data-code="200" data-tone="ok">测试</button>
+                      <button class="btn btn--link" type="button" data-open="server-modal">编辑</button>
+                      <button class="btn btn--link is-danger" type="button" data-pop="server-del">删除</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td><span class="table__name">http-fetch</span><span class="table__sub">抓取公开网页</span></td>
+                  <td class="num" style="font-size: var(--fs-xs)">https://mcp.internal/fetch</td>
+                  <td class="num">1</td>
+                  <td><span class="row" style="gap: var(--sp-2)"><span class="led led--ok"></span><span>正常</span></span></td>
+                  <td><span class="tag">无需凭据</span></td>
+                  <td>
+                    <div class="table__ops">
+                      <button class="btn btn--link" type="button" data-toast="握手成功，刷新到 1 个工具" data-code="200" data-tone="ok">测试</button>
+                      <button class="btn btn--link" type="button" data-open="server-modal">编辑</button>
+                      <button class="btn btn--link is-danger" type="button" data-pop="server-del">删除</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td><span class="table__name">postgres-ops</span><span class="table__sub">只读查询运维库</span></td>
+                  <td class="num" style="font-size: var(--fs-xs)">https://mcp.internal/pg</td>
+                  <td class="num">2</td>
+                  <td><span class="row" style="gap: var(--sp-2)"><span class="led led--fail"></span><span>握手失败</span></span></td>
+                  <td><span class="tag tag--ok">已配置</span></td>
+                  <td>
+                    <div class="table__ops">
+                      <button class="btn btn--link" type="button" data-toast="重试中…" data-code="RETRY">重试</button>
+                      <button class="btn btn--link" type="button" data-open="server-modal">编辑</button>
+                      <button class="btn btn--link is-danger" type="button" data-pop="server-del">删除</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="table__foot">
+              <span class="num">共 4 条 / 5 个 server（1 条被禁用后隐藏）· 每页 20</span>
+              <div class="pager"><button type="button" aria-current="true">1</button></div>
+            </div>
+          </div>
+
+          <div style="position: relative; height: 0">
+            <div class="popconfirm" id="server-del" hidden style="top: 8px; right: 0">
+              <span class="popconfirm__arrow" aria-hidden="true"></span>
+              <p>删除后绑定它的智能体将失去这些工具，绑定关系会一并清理。</p>
+              <div class="popconfirm__foot">
+                <button class="btn btn--sm" type="button" data-close>取消</button>
+                <button class="btn btn--sm btn--danger" type="button" data-close data-toast="已删除 server 及绑定关系" data-code="200" data-tone="ok">
+                  删除
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ S-06b：/mcp/credentials ============ -->
+          <div class="page__head" id="credentials" style="margin-top: var(--sp-8)">
+            <div>
+              <p class="kicker">S-06b / MCP CREDENTIALS</p>
+              <h2 style="font-size: var(--fs-2xl)">我的凭据</h2>
+              <p class="page__lead">
+                凭据仅用于代表你调用该工具，不会展示给他人，也不会出现在会话记录里。未配置的 server 置顶。
+              </p>
+            </div>
+            <div class="page__head-actions">
+              <span class="tag tag--warn">2 个未配置</span>
+            </div>
+          </div>
+
+          <div class="alert alert--info" style="margin-bottom: var(--sp-5)">
+            <span class="alert__icon" aria-hidden="true">i</span>
+            <div class="alert__body">
+              <p>
+                从 Agent 编辑页或工具失败卡片跳转过来时会带 <code>?serverId=</code>：页面自动滚动到该 server 分组并高亮。
+                试一下 <a href="./mcp.html?serverId=jira">./mcp.html?serverId=jira</a>。
+              </p>
+            </div>
+          </div>
+
+          <div class="split split--form">
+            <div class="stack">
+              <!-- 未配置置顶：jira（本次定位目标） -->
+              <div class="cred-group card" id="cred-jira">
+                <div class="card__head">
+                  <p class="card__title">jira</p>
+                  <span class="dot-badge"><span aria-hidden="true">●</span> 未配置</span>
+                  <div class="card__head-right">
+                    <span class="ratio">5 个工具依赖这组凭据</span>
+                  </div>
+                </div>
+                <div class="card__body stack stack--tight">
+                  <div class="field">
+                    <label class="field__label" for="c-jira-token">Personal Access Token <span class="req" aria-hidden="true">*</span></label>
+                    <input class="input" id="c-jira-token" type="password" placeholder="粘贴 token，保存后不再回显" />
+                    <p class="field__hint">注入位置：HEADER · Authorization</p>
+                  </div>
+                  <div class="field">
+                    <label class="field__label" for="c-jira-site">Site</label>
+                    <input class="input" id="c-jira-site" placeholder="your-team.atlassian.net" />
+                    <p class="field__hint">注入位置：QUERY · site</p>
+                  </div>
+                  <div class="row" style="margin-top: var(--sp-3); gap: var(--sp-3)">
+                    <button class="btn btn--primary" type="button" data-toast="jira 凭据已保存，仅你可见" data-code="200" data-tone="ok">保存该 server 凭据</button>
+                    <button class="btn" type="button" data-toast="已测试：凭据可用" data-code="200" data-tone="ok">测试连通性</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 已配置：git -->
+              <div class="cred-group card" id="cred-git">
+                <div class="card__head">
+                  <p class="card__title">git</p>
+                  <span class="tag tag--ok">已配置</span>
+                  <div class="card__head-right">
+                    <span class="ratio">最近更新 09-20 14:02</span>
+                  </div>
+                </div>
+                <div class="card__body stack stack--tight">
+                  <div class="field">
+                    <label class="field__label" for="c-git-token">Access Token</label>
+                    <input class="input" id="c-git-token" type="password" value="················" />
+                    <p class="field__hint">留空保存 = 不修改（不会把掩码写回去）</p>
+                  </div>
+                  <div class="row" style="margin-top: var(--sp-3); gap: var(--sp-3)">
+                    <button class="btn btn--primary" type="button" data-toast="git 凭据已保存" data-code="200" data-tone="ok">保存该 server 凭据</button>
+                    <button class="btn btn--danger" type="button" data-toast="已清除该 server 的凭据" data-code="200">清除凭据</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <aside class="stack stack--tight">
+              <div class="card bracket card--pad">
+                <p class="kicker">安全边界</p>
+                <ul style="margin-top: var(--sp-4); padding-left: 1.1em; font-size: var(--fs-sm); color: var(--ink-2)">
+                  <li>凭据加密存储，界面上仅显示「已配置 / 未配置」</li>
+                  <li>列表接口永不返回明文或掩码</li>
+                  <li>调用日志只记 server 与工具名，不记凭据</li>
+                </ul>
+              </div>
+              <div class="card card--flat card--pad">
+                <p class="kicker">为什么会看到这一页</p>
+                <p class="ratio" style="margin-top: var(--sp-3)">
+                  三种入口：顶部「我的凭据」、Agent 编辑页的「未配置」红点、会话里失败工具卡片的「去配置凭据」。
+                </p>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 注册/编辑 server：基本信息 + 凭据参数模板编辑器 -->
+    <div class="scrim" id="server-modal" hidden>
+      <div class="modal" style="width: min(680px, 100%)" role="dialog" aria-modal="true" aria-labelledby="server-title">
+        <div class="modal__head">
+          <h2 class="modal__title" id="server-title">编辑 server「jira」</h2>
+          <span class="tag">MCP</span>
+        </div>
+        <div class="modal__body">
+          <div class="field">
+            <label class="field__label" for="srv-name">名称 <span class="req" aria-hidden="true">*</span></label>
+            <input class="input" id="srv-name" value="jira" />
+          </div>
+          <div class="field">
+            <label class="field__label" for="srv-url">endpoint <span class="req" aria-hidden="true">*</span></label>
+            <input class="input num" id="srv-url" value="https://mcp.internal/jira" />
+            <p class="field__hint">保存时会握手一次，握手失败不阻断保存，但列表状态会标为「握手失败」</p>
+          </div>
+
+          <div class="field">
+            <span class="field__label">凭据参数模板</span>
+            <p class="field__hint" style="margin-bottom: var(--sp-3)">
+              模板决定「我的凭据」页出现哪些输入项，以及它们注入到请求的哪个位置（HEADER / QUERY / BODY）。
+            </p>
+            <div class="stack stack--tight">
+              <div class="tmpl-row">
+                <input class="input num" value="Authorization" aria-label="参数 key" />
+                <input class="input" value="Personal Access Token" aria-label="参数 label" />
+                <select class="select" aria-label="注入位置">
+                  <option selected>HEADER</option>
+                  <option>QUERY</option>
+                  <option>BODY</option>
+                </select>
+                <button class="btn btn--sm" type="button" data-toast="已移除该参数" data-code="200">移除</button>
+              </div>
+              <div class="tmpl-row">
+                <input class="input num" value="site" aria-label="参数 key" />
+                <input class="input" value="Site 域名" aria-label="参数 label" />
+                <select class="select" aria-label="注入位置">
+                  <option>HEADER</option>
+                  <option selected>QUERY</option>
+                  <option>BODY</option>
+                </select>
+                <button class="btn btn--sm" type="button" data-toast="已移除该参数" data-code="200">移除</button>
+              </div>
+              <button class="btn btn--sm" type="button" style="align-self: flex-start" data-toast="已追加一行参数模板" data-code="200">
+                + 添加参数
+              </button>
+            </div>
+          </div>
+
+          <div class="alert alert--warn">
+            <span class="alert__icon" aria-hidden="true">▲</span>
+            <div class="alert__body">
+              <p>删除或改名已被用户填过的参数，会清除对应已保存的凭据。此提示需二次确认后才生效。</p>
+            </div>
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button class="btn" type="button" data-close>取消</button>
+          <button class="btn btn--primary" type="button" data-close data-toast="已保存，握手成功（5 个工具）" data-code="200" data-tone="ok">
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite"></div>
+    <script src="./scripts/app.js"></script>
+    <script>
+      /* ?serverId=xxx 定位：滚动到分组并高亮 —— 从 Agent 编辑页 / 工具失败卡片直达同一处 */
+      (function () {
+        var params = new URLSearchParams(window.location.search)
+        var id = params.get('serverId')
+        if (!id) return
+        var target = document.getElementById('cred-' + id)
+        if (!target) return
+        target.scrollIntoView({ block: 'center' })
+        target.classList.add('target-flash')
+      })()
+    </script>
+  </body>
+</html>

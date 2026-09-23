@@ -4,8 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>doubuleA 工作台</title>
+    <!--
+      ⚠️ 这里刻意**没有** webfont 的 <link>。
+      外部字体 CSS 是渲染阻塞资源，网络受限时会白屏到超时；
+      改由 `src/styles/webfonts.ts` 在挂载后动态插入（可接受降级，中文本就由系统字体承接）。
+    -->
   </head>
-  <body>
+  <!--
+    `blueprint` 是氛围层的钩子：`styles/base.css` 用它挂 8px/64px 蓝图网格与颗粒
+    （两个 `position:fixed; pointer-events:none` 的伪元素，不参与布局也不吃点击）。
+  -->
+  <body class="blueprint">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
