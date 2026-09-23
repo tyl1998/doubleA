@@ -45,7 +45,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   // 已落地 ⇒ 不带 `batch`（P0-1-31 起把首页换成真实的智能体列表；编辑页不带导航项，
   // 它由列表与摘要卡进入，屏号在 `SERIAL_BY_PREFIX` 里）
   { code: 'AG', label: '智能体', path: '/', serial: 'S-02 · 智能体' },
-  { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库', batch: 'P0-1-35' },
+  // 已落地 ⇒ 不带 `batch`（P0-1-35 把知识库列表与详情换成真实页面）
+  { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库' },
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP', batch: 'P0-2（MCP 端点尚未存在）' },
   {
     code: 'CR',

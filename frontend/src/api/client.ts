@@ -273,6 +273,163 @@ export async function openEventStream(
 }
 
 /**
+ * 发起一次 **multipart 上传**（P0-1-35 的知识库文档上传/覆盖重建专用）。
+ *
+ * 为什么不复用 {@link request}：那个函数的 body 一律 `JSON.stringify` + `content-type: application/json`。
+ * 文件必须走 `FormData`，而 **`content-type` 绝对不能让调用方（或我们）手工设置** ——
+ * 它要带着 `boundary=…`，浏览器会自己填；写死了就会得到一个"服务端说不是 multipart"的 400，
+ * 看起来像后端不认这个端点。
+ *
+ * 响应仍是**统一信封**（`{document, deduplicated}` / `{document, unchanged}`），
+ * 所以信封解析照旧走 {@link unwrapEnvelope} —— 上传端点的失败（400 扩展名/MIME/魔数不符、
+ * 413 超限、404 知识库不存在）都是标准信封，与普通接口**完全一致**。
+ *
+ * ⚠️ 本仓的 upload 端点**只接受一个文件字段** `UPLOAD_FILE_FIELD`（`shared/src/document.ts`）：
+ * 多文件不是"多传几个"，而是 **413**（`routes/documents.ts` 的 `bodyLimit` 与 multipart 插件的
+ * 口径）。所以界面上是**单文件选择**，由 `pages/knowledge/knowledgeModel.ts` 的
+ * `screenPickedFiles` 在发请求**之前**拦下多选/`.doc`/不支持的扩展名。
+ */
+export async function requestFormData<T>(
+  path: string,
+  formData: FormData,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  const { signal } = options
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      // ⚠️ **不设 `content-type`**（见上）
+      body: formData,
+      ...(signal === undefined ? {} : { signal }),
+    })
+  } catch (error) {
+    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
+    throw new ApiError(
+      NETWORK_ERROR_CODE,
+      error instanceof Error && error.message !== ''
+        ? `无法连接后端：${error.message}`
+        : '无法连接后端，请检查网络或后端是否已启动',
+      0,
+    )
+  }
+
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
+  }
+
+  return unwrapEnvelope<T>(payload, response.status)
+}
+
+/** 一次二进制下载的结果 */
+export interface DownloadedFile {
+  blob: Blob
+  /**
+   * 服务端 `Content-Disposition` 里给的文件名；**解析不出时为 `null`**
+   * （调用方据此退回"用文档自己的 `fileName`"—— 那是同一份数据的另一个出口）。
+   */
+  fileName: string | null
+}
+
+/**
+ * 从 `Content-Disposition` 里取文件名（RFC 6266 / 5987）。
+ *
+ * 后端是**双写**的（`buildContentDisposition`）：`filename="<ASCII 回落>"` +
+ * `filename*=UTF-8''<百分号编码>`，中文名只在后者里。所以取法必须**先看 `filename*`**，
+ * 否则中文文档下载下来会得到一个被问号替换的乱码名 —— 而它看起来像"浏览器的问题"。
+ *
+ * 解析不出（缺头 / 畸形）时返回 `null`，**不抛错**：文件名不是下载的必要条件
+ * （调用方有 `document.fileName` 可用，见 {@link DownloadedFile.fileName}）。
+ */
+export function fileNameFromContentDisposition(header: string | null): string | null {
+  if (header === null || header === '') return null
+
+  // ① `filename*=UTF-8''%E8%BF%90%E7%BB%B4.md`（带语言标签时形如 `UTF-8'zh-CN'…`）
+  const extended = /filename\*\s*=\s*([^;]+)/i.exec(header)
+  if (extended !== null) {
+    const raw = extended[1]?.trim() ?? ''
+    const parts = raw.split("'")
+    // `charset'lang'value` 三段；缺少引号说明头是畸形的（**不猜**，退回下一路）
+    if (parts.length >= 3) {
+      const encoded = parts.slice(2).join("'")
+      try {
+        const decoded = decodeURIComponent(encoded)
+        if (decoded !== '') return decoded
+      } catch {
+        // 百分号编码坏了 —— 继续看 `filename=`
+      }
+    }
+  }
+
+  // ② `filename="运维手册.md"`（ASCII 回落；也可能是未加引号的 token）
+  const plain = /filename\s*=\s*([^;]+)/i.exec(header)
+  if (plain === null) return null
+  const value = (plain[1] ?? '').trim().replace(/^"(.*)"$/u, '$1').replace(/\\(.)/gu, '$1')
+  return value === '' ? null : value
+}
+
+/**
+ * 下载一个**字节流**端点（P0-1-35 的"下载原始文件"）。
+ *
+ * ⚠️ 这是本仓**唯一**不套统一信封的端点（`docs/02` §4.6 的下载行）：**成功是字节流、
+ * 失败才是信封**。所以判据是**响应的形状**而不是状态码 —— 与 {@link openEventStream} 同一路数：
+ * 先看 `content-type` 是不是 JSON，是就按信封收口（能拿到可展示的服务端文案），
+ * 不是才当文件收下。
+ *
+ * 为什么不直接 `window.open(url)`（那样也能带上 Cookie）：① 失败时浏览器会**渲染那段 JSON**，
+ * 用户看到一页乱码而不知道是"文件已经不在了"；② 拿不到响应头里的文件名，中文名只能靠 URL 猜。
+ * 走 fetch + Blob 才能把失败变成一句人话。
+ */
+export async function requestBlob(path: string, options: { signal?: AbortSignal } = {}): Promise<DownloadedFile> {
+  const { signal } = options
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      credentials: 'include',
+      ...(signal === undefined ? {} : { signal }),
+    })
+  } catch (error) {
+    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
+    throw new ApiError(
+      NETWORK_ERROR_CODE,
+      error instanceof Error && error.message !== ''
+        ? `无法连接后端：${error.message}`
+        : '无法连接后端，请检查网络或后端是否已启动',
+      0,
+    )
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (contentType.includes('application/json')) {
+    let payload: unknown
+    try {
+      payload = await response.json()
+    } catch {
+      throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
+    }
+    // 信封里的失败会在这里抛出去；成功信封（理论上不会出现）会被下面那句拦下
+    const data = unwrapEnvelope<unknown>(payload, response.status)
+    throw new ApiError('INTERNAL', `期望文件字节流，但响应是统一信封（HTTP ${response.status}）`, response.status, data)
+  }
+
+  if (!response.ok) {
+    // 非 JSON 且非 2xx：网关回了个 HTML（本机最典型的成因是 vite proxy 串到了别的服务）
+    throw new ApiError('INTERNAL', `下载失败：响应不是 JSON 信封也不是文件（HTTP ${response.status}）`, response.status)
+  }
+
+  return {
+    blob: await response.blob(),
+    fileName: fileNameFromContentDisposition(response.headers.get('content-disposition')),
+  }
+}
+
+/**
  * 错误码 → 用户可读文案的**单点收敛**（`03` §六 坑预判：不收在一处，各页面各写一遍 toast，
  * 后续改口径要全仓搜）。
  *

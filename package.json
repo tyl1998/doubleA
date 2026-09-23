@@ -47,6 +47,7 @@
     "verify:chat-package": "pnpm --filter @doubulea/backend verify:chat-package",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
     "verify:chat-sse": "pnpm --filter @doubulea/frontend verify:chat-sse",
+    "verify:knowledge-ui": "pnpm --filter @doubulea/frontend verify:knowledge-ui",
     "serve:upstreams": "pnpm --filter @doubulea/backend serve:upstreams",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",

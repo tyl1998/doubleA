@@ -334,13 +334,10 @@ export function sectionsOfUpdateBody(body: UpdateAgentBody): AgentSectionKey[] {
 /**
  * 时间格式化：`09-22 15:04`（与原型一致）。
  *
- * 刻意**不用 `toLocaleString`**：它的输出随运行环境（语言 / 时区 / ICU 版本）变化，而这个读数
- * 会被拿来与文档、截图对照 —— 一个本地化格式会让"这里显示的时间对不对"变成不可判的事。
- * 取本地时区这一点是刻意的（用户看的是自己机器上的时间）。
+ * ⚠️ **P0-1-35 起实现搬到了 `app/format.ts`**（知识库列表也要显示"最近更新"，而"时间读数只
+ * 应该有一份写法"）。这里保留同名重导出，是为了让 P0-1-31 的页面与 `verify:chat-sse` 的
+ * import 路径**一字不动** —— 抽取公共模块时"对外导出与实现逐字未变"是本仓的重构口径
+ * （`06` §六 第 ② 条）。**不要再在这里写第二份实现**：验收档里有一条源码级守门
+ * （`formatUpdatedAt` 的定义在全仓恰好一处）。
  */
-export function formatUpdatedAt(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
+export { formatUpdatedAt } from '../../app/format.js'

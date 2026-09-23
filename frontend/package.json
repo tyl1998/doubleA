@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "verify:chat-sse": "node --import tsx scripts/verify-chat-sse.mjs",
+    "verify:knowledge-ui": "node --import tsx scripts/verify-knowledge-ui.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

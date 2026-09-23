@@ -580,6 +580,34 @@
 .agent-cell__name { font-weight: 500; color: var(--ink); }
 .agent-cell__sub { font-size: var(--fs-xs); color: var(--muted); }
 
+/* ================ 知识库：表格里的名称 / 状态 / 片段单元（P0-1-35） ============ */
+/* 与 `.agent-cell` **同一条规则**、只换了名字：两处都表达"两行单元"，合并成一条选择器列表
+   而不是复制一份 —— 复制出来的那份迟早单独被人改一次（比如给知识库多留一行），
+   于是"同样的单元格在两个页面长得不一样"。 */
+.kb-cell { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.kb-cell__name,
+.kb-cell__sub {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.kb-cell__name { font-weight: 500; color: var(--ink); }
+.kb-cell__sub { font-size: var(--fs-xs); color: var(--muted); }
+
+/* 检索测试抽屉里的命中片段（`hit.snippet` 是**原文窗口**，可能带整段换行 ⇒ 必须截断，
+   否则一行结果能把抽屉撑成几屏高，用户再也看不出"哪一条排在前面"）。
+   三行是刻意的：够看出命中上下文，又不至于让一屏放不下三条结果。 */
+.kb-snippet {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  font-size: var(--fs-sm);
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
 /* ================== 标签变体（P0-1-31 起被真实渲染） ====================== */
 /* 先兑现 `app/theme.ts` 的 Tag 注释里那条待办：Tag 的边框色在 `ComponentToken` 里设不了
    （它取 `token.colorBorder`，而那一档必须留给交互控件的 3:1 边界 `--rule-control`），

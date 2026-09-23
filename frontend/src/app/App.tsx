@@ -8,6 +8,8 @@
  * P0-1-30：登录 → 首登强制改密 → 进首页，加上 `/settings/password`。
  * P0-1-31：`/`（智能体列表）、`/agents/new`、`/agents/:id/edit` 换成真实页面。
  * P0-1-32：`/chat/:agentId/:conversationId?` 换成真实的对话页（SSE 客户端 + 消息流七种卡片）。
+ * P0-1-35：`/knowledge` 与 `/knowledge/:id` 换成真实的知识库列表与详情页
+ *          （文档上传 / 覆盖重传 / 重试 / 下载 / 删除 + 检索测试抽屉 + 状态轮询）。
  *
  * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
  *
@@ -35,6 +37,8 @@ import { BatchPlaceholderPage, NotFoundPage } from '../pages/NoticePage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
 import { ChatPage } from '../pages/chat/ChatPage.js'
+import { KnowledgeDetailPage } from '../pages/knowledge/KnowledgeDetailPage.js'
+import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
 import { LoginPage } from '../pages/login/LoginPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 
@@ -55,39 +59,10 @@ export function App() {
               （`03` §4.1：展示开场白，首条消息发送时才创建会话、并把 id 写进 URL）——
               于是"刷新"这件事能定位到同一个会话，历史与流式走同一套组件重画。 */}
           <Route path="/chat/:agentId/:conversationId?" element={<ChatPage />} />
-          <Route
-            path="/knowledge"
-            element={
-              <BatchPlaceholderPage
-                serial="S-05 · 知识库"
-                title="知识库"
-                batch="P0-1-35"
-                blockedBy="D 包接口已就绪（P0-1-21 已 ✓）"
-                bullets={[
-                  '列表 + 弹窗形态创建（字段 ≤6 用弹窗，03 §七）',
-                  '详情页：名称描述与检索配置编辑 / 上传 / 检索测试',
-                  '文档表格：状态三态、chunk 数、覆盖重传 / 重试 / 下载原始 / 删除',
-                  '检索测试抽屉显示双路得分与融合排名',
-                  '.doc 在前端 accept 白名单就拦下，不发请求',
-                ]}
-              />
-            }
-          />
-          <Route
-            path="/knowledge/:id"
-            element={
-              <BatchPlaceholderPage
-                serial="S-05 · 知识库"
-                title="知识库详情"
-                batch="P0-1-35"
-                bullets={[
-                  '解析中的文档需要轮询刷新（TanStack Query refetchInterval）',
-                  '扫描件会落到 FAILED 并给出原因',
-                  '上传后是 PARSING 中间态，chunk 数要等流水线跑完',
-                ]}
-              />
-            }
-          />
+          {/* S-05 · 知识库（P0-1-35 接真页面）。列表与详情**都是登录即可**：
+              知识库没有 owner 列，是全员共享资源（`docs/02` §4.6 的权限口径与模型池相反）。 */}
+          <Route path="/knowledge" element={<KnowledgeListPage />} />
+          <Route path="/knowledge/:id" element={<KnowledgeDetailPage />} />
           <Route
             path="/mcp"
             element={

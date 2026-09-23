@@ -17,6 +17,20 @@ export const ADMIN_MODELS_PATH = '/admin/models'
 /** 智能体（`03` §二：`/` 是列表、`/agents/new` 建、`/agents/:id/edit` 改） */
 export const AGENTS_NEW_PATH = '/agents/new'
 
+/** 知识库列表（`03` §二：`/knowledge`，登录即可 —— 与模型池相反，**不是** ADMIN） */
+export const KNOWLEDGE_PATH = '/knowledge'
+
+/**
+ * 知识库详情（`03` §二 的 `/knowledge/:id`）。
+ *
+ * `encodeURIComponent` 的理由与 {@link agentEditPath} 相同（P0-1-31 已写在那里的注释）：
+ * 不是防注入，而是让"这个 id 不该出现在路径里"这类错误尽早表现为一个查不到的地址，
+ * 而不是拼出一个**看着对、打过去 404** 的链接。
+ */
+export function knowledgeDetailPath(kbId: string): string {
+  return `/knowledge/${encodeURIComponent(kbId)}`
+}
+
 /**
  * 编辑某智能体。
  *
