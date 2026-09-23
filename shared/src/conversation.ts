@@ -91,6 +91,16 @@ export function isConversationReadOnly(status: ConversationStatus): boolean {
  */
 export const CONVERSATION_UNTITLED_HINT = '新会话'
 
+/**
+ * 会话标题的长度上限（`P0-1-34` 起**前后端同源**）。
+ *
+ * 字面值 `255` 原本只写在 {@link renameConversationBodySchema} 里，而 P0-1-34 的侧栏行内编辑
+ * 也要用它（`maxLength` + 本地的"是否可保存"判据）。前端再抄一份数字的后果不是"多写一个常量"，
+ * 而是**两处会各自演化**（`docs/06` §六 第 ⑰ 条："同一口径在两处各写一遍，必有一处先腐烂"）。
+ * 落地形态与 `PASSWORD_*` / `MESSAGE_PAGE_LIMIT_*` 同款：常量放 `shared`，schema 与界面都引它。
+ */
+export const CONVERSATION_TOPIC_MAX_CHARS = 255
+
 // ───────────────────────────── 列表 / 详情投影 ─────────────────────────────
 
 /**
@@ -179,7 +189,7 @@ export const renameConversationBodySchema = z.object({
     })
     .trim()
     .min(1, '会话标题不能为空')
-    .max(255, '会话标题最多 255 个字符'),
+    .max(CONVERSATION_TOPIC_MAX_CHARS, `会话标题最多 ${CONVERSATION_TOPIC_MAX_CHARS} 个字符`),
 })
 export type RenameConversationBody = z.infer<typeof renameConversationBodySchema>
 

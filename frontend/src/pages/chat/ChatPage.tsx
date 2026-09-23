@@ -1,12 +1,14 @@
 /**
- * 对话页（P0-1-32：骨架 + SSE 客户端 + 消息流渲染；P0-1-33：输入区状态机 + 停止 + 断线对齐）
+ * 对话页（P0-1-32：骨架 + SSE 客户端 + 消息流渲染；P0-1-33：输入区状态机 + 停止 + 断线对齐；
+ * P0-1-34：**会话侧栏**）
  *
  * 依据：`docs/03-前端设计.md` §二（`/chat/:agentId`，`:conversationId?` 可选定位）、
- *      §4.1（对话页详设：头部 / 消息流 / **输入区状态机** / 首条消息才建会话 / **停止时序** /
- *      **断线黄条**）、§五（事件 → UI 映射）、§六（单一渲染路径）、§七（键盘约定、文案词表）。
+ *      §4.1（对话页详设：**会话侧栏** / 头部 / 消息流 / **输入区状态机** / 首条消息才建会话 /
+ *      **停止时序** / **断线黄条**）、§五（事件 → UI 映射）、§六（单一渲染路径）、
+ *      §七（键盘约定、文案词表、删除分级确认）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本批做到哪、哪些刻意留给后面一批（`docs/06` P0-1-34）
+ * 本批做到哪、哪些刻意留给后面一批（`docs/06` P0-1-35/36、P0-3）
  * ─────────────────────────────────────────────────────────────────────
  * ✅ P0-1-32：SSE 客户端（`useChatStream`）+ 事件归约（`roundReducer`）+ 消息流七种卡片 +
  *    历史与流式**共用**一套渲染 + 首条消息时创建会话 + `done`/`error` 收口 + 刷新后历史一致。
@@ -14,10 +16,22 @@
  *    **停止按钮**的完整时序（`POST /stop` → 等 `done{STOPPED}` → 5s 未收口才 abort → 拉历史对齐，
  *    `stopController.ts`）、**顶部黄条**与"点击对齐历史"（`DisconnectBanner` + `alignHistory.ts`）、
  *    `CONFLICT` 的**专用 toast**（`streamErrors.ts`）、同标签页重复发送的同步闸门。
- * ⏳ P0-1-34：会话侧栏（新建 / 重命名 / 删除）+ **全屏布局**（`03` §三：保留 Logo 与头像菜单、
- *    其余导航收进「工作台」下拉）。本批沿用现有外壳与页头。
+ * ✅ P0-1-34：**会话侧栏**（新建 / 切换 / 行内重命名 / 分级删除，`ConversationSidebar.tsx`）
+ *    —— 侧栏的判据全在 `conversationList.ts`（零依赖纯逻辑，有断言）；
+ *    **全屏布局**在 `AppLayout`（`docs/03` §三：保留 Logo 与头像菜单，其余导航收进「工作台」下拉）。
+ * ⏳ P0-3：TaskAgent 的**产物面板**（`artifact` 事件驱动）—— `design/chat.html` 是三栏，
+ *    本批落到两栏（侧栏 + 消息流）；产物面板要等产物收集（P0-3-7/9）。
  *
  * ─────────────────────────────────────────────────────────────────────
+ * 侧栏带来的那一件事：**切会话时不动 store**
+ * ─────────────────────────────────────────────────────────────────────
+ * 用户完全可以在流式期间切到另一个会话（这正是侧栏让它变得容易的动作）。此时：
+ *   · 旧流的帧还在往 store 里灌（fetch 没被中断）；
+ *   · 页面正在渲染**新会话**的历史。
+ * 不串台靠 `stores/chatStream.ts` 的 `streamFor` 守卫 —— `useChatStream` 只在
+ * `streamFor === 当前会话` 时才把 `round` 交给页面（见 `visibleRound`）。
+ * **刻意不在切换时 abort**（`useChatStream` 卸载 effect 的注释）：切走再切回反而能看到完整内容。
+ *
  * ⚠️ 一件必须靠"对齐 effect"解决的事：流式版本与落库版本的重叠
  * ─────────────────────────────────────────────────────────────────────
  * 一轮结束时会同时存在两份"同一轮"的数据：
@@ -41,6 +55,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import type { ReactNode, RefObject } from 'react'
 import { HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
+import type { RemoveConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
 import {
@@ -52,6 +67,7 @@ import { useFeedback } from '../../app/feedback.js'
 import { HOME_PATH, agentEditPath, chatPath } from '../../app/paths.js'
 import { TableSkeleton } from '../../components/ListStates.js'
 import { ChatInput } from '../../features/chat/ChatInput.js'
+import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MessageList } from '../../features/chat/MessageList.js'
 import { messagesToViews, openingView } from '../../features/chat/messageModel.js'
@@ -106,7 +122,7 @@ export function ChatPage() {
    * （`03` §4.1）。首帧 `agent` 还没到时是 `undefined`（按 ChatBot 处理）—— 这没关系：
    * hook 里存的是 ref，真正读它的时刻是"用户点了对齐/停止了"，那时 agent 早就到了。
    */
-  const { round, sending, stopping, disconnect, send, stop, align } = useChatStream(
+  const { round, sending, stopping, disconnect, streamingId, send, stop, align } = useChatStream(
     agentId,
     conversationId,
     {
@@ -261,6 +277,44 @@ export function ChatPage() {
       })
   }, [align, feedback])
 
+  // ── 侧栏（P0-1-34）的三个动作 ──────────────────────────────────────────────
+
+  /** 切到某个会话。用 `push`（不是 `replace`）：这**是**一次导航，后退该能回到上一个会话 */
+  const handleSelectConversation = useCallback(
+    (id: string): void => {
+      navigate(chatPath(agentId, id))
+    },
+    [agentId, navigate],
+  )
+
+  /**
+   * 「+ 新会话」⇒ 回到**不带 conversationId** 的地址（`03` §4.1：进入对话页只展示开场白，
+   * 首条消息发送时才真的建会话）。
+   *
+   * `push` 同样是对的：翻回上一个会话是用户会做的动作。
+   */
+  const handleNewConversation = useCallback((): void => {
+    navigate(chatPath(agentId))
+  }, [agentId, navigate])
+
+  /**
+   * 删除成功之后的收尾（两件，判断依据都是"删掉的是不是**我正在看/正在跑**的那一条"）。
+   *
+   * ① **删的正是 URL 里那个会话** ⇒ 立刻导航去新会话态。不导航的后果很具体：
+   *    页面停在一个已经不存在的会话上，历史查询下一次重取就是 404，屏幕上是一段
+   *    "历史没有读出来"，而用户明明刚刚亲手删掉了它。
+   * ② **那一轮还在本地流着** ⇒ 就地收掉渲染状态。**刻意不 abort fetch**：`AbortController`
+   *    在 `useChatStream` 内部（abort 是停止时序的一环，页面越权调它会把"停止"的两条路
+   *    搅成三条）。此后到达的帧会因为 `round === null` 被 `apply` 静默丢掉（store 既有行为）。
+   */
+  const handleConversationDeleted = useCallback(
+    (removed: RemoveConversationResult): void => {
+      if (removed.id === conversationId) navigate(chatPath(agentId), { replace: true })
+      if (removed.id === streamingId) useChatStreamStore.getState().reset()
+    },
+    [agentId, conversationId, navigate, streamingId],
+  )
+
   // ── 智能体本身取不到（不存在 / 已软删 / 链接里的 id 不对）：给一条能回去的路
   if (agentQuery.isError) {
     return (
@@ -280,9 +334,19 @@ export function ChatPage() {
   }
 
   return (
-    // `.chat` 的完整形态在 `03` §4.1 是"侧栏 + 消息流 +（TaskAgent 的产物面板）"，
-    // 本批只落中栏（侧栏属 P0-1-34）⇒ 用 `chat--solo` 覆盖成单栏（见 `styles/app.css`）
-    <div className="chat chat--solo">
+    // `.chat` 的完整形态在 `03` §4.1 是「会话侧栏 + 消息流 +（TaskAgent 的产物面板）」三栏
+    // （`design/chat.html` 的 `.chat--with-panel`）。本批落**左栏 + 中栏**（侧栏 = P0-1-34）；
+    // 产物面板要等产物收集（P0-3-7/9）⇒ 暂不加第三列：多一个永远空的占位会让
+    // "消息流到底占多宽"变成一个看不出来的问题。列的宽度是 `styles/app.css` 的 `.chat`
+    <div className="chat">
+      <ConversationSidebar
+        agentId={agentId}
+        conversationId={conversationId}
+        streamingId={streamingId}
+        onSelect={handleSelectConversation}
+        onNew={handleNewConversation}
+        onDeleted={handleConversationDeleted}
+      />
       <main className="chat__main" aria-label="当前会话">
         <div className="chat__head">
           <div>
@@ -380,6 +444,10 @@ export function ChatPage() {
           round={round}
           sending={sending}
           stopping={stopping}
+          // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
+          // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
+          // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
+          elsewhere={streamingId !== null && streamingId !== conversationId}
           draft={draft}
           onDraftChange={setDraft}
           onSubmit={() => {

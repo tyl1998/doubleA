@@ -17,6 +17,7 @@
  *     │                                                  stopping ──收口───────┤
  *     └──────────────── 停止 / 完成（收口）────────────────────────────────────┘
  *   confirm 到达 ⇒ 锁输入显示确认卡（优先级最高，可从 streaming/sending 进入）
+ *   elsewhere = 别的会话在生成（P0-1-34）⇒ 只能输入、不能发（本批前端只有一个轮次槽）
  * ```
  *
  *   · **谁可编辑**（streaming 中允许继续输入但发送禁用）；
@@ -48,10 +49,11 @@
 import type { StreamRound } from './roundReducer.js'
 
 /**
- * 输入区的五个状态（`03` §4.1 的 `idle` / `streaming` / `confirm` 三个显式命名，
- * 另两个是本批落地时**必须**分开的两段空窗：`sending` 与 `stopping`）。
+ * 输入区的六个状态（`03` §4.1 的 `idle` / `streaming` / `confirm` 三个显式命名，
+ * 另三个是本仓落地时**必须**分开的：`sending` 与 `stopping` 是 P0-1-33 定案的两段空窗，
+ * `elsewhere` 是 **P0-1-34**（侧栏让"换个会话再发一条"变成一个很容易的动作）补的第三个）。
  */
-export type ComposerState = 'idle' | 'sending' | 'streaming' | 'stopping' | 'confirm'
+export type ComposerState = 'idle' | 'sending' | 'streaming' | 'stopping' | 'confirm' | 'elsewhere'
 
 /** 主按钮形态：同一位置在四个状态下的四种样子（`03` §4.1："streaming: 按钮变 [停止]"） */
 export interface ComposerPrimary {
@@ -92,6 +94,18 @@ export interface ComposerInput {
   stopping: boolean
   /** 草稿（只用于算 `canSend`；空草稿时按钮禁用，避免"点一下发现没反应"） */
   draft: string
+  /**
+   * **另一个**会话正在生成（P0-1-34 新增；本会话不是那个会话）。
+   *
+   * 为什么需要它：侧栏让"切到另一个会话再发一条"变得很容易，而**本批的前端只有一个轮次槽**
+   * （`stores/chatStream.ts` 的 `round`）——
+   *   · `begin()` 会**覆盖**掉那个会话正在进行的一轮；
+   *   · 而旧流的帧还在往同一个槽里灌（`apply` 不认识"这一帧属于谁"）。
+   * 两者合起来就是一个**静默的串台**：B 的回答里混进 A 的增量。
+   * 后端每个会话各有一把锁（允许同时跑两条流），"同时只能有一条"是**前端本批的约束**
+   * （多流要把 store 改成 `Map`，属后续批次），故这里把它显式说出来而不是让它静默发生。
+   */
+  elsewhere: boolean
 }
 
 /** 各状态的文案。**一处定义**：placeholder / hint / 按钮 label 全从这里取 */
@@ -116,21 +130,31 @@ const TEXT = {
     placeholder: '请先处理上面的确认卡',
     hint: '有待确认的工具调用，输入区暂不可用',
   },
+  elsewhere: {
+    placeholder: '另一个会话正在生成，等它结束再发…',
+    hint: '同时只能有一轮在生成：等它结束，或到那个会话点「停止」',
+  },
 } as const satisfies Record<ComposerState, { placeholder: string; hint: string }>
 
 /**
  * 由"这一轮 + 这次发送"推出输入区的样子。
  *
- * 优先级（顺序即正确性，四条都有真实的错法）：
+ * 优先级（顺序即正确性，五条都有真实的错法）：
  *   ① `confirm` —— 它在 `03` §4.1 里写的是"**锁输入**显示确认卡"：即使这一轮还在 streaming，
  *      也要锁（确认卡是"流挂起等你应答"，此时能编辑正文没有任何意义）；
  *   ② `stopping` —— 用户已经点过停止 ⇒ 主按钮必须立刻变成"停止中"（而不是仍可再点一次
  *      「停止」：那会让用户以为没点上，反复点）；
  *   ③ `round.streaming` —— 服务端正在产出（`03` §4.1 唯一的"正经流式态"）；
- *   ④ `sending` —— 上面那段"建会话/建流"的空窗（`round` 还不存在，但它已经不是 `idle` 了）。
+ *   ④ `sending` —— 上面那段"建会话/建流"的空窗（`round` 还不存在，但它已经不是 `idle` 了）；
+ *   ⑤ `elsewhere` —— **别的**会话在生成（P0-1-34）。
+ *
+ * ⚠️ **⑤ 必须排在 ④ 后面**：用户按下发送的那一瞬间，这个会话的 `sending` 已经为真、
+ * 而 `elsewhere` 也可能仍为真（另一个会话的流还在跑）——若让它先赢，主按钮会在用户
+ * 刚点完发送后立刻从「发送中…」闪回「别的会话生成中」，看起来像"点了没反应"。
+ * 真正拦住那次发送的是 `useChatStream.send` 里的闸门（返回 `BUSY` + 一句能照着做的话）。
  */
 export function composeState(input: ComposerInput): ComposerView {
-  const { round, sending, stopping, draft } = input
+  const { round, sending, stopping, draft, elsewhere } = input
 
   // ① confirm：锁输入（优先级最高）
   if (round !== null && round.confirm !== null) {
@@ -185,6 +209,21 @@ export function composeState(input: ComposerInput): ComposerView {
       ...TEXT.sending,
       led: 'run',
       label: 'sending',
+    }
+  }
+
+  // ⑤ elsewhere：别的会话在生成（P0-1-34）。**输入不禁**（先构思下一条是安全的；
+  //    真正的拦阻在 `useChatStream.send`），只是不能提交 —— 与 streaming 同款口径
+  if (elsewhere) {
+    return {
+      state: 'elsewhere',
+      canType: true,
+      canSend: false,
+      locked: false,
+      primary: { kind: 'busy', label: '别的会话生成中', disabled: true, action: null },
+      ...TEXT.elsewhere,
+      led: 'warn',
+      label: 'elsewhere',
     }
   }
 

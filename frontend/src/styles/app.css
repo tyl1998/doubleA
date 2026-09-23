@@ -39,6 +39,11 @@
   min-height: 100vh;
 }
 
+/* 专注布局（P0-1-34）：对话页不渲染仪表轨 ⇒ 网格收成单列（`docs/03` §三 的"全屏布局"）。
+   ⚠️ 只改列定义，**不动 `.page` 的上下留白** —— 对话页的一屏高是按它算出来的
+   （`.chat` 的 `height: calc(100vh - … - var(--sp-6) - var(--sp-8))`）。 */
+.shell--focus { grid-template-columns: minmax(0, 1fr); }
+
 .rail {
   position: sticky;
   top: 0;
@@ -735,7 +740,11 @@
   .page { padding: var(--sp-5) var(--sp-5) var(--sp-8); }
   /* 对话页的一屏高跟着 `.page` 的 padding 一起变（见对话页段的注释）：`sp-6` → `sp-5`。
      漏了这一条的后果不是"少一点高度"，而是底部永远露出一条滚动条（下一条命令就能看出来）。 */
-  .chat--solo { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8)); }
+  .chat { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8)); }
+  /* 侧栏在窄屏收窄，但**不隐藏**：它是这个页面唯一的"在会话之间切换"的入口
+     （藏掉它就等于把用户锁在当前会话里 —— `03` §三 说的"导航孤岛"在这里会以另一种形式出现）。
+     268px 在 1024px 宽的窗口里会把消息流挤到 700px 以下，而那正是消息流的最小舒适宽度。 */
+  .chat { grid-template-columns: 208px minmax(0, 1fr); }
   .topbar { padding: 0 var(--sp-5) 0 var(--sp-3); gap: var(--sp-3); }
   .nav--collapse { display: none; }
 }
@@ -743,6 +752,8 @@
 @media (max-width: 720px) {
   /* 移动端答案：仪表轨转为底部横条，不硬塞侧边 */
   .shell { grid-template-columns: minmax(0, 1fr); padding-bottom: 56px; }
+  /* 专注布局没有那条底部横条 ⇒ 底部留白要还回去（否则对话页底部凭空多出 56px 空白） */
+  .shell--focus { padding-bottom: 0; }
   .rail {
     position: fixed;
     inset: auto 0 0 0;
@@ -758,18 +769,138 @@
   .page__head-actions { margin-left: 0; }
 }
 
-/* =========================== 对话页（P0-1-32） ============================= */
+/* =========================== 对话页（P0-1-32；P0-1-34 加侧栏） ================= */
 /* 原型（`design/chat.html`）是「会话侧栏 + 消息流 + 产物面板」三栏（`03` §4.1）。
-   本批只落**中栏**：侧栏属 P0-1-34、产物面板属 P0-3（TaskAgent）。
-   ⇒ 用 `--solo` 覆盖成单栏，而不是先写一个三栏再藏掉两栏（藏法会留下两个永远空的占位）。 */
-.chat--solo {
+   本批落**左栏 + 中栏**：侧栏好了（P0-1-34），产物面板属 P0-3（TaskAgent）。
+   刻意**不**先摆一个空的第三列 —— 那会让"消息流该占多宽"变成一个看不出来的问题，
+   而 P0-3 到时只需在这里把 `grid-template-columns` 补成原型那句。 */
+.chat {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   /* 一屏高：视口减去顶栏与 `.page` 的上下留白。少扣一项的症状是"对话页永远比视口高一点"
      —— 底部那条滚动条会一直露着，输入区永远压不到屏幕底边。
      ⚠️ `.page` 的 padding 在 1024px 断点里变了（`sp-6` → `sp-5`），那里的覆盖见文件末的断点块。 */
   height: calc(100vh - var(--topbar-h) - var(--sp-6) - var(--sp-8));
 }
+
+/* ── 会话侧栏（P0-1-34）───────────────────────────────────────────────────── */
+/* 结构与 `design/chat.html` 的 `.sidebar` 一致：头部一个「+ 新会话」，下面是分组列表。
+   ⚠️ 行的可点区域是一个**真 `<button>`**（`.conv__open`），操作按钮（✎ / ✕）是它的**兄弟**
+   而不是子节点 —— 按钮里嵌按钮是非法 HTML，而且点击会被外层吞掉
+   （症状："点了删除却切到了那个会话"）。 */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--rule-strong);
+}
+.sidebar__head { padding: var(--sp-4); border-bottom: 1px solid var(--rule); }
+.sidebar__body { padding: var(--sp-3); overflow-y: auto; }
+.sidebar__list {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--sp-2);
+  list-style: none;
+}
+.sidebar__group-list { margin: 0; padding: 0; list-style: none; }
+.sidebar__group {
+  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.12em;
+  color: var(--muted-2);
+}
+
+.conv {
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  transition: background var(--dur-micro) ease-out, border-color var(--dur-micro) ease-out;
+}
+.conv:hover { background: var(--surface-2); border-color: var(--rule); }
+.conv[data-current='true'] {
+  background: var(--accent-wash);
+  border-color: var(--accent-rule);
+}
+/* 当前会话左侧的刻度线：把"选中"做成仪器刻度，而不是色块（原型 `.conv[aria-current]::before`） */
+.conv[data-current='true']::before {
+  content: '';
+  position: absolute;
+  left: -2px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--accent);
+}
+
+/* 行本体：一个占满整行的按钮。抹平按钮的默认外观（背景/边框/字体/对齐/内边距）——
+   ⚠️ 这一段**必须**写全：漏掉 `text-align: left` 会让两行文字居中，漏掉 `font: inherit`
+   会让它还带着浏览器默认的按钮字体（两条都只在"看着有点像"的层面上出错）。 */
+.conv__open {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: var(--sp-3);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.conv__title {
+  display: block;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 给右侧的操作按钮留出位置：hover 时它们会盖在标题右端 */
+  padding-right: 44px;
+}
+.conv__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.conv__ops {
+  position: absolute;
+  top: var(--sp-2);
+  right: var(--sp-2);
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity var(--dur-micro) ease-out;
+}
+/* `:focus-within` 是键盘可达性的那一半：只写 `:hover` 会让 Tab 过来的用户看不到这两个按钮 */
+.conv:hover .conv__ops,
+.conv:focus-within .conv__ops { opacity: 1; }
+.conv__ops button {
+  width: 22px;
+  height: 22px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-xs);
+  color: var(--ink-2);
+  font-size: var(--fs-2xs);
+  line-height: 1;
+  cursor: pointer;
+}
+.conv__ops button:hover { color: var(--accent); border-color: var(--accent-rule); }
+
+/* 行内重命名态（`design/chat.html` 的第二条会话项）：就地变成输入框 + 保存/取消。
+   ⚠️ 输入框用 AntD 的 `Input`（不是原生 `<input class="input">`）—— 本仓的 `.input`
+   只存在于原型，落地后表单控件一律交给 AntD（`06` §六 第 28 条），写原生的话会得到一个
+   **完全没有样式**的输入框（`P0-1-24` 踩过同一个坑：`.alert` 同款）。 */
+.conv__edit { padding: var(--sp-2); display: flex; flex-direction: column; gap: var(--sp-2); }
+.conv__edit-ops { display: flex; gap: var(--sp-2); }
 
 .chat__main {
   display: flex;

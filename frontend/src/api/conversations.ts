@@ -1,5 +1,6 @@
 /**
- * 会话接口封装（P0-1-31 建；P0-1-32 补"发消息"这一整条链；P0-1-33 补"停止"与"活跃快照"）
+ * 会话接口封装（P0-1-31 建；P0-1-32 补"发消息"这一整条链；P0-1-33 补"停止"与"活跃快照"；
+ * P0-1-34 补"列表 / 改名 / 删除"三条 —— 侧栏要用）
  *
  * 依据：`docs/02` §4.5（会话九端点）、§五（SSE 协议）、`docs/03` §4.1（"首条消息发送时才创建会话"、
  *      输入区状态机与停止时序）、`shared/src/conversation.ts`（会话 / 消息 / 停止契约）、
@@ -12,6 +13,8 @@
  * |------|------------------|
  * | `GET /api/agents/:id/conversations` | `{ items, total, offset, limit }` |
  * | `POST /api/conversations` | **裸 `ConversationItem`** |
+ * | `PATCH /api/conversations/:id` | **裸 `ConversationItem`**（改名，P0-1-34） |
+ * | `DELETE /api/conversations/:id` | **裸 `RemoveConversationResult`**（`{ id, agentId, topic, deletedMessages }`，P0-1-34） |
  * | `GET /api/conversations/:id/messages` | `{ items, nextCursor, hasMore }`（**游标**分页） |
  * | `GET /api/conversations/:id/active` | **裸 `ConversationActive`**（含派生的 `streaming`） |
  * | `POST /api/conversations/:id/stop` | **裸 `StopConversationResult`**（`{ id, signaled }`） |
@@ -32,13 +35,14 @@
  * 把正文**还给输入框**，不让用户重打。
  */
 
-import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type {
   ConversationActive,
   ConversationItem,
   ConversationListResult,
   MessageItem,
   MessagePageResult,
+  RemoveConversationResult,
   SseEvent,
   StopConversationResult,
 } from '@doubulea/shared'
@@ -69,6 +73,94 @@ export function useMyConversationCount(agentId: string | undefined) {
       request<ConversationListResult>(`/api/agents/${encodeURIComponent(agentId ?? '')}/conversations?offset=0&limit=1`),
     enabled: agentId !== undefined,
     select: (data) => data.total,
+  })
+}
+
+// ───────────────────────────── 会话列表（侧栏，P0-1-34） ─────────────────────────────
+
+/**
+ * 侧栏一次取多少条会话。
+ *
+ * 与 `AGENTS_PAGE_LIMIT_MAX` 同口径（一次取满 100 + 客户端不再分页）：侧栏是**滚动一屏**的
+ * 导航控件，给它接一套分页反而要处理"翻页时高亮的那条在哪一页"。超过 100 个会话时第 100 条
+ * 之后看不到 —— 这是**写明的边界**，不是漏了（`limit` 的上限就是 100，`shared` 的
+ * `listConversationsQuerySchema`）。
+ */
+export const CONVERSATIONS_PAGE_LIMIT_MAX = 100
+
+/**
+ * 侧栏列表的缓存键。
+ *
+ * ⚠️ 它是 {@link agentConversationsQueryKey} 的**子键**，这不是巧合：那个键还承担
+ * "这个智能体下我名下的会话总数"（`useMyConversationCount`，删除 Agent 的确认框要用）。
+ * 一次消息落库会让**两处同时过期**（总数 + 列表），做成两个互不相干的键就得在每个
+ * 会改变它的地方记得失效两次 —— 迟早漏一个，症状是"侧栏多了一条、数字还是旧的"。
+ */
+export function agentConversationsListQueryKey(agentId: string): readonly [string, string, string, string] {
+  return [...agentConversationsQueryKey(agentId), 'list'] as const
+}
+
+/** 侧栏列表（`GET /api/agents/:id/conversations`，offset/limit 分页；顺序由服务端定，见 `02` §4.5 ③） */
+export function fetchAgentConversations(agentId: string, limit: number): Promise<ConversationListResult> {
+  const search = new URLSearchParams({ offset: '0', limit: String(limit) })
+  return request<ConversationListResult>(`/api/agents/${encodeURIComponent(agentId)}/conversations?${search.toString()}`)
+}
+
+/**
+ * 侧栏会话列表。`agentId === ''`（路由参数缺失）时**不发请求**。
+ *
+ * `keepPreviousData`：切走再切回时列表**不会闪成空白**（骨架屏只在"从来没有过数据"时出现）
+ * —— 与 `useAgents` 同款理由。
+ */
+export function useAgentConversations(agentId: string) {
+  return useQuery({
+    queryKey: agentConversationsListQueryKey(agentId),
+    queryFn: () => fetchAgentConversations(agentId, CONVERSATIONS_PAGE_LIMIT_MAX),
+    enabled: agentId !== '',
+    placeholderData: keepPreviousData,
+  })
+}
+
+/**
+ * 改名（`PATCH /api/conversations/:id`）。返回**裸 `ConversationItem`**（见文件头的信封表）。
+ *
+ * 成功后失效 `['agents', agentId, 'conversations']` 整棵子树：改名会改 `updatedAt`
+ * 与列表里那一行的标题，同时/或让排序发生变化（服务端的兜底键里没有 `updatedAt`，
+ * 但"总数"那个查询与它同前缀，一次失效两处都对齐 → 见 {@link agentConversationsListQueryKey}）。
+ */
+export function useRenameConversation(agentId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, topic }: { id: string; topic: string }) =>
+      request<ConversationItem>(`/api/conversations/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: { topic },
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+    },
+  })
+}
+
+/**
+ * 删除会话（`DELETE /api/conversations/:id`）—— **级联**（`messages` 由外键连带清除，
+ * `03` §七 把它归入"级联删除"一档：Modal + 红色危险按钮 + 明示影响范围）。
+ *
+ * 响应里的 `deletedMessages` 是**删前在同一个事务里数出来的**（`docs/02` §4.5 ②），
+ * 所以它只能用于**删完之后**的报告 —— 确认框里给不出准确条数（没有任何端点能数），
+ * 那里如实写"全部消息"、不编一个数字（见 `DeleteConversationModal.tsx` 的注释）。
+ *
+ * 失效 `agentConversationsQueryKey`（列表 + 总数）。**消息历史那棵树交给调用方** ——
+ * "删掉的正是当前打开的这个会话"时页面要导航走，由 `ChatPage` 决定怎么收尾。
+ */
+export function useRemoveConversation(agentId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      request<RemoveConversationResult>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+    },
   })
 }
 

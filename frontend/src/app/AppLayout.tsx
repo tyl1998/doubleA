@@ -1,8 +1,10 @@
 /**
- * 应用外壳（P0-1-30）
+ * 应用外壳（P0-1-30；P0-1-34 加「专注布局」）
  *
- * 依据：`docs/03-前端设计.md` §三（全局布局：Logo + 导航 + 头像菜单 + ADMIN 才可见的管理入口）、
- *      `design/agents.html` 的 `.shell` 构成（左仪表轨 + 顶栏 + `.page` 内容区）。
+ * 依据：`docs/03-前端设计.md` §三（全局布局：Logo + 导航 + 头像菜单 + ADMIN 才可见的管理入口；
+ *      **对话页为全屏布局：保留 Logo 与头像菜单，其余导航收进「工作台」下拉**）、
+ *      `design/agents.html` 的 `.shell` 构成（左仪表轨 + 顶栏 + `.page` 内容区）、
+ *      `design/chat.html` 的顶栏（`工作台 ▾` + 主题开关 + 头像）。
  *
  * 三件事只在这里做，别的页面不要重复：
  * 1. **`<main>` 地标与页面级留白**（`.page`）—— 页面组件只渲染自己的内容；
@@ -11,6 +13,16 @@
  *
  * 顶部两块导航（仪表轨的字母、顶栏的文字）是**同一批目的地**：点击行为一致，只是密度不同。
  * 这不是重复劳动 —— 仪表轨是随手可达的锚点，顶栏是第一次用的人能读懂的文字。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 专注布局（P0-1-34）：为什么仪表轨**也**要收起来
+ * ─────────────────────────────────────────────────────────────────────
+ * `03` §三 说的是"其余导航项收纳进「工作台」下拉入口 —— 避免导航孤岛（**全隐藏**会形成导航孤岛）"。
+ * 落地时有两个只做一半的写法，各自都会让这句话落空：
+ *   · **只把顶栏文字导航换成下拉、仪表轨照旧** ⇒ 导航一点没收敛，"全屏"也省不下左侧那 62px；
+ *   · **只藏次要项** ⇒ 正是 `04-设计评审报告` 第 2 条否掉的那条路（"哪些算次要未定义"）。
+ * 所以专注布局 = **不渲染仪表轨** + 顶栏的「工作台」下拉里放**按角色过滤后的全部导航项**。
+ * 判据在 `nav.ts#isFocusPath`（"哪一屏用什么外壳"与"这一屏叫什么"是同一件事的两面）。
  */
 
 import { Button, Dropdown, type MenuProps } from 'antd'
@@ -21,7 +33,7 @@ import { useCurrentUser, useLogout } from '../api/auth.js'
 import { HEALTH_TARGET_LABEL, useHealth } from '../api/health.js'
 import { useUiStore } from '../stores/ui.js'
 import { useFeedback } from './feedback.js'
-import { matchNavItem, serialForPath, visibleNavItems, type NavItem } from './nav.js'
+import { isFocusPath, matchNavItem, serialForPath, visibleNavItems, type NavItem } from './nav.js'
 import { ADMIN_MODELS_PATH, ADMIN_USERS_PATH, HOME_PATH, PASSWORD_PATH, loginPath } from './paths.js'
 
 /** 头像上的字：中文名取首字，拉丁名取前两位（`design/*.html` 的 `avatar__face`） */
@@ -74,6 +86,39 @@ function TopNavItem({ item }: { item: NavItem }) {
         {item.label}
       </NavLink>
     </li>
+  )
+}
+
+/**
+ * 「工作台」下拉（专注布局专用，`03` §三）：顶栏文字导航的**替代物**。
+ *
+ * 内容 = `visibleNavItems(role)`（与仪表轨、顶栏**同一份来源**，ADMIN 过滤在 `nav.ts` 里做），
+ * 所以"哪几个入口该出现"仍然只有一处判据 —— 这里只是换一种摆法。
+ * 用 AntD `Dropdown` + `menu`：它的键盘行为（↓ 展开、Esc 关、方向键在项间移动）是现成的，
+ * 自写一个 `<div onClick>` 会让这个入口对键盘用户失效（原型的 `.menu` 是纯 hover 的演示件）。
+ */
+function WorkspaceMenu({ items }: { items: NavItem[] }) {
+  const navigate = useNavigate()
+
+  const menuItems: MenuProps['items'] = [
+    { type: 'group' as const, label: '工作台', children: items.map((item) => ({ key: item.path, label: item.label })) },
+  ]
+
+  return (
+    <Dropdown
+      menu={{
+        items: menuItems,
+        onClick: ({ key }) => {
+          navigate(key)
+        },
+      }}
+      trigger={['click']}
+      placement="bottomLeft"
+    >
+      <Button size="small" type="text" aria-haspopup="menu">
+        工作台 ▾
+      </Button>
+    </Dropdown>
   )
 }
 
@@ -140,6 +185,63 @@ export function AppLayout() {
   const items = visibleNavItems(user.role)
   const led = serviceLed(health)
   const current = matchNavItem(location.pathname)
+  /** 对话页用专注布局（`03` §三）：不渲染仪表轨，顶栏用一个「工作台」下拉代替文字导航 */
+  const focus = isFocusPath(location.pathname)
+
+  const topbar = (
+    <header className="topbar">
+      <Link className="topbar__brand" to={HOME_PATH}>
+        doubuleA <span>工作台</span>
+      </Link>
+      {focus ? (
+        <nav aria-label="主导航">
+          <WorkspaceMenu items={items} />
+        </nav>
+      ) : (
+        <nav aria-label="主导航">
+          <ul className="nav">
+            {items.map((item) => (
+              <TopNavItem key={item.path} item={item} />
+            ))}
+          </ul>
+        </nav>
+      )}
+      <div className="topbar__right">
+        <Button
+          size="small"
+          type="text"
+          onClick={toggleThemeMode}
+          title="切换配色（浅色为交付主态）"
+          aria-pressed={themeMode === 'dark'}
+        >
+          {themeMode === 'dark' ? '暗色' : '浅色'}
+        </Button>
+        <UserMenu user={user} />
+      </div>
+    </header>
+  )
+
+  // 页面组件不再自带 `.page` 包裹 —— 留白与地标只在这里定义一次
+  const page = (
+    <main className="page" aria-label={current?.label ?? '工作台'}>
+      <Outlet />
+    </main>
+  )
+
+  if (focus) {
+    // `shell--focus` 只做一件事：把网格从"仪表轨 + 内容"改成单列（`styles/app.css`）。
+    // ⚠️ `.page` 的上下留白**不动** —— 对话页的一屏高是按它算出来的
+    //（`.chat` 的 `height: calc(100vh - … - var(--sp-6) - var(--sp-8))`），
+    // 顺手把 padding 抹平会让对话页比视口高出 104px。
+    return (
+      <div className="shell shell--focus">
+        <div>
+          {topbar}
+          {page}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="shell">
@@ -160,35 +262,8 @@ export function AppLayout() {
       </aside>
 
       <div>
-        <header className="topbar">
-          <Link className="topbar__brand" to={HOME_PATH}>
-            doubuleA <span>工作台</span>
-          </Link>
-          <nav aria-label="主导航">
-            <ul className="nav">
-              {items.map((item) => (
-                <TopNavItem key={item.path} item={item} />
-              ))}
-            </ul>
-          </nav>
-          <div className="topbar__right">
-            <Button
-              size="small"
-              type="text"
-              onClick={toggleThemeMode}
-              title="切换配色（浅色为交付主态）"
-              aria-pressed={themeMode === 'dark'}
-            >
-              {themeMode === 'dark' ? '暗色' : '浅色'}
-            </Button>
-            <UserMenu user={user} />
-          </div>
-        </header>
-
-        {/* 页面组件不再自带 `.page` 包裹 —— 留白与地标只在这里定义一次 */}
-        <main className="page" aria-label={current?.label ?? '工作台'}>
-          <Outlet />
-        </main>
+        {topbar}
+        {page}
       </div>
     </div>
   )

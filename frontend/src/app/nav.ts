@@ -99,3 +99,25 @@ export function serialForPath(pathname: string): string {
   if (item !== undefined) return item.serial
   return SERIAL_BY_PREFIX.find(([prefix]) => pathname.startsWith(prefix))?.[1] ?? 'S-00 · 工作台'
 }
+
+/**
+ * 该不该用「专注布局」（P0-1-34）：**只有对话页**。
+ *
+ * `docs/03` §三 原文："对话页（/chat）为全屏布局：**保留 Logo（点击回首页）与头像菜单
+ * （改密/登出）**，其余导航项收纳进「工作台」下拉入口 —— 避免用户对话中途配凭据/查知识库时
+ * 无路可走（全隐藏会形成导航孤岛）"。
+ *
+ * 两处落法都要点明，否则实现时很容易只做一半：
+ *   · **仪表轨也要收起来** —— "其余导航项"包含它。留着轨道等于导航一点没收敛，
+ *     而"全屏"也就无从谈起（左侧那 62px 从来省不下来）；
+ *   · **「工作台」下拉里是**全部**导航项**（按角色过滤后），不是"次要项" ——
+ *     `04-设计评审报告` 第 2 条的原话是"隐藏导航'次要项'（**哪些算次要未定义**）"，
+ *     那个批评正是指"挑一部分藏"这条路走不通。
+ *
+ * 判据写成函数放在这里（而不是在 `AppLayout` 里写 `startsWith`）的理由与
+ * `matchNavItem` 相同：**"哪一屏用什么外壳"和"这一屏叫什么"是同一件事的两面**，
+ * 分在两处写迟早出现"屏号说是对话页、外壳却还是普通布局"。
+ */
+export function isFocusPath(pathname: string): boolean {
+  return pathname.startsWith('/chat/')
+}

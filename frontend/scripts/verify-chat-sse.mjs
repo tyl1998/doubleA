@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * verify-chat-sse.mjs —— 对话页前端**无依赖**验收（P0-1-32 SSE 客户端 + **P0-1-33 输入区/停止/断线**）
+ * verify-chat-sse.mjs —— 对话页前端**无依赖**验收
+ * （P0-1-32 SSE 客户端 + **P0-1-33 输入区/停止/断线** + **P0-1-34 会话侧栏**）
  *
  * 跑法：`pnpm verify:chat-sse`
  *      （= `node --import tsx frontend/scripts/verify-chat-sse.mjs`，见文件末尾的"依赖与前置"）
@@ -15,12 +16,14 @@
  *   · **历史 vs 流式**：两条路径各自渲染时不会报错，只会"刷新前有、刷新后没有"；
  *   · **输入区状态机与停止时序**（P0-1-33）：五个状态、三种收尾路径 —— 写错的症状是
  *     "某个状态下按钮点不动""点了停止反而又发了一条""停止按钮转 5 秒圈"，
- *     每一种都要**在真浏览器里按到那一步**才看得见。
+ *     每一种都要**在真浏览器里按到那一步**才看得见；
+ *   · **会话侧栏的分组与读数**（P0-1-34）：分组判错只表现为"某条会话说在了错误的标题下面"、
+ *     读数算错只是显示一个偏了一点的数字 —— 两者都不抛异常、控制台干净，只有断言抓得住。
  * 这些全是**纯函数**或"副作用可注入"的控制器（`sseParser.ts` / `chatStream.ts` /
  * `roundReducer.ts` / `messageModel.ts` / `composerState.ts` / `stopController.ts` /
- * `streamErrors.ts` / `alignHistory.ts`），故本档直接喂手写字节、手写事件序列与手写依赖，
- * 逐条断言最终形状与**调用顺序** —— 这是本仓"纯逻辑拆进无依赖文件 ⇒ 断言进无依赖档"
- * 的同一手法（对照 backend 的 `chatContext.ts` / `semaphore.ts`）。
+ * `streamErrors.ts` / `alignHistory.ts` / **`conversationList.ts`**），故本档直接喂手写字节、
+ * 手写事件序列与手写依赖，逐条断言最终形状与**调用顺序** —— 这是本仓"纯逻辑拆进无依赖文件
+ * ⇒ 断言进无依赖档"的同一手法（对照 backend 的 `chatContext.ts` / `semaphore.ts`）。
  *
  * ⚠️ 本档**验不了**的东西（别把它当全批验收）：
  *   · React 渲染（七种卡片长什么样、思考块自动折叠、黄条长什么样）⇒ 归浏览器端测（`README` ⑳/㉖~㉛）；
@@ -232,9 +235,17 @@ const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
 const { flattenMessagePages, streamChat } = await import('../src/api/conversations.ts')
 // P0-1-33：输入区状态机 / 停止时序 / 断线对齐与文案（四个新的**零依赖纯逻辑**文件）
-const { composeState, isSubmitKey, createSendGate } = await import(
+const { composeState: composeStateRaw, isSubmitKey, createSendGate } = await import(
   '../src/features/chat/composerState.ts'
 )
+/**
+ * 用例夹具：把 `elsewhere`（**P0-1-34** 新增的第六个输入）默认成 `false`。
+ *
+ * ⚠️ 这个默认值**只存在于本档**，刻意**不**放进 `composerState.ts`（生产侧要求每个调用点显式传）
+ * —— 否则"忘了传"会静默等于"没有别的会话在生成"，而那正是新闸门失效的方式。
+ * 本组只有 H9/H10 关心它，其余用例写满六个字段只会让"这条在验什么"变模糊。
+ */
+const composeState = (patch) => composeStateRaw({ elsewhere: false, ...patch })
 const { createStopController, waitForRoundSettled, STOP_SETTLE_TIMEOUT_MS } = await import(
   '../src/features/chat/stopController.ts'
 )
@@ -244,6 +255,19 @@ const { chatErrorTitle, chatErrorDescription, shouldToastChatError } = await imp
 const { countAssistantMessages, decideAlign, shouldDropStreamVersion } = await import(
   '../src/features/chat/alignHistory.ts'
 )
+// P0-1-34：会话侧栏的**零依赖纯逻辑**（分组 / 相对时间 / 状态灯 / 改名与删除判据）
+const {
+  conversationItemView,
+  describeConversationTime,
+  groupConversationViews,
+  isDeleteConfirmed,
+  newConversationAction,
+  normalizeTopicDraft,
+} = await import('../src/features/chat/conversationList.ts')
+const { agentConversationsQueryKey, agentConversationsListQueryKey, CONVERSATIONS_PAGE_LIMIT_MAX } =
+  await import('../src/api/conversations.ts')
+const { CONVERSATION_TOPIC_MAX_CHARS, listConversationsQuerySchema, renameConversationBodySchema } =
+  await import('@doubulea/shared')
 
 // ───────────────────────────── 共用样本 ─────────────────────────────
 
@@ -1098,7 +1122,7 @@ await it('H5 `stopping`：点过停止 ⇒ 主按钮立刻变"停止中…"且�
   assertEqual(view.canSend, false, '等待收口期间不能发下一条')
 })
 
-await it('H6 五个状态的 `label` 与 `state` 一致、文案两两不同（漏改一个状态看得见）', () => {
+await it('H6 六个状态的 `label` 与 `state` 一致、文案两两不同（漏改一个状态看得见）', () => {
   const views = [
     // ⚠️ idle 那一份**要带草稿**：不带草稿时 `canSend` 本来就是 false（H1 已验），
     //    拿它去断言"只有 idle 允许发送"会因为夹具与断言不匹配而假红
@@ -1115,20 +1139,23 @@ await it('H6 五个状态的 `label` 与 `state` 一致、文案两两不同（�
       stopping: false,
       draft: '',
     }),
+    // 第六个：**别的**会话在生成（P0-1-34）。注意它的 `round` 是 `null` ——
+    // 那正是这个状态存在的理由（页面里这一轮不属于当前会话）
+    composeState({ round: null, sending: false, stopping: false, draft: '', elsewhere: true }),
   ]
   // 集合语义：先排序再比（`06` §六 第 ⑤ 条）
   assertDeepEqual(
     [...views.map((view) => view.state)].sort(),
-    ['confirm', 'idle', 'sending', 'stopping', 'streaming'],
-    '五个状态都真的可达（少一个就说明某个判据被更早的分支吃掉了）',
+    ['confirm', 'elsewhere', 'idle', 'sending', 'stopping', 'streaming'],
+    '六个状态都真的可达（少一个就说明某个判据被更早的分支吃掉了）',
   )
   for (const view of views) {
     assertEqual(view.label, view.state, `\`label\` 应等于 \`state\`（${view.state}）`)
   }
-  assertEqual(new Set(views.map((v) => v.placeholder)).size, 5, '占位符两两不同')
-  assertEqual(new Set(views.map((v) => v.hint)).size, 5, '提示行两两不同')
+  assertEqual(new Set(views.map((v) => v.placeholder)).size, 6, '占位符两两不同')
+  assertEqual(new Set(views.map((v) => v.hint)).size, 6, '提示行两两不同')
   // 两条不变量（它们是"防并发"与"锁输入"的最终口径）：
-  //   · **只有 idle 能发送** —— 其余四个状态里既有"正在跑"也有"正在等"，都不该放行
+  //   · **只有 idle 能发送** —— 其余五个状态里既有"正在跑"也有"正在等"，都不该放行
   //   · **只有 confirm 锁输入** —— 流式中必须还能打字（`03` §4.1）
   assertEqual(views.filter((v) => v.canSend).length, 1, '只有 idle 允许发送')
   assertEqual(views.filter((v) => v.primary.action === 'send').length, 1, '只有一个可点的发送按钮')
@@ -1158,6 +1185,57 @@ await it('H8 `createSendGate`：同标签页重复发送的同步闸门（释放
   assertEqual(gate.busy, false, '释放后回到空闲')
   assertEqual(gate.enter(), true, '可再次进入（否则用户只能发一条消息）')
   gate.leave()
+})
+
+await it('H9 `elsewhere`（P0-1-34）：别的会话在生成 ⇒ 只能输入、不能发', () => {
+  const view = composeState({
+    round: null,
+    sending: false,
+    stopping: false,
+    draft: '下一条想说的话',
+    elsewhere: true,
+  })
+  assertEqual(view.state, 'elsewhere', '状态名')
+  assertEqual(view.canSend, false, '不许发（前端只有一个轮次槽，发了就会覆盖另一会话的那一轮）')
+  assertEqual(view.canType, true, '但**输入不禁**（先构思下一条是安全的，与 streaming 同款口径）')
+  assertEqual(view.locked, false, '它不是"锁输入"那一类（锁输入只有 confirm）')
+  assertEqual(view.primary.action, null, '没有可点的主动作')
+  assertEqual(view.primary.disabled, true, '按钮不可点')
+  // 文案要**能照着做**，不能只说"不允许"
+  assertIncludes(view.primary.label, '别的会话', '按钮文案指明了原因')
+  assertIncludes(view.hint, '停止', '提示行给了出路')
+})
+
+await it('H10 `elsewhere` 的优先级排在 `sending` **之后**（顺序即正确性）', () => {
+  // 用户按下发送的那一瞬间：这一次的 `sending` 已经为真，而另一个会话的流可能还在跑。
+  // 若 `elsewhere` 先赢，主按钮会在刚点完发送后立刻从「发送中…」闪回「别的会话生成中」，
+  // 看起来像"点了没反应" —— 这是本组唯一一个"顺序必须写对"的地方
+  //
+  // ⚠️ 夹具里 `stopping` 必须是 `false`：`stopping` 的优先级**高于** `sending`（全序是
+  //    `confirm > stopping > streaming > sending > elsewhere`），把它设成 `true` 会验成
+  //    "stopping 胜过 sending"（那是 H5 的事），而这条问的是 `elsewhere` 排不排在 `sending` 后面。
+  //    另外 `sending` 与 `stopping` 同真也不是真实形态：前者是"这一轮还没进 store"，后者是
+  //    "已点停止、等 done{STOPPED} 收口"，两者互斥。
+  const view = composeState({
+    round: null,
+    sending: true,
+    stopping: false,
+    draft: '',
+    elsewhere: true,
+  })
+  assertEqual(view.state, 'sending', '`sending` 胜（它比 `elsewhere` 靠前）')
+  assertEqual(view.primary.label, '发送中…', '按钮文案')
+
+  // 反过来：只有 `elsewhere` 为真时才轮到它（H9 已验）；`streaming`（本会话在跑）一定优先于它
+  const streaming = composeState({
+    round: roundOf({ status: 'streaming' }),
+    sending: false,
+    stopping: false,
+    draft: '',
+    elsewhere: true,
+  })
+  assertEqual(streaming.state, 'streaming', '本会话在跑 ⇒ 是 streaming（能点[停止]），不是 elsewhere')
+  assertEqual(streaming.primary.action, 'stop', '主按钮仍是停止')
 })
 
 
@@ -1618,6 +1696,227 @@ await it('J12 `round === null` 也算"已收口"（少了这条会让停止按�
   store.getState().reset()
 })
 
+// ═════════════════════════════ K 组：会话侧栏（P0-1-34） ═════════════════════════
+
+groupStart(
+  'K',
+  '会话侧栏（conversationList / 缓存键 / 坑预判守门）',
+  '`03` §4.1 的侧栏三句（最近活跃排序 / 行内重命名 / 分级删除）与坑预判「活跃排序需在 done 后刷新」',
+)
+
+/** 侧栏的"现在"：**本地时间**字面量（实现的判据也全是本地日历日，两处必须同口径） */
+const SIDEBAR_NOW = new Date('2026-09-23T15:00:00')
+
+/**
+ * 造一条 `ConversationItem`。
+ *
+ * 它按 `shared/src/conversation.ts#conversationItemSchema` 把形状补满（侧栏只用得到其中几个
+ * 字段，但**形状要真** —— "少两个字段也能过"的夹具会让类型断言失去意义）。
+ */
+const convItem = (patch) => ({
+  id: 'conv-1',
+  agentId: 'agent-1',
+  agentName: '周报生成器',
+  agentType: 'CHATBOT',
+  topic: null,
+  status: 'ACTIVE',
+  lastMessageAt: null,
+  createdAt: '2026-09-23T14:00:00',
+  updatedAt: '2026-09-23T14:00:00',
+  ...patch,
+})
+
+await it('K1 时间读数五档（含 `null`）；**按日历日分档，不是按 24 小时差**', () => {
+  assertEqual(describeConversationTime(null, SIDEBAR_NOW), '还没有消息', '没消息的会话（不是 createdAt！）')
+  assertEqual(describeConversationTime('2026-09-23T14:59:30', SIDEBAR_NOW), '刚刚', '30 秒前')
+  assertEqual(describeConversationTime('2026-09-23T14:57:00', SIDEBAR_NOW), '3 分钟前', '3 分钟前')
+  assertEqual(describeConversationTime('2026-09-23T12:00:00', SIDEBAR_NOW), '3 小时前', '3 小时前')
+  assertEqual(describeConversationTime('2026-09-22T18:20:00', SIDEBAR_NOW), '昨天 18:20', '昨天')
+  assertEqual(describeConversationTime('2026-09-20T11:02:00', SIDEBAR_NOW), '09-20 11:02', '更早')
+  // ⚠️ 这一条是"日历日 vs 24h"的判别用例：差 15 小时 10 分，但**隔了一个自然日**。
+  //    写成 `(now - at) / 86400000` 取整的实现会得到"15 小时前"，而它其实是昨天的消息
+  //    —— 读数看着完全正常，只有分组会错（这正是它值得一条断言的原因）
+  assertEqual(describeConversationTime('2026-09-22T23:50:00', SIDEBAR_NOW), '昨天 23:50', '跨零点但不足 24 小时')
+  // 服务端时钟比本机快（漂移）⇒ 显示"刚刚"，不显示负数
+  assertEqual(describeConversationTime('2026-09-23T15:01:00', SIDEBAR_NOW), '刚刚', '未来的时间当刚刚')
+})
+
+await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持服务端给的顺序', () => {
+  // 入参顺序 = 服务端的顺序（`lastMessageAt desc` + `nulls:'first'`，`02` §4.5 ③）：
+  // 没消息的新会话排最前，然后按活跃时间降序
+  const list = [
+    convItem({ id: 'fresh', createdAt: '2026-09-23T14:30:00' }),
+    convItem({ id: 'today', topic: '本周部署变更周报', lastMessageAt: '2026-09-23T12:00:00' }),
+    convItem({ id: 'yesterday', lastMessageAt: '2026-09-22T18:20:00' }),
+    convItem({ id: 'lastWeek', lastMessageAt: '2026-09-20T11:02:00' }),
+  ]
+  const groups = groupConversationViews(list, SIDEBAR_NOW, null)
+
+  assertDeepEqual(
+    groups.map((group) => group.label),
+    ['今天', '更早'],
+    '分组标题与顺序',
+  )
+  assertDeepEqual(
+    groups[0].items.map((item) => item.id),
+    ['fresh', 'today'],
+    '「今天」：**刚建好还没说话的会话**也在今天（用 createdAt 兜底，不是掉进"更早"）',
+  )
+  assertDeepEqual(
+    groups[1].items.map((item) => item.id),
+    ['yesterday', 'lastWeek'],
+    '「更早」',
+  )
+  // 契约里最要紧的一条（见 `conversationList.ts` 文件头）：分组只切归属、**一列都不动**
+  assertDeepEqual(
+    groups.flatMap((group) => group.items.map((item) => item.id)),
+    list.map((item) => item.id),
+    '把各组拼回去必须等于入参原序（侧栏自己重排会与服务端分页打架）',
+  )
+
+  assertDeepEqual(
+    groupConversationViews([convItem({ id: 'a' })], SIDEBAR_NOW, null).map((group) => group.label),
+    ['今天'],
+    '只有今天的内容 ⇒ 不该出现一个空的「更早」标题',
+  )
+  assertDeepEqual(
+    groupConversationViews([convItem({ id: 'b', lastMessageAt: '2026-09-10T10:00:00' })], SIDEBAR_NOW, null).map(
+      (group) => group.label,
+    ),
+    ['更早'],
+    '反过来同理',
+  )
+  assertDeepEqual(groupConversationViews([], SIDEBAR_NOW, null), [], '一个会话都没有 ⇒ 没有分组')
+})
+
+await it('K3 状态灯三态：「生成中」只由**流 store** 点亮，`FINISHED` ⇒ 只读保留', () => {
+  const active = convItem({ id: 'a', topic: '本周部署变更周报', lastMessageAt: '2026-09-23T14:57:00' })
+
+  const running = conversationItemView(active, SIDEBAR_NOW, 'a')
+  assertEqual(running.led, 'run', '这一条在生成')
+  assertEqual(running.state, '生成中', '状态文案（与灯"色 + 字"两重表达）')
+  assertEqual(running.title, '本周部署变更周报', '标题取 topic')
+  assertEqual(running.time, '3 分钟前', '时间读数')
+
+  // ⚠️ 指向是**单侧**的：别的会话在生成，这一条不该亮 run（写成"只要有流就全都亮"的实现会红）
+  const other = conversationItemView(active, SIDEBAR_NOW, 'some-other-conversation')
+  assertEqual(other.led, 'idle', '别的会话在生成 ⇒ 这一条仍是 idle')
+  assertEqual(other.state, '可继续', '文案')
+
+  const finished = conversationItemView(convItem({ id: 'c', status: 'FINISHED' }), SIDEBAR_NOW, null)
+  assertEqual(finished.led, 'warn', 'FINISHED（Agent 被软删 ⇒ 只读保留）')
+  assertEqual(finished.state, '只读保留', '文案说结果，不说"已结束"')
+
+  const untitled = conversationItemView(convItem({ id: 'd' }), SIDEBAR_NOW, null)
+  assertEqual(untitled.title, '新会话', '没命名过 ⇒ 回落到 shared 的 CONVERSATION_UNTITLED_HINT')
+  assertEqual(untitled.time, '还没有消息', '没有消息时的时间读数')
+})
+
+await it('K4 行内重命名的三条判据（空 / 超长 / 没改动）；长度按**码点**算', () => {
+  assertEqual(normalizeTopicDraft('', null), null, '空串 ⇒ 提交不成立')
+  assertEqual(normalizeTopicDraft('   ', '旧名'), null, '只有空白 ⇒ 也不成立（后端 trim 后是空）')
+
+  const trimmed = normalizeTopicDraft('  沙箱并发怎么调  ', null)
+  assertEqual(trimmed.topic, '沙箱并发怎么调', '提交前 trim')
+  assertEqual(trimmed.unchanged, false, '是个新名字')
+
+  assertEqual(normalizeTopicDraft('旧名', '旧名').unchanged, true, '点开又原样保存 ⇒ 不发 PATCH')
+  assertEqual(normalizeTopicDraft(' 旧名 ', '旧名').unchanged, true, '只差空白也算没改动（trim 后比）')
+  assertEqual(normalizeTopicDraft('新名', null).unchanged, false, '原来没名字 ⇒ 一定有改动')
+
+  assertEqual(
+    normalizeTopicDraft('x'.repeat(CONVERSATION_TOPIC_MAX_CHARS), null).topic.length,
+    CONVERSATION_TOPIC_MAX_CHARS,
+    '恰好到上限 ⇒ 可以',
+  )
+  assertEqual(normalizeTopicDraft('x'.repeat(CONVERSATION_TOPIC_MAX_CHARS + 1), null), null, '超一个字符 ⇒ 不行')
+  // ⚠️ 按**码点**算：255 个 emoji 是 255 个字符，而 `'😀'.repeat(255).length` 是 510。
+  //    写成 `raw.length` 的实现会在这里红 —— 而它的症状是"用户打了半个标题就被拦下"
+  assert(
+    normalizeTopicDraft('😀'.repeat(CONVERSATION_TOPIC_MAX_CHARS), null) !== null,
+    '255 个 emoji 应当通过（后端 zod 的 `.max()` 也是按码点）',
+  )
+})
+
+await it('K5 删除确认词**逐字**（不 trim、不忽略大小写）', () => {
+  assertEqual(isDeleteConfirmed('删除'), true, '逐字对上')
+  assertEqual(isDeleteConfirmed('删除 '), false, '尾随空格不算')
+  assertEqual(isDeleteConfirmed(' 删除'), false, '前导空格不算')
+  assertEqual(isDeleteConfirmed('删 除'), false, '中间插空格不算')
+  assertEqual(isDeleteConfirmed('DELETE'), false, '换一种写法不算')
+  assertEqual(isDeleteConfirmed(''), false, '空串不算（弹窗刚打开时的默认态）')
+})
+
+await it('K6 「+ 新会话」的判据：已经在新会话态 ⇒ 什么都不做', () => {
+  assertEqual(newConversationAction('conv-1'), 'navigate', '从某个会话切走 ⇒ 导航到不带 id 的地址')
+  assertEqual(newConversationAction(undefined), 'already-new', '已经在新会话态 ⇒ 别往历史里塞空条目')
+})
+
+await it('K7 缓存键是**父子**关系：一次失效让"侧栏列表 + 会话总数"同时对齐', () => {
+  const parent = agentConversationsQueryKey('agent-1')
+  const child = agentConversationsListQueryKey('agent-1')
+  assertDeepEqual([...child].slice(0, parent.length), [...parent], '列表键必须是总数键的子键')
+  assert(child.length > parent.length, '子键要比父键长（否则两者是同一个缓存项）')
+  // ⚠️ 反向的一条：**不同的智能体不能共用同一个键**。把 agentId 忘了放进键里（或写成常量）的
+  //    实现会让"换一个智能体看到上一个的会话列表"，而它在两个智能体下都长得像正常数据
+  assert(
+    agentConversationsListQueryKey('agent-1').join('|') !== agentConversationsListQueryKey('agent-2').join('|'),
+    '不同 agentId 的缓存键必须不同',
+  )
+})
+
+await it('K8 上限常量与 `shared` 的契约同源（数字不许在两处各写一遍）', () => {
+  assertEqual(CONVERSATIONS_PAGE_LIMIT_MAX, 100, '侧栏一次取满 100 条（= listConversationsQuerySchema 的 limit 上限）')
+  assert(
+    listConversationsQuerySchema.safeParse({ limit: CONVERSATIONS_PAGE_LIMIT_MAX }).success,
+    '这个值本身必须通过后端的 schema',
+  )
+  assert(
+    !listConversationsQuerySchema.safeParse({ limit: CONVERSATIONS_PAGE_LIMIT_MAX + 1 }).success,
+    '再大一个就必须被拒（否则"取满 100"是假的）',
+  )
+
+  assert(
+    renameConversationBodySchema.safeParse({ topic: 'x'.repeat(CONVERSATION_TOPIC_MAX_CHARS) }).success,
+    '标题上限本身合法',
+  )
+  assert(
+    !renameConversationBodySchema.safeParse({ topic: 'x'.repeat(CONVERSATION_TOPIC_MAX_CHARS + 1) }).success,
+    '超一个字符必须被拒',
+  )
+  // 字段级**文案里**的数字也要来自同一个常量（P0-1-29 的 ⑰ 号教训：同一事实两处写必有一处腐烂）
+  const tooLong = renameConversationBodySchema.safeParse({ topic: 'x'.repeat(CONVERSATION_TOPIC_MAX_CHARS + 1) })
+  assert(
+    tooLong.success === false &&
+      tooLong.error.issues.some((issue) => issue.message.includes(String(CONVERSATION_TOPIC_MAX_CHARS))),
+    '字段级文案里的数字应当引用同一个常量',
+  )
+})
+
+await it('K9 **坑预判守门**：流结束时必须失效会话列表（否则新会话不冒头）', () => {
+  // `03` §五 的 `done` 行原文："结束流；… ；**刷新会话列表排序**"。
+  // 侧栏的排序键是 `last_message_at`，而它**正是这一轮落库时才被推进的**（`02` §4.5 ④）
+  // ⇒ 少了这次失效，刚说完话的会话在侧栏里排不到最前面（"新会话不冒头"）。
+  // 断言落在**源码**上（与 J4 同族）：它守的是"这一行被删掉"这件事，而它在纯函数里看不见。
+  const source = stripComments(
+    readFileSync(new URL('../src/features/chat/useChatStream.ts', import.meta.url), 'utf8'),
+  )
+  assertIncludes(
+    source,
+    'invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })',
+    '`useChatStream.ts` 里应当有这一行',
+  )
+})
+
+await it('K10 侧栏**不许自己排序**（排序口径只有服务端那一份）', () => {
+  // 在侧栏里再排一次 = 出现了第二份排序口径，而它与服务端的 offset/limit 分页会打架
+  // （症状："翻到第二页时同一条又出现一次 / 某一条永远看不到"）。分组只切归属，不动顺序。
+  const source = stripComments(
+    readFileSync(new URL('../src/features/chat/ConversationSidebar.tsx', import.meta.url), 'utf8'),
+  )
+  assert(!source.includes('.sort('), '侧栏源码里不该出现 `.sort(`')
+})
+
 // ───────────────────────────── 复原桩 ─────────────────────────────
 
 globalThis.fetch = realFetch
@@ -1650,14 +1949,24 @@ console.log(`        本档守的是"弹哪个文案、什么情况下弹"（J1/
 console.log(`  ${c.g}③${c.x} 断线黄条点击后历史与后端一致 .......... J5/J6（丢流式版本的判据）+ J9（黄条不被丢轮次带走）`)
 console.log(`  ${c.g}坑${c.x} 停止的 5s 收口窗口不能省 .............. I2（abort 必须排在等待之后）+ I3（窗口可注入）`)
 
+console.log(`\n${c.b}── P0-1-34 验收原文两条对应的证据 ──${c.x}`)
+console.log(`  ${c.g}①${c.x} 新建 → 切换 → 重命名 → 删除全流程顺 ...... K4（改名三条判据）+ K5（删除逐字确认）+ K6（新建）`)
+console.log(`     ${c.g}+${c.x} 列表形态（分组 / 顺序 / 读数 / 状态灯）......... K1 + K2 + K3`)
+console.log(`     ${c.y}⚠️${c.x} "顺不顺"是交互与网络的事（导航、` + '`PATCH`/`DELETE` 真打出去）⇒ 归浏览器端测（`' + `README` + '` ㉜~㊱）')
+console.log(`  ${c.g}②${c.x} 对话中途仍能进知识库/凭据页（导航不孤岛）... K10 的同族守门（源码级）`)
+console.log(`     ${c.y}⚠️${c.x} 专注布局本身（仪表轨收起 + 「工作台」下拉）是渲染的事 ⇒ 归浏览器端测（` + '`README` ㊲）')
+console.log(`  ${c.g}坑${c.x} 活跃排序需在 done 后刷新 ................... K9（源码级守门：那一行被删掉就红）`)
+
 console.log(`\n${c.d}── 本档验不到的（别当全批验收）──`)
-console.log(`  · React 渲染与交互（七种卡片、黄条、状态灯长什么样）⇒ 浏览器端测（` + '`README` ㉖~㉛）')
+console.log(`  · React 渲染与交互（七种卡片、黄条、状态灯长什么样、侧栏布局）⇒ 浏览器端测（` + '`README` ㉖~㊲）')
 console.log(`  · 真后端那一侧（响应头禁用缓冲 / 互斥锁 / 心跳 / done 时序 / stop 端点的服务端行为）⇒ ` + '`pnpm verify:chat-stream`、`verify:chatbot`')
 console.log(`  · 打包产物：本档跑的是**源码**（` + '`node --import tsx`' + `），不经 vite${c.x}`)
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ 对话页前端验收通过（P0-1-32 SSE 客户端 + P0-1-33 输入区/停止/断线）：${passed} 项全通过${c.x}`)
+  console.log(
+    `${c.g}${c.b}✅ 对话页前端验收通过（P0-1-32 SSE 客户端 + P0-1-33 输入区/停止/断线 + P0-1-34 会话侧栏）：${passed} 项全通过${c.x}`,
+  )
   process.exit(0)
 } else {
   console.log(`${c.r}${c.b}❌ 对话页前端验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)

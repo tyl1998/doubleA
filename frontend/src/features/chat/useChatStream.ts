@@ -11,14 +11,22 @@
  * ```
  * ① 同步闸门（`sendGate`）：上一次发送还没结束就直接拒绝 —— 见 `composerState.ts` 的 `createSendGate`
  * ② 正文 trim（空串直接返回，不发请求 —— 与后端 `chatRequestBodySchema` 的 `.min(1)` 同口径）
- * ③ 没有会话 ⇒ `POST /api/conversations` 建一个（`03` §4.1），把新 id 交给页面写进 URL
+ * ③ **另一个会话正在生成 ⇒ 拒绝**（P0-1-34；前端只有一个轮次槽，见下面那段长注释）
+ *    ⚠️ 它必须排在 ④ 之前：放到后面会在"新建会话态"下先建出一个空会话再报错
+ * ④ 没有会话 ⇒ `POST /api/conversations` 建一个（`03` §4.1），把新 id 交给页面写进 URL
  *    ⚠️ 这一步失败 ⇒ **整次发送作废**，且**不在界面上留下任何痕迹**（前置失败一个字不落库）
- * ④ store.begin(...)  ← 注意顺序：**流建立之后**才开始画气泡。反过来会让"点发送就出现
+ * ⑤ store.begin(...)  ← 注意顺序：**流建立之后**才开始画气泡。反过来会让"点发送就出现
  *    两条气泡、然后弹一个错误提示"，而那句话根本没被服务端接受过
- * ⑤ POST /chat + 读完事件流（每帧 `store.apply`）
- * ⑥ 收尾：`done` / `error` 事件由归约层收口；**没有终帧就结束** ⇒ 这里补一条"连接中断"
+ * ⑥ POST /chat + 读完事件流（每帧 `store.apply`）
+ * ⑦ 收尾：`done` / `error` 事件由归约层收口；**没有终帧就结束** ⇒ 这里补一条"连接中断"
  *    （`terminated === false`，见 `chatStream.ts` 的文件头）**并亮黄条**
  * ```
+ *
+ * ⚠️ ③ 是 P0-1-34（会话侧栏）带出来的一条**新闸门**，它拦的不是"服务端不允许"，
+ * 而是"**本批前端表达不了**"：见 `send` 里那段注释（一个轮次槽 + 淡出的串台）。
+ * 它同时是**界面上的第六个状态**（`composerState.ts` 的 `elsewhere`）—— 于是用户在
+ * 按下发送之前就知道发不出去，而不是"点了才被告知"。两面都要有：状态机负责"看得见"，
+ * 这里负责"拦得住"。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三类失败，三种处置（别混成一种）
@@ -26,6 +34,7 @@
  * | 失败 | 例子 | 界面 |
  * |------|------|------|
  * | **前置失败**（信封） | 401 / 400 / 404 / 409 只读 / 424 缺凭据 | `send` 返回 `{ok:false}`，**气泡不出现**，正文还给输入框 |
+ * | **前端闸门**（不发请求） | 同标签页重复发送（`BUSY`）、**另一个会话正在生成**（`BUSY`，P0-1-34） | 同上（同一个出口） |
  * | **流内 error 事件** | `CONFLICT`、上游 500 | 归约层把这一轮标红 ⇒ 消息流内错误卡 + **toast**（`03` §五 的 `error` 行），**不亮黄条** |
  * | **连接中断** | 服务端被 kill、代理断开 | 错误卡（`errorSource:'client'`）+ **顶部黄条**（`03` §4.1），**不弹 toast** |
  * 前两种的分界线由后端定（`shared/src/sse.ts` 文件头 ③），前端只需按"**响应是不是事件流**"分流
@@ -46,6 +55,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentType, ConversationActive, ConversationItem, MessagePageResult } from '@doubulea/shared'
 
 import {
+  agentConversationsQueryKey,
   conversationMessagesQueryKey,
   createConversation,
   fetchConversationActive,
@@ -90,6 +100,15 @@ export interface UseChatStreamResult {
   stopping: boolean
   /** 顶部黄条（`03` §4.1 断线）；点击它应当调 {@link UseChatStreamResult.align} */
   disconnect: DisconnectState | null
+  /**
+   * **哪个**会话此刻在生成（P0-1-34 的侧栏要用它点亮那一条的"生成中"灯）；`null` = 没有。
+   *
+   * ⚠️ 不能直接拿 `streamFor`：它一直留到这一轮被让位或被清掉（`stores/chatStream.ts`），
+   * 于是"刚收口的那条"会多亮几秒。判据与输入区的 `streaming` **同源** —— 只有
+   * `status === 'streaming'` 才算在生成（`stopping` 窗口里也是 `streaming`，
+   * 那段时间界面**确实**还在等服务端收口，亮着是对的）。
+   */
+  streamingId: string | null
   /** 发一条消息；返回 `ok:false` 时正文应当还给输入框 */
   send: (text: string) => Promise<SendOutcome>
   /** 点「停止」（时序见 `stopController.ts`）；返回值供页面决定说什么 */
@@ -198,7 +217,32 @@ export function useChatStream(
       try {
         const store = useChatStreamStore.getState()
 
-        // ③ 没有会话就先建（`03` §4.1：首条消息发送时才创建会话）
+        // ③ **别的会话正在生成 ⇒ 不开新的这一轮**（P0-1-34）。
+        //
+        // 为什么必须在这里拦：本批的前端只有**一个轮次槽**（`stores/chatStream.ts` 的 `round`）。
+        // 侧栏让"切到别的会话再发一条"变成一个很容易的动作，而那时：
+        //   · `store.begin(targetId, …)` 会**覆盖**掉另一个会话正在进行的一轮；
+        //   · 旧流的帧还在往同一个槽里灌（`apply` 不认识"这一帧属于谁"）。
+        // 两者合起来是一个**静默串台**：B 的回答里混进 A 的增量，而两个会话各自看起来
+        // 都"有内容"。后端每个会话各有一把锁（允许并行），"同时只能有一条"是本批前端的约束
+        // （多流要把 store 改成 `Map`，属后续批次）。
+        //
+        // ⚠️ 它排在 `createConversation` **之前**：放到后面会在"新建会话态"下先建出一个
+        //    空会话再报错（用户侧栏里凭空多一条"新会话"）。
+        // ⚠️ 文案要**能照着做**（"等它结束，或到那个会话点停止"），不能只说"不允许"。
+        const running = store.round !== null && store.round.status === 'streaming' ? store.streamFor : null
+        if (running !== null && running !== conversationIdRef.current) {
+          return {
+            ok: false,
+            error: new ApiError(
+              'BUSY',
+              '另一个会话正在生成中：等它结束，或到那个会话点「停止」',
+              429,
+            ),
+          }
+        }
+
+        // ④ 没有会话就先建（`03` §4.1：首条消息发送时才创建会话）
         let targetId = conversationIdRef.current
         if (targetId === undefined) {
           let created: ConversationItem
@@ -211,7 +255,7 @@ export function useChatStream(
           onConversationCreatedRef.current?.(created)
         }
 
-        // ④ 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）
+        // ⑤ 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）
         const controller = new AbortController()
         abortRef.current?.abort()
         abortRef.current = controller
@@ -258,6 +302,13 @@ export function useChatStream(
           // ⚠️ **不做这件事的后果很隐蔽**：`staleTime` 是 30s（`api/queryClient.ts`），
           // 用户在 30s 内切走再切回对话页，会看到**流式那一轮凭空消失**的旧历史。
           void queryClient.invalidateQueries({ queryKey: conversationMessagesQueryKey(targetId) })
+          // 侧栏（P0-1-34）的排序键是 `last_message_at`，而它**正是这一轮落库时才被推进的**
+          // （`02` §4.5 ④ 的唯一写入口 `touchConversation`）⇒ 不在这里失效，刚说过话的会话
+          // 就不会冒到「今天」那一组的最前面 —— 这正是 P0-1-34 的坑预判原文
+          //（`03` §五 的 `done` 行："**刷新会话列表排序**"）。
+          // 放在 `finally` 而不是 `done` 那一支：中断/断线的一轮**也可能落库**，
+          // 而"没落库"时多拉一次列表的代价只是一次几十行的查询（`03` §五 的 `done` 行是下限，不是上限）。
+          void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
         }
       } finally {
         sendGate.leave()
@@ -364,12 +415,16 @@ export function useChatStream(
   // ⚠️ `streaming` 也必须用**过滤后**的那一个：否则页面在别的会话里也会被禁用输入区
   const visibleRound = streamFor !== null && streamFor === conversationId ? round : null
 
+  /** 见 {@link UseChatStreamResult.streamingId}：判据与 `streaming` 同源，但**不过滤会话** */
+  const streamingId = streamFor !== null && round !== null && round.status === 'streaming' ? streamFor : null
+
   return {
     round: visibleRound,
     streaming: visibleRound !== null && visibleRound.status === 'streaming',
     sending,
     stopping,
     disconnect,
+    streamingId,
     send,
     stop,
     align: alignAndClear,

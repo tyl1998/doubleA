@@ -35,6 +35,12 @@ export interface ChatInputProps {
   sending: boolean
   /** 点了停止、正在 5s 窗口里等收口 */
   stopping: boolean
+  /**
+   * **另一个**会话正在生成（P0-1-34）。判据在页面里：
+   * `streamingId !== null && streamingId !== conversationId`（见 `useChatStream` 的
+   * `streamingId`）—— 这里只负责把它交给状态机，**不自己判**。
+   */
+  elsewhere: boolean
   draft: string
   onDraftChange: (text: string) => void
   /** 提交（发送）。**是否真的发**由状态机的 `canSend` 决定，这里不再判一次 */
@@ -47,12 +53,13 @@ export function ChatInput({
   round,
   sending,
   stopping,
+  elsewhere,
   draft,
   onDraftChange,
   onSubmit,
   onStop,
 }: ChatInputProps) {
-  const view = composeState({ round, sending, stopping, draft })
+  const view = composeState({ round, sending, stopping, elsewhere, draft })
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     // 判据在 `composerState.ts#isSubmitKey`（含中文输入法候选词的 `isComposing` 那一条 ——
