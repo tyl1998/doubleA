@@ -33,6 +33,9 @@ import {
   type UpdateKnowledgeBaseBody,
 } from '@doubulea/shared'
 
+// 逐字确认的唯一判据（P0-1-36 起三处级联删除共用这一份，见下方 `isKnowledgeDeleteConfirmed`）
+import { isTypedConfirmMatch } from '../../app/confirm.js'
+
 // ───────────────────────────── 上传白名单（accept 属性 + 发送前拦截）─────────────────────────────
 
 /**
@@ -620,10 +623,15 @@ export function buildRetrievalPatch(
 /**
  * 删库的逐字确认判据：**不做 `trim()`**。
  *
- * "顺手去掉首尾空白"会让"逐字确认"变成一句空话（与 `conversationList.isDeleteConfirmed` /
- * `DeleteAgentModal` 同款口径）。确认词就是知识库自己的名字 —— 与删智能体那档一致
- * （`03` §七 的级联删除：Modal + 红色危险按钮 + 明示影响范围）。
+ * "顺手去掉首尾空白"会让"逐字确认"变成一句空话（与删智能体那档同款口径）。确认词就是知识库
+ * 自己的名字 —— 与删智能体那档一致（`03` §七 的级联删除：Modal + 红色危险按钮 + 明示影响范围）。
+ *
+ * ⚠️ **P0-1-36 起实现改为委托** `app/confirm.ts#isTypedConfirmMatch`：同一句判据在 P0-1-34
+ * （会话）、P0-1-35（知识库）、P0-1-36（Provider）会出现**第三遍**，而"两处各写一遍必有一处
+ * 先腐烂"（`06` §六 第 ⑰ 条）—— 只要有人给其中一处加上 `trim()`，那一档就悄悄变成
+ * "差不多就行"，且**不报任何错**。对外导出与行为逐字未变，调用方 import 路径一字不动
+ * （与 P0-1-35 抽取 `formatUpdatedAt` 同一手法）。
  */
 export function isKnowledgeDeleteConfirmed(typed: string, name: string): boolean {
-  return typed === name
+  return isTypedConfirmMatch(typed, name)
 }

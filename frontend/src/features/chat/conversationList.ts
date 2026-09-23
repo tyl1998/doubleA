@@ -43,6 +43,9 @@ import {
   type ConversationItem,
 } from '@doubulea/shared'
 
+// 逐字确认的唯一判据（P0-1-36 起四处级联删除共用这一份，见下方 `isDeleteConfirmed`）
+import { isTypedConfirmMatch } from '../../app/confirm.js'
+
 /** 侧栏一行的视图（组件只把它画出来，不再做任何判断） */
 export interface ConversationListItemView {
   id: string
@@ -235,8 +238,11 @@ export const CONVERSATION_DELETE_CONFIRM_WORD = '删除'
  * ⚠️ **不做 `trim()`、不忽略大小写、不接受全角**（"删除 " 与 "删除" 不是一回事）：
  * 这一类"确认成本"的全部意义就在于**逼用户慢下来**，而"顺手把空白去掉"会让"粘了个带空格的
  * 词进来"也算通过 —— 它挡不住任何一次误触，却让"逐字确认"这句话变成一句空话。
- * 判据写成函数而不是让组件写 `typed === '删除'`，是为了让**这一条**能被无依赖档断言钉住。
+ *
+ * ⚠️ **P0-1-36 起实现改为委托** `app/confirm.ts#isTypedConfirmMatch`：到本批为止，
+ * "逐字确认"这句判据已经有四个消费方（会话 / 智能体 / 知识库 / Provider）—— 四份实现
+ * 必然先腐烂一份，且**不报任何错**。对外导出与行为逐字未变。
  */
 export function isDeleteConfirmed(typed: string): boolean {
-  return typed === CONVERSATION_DELETE_CONFIRM_WORD
+  return isTypedConfirmMatch(typed, CONVERSATION_DELETE_CONFIRM_WORD)
 }

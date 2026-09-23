@@ -30,6 +30,7 @@ import { useEffect, useState } from 'react'
 import { useMyConversationCount } from '../../api/conversations.js'
 import { useRemoveAgent } from '../../api/agents.js'
 import { describeError } from '../../api/client.js'
+import { isTypedConfirmMatch } from '../../app/confirm.js'
 import { useFeedback } from '../../app/feedback.js'
 import { mcpRefsOf } from './agentModel.js'
 
@@ -60,7 +61,9 @@ export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModal
 
   const knowledgeCount = agent.components.filter((c) => c.componentType === 'KNOWLEDGE').length
   const mcpRefs = mcpRefsOf(agent.components)
-  const nameMatches = typedName === agent.name
+  // 逐字确认（P0-1-36 起四处共用 `app/confirm.ts#isTypedConfirmMatch` 这一份实现：
+  // 智能体 / 会话 / 知识库 / Provider —— 判据散成四份必然先腐烂一份，且不报任何错）
+  const nameMatches = isTypedConfirmMatch(typedName, agent.name)
   const removing = removeAgent.isPending
 
   const confirm = () => {

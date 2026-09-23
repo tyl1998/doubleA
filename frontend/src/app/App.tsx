@@ -10,6 +10,8 @@
  * P0-1-32：`/chat/:agentId/:conversationId?` 换成真实的对话页（SSE 客户端 + 消息流七种卡片）。
  * P0-1-35：`/knowledge` 与 `/knowledge/:id` 换成真实的知识库列表与详情页
  *          （文档上传 / 覆盖重传 / 重试 / 下载 / 删除 + 检索测试抽屉 + 状态轮询）。
+ * P0-1-36：`/admin/users` 与 `/admin/models` 换成真实的用户管理与模型池管理
+ *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
  *
  * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
  *
@@ -34,6 +36,8 @@ import { AppLayout } from './AppLayout.js'
 import { RequireAdmin } from './RequireAdmin.js'
 import { RequireAuth } from './RequireAuth.js'
 import { BatchPlaceholderPage, NotFoundPage } from '../pages/NoticePage.js'
+import { ModelsPage } from '../pages/admin/ModelsPage.js'
+import { UsersListPage } from '../pages/admin/UsersListPage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
 import { ChatPage } from '../pages/chat/ChatPage.js'
@@ -107,40 +111,10 @@ export function App() {
           />
           <Route path="/settings/password" element={<PasswordPage />} />
 
-          {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见） */}
+          {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见）。两页都在 P0-1-36 接上真页面 */}
           <Route element={<RequireAdmin />}>
-            <Route
-              path="/admin/users"
-              element={
-                <BatchPlaceholderPage
-                  serial="S-07 · 用户管理"
-                  title="用户管理"
-                  batch="P0-1-36"
-                  blockedBy="B 包用户接口已就绪（P0-1-9 已 ✓）"
-                  bullets={[
-                    '建号：初始密码一次性展示（后端只在创建时下发一次）',
-                    '启停账号、改角色、重置密码',
-                    '被停用的账号下个请求就会 401（后端快照缓存会失效）',
-                  ]}
-                />
-              }
-            />
-            <Route
-              path="/admin/models"
-              element={
-                <BatchPlaceholderPage
-                  serial="S-07b · 模型池"
-                  title="模型池管理"
-                  batch="P0-1-36"
-                  blockedBy="C 包模型接口已就绪（P0-1-11 已 ✓）"
-                  bullets={[
-                    'provider 维护：名称 / 类型 / Base URL / API Key（Key 有进无出，保存后不回显）',
-                    '模型维护：模型名 / 类型 / 上下文长度 / 是否支持图片 / 启停',
-                    '停用的模型不会出现在「可用模型」下拉里（含管理员自己建 Agent 时）',
-                  ]}
-                />
-              }
-            />
+            <Route path="/admin/users" element={<UsersListPage />} />
+            <Route path="/admin/models" element={<ModelsPage />} />
             <Route
               path="/admin/usage"
               element={

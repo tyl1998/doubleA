@@ -1325,3 +1325,20 @@
   border-radius: var(--r-xs);
   color: var(--warn);
 }
+
+/* ============ 管理页：两段式区块（P0-1-36，`/admin/models` 的 Provider + 模型） ============
+   为什么要一个自写类而不是行内 style：这两个区块在页面里各出现一次，而"区块之间的留白"
+   与"标题行怎么摆"是同一条口径 —— 写两次行内 style 就会出现两处 `marginBottom` 不一致，
+   而症状只是"下面那块离得近了些"，没人会当成 bug 去查。
+   ⚠️ 只放**结构**（间距与对齐），外观（字号、颜色、Tag、Switch）全部交给 AntD 与 `tokens.css`
+   —— `06` P0-1-30 定案「AntD 已有的样式不重写」。`.card__title` 是已有类，这里只复用。
+   窄屏：`row--wrap` 已在工具类里处理换行，标题行用 `flex-wrap` 保证 1024 以下不撑出横向滚动。 */
+.admin-section { margin-bottom: var(--sp-8); }
+.admin-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-3);
+}
