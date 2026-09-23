@@ -14,6 +14,35 @@ export const HOME_PATH = '/'
 export const ADMIN_USERS_PATH = '/admin/users'
 export const ADMIN_MODELS_PATH = '/admin/models'
 
+/** 智能体（`03` §二：`/` 是列表、`/agents/new` 建、`/agents/:id/edit` 改） */
+export const AGENTS_NEW_PATH = '/agents/new'
+
+/**
+ * 编辑某智能体。
+ *
+ * `encodeURIComponent` 在这儿**不是**防注入（调用方给的都是服务端下发的 uuid），而是为了
+ * 让"这个 id 不该出现在路径里"这类错误尽早表现为一个查不到的地址，而不是拼出一个**看着对、
+ * 打过去 404** 的链接 —— 后者排查时第一反应是"后端路由没注册"。
+ */
+export function agentEditPath(agentId: string): string {
+  return `/agents/${encodeURIComponent(agentId)}/edit`
+}
+
+/**
+ * 与某智能体对话（`03` §二 的 `/chat/:agentId`，`conversationId` 可选定位）。
+ *
+ * `conversationId` 省略 = **新会话态**（`03` §4.1：展示开场白，首条消息发送时才创建会话）；
+ * 带上 = 定位到那个会话。P0-1-32 起"发第一条消息"会把它写进 URL（`replace`），
+ * 于是**刷新后仍停在同一会话**、历史用同一套组件重画 —— 这是本批验"刷新后形态一致"的前提。
+ *
+ * ⚠️ 侧栏、新建/重命名/删除会话属 **P0-1-34**：本批只有"URL 里带着的那个会话"，
+ * 没有"在会话之间切换"的入口（从列表页进来永远是**新会话态**）。
+ */
+export function chatPath(agentId: string, conversationId?: string): string {
+  const base = `/chat/${encodeURIComponent(agentId)}`
+  return conversationId === undefined ? base : `${base}/${encodeURIComponent(conversationId)}`
+}
+
 /** 登录页的两种视图（`docs/03` §二：`/login` 是"登录（含首登改密）"，两态同屏） */
 export type LoginView = 'login' | 'password'
 

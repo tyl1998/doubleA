@@ -7,6 +7,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "serve:upstreams": "node scripts/serve-upstreams.mjs",
     "watch:types": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "build": "pnpm run db:generate && tsc -p tsconfig.json",
     "start": "node dist/backend/src/index.js",

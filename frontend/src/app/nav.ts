@@ -23,7 +23,14 @@ export interface NavItem {
   serial: string
   /** ADMIN 专属入口（`03` §三：管理入口仅 ADMIN 可见） */
   adminOnly?: boolean
-  /** 该条目对应页面属哪个批次（尚未落地的页面用占位页承接，占位页要写明批次） */
+  /**
+   * 该条目对应的页面属哪个批次。
+   *
+   * ⚠️ 这是一个**给维护者看的台账，当前没有任何渲染出口**（占位页的批次文案来自路由表里
+   * 那条 `BatchPlaceholderPage` 的 `batch` prop）。所以它不会自己消失：**页面落地时必须手工删掉
+   * 这一项**（P0-1-31 把 `AG` 的值清掉了），否则这份台账会慢慢变成"哪些页还没做"的错误答案
+   * —— 而它存在的唯一理由就是回答这个问题。
+   */
   batch?: string
 }
 
@@ -35,7 +42,9 @@ export interface NavItem {
  * - 「任务」是 P1（`03` §4.7），本阶段不进导航 —— 摆一个点进去是空壳的入口比没有更差。
  */
 export const NAV_ITEMS: readonly NavItem[] = [
-  { code: 'AG', label: '智能体', path: '/', serial: 'S-02 · 智能体', batch: 'P0-1-31' },
+  // 已落地 ⇒ 不带 `batch`（P0-1-31 起把首页换成真实的智能体列表；编辑页不带导航项，
+  // 它由列表与摘要卡进入，屏号在 `SERIAL_BY_PREFIX` 里）
+  { code: 'AG', label: '智能体', path: '/', serial: 'S-02 · 智能体' },
   { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库', batch: 'P0-1-35' },
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP', batch: 'P0-2（MCP 端点尚未存在）' },
   {
@@ -55,8 +64,19 @@ export const NAV_ITEMS: readonly NavItem[] = [
   },
 ] as const
 
-/** 不在导航里的页面的屏号（登录 / 改密 / 未找到…），供仪表轨继续显示"第几屏" */
+/**
+ * 不在导航里的页面的屏号（登录 / 改密 / 智能体编辑 / 未找到…），供仪表轨继续显示"第几屏"。
+ *
+ * ⚠️ `/agents` 这一条是**必须的**：`matchNavItem` 判 `/agents/new` 时，导航项 `AG` 的 path 是 `/`
+ * 而它只对**恰好等于** `/` 的路径成立（否则它以 `/` 为前缀，命中一切路径）⇒ 落到本表。
+ * 不加这条，编辑页的仪表轨会显示兜底的「S-00 · 工作台」，而它明明是第 3 屏
+ * —— 一个读数错了的仪表比没有仪表更容易误导（原型上这里写的是 `S-03 · 编辑`）。
+ */
 const SERIAL_BY_PREFIX: readonly (readonly [string, string])[] = [
+  ['/agents', 'S-03 · 智能体编辑'],
+  // `/chat` 不进导航项（`03` §二：它是从智能体列表/列表页进入的页面，不是导航目的地），
+  // 但仪表轨底部那行"第几屏"照样要读对 —— P0-1-32 起这是真页面了
+  ['/chat', 'S-04 · 对话'],
   ['/settings/password', 'S-08 · 改密'],
   ['/login', 'S-01 · 登录'],
 ] as const

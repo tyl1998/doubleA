@@ -179,19 +179,97 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
   }
 
+  return unwrapEnvelope<T>(payload, response.status)
+}
+
+/**
+ * 把**已解析的响应体**按统一信封收口：成功返回 `data`，失败抛 {@link ApiError}。
+ *
+ * 抽出来的唯一理由是 `POST /api/conversations/:id/chat` 要用同一套判据（见 {@link openEventStream}）：
+ * 那个端点的**前置失败**（401/400/404/409/424）回的是标准 JSON 信封，**只有成功**才是事件流
+ * （`shared/src/sse.ts` 文件头 ③ 的"两类失败、两个出口"）。两处各写一遍信封解析，
+ * 迟早会出现"流那条路径忘了看 HTTP 状态"或"忘了收口 401"这类**只在某一条路径上**的偏差。
+ */
+function unwrapEnvelope<T>(payload: unknown, status: number): T {
   if (!isEnvelope(payload)) {
+    throw new ApiError('INTERNAL', `响应不符合统一信封约定（HTTP ${status}）`, status)
+  }
+  if (payload.code === OK_CODE) return payload.data as T
+
+  const error = new ApiError(payload.code, payload.msg, status, payload.data)
+  if (error.isUnauthorized) onUnauthorized?.()
+  throw error
+}
+
+/** SSE 响应的 Content-Type 前缀（`shared` 的 `SSE_CONTENT_TYPE` 带 `; charset=utf-8`） */
+const EVENT_STREAM_CONTENT_TYPE = 'text/event-stream'
+
+/**
+ * 发起一个**事件流**请求（P0-1-32 的 `POST /api/conversations/:id/chat` 专用）。
+ *
+ * 与原生的 `EventSource` 相比，这里必须自己发请求的三个理由（`docs/03` §一）：
+ *   ① 需要 **POST + JSON body**（`EventSource` 只能 GET）；
+ *   ② 需要带**凭据 Cookie**（`credentials: 'include'`，同源时无副作用但语义上必须写）；
+ *   ③ 需要一个能被上层 abort 的 `AbortSignal`（停止 / 卸载）。
+ *
+ * ⚠️ **响应可能是两种形态，判据是 HTTP 状态 + Content-Type，不是"有没有拿到流"**：
+ *   · 成功 ⇒ `200 text/event-stream`，返回 `Response` 交调用方逐帧读；
+ *   · 前置失败 ⇒ 4xx/5xx + **统一 JSON 信封**（未登录 / 参数非法 / 会话不是我的 / 只读 / 缺凭据）
+ *     ⇒ 走 {@link unwrapEnvelope}，抛出的 `ApiError` 与普通接口**完全一致**
+ *     （页面因此可以复用同一套错误提示与 401 收口）。
+ *   ⚠️ 例外：**并发冲突（`CONFLICT`）是 200 + 事件流里的一帧 `error`**，不是信封 ——
+ *   它照样走"流"这一路，由事件分派层收口（`shared/src/sse.ts` 文件头 ③）。
+ */
+export async function openEventStream(
+  path: string,
+  options: { body?: unknown; signal?: AbortSignal } = {},
+): Promise<Response> {
+  const { body, signal } = options
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(signal === undefined ? {} : { signal }),
+    })
+  } catch (error) {
+    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
     throw new ApiError(
-      'INTERNAL',
-      `响应不符合统一信封约定（HTTP ${response.status}）`,
-      response.status,
+      NETWORK_ERROR_CODE,
+      error instanceof Error && error.message !== ''
+        ? `无法连接后端：${error.message}`
+        : '无法连接后端，请检查网络或后端是否已启动',
+      0,
     )
   }
 
-  if (payload.code === OK_CODE) return payload.data as T
+  const contentType = response.headers.get('content-type') ?? ''
+  if (response.ok && contentType.startsWith(EVENT_STREAM_CONTENT_TYPE)) return response
 
-  const error = new ApiError(payload.code, payload.msg, response.status, payload.data)
-  if (error.isUnauthorized) onUnauthorized?.()
-  throw error
+  // 不是事件流 ⇒ 只可能是信封（前置失败）。此处**不判断状态码**：
+  // 判据是"收到了什么形状的响应"，而不是"HTTP 码看起来像成功" ——
+  // 200 + JSON 也会走到这里，那时 `unwrapEnvelope` 会把它当成功信封拆开，
+  // 由下面那句抛出"期望事件流"，比"把 JSON 当流去读"要早得多地失败。
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ApiError(
+      'INTERNAL',
+      `期望事件流，但响应不是 JSON 也不是事件流（HTTP ${response.status}）`,
+      response.status,
+    )
+  }
+  const data = unwrapEnvelope<unknown>(payload, response.status)
+  throw new ApiError(
+    'INTERNAL',
+    `期望事件流，但响应是统一信封（HTTP ${response.status}）`,
+    response.status,
+    data,
+  )
 }
 
 /**

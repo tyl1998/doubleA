@@ -1,16 +1,24 @@
 /**
- * 路由表（P0-1-30）
+ * 路由表（P0-1-30 建表；P0-1-31 接上智能体三条）
  *
  * 依据：`docs/03-前端设计.md` §二 的 14 条路由与权限列。
  *
- * ## 本批（P0-1-30）真正实现的只有一条链路
+ * ## 已落地的链路
  *
- * 登录 → 首登强制改密 → 进首页，加上 `/settings/password`。其余路由**按 `03` §二 全部登记**，
- * 但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
+ * P0-1-30：登录 → 首登强制改密 → 进首页，加上 `/settings/password`。
+ * P0-1-31：`/`（智能体列表）、`/agents/new`、`/agents/:id/edit` 换成真实页面。
+ * P0-1-32：`/chat/:agentId/:conversationId?` 换成真实的对话页（SSE 客户端 + 消息流七种卡片）。
+ *
+ * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
  *
  * 为什么不是先只登记已实现的路由：`03` §二 的路由表是**产品结构**，导航项的多寡本身就是
- * 验收内容（"ADMIN 与非 ADMIN 的导航项差异正确"）；而且一个能点进去、明说"属 P0-1-31"的入口，
+ * 验收内容（"ADMIN 与非 ADMIN 的导航项差异正确"）；而且一个能点进去、明说"属 P0-1-35"的入口，
  * 比一个 404 或一个消失的入口好得多。占位页**不接任何后端**，不会污染任何验收。
+ *
+ * ⚠️ `/chat/:agentId/:conversationId?` 里的**可选段**是本批加的（P0-1-32）：
+ * `03` §二 写的就是 `:conversationId? 可选定位`，而"刷新后历史还能重画"这件事
+ * **只有 URL 能承载**（会话 id 放在组件 state 里，刷新就没了 ⇒ 验收里的"刷新后形态一致"
+ * 根本验不了）。侧栏（在会话之间切换）仍属 P0-1-34。
  *
  * ## 守卫的嵌套顺序不是随意的
  *
@@ -24,6 +32,9 @@ import { AppLayout } from './AppLayout.js'
 import { RequireAdmin } from './RequireAdmin.js'
 import { RequireAuth } from './RequireAuth.js'
 import { BatchPlaceholderPage, NotFoundPage } from '../pages/NoticePage.js'
+import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
+import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
+import { ChatPage } from '../pages/chat/ChatPage.js'
 import { LoginPage } from '../pages/login/LoginPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 
@@ -36,72 +47,14 @@ export function App() {
       {/* 受保护路由：先登录态，再 ADMIN，最后才是页面 */}
       <Route element={<RequireAuth />}>
         <Route element={<AppLayout />}>
-          <Route
-            index
-            element={
-              <BatchPlaceholderPage
-                serial="S-02 · 智能体"
-                title="智能体"
-                batch="P0-1-31"
-                blockedBy="E 包接口已就绪（P0-1-24 已 ✓），本页是下一步"
-                bullets={[
-                  '列表三态：空态带引导按钮 / 加载骨架屏 / 错误带重试（03 §七）',
-                  '两种类型：CHATBOT 与 TASKAGENT，按最近更新排序',
-                  '创建与编辑走独立页的分区表单（基本信息 / 模型 / 提示词 / 组件绑定）',
-                  '删除走 Modal + 红色危险按钮 + 明示影响范围（级联删除 N 个会话）',
-                  '行级权限：他人的智能体只有「对话」入口，看不到编辑 / 删除',
-                ]}
-              />
-            }
-          />
-          <Route
-            path="/agents/new"
-            element={
-              <BatchPlaceholderPage
-                serial="S-03 · 智能体编辑"
-                title="创建智能体"
-                batch="P0-1-31"
-                bullets={[
-                  '四区表单：基本信息（名称 / 类型 / 描述）/ 模型 / 提示词 / 组件绑定',
-                  '保存 = PATCH + PUT components 串行，任一失败停留页面并标注未保存区块（03 §4.2）',
-                  '绑定的知识库与 MCP 多选；MCP 在 P0-1 阶段会被后端拒绝（400）',
-                ]}
-              />
-            }
-          />
-          <Route
-            path="/agents/:id/edit"
-            element={
-              <BatchPlaceholderPage
-                serial="S-03 · 智能体编辑"
-                title="编辑智能体"
-                batch="P0-1-31"
-                bullets={[
-                  '文本字段三态：不带 = 不动 / 清空 / 设置',
-                  '组件绑定是整体替换（PUT 集合语义），保存前会先校验引用再落库',
-                  '仅创建者与 ADMIN 可进（后端行级判据）',
-                ]}
-              />
-            }
-          />
-          <Route
-            path="/chat/:agentId"
-            element={
-              <BatchPlaceholderPage
-                serial="S-04 · 对话"
-                title="对话"
-                batch="P0-1-32 ~ P0-1-34"
-                blockedBy="F 包 SSE 契约已就绪（P0-1-29 已 ✓），界面分三步做"
-                bullets={[
-                  'fetch + ReadableStream 自实现 SSE 解析（需要 POST body，原生 EventSource 不够）',
-                  '七种卡片：用户气泡 / 助手 Markdown / 思考块 / 工具卡 / 引用卡 / 确认卡 / 产物卡',
-                  '输入区状态机：idle / streaming / confirm；停止走「先 POST /stop 再等 5s 收口」',
-                  '会话侧栏：新建 / 重命名 / 删除，按最近活跃排序',
-                  '历史渲染与流式渲染**同一套组件**（03 §六 的单一渲染路径）',
-                ]}
-              />
-            }
-          />
+          {/* S-02 · 智能体：首页就是列表（`03` §二：`/` = 智能体列表，登录即可看全部） */}
+          <Route index element={<AgentsListPage />} />
+          <Route path="/agents/new" element={<AgentCreatePage />} />
+          <Route path="/agents/:id/edit" element={<AgentEditPage />} />
+          {/* S-04 · 对话（P0-1-32 接真页面）。`:conversationId?` 可选：**省略即新会话态**
+              （`03` §4.1：展示开场白，首条消息发送时才创建会话、并把 id 写进 URL）——
+              于是"刷新"这件事能定位到同一个会话，历史与流式走同一套组件重画。 */}
+          <Route path="/chat/:agentId/:conversationId?" element={<ChatPage />} />
           <Route
             path="/knowledge"
             element={

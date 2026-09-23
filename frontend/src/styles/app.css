@@ -1,17 +1,30 @@
 /* ============================================================================
-   app.css —— 应用壳与组件（P0-1-30 落地范围）
+   app.css —— 应用壳与组件（P0-1-30 立骨架；P0-1-31 补智能体列表 / 四区表单）
    ----------------------------------------------------------------------------
-   与 `design/styles/components.css` 同源、类名逐字一致；**只搬本批真正消费的块**
-   （外壳 / 顶栏 / 页面骨架 / 卡片 / 按钮 / 表单 / 标签状态灯 / 三态 / 分段控件 / 头像，
-    以及登录页的页级构成 .auth）。
-   其余块（表格、弹窗抽屉、对话七卡、检索得分条…）留在原型里，由各自的批次
-   （P0-1-31 / 32~34 / 35）连同页面一起搬进来 —— 避免现在就有大段无人消费的死 CSS。
+   与 `design/styles/components.css` 同源、类名逐字一致；**只搬真正消费的块**。
+   P0-1-30 搬了：外壳 / 顶栏 / 页面骨架 / 卡片 / 标签状态灯 / 三态 / 分段控件 / 头像，
+   以及登录页的页级构成 `.auth`。
+   P0-1-31 又搬了：选项卡 `.pick`、四区表单 `.form-section`、吸底保存条 `.savebar`、
+   右侧摘要 `.aside-card` / `.summary-row`、表格里的名称单元 `.agent-cell`、标签变体 `.tag--*`。
+   P0-1-32 又搬了：对话页的 `.chat` / `.stream` / `.msg` / `.bubble` / `.think` / `.tool` /
+   `.cites` / `.cite` / `.artifact` / `.confirm-card` / `.queued` / `.composer` / `.caret`
+   （七种卡片 + 输入区）。侧栏 `.sidebar` / `.conv*` 与产物面板 `.panel*` **仍在原型里**
+   —— 它们属 P0-1-34（会话侧栏）与 P0-3（产物面板），现在搬是死 CSS。
+   其余块（弹窗抽屉、检索得分条…）由各自的批次（P0-1-35 / P0-1-36）连同页面一起搬进来。
 
    ⚠️ **按钮 / 输入框 / 标签 / 提示条刻意不在此文件里**：它们由 AntD 5 承担，
    视觉口径通过 `frontend/src/app/theme.ts` 的 ConfigProvider token 注入
    （`design/README.md` §三「原型令牌 → AntD 5 token 一一映射」）。
    本文件只放 AntD **没有等价物**的构成：仪表轨、顶栏、四角括号、状态灯、分段控件、
-   登录页的非对称两栏。
+   登录页的非对称两栏、四区表单的刻度线。
+   ⚠️ 同理**表格不在此文件里**：原型那一整套 `.table*` 由 AntD `Table` 承担，
+   这里只补它表达不了的"名称 + 副标题"两行单元（`.agent-cell`）。
+
+   ⚠️ **覆盖 AntD 组件外观的规则一律加 `:root` 前缀**（`.pick` / `.ant-tag` 那几组）。
+   原因不是风格：AntD 5 的样式由 cssinjs **在运行时注入到 `<head>` 末尾**，
+   DOM 顺序排在 app.css 之后 ⇒ 与之特指度打平的选择器（都是 0,1,0）**会输**，
+   而且症状是"这条规则明明写了却不生效"（`display`、`border-color` 这类属性上尤其难查）。
+   `:root` 把特指度抬到 (0,2,0)，一条 `:root` 前缀就是全部的解释。
 
    命名约定：块 .b  元素 .b__e  状态 .b--state  工具类 .u-*
    ========================================================================== */
@@ -430,6 +443,8 @@
 /* =========================== 工具类 ======================================= */
 .split { display: grid; gap: var(--sp-6); }
 .split--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* 智能体编辑页：左表单 + 右常驻摘要（`design/agent-edit.html` 的 `.split--form`，296px 是摘要栏宽） */
+.split--form { grid-template-columns: minmax(0, 1fr) 296px; align-items: start; }
 .stack { display: flex; flex-direction: column; gap: var(--sp-5); }
 .stack--tight { gap: var(--sp-3); }
 .row { display: flex; align-items: center; gap: var(--sp-3); }
@@ -544,20 +559,183 @@
   .auth__form, .auth__form-wide { max-width: 100%; }
 }
 
+/* ================ 智能体列表：表格里的名称单元（P0-1-31） ================== */
+/* 原型是 `.table__name` + `.table__sub`；落地表格由 AntD `Table` 承担，这两个类不再存在，
+   改成本块 —— 只表达"名称 + 副标题"这一个 AntD 没有的两行单元。
+   ⚠️ `-webkit-line-clamp: 1` 不是装饰：名称上限 128 字、描述上限 2000 字
+   （`shared` 的 `AGENT_*_MAX_CHARS`），不截断时一行会被撑成一片墙，整个表格的列宽判读都失效。 */
+.agent-cell { display: flex; flex-direction: column; min-width: 0; }
+.agent-cell__name,
+.agent-cell__sub {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  overflow: hidden;
+}
+.agent-cell__name { font-weight: 500; color: var(--ink); }
+.agent-cell__sub { font-size: var(--fs-xs); color: var(--muted); }
+
+/* ================== 标签变体（P0-1-31 起被真实渲染） ====================== */
+/* 先兑现 `app/theme.ts` 的 Tag 注释里那条待办：Tag 的边框色在 `ComponentToken` 里设不了
+   （它取 `token.colorBorder`，而那一档必须留给交互控件的 3:1 边界 `--rule-control`），
+   原型 `.tag` 要的是更浅的 `--rule`（发丝线）⇒ 在这里对齐。
+   ⚠️ 不要改用把全局 `colorBorder` 调浅的做法 —— 那会让所有输入框边界掉到 3:1 以下。
+   `:root` 前缀见文件头（覆盖 AntD 运行时样式）。 */
+:root .ant-tag { border-color: var(--rule); }
+
+/* 原型 `.tag--*` 有四个变体，这里只落**当前有消费方**的三个（`tag--ok` 尚无页面用到，
+   等有消费方再加 —— 预置的两条死规则只会让"这个变体到底谁在用"变成要搜的事）：
+   · accent —— 智能体类型（列表 / 页头）
+   · warn   —— 「未保存」区块、MCP 绑定（本阶段 MCP 只能由手工写库产生）
+   · danger —— 「保存失败」区块、绑定的模型已停用 */
+:root .ant-tag.tag--accent {
+  background: var(--accent-wash);
+  border-color: var(--accent-rule);
+  color: var(--accent);
+}
+:root .ant-tag.tag--warn {
+  background: var(--warn-wash);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  color: var(--warn);
+}
+:root .ant-tag.tag--danger {
+  background: var(--danger-wash);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+
+/* ================== 四区表单（智能体创建 / 编辑，P0-1-31） ================= */
+/* 左侧那条刻度线是"这一区落库了没有"的读数（`design/agent-edit.html`） */
+.form-section {
+  border-left: 2px solid var(--rule-strong);
+  padding-left: var(--sp-5);
+  transition: border-color var(--dur-base) ease-out;
+}
+/* ⚠️ 与原型的一处**有依据的**差异：原型只有 `.is-dirty` 一种状态，且直接变红。
+   落地拆成两种，因为 `06` P0-1-31 要兑现的正是"保存失败时不静默部分成功"：
+   · `.is-dirty`（琥珀）+「未保存」= 改了、还没提交 —— 用户自己的动作，没什么不对；
+   · `.is-failed`（红）+「保存失败」= 提交过、这一区没落库 —— 需要用户处理的事故。
+   合成一种颜色的话，"我还没点保存"与"我点了但它失败"在界面上分不出来，
+   而这两件事该做的事完全不同（一个是继续填、一个是重试或改内容）。 */
+.form-section.is-dirty { border-left-color: var(--warn); }
+.form-section.is-failed { border-left-color: var(--danger); }
+.form-section__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+/* 字段组的小标题（`.field__label` 在 AntD `Form.Item` 里自带，这里只补它没有的那种） */
+.block-label {
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+/* 引导问题的"一行一个"：输入框 + 移除按钮 */
+.guide-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-3); align-items: center; }
+
+/* 吸底保存条：滚动表单时"已保存到哪一刻 / 还有哪些区块没保存"始终可见。
+   z-index 12 落在顶栏（15）之下但高于正文，`color-mix` + `blur` 与顶栏同一语言。 */
+.savebar {
+  position: sticky;
+  bottom: 0;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-7);
+  padding: var(--sp-4) var(--sp-5);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--rule-strong);
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+
+/* ================== 右侧常驻摘要栏（智能体编辑页） ========================= */
+/* `top` 要避开顶栏（sticky，高 `--topbar-h`），否则摘要第一行会被顶栏压住 */
+.aside-card { position: sticky; top: calc(var(--topbar-h) + var(--sp-5)); }
+.aside-card__name {
+  margin-top: var(--sp-3);
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+/* 摘要里的一行读数（原型的 `.swatch` 是"令牌样张"专用，语义不对，故改名为 summary-row） */
+.summary-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  align-items: baseline;
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.summary-row__label { font-size: var(--fs-xs); color: var(--muted); }
+
+/* ============== 选项卡：类型单选 / 知识库多选（智能体编辑页） =============== */
+/* 原型叫 `.check`（`<label class="check"><input type="radio">…`）。落地控件是 AntD 的
+   `Radio` / `Checkbox`，**它们的根节点本来就是 `<label class="ant-radio-wrapper">`**
+   ⇒ 本类直接落在那个 wrapper 上，不再自己套一层 `<label>`（套了就变成 label 嵌 label，
+   点击行为会分成两块，选不中整张卡片）。
+   `:root` 前缀的理由见文件头 —— 这里正是最典型的场景：`display` / `align-items` 都是
+   AntD 也声明过的属性，不加前缀就会在 DOM 顺序上输掉（卡片不成卡片，且不报错）。 */
+:root .ant-radio-wrapper.pick,
+:root .ant-checkbox-wrapper.pick {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  width: 100%;
+  margin: 0;
+  padding: var(--sp-3);
+  background: var(--surface);
+  border: 1px solid var(--rule-control);
+  border-radius: var(--r-sm);
+  transition: border-color var(--dur-micro) ease-out, background var(--dur-micro) ease-out;
+}
+:root .ant-radio-wrapper.pick:hover,
+:root .ant-checkbox-wrapper.pick:hover {
+  border-color: var(--accent-rule);
+  background: var(--surface-2);
+}
+/* 控件与标题首行对齐的微调（原型 `.check input { margin: 3px 0 0 }` 同款）。
+   指到 `.ant-*` 内部类上必然有"升级 AntD 就静默失效"的风险 —— 失效的表现只是控件高一像素，
+   属于可接受的降级，故不带 `:root`（不必为它再抬一层特指度）。 */
+.pick .ant-radio,
+.pick .ant-checkbox { margin-top: 3px; }
+/* ⚠️ `display: block` 是**刻意**的：原型里 `.check__title` 与 `.check__meta` 是两个内联
+   `<span>`，会挤在同一行（"运维手册（v3）128 个片段"连成一串）。落地拆成两行 —— 标题是
+   名称、副标题是读数，本来就是两层信息。 */
+.pick__title { display: block; font-size: var(--fs-sm); font-weight: 500; }
+.pick__meta { display: block; font-size: var(--fs-xs); color: var(--muted); }
+
 /* =========================== 响应式 ======================================= */
 /* 设计基准 ≥1280px；<1024 只保证可用（docs/03 §七）。构成决策全部有移动端答案。 */
 @media (max-width: 1024px) {
   /* 触屏答案：控件高度抬到 44px（WCAG 2.5.5）。
      ⚠️ AntD 控件的高度来自 token（`controlHeight`）与内联样式，media query 改不到 token
-     ⇒ 只能在这一层覆盖。**本文件唯一引用 `.ant-*` 内部类的地方**，升级 AntD 时要复核。 */
-  .ant-btn:not(.ant-btn-sm) { min-height: 44px; }
-  .ant-btn-sm { min-height: 36px; }
-  .ant-input,
-  .ant-input-affix-wrapper,
-  .ant-select-selector { min-height: 44px; }
-  .ant-input-affix-wrapper .ant-input { min-height: auto; }
+     ⇒ 只能在这一层覆盖。**本文件唯一引用 `.ant-*` 内部类的地方**，升级 AntD 时要复核。
+     ⚠️ 单类选择器（`.ant-input` / `.ant-select-selector`）必须带 `:root` 前缀：它们与 AntD
+     自己那条同特指度，而 AntD 的样式表排在后面 ⇒ 不加前缀这三行**从来没生效过**
+     （症状是"移动端控件还是 34px 高"，而规则明明写在文件里）。`:not(.ant-btn-sm)` 那两条
+     本身就是 (0,2,0)，加不加都对，一并加上只为同一口径。 */
+  :root .ant-btn:not(.ant-btn-sm) { min-height: 44px; }
+  :root .ant-btn-sm { min-height: 36px; }
+  :root .ant-input,
+  :root .ant-input-affix-wrapper,
+  :root .ant-select-selector { min-height: 44px; }
+  :root .ant-input-affix-wrapper .ant-input { min-height: auto; }
   .split--2 { grid-template-columns: minmax(0, 1fr); }
+  /* 摘要栏落到表单下方（296px 的窄栏在这儿会把表单挤到不可用）⇒ sticky 也要取消，
+     否则它会以"粘在视口顶"的姿态飘在正文上 */
+  .split--form { grid-template-columns: minmax(0, 1fr); }
+  .aside-card { position: static; }
   .page { padding: var(--sp-5) var(--sp-5) var(--sp-8); }
+  /* 对话页的一屏高跟着 `.page` 的 padding 一起变（见对话页段的注释）：`sp-6` → `sp-5`。
+     漏了这一条的后果不是"少一点高度"，而是底部永远露出一条滚动条（下一条命令就能看出来）。 */
+  .chat--solo { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8)); }
   .topbar { padding: 0 var(--sp-5) 0 var(--sp-3); gap: var(--sp-3); }
   .nav--collapse { display: none; }
 }
@@ -579,3 +757,377 @@
   .page__head { flex-direction: column; align-items: flex-start; }
   .page__head-actions { margin-left: 0; }
 }
+
+/* =========================== 对话页（P0-1-32） ============================= */
+/* 原型（`design/chat.html`）是「会话侧栏 + 消息流 + 产物面板」三栏（`03` §4.1）。
+   本批只落**中栏**：侧栏属 P0-1-34、产物面板属 P0-3（TaskAgent）。
+   ⇒ 用 `--solo` 覆盖成单栏，而不是先写一个三栏再藏掉两栏（藏法会留下两个永远空的占位）。 */
+.chat--solo {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  /* 一屏高：视口减去顶栏与 `.page` 的上下留白。少扣一项的症状是"对话页永远比视口高一点"
+     —— 底部那条滚动条会一直露着，输入区永远压不到屏幕底边。
+     ⚠️ `.page` 的 padding 在 1024px 断点里变了（`sp-6` → `sp-5`），那里的覆盖见文件末的断点块。 */
+  height: calc(100vh - var(--topbar-h) - var(--sp-6) - var(--sp-8));
+}
+
+.chat__main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--paper);
+}
+
+.chat__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  background: var(--surface);
+  border-bottom: 1px solid var(--rule);
+}
+.chat__title {
+  font-family: var(--font-display);
+  font-size: var(--fs-md);
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+.chat__head-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
+
+/* 消息流：内部滚动（输入区固定在页面底部，不随消息滚走） */
+.stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-5) var(--sp-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+.stream__inner {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.msg { display: flex; flex-direction: column; gap: var(--sp-2); }
+.msg__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* 用户消息：右对齐实底色块；助手消息占满宽度（它可能含表格/代码块） */
+.msg--user { align-items: flex-end; }
+.msg--user .msg__head { flex-direction: row-reverse; }
+.bubble {
+  max-width: 76%;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-base);
+  line-height: var(--lh-body);
+  /* 用户消息是纯文本（不解析 Markdown）⇒ 换行必须保留 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble--user {
+  background: var(--ink);
+  color: var(--surface);
+  border-radius: var(--r-sm) var(--r-sm) var(--r-xs) var(--r-sm);
+}
+.bubble--agent {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  max-width: 100%;
+}
+/* 「复制全文」：默认隐身，hover / 键盘聚焦时出现（原型同款） */
+.msg__tools {
+  display: flex;
+  gap: var(--sp-3);
+  opacity: 0;
+  transition: opacity var(--dur-micro) ease-out;
+}
+.msg:hover .msg__tools, .msg:focus-within .msg__tools { opacity: 1; }
+.msg__tools button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.msg__tools button:hover { color: var(--accent); }
+.msg__tools button:disabled { cursor: default; opacity: 0.5; }
+
+/* 流式光标：与正文同基线的方头块，暗示"打字机" */
+.caret {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 2px;
+  background: var(--accent);
+  vertical-align: -2px;
+  animation: blink 1s steps(2) infinite;
+}
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* 折叠三角：`<details>` 的原生标记在各浏览器长得不一样，统一成 `›` + 旋转
+   （限定在消息流内，不动全局 —— 本仓另有用到 `<details>` 的地方不该被牵连） */
+.stream summary { list-style: none; }
+.stream summary::-webkit-details-marker { display: none; }
+.think[open] .think__caret,
+.tool[open] .think__caret { transform: rotate(90deg); }
+
+/* 思考块 */
+.think {
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.think__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-4);
+  background: none;
+  border: 0;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.think__head:hover { background: var(--surface-3); }
+.think__caret { margin-left: auto; transition: transform var(--dur-base) var(--ease-out); }
+.think[open] .think__caret { transform: rotate(90deg); }
+.think__body {
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  border-top: 1px dashed var(--rule-strong);
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+/* 工具卡：左侧状态刻度（`border-left` 实现）+ 等宽入参摘要 */
+.tool {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--muted-2);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.tool--run { border-left-color: var(--accent); }
+.tool--ok { border-left-color: var(--ok); }
+.tool--fail { border-left-color: var(--danger); }
+.tool__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3) var(--sp-4);
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.tool__name { font-family: var(--font-mono); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; }
+.tool__arg {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool__head-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-3); }
+.tool__body {
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  border-top: 1px dashed var(--rule);
+}
+.code-block {
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-xs);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  color: var(--ink-2);
+}
+
+/* 引用卡 */
+.cites {
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+.cites__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--rule);
+}
+.cite { border-bottom: 1px dashed var(--rule); }
+.cite:last-child { border-bottom: 0; }
+.cite summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  list-style: none;
+}
+.cite summary::-webkit-details-marker { display: none; }
+.cite summary:hover { background: var(--surface-2); }
+.cite__idx {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.cite__score { margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--muted); }
+.cite__snippet {
+  padding: 0 var(--sp-4) var(--sp-4) var(--sp-6);
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+/* 产物卡 */
+.artifact {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+}
+.artifact__kind {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  background: var(--surface-2);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-xs);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.artifact__name { font-size: var(--fs-sm); font-weight: 500; }
+.artifact__meta { font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--muted); }
+.artifact__ops { margin-left: auto; display: flex; gap: var(--sp-3); }
+
+/* 确认卡：阻塞输入区（`03` §4.1） */
+.confirm-card {
+  border: 1px solid var(--danger);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: var(--sh-2);
+  overflow: hidden;
+}
+.confirm-card__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--danger-wash);
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+}
+.confirm-card__title { font-size: var(--fs-sm); font-weight: 600; }
+.countdown {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--danger);
+}
+.confirm-card__body { padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3); }
+.confirm-card__foot { display: flex; gap: var(--sp-3); padding: 0 var(--sp-4) var(--sp-4); }
+
+/* 排队提示（`queued` 事件；产生方属 P0-3） */
+.queued {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--accent-wash);
+  border: 1px solid var(--accent-rule);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+/* 输入区 */
+.composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }
+.composer__inner { width: min(760px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
+.composer__box {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+  background: var(--surface);
+  border: 1px solid var(--rule-control);
+  border-radius: var(--r-md);
+  box-shadow: var(--sh-1);
+  transition: border-color var(--dur-micro) ease-out, box-shadow var(--dur-micro) ease-out;
+}
+.composer__box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
+/* ⚠️ 这里是**原生 `<textarea>`**（不是 AntD 的 `Input.TextArea`）：它与内联按钮一起构成
+   "方框内左侧自适应高度输入 + 右侧按钮"这个 AntD 表达不了的布局。按 P0-1-31 的定案，
+   覆盖 AntD 组件外观才需要 `:root` 前缀；本节没有任何 `.ant-*` 选择器。 */
+.composer textarea {
+  flex: 1;
+  max-height: 180px;
+  min-height: 34px;
+  padding: var(--sp-2) 0;
+  background: none;
+  border: 0;
+  resize: none;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--fs-base);
+  line-height: 1.6;
+}
+.composer textarea:focus { outline: none; }
+.composer textarea::placeholder { color: var(--muted-2); }
+.composer__hint {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.composer__hint kbd {
+  padding: 1px 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-xs);
+}
+.composer__state { margin-left: auto; }

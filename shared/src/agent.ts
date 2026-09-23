@@ -111,18 +111,33 @@ export function canEditAgent(
 
 // ───────────────────────────── 公共字段 ─────────────────────────────
 
+/**
+ * 各文本字段的长度上限（**导出成常量**：它们既要出现在 schema 的报错文案里，也要出现在
+ * 前端表单的提示文案里 —— 见 `docs/06` §六 那条"同一口径在两处各写一遍，必有一处先腐烂"。
+ * P0-1-31 的编辑页照原型写过一次 `8000`，而真上限是 `10000`：原型上的数字是**装饰**，
+ * 落地必须从常量取）。
+ */
+export const AGENT_NAME_MAX_CHARS = 128
+export const AGENT_DESCRIPTION_MAX_CHARS = 2000
+export const AGENT_ICON_MAX_CHARS = 255
+export const AGENT_SYSTEM_PROMPT_MAX_CHARS = 10_000
+export const AGENT_OPENING_REMARKS_MAX_CHARS = 2000
+
 /** 名称（列 `VARCHAR(128)`） */
 const agentNameSchema = z
   .string({ required_error: '请输入智能体名称' })
   .trim()
   .min(1, '请输入智能体名称')
-  .max(128, '名称最多 128 个字符')
+  .max(AGENT_NAME_MAX_CHARS, `名称最多 ${AGENT_NAME_MAX_CHARS} 个字符`)
 
 /**
  * 描述（列 `TEXT`，无硬上限）。2000 字是**防误操作**上限（与知识库描述同口径：
  * 把整篇文档粘进描述框是最常见的脏数据），不是存储约束。
  */
-const agentDescriptionSchema = z.string().trim().max(2000, '描述最多 2000 个字符')
+const agentDescriptionSchema = z
+  .string()
+  .trim()
+  .max(AGENT_DESCRIPTION_MAX_CHARS, `描述最多 ${AGENT_DESCRIPTION_MAX_CHARS} 个字符`)
 
 /**
  * 图标（列 `VARCHAR(255)`）。
@@ -131,7 +146,7 @@ const agentDescriptionSchema = z.string().trim().max(2000, '描述最多 2000 �
  * 但 P0-1 没有文件上传端点（`files` 表要到 P1 的附件/图标功能才用）。给一个 `VARCHAR(255)`
  * 就能表达的字段是对的 —— 将来真做上传时，存进去的内容变成 URL，**契约不用改**。
  */
-const agentIconSchema = z.string().trim().max(255, '图标最多 255 个字符')
+const agentIconSchema = z.string().trim().max(AGENT_ICON_MAX_CHARS, `图标最多 ${AGENT_ICON_MAX_CHARS} 个字符`)
 
 /**
  * 系统提示词 / 开场白：**刻意不 `trim()`**（与名称/描述相反）。
@@ -140,8 +155,12 @@ const agentIconSchema = z.string().trim().max(255, '图标最多 255 个字符')
  * "先空一行再写角色设定"这种常见写法悄悄改掉，而用户看不到自己写的内容被改了。
  * 上限是防误操作（`TEXT` 列本身没有上限）。
  */
-const agentSystemPromptSchema = z.string().max(10_000, '系统提示词最多 10000 个字符')
-const agentOpeningRemarksSchema = z.string().max(2000, '开场白最多 2000 个字符')
+const agentSystemPromptSchema = z
+  .string()
+  .max(AGENT_SYSTEM_PROMPT_MAX_CHARS, `系统提示词最多 ${AGENT_SYSTEM_PROMPT_MAX_CHARS} 个字符`)
+const agentOpeningRemarksSchema = z
+  .string()
+  .max(AGENT_OPENING_REMARKS_MAX_CHARS, `开场白最多 ${AGENT_OPENING_REMARKS_MAX_CHARS} 个字符`)
 
 /** 引导问题条数上限（`03` §4.2："可增删的列表"；防误操作，不是存储约束——jsonb 不限） */
 export const GUIDE_QUESTIONS_MAX = 10
