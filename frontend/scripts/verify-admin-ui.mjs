@@ -37,6 +37,9 @@
  *   H 删除分级（Provider 走级联 + 逐字确认；用户没有删除接口）
  *   I 拉取上游模型的读数（截断、未配 Key、0 条）
  *   J 源码级守门（几条"没有别的观测面"的正确性）
+ *     ⚠️ J13 原属"没有别的观测面"那一类，直到它在浏览器里真出过一次：
+ *     `useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)` 把 100 传进了 `offset` ⇒ 页面空、请求 200。
+ *     **这一条只能靠源码或端测发现**（接口层、类型检查、日志全都是绿的）。
  *
  * ⚠️ 本档**验不了**的东西（别把它当全批验收）：
  *   · React 渲染与交互（表长什么样、弹窗能不能关、rowSpan 真的合并了吗）⇒ 归浏览器端测
@@ -158,6 +161,10 @@ const {
   buildCreateProviderBody,
   buildProviderUpdateBody,
   providerTypeChangeBlocked,
+  protocolOptionsFor,
+  protocolAfterTypeChange,
+  protocolBaseUrlHint,
+  PROTOCOL_LOCKED_BY_TYPE_REASON,
   EMPTY_MODEL_FORM_VALUES,
   modelEditValuesOf,
   validateMaxContext,
@@ -199,6 +206,7 @@ function makeProvider(overrides = {}) {
     name: 'OpenAI 生产',
     baseUrl: 'https://api.openai.com/v1',
     type: 'CHAT',
+    protocol: 'OPENAI_COMPAT',
     enabled: true,
     hasKey: true,
     apiKeyPreview: 'sk-****abcd',
@@ -711,6 +719,153 @@ await it('I6 一切正常 ⇒ `null`（不多话）', () => {
   assertEqual(remoteModelNotice(makeRemoteResult(), true), null, '没有需要提醒的边界')
 })
 
+// ───────────────────────────── K 上游协议（P0-1-37）─────────────────────────────
+// ⚠️ 排在 J 组之前是**刻意**的：J 组是本档的"源码级守门"，按惯例收尾。
+
+groupStart(
+  'K',
+  '上游协议：可选值由类型决定、改类型要把协议收回默认值、请求体只在真变了才带',
+  '判据：`protocolOptionsFor` / `protocolAfterTypeChange` / `buildCreateProviderBody` / `buildProviderUpdateBody`',
+)
+
+await it('K1 可选协议由**类型**过滤：`CHAT` 三种都能选，`EMBEDDING` 只剩默认那一种', () => {
+  assertEqual(
+    protocolOptionsFor('CHAT')
+      .map((option) => option.value)
+      .join(','),
+    'OPENAI_COMPAT,OPENAI_RESPONSES,ANTHROPIC_MESSAGES',
+    '对话 Provider 的三种协议',
+  )
+  assertEqual(
+    protocolOptionsFor('EMBEDDING')
+      .map((option) => option.value)
+      .join(','),
+    'OPENAI_COMPAT',
+    '向量 Provider 只允许默认协议 —— 与后端 `protocolAllowedForType` 同一判据（前端不另写一遍）',
+  )
+  assert(
+    PROTOCOL_LOCKED_BY_TYPE_REASON.includes('embedding'),
+    '锁住时的说明必须点明"embedding 只有一条路"，否则用户只看到灰掉的下拉',
+  )
+})
+
+await it('K2 ⚠️ 改类型必须把协议收回默认值 —— 否则"CHAT+Anthropic 改成 EMBEDDING"是一次**必然 400** 的提交', () => {
+  assertEqual(
+    protocolAfterTypeChange('EMBEDDING', 'ANTHROPIC_MESSAGES'),
+    'OPENAI_COMPAT',
+    'CHAT+Anthropic → EMBEDDING：协议必须收回默认值（那个下拉在 EMBEDDING 下是灰的，用户没碰过它）',
+  )
+  assertEqual(
+    protocolAfterTypeChange('EMBEDDING', 'OPENAI_RESPONSES'),
+    'OPENAI_COMPAT',
+    'Responses 同理',
+  )
+  assertEqual(protocolAfterTypeChange('CHAT', 'ANTHROPIC_MESSAGES'), 'ANTHROPIC_MESSAGES', '合法的组合不该被改动')
+  assertEqual(protocolAfterTypeChange('CHAT', 'OPENAI_COMPAT'), 'OPENAI_COMPAT', '默认值不动')
+  assertEqual(protocolAfterTypeChange('EMBEDDING', 'OPENAI_COMPAT'), 'OPENAI_COMPAT', '已经合法就保持')
+})
+
+await it('K3 ⚠️ 编辑态：`protocol` **要回填**、`apiKey` **绝不回填**（两者刻意相反）', () => {
+  const provider = makeProvider({ protocol: 'ANTHROPIC_MESSAGES', apiKeyPreview: 'sk-****abcd' })
+  const values = providerEditValuesOf(provider)
+  assertEqual(values.protocol, 'ANTHROPIC_MESSAGES', '协议是给管理员看的既有配置，必须回填')
+  assertEqual(values.apiKey, '', 'Key 恒为空串 —— 回填掩码会让"点一下保存"把掩码当新 Key 存进去')
+  assert(!JSON.stringify(values).includes('sk-****abcd'), '掩码不许出现在表单初值里')
+})
+
+await it('K4 建 Provider **总是**带上 `protocol`（用户明确选过，不靠服务端默认值）', () => {
+  const body = buildCreateProviderBody({
+    name: '  OpenAI 生产  ',
+    baseUrl: ' https://api.openai.com/v1/ ',
+    type: 'CHAT',
+    protocol: 'OPENAI_COMPAT',
+    enabled: true,
+    apiKey: '',
+  })
+  assertEqual(body.protocol, 'OPENAI_COMPAT', '哪怕就是默认值也要显式带上（否则"界面显示兼容、实际存了别的"看不出来）')
+  assertEqual(body.name, 'OpenAI 生产', '名称两端空白要去掉')
+  assert(!('apiKey' in body), 'Key 留空 ⇒ 不带这个键')
+
+  const anth = buildCreateProviderBody({
+    name: 'Claude',
+    baseUrl: 'https://api.anthropic.com/v1',
+    type: 'CHAT',
+    protocol: 'ANTHROPIC_MESSAGES',
+    enabled: true,
+    apiKey: '  sk-new  ',
+  })
+  assertEqual(anth.protocol, 'ANTHROPIC_MESSAGES', '非默认协议照样带')
+  assertEqual(anth.apiKey, 'sk-new', 'Key 要去掉两端空白')
+})
+
+await it('K5 改 Provider：协议**逐字比较**，只在真变了才带；什么都没改 ⇒ `null`（不发请求）', () => {
+  const provider = makeProvider({ protocol: 'ANTHROPIC_MESSAGES' })
+  const baseline = {
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    type: provider.type,
+    protocol: 'ANTHROPIC_MESSAGES',
+    enabled: provider.enabled,
+    apiKey: '',
+  }
+
+  assertEqual(buildProviderUpdateBody(provider, baseline, false), null, '一个字段都没改 ⇒ 不发请求')
+
+  const onlyProtocol = buildProviderUpdateBody(provider, { ...baseline, protocol: 'OPENAI_RESPONSES' }, false)
+  assertEqual(Object.keys(onlyProtocol).join(','), 'protocol', '只改协议 ⇒ 请求体里**只有** protocol 这个键')
+
+  // ⚠️ 协议**没有**"有模型就不许改"的守卫（与 type 刻意相反，`02` §4.3）
+  const manyModels = makeProvider({ protocol: 'ANTHROPIC_MESSAGES', modelCount: 9 })
+  assertEqual(
+    buildProviderUpdateBody(manyModels, { ...baseline, protocol: 'OPENAI_COMPAT' }, false).protocol,
+    'OPENAI_COMPAT',
+    'modelCount > 0 也要能改协议（协议填错了本来就该能改回来）',
+  )
+  // 而 type 在同一条路上是被拦的 —— 两条"刻意相反"的处置放在一起对照
+  assertEqual(
+    buildProviderUpdateBody(manyModels, { ...baseline, type: 'EMBEDDING' }, false),
+    null,
+    '改 type 被拦（不发必然 409 的请求）',
+  )
+})
+
+await it('K6 三条协议的 `baseUrl` 提示各不相同且都点明后端会拼哪条路径', () => {
+  const hints = ['OPENAI_COMPAT', 'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES'].map((protocol) =>
+    protocolBaseUrlHint(protocol),
+  )
+  assertEqual(new Set(hints).size, 3, '三条提示必须互不相同（提示一样就等于没提示）')
+  assert(hints[0].includes('/chat/completions'), '兼容协议的提示要点明后缀')
+  assert(hints[1].includes('/responses'), 'Responses 的提示要点明后缀')
+  assert(hints[2].includes('/messages'), 'Anthropic 的提示要点明后缀')
+  for (const hint of hints) {
+    assert(hint.includes('版本段'), '三条都要提醒"填到版本段为止"（把整条 URL 粘进来是 404，而 404 不会说原因）')
+  }
+})
+
+await it('K7 ⚠️ `values` 不带 `protocol` ⇒ 当作**没改**，绝不把 `undefined` 塞进请求体', () => {
+  // 复现当时真红过的那一次：D4/D5/E2 用的就是不含 protocol 的 values 对象，
+  // 于是 `undefined !== 'OPENAI_COMPAT'` 被判成"改过"，请求体里多出一个 `protocol: undefined`
+  // ⇒ `Object.keys(body).length === 0` 这句被破坏，本该"不发请求"的零改动变成 `PATCH {}`（400）
+  const provider = makeProvider({ protocol: 'OPENAI_COMPAT' })
+  const partial = {
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    type: provider.type,
+    enabled: provider.enabled,
+    apiKey: '',
+  }
+
+  assertEqual(
+    buildProviderUpdateBody(provider, partial, false),
+    null,
+    '一个有效字段都没改 ⇒ 必须 `null`（不发请求），而不是 `{ protocol: undefined }`',
+  )
+
+  const renamed = buildProviderUpdateBody(provider, { ...partial, name: 'OpenAI 备用' }, false)
+  assertEqual(Object.keys(renamed).join(','), 'name', '只改名字 ⇒ 请求体里只有 name 这个键')
+  assert(!('protocol' in renamed), '不带 protocol 的表单值不该凭空造出一个键')
+})
+
 // ───────────────────────────── J 源码级守门 ─────────────────────────────
 
 groupStart('J', '源码级守门（几条"没有别的观测面"的正确性）', '判据：读源码文本断言，删掉就红')
@@ -828,6 +983,60 @@ await it('J12 管理页的样式只用已有类（不发明第二套读数类名
       assertIncludes(file.source, className, `${files[index]} 复用 ${className}`)
     }
   }
+})
+
+await it('J13 ⚠️ 列表 hook 一律**对象参数**：`offset` 与 `limit` 都是 number，位置参数必然错位', () => {
+  const files = sourceFiles()
+  const hooks = [
+    { file: 'api/modelPool.ts', hook: 'useModelProviders' },
+    { file: 'api/modelPool.ts', hook: 'useAdminModels' },
+    { file: 'api/adminUsers.ts', hook: 'useAdminUsers' },
+    { file: 'api/agents.ts', hook: 'useAgents' },
+  ]
+  for (const { file, hook } of hooks) {
+    const found = files.find((item) => item.name === file)
+    assert(found !== undefined, `找不到 ${file}`)
+    assert(
+      new RegExp(`export function ${hook}\\(params:`).test(found.source),
+      `${hook} 的首个形参必须是 \`params\`（对象参数）；写成 \`${hook}(offset = 0, limit = …)\` 时，` +
+        `调用方传一个数字（如 PAGE_LIMIT_MAX）会被静默读成 offset ⇒ 列表整片变空且**没有任何报错**`,
+    )
+    assertIncludes(found.source, 'params.limit ??', `${hook} 必须从 params.limit 取默认值（对象参数真的被用上）`)
+  }
+
+  // 消费方：本仓唯一出过事故的那页 —— 实参必须是对象字面量
+  const page = files.find((item) => item.name === 'pages/admin/ModelsPage.tsx')
+  assert(page !== undefined, '找不到 ModelsPage.tsx')
+  for (const hook of ['useModelProviders', 'useAdminModels']) {
+    assert(
+      new RegExp(`${hook}\\(\\{`).test(page.source),
+      `${hook}( 的实参必须是对象字面量（曾写成 ${hook}(MODEL_POOL_PAGE_LIMIT_MAX)，页面把 3 个 Provider/2 个模型全当成"没有"）`,
+    )
+  }
+  assertIncludes(page.source, 'limit: MODEL_POOL_PAGE_LIMIT_MAX', '两个 hook 都要显式带上 limit')
+})
+
+await it('J14 ⚠️ 协议下拉标灰 + 改类型走收口函数；列表里有一列「上游协议」', () => {
+  const files = sourceFiles()
+
+  const modal = files.find((item) => item.name === 'pages/admin/ProviderFormModal.tsx')
+  assert(modal !== undefined, '找不到 ProviderFormModal.tsx')
+  // ① 灰色下拉：`EMBEDDING` 下只剩一个选项就必须灰掉（配一个必然 400 的选项等于给用户挖坑）
+  assertIncludes(modal.source, 'disabled={protocolLocked}', '协议选择器要按 protocolLocked 标灰')
+  assertIncludes(modal.source, 'PROTOCOL_LOCKED_BY_TYPE_REASON', '标灰时要说清为什么（灰按钮不加解释等于页面坏了）')
+  // ② 改类型必须经过收口函数 —— 直接 `setProtocol` 会留下"灰着的字段报 400"
+  assert(
+    /setProtocol\(\(current\) => protocolAfterTypeChange\(next, current\)\)/.test(modal.source),
+    '类型选择器的 onChange 里必须调用 `protocolAfterTypeChange`：不收回默认值，' +
+      '"CHAT+Anthropic 改成 EMBEDDING"就是一次必然 400 的提交，且报错字段是那个灰着的下拉',
+  )
+  // ③ baseUrl 的提示随协议变（三条路后缀不同，填错的表现是 404）
+  assertIncludes(modal.source, 'protocolBaseUrlHint(protocol)', 'baseUrl 的提示要跟着协议走')
+
+  const page = files.find((item) => item.name === 'pages/admin/ModelsPage.tsx')
+  assert(page !== undefined, '找不到 ModelsPage.tsx')
+  assertIncludes(page.source, "title: '上游协议'", 'Provider 表要单独一列显示协议（类型与协议是两个维度）')
+  assertIncludes(page.source, 'UPSTREAM_PROTOCOL_LABELS[provider.protocol]', '列里读的是契约字段，不是自己拼的字符串')
 })
 
 // ───────────────────────────── 结论表 ─────────────────────────────

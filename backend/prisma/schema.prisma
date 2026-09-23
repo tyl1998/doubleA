@@ -72,6 +72,24 @@ enum ModelType {
   @@map("model_type")
 }
 
+/// **上游协议**（P0-1-37）：Provider 的上游"怎么说话"。
+///
+/// ⚠️ 与 `ModelType`（用途）是两件事：同一个"对话"用途可以走三种报文形状。
+/// · `OPENAI_COMPAT`   —— `POST {baseUrl}/chat/completions` + `Authorization: Bearer`（**默认**，P0-1-37 之前的全部行为）
+/// · `OPENAI_RESPONSES`—— `POST {baseUrl}/responses`
+/// · `ANTHROPIC_MESSAGES` —— `POST {baseUrl}/messages` + `x-api-key` + `anthropic-version`
+///
+/// 默认值 `OPENAI_COMPAT` 让既有行**逐字保持原行为**（`02` §6.1 的三协议映射表）。
+/// `type = EMBEDDING` 只允许 `OPENAI_COMPAT`（embedding 只有 `/embeddings` 一条路，
+/// 判据收在 `shared/src/modelProvider.ts#protocolAllowedForType`）。
+enum UpstreamProtocol {
+  OPENAI_COMPAT
+  OPENAI_RESPONSES
+  ANTHROPIC_MESSAGES
+
+  @@map("upstream_protocol")
+}
+
 /// Agent 类型（`01` 决策 4：ChatBot 主 + TaskAgent 辅）
 enum AgentType {
   CHATBOT
@@ -156,6 +174,8 @@ model ModelProvider {
   baseUrl   String    @map("base_url") @db.Text
   apiKeyEnc String?   @map("api_key_enc") @db.Text
   type      ModelType
+  /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`
+  protocol  UpstreamProtocol @default(OPENAI_COMPAT)
   enabled   Boolean   @default(true)
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)

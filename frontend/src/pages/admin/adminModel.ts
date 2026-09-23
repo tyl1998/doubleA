@@ -16,6 +16,11 @@
  *   · 表面一致的"重置密码"背后是 `POST :id/reset-password`（不是 PATCH），写错就是一个 404；
  *   · **Key 的回显**：编辑弹窗如果把 `apiKeyPreview` 回填进输入框，用户一保存就把掩码
  *     当成真 Key 存了进去（`02` §4.3 的"Key 有进无出"在界面这一侧最容易被破坏）。
+ * P0-1-37 又添了一族同性质的判据（上游协议）：
+ *   · `protocol` 与 `type` 是**两个字段**，而 `EMBEDDING` 只允许默认协议 ⇒ 改类型时必须把
+ *     协议收回默认值（见 {@link protocolAfterTypeChange}），否则这次提交必然 400，
+ *     且报错的字段是用户**没碰过**的那个下拉；
+ *   · 可选协议列表由 `shared#protocolAllowedForType` 过滤，前端不另写一遍判据。
  * 这些全是纯函数，所以判据拆到这里，由 `frontend/scripts/verify-admin-ui.mjs` 逐条断言
  * ——本仓"纯逻辑拆进无依赖文件 ⇒ 断言进无依赖档"的同一手法（对照 `verify-chat-sse` /
  * `verify-knowledge-ui`）。
@@ -41,9 +46,18 @@ import type {
   UpdateModelBody,
   UpdateModelProviderBody,
   UpdateUserBody,
+  UpstreamProtocol,
   UserListItem,
   UserRole,
   UserStatus,
+} from '@doubulea/shared'
+import {
+  DEFAULT_UPSTREAM_PROTOCOL,
+  EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
+  UPSTREAM_PROTOCOLS,
+  UPSTREAM_PROTOCOL_BASE_URL_HINTS,
+  UPSTREAM_PROTOCOL_LABELS,
+  protocolAllowedForType,
 } from '@doubulea/shared'
 
 import { isTypedConfirmMatch } from '../../app/confirm.js'
@@ -218,6 +232,8 @@ export interface ProviderFormValues {
   name: string
   baseUrl: string
   type: ModelType
+  /** 上游协议（P0-1-37）。`EMBEDDING` 下被类型锁成默认协议，见 {@link protocolAfterTypeChange} */
+  protocol: UpstreamProtocol
   enabled: boolean
   /** ⚠️ 编辑态**恒为空串**（`apiKeyPreview` 绝不回填）；空串 + 未动 = "不动原 Key" */
   apiKey: string
@@ -227,6 +243,7 @@ export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
   name: '',
   baseUrl: '',
   type: 'CHAT',
+  protocol: DEFAULT_UPSTREAM_PROTOCOL,
   enabled: true,
   apiKey: '',
 }
@@ -237,15 +254,58 @@ export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
  * ⚠️ `apiKey` 是**空串**，不是 `provider.apiKeyPreview` —— 这是"Key 有进无出"在界面侧的落点：
  * 回填掩码会让管理员一点保存就把 `sk-****abcd` 当成真 Key 写进库（`02` §4.3 的口径是
  * "渲染成掩码 + 「重新设置」按钮，**不回填输入框**"）。
+ *
+ * ⚠️ `protocol` 则**必须回填**：它就是要给管理员看的既有配置（`ModelProviderItem` 里带它），
+ * 与 Key 的处置刻意相反 —— 拿不到真值的是 Key，不是协议。
  */
 export function providerEditValuesOf(provider: ModelProviderItem): ProviderFormValues {
   return {
     name: provider.name,
     baseUrl: provider.baseUrl,
     type: provider.type,
+    protocol: provider.protocol,
     enabled: provider.enabled,
     apiKey: '',
   }
+}
+
+// ───────────────────────── 上游协议（P0-1-37） ─────────────────────────
+
+/** 协议下拉的选项（顺序 = `shared` 的 `UPSTREAM_PROTOCOLS`，也就是后端枚举的顺序） */
+export const PROTOCOL_OPTIONS: readonly { value: UpstreamProtocol; label: string }[] =
+  UPSTREAM_PROTOCOLS.map((protocol) => ({ value: protocol, label: UPSTREAM_PROTOCOL_LABELS[protocol] }))
+
+/**
+ * 某个 Provider 类型下**可选**的协议。
+ *
+ * 判据委托 `shared` 的 `protocolAllowedForType` —— 与后端 schema / service **同一份实现**。
+ * 前端另写一遍 `type === 'EMBEDDING' && …` 就会出现"界面能选、后端 400"这种最招人烦的错配。
+ *
+ * ⚠️ 返回**可变**数组（不是 `readonly`）：AntD 的 `Select.options` 收的是可变数组，
+ * 传 `readonly` 会编译期报 TS4104。`.filter` 本来就产出一份新数组，没有共享可变状态的风险。
+ */
+export function protocolOptionsFor(type: ModelType): { value: UpstreamProtocol; label: string }[] {
+  return PROTOCOL_OPTIONS.filter((option) => protocolAllowedForType(type, option.value))
+}
+
+/** 协议被类型锁住时选择器的说明（就是后端那条 400 字段级文案，不加一个字的翻译） */
+export const PROTOCOL_LOCKED_BY_TYPE_REASON = EMBEDDING_PROTOCOL_CONFLICT_MESSAGE
+
+/**
+ * 切换类型后协议应当落到哪个值。
+ *
+ * ⚠️ 必须显式收回默认值：`CHAT + ANTHROPIC_MESSAGES` 的 Provider 被改成 `EMBEDDING` 时，
+ * 若协议还停在 Anthropic，这次提交必然 `400`（字段级错误指向 `protocol`）——
+ * 而那个下拉在 `EMBEDDING` 下是**灰的**，用户看到的是"一个我没碰过的字段报错了"。
+ * 收回默认值的代价为零（默认协议正是唯一合法值），不收回则是一次必错的提交。
+ */
+export function protocolAfterTypeChange(nextType: ModelType, current: UpstreamProtocol): UpstreamProtocol {
+  return protocolAllowedForType(nextType, current) ? current : DEFAULT_UPSTREAM_PROTOCOL
+}
+
+/** `baseUrl` 输入框下方的提示 —— 每种协议的路径后缀不同，填错的表现是 404（`02` §6.1） */
+export function protocolBaseUrlHint(protocol: UpstreamProtocol): string {
+  return UPSTREAM_PROTOCOL_BASE_URL_HINTS[protocol]
 }
 
 /** Key 那一列/那一行的读数：已配置给掩码（后端解密后生成），未配置给一句人话 */
@@ -282,6 +342,10 @@ export function buildCreateProviderBody(values: ProviderFormValues): CreateModel
     name: values.name.trim(),
     baseUrl: values.baseUrl.trim(),
     type: values.type,
+    // ⚠️ 总是带上 protocol（哪怕它就是默认值）：用户在下拉里**明确选过**，
+    //    而依赖服务端默认值会让"界面显示 OpenAI 兼容、实际存了别的"无法从请求体看出来
+    //    （与 `role` 总是带上同一个理由，见 `buildCreateUserBody`）
+    protocol: values.protocol,
     enabled: values.enabled,
     ...(apiKey === '' ? {} : { apiKey }),
   }
@@ -290,11 +354,15 @@ export function buildCreateProviderBody(values: ProviderFormValues): CreateModel
 /**
  * 改 Provider 请求体。返回值 `null` = 没有任何改动 ⇒ 不发请求。
  *
- * 三处三态/守卫都在这里收口（页面只负责收集表单值）：
+ * 四处三态/守卫都在这里收口（页面只负责收集表单值）：
  *   · `apiKey` 按 {@link providerKeyIntent} 决定带不带、带什么（见上）；
  *   · `type` **有模型时不让改** —— 后端 `409`（`02` §4.3）。界面上把选择器标灰，
  *     所以这里再兜一道：`.type` 与已存值不同且 `modelCount > 0` 时**不带上这个键**
  *     （宁可当作"没改"，也不发一个必然 409 的请求）；
+ *   · `protocol` **逐字比较后只在真变了才带**（同 `name`/`baseUrl` 的处置）——
+ *     每次刷新 `updated_at` 会把"最近更新"这一列搅乱，而后端那条排序正是按它来的。
+ *     ⚠️ 协议**没有**"有模型就不许改"的守卫（与 `type` 刻意相反，`02` §4.3）：
+ *     填错了本来就该能改回来，所以这里不做 {@link providerTypeChangeBlocked} 那种拦截；
  *   · `baseUrl` 归一化（去尾斜杠）**交给契约层**（`providerBaseUrlSchema` 的 `transform`），
  *     前端不自己 `replace` —— 否则"存下来的到底是什么"会有两个答案。
  */
@@ -312,6 +380,16 @@ export function buildProviderUpdateBody(
   if (baseUrl !== provider.baseUrl) body.baseUrl = baseUrl
 
   if (values.type !== provider.type && !providerTypeChangeBlocked(provider)) body.type = values.type
+
+  /**
+   * ⚠️ `protocol` 要显式判 `undefined`（**三态**，与后端 `apiKey`/`maxContext` 同款）：
+   * 不判的话，`values.protocol === undefined` 会被"`undefined !== 'OPENAI_COMPAT'`"判成一次改动，
+   * 于是请求体里多出一个 `protocol: undefined` —— 它被 `JSON.stringify` 悄悄丢掉，**但**
+   * `Object.keys(body).length === 0` 这句已经被它破坏了 ⇒ 本该 `return null` 的"零改动"
+   * 变成一次 `PATCH {}`，而契约的"至少带一个字段"会把这次必然无效的请求打成 400。
+   * （这不是假想：本仓的无依赖验收档 D4/D5/E2 当时就是这么红的。）
+   */
+  if (values.protocol !== undefined && values.protocol !== provider.protocol) body.protocol = values.protocol
 
   if (values.enabled !== provider.enabled) body.enabled = values.enabled
 

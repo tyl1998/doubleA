@@ -1,16 +1,17 @@
 /**
- * LLM client —— OpenAI 兼容协议的**传输层**（P0-1-12）
+ * LLM client —— 对话协议的**传输层**（P0-1-12 起；P0-1-37 起三协议）
  *
- * 依据：`docs/02-后端设计.md` §一（「LLM 接入 = OpenAI 兼容 client（自定义 baseURL）」）、
- *      §六 第 3 步（ChatBot 走 `stream: true`，delta / thinking 持续透传）、
- *      §八（embedding 的 api 模式也复用同一套"OpenAI 兼容 + 自定义 baseURL"口径）、
+ * 依据：`docs/02-后端设计.md` §一（「LLM 接入 = OpenAI 兼容 client（自定义 baseURL）+
+ *      **协议可配**」）、§六 第 3 步（ChatBot 走 `stream: true`，delta / thinking 持续透传）、
+ *      §6.1（**三协议映射表** + 差异收敛清单）、§八（embedding 的 api 模式也复用同一套
+ *      "OpenAI 兼容 + 自定义 baseURL"口径）、
  *      §4.3（`GET /api/model-providers/:id/remote-models` 拉取该配置下的上游模型）。
  * 产出要求：`06` P0-1-12 —— 「`llm/client.ts`：`baseURL` 取自 provider、Key 从 `api_key_enc`
  *      解密注入（**仅后端内存**）、支持 `stream: true` 增量回调；为 F 包的编排预留
  *      `chatStream()` 与 `chat()` 两个入口」。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件的三条口径（写给后来改它的人）
+ * 本文件的四条口径（写给后来改它的人）
  * ─────────────────────────────────────────────────────────────────────
  *
  * **① 只做传输，不碰数据库。** Provider/模型 → 上游配置的解析（含解密 Key）在
@@ -31,6 +32,9 @@
  *      · ⚠️ **刻意不发 `stream_options`**（`include_usage`）：这是踩过的最常见的 400 来源
  *        （不是所有网关都认这个字段），而 usage 只是"有就收、没有就算了"的锦上添花 ——
  *        真需要它时应先做成 Provider 级开关，而不是默认发出去。
+ *    ⚠️ P0-1-37 起，上面前四条里"取哪个字段"的部分**搬到了 `./protocol.ts`**（按 Provider 的
+ *      `protocol` 分流）；本文件只留"与协议无关"的那部分：读流 / 计时 / 汇总 / 脱敏 / 回调。
+ *      **这条边界要守住** —— 往这里加 `if (protocol === '…')` 就是把差异又摊回了外壳。
  *
  * **③ 超时与中断分三级，且各有去处**（不这样做的话，一个卡死的上游会永久占住
  *    ChatBot 的并发闸）：
@@ -44,19 +48,28 @@
  *      · 调用方传入的 `abortSignal`（用户的"停止"）→ {@link LlmAbortError}，
  *        与故障区分开：**用户点停止不是错误**，F 包据此推 `done{finishReason: STOPPED}`。
  *
- * **密钥零下发（`02` §九/§十 不变式）**在本层的落点：{@link LlmTarget.apiKey} 只存在于
- * 进程内存，且**任何**写进日志/错误消息的上游响应片段都要先过 {@link redactSecret} ——
- * 上游 401 的响应体里回显 `Authorization` 是常见行为，不脱敏就等于把 Key 借错误消息漏出去。
+ * **④ 密钥零下发（`02` §九/§十 不变式）**在本层的落点：{@link LlmTarget.apiKey} 只存在于
+ *    进程内存，且**任何**写进日志/错误消息的上游响应片段都要先过 `redactSecret`（在
+ *    `upstream.ts` / `protocol.ts` 各自的出口里）—— 上游 401 的响应体里回显 `Authorization`
+ *    是常见行为，不脱敏就等于把 Key 借错误消息漏出去。
  *
- * **④ 通用件已抽到 `./upstream.ts`（P0-1-13）**：看门狗 `Deadline` / 中断类 /
+ * **⑤ 通用件已抽到 `./upstream.ts`（P0-1-13）**：看门狗 `Deadline` / 中断类 /
  *    脱敏 / 状态码映射 / `fetchUpstreamJson` 都是"与协议无关"的，embedding 的 api 模式
  *    要的是**同一套**（§六.1 的差异收敛口径对 §八 同样成立）。本文件只留"对话协议"这一层。
  */
 
-import { AppError } from '@doubulea/shared'
+import { AppError, type UpstreamProtocol } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
+import {
+  mergeUsage,
+  protocolOf,
+  type ChatMessage,
+  type ChatUsage,
+  type DecodedFrame,
+  type ProtocolDecodeContext,
+} from './protocol.js'
 import {
   Deadline,
   LlmAbortError,
@@ -67,23 +80,19 @@ import {
   snippet,
   throwUpstreamStatus,
   toUpstreamFailure,
-  upstreamHeaders,
   type UpstreamEndpoint,
 } from './upstream.js'
 
 // 这两项 P0-1-12 起就是从本文件导出的（`services/model.service.ts`、F 包与验收脚本在用），
 // 实现搬到 `upstream.ts` 后在这里原样再导出：**调用点不因为一次重构而改 import 路径**。
 export { LlmAbortError, redactSecret }
+// 同理：`ChatMessage` / `ChatUsage` 的实现（定义）P0-1-37 起搬到了 `./protocol.ts`
+// （依赖方向原因，见那边的文件头），**调用点同样不用改 import 路径**。
+export type { ChatMessage, ChatUsage, DecodedFrame } from './protocol.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 对外类型（F 包的编排层只依赖这几项）
 // ═════════════════════════════════════════════════════════════════════
-
-/** 对话消息（本批只到"文本进、文本出"；工具/多模态 part 由 `extraBody` 逃生口与 P0-1-26 承接） */
-export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string
-}
 
 /**
  * 一次调用的**上游目标**：由 `services/model.service.ts#resolveChatTarget()` 组装。
@@ -101,17 +110,20 @@ export interface LlmTarget {
   supportsVision: boolean
   providerId: string
   providerName: string
+  /**
+   * 上游协议（Provider 级配置，`02` §4.3 / §6.1）。
+   *
+   * 可选是**刻意**的：验收脚本会手工构造 target（P0-1-37 之前的脚本全都不带这个字段），
+   * 而"没给"应当等价于"用默认协议"—— 由 `protocolOf()` 一处回落（见 `protocol.ts` 文件头口径 ②），
+   * 而不是让每个调用点各写一遍 `?? 'OPENAI_COMPAT'`。
+   */
+  protocol?: UpstreamProtocol
   /** 已归一化（去尾斜杠），拼路径不会出现 `//` */
   baseUrl: string
   /** 未配置时为 `null` —— 有的自建/内网 OpenAI 兼容实现不校验凭据 */
   apiKey: string | null
 }
 
-export interface ChatUsage {
-  tokensIn: number | null
-  tokensOut: number | null
-  tokensTotal: number | null
-}
 
 export interface ChatResult {
   text: string
@@ -200,6 +212,17 @@ function endpointOf(target: LlmTarget): UpstreamEndpoint {
   }
 }
 
+/**
+ * 协议解码上下文。
+ *
+ * ⚠️ 这里**故意**带上 `apiKey`：协议钩子在拼错误消息时要把上游回显的凭据抹掉
+ * （`upstream.ts#redactSecret`）。它只进"脱敏函数的入参"，绝不进消息本身 ——
+ * 与 {@link describeTarget} 的区别正在于此。
+ */
+function decodeContextOf(target: LlmTarget): ProtocolDecodeContext {
+  return { providerName: target.providerName, subject: target.modelName, apiKey: target.apiKey }
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // chat()：非流式
 // ═════════════════════════════════════════════════════════════════════
@@ -218,111 +241,44 @@ export async function chat(
   options: ChatOptions = {},
 ): Promise<ChatResult> {
   const startedAt = Date.now()
+  const protocol = protocolOf(target.protocol)
+  const endpoint = endpointOf(target)
 
-  const body: Record<string, unknown> = { model: target.modelName, messages, stream: false }
-  if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens
-  if (options.temperature !== undefined) body.temperature = options.temperature
-  Object.assign(body, options.extraBody ?? {})
+  // 报文形状（路径 / 字段名 / system 放哪 / 有没有必填项）全部由协议决定 —— 见 `./protocol.ts`
+  const body = protocol.buildBody({
+    model: target.modelName,
+    messages,
+    stream: false,
+    maxTokens: options.maxTokens,
+    temperature: options.temperature,
+    extraBody: options.extraBody,
+  })
 
   // 非流式的报文很小（一次问答的 JSON），所以一个计时器覆盖"到响应头 + 读 body"全程
-  const payload = await fetchUpstreamJson(endpointOf(target), {
-    path: '/chat/completions',
+  const payload = await fetchUpstreamJson(endpoint, {
+    path: protocol.chatPath,
     body,
+    // 鉴权头的形状也随协议（Bearer vs `x-api-key`）；覆盖 `fetchUpstreamJson` 的默认头
+    headers: protocol.headers(endpoint),
     timeoutMs: options.timeoutMs ?? config.llm.requestTimeoutMs,
     abortSignal: options.abortSignal,
     stage: 'chat',
   })
 
-  const parsed = readCompletionPayload(payload, target)
+  const parsed = protocol.readNonStream(payload, decodeContextOf(target))
   return {
     text: parsed.text,
-    rawFinishReason: parsed.rawFinishReason,
+    // 结束原因已由协议归一化到 OpenAI 词表（`protocol.ts` 文件头口径 ①）——
+    // 上层（`chatBot`）靠 `!== 'stop'` 判"可能被截断"，三协议必须是同一套词表
+    rawFinishReason: parsed.finishReason,
     usage: parsed.usage,
     durationMs: Date.now() - startedAt,
   }
 }
 
-/** 从非流式响应体里取文本 / 结束原因 / usage（两种形状：OpenAI 标准与部分网关的 error） */
-function readCompletionPayload(
-  payload: unknown,
-  target: LlmTarget,
-): { text: string; rawFinishReason: string | null; usage: ChatUsage | null } {
-  if (typeof payload !== 'object' || payload === null) {
-    throw AppError.upstreamError(`上游响应结构异常（不是对象）：${target.providerName}`)
-  }
-  const record = payload as Record<string, unknown>
-
-  /**
-   * ⚠️ 有的网关**用 200 返回错误**（`{error: {message}}`）。不显式判它的话，
-   * 这里会取到空文本、调用方看到"模型答了个空"，问题被推迟到很久以后。
-   */
-  const errorField = record.error
-  if (typeof errorField === 'object' && errorField !== null) {
-    const message = (errorField as { message?: unknown }).message
-    throw AppError.upstreamError(
-      `上游以 200 返回了错误：${target.providerName}。${redactSecret(String(message ?? '(无 message)'), target.apiKey)}`,
-    )
-  }
-
-  const choices = Array.isArray(record.choices) ? record.choices : []
-  const first = choices[0]
-  if (typeof first !== 'object' || first === null) {
-    throw AppError.upstreamError(
-      `上游响应里没有 choices[0]：${target.providerName}。原始响应：${snippet(
-        JSON.stringify(record),
-        target.apiKey,
-      )}`,
-    )
-  }
-  const choice = first as Record<string, unknown>
-  const message = (
-    typeof choice.message === 'object' && choice.message !== null
-      ? (choice.message as Record<string, unknown>)
-      : {}
-  )
-
-  return {
-    text: readDeltaText(message.content),
-    rawFinishReason: typeof choice.finish_reason === 'string' ? choice.finish_reason : null,
-    usage: readUsage(record.usage),
-  }
-}
-
-/** `content` 可能是字符串、也可能是多模态 part 数组；空/缺省都归成空串 */
-function readDeltaText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  let text = ''
-  for (const part of content) {
-    if (typeof part === 'string') {
-      text += part
-      continue
-    }
-    if (typeof part === 'object' && part !== null) {
-      const value = (part as Record<string, unknown>).text
-      if (typeof value === 'string') text += value
-    }
-  }
-  return text
-}
-
-/** usage 的三种常见命名都收（`prompt_tokens` / `input_tokens` 并存于不同实现） */
-function readUsage(raw: unknown): ChatUsage | null {
-  if (typeof raw !== 'object' || raw === null) return null
-  const record = raw as Record<string, unknown>
-  const pick = (...keys: string[]): number | null => {
-    for (const key of keys) {
-      const value = record[key]
-      if (typeof value === 'number' && Number.isFinite(value)) return value
-    }
-    return null
-  }
-  const tokensIn = pick('prompt_tokens', 'input_tokens')
-  const tokensOut = pick('completion_tokens', 'output_tokens')
-  const tokensTotal = pick('total_tokens') ?? (tokensIn === null || tokensOut === null ? null : tokensIn + tokensOut)
-  if (tokensIn === null && tokensOut === null && tokensTotal === null) return null
-  return { tokensIn, tokensOut, tokensTotal }
-}
+// 原 `readCompletionPayload` / `readDeltaText` / `readUsage` 三个函数 P0-1-37 起搬到了
+// `./protocol.ts`（三协议各有一份报文形状，它们正是"哪个协议取哪个字段"的实现）。
+// 本文件不再认识 `choices` / `content` / `usage` 这些字段名 —— 这正是 ② 那条边界。
 
 // ═════════════════════════════════════════════════════════════════════
 // chatStream()：SSE 增量
@@ -351,19 +307,25 @@ export async function chatStream(
   /** 流内空闲的窗口：每收一块就重置（见文件头 ③） */
   const idleMs = options.idleTimeoutMs ?? config.llm.streamIdleTimeoutMs
   const endpoint = endpointOf(target)
+  const protocol = protocolOf(target.protocol)
+  const decodeCtx = decodeContextOf(target)
 
-  const body: Record<string, unknown> = { model: target.modelName, messages, stream: true }
-  if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens
-  if (options.temperature !== undefined) body.temperature = options.temperature
-  Object.assign(body, options.extraBody ?? {})
+  const body = protocol.buildBody({
+    model: target.modelName,
+    messages,
+    stream: true,
+    maxTokens: options.maxTokens,
+    temperature: options.temperature,
+    extraBody: options.extraBody,
+  })
   // ⚠️ 刻意不写 `stream_options`（见文件头 ②）：它是 400 的常见来源，而 usage 只是锦上添花
 
   let response: Response
   try {
     deadline.arm(headingMs, '首次响应（到响应头）')
-    response = await fetch(`${target.baseUrl}/chat/completions`, {
+    response = await fetch(`${target.baseUrl}${protocol.chatPath}`, {
       method: 'POST',
-      headers: upstreamHeaders(endpoint, { accept: 'text/event-stream' }),
+      headers: protocol.headers(endpoint, { accept: 'text/event-stream' }),
       body: JSON.stringify(body),
       signal: deadline.signal,
     })
@@ -406,12 +368,13 @@ export async function chatStream(
       { ...describeTarget(target), contentType },
       '上游忽略了 stream:true（回的是 JSON），已按非流式处理',
     )
-    const parsed = readCompletionPayload(payload, target)
+    const parsed = protocol.readNonStream(payload, decodeCtx)
     if (parsed.text !== '') callbacks.onDelta(parsed.text)
+    if (parsed.thinking !== '') callbacks.onThinking?.(parsed.thinking)
     if (parsed.usage !== null) callbacks.onUsage?.(parsed.usage)
     return {
       text: parsed.text,
-      rawFinishReason: parsed.rawFinishReason,
+      rawFinishReason: parsed.finishReason,
       usage: parsed.usage,
       deltaCount: parsed.text === '' ? 0 : 1,
       malformedFrames: 0,
@@ -434,7 +397,10 @@ export async function chatStream(
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   let dataLines: string[] = []
-  let sentinelSeen = false
+  /** 当前 SSE 事件的 `event:` 名（Anthropic 用它区分帧种类；下一个空行后复位） */
+  let eventName: string | null = null
+  /** 见过"流结束信号"（`[DONE]` / `message_stop` / `response.completed`）—— 只用于一行 debug 日志 */
+  let endSignalSeen = false
 
   /**
    * 每个增量之前都查一次调用方的信号。
@@ -447,14 +413,37 @@ export async function chatStream(
     if (options.abortSignal?.aborted === true) throw new LlmAbortError('调用已被调用方中断（流式）')
   }
 
+  /** 把协议解出来的一帧并进汇总，并回调 —— **这里不认识任何协议字段名**（边界见文件头 ②） */
+  const applyFrame = (frame: DecodedFrame): void => {
+    if (frame.thinking !== '') callbacks.onThinking?.(frame.thinking)
+    if (frame.text !== '') {
+      state.text += frame.text
+      state.deltaCount += 1
+      callbacks.onDelta(frame.text)
+    }
+    if (frame.finishReason !== null) state.rawFinishReason = frame.finishReason
+    if (frame.usage !== null) {
+      /**
+       * ⚠️ 是**合并**不是替换：Anthropic 把一个 usage 拆在 `message_start`（input_tokens）
+       * 与 `message_delta`（output_tokens）两帧里 —— 直接替换会丢掉前一半。
+       * 对"一次给全"的 OpenAI 系来说，合并等价于赋值。
+       */
+      state.usage = mergeUsage(state.usage, frame.usage)
+      callbacks.onUsage?.(state.usage)
+    }
+    if (frame.done) endSignalSeen = true
+  }
+
   const dispatch = (): void => {
+    const event = eventName
+    eventName = null
     if (dataLines.length === 0) return
     throwIfAborted()
     // SSE 规范：一个事件的多个 `data:` 行用换行拼接
     const payload = dataLines.join('\n')
     dataLines = []
-    if (payload.trim() === '[DONE]') {
-      sentinelSeen = true
+    if (protocol.isDoneSentinel(payload, event)) {
+      endSignalSeen = true
       return
     }
     let chunk: unknown
@@ -469,7 +458,7 @@ export async function chatStream(
       )
       return
     }
-    applyStreamChunk(chunk, target, state, callbacks)
+    applyFrame(protocol.readStreamFrame(chunk, event, decodeCtx))
   }
 
   try {
@@ -487,10 +476,14 @@ export async function chatStream(
           dispatch() // 空行 = 一帧结束
         } else if (line.startsWith(':')) {
           // 注释行（保活 `: ping`）—— 忽略，但它已通过 idle.arm() 重置了空闲计时，这正是要的效果
+        } else if (line.startsWith('event:')) {
+          // ⚠️ P0-1-37 起要收它：Anthropic 用 `event:` 区分帧种类（`message_stop` / `error`…）。
+          // SSE 规范：`event:` 对**紧随其后**的那个 data 块生效 ⇒ 记下来，dispatch 后复位。
+          eventName = line.slice('event:'.length).trim()
         } else if (line.startsWith('data:')) {
           dataLines.push(line.slice('data:'.length).trimStart())
         }
-        // 其它字段（event:/id:/retry:）本层不消费：SSE 归一化在编排层（`02` §五）
+        // 其它字段（`id:` / `retry:`）本层不消费：SSE 归一化在编排层（`02` §五）
         index = buffer.indexOf('\n')
       }
     }
@@ -511,8 +504,9 @@ export async function chatStream(
     deadline.clear()
   }
 
-  if (sentinelSeen) {
-    getLogger().debug({ ...describeTarget(target) }, '上游发来了 [DONE] 哨兵')
+  if (endSignalSeen) {
+    // 措辞刻意中立：`[DONE]` 只是三种协议的结束信号之一（另有 `message_stop` / `response.completed`）
+    getLogger().debug({ ...describeTarget(target), protocol: protocol.id }, '上游发来了流结束信号')
   }
   return {
     text: state.text,
@@ -532,61 +526,15 @@ interface StreamState {
   usage: ChatUsage | null
 }
 
-/** 处理一帧（已 JSON.parse 过）；把各种实现差异都收在这里 */
-function applyStreamChunk(
-  chunk: unknown,
-  target: LlmTarget,
-  state: StreamState,
-  callbacks: ChatStreamCallbacks,
-): void {
-  if (typeof chunk !== 'object' || chunk === null) return
-  const record = chunk as Record<string, unknown>
-
-  const errorField = record.error
-  if (typeof errorField === 'object' && errorField !== null) {
-    const message = (errorField as { message?: unknown }).message
-    throw AppError.upstreamError(
-      `上游在流中返回错误：${target.providerName}。${redactSecret(String(message ?? '(无 message)'), target.apiKey)}`,
-    )
-  }
-
-  const usage = readUsage(record.usage)
-  if (usage !== null) {
-    state.usage = usage
-    callbacks.onUsage?.(usage)
-  }
-
-  // 有的实现会额外给一个 chat.completion.chunk 之外的顶层 `message`（非流式残留）—— 兜一下
-  const choices = Array.isArray(record.choices) ? record.choices : []
-  for (const rawChoice of choices) {
-    if (typeof rawChoice !== 'object' || rawChoice === null) continue
-    const choice = rawChoice as Record<string, unknown>
-    if (typeof choice.finish_reason === 'string') state.rawFinishReason = choice.finish_reason
-
-    const delta = (
-      typeof choice.delta === 'object' && choice.delta !== null
-        ? (choice.delta as Record<string, unknown>)
-        : {}
-    )
-    // 首帧常常只有 role、thinking 有的实现写 `reasoning` 而不是 `reasoning_content`
-    const thinking = readDeltaText(delta.reasoning_content ?? delta.reasoning)
-    if (thinking !== '') callbacks.onThinking?.(thinking)
-
-    const text = readDeltaText(delta.content)
-    if (text !== '') {
-      state.text += text
-      state.deltaCount += 1
-      callbacks.onDelta(text)
-    }
-  }
-}
+// 原 `applyStreamChunk`（"这一帧取哪个字段"）P0-1-37 起搬到了 `./protocol.ts`，
+// 本文件只剩上面的 `applyFrame` —— 它只做"并进汇总 + 回调"，不认任何协议字段名。
 
 // ═════════════════════════════════════════════════════════════════════
 // fetchRemoteModels()：拉取"该配置下的模型"
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 拉取 Provider 上游**实际提供**的模型列表（OpenAI 兼容的 `GET {baseUrl}/models`）。
+ * 拉取 Provider 上游**实际提供**的模型列表（三协议都是 `GET {baseUrl}/models`）。
  *
  * 为什么要有它（用户 2026-09-21 提出）：模型池里的 `modelName` 全靠管理员手敲，
  * 而手敲错一个字符要等到第一次发消息才以 404 暴露。这是"通用"能力 ——
@@ -597,12 +545,15 @@ function applyStreamChunk(
  *   · `{ models: [{ name, model }] }`（llama.cpp / ollama 一类的兼容层）
  *   · 裸数组 `[{ id }]`
  *
+ * ⚠️ P0-1-37：鉴权头**随协议**走。Anthropic 的 `/models` 同样要 `x-api-key`
+ * （只是没用 `Authorization` 而已），所以这里不能再无脑套 `upstreamHeaders`。
+ *
  * @throws {AppError} `UPSTREAM_ERROR`(502) 上游非 2xx（404 时文案点明"该实现可能不提供 /models"）
  *                    / `UPSTREAM_TIMEOUT`(504) 超时
  * @throws {LlmAbortError} 调用方中断
  */
 export async function fetchRemoteModels(
-  target: Pick<LlmTarget, 'providerName' | 'baseUrl' | 'apiKey'>,
+  target: Pick<LlmTarget, 'providerName' | 'baseUrl' | 'apiKey'> & Pick<Partial<LlmTarget>, 'protocol'>,
   options: Pick<ChatOptions, 'abortSignal' | 'timeoutMs'> = {},
 ): Promise<{ items: RemoteModel[]; total: number; truncated: boolean }> {
   // 这个探测请求没有"某个模型"这个主语（`subject` 缺省时消息里只写上游名）
@@ -611,27 +562,32 @@ export async function fetchRemoteModels(
     baseUrl: target.baseUrl,
     apiKey: target.apiKey,
   }
+  const protocol = protocolOf(target.protocol)
 
   let payload: unknown
   try {
     payload = await fetchUpstreamJson(endpoint, {
-      path: '/models',
+      path: protocol.modelsPath,
       method: 'GET',
+      headers: protocol.headers(endpoint, { json: false }),
       timeoutMs: options.timeoutMs ?? config.llm.requestTimeoutMs,
       abortSignal: options.abortSignal,
       stage: 'get /models',
     })
   } catch (error) {
     if (options.abortSignal?.aborted === true) throw new LlmAbortError('拉取上游模型列表已被中断')
-    // 404 单独给文案：不是所有 OpenAI 兼容实现都提供列表，此时"手工录入"才是正解
+    // 404 单独给文案：不是所有实现都提供列表，此时"手工录入"才是正解
     if (
       typeof error === 'object' &&
       error !== null &&
       (error as { data?: { upstreamStatus?: unknown } }).data?.upstreamStatus === 404
     ) {
       throw AppError.upstreamError(
-        `上游没有 /models 端点（HTTP 404）：${target.providerName}。` +
-          '该实现可能不提供模型列表（不是所有 OpenAI 兼容实现都实现它），请手工录入模型名。',
+        `上游没有 ${protocol.modelsPath} 端点（HTTP 404）：${target.providerName}。` +
+          (protocol.id === 'ANTHROPIC_MESSAGES'
+            ? 'Anthropic Messages 协议下该端点同样要带 x-api-key（本平台已按协议带上）；' +
+              '若这是自建的兼容网关，请手工录入模型名。'
+            : '该实现可能不提供模型列表（不是所有 OpenAI 兼容实现都实现它），请手工录入模型名。'),
         { upstreamStatus: 404 },
       )
     }

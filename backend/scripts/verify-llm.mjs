@@ -1,26 +1,35 @@
 #!/usr/bin/env node
 /**
- * verify-llm.mjs —— P0-1-12 的 **LLM client 验收**（需要真实 Redis + PG）
+ * verify-llm.mjs —— P0-1-12 的 **LLM client 验收**（需要真实 Redis + PG）；P0-1-37 起兼验三协议
  *
- * 验的是 `06` P0-1-12 的两条验收门槛 + `02` §4.3 的「拉取该配置下的上游模型」：
+ * 验的是 `06` P0-1-12 的两条验收门槛 + `02` §4.3 的「拉取该配置下的上游模型」
+ * + `02` §6.1 的**三协议映射表**（P0-1-37：OpenAI 兼容 / OpenAI Responses / Anthropic Messages）：
  *
  *   ① 「对一个真实 provider 发一次极小请求（`max_tokens: 1`）能拿到响应」；
- *   ② 「流式模式下能逐块收到 delta」。
+ *   ② 「流式模式下能逐块收到 delta」；
+ *   ③ （P0-1-37）「同一个模型，换个 Provider 协议就能打到另一条路径、用另一套鉴权头，
+ *      并且文本/思考/结束原因/usage 都解释得对」。
  *
  * ⚠️ **"真实 provider" 用本地假上游代替**。不这样做的原因不是图省事：
  *    验收不能依赖外部厂商（凭据、网络、限额、以及"厂商哪天改了报文"都会让脚本变成噪声）。
- *    这里起一个**真的 HTTP 服务**（`http.createServer` + 端口 0），按 OpenAI 兼容协议应答，
- *    并把收到的每个请求原样记下来 —— 于是"Key 到底有没有被解密注入""有没有乱发 `stream_options`"
- *    这类问题都能**在服务端取证**，而不是靠读代码猜。
+ *    这里起一个**真的 HTTP 服务**（`http.createServer` + 端口 0），按三种协议分别应答，
+ *    并把收到的每个请求原样记下来（含 `authorization` / `x-api-key` / `anthropic-version`）
+ *    —— 于是"Key 到底有没有被解密注入""报文走的是哪条路径""有没有乱发 `stream_options`"
+ *    这类问题都能**在上游侧取证**，而不是靠读代码猜。
  *
- * 两类用例，刻意分开（对应 `llm/client.ts` 的分层）：
+ * 三组用例，刻意分开（对应 `llm/` 的分层）：
  *   · **A 组 · 传输层**（模块级，手工构造 target，不需要库）：报文正确性、超时、中断、流式边界。
- *   · **B 组 · 集成**（走 `app.inject` + 真库）：`resolveChatTarget()` 的四道前置校验、
- *     路由 `GET /api/model-providers/:id/remote-models`、以及**"密文里的 Key 被解密后
- *     真的注进了 Authorization"**（一次端到端取证）。
+ *   · **C 组 · 三协议**（同样模块级）：协议查表与回落、结束哨兵、结束原因归一化、usage 两半合并、
+ *     三条路径各自的报文形状与鉴权头、三协议的「200 里藏错误」都抛 502 且不泄 Key
+ *     （P0-1-37 新增，理由见 `llm/protocol.ts` 文件头）。
+ *   · **B 组 · 集成**（走 `app.inject` + 真库）：`resolveChatTarget()` 的前置校验、
+ *     `protocol` 的落库/回显/合法组合守卫、路由 `GET /api/model-providers/:id/remote-models`、
+ *     以及**"密文里的 Key 被解密后真的注进了鉴权头"**（一次端到端取证）。
  *
  * ⚠️ 跑之前必须先起依赖：`pnpm infra:up && pnpm db:deploy`
- * 脚本自造带随机后缀的临时数据（ADMIN + MEMBER + 4 个 Provider + 若干模型），结束时删净。
+ * 脚本自造带随机后缀的临时数据（ADMIN + MEMBER + 若干 Provider + 模型），结束时删净。
+ *
+ * ⚠️ 口径：这是**夹具假上游**档 —— 只证明"契约与配置接对了"，**不等于**"真厂商那边一定对"。
  */
 
 // 必须在 import `config.js`（经 dist 的 app.js / client.js）之前设置：
@@ -41,6 +50,13 @@ const { closeRedis, ensureRedisConnected, getRedis, invalidateUserSnapshot, sess
 const { chat, chatStream, fetchRemoteModels, normalizeRemoteModels, redactSecret } = await import(
   '../dist/backend/src/llm/client.js'
 )
+const {
+  ANTHROPIC_API_VERSION,
+  ANTHROPIC_DEFAULT_MAX_TOKENS,
+  PROTOCOL_IDS,
+  mergeUsage,
+  protocolOf,
+} = await import('../dist/backend/src/llm/protocol.js')
 const { resolveChatTarget, listProviderRemoteModels } = await import(
   '../dist/backend/src/services/model.service.js'
 )
@@ -110,7 +126,18 @@ const upstream = http.createServer(async (req, res) => {
   const raw = Buffer.concat(chunks).toString('utf8')
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   const auth = req.headers.authorization ?? null
-  upstreamRequests.push({ method: req.method, path: url.pathname, auth, raw })
+  // P0-1-37：Anthropic 协议的鉴权头是 `x-api-key` + `anthropic-version`（且**不能**有 Authorization）
+  // —— 三样都记下来，"头到底怎么发的"只能在上游侧取证
+  const xApiKey = req.headers['x-api-key'] ?? null
+  const anthropicVersion = req.headers['anthropic-version'] ?? null
+  upstreamRequests.push({
+    method: req.method,
+    path: url.pathname,
+    auth,
+    xApiKey,
+    anthropicVersion,
+    raw,
+  })
 
   // ── GET /models 的三种形态 ──
   if (url.pathname === '/v1/models') {
@@ -209,6 +236,108 @@ const upstream = http.createServer(async (req, res) => {
   if (url.pathname === '/v1/chat/completions-with-key-echo') {
     return json(res, 200, { error: { message: `leaked? ${auth ?? ''}` } })
   }
+
+  // ══════════ P0-1-37：另外两种协议（Responses / Anthropic Messages）══════════
+
+  if (url.pathname === '/resp/responses') {
+    const body = JSON.parse(raw)
+    if (body.stream === true) {
+      sseHead(res)
+      res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created' })}\n\n`)
+      res.write(frame({ type: 'response.in_progress' })) // 保活类帧：不该产生增量
+      res.write(frame({ type: 'response.output_text.delta', delta: '你好，' }))
+      res.write(frame({ type: 'response.reasoning_summary_text.delta', delta: '先想一下' }))
+      res.write(frame({ type: 'response.output_text.delta', delta: '来自 Responses' }))
+      // 结束帧：status 与 usage 都在 `response` 快照里。⚠️ **不发 `[DONE]`**（Responses 没有这个哨兵）
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: { status: 'completed', usage: { input_tokens: 9, output_tokens: 5, total_tokens: 14 } },
+        })}`,
+      )
+      return res.end()
+    }
+    // 非流式：**故意不给 `output_text` 便捷字段** ⇒ 逼着解析器读原生 `output[].content[]`
+    //（差异收敛清单第 13 条：照 OpenAI 老解析器打过去只会得到"没有 choices[0]"）
+    return json(res, 200, {
+      id: 'resp-verify',
+      object: 'response',
+      status: 'completed',
+      output: [
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: '先想一下' }] },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: `收到了 ${body.max_output_tokens} 的额度` }],
+        },
+      ],
+      usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+    })
+  }
+  if (url.pathname === '/respfail/responses') {
+    // Responses 的"失败"形态：`status: 'failed'`，错误在 `error` 里（有的还回显凭据）
+    return json(res, 200, {
+      status: 'failed',
+      error: { code: 'server_error', message: `boom, token=${auth ?? '(none)'}` },
+    })
+  }
+
+  if (url.pathname === '/anth/messages') {
+    const body = JSON.parse(raw)
+    if (body.stream === true) {
+      sseHead(res)
+      // Anthropic 的帧**都带 `event:` 行**（本层要收它）；usage 拆成两半给
+      res.write(
+        `event: message_start\ndata: ${JSON.stringify({
+          type: 'message_start',
+          message: { id: 'msg_verify', usage: { input_tokens: 12, output_tokens: 1 } },
+        })}\n\n`,
+      )
+      res.write('event: ping\ndata: {"type":"ping"}\n\n') // 保活帧
+      res.write(
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      )
+      res.write(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想一下"}}\n\n',
+      )
+      res.write(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好，"}}\n\n',
+      )
+      res.write(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"来自 Anthropic"}}\n\n',
+      )
+      // 结束原因与**另一半** usage 都在这；随后 `message_stop`（没有 `[DONE]`）
+      res.write(
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}\n\n',
+      )
+      res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+      return res.end()
+    }
+    return json(res, 200, {
+      id: 'msg_verify',
+      type: 'message',
+      role: 'assistant',
+      // thinking 块与 text 块混在一起（真实报文就是这样）
+      content: [
+        { type: 'thinking', thinking: '先想一下' },
+        { type: 'text', text: `收到了 ${body.max_tokens} 的额度` },
+      ],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 7, output_tokens: 3 },
+    })
+  }
+  if (url.pathname === '/anthfail/messages') {
+    // Anthropic 的错误体：`{type:'error', error:{...}}`，**以 200 回**，且回显凭据
+    return json(res, 200, {
+      type: 'error',
+      error: { type: 'overloaded_error', message: `overloaded, x-api-key=${xApiKey ?? '(none)'}` },
+    })
+  }
+  if (url.pathname === '/anth/models') {
+    // Anthropic 的 `/models` 同样要 `x-api-key`（本仓 P0-1-37 起按协议出鉴权头）
+    return json(res, 200, { data: [{ id: 'claude-verify-1' }] })
+  }
+
   return json(res, 404, { error: { message: `no such path: ${url.pathname}` } })
 })
 
@@ -216,9 +345,14 @@ await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
 const upstreamPort = upstream.address().port
 const upstreamBase = `http://127.0.0.1:${upstreamPort}`
 
-/** 手工构造的 target（A 组用；B 组由 `resolveChatTarget` 产出） */
-function targetAt(path, apiKey = SECRET_KEY) {
-  return {
+/**
+ * 手工构造的 target（A/C 组用；B 组由 `resolveChatTarget` 产出）。
+ *
+ * ⚠️ `protocol` 缺省**不带这个键**（不是填个默认值）—— 这样"没给协议"那条回落路径
+ * （`protocolOf(undefined)`）在真调用里也被走了一遍，而不是只在纯函数用例里验。
+ */
+function targetAt(path, apiKey = SECRET_KEY, protocol = undefined) {
+  const target = {
     modelId: 'unit-model',
     modelName: 'unit-model',
     label: '单测假模型',
@@ -229,7 +363,16 @@ function targetAt(path, apiKey = SECRET_KEY) {
     baseUrl: `${upstreamBase}${path}`,
     apiKey,
   }
+  return protocol === undefined ? target : { ...target, protocol }
 }
+
+/**
+ * 协议钩子的解码上下文（纯逻辑用例用；真调用里由 `client.ts` 从 target 组装）。
+ *
+ * ⚠️ 是一个**函数**而不是常量：`SECRET_KEY` 在下面才声明，写成常量会撞上 TDZ
+ * （`Cannot access 'SECRET_KEY' before initialization` —— 这个坑真踩了一次）。
+ */
+const decodeCtx = () => ({ providerName: '假上游', subject: 'unit-model', apiKey: SECRET_KEY })
 
 /** 收流式增量的工具 */
 function collector() {
@@ -533,6 +676,246 @@ try {
     assertEqual(normalizeRemoteModels(null).length, 0, 'null 应得到空列表')
   })
 
+  // ══════════ 5. C 组：三协议（P0-1-37）══════════
+  console.log(
+    `\n  ${c.d}── C 组：上游协议（OpenAI 兼容 / OpenAI Responses / Anthropic Messages）──${c.x}`,
+  )
+
+  await it('协议查表：三个 id、未知/缺省一律回落默认协议（老调用点 + 新代码逐字保持原行为）', () => {
+    assertEqual(PROTOCOL_IDS.length, 3, '协议个数')
+    assertEqual(
+      PROTOCOL_IDS.join(','),
+      'OPENAI_COMPAT,OPENAI_RESPONSES,ANTHROPIC_MESSAGES',
+      'id 与顺序都要和 `shared` 的同名常量一致',
+    )
+    assertEqual(protocolOf(undefined).id, 'OPENAI_COMPAT', '缺省回落')
+    assertEqual(protocolOf(null).id, 'OPENAI_COMPAT', 'null 回落')
+    // 库里那一列是 PG enum、不会有非法值；但手工构造的 target 可能有 ⇒ 回落而不是抛
+    assertEqual(protocolOf('NOT_A_PROTOCOL').id, 'OPENAI_COMPAT', '未知值回落')
+    assertEqual(protocolOf('ANTHROPIC_MESSAGES').chatPath, '/messages', 'Anthropic 的对话路径')
+    assertEqual(protocolOf('OPENAI_RESPONSES').chatPath, '/responses', 'Responses 的对话路径')
+  })
+
+  await it('协议钩子纯逻辑：结束哨兵 / 结束原因词表 / usage 两半合并', () => {
+    // ① 只有 OpenAI 兼容认 `[DONE]`；另两个的结束信号是可解析的 JSON 帧
+    assertEqual(protocolOf('OPENAI_COMPAT').isDoneSentinel('[DONE]', null), true, '兼容协议认 [DONE]')
+    assertEqual(protocolOf('OPENAI_RESPONSES').isDoneSentinel('[DONE]', null), false, 'Responses 不认 [DONE]')
+    assertEqual(protocolOf('ANTHROPIC_MESSAGES').isDoneSentinel('[DONE]', null), false, 'Anthropic 不认 [DONE]')
+
+    const anth = protocolOf('ANTHROPIC_MESSAGES')
+    const resp = protocolOf('OPENAI_RESPONSES')
+    assertEqual(anth.readStreamFrame({ type: 'message_stop' }, null, decodeCtx()).done, true, 'message_stop ⇒ done')
+    assertEqual(
+      resp.readStreamFrame({ type: 'response.completed', response: { status: 'completed' } }, null, decodeCtx()).done,
+      true,
+      'response.completed ⇒ done',
+    )
+
+    // ② 结束原因必须归一化到 OpenAI 词表 —— 否则 `chatBot` 的"可能被截断"留痕会对**每一条**
+    //    正常回答都报警（`end_turn` / `completed` 都不等于 `stop`）
+    assertEqual(
+      anth.readStreamFrame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }, null, decodeCtx()).finishReason,
+      'stop',
+      'end_turn → stop',
+    )
+    assertEqual(
+      anth.readStreamFrame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' } }, null, decodeCtx()).finishReason,
+      'length',
+      'max_tokens → length（这才是"被截断"）',
+    )
+    assertEqual(
+      anth.readStreamFrame({ type: 'message_delta', delta: { stop_reason: 'tool_use' } }, null, decodeCtx()).finishReason,
+      'tool_calls',
+      'tool_use → tool_calls',
+    )
+    assertEqual(
+      resp.readNonStream(
+        {
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          // ⚠️ 必须给一个**非空** output：Responses 的 `output` 为空时抛 502（与兼容协议
+          //    "没有 choices[0] 就报错"同款口径），那样就验不到结束原因的映射了
+          output: [{ type: 'message', content: [{ type: 'output_text', text: '被截断了' }] }],
+        },
+        decodeCtx(),
+      ).finishReason,
+      'length',
+      'incomplete + max_output_tokens → length',
+    )
+    assertEqual(
+      resp.readNonStream({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '好' }] }] }, decodeCtx())
+        .finishReason,
+      'stop',
+      'completed → stop',
+    )
+    // 未知取值原样透出（不猜、不吞）
+    assertEqual(
+      anth.readStreamFrame({ type: 'message_delta', delta: { stop_reason: 'pause_turn' } }, null, decodeCtx()).finishReason,
+      'stop',
+      'pause_turn 是已知值 ⇒ stop',
+    )
+
+    // ③ usage 合并：**非 null 覆盖**（null = "这一帧没说"，不是"值是空"）
+    const merged = mergeUsage({ tokensIn: 12, tokensOut: null, tokensTotal: null }, {
+      tokensIn: null,
+      tokensOut: 8,
+      tokensTotal: null,
+    })
+    assertEqual(merged.tokensIn, 12, '前一半的 input_tokens 不能被后一半抹掉')
+    assertEqual(merged.tokensOut, 8, '后一半的 output_tokens')
+    assertEqual(merged.tokensTotal, 20, 'Anthropic 不给 total ⇒ 两边齐了之后补算')
+    assertEqual(mergeUsage(null, { tokensIn: null, tokensOut: 3, tokensTotal: null }).tokensIn, null, '只有一半时另一半仍是 null')
+  })
+
+  await it('Responses：`instructions` 在顶层、`input` 里没有 system、上限字段叫 `max_output_tokens`', async () => {
+    upstreamRequests.length = 0
+    const result = await chat(
+      targetAt('/resp', SECRET_KEY, 'OPENAI_RESPONSES'),
+      [
+        { role: 'system', content: '你是助手' },
+        { role: 'user', content: '在吗' },
+      ],
+      { maxTokens: 1 },
+    )
+
+    const sent = upstreamRequests.find((item) => item.path === '/resp/responses')
+    assert(sent !== undefined, '假上游没有收到 /resp/responses')
+    const body = JSON.parse(sent.raw)
+    assertEqual(body.instructions, '你是助手', 'system 必须挪到顶层 instructions')
+    assertEqual(body.max_output_tokens, 1, 'Responses 的上限字段名')
+    assert(!('max_tokens' in body), 'Responses 不该出现 `max_tokens`（字段名不同，传错就是静默失效）')
+    assertEqual(body.stream, false, '非流式应显式 stream:false')
+    assertEqual(body.input.length, 1, 'input 里只应剩 user/assistant')
+    assertEqual(body.input[0].role, 'user', 'input[0].role')
+    assert(!JSON.stringify(body.input).includes('你是助手'), 'system 不该再出现在 input 里')
+    assertEqual(sent.auth, `Bearer ${SECRET_KEY}`, 'Responses 仍走 Bearer')
+
+    // ⚠️ 上游**故意没给** `output_text` 便捷字段 ⇒ 这段文本只能来自原生 `output[].content[]`
+    assertEqual(result.text, '收到了 1 的额度', '文本来自 output[].content[] 里 type=output_text')
+    assertEqual(result.rawFinishReason, 'stop', 'status=completed 归一化成 stop')
+    assertEqual(result.usage?.tokensIn, 7, 'usage.tokensIn')
+    assertEqual(result.usage?.tokensTotal, 10, 'usage.tokensTotal')
+  })
+
+  await it('Responses 流式：`response.output_text.delta` 增量 + `response.completed` 收尾（无 `[DONE]`）', async () => {
+    upstreamRequests.length = 0
+    const sink = collector()
+    const summary = await chatStream(
+      targetAt('/resp', SECRET_KEY, 'OPENAI_RESPONSES'),
+      [{ role: 'user', content: 'hi' }],
+      sink.callbacks,
+    )
+
+    assertEqual(sink.deltas.join(''), '你好，来自 Responses', '逐帧拼接')
+    assertEqual(sink.thinking.join(''), '先想一下', 'reasoning_summary_text.delta 归到思考块')
+    assertEqual(summary.deltaCount, 2, '两个文本增量（保活类帧不算）')
+    assertEqual(summary.rawFinishReason, 'stop', '结束原因取 response.status 并归一化')
+    assertEqual(summary.usage?.tokensIn, 9, 'usage 在结束帧的 `response` 快照里')
+    assertEqual(summary.usage?.tokensTotal, 14, 'usage.tokensTotal')
+    assertEqual(summary.malformedFrames, 0, '不该有畸形帧')
+  })
+
+  await it('Anthropic：`x-api-key` + `anthropic-version`、**不发 Authorization**、`system` 顶层、`max_tokens` 必填', async () => {
+    upstreamRequests.length = 0
+    // ⚠️ 刻意**不传** maxTokens —— Anthropic 的 max_tokens 是必填，缺了就是 400
+    const result = await chat(
+      targetAt('/anth', SECRET_KEY, 'ANTHROPIC_MESSAGES'),
+      [
+        { role: 'system', content: '你是助手' },
+        { role: 'user', content: '在吗' },
+      ],
+    )
+
+    const sent = upstreamRequests.find((item) => item.path === '/anth/messages')
+    assert(sent !== undefined, '假上游没有收到 /anth/messages')
+    assertEqual(sent.auth, null, 'Anthropic 不能带 Authorization（部分网关见到就是 400）')
+    assertEqual(sent.xApiKey, SECRET_KEY, 'x-api-key 必须是明文 Key')
+    assertEqual(sent.anthropicVersion, ANTHROPIC_API_VERSION, 'anthropic-version')
+
+    const body = JSON.parse(sent.raw)
+    assertEqual(body.system, '你是助手', 'system 必须在顶层（messages 的 role 只认 user/assistant）')
+    assertEqual(body.max_tokens, ANTHROPIC_DEFAULT_MAX_TOKENS, '调用方没给上限 ⇒ 补默认值（必填）')
+    assertEqual(body.messages.length, 1, 'messages 里只应剩 user/assistant')
+    assertEqual(body.messages[0].role, 'user', 'messages[0].role')
+    assert(!JSON.stringify(body.messages).includes('你是助手'), 'system 不该再出现在 messages 里')
+
+    assertEqual(result.text, '收到了 4096 的额度', '文本取 content[] 里 type=text 的块（thinking 块要跳过）')
+    assertEqual(result.rawFinishReason, 'stop', 'stop_reason=end_turn 归一化成 stop')
+    assertEqual(result.usage?.tokensIn, 7, 'usage.tokensIn（Anthropic 用 input_tokens）')
+    assertEqual(result.usage?.tokensTotal, 10, '无 total_tokens ⇒ 由 in+out 补算')
+  })
+
+  await it('Anthropic 流式：usage 两半合并、`message_stop` 收尾、没有 `[DONE]` 也一个字不少', async () => {
+    upstreamRequests.length = 0
+    const sink = collector()
+    const summary = await chatStream(
+      targetAt('/anth', SECRET_KEY, 'ANTHROPIC_MESSAGES'),
+      [{ role: 'user', content: 'hi' }],
+      sink.callbacks,
+      { maxTokens: 64 },
+    )
+
+    assertEqual(sink.deltas.join(''), '你好，来自 Anthropic', '逐帧拼接')
+    assertEqual(sink.thinking.join(''), '想一下', 'thinking_delta 归到思考块')
+    assertEqual(summary.deltaCount, 2, '两个 text_delta（content_block_start 的空文本不算）')
+    assertEqual(summary.rawFinishReason, 'stop', 'message_delta.delta.stop_reason 归一化')
+    // ⚠️ 这两条是本协议最容易写错的一处：usage **拆在 `message_start` 与 `message_delta` 两帧**，
+    //    用"替换"而不是"合并"就会丢掉前一半（症状是 tokensIn 恒为 null，而且不报错）
+    assertEqual(summary.usage?.tokensIn, 12, 'message_start 的 input_tokens')
+    assertEqual(summary.usage?.tokensOut, 8, 'message_delta 的 output_tokens')
+    assertEqual(summary.usage?.tokensTotal, 20, '两半齐了 ⇒ 补算 total')
+
+    const sent = JSON.parse(upstreamRequests.find((item) => item.path === '/anth/messages').raw)
+    assertEqual(sent.max_tokens, 64, '调用方给了上限就用它的')
+    assertEqual(sent.stream, true, '流式必须显式 stream:true')
+  })
+
+  await it('三协议的「200 里藏错误」都抛 502，且错误消息里**没有明文 Key**', async () => {
+    // Anthropic：错误体是 `{type:'error', error:{...}}`，且上游把 x-api-key 回显了出来
+    await (async () => {
+      let caught = null
+      try {
+        await chat(targetAt('/anthfail', SECRET_KEY, 'ANTHROPIC_MESSAGES'), [{ role: 'user', content: 'hi' }])
+      } catch (error) {
+        caught = error
+      }
+      assert(caught !== null, 'Anthropic 的 200-error 必须抛')
+      assertEqual(caught.code, 'UPSTREAM_ERROR', '错误码')
+      assertEqual(caught.status, 502, 'HTTP 语义')
+      assert(!caught.message.includes(SECRET_KEY), `错误消息里出现了明文 Key：${caught.message}`)
+      assert(caught.message.includes('****'), '回显的凭据应被替换成 ****')
+    })()
+
+    // Responses：`status: 'failed'`（错误在 `error` 里，不在 choices 里）
+    await (async () => {
+      let caught = null
+      try {
+        await chat(targetAt('/respfail', SECRET_KEY, 'OPENAI_RESPONSES'), [{ role: 'user', content: 'hi' }])
+      } catch (error) {
+        caught = error
+      }
+      assert(caught !== null, 'Responses 的 status=failed 必须抛')
+      assertEqual(caught.code, 'UPSTREAM_ERROR', '错误码')
+      assert(!caught.message.includes(SECRET_KEY), `错误消息里出现了明文 Key：${caught.message}`)
+    })()
+  })
+
+  await it('Anthropic 的 `GET /models` 同样带 `x-api-key`（不能再无脑套 Bearer 头）', async () => {
+    upstreamRequests.length = 0
+    const result = await fetchRemoteModels({
+      providerName: '假 Anthropic',
+      baseUrl: `${upstreamBase}/anth`,
+      apiKey: SECRET_KEY,
+      protocol: 'ANTHROPIC_MESSAGES',
+    })
+
+    const sent = upstreamRequests.find((item) => item.path === '/anth/models')
+    assert(sent !== undefined, '假上游没有收到 /anth/models')
+    assertEqual(sent.xApiKey, SECRET_KEY, 'x-api-key')
+    assertEqual(sent.auth, null, 'Anthropic 的探测请求也不该有 Authorization')
+    assertEqual(result.items.map((item) => item.id).join(','), 'claude-verify-1', '归一化后的清单')
+  })
+
   // ══════════ 5. B 组：集成（真库 + 真接口）══════════
   const passwordHash = await hashPassword(PASSWORD)
   const admin = await prisma.user.create({
@@ -564,14 +947,20 @@ try {
   const adminCookie = await login(adminUsername)
   const memberCookie = await login(memberUsername)
 
-  /** 通过真接口建 Provider（顺带覆盖 P0-1-10 的 baseUrl 归一化：这里**故意带尾斜杠**） */
-  const createProvider = async (name, { path, apiKey }) => {
+  /**
+   * 通过真接口建 Provider（顺带覆盖 P0-1-10 的 baseUrl 归一化：这里**故意带尾斜杠**）。
+   *
+   * `protocol`/`type` 都可覆盖（P0-1-37）：前者用来验"协议落库 + 回显 + 被 target 带出去"，
+   * 后者用来验 EMBEDDING 与协议的合法组合。
+   */
+  const createProvider = async (name, { path, apiKey, protocol, type = 'CHAT' }) => {
     const response = await api('POST', '/api/model-providers', {
       cookie: adminCookie,
       payload: {
         name,
         baseUrl: `${upstreamBase}${path}/`, // 尾斜杠会被契约去掉
-        type: 'CHAT',
+        type,
+        ...(protocol === undefined ? {} : { protocol }),
         apiKey,
       },
     })
@@ -794,6 +1183,111 @@ try {
     const result = await fetchRemoteModels({ providerName: '手搓', baseUrl: `${upstreamBase}/v1`, apiKey: null })
     assertEqual(result.total, 2, '条数')
     assertEqual(result.truncated, false, 'truncated')
+  })
+
+  // ══════════ 6. B 组续：`protocol` 的落库 / 回显 / 拼接（P0-1-37）══════════
+  await it('建 Provider 不传 `protocol` ⇒ 落默认值并在列表里回显（既有前端/脚本零改动）', async () => {
+    assertEqual(providerWithKey.protocol, 'OPENAI_COMPAT', '缺省应是默认协议（P0-1-37 之前的全部行为）')
+
+    const listed = await api('GET', `/api/model-providers?limit=100`, { cookie: adminCookie })
+    assertEqual(listed.statusCode, 200, '列表状态码')
+    const rows = listed.json().data.items
+    const row = rows.find((item) => item.id === providerWithKey.id)
+    assert(row !== undefined, '列表里应能找到刚建的 Provider')
+    // ⚠️ 这一条是"上一版前端两个列表恒为空"那类缺陷的反面：**回显字段必须在列表里真的存在**
+    assertEqual(row.protocol, 'OPENAI_COMPAT', '列表条目里的 protocol')
+  })
+
+  await it('`EMBEDDING` + 非默认协议 → 400，字段级错误指向 `protocol`；建默认协议的向量 Provider 正常', async () => {
+    const conflict = await api('POST', '/api/model-providers', {
+      cookie: adminCookie,
+      payload: {
+        name: `LLM 验证向量协议冲突 ${suffix}`,
+        baseUrl: `${upstreamBase}/v1`,
+        type: 'EMBEDDING',
+        protocol: 'ANTHROPIC_MESSAGES',
+      },
+    })
+    assertEqual(conflict.statusCode, 400, '向量 Provider 配 Anthropic 必须 400')
+    const body = conflict.json()
+    assertEqual(body.code, 'VALIDATION', '信封 code')
+    const field = body.data.fields.find((issue) => issue.path.endsWith('protocol'))
+    assert(field !== undefined, `字段级错误应指向 protocol，实际：${JSON.stringify(body.data.fields)}`)
+
+    const ok = await createProvider(`LLM 验证向量上游 ${suffix}`, { path: '/v1', type: 'EMBEDDING' })
+    assertEqual(ok.protocol, 'OPENAI_COMPAT', '向量 Provider 用默认协议是合法的')
+  })
+
+  await it('改 `protocol`：**不加"有模型就 409"的守卫**（与改 type 刻意相反），且合并后与 type 冲突要 400', async () => {
+    // 前置取证：这个 Provider 下确实是有模型的（否则"不加守卫"这句话就没被验到）
+    const countBefore = await prisma.model.count({ where: { providerId: providerWithKey.id } })
+    assert(countBefore > 0, '这个用例要求 Provider 下已有模型')
+
+    // ① 已有模型，改 protocol 仍然放行（协议填错了本来就该能改回来）
+    const patched = await api('PATCH', `/api/model-providers/${providerWithKey.id}`, {
+      cookie: adminCookie,
+      payload: { protocol: 'OPENAI_RESPONSES' },
+    })
+    assertEqual(patched.statusCode, 200, '有模型时改 protocol 不该 409')
+    assertEqual(patched.json().data.protocol, 'OPENAI_RESPONSES', '响应里的新协议')
+    assertEqual(patched.json().data.modelCount, countBefore, 'modelCount 仍如实返回（改协议不动模型）')
+
+    // 回到默认协议（后面的用例还要走 /chat/completions）
+    const restored = await api('PATCH', `/api/model-providers/${providerWithKey.id}`, {
+      cookie: adminCookie,
+      payload: { protocol: 'OPENAI_COMPAT' },
+    })
+    assertEqual(restored.json().data.protocol, 'OPENAI_COMPAT', '改回来')
+
+    // ② 合并后冲突：另建一个向量 Provider，再想把它的 protocol 改成 Anthropic ⇒ 400
+    //    （这条**只有服务层判得了** —— schema 里看不到库里的 type，见 `model.service.ts` 文件头 ⑤）
+    const vectorProvider = await createProvider(`LLM 验证向量协议守卫 ${suffix}`, {
+      path: '/v1',
+      type: 'EMBEDDING',
+    })
+    const rejected = await api('PATCH', `/api/model-providers/${vectorProvider.id}`, {
+      cookie: adminCookie,
+      payload: { protocol: 'ANTHROPIC_MESSAGES' },
+    })
+    assertEqual(rejected.statusCode, 400, '向量 Provider 改成 Anthropic 必须 400')
+    assertEqual(rejected.json().code, 'VALIDATION', '信封 code')
+
+    const listed = await prisma.modelProvider.findUnique({
+      where: { id: vectorProvider.id },
+      select: { protocol: true },
+    })
+    assertEqual(listed?.protocol, 'OPENAI_COMPAT', '被拒的改动不该落库')
+
+    // ③ 一次请求里 type 与 protocol 同时矛盾 ⇒ schema 那一层就拦（400，同一套字段级形状）
+    const bothConflicting = await api('PATCH', `/api/model-providers/${vectorProvider.id}`, {
+      cookie: adminCookie,
+      payload: { type: 'EMBEDDING', protocol: 'ANTHROPIC_MESSAGES' },
+    })
+    assertEqual(bothConflicting.statusCode, 400, 'type 与 protocol 同时矛盾也必须 400')
+  })
+
+  await it('`resolveChatTarget()` 把 Provider 的协议带进 target —— Anthropic Provider 端到端走 /messages + x-api-key', async () => {
+    const anthProvider = await createProvider(`LLM 验证 Anthropic 上游 ${suffix}`, {
+      path: '/anth',
+      apiKey: SECRET_KEY,
+      protocol: 'ANTHROPIC_MESSAGES',
+    })
+    const anthModel = await createModel(anthProvider.id, `verify-llm-claude-${suffix}`)
+
+    const target = await resolveChatTarget(anthModel.id)
+    assertEqual(target.protocol, 'ANTHROPIC_MESSAGES', '协议来自 **Provider**（不是模型）')
+    assertEqual(target.apiKey, SECRET_KEY, 'Key 照样解密注入')
+
+    upstreamRequests.length = 0
+    const sink = collector()
+    const summary = await chatStream(target, [{ role: 'user', content: '接入验一下' }], sink.callbacks)
+
+    const sent = upstreamRequests.find((item) => item.path === '/anth/messages')
+    assert(sent !== undefined, '上游应收到 /anth/messages（而不是 /chat/completions）')
+    assertEqual(sent.xApiKey, SECRET_KEY, 'x-api-key 用的是解密后的明文')
+    assertEqual(sent.auth, null, 'Anthropic 全程不带 Authorization')
+    assertEqual(sink.deltas.join(''), '你好，来自 Anthropic', '增量照常透出')
+    assertEqual(summary.rawFinishReason, 'stop', '结束原因已归一化')
   })
 } finally {
   // ── 清理（顺序是硬要求：Model 先于 Provider；用户之前先删快照）──

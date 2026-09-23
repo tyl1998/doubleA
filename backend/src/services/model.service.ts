@@ -31,12 +31,24 @@
  *    两条都在服务层**前置检查**并给出可执行的 409 文案（`06` P0-1-10 落地要点）。
  *    P0-1-11 又在**模型**这一侧补了同族的三条守卫（同款思路：先查、说人话、别让 500 说话）：
  *    删除时有 Agent 引用 / 改 type 时有 Agent 引用 / 试图把模型迁到别的 Provider。
+ *
+ * **⑤ `protocol`（P0-1-37）在服务层的两条落点。**
+ *    · **创建**：`protocol` 缺省 = `DEFAULT_UPSTREAM_PROTOCOL`（默认值只在这一处补，
+ *      `shared` 的 schema 刻意不用 `.default()` —— 见那边的注释）；
+ *    · **修改**：`type` 与 `protocol` 的关系要在**服务层**判一次 —— 因为"只改 protocol、
+ *      不动 type"这条路在 schema 里看不到库里的 `type`（`protocolAllowedForType` 是唯一判据）。
+ *    ⚠️ 改 `protocol` **刻意不加"有模型就 409"的守卫**（与改 `type` 刻意相反，`02` §4.3）：
+ *      改 `type` 会留下自相矛盾的冗余数据，改 `protocol` 只换调用方式、不动任何数据形状 ——
+ *      而协议填错了本来就应该能改回来。
  */
 
 
 import {
   AppError,
+  DEFAULT_UPSTREAM_PROTOCOL,
+  EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
   maskApiKey,
+  protocolAllowedForType,
   type CreateModelBody,
   type CreateModelProviderBody,
   type ListAvailableModelsQuery,
@@ -49,6 +61,7 @@ import {
   type RemoteModelListResult,
   type UpdateModelBody,
   type UpdateModelProviderBody,
+  type UpstreamProtocol,
 } from '@doubulea/shared'
 
 import { decryptSecret, encryptSecret } from '../infra/crypto.js'
@@ -69,6 +82,7 @@ const PROVIDER_SELECT = {
   baseUrl: true,
   apiKeyEnc: true,
   type: true,
+  protocol: true,
   enabled: true,
   createdAt: true,
   updatedAt: true,
@@ -82,6 +96,7 @@ interface ProviderRow {
   baseUrl: string
   apiKeyEnc: string | null
   type: ModelProviderItem['type']
+  protocol: UpstreamProtocol
   enabled: boolean
   createdAt: Date
   updatedAt: Date
@@ -108,6 +123,7 @@ function toItem(row: ProviderRow): ModelProviderItem {
     name: row.name,
     baseUrl: row.baseUrl,
     type: row.type,
+    protocol: row.protocol,
     enabled: row.enabled,
     hasKey: row.apiKeyEnc !== null,
     apiKeyPreview: row.apiKeyEnc === null ? null : buildPreview(row.apiKeyEnc, row.id),
@@ -173,6 +189,9 @@ export async function listModelProviders(
 export async function createModelProvider(input: CreateModelProviderBody): Promise<ModelProviderItem> {
   const db = getPrisma()
   const apiKey = input.apiKey ?? undefined
+  // 默认值**只在这一处补**（`shared` 的 create schema 里 `protocol` 是 optional，故意不用
+  // `.default()` —— 用了会让 `z.infer` 与 `z.input` 分叉，`06` P0-1-11 踩过）
+  const protocol = input.protocol ?? DEFAULT_UPSTREAM_PROTOCOL
 
   const created = await db.$transaction(async (tx) => {
     const row = await tx.modelProvider.create({
@@ -180,7 +199,9 @@ export async function createModelProvider(input: CreateModelProviderBody): Promi
         name: input.name,
         baseUrl: input.baseUrl,
         type: input.type,
-        // 显式写出 enabled：DB 默认也是 true，但"新 Provider 默认启用"属于契约，不该藏在迁移里
+        // 显式写出 protocol/enabled：DB 默认也是这两值，但"新 Provider 默认走兼容协议、默认启用"
+        // 属于契约，不该藏在迁移里
+        protocol,
         enabled: input.enabled ?? true,
         apiKeyEnc: null,
       },
@@ -195,7 +216,13 @@ export async function createModelProvider(input: CreateModelProviderBody): Promi
   })
 
   getLogger().info(
-    { providerId: created.id, name: created.name, type: created.type, hasKey: apiKey !== undefined },
+    {
+      providerId: created.id,
+      name: created.name,
+      type: created.type,
+      protocol: created.protocol,
+      hasKey: apiKey !== undefined,
+    },
     '已创建模型 Provider（Key 已加密落库，明文不再出现）',
   )
   return toItem(created)
@@ -209,7 +236,13 @@ export async function createModelProvider(input: CreateModelProviderBody): Promi
  * `type` 又会静默改变"已绑定的 Agent 用的是哪类模型"。两条都不好，故**拒绝并要求先处理模型** ——
  * 显式报错比静默改数据强。
  *
+ * **`protocol` 的守卫只有一条**（P0-1-37）：合并后的 `(type, protocol)` 必须是合法组合
+ * （判据 = `shared` 的 `protocolAllowedForType`，只有一份）。⚠️ 「只改 protocol」这条路
+ * **在 schema 里判不了** —— 那里看不到库里的 `type` —— 所以必须在这里判。
+ * 其余刻意**不加**守卫：改 protocol 不动任何数据形状，填错了就该能改回来（与改 `type` 刻意相反）。
+ *
  * @throws {AppError} `NOT_FOUND`(404) 目标不存在 / `CONFLICT`(409) 有模型时改 type
+ *                    / `VALIDATION`(400) 合并后 type 与 protocol 冲突（字段级指向 `body.protocol`）
  */
 export async function updateModelProvider(
   id: string,
@@ -218,7 +251,7 @@ export async function updateModelProvider(
   const db = getPrisma()
   const target = await db.modelProvider.findUnique({
     where: { id },
-    select: { id: true, type: true, _count: { select: { models: true } } },
+    select: { id: true, type: true, protocol: true, _count: { select: { models: true } } },
   })
   if (target === null) throw AppError.notFound('Provider 不存在')
 
@@ -227,6 +260,17 @@ export async function updateModelProvider(
       `该 Provider 下已有 ${target._count.models} 个模型，不能改类型（模型类型与 Provider 类型必须一致）。` +
         '请先删除或迁走这些模型',
     )
+  }
+
+  /**
+   * 合并后判一次（用**库里**的 type × **请求里的** protocol，两边都可能缺省）。
+   * 与 `shared` 的 `updateModelProviderBodySchema#superRefine` 共用同一个纯函数判据，
+   * 那条 schema 只能覆盖"type 与 protocol 一起传且互相矛盾"的情形。
+   */
+  if (!protocolAllowedForType(input.type ?? target.type, input.protocol ?? target.protocol)) {
+    throw AppError.validation(EMBEDDING_PROTOCOL_CONFLICT_MESSAGE, {
+      fields: [{ path: 'body.protocol', message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE }],
+    })
   }
 
   // 三态落点：undefined = 不带这一列（Prisma 视作"不动"）；null = 显式清空；string = 写入密文
@@ -243,6 +287,7 @@ export async function updateModelProvider(
         ...(input.name === undefined ? {} : { name: input.name }),
         ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
         ...(input.type === undefined ? {} : { type: input.type }),
+        ...(input.protocol === undefined ? {} : { protocol: input.protocol }),
         ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
         ...apiKeyData,
       },
@@ -261,6 +306,7 @@ export async function updateModelProvider(
       keyAction: input.apiKey === undefined ? 'untouched' : input.apiKey === null ? 'cleared' : 'replaced',
       enabled: input.enabled,
       type: input.type,
+      protocol: input.protocol,
     },
     '已更新模型 Provider',
   )
@@ -664,19 +710,24 @@ export async function removeModel(id: string): Promise<{ id: string; modelName: 
  * {@link LlmTarget.apiKey}（仅内存）。与 {@link providerKeyAad} 一样，
  * 把"怎么解密、失败怎么办"收在一处，避免将来有第二个人再写一遍（写错就是 401 排查半天）。
  */
-async function readProviderCredential(providerId: string): Promise<{ providerName: string; baseUrl: string; apiKey: string | null }> {
+async function readProviderCredential(
+  providerId: string,
+): Promise<{ providerName: string; baseUrl: string; apiKey: string | null; protocol: UpstreamProtocol }> {
   const db = getPrisma()
   const row = await db.modelProvider.findUnique({
     where: { id: providerId },
-    select: { name: true, baseUrl: true, apiKeyEnc: true },
+    select: { name: true, baseUrl: true, apiKeyEnc: true, protocol: true },
   })
   if (row === null) throw AppError.notFound('Provider 不存在')
-  if (row.apiKeyEnc === null) return { providerName: row.name, baseUrl: row.baseUrl, apiKey: null }
+  if (row.apiKeyEnc === null) {
+    return { providerName: row.name, baseUrl: row.baseUrl, apiKey: null, protocol: row.protocol }
+  }
   try {
     return {
       providerName: row.name,
       baseUrl: row.baseUrl,
       apiKey: decryptSecret(row.apiKeyEnc, providerKeyAad(providerId)),
+      protocol: row.protocol,
     }
   } catch (error) {
     // 与列表页的降级不同：这里**不能**降级成"没配 Key" —— 那会让调用方以为"换个能用的
@@ -719,7 +770,7 @@ export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
       maxContext: true,
       supportsVision: true,
       providerId: true,
-      provider: { select: { name: true, baseUrl: true, enabled: true } },
+      provider: { select: { name: true, baseUrl: true, enabled: true, protocol: true } },
     },
   })
   if (row === null) throw AppError.notFound('模型不存在')
@@ -751,6 +802,9 @@ export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
     supportsVision: row.supportsVision,
     providerId: row.providerId,
     providerName: row.provider.name,
+    // 上游协议来自 **Provider**（不是模型）：同一 Provider 下所有模型走同一种协议
+    // （`02` §4.3：`protocol` 定义在 `model_providers` 上）
+    protocol: row.provider.protocol,
     baseUrl: row.provider.baseUrl,
     apiKey: credential.apiKey,
   }
@@ -769,8 +823,10 @@ export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
  *   ① **不要求 Provider 启用**：这正是用来诊断"这个 Provider 还能不能连上"的动作，
  *      停用了反而更需要探（比如换 Key 后先探一次再启用）；
  *   ② **不要求配 Key**：`GET /models` 在许多自建/内网实现上是免鉴权的，本地 vLLM /
- *      llama.cpp / ollama 的兼容层都属此类。没配就不带 `Authorization` 头去探，
+ *      llama.cpp / ollama 的兼容层都属此类。没配就不带鉴权头去探，
  *      能不能成由上游决定 —— 这样"用不了"与"不支持列表"能被区分开。
+ *      ⚠️ P0-1-37：Anthropic 协议下该端点要的是 `x-api-key`（且不能带 `Authorization`），
+ *      所以头由 `llm/protocol.ts` 按 `credential.protocol` 出，这里不再自己拼。
  *
  * @throws {AppError} `NOT_FOUND`(404) Provider 不存在 / `INTERNAL`(500) Key 解密失败
  *                    / `UPSTREAM_ERROR`(502)、`UPSTREAM_TIMEOUT`(504) 见 `llm/client.ts`
@@ -779,7 +835,14 @@ export async function listProviderRemoteModels(providerId: string): Promise<Remo
   const credential = await readProviderCredential(providerId)
   const result = await fetchRemoteModels(credential)
   getLogger().info(
-    { providerId, providerName: credential.providerName, total: result.total, truncated: result.truncated, hasKey: credential.apiKey !== null },
+    {
+      providerId,
+      providerName: credential.providerName,
+      protocol: credential.protocol,
+      total: result.total,
+      truncated: result.truncated,
+      hasKey: credential.apiKey !== null,
+    },
     '已拉取上游模型列表',
   )
   return {

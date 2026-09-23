@@ -32,7 +32,14 @@
  */
 
 import { Alert, Button, Checkbox, Input, Popconfirm, Select, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
-import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem, type ModelType } from '@doubulea/shared'
+import {
+  MODEL_TYPES,
+  MODEL_TYPE_LABELS,
+  UPSTREAM_PROTOCOL_LABELS,
+  type ModelItem,
+  type ModelProviderItem,
+  type ModelType,
+} from '@doubulea/shared'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
@@ -65,8 +72,12 @@ const TYPE_FILTER_OPTIONS = [
 
 export function ModelsPage() {
   const feedback = useFeedback()
-  const providersQuery = useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)
-  const modelsQuery = useAdminModels(MODEL_POOL_PAGE_LIMIT_MAX)
+  // ⚠️ 只传 `limit`、**不传 `offset`**（默认 0，一次取满、筛选全在客户端）。
+  //    这里曾经写成 `useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)` —— 在位置参数签名下
+  //    那个 100 落进了 `offset`，页面因此把 3 个 Provider / 2 个模型全当成"没有"。
+  //    签名已改成对象参数，这类错位现在编译期就会报错（见 `api/modelPool.ts#ListModelPoolParams`）。
+  const providersQuery = useModelProviders({ limit: MODEL_POOL_PAGE_LIMIT_MAX })
+  const modelsQuery = useAdminModels({ limit: MODEL_POOL_PAGE_LIMIT_MAX })
   const removeModel = useRemoveModel()
 
   const [creatingProvider, setCreatingProvider] = useState(false)
@@ -128,6 +139,23 @@ export function ModelsPage() {
       dataIndex: 'type',
       width: 90,
       render: (_, provider) => <Tag>{MODEL_TYPE_LABELS[provider.type]}</Tag>,
+    },
+    {
+      // P0-1-37：协议与类型是**两个维度**（同为对话，可以是兼容/Responses/Anthropic），
+      // 所以单独一列，而不是塞进「类型」那个 Tag 里 —— 合在一处就没法按协议扫一眼排查
+      title: '上游协议',
+      dataIndex: 'protocol',
+      width: 160,
+      render: (_, provider) => (
+        <div className="kb-cell">
+          <span>{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}</span>
+          {provider.protocol !== 'OPENAI_COMPAT' && (
+            <span className="kb-cell__sub">
+              {provider.protocol === 'ANTHROPIC_MESSAGES' ? 'x-api-key' : '/responses'}
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       title: 'API Key',

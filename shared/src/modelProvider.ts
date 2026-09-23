@@ -37,6 +37,64 @@ export const MODEL_TYPE_LABELS: Readonly<Record<ModelType, string>> = {
   EMBEDDING: '向量',
 }
 
+// ───────────────────────── 上游协议（P0-1-37） ─────────────────────────
+
+/**
+ * **上游协议**：这个 Provider 的上游"怎么说话"（`docs/02` §6.1 的三协议映射表）。
+ *
+ * ⚠️ 与 {@link MODEL_TYPES} 是**两件事**：`type` 是**用途**（对话 / 向量），协议是**报文形状**。
+ * 同一个用途可以有多种协议（对话可以是 OpenAI 兼容、OpenAI Responses、Anthropic 原生），
+ * 而向量只有一条路（见 {@link DEFAULT_UPSTREAM_PROTOCOL}）。
+ *
+ * 与 `schema.prisma` 的 `enum UpstreamProtocol` **逐字一致**。
+ */
+export const UPSTREAM_PROTOCOLS = ['OPENAI_COMPAT', 'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES'] as const
+export type UpstreamProtocol = (typeof UPSTREAM_PROTOCOLS)[number]
+
+/** 协议的中文名（管理页列、下拉、错误文案共用一处） */
+export const UPSTREAM_PROTOCOL_LABELS: Readonly<Record<UpstreamProtocol, string>> = {
+  OPENAI_COMPAT: 'OpenAI 兼容',
+  OPENAI_RESPONSES: 'OpenAI Responses',
+  ANTHROPIC_MESSAGES: 'Anthropic Messages',
+}
+
+/**
+ * 每个协议该往 `baseUrl` 里填什么。
+ *
+ * 三条都要求"**填到版本段为止**"（如 `…/v1`）—— 这是最常填错的一处：把
+ * `https://api.anthropic.com/v1/messages` 整条粘进 baseUrl 会拼成
+ * `…/v1/messages/messages` ⇒ 404，而 404 的文案只会说"请检查 baseUrl 是否包含正确的版本段"。
+ */
+export const UPSTREAM_PROTOCOL_BASE_URL_HINTS: Readonly<Record<UpstreamProtocol, string>> = {
+  OPENAI_COMPAT: '如 https://api.openai.com/v1 —— 填到版本段为止（后端会拼 /chat/completions）',
+  OPENAI_RESPONSES: '如 https://api.openai.com/v1 —— 填到版本段为止（后端会拼 /responses）',
+  ANTHROPIC_MESSAGES: '如 https://api.anthropic.com/v1 —— 填到版本段为止（后端会拼 /messages）',
+}
+
+/**
+ * **默认协议**，同时也是**向量（embedding）唯一允许**的协议。
+ *
+ * 两个用途合成一个常量是刻意的 —— 它们本来就是同一个事实："OpenAI 兼容"是这个系统
+ * 既有的、也是最普遍可用的那一条路（P0-1-37 之前**全部**流量都走它，所以它天然是默认值；
+ * 而 `02` §八 规定 embedding 只有 `/embeddings` 一条路，所以它也是向量侧的唯一解）。
+ * 拆成两个常量会让"默认协议改了、但向量白名单没跟着改"变成一个静默的不一致。
+ */
+export const DEFAULT_UPSTREAM_PROTOCOL: UpstreamProtocol = 'OPENAI_COMPAT'
+
+/**
+ * 「向量 Provider 只能配默认协议」这一条判据的**唯一实现**（schema 与 service 共用）。
+ *
+ * ⚠️ 写成纯函数而不是两处各写一遍 `type === 'EMBEDDING' && protocol !== …`：
+ * 建与改两条路径都要判它，而**改**那条只能拿"库里的 type + 请求里的 protocol"合并后再判
+ * （请求里可能一个字段都没带）⇒ 判据必须能被两处用**不同入参**调用。
+ */
+export function protocolAllowedForType(type: ModelType, protocol: UpstreamProtocol): boolean {
+  return type !== 'EMBEDDING' || protocol === DEFAULT_UPSTREAM_PROTOCOL
+}
+
+/** 上一条的中文说明（400 的字段级文案与前端提示共用） */
+export const EMBEDDING_PROTOCOL_CONFLICT_MESSAGE = `向量类型的 Provider 只能用 ${DEFAULT_UPSTREAM_PROTOCOL} 协议（embedding 只有 OpenAI 兼容一条路）`
+
 /**
  * 掩码低于这个长度就**只露尾巴**。
  *
@@ -78,6 +136,11 @@ export const modelProviderItemSchema = z.object({
   /** 已去掉尾部斜杠（拼接 `/chat/completions` 时不会出现 `//`，见 {@link providerBaseUrlSchema}） */
   baseUrl: z.string(),
   type: z.enum(MODEL_TYPES),
+  /**
+   * 上游协议（P0-1-37）。⚠️ 与 `type` 是两件事：这个是"**怎么说话**"，`type` 是"**干什么用**"。
+   * 管理页把它当一列显示（改错协议的症状是"一发消息就 404/401"）。
+   */
+  protocol: z.enum(UPSTREAM_PROTOCOLS),
   enabled: z.boolean(),
   /** 是否已配置 Key。**只有布尔**，不泄露长度等元信息 */
   hasKey: z.boolean(),
@@ -161,10 +224,37 @@ export const createModelProviderBodySchema = z.object({
     .max(128, '名称最多 128 个字符'),
   baseUrl: providerBaseUrlSchema,
   type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
+  /**
+   * 上游协议；**缺省即 {@link DEFAULT_UPSTREAM_PROTOCOL}**（= P0-1-37 之前的所有行为）。
+   *
+   * ⚠️ 这里用 `.optional()` 而**不是** `.default()`：与 `update` 保持同一口径，
+   * 默认值只在**服务层**补一处（`?? DEFAULT_UPSTREAM_PROTOCOL`）。用 `.default()` 会让
+   * `z.infer` 变成 required、`z.input` 变成 optional —— 同一个字段两套类型，
+   * 服务层读到的类型与运行时不一致（`06` P0-1-24 那类"看着对、其实对不上"的坑）。
+   */
+  protocol: z
+    .enum(UPSTREAM_PROTOCOLS, {
+      errorMap: () => ({ message: `protocol 只能是 ${UPSTREAM_PROTOCOLS.join('/')}` }),
+    })
+    .optional(),
   enabled: z.boolean().optional(),
   /** 可缺省（先建 Provider 后配 Key 是正常流程）。`null` 与缺省同义：不配置 Key */
   apiKey: providerApiKeySchema.nullish(),
 })
+  /**
+   * ⚠️ 用 `superRefine` 而不是 `.refine()`：后者失败时 `path` 是**空串**，
+   * 前端没法把错误挂到 `protocol` 那个下拉上（`06` P0-1-24 的教训）。
+   */
+  .superRefine((body, ctx) => {
+    // 缺省按默认协议判（与 service 层补的默认值同一口径）
+    if (!protocolAllowedForType(body.type, body.protocol ?? DEFAULT_UPSTREAM_PROTOCOL)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['protocol'],
+        message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
+      })
+    }
+  })
 export type CreateModelProviderBody = z.infer<typeof createModelProviderBodySchema>
 
 // ───────────────────────────── 改（三态） ─────────────────────────────
@@ -191,6 +281,16 @@ export const updateModelProviderBodySchema = z
     type: z
       .enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) })
       .optional(),
+    /**
+     * 上游协议（P0-1-37）。**三态与 `apiKey` 不同**：这里没有"清空"这个概念
+     * （协议总得有一个值），所以只有"不带 = 不动"与"给值 = 改成它"两态。
+     * ⚠️ 正因为如此，**绝不能加 `.default()`** —— 那会把"改个名字"顺手改成默认协议。
+     */
+    protocol: z
+      .enum(UPSTREAM_PROTOCOLS, {
+        errorMap: () => ({ message: `protocol 只能是 ${UPSTREAM_PROTOCOLS.join('/')}` }),
+      })
+      .optional(),
     enabled: z.boolean().optional(),
     /**
      * ⚠️ 这里必须是 `.nullable().optional()`（**不能**用 `.nullish()` 之外的简化写法，
@@ -203,12 +303,31 @@ export const updateModelProviderBodySchema = z
       body.name !== undefined ||
       body.baseUrl !== undefined ||
       body.type !== undefined ||
+      body.protocol !== undefined ||
       body.enabled !== undefined ||
       // `apiKey: null`（清空）在这里也判为 true —— `null !== undefined`，正是想要的效果；
       // 只有"整个字段缺席"（undefined）才算没给。
       body.apiKey !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
+  /**
+   * ⚠️ 这里**只能**判"请求里同时给了 `type=EMBEDDING` 与一个非默认协议"这一种情况。
+   * 「库里的 type 是 EMBEDDING、而这次只改 protocol」拿不到库值 ⇒ 必须在**服务层**判
+   * （那里才查得到这一行）。两处共用 {@link protocolAllowedForType}，判据只有一份。
+   */
+  .superRefine((body, ctx) => {
+    if (
+      body.type !== undefined &&
+      body.protocol !== undefined &&
+      !protocolAllowedForType(body.type, body.protocol)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['protocol'],
+        message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
+      })
+    }
+  })
 export type UpdateModelProviderBody = z.infer<typeof updateModelProviderBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */

@@ -50,6 +50,16 @@ export function fetchAdminUsers(offset = 0, limit = ADMIN_USERS_PAGE_LIMIT_MAX):
 }
 
 /**
+ * 列表查询参数。⚠️ 与 `api/agents.ts#ListAgentsParams`、`api/modelPool.ts#ListModelPoolParams`
+ * 同款**对象参数**：`offset` 与 `limit` 都是 `number`，位置参数下"只传想传的那个"必然错位
+ *（模型池就因此真出过一次事故，见 `modelPool.ts` 里那段说明）。
+ */
+export interface ListAdminUsersParams {
+  offset?: number
+  limit?: number
+}
+
+/**
  * 用户列表。
  *
  * 排序由后端定（`username asc, id asc`，`02` §4.2）—— 前端**不再排一次**：分页要的是稳定
@@ -58,7 +68,9 @@ export function fetchAdminUsers(offset = 0, limit = ADMIN_USERS_PAGE_LIMIT_MAX):
  * `placeholderData: keepPreviousData` 的理由同知识库文档表：写操作后失效重取时不要让
  * 表格闪成骨架屏（用户刚点完"停用"，正盯着那一行看结果）。
  */
-export function useAdminUsers(offset = 0, limit = ADMIN_USERS_PAGE_LIMIT_MAX) {
+export function useAdminUsers(params: ListAdminUsersParams = {}) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? ADMIN_USERS_PAGE_LIMIT_MAX
   return useQuery({
     queryKey: [...ADMIN_USERS_QUERY_KEY, offset, limit] as const,
     queryFn: () => fetchAdminUsers(offset, limit),

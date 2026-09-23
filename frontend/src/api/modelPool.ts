@@ -67,6 +67,24 @@ export const ADMIN_MODELS_QUERY_KEY = ['admin', 'models'] as const
 export const MODEL_POOL_PAGE_LIMIT_MAX = 100
 
 /**
+ * 两个列表 hook 的查询参数。
+ *
+ * ⚠️ **刻意用对象参数，不用 `(offset, limit)` 两个位置参数** —— 与 `api/agents.ts#ListAgentsParams`
+ * 同款，这是本仓列表 hook 的统一口径。
+ *
+ * 理由是一次真事故：`offset` 与 `limit` 都是 `number`，位置参数下
+ * `useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)`（本意"取满 100 条"）会被读成
+ * `offset=100, limit=100`。后端对 `offset` 只有 `min(0)`、**没有上限**，于是它安静地返回
+ * `{ items: [], total: 3, offset: 100, limit: 100 }`：页面上 Provider 区与模型区双双变成
+ * 「还没有 Provider」空状态，而同一屏的头部却写着"共 3 个"。**请求 200、无报错、Network 面板
+ * 全绿** —— 光看日志与状态码完全发现不了。对象参数把这类错位挪到**编译期**报错。
+ */
+export interface ListModelPoolParams {
+  offset?: number
+  limit?: number
+}
+
+/**
  * 模型池写操作后统一失效的三个视图（见文件头 ③）。
  *
  * 抽成一个函数而不是在八个 mutation 里各写一遍：漏掉 `['models','available','CHAT']` 的
@@ -86,7 +104,9 @@ export function fetchModelProviders(offset = 0, limit = MODEL_POOL_PAGE_LIMIT_MA
 }
 
 /** Provider 列表（排序由后端定：`createdAt asc, id asc`，前端不再排一次） */
-export function useModelProviders(offset = 0, limit = MODEL_POOL_PAGE_LIMIT_MAX) {
+export function useModelProviders(params: ListModelPoolParams = {}) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? MODEL_POOL_PAGE_LIMIT_MAX
   return useQuery({
     queryKey: [...MODEL_PROVIDERS_QUERY_KEY, offset, limit] as const,
     queryFn: () => fetchModelProviders(offset, limit),
@@ -163,7 +183,9 @@ export function fetchAdminModels(offset = 0, limit = MODEL_POOL_PAGE_LIMIT_MAX):
  * 筛选全在客户端做（一次取满 100 条），理由与知识库列表同款 —— "服务端筛选 + 客户端筛选"
  * 会让后者只作用于当前页，那是**看着像坏了**的行为。超过 100 个模型时页脚如实提示。
  */
-export function useAdminModels(offset = 0, limit = MODEL_POOL_PAGE_LIMIT_MAX) {
+export function useAdminModels(params: ListModelPoolParams = {}) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? MODEL_POOL_PAGE_LIMIT_MAX
   return useQuery({
     queryKey: [...ADMIN_MODELS_QUERY_KEY, offset, limit] as const,
     queryFn: () => fetchAdminModels(offset, limit),

@@ -56,8 +56,14 @@ export function describeEndpoint(endpoint: UpstreamEndpoint): Record<string, unk
   return { ...base, ...(endpoint.logFields ?? {}) }
 }
 
-/** 消息里的"上游 / 主语"拼法（`/models` 一类没有主语的请求只写上游名） */
-function describeForMessage(endpoint: UpstreamEndpoint): string {
+/**
+ * 消息里的"上游 / 主语"拼法（`/models` 一类没有主语的请求只写上游名）。
+ *
+ * P0-1-37 起导出：`llm/protocol.ts` 的协议钩子也要拼同一句文案（`上游 / 模型`），
+ * 复制一份就会有两处文案漂移的可能 —— 那是排查时最讨厌的一种不一致。
+ * 入参刻意收窄成"只用到的那两个字段"：协议钩子手里只有 Provider 名与模型名（没有 baseUrl）。
+ */
+export function describeForMessage(endpoint: Pick<UpstreamEndpoint, 'providerName' | 'subject'>): string {
   return endpoint.subject === undefined
     ? endpoint.providerName
     : `${endpoint.providerName} / ${endpoint.subject}`
@@ -260,6 +266,15 @@ export interface UpstreamJsonRequest {
   /** 有 body 才会写 `content-type` 并自动 `POST` 序列化 */
   body?: unknown
   accept?: string
+  /**
+   * 请求头**整体覆盖**（P0-1-37）。缺省 = {@link upstreamHeaders}（OpenAI 的 `Bearer` 形状）。
+   *
+   * 为什么是"覆盖"而不是"合并"：三协议里只有 OpenAI 系用 `Bearer`，Anthropic 要的是
+   * `x-api-key` + `anthropic-version` 且**不能**带 `Authorization`（部分网关见到就 400）。
+   * 合并语义下"默认头该不该发"要先知道对方是哪个协议 —— 那等于把协议知识塞回本文件，
+   * 而本文件的定位恰恰是"不认识协议"（见文件头）。构造头的那一份实现在 `llm/protocol.ts`。
+   */
+  headers?: Record<string, string>
   /** 「到响应头 + 读 body」的总上限（报文都很小，不必分两段计时） */
   timeoutMs: number
   abortSignal?: AbortSignal
@@ -289,7 +304,9 @@ export async function fetchUpstreamJson(
     deadline.arm(request.timeoutMs, '首次响应（到响应头）')
     response = await fetch(`${endpoint.baseUrl}${request.path}`, {
       method: request.method ?? 'POST',
-      headers: upstreamHeaders(endpoint, { accept: request.accept, json: request.body !== undefined }),
+      headers:
+        request.headers ??
+        upstreamHeaders(endpoint, { accept: request.accept, json: request.body !== undefined }),
       body: request.body === undefined ? undefined : JSON.stringify(request.body),
       signal: deadline.signal,
     })
