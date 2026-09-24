@@ -28,10 +28,16 @@
  * ─────────────────────────────────────────────────────────────────────
  *   GET    /            列表 → `{items,total,offset,limit}`
  *   POST   /            注册 → `{server,test}`（裸 item + 一次 best-effort 探测结果，**不是 201**）
- *   PATCH  /:id         改   → 裸 `McpServerItem`
+ *   PATCH  /:id         改   → **`{server,credentialSchemaImpact}`**（P0-2-3 加的复合响应）
  *   DELETE /:id         删   → `{id,name}`
  *   POST   /:id/test    测试 → **恒 200** + `{ok,tools}` / `{ok,error}`
  *   GET    /:id/tools   工具 → 裸 `{tools,fetchedAt,cached}`（本批纯读缓存）
+ *
+ * ⚠️ **`PATCH` 的回包在 P0-2-3 变过一次**（原先是裸 item）：模板变更要带回一条"本次请求特有"的
+ * 提示（`credentialSchemaImpact`），而进 item 就破了"全端点唯一形状"（P0-2-2 定案 ② 的同一条
+ * 理由）⇒ 走 `{server, credentialSchemaImpact}` 这条复合响应的路，与 `POST /` 的 `{server,test}` 同族。
+ * `credentialSchemaImpact` 为 `null` = 本次没有需要提示的影响（没提交模板 / 提交了但等价），
+ * 且**它只提示、绝不自动删任何已存凭据**（P0-2-3 坑预判 2）。
  *
  * ⚠️ 凭据那三条（`/api/mcp/credentials**`）**属 P0-2-4**，**不要顺手补**：
  * 它们的收窄不在角色上而在 `user_id` 上（只能动自己的），且要有 `mcp_credentials` 表。
@@ -93,7 +99,13 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
     async (request) => ok(await createMcpServer(request.body, viewerOf(request))),
   )
 
-  /** 部分更新（登录即可）。`OAUTH` 400；注册信息变更 ⇒ 清工具缓存（语义在服务层收口） */
+  /**
+ * 部分更新（登录即可）。三条闸门的位置要点：
+ *   · `OAUTH` 400 与**模板深度校验**（P0-2-3）都在**路由级 schema** 上 ⇒ 校验失败时
+ *     服务层根本不会被调用（"先校验、后写库"这条在框架层就成立了）；
+ *   · 注册信息变更 ⇒ 清工具缓存，语义在服务层收口；
+ *   · 模板变更 ⇒ 回包里带 `credentialSchemaImpact`（**只提示、不删任何已存凭据**）。
+ */
   app.patch<{ Params: McpServerIdParams; Body: UpdateMcpServerBody }>(
     '/api/mcp/servers/:id',
     {

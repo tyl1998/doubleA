@@ -10,9 +10,10 @@
  * 与 `chat-upstream.mjs` / `embedding-upstream.mjs` 同一条理由（`06` 第五档）：凭据、
  * 网络、第三方版本变更都是噪声，而"**我们发出去的报文对不对**"反而验不到。
  * 这里起一个**真的 HTTP 服务**（`http.createServer` + 端口 0）按 MCP 协议应答，
- * 并把**每个请求原样记下来**（method / path / 五个关键头 / body）——
+ * 并把**每个请求原样记下来**（method / path / 查询串 / 五个关键头 / 全部头名 / body）——
  * 于是"握手发没发 initialize""`mcp-protocol-version` 带没带""Accept 是不是双形态"
- * 这类问题都能在**上游侧取证**，而不是靠读代码猜。
+ * "凭据到底注到了哪一层（头 / 查询串 / 报文体）"这类问题都能在**上游侧取证**，
+ * 而不是靠读代码猜。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 它刻意支持的三件事（少一件就有需求验不了）
@@ -175,12 +176,23 @@ export async function startFakeMcpServer(options = {}) {
     const entry = {
       method: req.method,
       path: url.pathname,
+      /**
+       * 查询串（解析成对象，无参数时为 `{}`）。
+       * 用途：P0-2-3 的 H 组探针要验"QUERY 注入到底有没有真的上到线上"——
+       * 只看客户端代码是看不出自定义 `fetch` 有没有改 URL 的。
+       */
+      query: Object.fromEntries(url.searchParams),
       /** 三个必验的头 + 两个可验的头（`Accept` 的双形态是 Streamable HTTP 的硬要求） */
       accept: req.headers.accept ?? null,
       contentType: req.headers['content-type'] ?? null,
       protocolVersion: req.headers['mcp-protocol-version'] ?? null,
       sessionId: req.headers['mcp-session-id'] ?? null,
       lastEventId: req.headers['last-event-id'] ?? null,
+      /**
+       * 收到**全部**头名（小写）。用途同 `query`：HEADER 注入的取证点。
+       * 与上面五个"点名的头"分开：那五个是断言用的，这个是"有没有多出东西"用的。
+       */
+      headerNames: Object.keys(req.headers),
       body: parseBody(raw),
       /** 这一条是用什么形态回的（`json` / `sse` / `error:*` / `raw` / `terminate`） */
       responded: null,

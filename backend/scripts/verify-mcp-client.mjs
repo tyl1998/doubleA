@@ -20,6 +20,10 @@
  *   门槛 4 → D 组（DNS / 连接被拒 / 非 MCP 端点；且消息里没有凭据）
  *   门槛 5 → A 组（假上游侧取证：initialize / 版本头 / Accept 双形态）
  *
+ * 另有一组**不属于上面五条门槛**的用例：**H 组**（P0-2-3 坑预判 1 的探针）——
+ * 它问"凭据注到报文的哪一层才安全"，以及 P0-2-7 拿什么去注入。放在这里的理由：
+ * 它验的对象是 **SDK 的 transport 行为**，与本档同源（不需要 PG / Redis）。
+ *
  * ⚠️ 口径：这是**夹具假上游**档 —— 只证明"契约与配置接对了"，
  *    **不等于**"真 MCP 服务那边一定对"（对方的实现差异、认证方式、限流都不在本档范围内）。
  *
@@ -41,6 +45,9 @@ const { McpAbortError, SUPPORTED_PROTOCOL_VERSIONS } = await import(
 )
 const { config } = await import('../dist/backend/src/config.js')
 const { LATEST_PROTOCOL_VERSION } = await import('@modelcontextprotocol/sdk/types.js')
+// H 组（P0-2-3 探针）用：直接拿 SDK 的 Client + transport，验证"自定义 fetch"这个注入钩子
+const { Client } = await import('@modelcontextprotocol/sdk/client/index.js')
+const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js')
 
 // ───────────────────────────── 断言脚手架（与另几个脚本同一套）─────────────────────────────
 
@@ -660,6 +667,185 @@ await it('G3 超时默认值真的来自配置（不是写死的常量）', asyn
     } finally {
       await client.close()
     }
+  })
+})
+
+// ─────────────────────── H 组 · P0-2-3 探针：凭据注到了哪一层 ───────────────────────
+
+/**
+ * ⚠️ 本组**不属于 P0-2-1 的五条门槛**（所以编号是 H 而不是接着 G）。
+ * 它是 P0-2-3 的坑预判 1 —— `inject: 'BODY'` 与 JSON-RPC 报文天然冲突 —— 的**取证**。
+ *
+ * 要回答三个问题（结论回写 `docs/02` §九 + `issue_fix/问题记录-P0-2-3-*.md`）：
+ *   ① "顶层额外字段"服务端认不认？（H1）
+ *   ② 凭据塞进 `params` 会怎样？（H2）
+ *   ③ 与 `jsonrpc`/`id`/`method`/`params` 撞名为啥要拒？（H3）
+ * 外加一条工程结论：**P0-2-7 拿什么去注入**（H4）。
+ */
+group('H 组 · P0-2-3 探针：BODY 注入与 JSON-RPC 报文')
+
+/**
+ * 裸 POST 一条 JSON-RPC 报文 —— 刻意绕开 SDK。
+ *
+ * 为什么不用 `McpClient`：本组问的是"**协议线上**，多出来的字段会怎样"，而 SDK 的
+ * `callTool(params, resultSchema?, options?)` 根本没有"往报文里加顶层字段"的参数
+ * （这本身就是 H4 要证的结论）。只能用裸 `fetch` 把报文亲手写出来。
+ */
+async function rawRpc(server, body, sessionId) {
+  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
+  if (sessionId !== undefined && sessionId !== null) headers['mcp-session-id'] = sessionId
+  const response = await fetch(server.url, { method: 'POST', headers, body: JSON.stringify(body) })
+  const text = await response.text()
+  return {
+    status: response.status,
+    sessionId: response.headers.get('mcp-session-id'),
+    json: text === '' ? null : JSON.parse(text),
+  }
+}
+
+/** 裸握手一次，拿回会话 id（`initialize` 之外的请求都要求带上，见夹具坑预判 2） */
+async function rawHandshake(server) {
+  const { sessionId } = await rawRpc(server, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'probe', version: '0' } },
+  })
+  assert(typeof sessionId === 'string' && sessionId.length > 0, 'initialize 应签发会话 id')
+  return sessionId
+}
+
+/** `tools/call` 结果里的正文（第一块文本） */
+const callText = (json) => json?.result?.content?.[0]?.text ?? null
+
+await it('H1 非保留的顶层额外字段能到达服务端，且完全不影响这次调用 ⇒ BODY 注入在协议线上可行', async () => {
+  await withServer({}, async (server) => {
+    const sid = await rawHandshake(server)
+    const { status, json } = await rawRpc(
+      server,
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: { text: 'hi' } },
+        // 这就是"凭据注到顶层"的样子：服务端不认识的顶层字段不影响 JSON-RPC 解析
+        'x-credential': 'TOP-SECRET',
+      },
+      sid,
+    )
+    assertEqual(status, 200, 'HTTP 状态')
+    assertEqual(callText(json), 'echo: {"text":"hi"}', '调用结果应与没注入时一模一样')
+    const call = requestsFor(server, 'tools/call').at(-1)
+    assertEqual(firstMessage(call)['x-credential'], 'TOP-SECRET', '服务端应收到这个顶层字段')
+    assertEqual(firstMessage(call).params.arguments.text, 'hi', '`params` 不该被搅动')
+    return '顶层 = BODY 注入唯一安全的落点'
+  })
+})
+
+await it('H2 塞进 `params.arguments` 会污染工具入参；塞成 `params` 的兄弟键则凭据根本没被用上', async () => {
+  await withServer({}, async (server) => {
+    const sid = await rawHandshake(server)
+
+    // 2a：进 `params.arguments` ⇒ 混进工具自己的参数里（echo 把它一起回显了）
+    const inArgs = await rawRpc(
+      server,
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: { text: 'hi', credential: 'ARG-SECRET' } },
+      },
+      sid,
+    )
+    assertEqual(
+      callText(inArgs.json),
+      'echo: {"text":"hi","credential":"ARG-SECRET"}',
+      '凭据混进了工具入参 —— 这就是"污染工具参数"',
+    )
+
+    // 2b：`params.credential`（与 name/arguments 平级）⇒ 夹具不读它
+    const sibling = await rawRpc(
+      server,
+      {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: { text: 'hi' }, credential: 'SIBLING-SECRET' },
+      },
+      sid,
+    )
+    assertEqual(callText(sibling.json), 'echo: {"text":"hi"}', '兄弟键不会进工具入参')
+    return '两条都不可用：一条污染入参、一条等于白注'
+  })
+})
+
+await it('H3 与四个 JSON-RPC 顶层键撞名会改掉报文语义 ⇒ 模板层必须拒掉这四个键', async () => {
+  await withServer({}, async (server) => {
+    const sid = await rawHandshake(server)
+
+    // 撞 `method`：这次"调用"变成了另一次调用（服务端按新方法处理）
+    const byMethod = await rawRpc(
+      server,
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: { name: 'echo', arguments: { text: 'hi' } } },
+      sid,
+    )
+    assert(Array.isArray(byMethod.json.result?.tools), '撞 method 后服务端回了工具列表 —— 已经不是那次调用了')
+
+    // 撞 `params`：工具名与入参一起丢
+    const byParams = await rawRpc(
+      server,
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { credential: 'X' } },
+      sid,
+    )
+    assertEqual(byParams.json.error?.code, -32602, '撞 params 后工具名丢了 ⇒ 服务端回"未知工具"')
+
+    // 撞 `id`：凭据值顶掉了报文 id，响应原样把它带回来（关联被毁 **且** 凭据被回显到线上）
+    const byId = await rawRpc(
+      server,
+      { jsonrpc: '2.0', id: 'ID-SECRET', method: 'tools/call', params: { name: 'echo', arguments: { text: 'hi' } } },
+      sid,
+    )
+    assertEqual(byId.json.id, 'ID-SECRET', '响应 id 被顶成了凭据值')
+
+    return 'jsonrpc / id / method / params 一个都不能给（`jsonrpc` 夹具不校验，同理）'
+  })
+})
+
+await it('H4 真 SDK 路径：transport 的 `fetch` 选项能改 URL / 头 / 报文体 ⇒ P0-2-7 的干净口子', async () => {
+  await withServer({}, async (server) => {
+    // 一个"注入中间件"：把三处该注的东西都注上，再用真 fetch 打出去
+    const injectFetch = async (input, init) => {
+      const url = new URL(String(input))
+      url.searchParams.set('probeQuery', 'QUERY-SECRET')
+      const headers = new Headers(init?.headers)
+      headers.set('x-probe-header', 'HEADER-SECRET')
+      let body = init?.body
+      if (typeof body === 'string') {
+        const parsed = JSON.parse(body)
+        for (const message of Array.isArray(parsed) ? parsed : [parsed]) message.probeBody = 'BODY-SECRET'
+        body = JSON.stringify(parsed)
+      }
+      return fetch(url, { ...init, headers, body })
+    }
+
+    const transport = new StreamableHTTPClientTransport(new URL(server.url), { fetch: injectFetch })
+    const client = new Client({ name: 'probe', version: '0' }, { capabilities: {} })
+    await client.connect(transport)
+    let text
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: { text: 'sdk' } })
+      text = result.content?.[0]?.text ?? null
+    } finally {
+      await transport.terminateSession().catch(() => undefined)
+      await client.close().catch(() => undefined)
+    }
+
+    assertEqual(text, 'echo: {"text":"sdk"}', '注入后调用仍应正常')
+    const call = requestsFor(server, 'tools/call').at(-1)
+    assertEqual(firstMessage(call).probeBody, 'BODY-SECRET', '报文体被改写（BODY 注入）')
+    assertEqual(call.query.probeQuery, 'QUERY-SECRET', 'URL 被改写（QUERY 注入）')
+    assert(call.headerNames.includes('x-probe-header'), '请求头被改写（HEADER 注入）')
+    return 'McpClient 尚未透出该选项 —— 这是 P0-2-7 的接回点'
   })
 })
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * verify-mcp-servers.mjs —— P0-2-2「Server 注册 CRUD + 连通测试」验收
+ * verify-mcp-servers.mjs —— P0-2-2「Server 注册 CRUD + 连通测试」+ P0-2-3「模板变更的影响提示」验收
  *
  * 跑法：`pnpm verify:mcp-servers`（= `pnpm --filter @doubulea/backend verify:mcp-servers`）
  * ⚠️ 前置：`pnpm infra:up && pnpm db:deploy`（真 PG + Redis）+ `pnpm -r build` 出 dist。
@@ -16,7 +16,7 @@
  * ⚠️ 口径：**夹具假上游**档 —— 只证明"契约与配置接对了"，**不等于**"真 MCP 服务那边一定对"。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本脚本最想钉死的三件事（都不是"接口通不通"层面的）
+ * 本脚本最想钉死的四件事（都不是"接口通不通"层面的）
  * ─────────────────────────────────────────────────────────────────────
  * ① **权限是「登录即可」，且**没有 owner 列收窄**（`06` §4.2 第五族 / 门槛 1）。
  *    `mcp_servers.created_by` 只是**留痕**。所以这里**两个用户都是 MEMBER**，
@@ -31,6 +31,13 @@
  *    `auth_type` 变了才清；**只改 `name` 不清**；**原样提交**（内容相同、键序被 PG 重排过）
  *    也不能清。漏了前者的症状是"改了 endpoint，工具列表还是旧 server 的"（**纯静默**）；
  *    写错了后者则"每次保存工具数都归零"（也一样没人看得出是 bug）。
+ * ④ **模板变更只提示、绝不自动清理**（P0-2-3 门槛 3 / 坑预判 2，H 组）。
+ *    `PATCH` 响应里带 `credentialSchemaImpact`（**这正是本批唯一的一次契约变更**：
+ *    P0-2-2 时它回的是**裸 item**）。它只说明"哪些参数被删/被加/被换注入位置"，
+ *    **一个字都不许动**用户已填的凭据（值没了是不可逆的 —— 用户只是临时改错了模板而已）。
+ *    ⚠️ 另有一条**最容易看走眼**的：**"缓存该不该清"与"提示什么"是两个判据** ——
+ *    只改 `label` 时**提示是 `null` 但缓存照清**，同一份输入得出两个结论是**对的**。
+ *    `affectedCredentials` 本批恒 `null`（凭据表属 P0-2-4），H1 守着它、P0-2-4 落地时翻转。
  */
 
 // ⚠️ 必须在 import `config.js`（经 dist 的 app.js 间接引入）**之前**设置：
@@ -180,6 +187,23 @@ async function createServer(cookie, payload) {
   return { item: parsed.data, test: response.json().data.test, response }
 }
 
+/**
+ * `PATCH /api/mcp/servers/:id` 的响应信封 —— **P0-2-3 起是 `{server, credentialSchemaImpact}`**
+ * （与 `POST /` 的 `{server,test}` 同族；P0-2-2 时它还回**裸 item**，这是一次刻意的契约变更）。
+ *
+ * 两个取值点分开写，是因为"改完之后的 server"与"本次模板变更对已存凭据的影响"本来就是
+ * 两件事 —— 把它们揉成一个 `item` 会让 H 组的断言读起来像在同一个对象上乱翻字段。
+ */
+function patchOf(response) {
+  const data = response.json().data
+  // ⚠️ 键**必须存在**（可为 `null` 不能缺）—— 少了这条，服务层忘了带键时 `undefined` 会
+  //    一路充当"没有影响"，把 H1/H3 变成假绿
+  assert('credentialSchemaImpact' in data, '⚠️ P0-2-3 起 PATCH 响应必须带 `credentialSchemaImpact`（可为 null，不能缺）')
+  const parsed = mcpServerItemSchema.safeParse(data.server)
+  assert(parsed.success, `PATCH 响应不符合契约：${JSON.stringify(parsed.error?.issues)}`)
+  return { item: parsed.data, impact: data.credentialSchemaImpact }
+}
+
 /** 库里那一行的原始列（`tool_cache` 要逐字比对，不能过投影） */
 function rawRow(id) {
   return prisma.mcpServer.findUnique({
@@ -282,7 +306,7 @@ try {
       payload: { name: `被别人改过的-${suffix}` },
     })
     assertEqual(response.statusCode, 200, '⚠️ 若这里变成 403/404，说明有人擅自加了 owner 收窄')
-    assertEqual(mcpServerItemSchema.parse(response.json().data).name, `被别人改过的-${suffix}`, '改动生效')
+    assertEqual(patchOf(response).item.name, `被别人改过的-${suffix}`, '改动生效')
     assertEqual(
       (await rawRow(first.item.id)).name,
       `被别人改过的-${suffix}`,
@@ -711,7 +735,7 @@ try {
       cookie: creatorCookie,
       payload: { name: `${name}-改过` },
     })
-    assertEqual(mcpServerItemSchema.parse(renamed.json().data).slug, a.item.slug, '⚠️ 改名不改 slug（它是工具名前缀）')
+    assertEqual(patchOf(renamed).item.slug, a.item.slug, '⚠️ 改名不改 slug（它是工具名前缀）')
   })
 
   await it('F2 纯中文名 ⇒ 回落到 `server`（slug 要进工具名，而工具名只认 ASCII）', async () => {
@@ -749,7 +773,7 @@ try {
       cookie: creatorCookie,
       payload: { endpointUrl: UNREACHABLE_URL },
     })
-    const item = mcpServerItemSchema.parse(patched.json().data)
+    const item = patchOf(patched).item
     assertEqual(item.toolCount, 0, '⚠️ 漏了这一步的症状是"改了 endpoint，工具列表还是旧 server 的"—— 纯静默')
     assertEqual(item.status, 'UNKNOWN', 'status 回 UNKNOWN（旧结论对新地址没有意义）')
     const row = await rawRow(target.item.id)
@@ -766,7 +790,7 @@ try {
       cookie: creatorCookie,
       payload: { name: `验证 MCP-只改名-改过-${suffix}` },
     })
-    const item = mcpServerItemSchema.parse(patched.json().data)
+    const item = patchOf(patched).item
     assertEqual(item.toolCount, DEFAULT_TOOLS.length, '工具数不动')
     assertEqual(item.status, 'OK', 'status 不动')
     const after = await rawRow(target.item.id)
@@ -808,7 +832,7 @@ try {
       cookie: creatorCookie,
       payload: { endpointUrl: upstream.url, credentialSchema: entries },
     })
-    const item = mcpServerItemSchema.parse(patched.json().data)
+    const item = patchOf(patched).item
     assertEqual(item.toolCount, DEFAULT_TOOLS.length, '⚠️ 提交里带了键、但值没变 ⇒ 不许清（否则每次保存工具数都归零）')
     assertEqual(item.status, 'OK', 'status 不动')
     assertEqual(
@@ -822,9 +846,9 @@ try {
       cookie: creatorCookie,
       payload: { credentialSchema: [...entries, { key: 'extra', label: '多加一个', type: 'string', inject: 'BODY' }] },
     })
-    assertEqual(mcpServerItemSchema.parse(changed.json().data).toolCount, 0, '模板真的变了 ⇒ 必须清缓存')
+    assertEqual(patchOf(changed).item.toolCount, 0, '模板真的变了 ⇒ 必须清缓存')
     assertEqual(
-      mcpServerItemSchema.parse(changed.json().data).credentialSchema.length,
+      patchOf(changed).item.credentialSchema.length,
       2,
       '置换语义：提交什么就是什么（与 P0-2-4 的凭据**值**是合并语义刻意相反）',
     )
@@ -859,6 +883,128 @@ try {
     assertEqual(config.mcp.requestTimeoutMs, 5000, 'MCP_REQUEST_TIMEOUT_MS（本脚本注入值）')
     assertEqual(config.mcp.confirmTimeoutSec, 120, 'MCP_CONFIRM_TIMEOUT_SEC 默认值')
     assertEqual(config.mcp.toolLimit, 64, 'MCP_TOOL_LIMIT 默认值')
+  })
+
+  // ═══════════════════════════════════════════════════════════════════
+  group('H 组 · 凭据模板变更的**影响提示**（P0-2-3 门槛 3：只提示，绝不自动清理）')
+  // ═══════════════════════════════════════════════════════════════════
+
+  await it('H1 删掉一个参数 ⇒ `removedKeys` 如实报出、`affectedCredentials` 为 `null`、库里模板就是提交的那份', async () => {
+    const entries = [
+      { key: 'token', label: '令牌', type: 'string', inject: 'HEADER' },
+      { key: 'tenant_id', label: '租户', type: 'string', inject: 'QUERY' },
+    ]
+    const target = await createServer(creatorCookie, {
+      name: `验证 MCP-删参数-${suffix}`,
+      endpointUrl: upstream.url,
+      credentialSchema: entries,
+    })
+    assertSameJson(target.item.credentialSchema, entries, '前置：两条都存进去了')
+
+    const patched = await api('PATCH', `/api/mcp/servers/${target.item.id}`, {
+      cookie: creatorCookie,
+      payload: { credentialSchema: [entries[0]] },
+    })
+    assertEqual(patched.statusCode, 200, 'PATCH 状态码')
+    const { item, impact } = patchOf(patched)
+
+    assert(impact !== null, '模板真的删了东西 ⇒ 必须有提示（`null` 是"没有需要提示的影响"）')
+    assertSameJson(impact.removedKeys, ['tenant_id'], '删掉的那个 key 要被如实报出来')
+    assertSameJson(impact.addedKeys, [], '没有新增')
+    assertSameJson(impact.retargetedKeys, [], '没有换注入位置')
+    // ⚠️ 这条守着"本批必须留白"（`shared/src/mcp.ts` 的 `credentialSchemaImpactOf` 是唯一赋值点）：
+    //    凭据表属 P0-2-4，此刻后端**没有能力**回答"几条已存凭据受影响"。填 `0` 会被读成
+    //    "没有凭据受影响"这个此刻无法作出的断言 ⇒ 只能 `null`。**P0-2-4 落地时把这条翻转。**
+    assertEqual(impact.affectedCredentials, null, '⚠️ 条数此刻答不出来 ⇒ `null`（不是 0）')
+
+    // 库里的模板 = 提交的那份（一字不多、一字不少）；**此处不存在任何"自动清理"**
+    const row = await prisma.mcpServer.findUnique({
+      where: { id: target.item.id },
+      select: { credentialSchema: true },
+    })
+    assertSameJson(row.credentialSchema, [entries[0]], '⚠️ 只该换掉模板本身（P0-2-4 之前"清理"是无中生有）')
+    assertSameJson(item.credentialSchema, [entries[0]], '出口投影与库里一致')
+  })
+
+  await it('H2 ⚠️ 两个判据**刻意分离**：只改 `label` ⇒ 提示为 `null`，但缓存**照清**（同一份输入，两个结论）', async () => {
+    const entry = { key: 'token', label: '令牌', type: 'string', inject: 'HEADER' }
+    const target = await createServer(creatorCookie, {
+      name: `验证 MCP-只改文案-${suffix}`,
+      endpointUrl: upstream.url,
+      credentialSchema: [entry],
+    })
+    assertEqual(target.item.toolCount, DEFAULT_TOOLS.length, '前置：有缓存')
+
+    const patched = await api('PATCH', `/api/mcp/servers/${target.item.id}`, {
+      cookie: creatorCookie,
+      payload: { credentialSchema: [{ ...entry, label: '访问令牌（换了个说明）' }] },
+    })
+    const { item, impact } = patchOf(patched)
+
+    // ① "已存凭据会受什么影响" ⇒ 不受影响（`label` 是文案，值还是注到同一个 header 上）
+    assertEqual(impact, null, '⚠️ 改 `label` 不产生影响提示（否则用户会收到一堆无意义警告）')
+    // ② "缓存该不该清" ⇒ 要清（模板整体确实变了 —— 这是另一个判据，别把它俩合并）
+    assertEqual(item.toolCount, 0, '⚠️ 模板真变了 ⇒ 缓存照清（`sameJson` 整体比较，连 `label` 也算）')
+    assertEqual(item.status, 'UNKNOWN', 'status 同样回 UNKNOWN')
+  })
+
+  await it('H3 新增参数 ⇒ `addedKeys`；换注入位置 ⇒ `retargetedKeys`（值不用重填，但注入的目标变了）', async () => {
+    const target = await createServer(creatorCookie, {
+      name: `验证 MCP-增与换位-${suffix}`,
+      endpointUrl: upstream.url,
+      credentialSchema: [{ key: 'token', label: '令牌', type: 'string', inject: 'HEADER' }],
+    })
+
+    const patched = await api('PATCH', `/api/mcp/servers/${target.item.id}`, {
+      cookie: creatorCookie,
+      payload: {
+        credentialSchema: [
+          { key: 'token', label: '令牌', type: 'string', inject: 'QUERY' },
+          { key: 'apiKey', label: '密钥', type: 'string', inject: 'BODY' },
+        ],
+      },
+    })
+    const { impact } = patchOf(patched)
+    assert(impact !== null, '有增有换 ⇒ 必须有提示')
+    assertSameJson(impact.removedKeys, [], '没有删')
+    assertSameJson(impact.addedKeys, ['apiKey'], '新增的 key')
+    assertSameJson(impact.retargetedKeys, ['token'], '⚠️ 值还在，但它从 HEADER 换到了 QUERY')
+  })
+
+  await it('H4 不提交模板（只改 `name`）⇒ 提示为 `null`（"没提交"与"提交了但等价"收敛到同一种形态）', async () => {
+    const entries = [{ key: 'token', label: '令牌', type: 'string', inject: 'HEADER' }]
+    const target = await createServer(creatorCookie, {
+      name: `验证 MCP-不动模板-${suffix}`,
+      endpointUrl: upstream.url,
+      credentialSchema: entries,
+    })
+    const patched = await api('PATCH', `/api/mcp/servers/${target.item.id}`, {
+      cookie: creatorCookie,
+      payload: { name: `验证 MCP-不动模板-改过-${suffix}` },
+    })
+    const { item, impact } = patchOf(patched)
+    assertEqual(impact, null, '没提交模板 ⇒ `null`')
+    assertSameJson(item.credentialSchema, entries, '模板没动')
+  })
+
+  await it('H5 只把顺序换个位置地提交 ⇒ 提示为 `null`（顺序不算改动，但顺序仍要原样存住）', async () => {
+    const entries = [
+      { key: 'token', label: '令牌', type: 'string', inject: 'HEADER' },
+      { key: 'tenant_id', label: '租户', type: 'string', inject: 'QUERY' },
+    ]
+    const target = await createServer(creatorCookie, {
+      name: `验证 MCP-原样模板-${suffix}`,
+      endpointUrl: upstream.url,
+      credentialSchema: entries,
+    })
+    // ⚠️ 顺序反过来提交：顺序不算改动 ⇒ 提示仍为 `null`（集合语义判等）
+    const patched = await api('PATCH', `/api/mcp/servers/${target.item.id}`, {
+      cookie: creatorCookie,
+      payload: { credentialSchema: [entries[1], entries[0]] },
+    })
+    const { item, impact } = patchOf(patched)
+    assertEqual(impact, null, '⚠️ 只换顺序不算改动（`{removedKeys:[],addedKeys:[],retargetedKeys:[]}` 不该上线）')
+    assertEqual(item.credentialSchema[0].key, 'tenant_id', '但顺序**是**界面顺序 ⇒ 库里按提交序存')
   })
 } finally {
   // ── 最终清理（一律 `deleteMany`：清理阶段"目标已经不在了"是正常情况）──
@@ -914,9 +1060,9 @@ try {
 
 console.log('')
 if (failed === 0) {
-  console.log(`${c.g}${c.b}✅ P0-2-2 MCP server 注册验收通过：${passed} 项全通过${c.x}`)
+  console.log(`${c.g}${c.b}✅ P0-2-2/P0-2-3 MCP server 注册与凭据模板验收通过：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {
-  console.log(`${c.r}${c.b}❌ P0-2-2 MCP server 注册验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
+  console.log(`${c.r}${c.b}❌ P0-2-2/P0-2-3 MCP server 注册与凭据模板验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)
   process.exit(1)
 }

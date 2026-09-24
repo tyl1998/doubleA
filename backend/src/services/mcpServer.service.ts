@@ -1,13 +1,14 @@
 /**
- * MCP server 服务（P0-2-2）
+ * MCP server 服务（P0-2-2；P0-2-3 加"模板变更的影响"）
  *
  * 依据：`docs/02-后端设计.md` §4.7（六条路由）+ §三（`mcp_servers` 表）+ §九（注册者定义模板）
- *      + `docs/06-实施计划.md` §四 P0-2-2（内容 / 验收门槛 1~5 / 坑预判 1~4）与 §4.2、§4.3
+ *      + `docs/06-实施计划.md` §四 P0-2-2（内容 / 验收门槛 1~5 / 坑预判 1~4）
+ *        与 P0-2-3（凭据模板的深度校验 / `credentialSchemaImpact` / 坑预判 2）
+ *        与 §4.2、§4.3
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件的五条口径（每条都对应一条验收门槛或坑预判）
+ * 本文件的**六条口径**（每条都对应一条验收门槛或坑预判）
  * ─────────────────────────────────────────────────────────────────────
- *
  * **① 权限是"登录即可"，且**没有 owner 列收窄**（`06` §4.2 第五族 / 验收门槛 1）。**
  *    `created_by` 只作**留痕**：它出现在响应里（前端能显示"谁注册的"），但**不参与任何判定** ——
  *    没有"只有创建者能改"这一说。所以本文件里**一个权限判断都没有**，删/改别人建的 server
@@ -36,10 +37,19 @@
  *    本方案下拉不到 —— 那时 `POST /:id/test` 会**如实报出**（`ok:false` + 可读原因），
  *    而**不许**"顺手带上某个人的凭据"（那会造出"工具列表依赖谁先点过测试"的诡异状态）。
  *    这也意味着 `tool_cache` 是**每个 server 一份、全员共享**的，与用户无关。
+ *
+ * **⑥ 改模板时**只提示、绝不自动清理**已存的凭据（P0-2-3 坑预判 2 / 门槛 3）。**
+ *    `credentialSchema` 变更后，响应里带回 `credentialSchemaImpact`（增/删/换注入位置三类 key 级的
+ *    差异）；本服务**一个字的凭据都不碰**（表属 P0-2-4）—— 因为"用户临时改错模板"⇒ 值被清掉是
+ *    **不可逆**的，而他什么都没做。⚠️ 这与"缓存该不该清"是**两个判据**：缓存用 `sameJson`
+ *    判"模板整体变没变"（连 `label` 改了也清），impact 用 `diffCredentialSchema` 判
+ *    "**已存凭据会受什么影响**"（只有 key 级的三种改动才算）。
  */
 
 import {
   AppError,
+  credentialSchemaImpactOf,
+  diffCredentialSchema,
   normalizeCredentialSchema,
   slugifyServerName,
   uniqueSlug,
@@ -53,6 +63,7 @@ import {
   type OffsetPage,
   type RemoveMcpServerResult,
   type UpdateMcpServerBody,
+  type UpdateMcpServerResult,
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
@@ -341,22 +352,45 @@ export async function createMcpServer(
  * 分辨方式：**模板**（schema）是注册者定义的、可以整体覆盖；**值**（values）不可回填，
  * 所以只能合并。这条差别写在两处的契约注释里，别互相照抄。
  *
+ * ⚠️ **非法模板进不到这里**（P0-2-3：按 `inject` 判 `key`、同模板内判重都在路由级 schema 上，
+ * 报错 path 精确到 `body.credentialSchema.<i>.key`）⇒ 本函数拿到的模板一定是合法的。
+ *
  * @throws {AppError} `NOT_FOUND`(404) server 不存在 / `VALIDATION`(400) 传了 OAUTH
  */
-export async function updateMcpServer(id: string, input: UpdateMcpServerBody): Promise<McpServerItem> {
+export async function updateMcpServer(
+  id: string,
+  input: UpdateMcpServerBody,
+): Promise<UpdateMcpServerResult> {
   const db = getPrisma()
   assertAuthTypeSupported(input.authType)
 
   const current = await db.mcpServer.findUnique({ where: { id }, select: MCP_SERVER_SELECT })
   if (current === null) throw AppError.notFound('MCP server 不存在')
 
+  /** 库里那份模板的**可用化**版本（jsonb 里可能混着坏条目，见 `normalizeCredentialSchema`） */
+  const currentSchema = normalizeCredentialSchema(current.credentialSchema)
+
   // 只在"真的变了"时才清缓存 —— 前端保存整个表单时会把**没改的字段**也一起提交，
   // 若按"提交里带了就清"判，每次保存都会让工具数归零（见 sameJson 的注释）
   const invalidatesCache =
     (input.endpointUrl !== undefined && input.endpointUrl !== current.endpointUrl) ||
     (input.authType !== undefined && input.authType !== current.authType) ||
-    (input.credentialSchema !== undefined &&
-      !sameJson(input.credentialSchema, normalizeCredentialSchema(current.credentialSchema)))
+    (input.credentialSchema !== undefined && !sameJson(input.credentialSchema, currentSchema))
+
+  /**
+   * 本次模板变更对"**已存凭据**"的影响（P0-2-3 门槛 3）。
+   *
+   * 三件事要一起记住：
+   *   · 判据是 `diffCredentialSchema`（key 级：增/删/换注入位置），**不是**上面那个
+   *     `sameJson`（整体级）—— 改个 `label` 该清缓存，但**与用户的凭据无关**，不该弹提示；
+   *   · 没提交模板 ⇒ `null`（`undefined` 与"提交了但等价"在这里是同一个结论：无需提示）；
+   *   · **只提示**：本函数**一个字的凭据都不碰**（表属 P0-2-4）。自动清理会把"用户临时改错
+   *     模板"变成**不可逆的数据丢失**，而他什么都没做（坑预判 2）。
+   */
+  const impact =
+    input.credentialSchema === undefined
+      ? null
+      : credentialSchemaImpactOf(diffCredentialSchema(currentSchema, input.credentialSchema))
 
   const updated = await db.mcpServer.update({
     where: { id },
@@ -377,10 +411,17 @@ export async function updateMcpServer(id: string, input: UpdateMcpServerBody): P
   })
 
   getLogger().info(
-    { mcpServerId: id, invalidatesCache, changed: Object.keys(input) },
+    {
+      mcpServerId: id,
+      invalidatesCache,
+      changed: Object.keys(input),
+      // ⚠️ 只记 key 名与条数：这里**没有值**可漏，但"impact 只写 key 名"这条纪律要一致
+      //    （P0-2-4 的日志会经手真正的值，见 `02` §十三 的 `[REDACTED]` 口径）
+      impactRemoved: impact?.removedKeys.length ?? 0,
+    },
     invalidatesCache ? '已更新 MCP server（注册信息变更，工具缓存已失效）' : '已更新 MCP server',
   )
-  return toItem(updated)
+  return { server: toItem(updated), credentialSchemaImpact: impact }
 }
 
 // ═════════════════════════════════════════════════════════════════════

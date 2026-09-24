@@ -99,6 +99,16 @@
  *              （逐条过滤、永不抛错）、`toolCache` 的读写（**坏数据整体作废**，不是逐条过滤）。
  *              三个被测模块**都不 import 运行期模块** ⇒ 本档（无依赖、可进 CI）直接断言；
  *              行为侧（真 PG + 真假 MCP 上游 + 全员权限 + 409 守卫）归 `verify-mcp-servers.mjs`。
+ *   · P0-2-3：**凭据参数模板的深度校验与影响提示** —— 三条按注入位置分的 `key` 规则
+ *              （HEADER 不得占用平台自用头名、且须是合法头名；QUERY 不得含 `&`/`=`；
+ *              BODY 除四个 JSON-RPC 保留键外任意），报错 path 精确到 `[i,'key']`
+ *              （`superRefine` + `addIssue({path})`，`.refine()` 给不出 path）；
+ *              独立入口 `validateCredentialSchema`（**path 相对模板数组**、形状语义两样都做、
+ *              永不抛错）；`diffCredentialSchema` 的**集合语义**（顺序 / `label` / `required`
+ *              都不算改动）；`credentialSchemaImpactOf` 的**空 diff ⇒ `null`**；
+ *              以及 `updateMcpServerResultSchema`（`{server, credentialSchemaImpact}`）。
+ *              另有一条**守着 `affectedCredentials` 恒 `null`** 的断言 —— P0-2-4 落地时翻转它。
+ *              "BODY 注入为什么只拒那四个键"的取证在 `verify-mcp-client.mjs` 的 **H 组**（探针）。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -241,6 +251,17 @@ import {
   slugifyServerName,
   uniqueSlug,
   updateMcpServerBodySchema,
+  // 凭据参数模板的深度校验（P0-2-3）
+  MCP_CREDENTIAL_KEY_MAX,
+  MCP_JSONRPC_RESERVED_KEYS,
+  MCP_RESERVED_HEADER_NAMES,
+  credentialSchemaEntrySchema,
+  credentialSchemaImpactOf,
+  credentialSchemaImpactSchema,
+  credentialSchemaSchema,
+  diffCredentialSchema,
+  updateMcpServerResultSchema,
+  validateCredentialSchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -3556,6 +3577,218 @@ await it('`normalizeCredentialSchema`：**逐条过滤**、永不抛错、守住
     `截断到 ${MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES} 条（与契约用同一个常量 —— 它同时是渲染上限）`,
   )
   assertEqual(CREDENTIAL_INJECT_LOCATIONS.join('/'), 'HEADER/QUERY/BODY', '注入位置取值域')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// P0-2-3：凭据参数模板 —— 深度校验 / 差异 / 影响提示
+//
+// 这一节守的错**都没有 HTTP 表现**（或表现得很晚）：
+//   · 深度校验漏一条 ⇒ 用户存进一个"永远注入不出去"的参数名（含空格的头名），
+//     界面上一路绿灯，直到真的去调那个工具才炸；
+//   · 报错 path 不给到 `[i,'key']` ⇒ 前端只能把整个表单标红，用户不知道改哪一行；
+//   · 模板变更的"提示"变成**自动清理** ⇒ 用户什么都没做，已填的凭据就没了（不可逆）；
+//   · 把"改 `label`"也算成"影响" ⇒ 用户收到一堆无意义的警告，于是再也不看那个提示。
+// 三处被测模块都不 import 运行期模块 ⇒ 这一档（无依赖、可进 CI）能直接断言；
+// 行为侧（真 PG + 真 PATCH + 库里凭据一字未动）归 `verify-mcp-servers.mjs`。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+console.log(`\n${c.b}── 凭据参数模板（P0-2-3）：深度校验 / 差异 / 影响提示 ──${c.x}`)
+
+/** 一个合法的模板条目（各条用例按需覆写一两个字段） */
+const credFixture = { key: 'token', label: '访问令牌', type: 'string', inject: 'HEADER' }
+
+/** 把建/改请求体走一遍（`credentialSchema` 是唯一关心的字段） */
+const parseCredBody = (credentialSchema) =>
+  createMcpServerBodySchema.safeParse({
+    name: '内部工单平台',
+    endpointUrl: 'https://mcp.example.com/mcp',
+    credentialSchema,
+  })
+
+/** 取 path 恰好等于 `path` 的那条 issue（`undefined` 表示没报在那里） */
+const issueAt = (result, path) =>
+  result.error.issues.find((issue) => JSON.stringify(issue.path) === JSON.stringify(path))
+
+/** 报错所在的行下标集合（去重，便于"报在第几条"这类断言） */
+const issueRows = (result) =>
+  [...new Set(result.error.issues.map((issue) => issue.path[1]).filter((row) => typeof row === 'number'))].sort()
+
+await it('模板深度校验：报错 path 精确到 `[i,\'key\']`／`[i,\'inject\']`（前端据此定位到输入框）', () => {
+  // ① 非法 inject —— 形状错（取值域），由逐条 schema 自己报
+  const badInject = parseCredBody([{ ...credFixture, inject: 'COOKIE' }])
+  assertEqual(badInject.success, false, '取值域外的 inject 应被拒')
+  assert(issueAt(badInject, ['credentialSchema', 0, 'inject']) !== undefined, 'path 应指到第 0 条的 inject')
+
+  // ② `type` 只支持 string
+  const badType = parseCredBody([{ ...credFixture, type: 'number' }])
+  assertEqual(badType.success, false, 'type=number 应被拒（P0 只支持 string）')
+  assert(issueAt(badType, ['credentialSchema', 0, 'type']) !== undefined, 'path 应指到 type')
+
+  // ③ 同一模板内 key 重复 —— 判重是**跨行**的（数组级 superRefine），path 指到**后面那一条**
+  const dup = parseCredBody([credFixture, { ...credFixture, label: '再来一个' }])
+  assertEqual(dup.success, false, '同模板内 key 重复应被拒')
+  assert(
+    issueAt(dup, ['credentialSchema', 1, 'key']) !== undefined,
+    '⚠️ path 必须指到重复的那一条（第 1 条），不是第 0 条 —— `.refine()` 给不出这个 path',
+  )
+  // ⚠️ 只有"后出现的那一条"被标红：把错误摊到两行上，前端会看到同一句话出现两次
+  assertEqual(JSON.stringify(issueRows(dup)), '[1]', '判重只标后面那一条')
+
+  // ④ `key` 有 `.trim()` ⇒ 前后空格会被折掉，于是「token」与「 token 」算重复（它们本来就是同一个头名）
+  const dupByTrim = parseCredBody([credFixture, { ...credFixture, key: '  token  ' }])
+  assertEqual(dupByTrim.success, false, '⚠️ trim 之后同名也应判重（`.trim()` 跑在形状层，先于判重）')
+
+  // ⑤ HEADER 的 key 含空格 / 冒号（RFC 7230 的 token 不含它们）
+  for (const key of ['X User Token', 'X-User:Token']) {
+    const bad = parseCredBody([{ ...credFixture, key }])
+    assertEqual(bad.success, false, `HEADER key「${key}」应被拒`)
+    assert(issueAt(bad, ['credentialSchema', 0, 'key']) !== undefined, `path 应指到 key（${key}）`)
+  }
+  assertEqual(parseCredBody([{ ...credFixture, key: 'X-User-Token' }]).success, true, '合法的头名应通过')
+
+  // ⑥ HEADER 不得占用**平台自己的**头（按小写比较）
+  const reserved = parseCredBody([{ ...credFixture, key: 'Accept' }])
+  assertEqual(reserved.success, false, '⚠️ 保留头名应被拒（`Accept` 大小写不敏感）')
+  assert(
+    MCP_RESERVED_HEADER_NAMES.includes('mcp-session-id'),
+    '`mcp-session-id` / `mcp-protocol-version` 必须在保留名单里（占了会毁掉会话与协议协商）',
+  )
+
+  // ⑦ QUERY 的 key 不能含 `&` / `=`
+  for (const key of ['a&b', 'a=b']) {
+    const bad = parseCredBody([{ ...credFixture, key, inject: 'QUERY' }])
+    assertEqual(bad.success, false, `QUERY key「${key}」应被拒`)
+  }
+  assertEqual(parseCredBody([{ ...credFixture, key: 'api_key', inject: 'QUERY' }]).success, true, '普通查询键应通过')
+
+  // ⑧ BODY 接受任意 key，**除了**四个 JSON-RPC 保留键（撞名的后果由 H 组探针取证）
+  assertEqual(parseCredBody([{ ...credFixture, key: 'apiKey', inject: 'BODY' }]).success, true, 'BODY 接受非保留 key')
+  for (const key of MCP_JSONRPC_RESERVED_KEYS) {
+    assertEqual(parseCredBody([{ ...credFixture, key, inject: 'BODY' }]).success, false, `BODY key「${key}」撞保留键应被拒`)
+  }
+
+  // ⑨ `key` 与 `label` 都有长度上限（`key` 的上限是渲染与可读性口径，列里没有它）
+  const longKey = 'X' + 'a'.repeat(MCP_CREDENTIAL_KEY_MAX)
+  const badKey = parseCredBody([{ ...credFixture, key: longKey }])
+  assertEqual(badKey.success, false, `key 超过 ${MCP_CREDENTIAL_KEY_MAX} 字符应被拒`)
+  assert(issueAt(badKey, ['credentialSchema', 0, 'key']) !== undefined, 'path 应指到 key')
+  assertEqual(
+    parseCredBody([{ ...credFixture, key: 'X'.repeat(MCP_CREDENTIAL_KEY_MAX) }]).success,
+    true,
+    '⚠️ 恰好等于上限应通过（边界是"最多 N 个"，不是"少于 N 个"）',
+  )
+})
+
+await it('整模板超 64 条 ⇒ 报在**数组**上（path 只到 `credentialSchema`，前端整块标红）', () => {
+  const tooMany = Array.from({ length: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES + 1 }, (_v, i) => ({
+    ...credFixture,
+    key: `k${i}`,
+  }))
+  const result = parseCredBody(tooMany)
+  assertEqual(result.success, false, `超过 ${MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES} 条应被拒`)
+  assert(
+    result.error.issues.some((issue) => JSON.stringify(issue.path) === '["credentialSchema"]'),
+    '⚠️ 超长是"整个模板"的错，path 不该指到某一行',
+  )
+  assertEqual(JSON.stringify(issueRows(result)), '[]', '超长不该让任何一行被标红（65 条本身都合法）')
+})
+
+await it('`validateCredentialSchema` 独立入口：**path 相对模板数组**、两样都做、永不抛错', () => {
+  // 独立入口的 path **不带** `credentialSchema` 前缀（它不知道外层的字段名）—— 这是与 schema 路径的关键差别
+  const bad = validateCredentialSchema([credFixture, { ...credFixture, inject: 'COOKIE' }])
+  assertEqual(bad.ok, false, '应判为非法')
+  assert(
+    bad.issues.some((issue) => JSON.stringify(issue.path) === '[1,"inject"]'),
+    `⚠️ 独立入口的 path 相对模板数组（形如 [1,"inject"]），实际：${JSON.stringify(bad.issues)}`,
+  )
+  // 形状错 + 语义错由它自己**都做**（没有 zod 帮它报形状）
+  const bothWrong = validateCredentialSchema([{ key: '', label: 'x', type: 'string', inject: 'COOKIE' }])
+  assertEqual(bothWrong.ok, false, '形状与语义同时错也应判非法')
+  assert(
+    bothWrong.issues.length >= 2,
+    `⚠️ 独立入口要两样都报（形状 + 语义），实际只报了 ${bothWrong.issues.length} 条`,
+  )
+
+  // 非数组 / 超长：各报一条，且 **永不抛错**
+  for (const raw of [null, undefined, {}, 'x', 42]) {
+    const result = validateCredentialSchema(raw)
+    assertEqual(result.ok, false, `非数组（${JSON.stringify(raw)}）应判非法`)
+    assertEqual(result.issues.length, 1, '非数组只报一条（不要编出一串无意义的次生错）')
+    assertEqual(JSON.stringify(result.issues[0].path), '[]', 'path 为空 = "整个字段"')
+  }
+  assertEqual(
+    validateCredentialSchema(Array.from({ length: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES + 1 }, (_v, i) => ({ ...credFixture, key: `k${i}` }))).ok,
+    false,
+    '超长应判非法',
+  )
+
+  // 合法模板 ⇒ `{ok:true}`（判别式的另一半）
+  assertEqual(validateCredentialSchema([credFixture]).ok, true, '合法模板应通过')
+  assertEqual(validateCredentialSchema([]).ok, true, '空模板合法（= 这个 server 不需要用户填东西）')
+  assertEqual(credentialSchemaSchema.safeParse([credFixture]).success, true, '同一条模板走 schema 也应通过')
+  assertEqual(credentialSchemaEntrySchema.safeParse(credFixture).success, true, '单条形状 schema 通过')
+})
+
+await it('`diffCredentialSchema`：**按 key 集合**判差异（顺序、`label`、`required` 都不算改动）', () => {
+  const a = { key: 'a', label: 'A', type: 'string', inject: 'HEADER' }
+  const b = { key: 'b', label: 'B', type: 'string', inject: 'HEADER' }
+
+  // ⚠️ 只换顺序 ⇒ 三个数组都空（"换了个位置"不是"增/删"）
+  const reordered = diffCredentialSchema([a, b], [b, a])
+  assertSameSet(
+    [...reordered.removedKeys, ...reordered.addedKeys, ...reordered.retargetedKeys],
+    [],
+    '换顺序不算任何改动',
+  )
+
+  // ⚠️ 只改 `label` / `required` ⇒ 同样不算改动（改文案对"已存的值"没有任何影响）
+  const relabeled = diffCredentialSchema([a], [{ ...a, label: '换个说明', required: true }])
+  assertSameSet([...relabeled.removedKeys, ...relabeled.addedKeys, ...relabeled.retargetedKeys], [], '改文案不算改动')
+
+  // 删 / 增 / 改注入位置 = 三类改动
+  const diff = diffCredentialSchema([a, b], [{ ...b, inject: 'QUERY' }, { key: 'c', label: 'C', type: 'string', inject: 'BODY' }])
+  assertSameSet(diff.removedKeys, ['a'], '旧有新无 ⇒ removed')
+  assertSameSet(diff.addedKeys, ['c'], '新有旧无 ⇒ added')
+  assertSameSet(diff.retargetedKeys, ['b'], '两边都有但 inject 变了 ⇒ retargeted')
+
+  // 大小写不同 = 两个键 ⇒ 如实报成"移除 + 新增"（这正是要让用户看到的）
+  const recased = diffCredentialSchema([a], [{ ...a, key: 'A' }])
+  assertSameSet(recased.removedKeys, ['a'], '`a` → `A` 是一次"移除"')
+  assertSameSet(recased.addedKeys, ['A'], '`a` → `A` 也是一次"新增"')
+})
+
+await it('`credentialSchemaImpactOf`：空 diff ⇒ `null`；非空 ⇒ 带 `affectedCredentials`（本批恒 `null`）', () => {
+  const empty = { removedKeys: [], addedKeys: [], retargetedKeys: [] }
+  assertEqual(credentialSchemaImpactOf(empty), null, '⚠️ 空 diff 收敛成 `null`（不让 `{removedKeys:[]}` 这种形态上线）')
+
+  const diff = { removedKeys: ['old'], addedKeys: [], retargetedKeys: [] }
+  const impact = credentialSchemaImpactOf(diff)
+  assertSameObject(
+    impact,
+    { removedKeys: ['old'], addedKeys: [], retargetedKeys: [], affectedCredentials: null },
+    'impact 的形状',
+  )
+  // ⚠️ 这条守着"本批必须留白"：凭据表属 P0-2-4，此刻后端**没有能力**回答"几条凭据受影响"。
+  //    填 `0` 会被读成"没有凭据受影响"这个此刻无法作出的断言 ⇒ 只能 `null`。
+  //    **P0-2-4 落地时把这条断言翻转**（同 §七"刻意未注册型断言的保质期"的既有套路）。
+  assertEqual(impact.affectedCredentials, null, '⚠️ P0-2-4 之前必须恒为 `null`（不是 0）')
+  assertEqual(credentialSchemaImpactSchema.safeParse(impact).success, true, 'impact 通过契约')
+  assertEqual(
+    credentialSchemaImpactSchema.safeParse({ ...impact, affectedCredentials: -1 }).success,
+    false,
+    '条数不能为负',
+  )
+})
+
+await it('`updateMcpServerResultSchema`：`{server, credentialSchemaImpact}`（与 `POST` 的 `{server,test}` 同族）', () => {
+  assertSameSet(Object.keys(updateMcpServerResultSchema.shape), ['server', 'credentialSchemaImpact'], '两个键')
+  assertEqual(
+    updateMcpServerResultSchema.safeParse({ server: mcpItemFixture, credentialSchemaImpact: null }).success,
+    true,
+    '`null` = 本次没有需要提示的影响（没提交模板 / 提交了但等价）',
+  )
+  assertEqual(updateMcpServerResultSchema.safeParse({ server: mcpItemFixture }).success, false, '⚠️ 键必须恒在（可为 null，不能缺）')
+  assertEqual(updateMcpServerResultSchema.safeParse({ credentialSchemaImpact: null }).success, false, '`server` 必填')
 })
 
 await it('`toolCache` 读写：坏数据**整体作废** + 三处读端同一套降级（`0` 与"没有"要分得开）', () => {
