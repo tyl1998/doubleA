@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-1-37 上游协议扩展（OpenAI Responses + Anthropic Messages；Provider 加 protocol 列，默认 OPENAI_COMPAT ⇒ 既有行行为不变）',
+    step: 'P0-1-38 P0-1 收尾（阶段一出口验收清单 + TTFT 统计口径；⚠️ 本批纯文档，后端代码未改动，仅本标识随批次前进）',
     address,
   })
   logger.info(
