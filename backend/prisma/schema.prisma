@@ -180,9 +180,10 @@ model User {
   createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  agents        Agent[]
-  conversations Conversation[]
-  mcpServers    McpServer[]
+  agents         Agent[]
+  conversations  Conversation[]
+  mcpServers     McpServer[]
+  mcpCredentials McpCredential[]
 
   @@map("users")
 }
@@ -539,6 +540,42 @@ model McpServer {
 
   creator User @relation(fields: [createdBy], references: [id], onDelete: Restrict)
 
+  credentials McpCredential[]
+
   @@index([createdBy])
   @@map("mcp_servers")
+}
+
+/// 用户级凭据（P0-2-4；`02` §三 的 `mcp_credentials` + §九 的核心定制点）。
+///
+/// 三条口径（细节与理由见 `shared/src/mcp.ts` 文件头 ⑤ 与 `mcpCredential.service.ts`）：
+///   · **一行 = (server, user) 一份**，`uniq(server_id, user_id)` 就是"每用户每 server 一份"的落点；
+///   · `values` 是 jsonb `{ "<模板里的 key>": "v1.<iv>.<tag>.<ct>" }` —— **逐 key 一条独立密文**
+///     （AAD 含 serverId + userId + key）。⚠️ "清空某个 key" = **把这个键删掉**，不是存空串
+///     （存空串会得到一段结构合法的空密文，让"已配置"永远为真）。
+///   · 权限收窄**全在 `user_id` 上**（不是角色）：任何登录用户只能读写自己的行，
+///     ADMIN **也没有后门**（第四族同源）。所以本表**没有 `created_by`** ——
+///     `user_id` 本身就是归属，再加一列留痕只会让人以为存在"代填"的入口。
+model McpCredential {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  serverId  String   @map("server_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  /// 加密后的值：`{ "<key>": "v1.<iv>.<tag>.<ct>" }`；键集 = 我填过的参数（空串不算有值）
+  /// ⚠️ 列名带 `_enc` 是刻意的（与 `model_providers.api_key_enc` 同一条纪律）：
+  ///    让"这一列是密文"在**库结构层面**就看得出来 —— 任何一条 `SELECT` 的结果都不该被当成明文用。
+  ///    它只在 `mcpCredential.service.ts` 被读写；日志侧另有 `LOG_REDACT_PATHS` 兜底。
+  valuesEnc Json     @default("{}") @map("values_enc") @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// ⚠️ `Cascade`：server 被删时凭据**必须跟着消失**（它引用的模板都没了）；
+  ///    这也让 `removeMcpServer` 的 `P2025` 兜底注释里那句"本表目前没有任何 CASCADE 子表"作废
+  server McpServer @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  /// ⚠️ `Cascade` 是**兜底**而不是活路径：本仓的用户没有硬删除入口（只改 `status`），
+  ///    真删用户时（运维/脚本）他的凭据也不该留成一个指向不存在用户的行
+  user   User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([serverId, userId])
+  @@index([userId])
+  @@map("mcp_credentials")
 }

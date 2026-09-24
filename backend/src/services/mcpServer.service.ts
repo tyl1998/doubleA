@@ -40,8 +40,9 @@
  *
  * **⑥ 改模板时**只提示、绝不自动清理**已存的凭据（P0-2-3 坑预判 2 / 门槛 3）。**
  *    `credentialSchema` 变更后，响应里带回 `credentialSchemaImpact`（增/删/换注入位置三类 key 级的
- *    差异）；本服务**一个字的凭据都不碰**（表属 P0-2-4）—— 因为"用户临时改错模板"⇒ 值被清掉是
- *    **不可逆**的，而他什么都没做。⚠️ 这与"缓存该不该清"是**两个判据**：缓存用 `sameJson`
+ *    差异 + **受影响的已存凭据条数**）；本服务**一个字的凭据值都不碰**（那条链路在
+ *    `mcpCredential.service.ts`，它**只读 `values` 的键名来数条数**，不解密、不写）——
+ *    因为"用户临时改错模板"⇒ 值被清掉是**不可逆**的，而他什么都没做。⚠️ 这与"缓存该不该清"是**两个判据**：缓存用 `sameJson`
  *    判"模板整体变没变"（连 `label` 改了也清），impact 用 `diffCredentialSchema` 判
  *    "**已存凭据会受什么影响**"（只有 key 级的三种改动才算）。
  */
@@ -70,6 +71,7 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma, Prisma } from '../infra/prisma.js'
 import { McpClient } from '../mcp/client.js'
 import { buildToolCache, parseToolCache, toolCountOf } from '../mcp/toolCache.js'
+import { countAffectedCredentials } from './mcpCredential.service.js'
 
 /** 调用者（只用到 id：本资源没有 owner 收窄，`created_by` 只是留痕，见文件头 ①） */
 export interface McpViewer {
@@ -378,19 +380,29 @@ export async function updateMcpServer(
     (input.credentialSchema !== undefined && !sameJson(input.credentialSchema, currentSchema))
 
   /**
-   * 本次模板变更对"**已存凭据**"的影响（P0-2-3 门槛 3）。
+   * 本次模板变更对"**已存凭据**"的影响（P0-2-3 门槛 3；条数在 P0-2-4 兑现）。
    *
-   * 三件事要一起记住：
+   * 四件事要一起记住：
    *   · 判据是 `diffCredentialSchema`（key 级：增/删/换注入位置），**不是**上面那个
    *     `sameJson`（整体级）—— 改个 `label` 该清缓存，但**与用户的凭据无关**，不该弹提示；
    *   · 没提交模板 ⇒ `null`（`undefined` 与"提交了但等价"在这里是同一个结论：无需提示）；
-   *   · **只提示**：本函数**一个字的凭据都不碰**（表属 P0-2-4）。自动清理会把"用户临时改错
-   *     模板"变成**不可逆的数据丢失**，而他什么都没做（坑预判 2）。
+   *   · **`affectedCredentials` 现在是一个真数**（P0-2-3 时恒 `null`：那时没有凭据表，
+   *     后端**没有能力**回答"几条已存凭据受影响"）。数它要查一次库，而它只对
+   *     `removedKeys` 有意义（`removedKeys` 为空时 `countAffectedCredentials` **一条查询都不发**）；
+   *   · **只提示**：本函数**一个字的凭据都不碰**（"值没了"是**不可逆**的，而用户可能只是
+   *     临时改错了模板）。真要清理由用户在凭据页自己点 `DELETE`（P0-2-4）。
    */
-  const impact =
+  const schemaDiff =
     input.credentialSchema === undefined
       ? null
-      : credentialSchemaImpactOf(diffCredentialSchema(currentSchema, input.credentialSchema))
+      : diffCredentialSchema(currentSchema, input.credentialSchema)
+  const impact =
+    schemaDiff === null
+      ? null
+      : credentialSchemaImpactOf(
+          schemaDiff,
+          await countAffectedCredentials(id, schemaDiff.removedKeys),
+        )
 
   const updated = await db.mcpServer.update({
     where: { id },
@@ -416,8 +428,10 @@ export async function updateMcpServer(
       invalidatesCache,
       changed: Object.keys(input),
       // ⚠️ 只记 key 名与条数：这里**没有值**可漏，但"impact 只写 key 名"这条纪律要一致
-      //    （P0-2-4 的日志会经手真正的值，见 `02` §十三 的 `[REDACTED]` 口径）
+      //    （P0-2-4 起凭据链路真的经手值与密文，那条纪律在 `mcpCredential.service.ts` 文件头 ⑥，
+      //     同 `02` §十三 的 `[REDACTED]` 口径）
       impactRemoved: impact?.removedKeys.length ?? 0,
+      impactAffected: impact?.affectedCredentials ?? 0,
     },
     invalidatesCache ? '已更新 MCP server（注册信息变更，工具缓存已失效）' : '已更新 MCP server',
   )
@@ -437,9 +451,11 @@ export async function updateMcpServer(
  * 才炸且查不出来**。口径与 P0-1-15 的删库守卫**同源**（先查、给数字、409 说人话），
  * 文案同句式、只是主语换成 server。
  *
- * ⚠️ `P2025`（"查到之后、删之前被并发删掉"）按 404 回，与 `kb.service.ts` 的删库**同款兜底**：
- * 本表目前没有任何 `CASCADE` 子表（`mcp_credentials` 属 P0-2-4，届时按"凭据随 server 消失"
- * 加 `CASCADE`），所以这条只可能来自并发，不是数据一致性问题。
+ * ⚠️ `P2025`（"查到之后、删之前被并发删掉"）按 404 回，与 `kb.service.ts` 的删库**同款兜底**。
+ * ⚠️ **P0-2-4 起本表有了 `CASCADE` 子表**（`mcp_credentials`：server 被删 ⇒ 那份模板也没了，
+ * 用户填的值必须跟着消失）。⇒ 这条 404 兜底现在**只可能**来自并发，不再是"没有子表所以一定是
+ * 并发"的推论；同时"删 server"会**连带删掉所有人的凭据**（`03` §七 的删除分级里它属"普通删除"
+ * —— 凭据不是用户可见的资产，且它引用的模板已不存在）。
  *
  * @throws {AppError} `NOT_FOUND`(404) 不存在 / `CONFLICT`(409) 正被 Agent 绑定
  */

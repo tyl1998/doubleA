@@ -64,6 +64,12 @@ export const LOG_REDACT_PATHS: readonly string[] = [
   '*.secret',
   'values',
   '*.values',
+  // P0-2-4 起凭据值的真实列名是 `values_enc`（Prisma 字段 `valuesEnc`）—— 上面两条 `values`
+  // 是 P0-1-12 定的占位口径，**留着不删**（纵深防御），但真正会出现在日志对象里的是这四个：
+  'valuesEnc',
+  '*.valuesEnc',
+  'values_enc',
+  '*.values_enc',
   'authorization',
   '*.authorization',
   'cookie',

@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-3 凭据参数模板（credential_schema 的深度校验 / 模板差异 diff / PATCH 回带 credentialSchemaImpact，只提示不清理）',
+    step: 'P0-2-4 我的凭据（mcp_credentials 表 / 每用户每 server 一份 AES-256-GCM 逐 key 加密 / 三条路由只动自己的 / PUT 合并语义 / 未配置清单）',
     address,
   })
   logger.info(

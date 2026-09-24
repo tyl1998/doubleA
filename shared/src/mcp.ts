@@ -53,6 +53,22 @@
  * "模板**整体**有没有变"（连 `label` 改了也清缓存）；`diffCredentialSchema` 判的是
  * "**已存凭据会受什么影响**"（只有"增/删/换注入位置"这三种 key 级的改动才算）。两者对同一份
  * 输入给出**不同**的结论是**对的**，差别写在两处的注释里。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑤ 凭据**值**（P0-2-4）：`PUT` 合并 / 只有 key 与 hasValue 出网 / AAD 绑 (server,user,key)
+ * ─────────────────────────────────────────────────────────────────────
+ * 与 ④ 的模板是两层不同的东西：模板是**注册者**定义的表单（人人可见），值是**每个用户**自己填的
+ * 令牌（只进不出）。四条口径：
+ *   · **`PUT` 是合并语义**（只动提交里出现的 key），与 P0-1 的 `components`（整体替换）**刻意相反**
+ *     —— 分辨方式只有一个：**不可回填的字段只能合并**。值不下发（连掩码都没有）⇒ 整体替换
+ *     必然静默清空用户没填的 key。见 {@link putMyCredentialBodySchema}。
+ *   · **出网只有 `key` + `hasValue`**（{@link mcpCredentialFieldSchema}），**没有值、没有掩码**：
+ *     Provider Key 的掩码是为了"管理员确认没配错"，而这是每个人自己的令牌 —— 下发掩码收益为零。
+ *   · **AAD 必须含 `serverId` + `userId`**（后端 `mcpCredentialAad`）：否则"把 A 的密文粘到 B 的行上"
+ *     能解开，那"绑定层"的验收就成了摆设（`06` P0-2-4 坑预判 3）。多带 `key` 是为了让值
+ *     不能在字段之间搬运；**刻意不带行 id** —— 那样 upsert 就得先有 id（P0-1-10 的 Provider 是
+ *     反例：它的 AAD 含 id，所以加密只能发生在拿到 id 之后）。
+ *   · **`configured` 按当前模板逐 key 判**，不是"表里有没有行"（见 {@link isCredentialConfigured}）。
  */
 
 import { z } from 'zod'
@@ -103,6 +119,17 @@ export const MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES = 64
 
 /** 凭据参数名的上限（列没有、是渲染与可读性的口径；与 `label` 同长） */
 export const MCP_CREDENTIAL_KEY_MAX = 64
+
+/**
+ * **单个凭据值**的上限（P0-2-4）。
+ *
+ * 定 4096 的理由：凭据就是"一次 HTTP 请求里能带出去的东西"——令牌 / JWT / 签名（JWT 带一堆
+ * 声明也很少过 2KB）/ API Key，4096 够用且能挡住"把整个证书或私钥贴进来"。
+ * ⚠️ 它是一个**明文长度**的口径，不是密文列宽（`values` 是 jsonb，没有列宽）。
+ * ⚠️ 校验按**字符数**（`z.string().max`）而不是字节：一个 4096 字符的中文串编成 UTF-8 是 12KB，
+ * 但那种值本来就不可能是一个令牌 —— 逐字节判只会让报错文案更难解释。
+ */
+export const MCP_CREDENTIAL_VALUE_MAX = 4096
 
 /**
  * **平台自己要发的请求头**（`HEADER` 注入的 `key` 不得占用它们）。
@@ -465,6 +492,196 @@ export function normalizeCredentialSchema(raw: unknown): CredentialSchema {
   return out
 }
 
+// ───────────────────────────── 凭据值（P0-2-4）─────────────────────────────
+
+/**
+ * `values`（jsonb）里**真正有值**的那些 key —— 读取端的唯一入口，**永不抛错**。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ① 为什么"有值"要单独定义，而不是读 `Object.keys(values)`
+ * ─────────────────────────────────────────────────────────────────────
+ * 「清空某个 key」的语义是**把它从对象里删掉**，而不是存一个空串：
+ * `encryptSecret('')` 会得到一个**结构合法**的密文（`v1.<iv>.<tag>.`），
+ * 若"键在 = 有值"，清空过的参数会永远显示成"已配置"（`03` §4.5 的 ✓ 是骗人的）。
+ * ⇒ 判据统一为"**值是长度 > 0 的字符串**"，空串 / 非字符串一律当"没有值"。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ② 为什么必须过它：`values` 是 jsonb，读出来的东西不保证是我们写的形状
+ * ─────────────────────────────────────────────────────────────────────
+ * 与 `normalizeCredentialSchema` 同一条理由（手工改库、跨环境导入、半截数据）：
+ * 一个 `null` 值会让 `Object.keys` 之外的所有读法在渲染期炸掉。
+ *
+ * ⚠️ **返回的是集合语义，不是数组顺序**：PG 的 jsonb **会重排键**，所以调用方
+ * **不得依赖顺序**（要比就按集合比 / 先 sort）。`verify:app` 有一条断言专门盯这件事。
+ */
+export function credentialValueKeys(raw: unknown): string[] {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return []
+  const keys: string[] = []
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'string' && value !== '') keys.push(key)
+  }
+  return keys
+}
+
+/**
+ * **必填、而我还没有值**的 key（顺序 = 模板顺序，便于界面直接渲染提示）。
+ *
+ * ⚠️ 这是 `configured` 的唯一判据来源，见 {@link isCredentialConfigured}。
+ */
+export function missingRequiredCredentialKeys(
+  schema: readonly CredentialSchemaEntry[],
+  presentKeys: Iterable<string>,
+): string[] {
+  const present = new Set(presentKeys)
+  return schema.filter((entry) => entry.required === true && !present.has(entry.key)).map((entry) => entry.key)
+}
+
+/**
+ * 「我这份凭据算不算配好了」—— **按当前模板逐 key 检查**，不是"表里有没有行"。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么不是"有没有行"（`06` P0-2-4 坑预判 2）
+ * ─────────────────────────────────────────────────────────────────────
+ * `PUT` 是**合并**语义（见 {@link putMyCredentialBodySchema}）⇒ 注册者后来给模板**新增**一个
+ * `required` 参数时，老用户的行**还在**、但那个 key **没有值**。若用"表里有行 = 已配置"，
+ * 界面会显示 ✓、工具调用时才发现缺 key（甚至只表现为"上游说我没权限"）。
+ * ⇒ 判据只认「**当前模板的必填项是否齐全**」：
+ *   · 模板里没有必填项（含空模板）⇒ **`true`**（没有任何东西要他填）；
+ *   · 有行但缺必填 ⇒ `false`（与没有行**同一个结论**）；
+ *   · 没行但模板无需填写 ⇒ `true`（例如内网无鉴权的 server）。
+ * ⚠️ 非必填项缺值**不影响** `configured`（它只影响界面上那一行的 ✓）。
+ */
+export function isCredentialConfigured(
+  schema: readonly CredentialSchemaEntry[],
+  presentKeys: Iterable<string>,
+): boolean {
+  return missingRequiredCredentialKeys(schema, presentKeys).length === 0
+}
+
+/**
+ * 模板一行 + **我这边有没有值**（`03` §4.5 的"每个参数一行：label + 密码框 + 已配置 ✓"）。
+ *
+ * ⚠️ **没有任何"值"的字段**（连掩码都没有，与 Provider Key 的 `apiKeyPreview` 刻意不同）：
+ * Provider Key 是**管理员**配的一份、掩码是为了"确认没配错"；而这里是每个用户自己的令牌，
+ * 下发掩码等于把"这个人的令牌长什么样"放进了一个更多人可以读到的通道，
+ * 收益却是零（他自己知道填了什么）。**有进无出，连影子都不给。**
+ */
+export const mcpCredentialFieldSchema = z.object({
+  key: z.string(),
+  label: z.string(),
+  inject: z.enum(CREDENTIAL_INJECT_LOCATIONS),
+  /** 归一化后的必填标记（模板里省略 = 非必填）——界面上用它决定是否标红星 */
+  required: z.boolean(),
+  /** 我这边这个 key 有没有值（**只有真假，没有值本身**） */
+  hasValue: z.boolean(),
+  placeholder: z.string().nullable(),
+})
+export type McpCredentialField = z.infer<typeof mcpCredentialFieldSchema>
+
+/**
+ * 一个 server × 我 的凭据状态（`GET /api/mcp/credentials` 的一项 / `PUT` 的响应）。
+ *
+ * ⚠️ **`fields` 是按"模板"投影的，不是按"我存了什么"**：模板里删掉的 key 即使库里还留着值
+ * （P0-2-3 定案：**只提示、绝不自动清理**），也**不出现在这里** —— 它已经不会被注入，
+ * 界面不该拿它冒充一个可用参数。清理由用户在 `DELETE` 里自己做。
+ * ⚠️ 所以 `hasValue` 的覆盖面是 `credentialValueKeys(values)`（**全部有值的 key**），
+ * 而不是 `fields` 里那些（后者只是"模板里还认的"）。
+ */
+export const mcpCredentialItemSchema = z.object({
+  serverId: z.string(),
+  /** 冗余带上名字与 slug：凭据页是"按 server 分组的一张表单"，让前端不再去 join `/api/mcp/servers` */
+  serverName: z.string(),
+  serverSlug: z.string(),
+  fields: z.array(mcpCredentialFieldSchema),
+  /** 当前模板的必填项里我还没值的（顺序 = 模板顺序）；空 ⇒ `configured:true` */
+  missingKeys: z.array(z.string()),
+  /** = `missingKeys.length === 0`（见 {@link isCredentialConfigured}，**不是**"表里有没有行"） */
+  configured: z.boolean(),
+  /**
+   * 我这份凭据最后一次写入时间；`null` = **从没写过**（没有行）。
+   * ⚠️ 它与 `configured` 是两件事：模板没有必填项时"从没写过"也是 `configured:true`。
+   */
+  updatedAt: z.string().nullable(),
+})
+export type McpCredentialItem = z.infer<typeof mcpCredentialItemSchema>
+
+/**
+ * 「未配置的 server」条目（**瘦投影**：`03` §4.5"未配置的 server 置顶提示"只要名字 + 缺哪些 key）。
+ *
+ * 它是 `items.filter((item) => !item.configured)` 的**派生结论**，服务层一次查询算出两半，
+ * 传的仍是同一份事实 —— 不是"同一份数据的第二种形状"（P0-2-2 定案 ② 那条禁的是后者）。
+ */
+export const mcpUnconfiguredServerSchema = z.object({
+  serverId: z.string(),
+  serverName: z.string(),
+  serverSlug: z.string(),
+  missingKeys: z.array(z.string()),
+})
+export type McpUnconfiguredServer = z.infer<typeof mcpUnconfiguredServerSchema>
+
+/**
+ * `GET /api/mcp/credentials` 的响应：**两面都给**（`06` P0-2-4 验收门槛 5）。
+ *
+ * ⚠️ **刻意不分页**（与 `/api/models/available` 同为"取全集"型端点，另几个列表端点是"翻页表格"）：
+ * 本页是一张**按 server 分组的长表单**，"未配置的置顶提示"必须跨全部 server 成立 ——
+ * 一旦分页，"置顶"只对当前页有效（用户翻到第 3 页时提示会凭空消失）。
+ * 代价是响应大小随 server 数增长；本仓的规模口径是"几百人的内部系统"（`01` §1.3），
+ * server 量级在几十 —— 真到需要分页时（P1）它也不会是"加 offset"就够的（要改成按需展开）。
+ */
+export const mcpCredentialListResultSchema = z.object({
+  /** 全部 server（按录入顺序 `createdAt asc`），每个都带"我这边缺什么" */
+  items: z.array(mcpCredentialItemSchema),
+  /** `items` 里 `configured:false` 的那些（瘦投影，置顶提示用） */
+  unconfigured: z.array(mcpUnconfiguredServerSchema),
+})
+export type McpCredentialListResult = z.infer<typeof mcpCredentialListResultSchema>
+
+/**
+ * `DELETE /api/mcp/credentials/:serverId` 的响应 —— 与其它"删类"端点同形（`{id,name}` 那一族）。
+ *
+ * ⚠️ 删除是**幂等**的语义选择：本来就没配 ⇒ **404**（与"这个 server 不存在"同码）。
+ * 理由：本端点删的是"**我的那份**"，反馈"你没有可删的东西"比"删除成功"更准确 ——
+ * 前端点删除时弹的是 Popconfirm，"其实什么都没有"正是它该说的话。
+ */
+export const removeMyCredentialResultSchema = z.object({
+  serverId: z.string(),
+  serverName: z.string(),
+})
+export type RemoveMyCredentialResult = z.infer<typeof removeMyCredentialResultSchema>
+
+/**
+ * `PUT /api/mcp/credentials/:serverId` 请求体：**合并语义**（只动提交里出现的 key）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⚠️ 这一条与 P0-1 的 `components`（整体替换）**刻意相反**，别互相"统一"
+ * ─────────────────────────────────────────────────────────────────────
+ * `06` P0-2-4 坑预判 1：Agent 的组件绑定定为**整体替换**，理由是"省略 = 清空会让前端忘带字段
+ * 变成**静默解绑**"。而凭据这里必须**反过来**，理由同样硬：
+ * **值不下发**（连掩码都没有）⇒ 前端**根本无从回填** ⇒ 若整体替换，用户只改一个 key 时
+ * 提交 `{token:'新值'}` 会把他没填的另一个 key **静默清空**（他什么都没做，值却没了）。
+ * ⇒ 两条口径都写在契约注释里（`shared/src/agent.ts` 的 `components` / 本处），
+ * 分辨方式：**"不可回填的字段只能合并"**。
+ *
+ * 三个配套规则：
+ *   · **空串 = 清空该 key**（把键从 `values` 里删掉，而不是存一个空密文）；
+ *   · **清空整份凭据走 `DELETE /:serverId`**（本端点不接受"清空所有 key 的语义"——
+ *     提交空对象是**没有意义的请求**，直接 400，免得它被当成一种"清空"的第二条路）；
+ *   · **不在当前模板里的 key ⇒ 400**：存下一个永远不会被注入的值，是给用户一个
+ *     "我明明填了"的错觉（且它是**静默**的 —— 注入端只会按模板找 key）。
+ */
+export const putMyCredentialBodySchema = z.object({
+  values: z
+    .record(
+      z
+        .string({ required_error: '凭据值必须是字符串' })
+        .max(MCP_CREDENTIAL_VALUE_MAX, `单个凭据值最多 ${MCP_CREDENTIAL_VALUE_MAX} 个字符`),
+    )
+    .refine((values) => Object.keys(values).length > 0, {
+      message: '请至少提交一个凭据参数（要清空整份凭据请用 DELETE）',
+    }),
+})
+export type PutMyCredentialBody = z.infer<typeof putMyCredentialBodySchema>
+
 // ───────────────────────────── 输出投影 ─────────────────────────────
 
 /**
@@ -547,15 +764,17 @@ export type McpServerCreateResult = z.infer<typeof mcpServerCreateResultSchema>
  * **一次模板变更对"已存凭据"的影响**（`06` P0-2-3 的验收门槛 3）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ① `affectedCredentials` 本批**恒为 `null`** —— 凭据表属 P0-2-4
+ * ① `affectedCredentials`：**P0-2-3 留白的那个数，P0-2-4 填上了**
  * ─────────────────────────────────────────────────────────────────────
- * 它是"值里含 `removedKeys` 之一的凭据条数"，而 `mcp_credentials` 表要到 **P0-2-4** 才建。
- * 这里**刻意留白而不是填 0**：`0` 会被读成"**没有凭据受影响**"（一句关于一个还不存在的功能的
- * 断言），而后端此刻根本没有能力回答这个问题。**说不出来的数字宁可留白，也不要编一个**
- * （P0-1-34/35 第 ⑦ 条的同一条原则）。
- * ⇒ **接回点（P0-2-4 兑现）**：建表后把 `null` 换成真数（数 `values` 里含 `removedKeys` 的行）。
- * `verify:app` 里有一条**守着"它现在必须是 null"**的断言，P0-2-4 落地时**翻转**它即可
- * （同 §七"刻意未注册型断言的保质期"的既有套路）。
+ * 它是"`values` 里含 `removedKeys` 之一的**已存凭据条数**"（全库口径，不是"我自己的"）。
+ * P0-2-3 时 `mcp_credentials` 表还不存在，后端**没有能力**回答 ⇒ 那时恒 `null`
+ * （**刻意留白而不是填 0**：`0` 会被读成"没有凭据受影响"这个此刻无法作出的断言）。
+ * ⇒ **P0-2-4 建表后兑现**：`credentialSchemaImpactOf` 的第二个参数变成**必填**，
+ * `null` 这个取值**从契约里彻底消失**（不再是"nullable 但恒真有值"的死分支）——
+ * 说不出来的数字宁可留白，**能说出来的就必须说**。
+ * ⚠️ 只有 `removedKeys` 进这个数：`addedKeys` 是"缺值"（没有任何已存的值受影响）、
+ * `retargetedKeys` 是"值还在、只是注入到了别处"（改注入位置**不会**让值失效）。
+ * 三者里只有"被删掉的 key"会让用户已填的值**再也用不上**。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ② 只提示、**永不自动清理**
@@ -573,8 +792,11 @@ export const credentialSchemaImpactSchema = z.object({
   addedKeys: z.array(z.string()),
   /** 两边都有、但注入位置变了的 key（顺序 = 旧模板顺序） */
   retargetedKeys: z.array(z.string()),
-  /** 受影响的已存凭据条数；**本批恒 `null`**（见上 ①，凭据表属 P0-2-4） */
-  affectedCredentials: z.number().int().min(0).nullable(),
+  /**
+   * `values` 里含任一 `removedKeys` 的**已存凭据条数**（全库口径）。
+   * ⚠️ 它是"**几条凭据里有值会被这次改动废掉**"，不是"几个 key"也不是"几个用户"。
+   */
+  affectedCredentials: z.number().int().min(0),
 })
 export type CredentialSchemaImpact = z.infer<typeof credentialSchemaImpactSchema>
 
@@ -585,8 +807,16 @@ export type CredentialSchemaImpact = z.infer<typeof credentialSchemaImpactSchema
  * **"本次没有任何需要提示的影响"**（既包括没提交模板，也包括提交了一份与现状等价的模板）。
  * 让"三个数组都空"的形态在线上出现，前端就得多写一个 `length === 0` 的分支，
  * 而那条分支与 `null` 分支做的事一模一样（P0-1-21 的"同一份数据两种形状"）。
+ *
+ * @param affectedCredentials `values` 里含 `removedKeys` 的已存凭据条数（**调用方查库得到**）。
+ *   ⚠️ **必填**（P0-2-4 定案）：它是"本函数不做 IO"与"这个数必须真实"之间的取舍 ——
+ *   纯函数保持可断言，而"必须给出真数"由签名强制（忘了传就编译不过，
+ *   而不是悄悄回一个 `null` 让界面以为"没人受影响"）。
  */
-export function credentialSchemaImpactOf(diff: CredentialSchemaDiff): CredentialSchemaImpact | null {
+export function credentialSchemaImpactOf(
+  diff: CredentialSchemaDiff,
+  affectedCredentials: number,
+): CredentialSchemaImpact | null {
   if (
     diff.removedKeys.length === 0 &&
     diff.addedKeys.length === 0 &&
@@ -594,8 +824,7 @@ export function credentialSchemaImpactOf(diff: CredentialSchemaDiff): Credential
   ) {
     return null
   }
-  // ⚠️ `affectedCredentials` 的**唯一**赋值点就在这里（本批恒 null，见 schema 的注释）
-  return { ...diff, affectedCredentials: null }
+  return { ...diff, affectedCredentials }
 }
 
 /**
@@ -773,3 +1002,16 @@ export const mcpServerIdParamsSchema = z.object({
   id: z.string().uuid('MCP server ID 不是合法 UUID'),
 })
 export type McpServerIdParams = z.infer<typeof mcpServerIdParamsSchema>
+
+/**
+ * 凭据端点的路径参数：`:serverId`。
+ *
+ * ⚠️ **名字是 `serverId` 不是 `id`**（所以不能复用上面那个）：凭据的主语是"**我的这一份**"，
+ * 路径里的 uuid 指向的是 **server**，行本身由 `(serverId, 我)` 推出来 —— 前端不该、也无法指定
+ * 凭据行 id（那会立刻引出"能不能删别人的行"这个问题，而答案是"根本没有这个入口"）。
+ * 少一个 `id` 就少一整类越权可能（`02` §4.7 的"收窄在 `user_id` 上，不在角色上"。
+ */
+export const mcpCredentialServerIdParamsSchema = z.object({
+  serverId: z.string().uuid('MCP server ID 不是合法 UUID'),
+})
+export type McpCredentialServerIdParams = z.infer<typeof mcpCredentialServerIdParamsSchema>

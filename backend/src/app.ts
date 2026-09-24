@@ -26,6 +26,7 @@ import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
+import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
 import { registerMcpServerRoutes } from './routes/mcpServers.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
@@ -163,8 +164,11 @@ export function buildApp(): FastifyInstance {
   // ⑫ MCP server 注册（P0-2-2）。权限是**登录即可**（`06` §4.2 的第五族，最接近知识库）——
   //    这里一个 `requireAdmin` 都没有，且路由/服务层都**刻意不做**"只有创建者能改删"的收窄
   //    （`mcp_servers.created_by` 只作**留痕**，理由见 routes/mcpServers.ts 文件头）。
-  //    ⚠️ 凭据那三条路由（`/api/mcp/credentials**`）属 **P0-2-4**，本批**不注册**。
   registerMcpServerRoutes(app)
+  // ⑬ MCP **用户级凭据**（P0-2-4）。同样是"登录即可"，但收窄**不在角色上、在 `user_id` 上**：
+  //    只能读写自己的那一份，ADMIN 也没有后门（`06` §4.2 的第四族，与 conversations 同源）。
+  //    ⚠️ 它与隔壁 ⑫ **并排**注册、权限却不同族 —— 差别写在 routes/mcpCredentials.ts 文件头。
+  registerMcpCredentialRoutes(app)
 
   return app
 }
