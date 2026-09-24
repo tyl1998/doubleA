@@ -125,6 +125,47 @@ export const MCP_SERVER_NAME_MAX = 128
 export const MCP_ENDPOINT_URL_MAX = 2048
 
 /**
+ * 工具名（下发给模型的 OpenAI `function.name`）的长度上限（**P0-2-6 定案**）。
+ *
+ * 取 64 而不是"各家 provider 里最长的那一档"：名字是**跨协议共用**的（`02` §9.7），
+ * 按最紧的一档算一次，将来接别家协议时不用重算。⚠️ 截断**只发生在产出侧**、且截断后
+ * 仍保证唯一（截断 + 序号）—— 若放任上游去截，模型回 `tool_calls` 时给的名字会与我们
+ * 登记的名字对不上，而那种失败**没有任何报错**（只是"找不到工具"）。
+ *
+ * 字符集口径同一条：`[A-Za-z0-9_-]`（见 `mcp/toolSchema.ts#sanitizeToolName`）。
+ */
+export const MCP_TOOL_NAME_MAX = 64
+
+/**
+ * 工具名前缀：`mcp_{slug}_{toolName}`（`02` §九）。
+ *
+ * ⚠️ 前缀是**必须的**：同一次请求里既有 MCP 工具（P0-2）也可能有平台内置工具（P0-3），
+ * 前缀让"这个名字属于哪一族"一眼可判，也顺手避开了与 `Object.prototype` 同名键
+ * （反向映射表是个普通对象）。
+ */
+export const MCP_TOOL_NAME_PREFIX = 'mcp_'
+
+/**
+ * 工具**描述**下发给模型时的长度上限（**P0-2-6 定案**）。
+ *
+ * 描述是进上下文的（每个工具一份），一个啰嗦的工具说明会直接挤掉对话本身；
+ * 1024 是"够写清用途与注意事项"的经验值。⚠️ 按**码点**截断（不是 UTF-16 码元）——
+ * `String.prototype.slice` 会把代理对劈成两半、产出非法字符串，而这一层毫无报错（P0-1-18）。
+ */
+export const MCP_TOOL_DESCRIPTION_MAX = 1024
+
+/**
+ * 非 object 根 schema 的**包装键名**（P0-2-6 坑预判 3 的处置）。
+ *
+ * OpenAI 的 `parameters` 必须是 object 根，而 MCP 工具的 `inputSchema` 理论上可以是
+ * 任意 JSON Schema ⇒ 遇到非 object 根时包成 `{ type:'object', properties:{ input: <原 schema> } }`。
+ * ⚠️ 这是一个**已知边界**：包装后模型会传 `{ input: … }`，而那个工具真正想要的是顶层标量 ⇒
+ * 这次调用**会失败**。之所以仍然包（而不是丢弃该工具）：包住至少"参数提示里的约束还在"，
+ * 用户能从工具卡片看到原始 schema 并去修服务端；丢了就只剩"这个工具神秘消失"。
+ */
+export const MCP_TOOL_WRAPPER_KEY = 'input'
+
+/**
  * 凭据模板的条目数上限。
  *
  * 定 64 的理由是**它同时是渲染上限**：`03` §4.4 的模板编辑器是一行一个参数的表单，

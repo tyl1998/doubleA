@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-5 工具发现（GET /:id/tools 加 ?refresh=1 真拉落库 / 拉不到时：有缓存回缓存 200 + cached:true、无缓存 502 / 纯读缓存零联网 / tools/list 不带用户凭据⇒缓存全员共享）',
+    step: 'P0-2-6 inputSchema → OpenAI function 转换（mcp_{slug}_{tool} 过 [A-Za-z0-9_-] 后截断 64 + 撞名加序号 / 反向映射表 OpenAI名→{toolName,serverId} / 只做三件有理由的兼容：剥 $schema、缺 type 补 object、非 object 根包一层（additionalProperties 等一律原样留）/ 超 MCP_TOOL_LIMIT 截断，告警由调用方打；纯函数未接线，接回点 P0-2-8）',
     address,
   })
   logger.info(
