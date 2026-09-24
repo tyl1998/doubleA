@@ -1342,3 +1342,51 @@
   gap: var(--sp-3) var(--sp-4);
   margin-bottom: var(--sp-3);
 }
+
+/* ============ MCP：模板编辑器 / 凭据分组 / ?serverId= 定位（P0-2-11） ============
+   三块都来自 `design/mcp.html` 的内联样式段（原型把 `.tmpl-row` / `.cred-group` 写在页面里，
+   因为那两个类**只属于这一页**）—— 落到本仓时放进 `app.css`，理由是 `index.css` 的导入顺序：
+   页面级 `<style>` 会被打包顺序挤到 `tokens.css` 之前（P0-1-35 踩过同一处）。
+   ⚠️ `.target-flash` 在原型里由 `design/scripts/app.js` 的一个类切花提供，本仓没有那份脚本
+   ⇒ 在这里补一条**只有 keyframes + 一次播放**的实现（它必须能重复触发：用户点两次同一个
+   「去配置凭据」链接时，第二次也得看得见 —— 所以动画挂在类上而不是挂载时执行一次）。
+   本节的三个类**都不含 `.ant-*` 选择器**，按 P0-1-31 的定案不需要 `:root` 前缀。 */
+.cred-group + .cred-group { margin-top: var(--sp-5); }
+
+.tmpl-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 132px auto;
+  gap: var(--sp-3);
+  align-items: center;
+}
+
+/* 定位目标的高亮：`?serverId=` 进来时滚动到这一组并闪一下边框。
+   用 `outline` 而不是 `border`：卡片自身已经有边框，加一条会把它撑宽 2px ⇒ 整列内容横向抖一下。 */
+@keyframes target-flash {
+  from { outline-color: var(--accent); }
+  to { outline-color: transparent; }
+}
+.target-flash {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  animation: target-flash 1.6s ease-out 1;
+}
+
+/* 端点地址那一格：等宽 + 允许在任意位置断开（长 URL 会把表格撑出横向滚动条） */
+.mcp-endpoint {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  word-break: break-all;
+}
+
+/* 表格里那一格「我的凭据」的小圆点徽标（原型 `.dot-badge`；本仓用 Tag 表达文本，圆点只做前导） */
+.cred-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: var(--sp-1);
+  border-radius: 50%;
+  background: var(--warn);
+  vertical-align: middle;
+}

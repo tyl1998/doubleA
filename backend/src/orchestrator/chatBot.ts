@@ -421,11 +421,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
            * `shared/src/conversation.ts`），而 `emit()` **序列化的是原对象、不是 `parsed.data`**
            * （zod 的 strip 只在 `parsed.data` 上生效）⇒ 一旦把 `arguments` 混进 payload 对象，
            * 它就会**原样出现在流里**。所以完整入参只在**落库那一份**上补（见下面 `toolRecords.push`）。
+           *
+           * ⚠️ **`serverId` 是 P0-2-11 加的**（`shared#toolCallRecordSchema` 的注释写了理由）：
+           * 前端工具卡的「去配置凭据」要跳到 `/mcp/credentials?serverId=…`，而 `serverName` 只是展示名。
+           * 它与 `serverName` **同源地**取自目录（`route.serverId`）⇒ 两者要么都在、要么都不在；
+           * `route === undefined`（模型报了一个我们没下发的工具名，见下面那段收尾）时两个都缺 ——
+           * 那时卡片本来就没有"哪台 server"可指，跳转按钮也不会出现。
            */
           const base = {
             callId: call.id,
             toolName: call.name,
             serverName,
+            ...(route === undefined ? {} : { serverId: route.serverId }),
             kind: 'MCP' as const,
           }
           const parsed = parseToolArguments(call.arguments)

@@ -63,10 +63,12 @@ import {
   useConversationMessages,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
+import { confirmConversation } from '../../api/mcp.js'
 import { useFeedback } from '../../app/feedback.js'
 import { HOME_PATH, agentEditPath, chatPath } from '../../app/paths.js'
 import { TableSkeleton } from '../../components/ListStates.js'
 import { ChatInput } from '../../features/chat/ChatInput.js'
+import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/confirmModel.js'
 import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MessageList } from '../../features/chat/MessageList.js'
@@ -136,6 +138,8 @@ export function ChatPage() {
 
   const [draft, setDraft] = useState('')
   const [aligning, setAligning] = useState(false)
+  /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
+  const [confirmPending, setConfirmPending] = useState(false)
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
   const frameRef = useRef<HTMLDivElement>(null)
   /**
@@ -276,6 +280,53 @@ export function ChatPage() {
         setAligning(false)
       })
   }, [align, feedback])
+
+  /**
+   * 答复确认卡（P0-2-11）。
+   *
+   * ─────────────────────────────────────────────────────────────────────
+   * 三条顺序推理（写在这里，因为它们是"为什么这么写"而不是"写了什么"）
+   * ─────────────────────────────────────────────────────────────────────
+   * ① **无论成败都收卡**（`finally`）：这一次答复要么被服务端消费了、要么那个提问已经不存在
+   *    （`applied:false`）—— 两种情况都不该让卡片继续挂在输入区上问同一个问题。
+   *    留在那里的后果很具体：用户会以为没点上而反复点，而每次都只拿到一句"没生效"。
+   * ② **成功路径分两个通道**：`applied:true` ⇒ 成功提示（"已确认，工具继续执行" /
+   *    "已取消，这个工具不会执行"）；`applied:false` ⇒ **中性提示**（`note`），
+   *    因为它是"这个提问已经结束了"，**不是错误**（`shared#confirmConversationResultSchema`）。
+   *    用红色报它会让用户去处理一个必然存在的竞态。
+   * ③ **`conversationId` 缺失时直接返回**：确认卡只可能出现在"有会话、有流在跑"的时候，
+   *    但类型上它是可选的（新会话态）—— 少了这个守卫，TS 会拦（这也是它该拦的：
+   *    应答端点 `/api/conversations/:id/confirm` 的路径里必须有 id）。
+   *
+   * ⚠️ 卡片上显示的 `expiresAt` 与这里的应答是**两件事**：前端到点只把按钮禁用
+   * （读数变"已超时"），**不自己撤卡、也不代替服务端做"超时即取消"**。真正的收口在服务端。
+   */
+  const handleConfirmAnswer = useCallback(
+    (accepted: boolean): void => {
+      const confirm = useChatStreamStore.getState().round?.confirm
+      if (confirm === undefined || confirm === null) return
+      if (conversationId === undefined) return
+
+      setConfirmPending(true)
+      void confirmConversation(conversationId, { confirmId: confirm.confirmId, accepted })
+        .then((result) => {
+          const ignored = confirmIgnoredNote(result.applied)
+          if (ignored === null) feedback.ok(confirmAnsweredText(result.accepted))
+          else feedback.note(ignored)
+        })
+        .catch((error: unknown) => {
+          // 请求自己失败了（网络层 / 401 / 404）。**卡片照样在 `finally` 里收掉**：
+          // 悬着一张卡会挡住输入区（确认态是**锁输入**的），而用户此时真正需要的是
+          // "能继续用这个页面"；他要是还想确认，服务端那边的等待窗口也还在（`expiresAt`）。
+          feedback.fail(error, '确认没有发出去')
+        })
+        .finally(() => {
+          setConfirmPending(false)
+          useChatStreamStore.getState().clearConfirm()
+        })
+    },
+    [conversationId, feedback],
+  )
 
   // ── 侧栏（P0-1-34）的三个动作 ──────────────────────────────────────────────
 
@@ -454,6 +505,8 @@ export function ChatPage() {
             void submit()
           }}
           onStop={handleStop}
+          onConfirmAnswer={handleConfirmAnswer}
+          confirmPending={confirmPending}
         />
       </main>
     </div>

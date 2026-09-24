@@ -33,6 +33,7 @@
 import type {
   ChatFinishReason,
   CitationItem,
+  ConfirmSource,
   SseDonePayload,
   SseEvent,
 } from '@doubulea/shared'
@@ -99,11 +100,28 @@ export interface StreamRound {
    */
   assistantMessageId: string | null
   /**
-   * 待应答的确认（`02` §六 第 4 步：`confirm` 事件到达 ⇒ 锁输入区）。
-   * ⚠️ **P0 阶段恒为 `null`**：`confirm` 的产生方是 MCP 工具的危险判定，属 **P0-2**；
-   * 它的应答端点 `POST /:id/confirm` 也属 P0-2。归约与渲染先就位，产生路径等那一批。
+   * 待应答的确认（`02` §六 第 4 步 / §9.10：`confirm` 事件到达 ⇒ 锁输入区）。
+   *
+   * ⚠️ **P0-2-11 起它真的会被填上**（产生方是 P0-2-9 的危险判定闸门与 MCP 的
+   * `elicitation/create`，两个都在 P0-2-10 落地）。归约体没变 —— `event.data` 本来就是
+   * `sseConfirmPayloadSchema` 的完整输出，只是**这个类型声明原先收窄成三个字段**，
+   * 于是 `ConfirmCard` 读不到 `source` / `expiresAt`。
+   * ⇒ 本批把类型补成完整载荷（**这正是一个"类型比事实窄"的坑**：归约层一直带着它，
+   * 只是声明层把它藏了起来）。
+   *
+   * ⚠️ 倒计时**只读 `expiresAt`**（服务端给的绝对时刻），前端**不另起一个 120s**
+   * （`06` P0-2-11 坑预判 3）：两边只要有一点点差（网络、时钟、重连）就会变成
+   * "界面说还没到、服务端已按取消处理"，而用户看到的是"我点了确认但什么都没发生"。
    */
-  confirm: { confirmId: string; toolName: string; inputSummary: string } | null
+  confirm: {
+    confirmId: string
+    /** 谁在问（`PLATFORM` = 平台危险判定；`SERVER` = MCP server 反向发起）—— 只决定说明文案 */
+    source: ConfirmSource
+    toolName: string
+    inputSummary: string
+    /** 服务端这次等待的截止时刻（ISO 8601） */
+    expiresAt: string
+  } | null
   /**
    * 沙箱排队位次（`queued` 事件，**1 = 下一个**）。
    * ⚠️ **P0 阶段恒为 `null`**：产生方是沙箱并发闸，属 **P0-3**（`CHATBOT_CONCURRENCY` 满时

@@ -84,13 +84,20 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 与组件绑定从 P0-1-22/23 起；**会话管理从 P0-1-25 起；SSE 出口（发消息 / 停止 / 互斥 / 心跳）从 P0-1-26 起；ChatBot 编排循环（检索块 / 流式透传 / 引用 / 落库 / 并发闸）从 P0-1-27 起；消息历史（游标分页 / `content` 原样透出）从 P0-1-28 起**；对话包验收从 P0-1-29 起；**前端从 P0-1-30 起**；**知识库页面的判据从 P0-1-35 起**；**管理页的判据从 P0-1-36 起；上游协议扩展（Provider `protocol`：OpenAI Responses / Anthropic 原生 Messages）从 P0-1-37 起**；**MCP client 从 P0-2-1 起；MCP server 注册与连通测试从 P0-2-2 起**）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 与组件绑定从 P0-1-22/23 起；**会话管理从 P0-1-25 起；SSE 出口（发消息 / 停止 / 互斥 / 心跳）从 P0-1-26 起；ChatBot 编排循环（检索块 / 流式透传 / 引用 / 落库 / 并发闸）从 P0-1-27 起；消息历史（游标分页 / `content` 原样透出）从 P0-1-28 起**；对话包验收从 P0-1-29 起；**前端从 P0-1-30 起**；**知识库页面的判据从 P0-1-35 起**；**管理页的判据从 P0-1-36 起；上游协议扩展（Provider `protocol`：OpenAI Responses / Anthropic 原生 Messages）从 P0-1-37 起**；**MCP client 从 P0-2-1 起；MCP server 注册与连通测试从 P0-2-2 起**；**MCP 页面的判据（MCP 管理页 / 我的凭据页 / 确认卡）从 P0-2-11 起**）
 
 > ⚠️ **2026-09-24：本节的验收脚本已全部移除**（`backend/scripts/**` 连同假上游夹具由用户删除，
-> 两个 `package.json` 里 26+26 条指向它们的 `verify:*` / `serve:upstreams` 条目也一并清掉）。
+> `package.json` 里 26+26 条指向它们的 `verify:*` / `serve:upstreams` 条目也一并清掉 ——
+> 清的是**根**与**后端**那两处，`frontend/package.json` 里那几条**没动**，见下面的订正）。
 > **验收改走人工端测**：命令与「看什么」见下文「手工端测 · 命令行」与「浏览器端测」两族小节 ——
 > 那是**现在唯一有效的验收入口**。下面块里保留的只有静态检查与批次自检；
 > 历史上那些 `verify:*` 的名字**只作记录**（用来记住各批「当年验过什么」），照着敲会报 `Command not found`。
+>
+> ⚠️ **订正（2026-09-24，P0-2-11 回写时发现）**：上面那句只对**后端/接口级**的 `verify:*` 成立。
+> **前端有四档无依赖纯逻辑档仍然存在且可跑** —— `pnpm verify:chat-sse` / `verify:knowledge-ui` /
+> `verify:admin-ui` / `verify:mcp-ui`（`frontend/scripts/*.mjs`，跑源码、**不起后端、不起浏览器、不经 vite**）。
+> ⚠️ 但**"存在 ≠ 要跑"**：按用户 2026-09-24 定案，**验收一律人工端测**，智能体不再把这几档当收尾动作；
+> 它们的价值是"判据与契约接对了"这一层，**不证明**界面点得动。
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
@@ -98,8 +105,11 @@ pnpm -r typecheck      # tsc strict（三包：shared / backend / frontend）
 pnpm -r build          # 三包依次产出 dist
 pnpm check:batch       # 批次标识自检：docs/06 最后一个 [✓] 的批次号 vs index.ts 启动信封的 step（不一致即 exit 1）
 #
-# ⚠️ 历史上还有一整套 `pnpm verify:***`（接口级 / 数据层 / 会话 / 各包验收 / 前端纯逻辑档）。
-#    它们已于 2026-09-24 随脚本一起移除 —— 现在敲任何一个都会 Command not found。
+# ⚠️ 历史上还有一整套 `pnpm verify:***`（接口级 / 数据层 / 会话 / 各包验收）。
+#    其中后端那批已于 2026-09-24 随 `backend/scripts/**` 一起移除 ⇒ 敲它们报 Command not found。
+#    ⚠️ 例外：前端四档无依赖纯逻辑档**还在**（verify:chat-sse / knowledge-ui / admin-ui / mcp-ui）——
+#    可跑，但按用户定案「验收一律人工端测」，**存在 ≠ 要跑**（见上一段的订正）。
+pnpm verify:mcp-ui     # P0-2-11 前端 MCP 页 / 凭据页 / 确认卡 判据档（53 项，跑源码）
 ```
 
 > `pnpm verify:app` 会在构建产物上跑：/health 三项探活、Zod 校验失败的字段明细、领域错误、
@@ -450,7 +460,7 @@ curl -s --noproxy '*' http://127.0.0.1:13000/health | jq .
 | `GET /api/model-providers/:id/remote-models` | **拉取该配置的上游实际提供的模型列表**（仅 ADMIN；通则 `GET {baseUrl}/models`，**只读探测不落库**；不要求 Provider 启用、也不要求配 Key） |
 | 其余 `/api/**` | P0-1-10 起逐个落地（未注册路由得到统一信封 404）。数据模型（P0-1-5 ✅）、会话（P0-1-6 ✅）、认证（P0-1-7 ✅）、用户管理（P0-1-8 ✅）、**种子脚本 + 端到端验收（P0-1-9 ✅）** 已就位 |
 
-### 起前端（P0-1-30 起：登录页 + 强制改密 + 路由守卫 + 全局布局；P0-1-31/32 起：智能体列表、对话页；P0-1-35 起：知识库列表 + 详情页 + 检索测试；**P0-1-36 起：用户管理 + 模型池管理页 —— 包 G 七批全落地，只剩 `/mcp`、`/mcp/credentials` 是占位页**；**P0-1-37 起：模型池 Provider 可选上游协议（OpenAI 兼容 / OpenAI Responses / Anthropic 原生 Messages）—— 表单多「上游协议」下拉、Provider 表多「上游协议」列，`EMBEDDING` 类型不给选非兼容协议**）
+### 起前端（P0-1-30 起：登录页 + 强制改密 + 路由守卫 + 全局布局；P0-1-31/32 起：智能体列表、对话页；P0-1-35 起：知识库列表 + 详情页 + 检索测试；P0-1-36 起：用户管理 + 模型池管理页；**P0-1-37 起：模型池 Provider 可选上游协议（OpenAI 兼容 / OpenAI Responses / Anthropic 原生 Messages）—— 表单多「上游协议」下拉、Provider 表多「上游协议」列，`EMBEDDING` 类型不给选非兼容协议**；**P0-2-11 起：MCP 管理页 + 我的凭据页 —— `/mcp`、`/mcp/credentials` 两条占位页换成真页面，`03` §二 的 P0 十条路由至此全部落地、界面里再没有 `BatchPlaceholderPage`**）
 
 ```bash
 # 必须显式带代理目标：vite.config.ts 里 /api 的默认值是 localhost:3000，
@@ -690,6 +700,60 @@ VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend   # → http://lo
 > 跑的是状态/操作矩阵/请求体三态/Key 三态/协议下拉与三态守卫/409 守卫/分组顺序/删除分级/源码级守门等**判据**，**不起浏览器、不起真后端、也不经 vite**）
 > ⇒ 它只证明"判据与契约接对了"。**"建号真的能登进去、Key 真的存进去了、上游真的能连上"** 不在这里：
 > 分别归 `pnpm verify:app`（用户接口）/ `pnpm verify:model-providers`（Key 加密与脱敏）/ `pnpm verify:llm`（上游连通，**含 P0-1-37 的三种协议**）。
+
+### 浏览器端测 · MCP（⭐ **阶段二唯一的浏览器端测点**：P0-2-11 起）
+
+**前置**（三样都得有，缺一样就走不到后半段）：
+1. 同「浏览器端测」首节：**依赖服务 + 迁移 + 后端（13000）+ 前端（5174）**两个进程都起着；
+2. **一台可注册的 MCP server** —— 直接用「手工端测 · 命令行」**㉒/㉓ 里那个内联假上游**（另开一个终端跑着它）。
+   它是 Streamable HTTP 单 URL，正好当"一台真的 server"用；
+3. ⭐ **一个会主动要工具的"模型"** —— ⚠️ **最容易漏的一步**：**真模型不会主动去调一个刚注册的工具**。
+   所以在 `/admin/models` 建一个 Provider 指向 **㉓ 里那个假 LLM**（它按帧序要求"拿到工具结果之后才给正文"），
+   再用它建一个 `CHAT` 模型 + 一个智能体。
+   ⇒ **只做 1、2 也能测"建 server / 填凭据 / 工具清单"，但"对话里触发工具"这一步走不到。**
+
+⚠️ 本批**不做代码语法高亮**之类的无关项；也**不需要真厂商**（用假 LLM）。
+
+| # | 该测的路径 | 预期 |
+|---|-----------|------|
+| ① | 左侧导航点「MCP」 | 是**真列表页**（不再是"属哪个批次"的占位说明）；顶部一条 Alert 说明**任何登录用户都可以注册 / 修改 / 删除**（第五族权限，与模型池只有 ADMIN **刻意相反**）；右上角有「我的凭据」入口，带**未配置数量**徽标 |
+| ② | 点「注册 server」：填名称 + endpoint（假上游的 URL）+ 在**模板编辑器**里加一行（`token` / 说明 / 注入位置选 **请求头（HEADER）**）→ 保存 | 提示「已注册…」；列表出现该行。⚠️ **工具数列此时显示 `—`**（**没测过 = 说不出来**，不是 `0`）；状态列写「**未测试**」（不是「异常」） |
+| ③ | 点该行「测试」→ 再点「工具数」那一列 | 测试成功给一条提示（⚠️ **`/:id/test` 恒 200**，连不上是**结论**不是报错）；工具数变成真数字；工具清单弹窗列出 `echo` / `boom` / `purge` 等，底部标「**刚刚拉取**」；**关掉再点开** ⇒ 标「**来自缓存**」；点「重新拉取」⇒ 又是「刚刚拉取」 |
+| ④ | 点「我的凭据」 | 未配置的 server **置顶**并红字列出缺哪些参数；**只填 `token` 一个 key** → 「保存该 server 的凭据」⇒ 成功 |
+| ⑤ | ⭐ 回 `/mcp`，编辑该 server，**再加一行** `site`（注入位置选 **查询参数（QUERY）**）→ 保存 | 保存成功后弹一句影响提示，含「新增的参数：site（需要在「我的凭据」里填）」并**必须**带「**已填的值不会被自动清理**」；⚠️ **不许出现「已清理」「已删除」**（那是承诺，系统只提示不清理） |
+| ⑥ | ⭐ 回凭据页 | 已存的 `token` 显示「**已配置 ✓**」+ **一个空输入框**（占位符「留空 = 不变」）；⚠️ **空框是对的、不是丢了**（凭据永不下发、连掩码都不给）。**这次只填 `site` 保存** ⇒ 再回来：**`token` 与 `site` 两个都显示已配置** —— 这就是"**只填一个 key 保存、再回来另一个 key 仍在**" |
+| ⑦ | 建/编智能体，看第 4 区的 MCP 多选框 | 是真多选框（不再是一句空态说明）；勾选后保存成功。若当前用户**没配**该 server 的凭据，勾选项旁有「未配置凭据」红点 + 「去配置凭据」链接 |
+| ⑧ | 点⑦那个「去配置凭据」 | 跳到 `/mcp/credentials?serverId=…`，页面**自动滚到该 server 的分组**并**高亮闪一下**（不是停在页面顶部） |
+| ⑨ | 用该智能体进对话页，发一句会触发工具的话 | 看到**工具卡状态流转**（运行中 → 成功）；展开能看到入参与出参摘要 |
+| ⑩ | ⭐ 触发**危险工具**（假上游里的 `purge` —— 它**没有**声明"只读"） | **输入区被锁**、确认卡**弹出来**：倒计时**在真的倒数**、说明行写着这是**平台按危险判定**发起的确认（`PLATFORM`） |
+| ⑪ | **点「取消」** | 卡消失；工具卡变**失败**并写着"用户已取消（未执行）"；**模型继续回答**、这一轮正常收尾（⚠️ **不是**整轮失败 —— 取消后流程可继续） |
+| ⑫ | 再触发一次，**点「确认」** | 工具**真的执行**（假上游终端里的请求计数 **+1**），工具卡变成功 |
+| ⑬ | 再触发一次，**什么都不点**，等倒计时走完 | 读数停在「**已超时**」、两个按钮变灰（那正是此时的事实：点了也只会拿到 `applied:false`）；服务端按取消处理，**流程照样继续**。想快点看这条：给后端注入 `MCP_CONFIRM_TIMEOUT_SEC=2` 再重启 |
+| ⑭ | **刷新页面**看刚才那一轮 | 历史里的工具卡**还在**（`tool_calls` 落库并在 `messageToView` 里还原）；⚠️ **确认卡不会自己回来**（那一轮已经往下走了，这不是 bug） |
+| ⑮ | 回 `/mcp` 编辑 server，**删掉** `site` 那一行 → 保存 → 回凭据页 | 影响提示说「已移除的参数：site …」+「已填的值将**不再被注入**」；而凭据页里**那个 key 的已填值仍在**（只是不再被注入）—— 这就是「**不会被自动清理**」的实证 |
+
+**已知边界（别当 bug）** —— P0-2-11 之后：
+- ⚠️ **真模型不会主动给一个陌生工具发调用**（见前置 3）⇒ "对话里触发工具"必须用假 LLM 或明确的提示词；
+- ⚠️ **`source=SERVER` 的确认卡（MCP 反向发起的 `elicitation/create`）本档验不到** —— 与命令行档 ㉓/㉔ 同一条边界，
+  假上游不发 elicitation（所以卡片上那句"由服务端发起"的文案，两种来源里只有一种能被你看到）；
+- **「工具数」列在没测过之前是 `—` 不是 `0`**：`0` 的含义是"拉过、真的没有工具"（两个不同的结论）；
+- **状态列的「未测试」不是「异常」**：没握过手就是没握过手；
+- **凭据值永远不回填**（空框 + 「已配置 ✓」是对的）；**「清除凭据」是另一个显式动作**（不是"把框清空再保存"）；
+- **凭据保存是合并语义**（只动你这次填的 key）—— 与智能体 `components` 的**整体替换**刻意相反：
+  不可回填的字段只能合并；因此"留空"= 不变，绝不能被当成"清空"；
+- **模板校验与后端是同一份**：`key` 撞平台保留头（`accept` 等）/ 含空格 `QUERY` 名含 `&=`/`BODY` 名撞 `jsonrpc`·`id`·`method`·`params`/ 同模板内重名 —— 都会在**行内当场报红**，不会等到提交后 400；
+- **删除一台被别的智能体绑着的 server 会 409**（那是"先解绑"的信号，不是坏了）；
+- **两台 server 的 `name` 可以重名**（展示名而已）⇒ 定位到分组靠的是 `serverId`，不是名字。
+
+> **⚠️ 这一节证明什么、不证明什么**：智能体侧**没有**代跑浏览器（用户 2026-09-23/24 定案）。
+> 判据侧只有**无依赖纯逻辑档** `pnpm verify:mcp-ui`（**53 项**：凭据表单"只改一个 key"的请求体合并语义 /
+> 未配置计数与置顶排序 / `?serverId=` 的滚动目标 / 模板编辑器增删行与校验 / server 表单"没改就不发" /
+> 列表三个读数 / 确认卡倒计时文案与取消分支 / 逐个错误码→文案 —— 全是**纯函数**，**不起浏览器、不起后端、不经 vite**）
+> ⇒ 它只证明"**判据与契约接对了**"。**表格长什么样、滚动有没有真的发生、按钮点得动**，
+> 只在**你自己动手**的这一刻才算数。
+> ⚠️ **真后端那一半**（注册的 400 文案、`PATCH` 的影响计数、`/:id/test` 恒 200、`/:id/tools` 的 502 与
+> "有缓存就 200"）归「手工端测 · 命令行」**㉒/㉓** 的内联假上游，**不归本档**。
+> ⚠️ 本节的门槛**尚未取证** —— 它是 P0-2-12（P0-2 包验收）的前置。
 
 ### 阶段一出口验收（人工 · P0-1-38 收尾；`01` §五 阶段一，7 条门槛）
 
@@ -2158,31 +2222,31 @@ doubuleA/
 │   │   └── infra/                 ← logger.ts（P0-1-3 ✅）+ pg/redis/s3.ts（P0-1-4 ✅）
 │   │                                + prisma.ts（客户端单例，P0-1-5 ✅）
 │   │                                + crypto.ts（AES-256-GCM + bcrypt，P0-1-6 ✅）
-│   └── scripts/                   ← verify-app.mjs（不占端口）+ verify-db.mjs（真实 PG）
-│                                     + verify-session.mjs / verify-auth.mjs / verify-users.mjs（真实 PG+Redis）
-│                                     + verify-model-providers.mjs / verify-models.mjs（真实 PG+Redis）
-│                                     + verify-llm.mjs（真 HTTP 假上游 + 真实 PG+Redis）
-│                                     + verify-embedding.mjs（真 HTTP 假上游 + stub 运行时，**无依赖**）
-│                                     + verify-knowledge.mjs（**只需真实 PG**：扩展/特殊索引/migrate diff）
-│                                     + verify-e2e.mjs（自起真实进程）
+│   └── scripts/                   ← ⚠️ **空目录**：原有的一整套 verify-*.mjs 与假上游夹具
+│                                      **2026-09-24 由用户删除**（空目录还在 ⇒ 别再往里放东西）。
+│                                      验收入口改走本 README 的「手工端测 · 命令行」与「浏览器端测」两族
 ├── frontend/                      ← @doubulea/frontend（独立构建，→ frontend/dist 纯静态）
 │   ├── src/app/                   ← 路由+守卫 / 布局外壳（含专注布局与「工作台」下拉）/
-│   │                                nav.ts 导航单一来源 / paths.ts / feedback.ts 错误码→文案 /
-│   │                                theme.ts / format.ts 时间读数唯一来源 /
+│   │                                nav.ts 导航单一来源 / paths.ts（含 mcpCredentialsPath）/
+│   │                                feedback.ts 错误码→文案 / theme.ts / format.ts 时间读数唯一来源 /
 │   │                                confirm.ts 逐字确认判据（P0-1-36 ✅ 四处消费方共用）
-│   ├── src/pages/                 ← login / agents / chat / knowledge / settings / admin（P0-1-36 ✅）
-│   │                                —— `agents/` `knowledge/` `admin/` **各带一个零依赖纯逻辑文件**
-│   │                                   （agentModel / knowledgeModel / adminModel）
-│   ├── src/features/chat/         ← 对话域组件 + **八个零依赖纯逻辑文件**（P0-1-32~34 ✅）
+│   ├── src/pages/                 ← login / agents / chat / knowledge / mcp / settings / admin
+│   │                                —— `agents/` `knowledge/` `admin/` `mcp/` **各带一个零依赖纯逻辑文件**
+│   │                                   （agentModel / knowledgeModel / adminModel / **mcpModel**）
+│   │                                   ⚠️ P0-2-11 起 `/mcp` 与 `/mcp/credentials` 是真页面，
+│   │                                   界面上**再没有** `BatchPlaceholderPage`
+│   ├── src/features/chat/         ← 对话域组件 + **十个零依赖纯逻辑文件**（P0-1-32~34 ✅；P0-2-11 加 confirmModel）
 │   ├── src/api/                   ← 按模块请求封装（TanStack Query 底座）；client.ts 统一信封 → ApiError
 │   │                                （另含 requestFormData / requestBlob / fileNameFromContentDisposition
 │   │                                  三个**非 JSON 形态**通道，P0-1-35 ✅）
+│   │                                + mcp.ts（MCP 六端点 hooks + `confirmConversation`，P0-2-11 ✅）
 │   ├── src/stores/                ← zustand（ui 主题、chatStream 流状态）
 │   ├── src/styles/                ← tokens.css 令牌唯一来源 / base.css / app.css（只放结构）
 │   └── scripts/                   ← **无依赖验收档**：verify-chat-sse.mjs（P0-1-32 ✅）/
-│                                    verify-knowledge-ui.mjs（P0-1-35 ✅）/ verify-admin-ui.mjs（P0-1-36 ✅）
+│                                    verify-knowledge-ui.mjs（P0-1-35 ✅）/ verify-admin-ui.mjs（P0-1-36 ✅）/
+│                                    **verify-mcp-ui.mjs（P0-2-11 ✅）**
 │                                    —— `node --import tsx` 直跑**源码**，不起浏览器/不起后端/不经 vite
-│                                       （⚠️ 三档都只证明"判据与契约接对了"）
+│                                       （⚠️ 四档都只证明"判据与契约接对了"；且**存在 ≠ 要跑**）
 ├── infra/                         ← docker-compose + 自建 PG 镜像 + 启停脚本（P0-1-2 ✅）
 │   ├── docker-compose.yml         ← postgres / redis / minio
 │   ├── postgres/Dockerfile        ← pgvector + 源码编译 pg_bigm
@@ -2262,3 +2326,4 @@ doubuleA/
 | 2026-09-24 | — | **P0-2-8 完成（P0-2 工具闭环 8/12）· 🎯 工具闭环的「整条链」首次在命令行层跑通**：编排循环接工具调用 + 10 轮上限。**手工跑法见「手工端测 · 命令行」㉓**（内联假 LLM 吐分片 `tool_calls` + 内联假 MCP 执行 `tools/call`，两段 `node --input-type=module -e '…'` 前台常驻、**不依赖仓库里有夹具文件**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/conversation.ts`（`tool_calls` **从"刻意不定型"升级为定型**：迁入 `TOOL_CALL_KINDS`/`TOOL_CALL_STATUSES` + 新增 `toolCallRecordSchema` + `messageContentSchema` 加 `tool_calls`；**判据 = 写入端与读取端都已落地**）；`shared/src/sse.ts`（`sseToolCallPayloadSchema` 改为 `toolCallRecordSchema.omit({arguments:true})` **派生**，两常量**刻意不再导出** —— `export *` 会让同名变"歧义名"）；`backend/src/llm/protocol.ts`（**本批最大改动**：工具调用抽象 —— `ChatToolCall`/`ToolCallChunk`/分片累积器 `ToolCallBuffer`/`parseToolArguments`（空串⇒`{}`、非法 JSON⇒`{ok:false,reason}`、**不猜**）/`sumUsages`（多轮**相加**，与 `mergeUsage` 的"同一次调用的两半**覆盖**"刻意不同）+ 三协议各自的工具定义形状与**结果回填形态**：OpenAI `role:'tool'`+`tool_call_id`、Responses `function_call`/`function_call_output` item、Anthropic 把 `tool_result` **合成一条 user 消息** + 相邻同角色合并）；`backend/src/llm/client.ts`（`tools` 选项 + `toolCalls` 汇总 + **同一个累积器**在 `chat()`/`chatStream()` 都用、半成品不外泄）；`backend/src/services/mcpCall.service.ts`（新增 `resolveMcpToolCatalog`（读 `tool_cache`、**不联网不碰凭据**、`taken` 逐台累积去重）+ `executeMcpToolCall`（`resolveMcpCallContext` → connect → `callTool` → `finally close()`））；`backend/src/orchestrator/chatContext.ts`（工具结果 → 消息的**纯函数**：`truncateToolResult`(8000)/`summarizeToolInput`(200, 凭据形状遮值)/`buildToolResultMessages`/`buildAssistantToolCallsMessage`/`TOOL_LOOP_LIMIT_NOTICE`/历史**成对**还原）；`backend/src/orchestrator/chatBot.ts`（**核心**：`for(;;)` 工具循环 + `toolRecords` 落进助手消息 `content`）；`backend/src/index.ts`（信封 `step`）。**六条最值得记的**：① ⚠️ **流式 `tool_calls` 是"分片累积"的** ⇒ **绝不能在第一片 `JSON.parse`**（`arguments` 是不完整 JSON，**不报错、只解析出空参数**）；② ⚠️ **工具结果报文形态跨协议全不同** ⇒ 编排层只吐协议无关的 `role:'tool'`，**手拼报文一律归 `buildBody`**（否则"换协议就调不动工具"且 `verify:llm` 不会红）；③ **工具失败 ≠ 这一轮失败**：`isError`/缺凭据 424/上游 502/504 全变 `tool_call{ERROR}` + 回填给模型自己解释，**唯一例外是中断**（`McpAbortError`）；④ **"还允不允许要工具"的判据是"已执行了几轮"**（到 10 轮**当轮撤掉 `tools`** + 注一次提示；模型仍硬报就只能收尾）；⑤ ⚠️ **历史还原必须"成对"**（半截记录 = 400 ⇒ **整段丢**，否则"这个会话从此再也发不出消息"且指不到那一行）；⑥ **凭据主语来自"当前会话"**（`viewer.userId` 懒加载现查）。**已知边界（同时写进 `02` §6.3）**：**危险判定不做**（属 P0-2-9，接回点已预留在取凭据与发 `RUNNING` 卡**之前**）⇒ 工具一律直接执行；一轮多调用**按顺序**执行；还原顺序是 `assistant{正文+toolCalls}` → `tool{结果}`（**最终正文排在工具结果之前** ⇒ 保真度折损，别当 bug）；`usage_records` 仍属 P1。**取证方式**：⚠️ 本批**无自动化验收档**（脚本与夹具已删）；**未跑 typecheck/build/回归/浏览器**；命令行人工程序 = `README` ㉓。**下一步 = P0-2-9**（危险判定 `mcp/risk.ts` 纯函数）。 |
 | 2026-09-24 | — | **P0-2-9 完成（P0-2 工具闭环 9/12）：危险判定（`annotations` ⇒ 平台侧强制确认）** —— ⚠️ **本批只做"判定"，"确认"（弹卡等应答）仍属 P0-2-10** ⇒ **不是端测里程碑**、命令行与界面都验不到新东西（**所有工具仍然一律直接执行**）。**新增** `backend/src/mcp/risk.ts`（纯函数 `isDangerousTool(tool)`，**只有一条 `import type`** ⇒ 真值表断言不需要起依赖）。判据一句话：**`readOnlyHint === true` 且 `destructiveHint !== true` ⇒ 安全，其余（含读不出注解）一律危险** —— 即"**拿不准就确认**"。⚠️ **唯一超出"新增一个文件"的改动**：`mcp/toolSchema.ts` 的 `McpToolRoute` 多了 **`dangerous: boolean`**（`toOpenAiTools` 里算好，因为判定要用工具自己的 `annotations`、而描述符只有那个函数手上才有）；它**不进** `OpenAiFunctionTool`（是我们的策略、不是给模型的提示）。**四条取舍**：`annotations` **服务端自报、不可信**（`readOnlyHint: true` 即可绕过 ⇒ P0 边界到此、平台强制名单属 P1）／判定输入是**这个工具**不是这台 server／`idempotentHint`·`openWorldHint` **刻意不参与**／**严格 `=== true`**、非布尔按缺失（宽松写法会让拼错类型的 server 静默拿到"只读"资格，而症状是"确认卡该弹没弹"）。**取证**：`/tmp` 临时脚本 + `node --import tsx` 真 import，**55 条断言 ALL PASS**（3×3 全枚举 + 两个 hint 的不变量 + 非布尔 + 读不出注解 + 真实描述符 + **接线 6 组**）；首跑红 9 条**全是核查脚本自己把"安全"当成了返回值**，实现零改动；**未跑构建/回归/浏览器**。回写：`docs/02` 新增 **§9.9** 判定表 + §十 一行；`docs/06` 进度 **9/12**。**下一步 = P0-2-10**（`POST /:id/confirm` + 挂起 + 120s 超时按取消） |
 | 2026-09-24 | — | **P0-2-10 完成（P0-2 工具闭环 10/12）：elicitation 确认流（`confirm` 事件挂起 + `POST /:id/confirm` 应答 + 120s 超时按取消）** —— **手工跑法见「手工端测 · 命令行」㉔**（承接 ㉓ 的同一台内联假上游，不用重起；`purge` 工具**刻意不声明 `annotations`** 故按真值表判为危险。⚠️ ㉓ 里 `echo`/`boom` 那两行 `annotations: { readOnlyHint: true }` 是**本批加的**、不是装饰：**删掉它们，㉓ 整节会变成"每调一次工具先弹一次确认"**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/sse.ts`（`CONFIRM_SOURCES = ['PLATFORM','SERVER']` + `sseConfirmPayloadSchema` 增量 **`source` / `expiresAt`** + 新增 `confirmRequestBodySchema` 与 `confirmConversationResultSchema`）、`shared/src/conversation.ts`（活跃流快照加**第四个字段** `pendingConfirmId` —— `EMPTY_ACTIVE_SNAPSHOT` / `parseActiveSnapshot` / zod schema **三处一起改**）、`backend/src/infra/redis.ts`（`chatConfirmKey` = `chat.confirm:{id}` + `CHAT_CONFIRM_TTL_SEC = 60`；**值是结构化的**而不是布尔）、`backend/src/orchestrator/sse.ts`（**核心**：`ConfirmQuestion` / `ConfirmDecision`（`CONFIRMED` 与 `REJECTED` 与 `TIMEOUT`）/ `parseConfirmAnswer` / `clearConfirmSignal` / `answerConfirm` + `SseChannel#awaitConfirm` 与 `#waitForConfirm` + `ChatProducerInput` 多一个 `awaitConfirm` 成员；`stopPollIntervalMs` 改名 `signalPollIntervalMs` 两类信号共用）、`backend/src/orchestrator/chatContext.ts`（`TOOL_CONFIRM_REJECTED_OUTPUT` / `TOOL_CONFIRM_TIMEOUT_OUTPUT` 两个常量，**刻意分开**）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext` / `executeMcpToolCall` 透传 `onElicit`）、`backend/src/orchestrator/chatBot.ts`（**挂起点就插在"取凭据 / 发 `RUNNING` 卡之前"** —— 即 P0-2-9 留的那处接回点；另加 `onElicit` 处理器把三个结局映射成 `accept` / `decline` / `cancel`）、`backend/src/routes/conversations.ts`（**第九条路由**，`02` §4.5 那张表至此无缺口）、`backend/src/index.ts`（`step`）。**八条最值得记的**：① **两条来源、一个原语** —— 平台强制确认（`PLATFORM`）与服务端反向 elicitation（`SERVER`）走**同一个** `confirm` 事件、同一个应答端点、同一个 `awaitConfirm`，差别只在 payload 的 `source`（决定前端选哪句文案）；② ⚠️ **应答必须带 `confirmId`**（键里存 `{confirmId, accepted}`、消费时按 id 匹配、读到即删、新一次等待开始前**再清一次**）—— 否则上一轮的迟到点击会被下一轮当成答案消费掉，症状是"**确认卡一闪而过**"且**零报错**；③ **三种结局必须分得开** ——"用户已取消"与"等待确认超时"回填**不同**文案（前者是用户的决定、后者是没人应答），合成一句话用户就读不出自己那一按到底生效了没有；④ **取消与超时都不让这一轮失败**（回填一条"未执行"的工具结果、流程继续 —— `01` §3.6 原文），**唯一的例外是中断**（`awaitConfirm` 抛 `ChatStoppedError`，交回"本轮被中断"的收尾）；⑤ **被拦下的调用不发 `RUNNING` 卡**（那张卡的含义是"已经在跑"，而它其实没跑过 ⇒ 只发最终那张 ERROR 卡，前端按 `callId` upsert）；⑥ **超时与心跳是两个独立机制** ⇒ 挂起期间 `ping` 照发、锁跟着心跳续期（**没有**第二条续期路径 —— 另起一条迟早与心跳那条打架）；⑦ **`applied:false` 是 200 不是 4xx**（用户看到卡片没消失就会再点一次，那是常态），且**不为"会话只读"单开 409**（只读会话**必定**没有活跃流 ⇒ 已被同一条判据覆盖，单开会让"流中途 Agent 被软删、用户正在看确认卡"误报）；⑧ ⚠️ **本批实际写错一次（`typecheck` 抓到）** —— `streamChatReply` 里 `acquireConversationLock` 的初始快照是**逐字段手写**的，加第四个字段时它**少一个键**，而后果是"**所有 `/confirm` 应答都变成 `applied:false`**"（静默到只有类型检查能抓）⇒ 改成 `{ ...EMPTY_ACTIVE_SNAPSHOT, startedAt }`，从根上断掉这一类。**已知边界**：`annotations` **服务端自报、不可信**（声明 `readOnlyHint: true` 即可绕过 ⇒ 平台强制名单属 **P1**）；假上游**不发** elicitation ⇒ `SERVER` 那一路在 ㉔ 里验不到（要真上游；契约与三条映射见 `docs/02` §9.10）。**取证方式**：⚠️ **本批无自动化验收档**（脚本与夹具 2026-09-24 已删；浏览器档 = **P0-2-11 之后**）；智能体侧只跑了 `pnpm -r typecheck`（三包全绿，**且首跑抓到上面第 ⑧ 条那个静默 bug**）与 `pnpm check:batch`；**未跑构建/回归/浏览器，本批不是端测里程碑**。回写：`docs/02` 新增 **§9.10** + §4.5 / §5.1 / §5.2 / §六 第 4 步 / §9.9 的落地标记同步；`docs/06` 进度 **10/12**。**下一步 = P0-2-11**（前端确认卡 + `/mcp` 页面 —— **它才是浏览器可端测里程碑**） |
+| 2026-09-24 | — | **P0-2-11 完成（P0-2 工具闭环 11/12）· 🎯 阶段二唯一的「浏览器端测」里程碑达成**：MCP 管理页 + 我的凭据页 + 确认卡接真数据源 + Agent 编辑页 MCP 多选接回 + 工具失败卡「去配置」跳转。**手工跑法见新增的本文「浏览器端测 · MCP」一节（①~⑮）** —— ⚠️ 它**前置三样**：依赖+迁移+两个进程、一台可注册的 MCP server（复用「手工端测 · 命令行」㉒/㉓ 的**内联假上游**）、**一个会主动要工具的假 LLM**（真模型不会去调一个刚注册的工具 ⇒ 少了它，"对话里触发工具"这一段走不到）。**新增 8 个文件**：`frontend/src/api/mcp.ts`（两条 query key 树 + 六条端点 hooks + `confirmConversation`；服务器列表与凭据清单**刻意都不分页**）、`frontend/src/pages/mcp/mcpModel.ts`（**零依赖纯逻辑 515 行**：server 表单 / 模板编辑器 / 凭据表单 / 列表读数 / 定位目标）、`frontend/src/features/chat/confirmModel.ts`（确认卡倒计时与文案 —— **放 `features/` 而不是 `pages/` 是为了不造出反向依赖**）、`pages/mcp/` 的四个组件页、`frontend/scripts/verify-mcp-ui.mjs`（**53 项**，A~I 九组）。**改动 9 处**：`shared/src/conversation.ts`（**本批唯一契约增量 `toolCallRecordSchema.serverId?`**）、`backend/src/orchestrator/chatBot.ts`（`base` 按**三态**带上 `serverId`）、`app/{App,nav,paths}.ts`（两条占位路由与两条 `batch` 台账一起删 —— **台账不删会变成"哪些页还没做"的错误答案**）、`features/chat/{ConfirmCard,ToolCard,messageModel,roundReducer,ChatInput}.tsx`、`stores/chatStream.ts`（新增 **`clearConfirm()`**）、`pages/chat/ChatPage.tsx`、`pages/agents/{AgentFormPage,agentModel}.ts`（MCP 多选接回）、`styles/app.css`、根/前端 `package.json`（`verify:mcp-ui`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动、零后端路由改动**。**六条最值得记的**：① ⚠️ **`serverId` 是"工具名反推不出来"才必须加的** —— `serverName` 可重名、`toolName` 里的 slug **刻意不唯一**（同 `mcp.ts` 文件头 ③）⇒ 反推会指到别的 server，症状是"点了去配置、落在另一台 server 的分组上"；且因 `sseToolCallPayloadSchema = toolCallRecordSchema.omit({arguments:true})` 它是**派生**的，这个字段自动同时出现在落库那份与上流那份上，**别顺手做成必填**（历史行里没有它）。② ⚠️ **`StreamRound.confirm` 是"类型比事实窄"**（只声明三个键、payload 有五个）⇒ 补齐 `source`/`expiresAt`；倒计时**只读 `expiresAt`**、到点停在「已超时」+ 两键禁用、**卡不自己撤**（撤卡的判据在服务端）。③ ⚠️ **"收卡"没有服务端事件**（答复走独立于流的 `/confirm`，流里那个提问已被消费）⇒ store 上新增显式动作 `clearConfirm()`；不做则症状是**确认卡一闪而过之后又回来**。④ **模板编辑器不重写校验**：直接调 `shared#validateCredentialSchema`（四条语义规则后端已有一份），前端只把 `path[index,'key']` 还原成"哪一行哪一列"；⚠️ 写断言时踩过一次 —— 拿 `Authorization` 当"撞保留头"的夹具，而它**既不在** `MCP_RESERVED_HEADER_NAMES`、**也是**合法头名 ⇒ 什么都不报（真夹具是 `Accept` 或含空格的 `X-User Token`）。⑤ **"没改就不发"用集合语义判等**（`diffCredentialSchema`，不是 `JSON.stringify`）—— 换两行顺序或只改 `label` 都不算改动，否则会发一次无意义的 `PATCH` 并弹一条本不该有的"影响了 N 份凭据"。⑥ **坑预判 1 点名的五处，实际只有一处还需要动手**：`assertComponentRefsBindable` 的 MCP 分支**早在 P0-2-2 就翻了**；`verify:agents` / `verify:agent-package` / `verify-app.mjs` **三个脚本 2026-09-24 已随 `backend/scripts/**` 删除** ⇒ 那几处断言**无从翻转**（后者还先被 P0-2-10 作废）；真正动手的只有 `AgentFormPage` 的 MCP 多选。**取证方式**：⚠️ **浏览器那条路由人工走**（本文「浏览器端测 · MCP」①~⑮，**尚未取证**、是 P0-2-12 的前置）；智能体侧只跑了 `pnpm verify:mcp-ui`（**53/53**）与 `pnpm -r typecheck`（**三包全绿**；⚠️ 首跑抓到 4 处编译错，都是"搬文件 / 改签名之后的尾巴"：`ConfirmCard` 还从 `pages/mcp/` import 三个函数、`mcpModel` 残留未用的 `ConfirmSource`、`removeTemplateRow` 的 `readonly` 出参与可变草稿对不上）。⚠️ **未跑构建/浏览器/真后端** ⇒ 只证明**契约与接线**对，**不证明界面点得动**。**顺带订正一处 README 自身的不准确**：本节上面那句"现在敲任何一个 `verify:*` 都会 `Command not found`"只对**后端**那批成立 —— `frontend/scripts/**` 的四档（`chat-sse` / `knowledge-ui` / `admin-ui` / **`mcp-ui`**）**还在且可跑**，但按用户定案「验收一律人工端测」⇒ **存在 ≠ 要跑**。回写：`docs/03` §二（十条路由全部落地、**删掉** P0-2-10 那条"确认卡未接"告警）·§4.1·§4.2·§4.4·§4.5·§五·§六·§八；`docs/02` §5.1 的 `tool_call` 行补 `serverId?` + §9.3 新增"为什么只靠 `errorCode` 还不够" + §十四；`docs/06` 进度 **11/12** + §七 第 7 行。**下一步 = P0-2-12**（P0-2 包验收 R1/R2 —— ⚠️ **它要等你先把浏览器那条路走一遍**） |

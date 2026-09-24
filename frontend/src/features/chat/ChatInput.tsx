@@ -31,7 +31,9 @@ import type { StreamRound } from './roundReducer.js'
 export interface ChatInputProps {
   /** 当前会话进行中的那一轮（`null` = 空闲） */
   round: StreamRound | null
-  /** `send()` 在飞（含"建会话 + 建流"的空窗） */
+  /**
+   * `send()` 在飞（含"建会话 + 建流"的空窗）
+   */
   sending: boolean
   /** 点了停止、正在 5s 窗口里等收口 */
   stopping: boolean
@@ -47,6 +49,15 @@ export interface ChatInputProps {
   onSubmit: () => void
   /** 点「停止」（时序在 `stopController.ts`，这里只管把意图转出去） */
   onStop: () => void
+  /**
+   * 答复确认卡（P0-2-11）：`true` = 确认执行、`false` = 取消。
+   *
+   * ⚠️ 本组件**不碰请求**（`03` §六："组件内不写请求，全部走 api 层"）—— 它只把意图转出去，
+   * 由 `ChatPage#handleConfirm` 决定发什么、以及答复之后怎么收卡（见 `ConfirmCard` 文件头 ③）。
+   */
+  onConfirmAnswer: (accepted: boolean) => void
+  /** 确认应答正在提交（两个按钮都禁用，防连点） */
+  confirmPending: boolean
 }
 
 export function ChatInput({
@@ -58,6 +69,8 @@ export function ChatInput({
   onDraftChange,
   onSubmit,
   onStop,
+  onConfirmAnswer,
+  confirmPending,
 }: ChatInputProps) {
   const view = composeState({ round, sending, stopping, elsewhere, draft })
 
@@ -86,12 +99,18 @@ export function ChatInput({
     >
       <div className="composer__inner">
         {/* 确认卡：`confirm` 事件到达 ⇒ 锁输入显示确认卡（`03` §4.1）。
-            ⚠️ P0 阶段恒不出现（产生方是 MCP 的工具危险判定，属 P0-2），形状先就位 */}
+            ⚠️ **P0-2-11 起它接的是真数据源**：`source` / `expiresAt` 都来自服务端的
+            `confirm` 事件（`round.confirm` 就是那个载荷），倒计时读 `expiresAt` 而不是
+            前端自己数 120 秒；两个按钮真发 `POST /:id/confirm`（由页面实现）。
+            卡片的消失仍是**页面**决定的（答复之后 `clearConfirm()`），不是卡片自己撤销。 */}
         {round?.confirm === null || round?.confirm === undefined ? null : (
           <ConfirmCard
+            source={round.confirm.source}
             toolName={round.confirm.toolName}
             inputSummary={round.confirm.inputSummary}
-            timeoutSec={120}
+            expiresAt={round.confirm.expiresAt}
+            pending={confirmPending}
+            onAnswer={onConfirmAnswer}
           />
         )}
 

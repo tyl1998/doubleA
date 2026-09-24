@@ -85,6 +85,19 @@ interface ChatStreamState {
   showDisconnect: (payload: DisconnectState) => void
   /** 收黄条（用户点过它 = 已经对齐过了；开新一轮时也清） */
   clearDisconnect: () => void
+  /**
+   * 收掉当前这张确认卡（P0-2-11）。
+   *
+   * ⚠️ **服务端不会为此发任何事件**：答复走的是 `POST /:id/confirm`（一次独立于流的普通请求），
+   * 而流里那唯一的"提问"已经由这次答复消费掉了。若不在本地收卡，它会一直挂在输入区上方
+   * —— 用户点了「确认」、工具也真的开始跑了，卡片却还在问同一个问题（P0-2-10 那条
+   * 「确认卡一闪而过」的反面：**它不是一闪而过，而是不走**）。
+   *
+   * 归约层**不做**这件事（没有对应的事件），所以它是 store 上的一个显式动作 ——
+   * 与 `clearDisconnect` 同款理由：界面上的一个东西消失，需要一个说得出来源的触发点
+   * （这里就是"我方已经答复过了"）。
+   */
+  clearConfirm: () => void
   /** 清空（切换会话 / 卸载页面 / 前置失败回滚时调用） */
   reset: () => void
 }
@@ -134,6 +147,17 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
 
   clearDisconnect: () => {
     set({ disconnect: null })
+  },
+
+  clearConfirm: () => {
+    // ⚠️ `round === null` 时是**空操作**（没有轮次就没有卡片可言）；
+    //    `confirm` 已经是 `null` 时**返回同一引用** —— zustand 的 `set` 拿到 `state`
+    //    本身即"状态未变"，不会触发任何重渲染（与归约层返回同一引用的口径一致）。
+    set((state) =>
+      state.round === null || state.round.confirm === null
+        ? state
+        : { round: { ...state.round, confirm: null } },
+    )
   },
 
   reset: () => {

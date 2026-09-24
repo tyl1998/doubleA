@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-10 elicitation 确认流（confirm 事件挂起 + POST /:id/confirm 应答 + 120s 超时按取消 / 两条来源统一走 SseChannel#awaitConfirm：PLATFORM=危险工具先问后执行、SERVER=MCP elicitation/create 途中问；应答槽 chat.confirm:{id} 存 {confirmId,accepted} 按 id 匹配、读到即删；取消/超时都回填 tool_result 且**流程继续**；重复/迟到的应答一律 200 + applied:false）',
+    step: 'P0-2-11 前端 MCP 管理页 / 我的凭据页 / 确认卡片（/mcp 与 /mcp/credentials 两条占位路由换真页面；ConfirmCard 接真数据源：倒计时只读服务端 expiresAt、收卡由 store#clearConfirm 显式承担；Agent 编辑页 MCP 多选接回；工具失败卡"去配置凭据"跳 /mcp/credentials?serverId=…；契约只增量一个 toolCallRecordSchema.serverId）',
     address,
   })
   logger.info(

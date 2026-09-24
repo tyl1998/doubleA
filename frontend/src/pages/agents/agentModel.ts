@@ -207,23 +207,26 @@ export function componentsFromAgent(item: AgentItem): AgentComponentInput[] {
 }
 
 /**
- * 过滤出**能提交**的绑定：只留 `KNOWLEDGE`。
+ * 过滤出**能提交**的绑定：`KNOWLEDGE` 与 `MCP` 两类。
  *
- * P0-1-23 定案：`mcp_servers` 表属 P0-2，本阶段 `PUT …/components` **明确拒绝 MCP 引用（400）**
- * ——因为当前不存在任何真实 server，收到的 MCP id 必然是伪造/过期的，写进去就是
- * "永远修不好的孤儿绑定"（`ref_id` 是无 FK 的多态外键，数据库不会拦）。
- * 所以 UI 上既**不提供 MCP 勾选**，提交时也不带 MCP 项。
+ * ⚠️ **P0-2-11 起 MCP 解禁**。P0-1-23 时期这里只留 `KNOWLEDGE`，理由是"`mcp_servers` 表属 P0-2，
+ * 收到的 MCP id 必然是伪造/过期的"；P0-2-2 已经把后端的 `assertComponentRefsBindable`
+ * 翻成**存在性校验**（不存在的 id ⇒ `404 MCP server 不存在或已被删除`）
+ * ⇒ 前端可以、也应该把它交上去了（UI 上的多选框同批接回，见 `AgentFormPage` 的 MCP 区）。
  *
- * ⚠️ 副作用要如实说：若某条 `MCP` 绑定**已经**存在（本阶段只能由手工写库产生），本页保存时
- * 会把它清掉 —— 因为整体替换的语义就是"提交的集合就是全部"。{@link mcpRefsOf} 负责把这件事
- * **显示出来**（编辑页的 MCP 区会给出警示条），而不是悄悄丢掉。
+ * ⚠️ 这个函数仍是**唯一**决定"哪些绑定会被提交"的地方：`sameComponentSet` 的两次比较
+ * 都以它的输出为基准 ⇒ 少一类就会出现"每次保存都白发一个 `PUT`"（永远为真的脏），
+ * 多一类就会把不该动的绑定一起交上去。两条都是**没有编译期错误**的错。
  */
 export function submittableComponents(
   components: readonly { componentType: string; refId: string }[],
 ): AgentComponentInput[] {
   return components
-    .filter((component) => component.componentType === 'KNOWLEDGE')
-    .map((component) => ({ componentType: 'KNOWLEDGE' as const, refId: component.refId }))
+    .filter((component) => component.componentType === 'KNOWLEDGE' || component.componentType === 'MCP')
+    .map((component) => ({
+      componentType: component.componentType as 'KNOWLEDGE' | 'MCP',
+      refId: component.refId,
+    }))
 }
 
 /** 当前表单里的绑定（知识库多选 → 写侧形态） */
@@ -231,12 +234,22 @@ export function knowledgeSelectionOf(selectedIds: readonly string[]): AgentCompo
   return selectedIds.map((refId) => ({ componentType: 'KNOWLEDGE' as const, refId }))
 }
 
+/** 当前表单里的绑定（MCP 多选 → 写侧形态） */
+export function mcpSelectionOf(selectedIds: readonly string[]): AgentComponentInput[] {
+  return selectedIds.map((refId) => ({ componentType: 'MCP' as const, refId }))
+}
+
 /** 从绑定集合里取出知识库 id 列表（供多选框的 `value`） */
 export function knowledgeIdsOf(components: readonly { componentType: string; refId: string }[]): string[] {
   return components.filter((c) => c.componentType === 'KNOWLEDGE').map((c) => c.refId)
 }
 
-/** 从绑定集合里取出 MCP 引用（本阶段只可能由手工写库产生，见 {@link submittableComponents}） */
+/** 从绑定集合里取出 MCP server id 列表（供多选框的 `value`） */
+export function mcpIdsOf(components: readonly { componentType: string; refId: string }[]): string[] {
+  return components.filter((c) => c.componentType === 'MCP').map((c) => c.refId)
+}
+
+/** 从绑定集合里取出 MCP 引用（仍用于摘要卡上的"共几个 server"） */
 export function mcpRefsOf(
   components: readonly { componentType: string; refId: string }[],
 ): { componentType: 'MCP'; refId: string }[] {

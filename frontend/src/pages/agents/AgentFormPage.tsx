@@ -75,9 +75,10 @@ import { useAgent, useCreateAgent, useReplaceAgentComponents, useUpdateAgent } f
 import { describeError } from '../../api/client.js'
 import { useMyConversationCount } from '../../api/conversations.js'
 import { useKnowledgeBases } from '../../api/knowledgeBases.js'
+import { useMcpServers, useMyCredentials } from '../../api/mcp.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH, chatPath } from '../../app/paths.js'
+import { HOME_PATH, chatPath, mcpCredentialsPath } from '../../app/paths.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import {
@@ -91,8 +92,10 @@ import {
   changedSections,
   componentsFromAgent,
   formatUpdatedAt,
+  knowledgeIdsOf,
   knowledgeSelectionOf,
-  mcpRefsOf,
+  mcpIdsOf,
+  mcpSelectionOf,
   orderSections,
   sameComponentSet,
   sectionOrdinal,
@@ -208,9 +211,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const [created, setCreated] = useState<AgentItem | undefined>(undefined)
   const [failures, setFailures] = useState<SaveFailure[]>([])
   const [saving, setSaving] = useState(false)
-  const [selectedKbIds, setSelectedKbIds] = useState<string[]>(
-    initialComponents.filter((c) => c.componentType === 'KNOWLEDGE').map((c) => c.refId),
-  )
+  const [selectedKbIds, setSelectedKbIds] = useState<string[]>(knowledgeIdsOf(initialComponents))
+  /**
+   * 已勾选的 MCP server（**P0-2-11 接回**：P0-1-23 时期这里没有它，
+   * 因为 `mcp_servers` 表还不存在、后端也明确拒绝 MCP 引用）。
+   * 初值走 `mcpIdsOf`（与知识库那条同款），保证"编辑一个已绑定的智能体"时勾选状态是对的。
+   */
+  const [selectedMcpIds, setSelectedMcpIds] = useState<string[]>(mcpIdsOf(initialComponents))
   const [deleteOpen, setDeleteOpen] = useState(false)
 
   const item = initialItem ?? created
@@ -220,10 +227,18 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const kbQuery = useKnowledgeBases()
   const modelQuery = useAvailableChatModels()
   const conversationCount = useMyConversationCount(item?.id)
+  /**
+   * MCP 两个查询（P0-2-11）：server 列表（多选框的数据源）+ 我的凭据清单
+   * （**红点的唯一来源** —— `06` P0-2-11 坑预判 4：未配置红点/计数只有一个来源，
+   * 本页**不自己数一遍**"哪些 server 我没配凭据"，那样会与凭据页的徽标各说各话）。
+   */
+  const mcpQuery = useMcpServers()
+  const credQuery = useMyCredentials()
   const kbItems = kbQuery.data?.items ?? []
+  const mcpItems = mcpQuery.data?.items ?? []
   const modelOptions = modelQuery.data?.items ?? []
 
-  const selectedComponents = knowledgeSelectionOf(selectedKbIds)
+  const selectedComponents = [...knowledgeSelectionOf(selectedKbIds), ...mcpSelectionOf(selectedMcpIds)]
 
   /**
    * 已勾选、但**不在知识库列表里**的 id（列表重拉后消失的那些）。
@@ -235,11 +250,32 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const missingKbIds = kbQuery.data === undefined ? [] : selectedKbIds.filter((id) => !kbIdSet.has(id))
 
   /**
+   * 已勾选、但**不在 MCP server 列表里**的 server id。
+   *
+   * ⚠️ 与 `missingKbIds` **同一条推理**，而且这里更可能真发生：MCP server 是**全员可删**的
+   * （第五族权限），别人删掉一台你绑过的 server 完全正常。若不把这行显式列出来，
+   * 用户会**被卡死**在 P0-1-31 那个坑里：`sameComponentSet` 永远为假 ⇒ 每次保存都重发
+   * 同一个失败的 `PUT`，而提示里那串 uuid 在页面上找不到任何对应物。
+   */
+  const mcpIdSet = new Set(mcpItems.map((server) => server.id))
+  const missingMcpIds = mcpQuery.data === undefined ? [] : selectedMcpIds.filter((id) => !mcpIdSet.has(id))
+
+  /**
+   * 「未配置凭据」的 server id 集合（红点判据）。
+   *
+   * ⚠️ 判据只有一条来源：`GET /api/mcp/credentials` 的 `unconfigured`（瘦投影），
+   * 它是服务端从同一份 `items` 派生的**结论**。本页**不重新算**
+   * `fields`/`missingKeys`（那会造出第二份判据，且与凭据页的徽标可能不一致）。
+   */
+  const unconfiguredMcpIds = new Set((credQuery.data?.unconfigured ?? []).map((server) => server.serverId))
+
+  /**
    * 脏区块 = 文本/模型字段的差异 ∪ 组件绑定的集合差异。
    *
-   * ⚠️ 组件那一路比较的是 `submittableComponents(snapshot.components)`（**只含 KNOWLEDGE**）：
-   * 提交时本来就不带 MCP，若拿含 MCP 的快照去比，会得到一个永远为真的"脏"
-   * （每次保存都白发一个 `PUT`，并把 MCP 行清掉）。
+   * ⚠️ 组件那一路比较的是 `submittableComponents(snapshot.components)` —— **P0-2-11 起它含
+   * `KNOWLEDGE` 与 `MCP` 两类**（`agentModel#submittableComponents` 是唯一的"哪些绑定会被提交"
+   * 判据）。少算一类 ⇒ 每次保存都白发一个 `PUT` 且永远显示"未保存"；多算一类 ⇒ 把不该动的
+   * 绑定一起交上去。两条都是没有编译期错误的错。
    */
   const componentsDirty = !sameComponentSet(submittableComponents(snapshot.components), selectedComponents)
   const dirtySections = orderSections([
@@ -368,7 +404,6 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
   // ───────────────────────── 渲染 ─────────────────────────
 
-  const mcpRefs = mcpRefsOf(snapshot.components)
   const staleModelOption =
     item !== undefined && !modelOptions.some((option) => option.id === values.modelId)
       ? // 绑定的模型已停用时，把它作为**唯一能看到的旧值**留在下拉里：否则 Select 只显示一个裸 uuid，
@@ -388,6 +423,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const toggleKb = (kbId: string, checked: boolean) => {
     setSelectedKbIds((current) =>
       checked ? [...current.filter((id) => id !== kbId), kbId] : current.filter((id) => id !== kbId),
+    )
+  }
+
+  /** MCP 多选的勾选/取消（与 `toggleKb` 同款：保持"最后勾的排在后面"的追加语义） */
+  const toggleMcp = (serverId: string, checked: boolean) => {
+    setSelectedMcpIds((current) =>
+      checked ? [...current.filter((id) => id !== serverId), serverId] : current.filter((id) => id !== serverId),
     )
   }
 
@@ -670,28 +712,119 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
                 <div>
                   <p className="block-label">MCP 工具</p>
-                  <Alert
-                    type="info"
-                    showIcon
-                    message="MCP 绑定属 P0-2，本阶段不提供勾选"
-                    description="mcp_servers 表要到 P0-2 才建，现在选不出真实的 server；后端也会明确拒绝（400）。P0-2 落地后这里换成 server 多选，接口形态不变。"
-                  />
-                </div>
 
-                {mcpRefs.length > 0 && (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    message={`该智能体现有 ${mcpRefs.length} 条 MCP 绑定（本阶段只能由手工写库产生）`}
-                    description="整体替换的语义是「提交的集合就是全部」—— 本页保存后会解除这些 MCP 绑定。若不想动它，请先不要在本页保存。"
-                  />
-                )}
+                  {mcpQuery.isPending ? (
+                    <TableSkeleton rows={2} />
+                  ) : mcpQuery.isError ? (
+                    <Alert
+                      type="error"
+                      showIcon
+                      message="MCP server 列表加载失败"
+                      description={describeError(mcpQuery.error).message}
+                      action={
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            void mcpQuery.refetch()
+                          }}
+                        >
+                          重试
+                        </Button>
+                      }
+                    />
+                  ) : mcpItems.length === 0 ? (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="还没有注册任何 MCP server"
+                      description="先到 MCP 管理页注册一台（并握手成功），回到本页才能勾选它的工具。"
+                      action={
+                        <Link to="/mcp">
+                          <Button size="small">去 MCP 管理页</Button>
+                        </Link>
+                      }
+                    />
+                  ) : (
+                    <div className="stack stack--tight">
+                      {mcpItems.map((server) => {
+                        const needsCredential = unconfiguredMcpIds.has(server.id)
+                        return (
+                          <Checkbox
+                            className="pick"
+                            key={server.id}
+                            checked={selectedMcpIds.includes(server.id)}
+                            onChange={(event) => toggleMcp(server.id, event.target.checked)}
+                          >
+                            <span className="pick__title">
+                              {server.name}
+                              {/* ⚠️ 「未配置凭据」红点的**唯一来源**是 `GET /api/mcp/credentials`
+                                  的 `unconfigured`（见 `unconfiguredMcpIds` 的注释）。它不是
+                                  "不能绑"—— 绑得上，只是这个智能体跑到那个工具时会 424 */}
+                              {needsCredential && (
+                                <Tag className="tag--warn" style={{ marginLeft: 'var(--sp-2)' }}>
+                                  未配置凭据
+                                </Tag>
+                              )}
+                            </span>
+                            <span className="pick__meta">
+                              {server.toolCount === 0 ? '还没有工具' : `${server.toolCount} 个工具`}
+                              {' · mcp_'}
+                              {server.slug}
+                              {needsCredential ? (
+                                <>
+                                  {' · '}
+                                  <Link to={mcpCredentialsPath(server.id)}>去配置凭据</Link>
+                                </>
+                              ) : null}
+                            </span>
+                          </Checkbox>
+                        )
+                      })}
+                      <span className="ratio">
+                        一次列出 {mcpItems.length} 个（limit 上限 100）。绑定后这个智能体就能调用它们的工具；
+                        需要你个人凭据的 server 会标「未配置凭据」—— 绑得上，但跑到那里会报 424。
+                      </span>
+                    </div>
+                  )}
+
+                  {/* ⚠️ 「已勾选但已不在列表里」的 server **必须显式列出来，而且必须能取消勾选**
+                      （与上面知识库那一段同一条推理，而 MCP 这边更可能真发生：server 是全员可删的）。 */}
+                  {missingMcpIds.length > 0 && (
+                    <div className="stack stack--tight" style={{ marginTop: 'var(--sp-3)' }}>
+                      {missingMcpIds.map((serverId) => (
+                        <Checkbox
+                          key={serverId}
+                          className="pick"
+                          checked
+                          onChange={() => toggleMcp(serverId, false)}
+                        >
+                          <span className="pick__title">
+                            已失效的 server <Tag className="tag--danger">需解绑</Tag>
+                          </span>
+                          <span className="pick__meta">
+                            {serverId} · 它已被删除（或你的账号看不到它）。取消勾选即解绑，然后保存。
+                          </span>
+                        </Checkbox>
+                      ))}
+                    </div>
+                  )}
+
+                  {credQuery.isError ? (
+                    <Alert
+                      type="warning"
+                      style={{ marginTop: 'var(--sp-3)' }}
+                      showIcon
+                      message="凭据状态没有读出来"
+                      description="此刻列表里不会出现「未配置凭据」标记 —— 说不出来的事不冒充结论。这不影响保存绑定。"
+                    />
+                  ) : null}
+                </div>
 
                 <Alert
                   type="info"
                   showIcon
                   message="组件绑定保存时是整体替换"
-                  description="取消勾选即解除绑定，不会删除知识库或它的文档。绑定信息写入独立的 agent_components 表。"
+                  description="取消勾选即解除绑定，不会删除知识库或 MCP server 本身。绑定信息写入独立的 agent_components 表。"
                 />
               </div>
             </FormSection>
@@ -727,7 +860,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 value={item?.modelName ?? modelOptions.find((option) => option.id === values.modelId)?.label ?? '未选择'}
               />
               <SummaryRow label="知识库" value={`${selectedKbIds.length} 个`} />
-              <SummaryRow label="MCP 工具" value={`${mcpRefs.length} 个 server`} />
+              <SummaryRow label="MCP 工具" value={`${selectedMcpIds.length} 个 server`} />
               <SummaryRow
                 label="我的会话"
                 value={conversationCount.data === undefined ? '—' : String(conversationCount.data)}

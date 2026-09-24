@@ -12,6 +12,9 @@
  *          （文档上传 / 覆盖重传 / 重试 / 下载 / 删除 + 检索测试抽屉 + 状态轮询）。
  * P0-1-36：`/admin/users` 与 `/admin/models` 换成真实的用户管理与模型池管理
  *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
+ * P0-2-11：`/mcp` 与 `/mcp/credentials` 换成真实的 MCP 管理页与我的凭据页
+ *          （**至此 `03` §二 的 P0 十条路由全部落地**，`BatchPlaceholderPage` 只剩 `/tasks`
+ *           与 `/admin/usage` 两条 P1 路由，以及那个 `*` 未找到页）。
  *
  * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
  *
@@ -44,6 +47,8 @@ import { ChatPage } from '../pages/chat/ChatPage.js'
 import { KnowledgeDetailPage } from '../pages/knowledge/KnowledgeDetailPage.js'
 import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
 import { LoginPage } from '../pages/login/LoginPage.js'
+import { McpCredentialsPage } from '../pages/mcp/McpCredentialsPage.js'
+import { McpServersPage } from '../pages/mcp/McpServersPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 
 export function App() {
@@ -67,37 +72,11 @@ export function App() {
               知识库没有 owner 列，是全员共享资源（`docs/02` §4.6 的权限口径与模型池相反）。 */}
           <Route path="/knowledge" element={<KnowledgeListPage />} />
           <Route path="/knowledge/:id" element={<KnowledgeDetailPage />} />
-          <Route
-            path="/mcp"
-            element={
-              <BatchPlaceholderPage
-                serial="S-06 · MCP"
-                title="MCP server 管理"
-                batch="P0-2"
-                blockedBy="MCP 端点尚不存在；P0-1 阶段后端明确拒绝 MCP 组件引用（400 + 指向 P0-2）"
-                bullets={[
-                  'server 列表与注册 / 编辑 / 删除',
-                  '每个 server 的工具清单与凭据状态',
-                  '未配置凭据时给出 424 NEED_CREDENTIAL 对应文案',
-                ]}
-              />
-            }
-          />
-          <Route
-            path="/mcp/credentials"
-            element={
-              <BatchPlaceholderPage
-                serial="S-06b · 凭据"
-                title="我的凭据"
-                batch="P0-2"
-                blockedBy="凭据端点尚不存在"
-                bullets={[
-                  '按 server 分组管理个人凭据，写入后不回显明文',
-                  '支持 ?serverId= 定位并高亮该分组（从编辑页与工具失败卡直达）',
-                ]}
-              />
-            }
-          />
+          {/* S-06 · MCP（P0-2-11 接真页面）。**两条都是登录即可**：`mcp_servers` 没有 owner 列
+              ⇒ 人人可改可删（第五族，`02` §4.7）；凭据那一族的收窄在 `user_id` 上、只在服务端，
+              界面上没有任何"别人的凭据"可看。 */}
+          <Route path="/mcp" element={<McpServersPage />} />
+          <Route path="/mcp/credentials" element={<McpCredentialsPage />} />
           <Route
             path="/tasks"
             element={

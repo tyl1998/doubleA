@@ -20,6 +20,27 @@ export const AGENTS_NEW_PATH = '/agents/new'
 /** 知识库列表（`03` §二：`/knowledge`，登录即可 —— 与模型池相反，**不是** ADMIN） */
 export const KNOWLEDGE_PATH = '/knowledge'
 
+/** MCP server 管理（`03` §二：`/mcp`，登录即可） */
+export const MCP_PATH = '/mcp'
+
+/** 我的凭据（`03` §二：`/mcp/credentials`，登录即可） */
+export const MCP_CREDENTIALS_PATH = '/mcp/credentials'
+
+/**
+ * 「我的凭据」地址，可带 `?serverId=` 定位到某一台 server 的分组（`03` §二 的引注、§4.5）。
+ *
+ * ⚠️ **这是"从别处跳到凭据页"的唯一构造点**，三个入口共用（`03` §4.5 的原文就点了三个）：
+ *   · Agent 编辑页 MCP 多选框旁的「未配置」红点（`03` §4.2 第 4 区）；
+ *   · 会话里失败工具卡的「去配置凭据」（`02` §9.3，`errorCode === 'NEED_CREDENTIAL'`）；
+ *   · 顶部「我的凭据」入口（不带 `serverId`，落在全清单上）。
+ *
+ * 不传 `serverId` ⇒ **裸路径**（不是 `?serverId=`）：凭据页据此区分"要定位到某台"与"就看看全部"，
+ * 而空串会让它去 `document.getElementById('cred-')` 找一个不存在的锚点（静默什么都不发生）。
+ */
+export function mcpCredentialsPath(serverId?: string): string {
+  return serverId === undefined ? MCP_CREDENTIALS_PATH : `${MCP_CREDENTIALS_PATH}?serverId=${encodeURIComponent(serverId)}`
+}
+
 /**
  * 知识库详情（`03` §二 的 `/knowledge/:id`）。
  *

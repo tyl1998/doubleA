@@ -47,14 +47,9 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { code: 'AG', label: '智能体', path: '/', serial: 'S-02 · 智能体' },
   // 已落地 ⇒ 不带 `batch`（P0-1-35 把知识库列表与详情换成真实页面）
   { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库' },
-  { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP', batch: 'P0-2（MCP 端点尚未存在）' },
-  {
-    code: 'CR',
-    label: '我的凭据',
-    path: '/mcp/credentials',
-    serial: 'S-06b · 凭据',
-    batch: 'P0-2（凭据端点尚未存在）',
-  },
+  // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页与我的凭据页换成真实页面）
+  { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
+  { code: 'CR', label: '我的凭据', path: '/mcp/credentials', serial: 'S-06b · 凭据' },
   /**
    * 管理面**两条**（P0-1-36 落地）。
    *

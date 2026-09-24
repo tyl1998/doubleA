@@ -20,21 +20,29 @@
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 历史里只读**已定义**的段，未定义的段原样留着（不猜形状）
  * ─────────────────────────────────────────────────────────────────────
- * `content` 的写入端契约（`messageContentSchema`）当前只声明三段：`text` / `thinking` / `citations`
- * —— `tool_calls`（工具，属 **P0-2**）与 `attachments`（附件，属 **P1**）**刻意未定型**
- * （`shared/src/conversation.ts` 的注释："现在写进去只会是猜的形状"）。
- * 所以本文件在解包历史 `content` 时**严格按这三段取值**，其余键既不读也不删（原样留在视图模型之外的
- * 原始对象里）。等 P0-2/P0-3 把 `tool_calls` / `artifacts` 的形状定下来，
- * **只需要在本文件的 {@link messageToView} 里加两行映射**，组件一行都不用改 —— 这正是
- * "先归一化"的收益所在。
- * 反过来说：**不要**为了"提前支持"而在前端猜一个 `tool_calls` 形状 —— 那是自己发明契约，
+ * `content` 的写入端契约（`messageContentSchema`）当前声明四段：`text` / `thinking` /
+ * `citations` / `tool_calls`（**P0-2-8 定型、P0-2-11 接回**）；`attachments`（附件，属 **P1**）
+ * **刻意未定型**（`shared/src/conversation.ts` 的注释："现在写进去只会是猜的形状"）。
+ * 所以本文件在解包历史 `content` 时**严格按已定义的那几段取值**，其余键既不读也不删
+ * （原样留在视图模型之外的原始对象里）。等 P1 把 `attachments` 的形状定下来，
+ * **只需要在本文件的 {@link messageToView} 里加一行映射**，组件一行都不用改 ——
+ * 这正是"先归一化"的收益所在。
+ * 反过来说：**不要**为了"提前支持"而在前端猜一个形状 —— 那是自己发明契约，
  * 而后端将来写进去的形状与它不一致时，历史渲染会**安静地错**（字段名差一个字母就渲染出空白卡片）。
  *
  * ⚠️ 开场白（`03` §4.1 第一行）**不是**这个模型的成员：它是 Agent 的静态属性
  * （`agent.openingRemarks`），只在"新会话态"显示，不落库、不进消息数组。
  */
 
-import { citationItemSchema, type CitationItem, type MessageItem } from '@doubulea/shared'
+import {
+  DEFAULT_MESSAGE_BY_ERROR_CODE,
+  ERROR_CODES,
+  citationItemSchema,
+  toolCallRecordSchema,
+  type CitationItem,
+  type ErrorCode,
+  type MessageItem,
+} from '@doubulea/shared'
 import type {
   ChatFinishReason,
   SseArtifactPayload,
@@ -50,10 +58,68 @@ export interface ToolCallView {
   toolName: string
   /** 工具来自哪个系统（`kind=SANDBOX` 时为空串） */
   serverName: string
+  /**
+   * 工具所属 MCP server 的 **id**（`kind=SANDBOX` 时没有这个键）。
+   *
+   * ⚠️ **P0-2-11 的契约增量**（`shared/src/conversation.ts#toolCallRecordSchema`）：
+   * 工具卡上那条「去配置凭据」要跳 `/mcp/credentials?serverId=…`，而 `serverName` 做不到
+   * （它是展示名，可重名）；从 `toolName` 的 `mcp_{slug}_{tool}` 反推更不行
+   * （slug 刻意不唯一 ⇒ 会指到别的 server 上）。
+   */
+  serverId?: string
   kind: ToolCallKind
   status: ToolCallStatus
   inputSummary: string
   output?: string
+  /**
+   * 失败时的错误码（`shared/src/errors.ts` 的取值域，**不是 HTTP 状态码**）。
+   * ⚠️ 前端从 `output` 那句人话里认不出"这是缺凭据"，只能靠这个**结构化**的信号
+   * —— 它正是"失败卡带『去配置』跳转"能成立的前提（`02` §9.3）。
+   */
+  errorCode?: string
+}
+
+/**
+ * 这张工具卡要不要给「去配置凭据」按钮（`02` §9.3 的判据**逐字**）。
+ *
+ * 三个条件**缺一不可**：失败（`ERROR`）+ 错误码是 `NEED_CREDENTIAL`（424）
+ * + **知道是哪台 server**（`serverId` 存在）。
+ *
+ * ⚠️ 第三条最容易漏，而漏了的后果很具体：`serverId` 缺失时（历史里 P0-2-11 之前落库的老记录、
+ * 或 `kind=SANDBOX` 的工具）会拼出 `/mcp/credentials?serverId=`（**空值**）——
+ * 用户点了按钮、页面也跳过去了、就是什么都不发生（因为凭据页拿到了一个不在清单里的空 id
+ * ⇒ `resolveScrollTarget` 返回 `null`）。那是"点不通的入口"的变体，而它更难查：
+ * 页面确实跳转了。
+ *
+ * ⚠️ 拿 `serverName` 当判据同样不行：它是展示名、**可重名**，也不是那条路径接受的参数形态。
+ */
+export function canConfigureCredential(tool: {
+  status: string
+  errorCode?: string | undefined
+  serverId?: string | undefined
+}): boolean {
+  return tool.status === 'ERROR' && tool.errorCode === 'NEED_CREDENTIAL' && (tool.serverId ?? '') !== ''
+}
+
+/**
+ * 工具卡失败时的错误码 → **卡片内部那一行**的补充说明（可操作的那句）。
+ *
+ * ⚠️ 这**不是**第二份"错误码 → 文案"映射层（`03` §六：那一层在 `app/feedback.ts`，
+ * 页面不许自己拼 toast 文案）。它只覆盖 MCP 语境下的三条真实分支，
+ * 其余一律返回 `null` ⇒ 卡片只显示服务端给的原因原文，不叠加解释。
+ * 这样"多一句解释"永远是有意为之，而不是某天顺手加的。
+ */
+export function toolErrorHint(errorCode: string | undefined): string | null {
+  switch (errorCode) {
+    case 'NEED_CREDENTIAL':
+      return '这台 server 需要你个人的凭据。点「去配置凭据」填一次，之后这个工具就能用了。'
+    case 'UPSTREAM_TIMEOUT':
+      return 'MCP server 没有在规定时间内应答。它可能正忙或已失联，可以稍后重试。'
+    case 'UPSTREAM_ERROR':
+      return 'MCP server 返回了异常。它那边的配置或运行状态可能有问题。'
+    default:
+      return null
+  }
 }
 
 /** 产物卡的视图状态（`sseArtifactPayloadSchema` 的直译） */
@@ -113,10 +179,15 @@ export function toolViewFromEvent(payload: SseToolCallPayload): ToolCallView {
     callId: payload.callId,
     toolName: payload.toolName,
     serverName: payload.serverName,
+    // `serverId` / `errorCode` 都是**可选**键（`kind=SANDBOX` 没有前者、非失败帧没有后者）
+    // ⇒ 用"有才带上"的三态写法，别写成 `?? ''`（空串会让 `canConfigureCredential` 多走一条
+    //    判断，而"没有这个键"与"有但是空"在这个契约里是两件事）
+    ...(payload.serverId === undefined ? {} : { serverId: payload.serverId }),
     kind: payload.kind,
     status: payload.status,
     inputSummary: payload.inputSummary,
     ...(payload.output === undefined ? {} : { output: payload.output }),
+    ...(payload.errorCode === undefined ? {} : { errorCode: payload.errorCode }),
   }
 }
 
@@ -157,6 +228,62 @@ function pickCitations(source: Record<string, unknown>): CitationItem[] | null {
 }
 
 /**
+ * 工具段：逐项过 `toolCallRecordSchema`（**同一个 schema**，与 `tool_call` 事件共用）。
+ *
+ * ⚠️ **P0-2-8 把写入端定型了，P0-2-11 在这里把它接回**（`shared/src/conversation.ts` 第 62~63 行
+ * 写着"P0-2-11 只要在前端 `messageToView` 里加一段映射（那正是它留的接回点）"）。
+ * 在那之前本函数返回 `[]` 是**刻意的**：形状没定就猜着解，会在字段名差一个字母时
+ * **安静地渲染出一批空卡片**。
+ *
+ * ⚠️ `arguments`（模型给的参数 JSON 原样）**不进视图模型**：它是给排查用的留档，
+ * 卡片上要显示的是 `inputSummary`（截断过、且**凭据值已抹除**）。
+ * 把它带上来只会有两种下场：要么忘了脱敏直接显示（凭据泄漏），要么多写一条"这里不许显示"
+ * 的规则去防自己。**不让它进来就不存在这个问题。**
+ *
+ * 其余各段与 {@link pickCitations} 同款处置：逐项校验、坏的一项丢弃、全坏 ⇒ 当作没有。
+ */
+function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
+  const value = source['tool_calls']
+  if (!Array.isArray(value)) return []
+  const views: ToolCallView[] = []
+  for (const entry of value) {
+    const parsed = toolCallRecordSchema.safeParse(entry)
+    if (!parsed.success) continue
+    const record = parsed.data
+    views.push({
+      callId: record.callId,
+      toolName: record.toolName,
+      serverName: record.serverName,
+      ...(record.serverId === undefined ? {} : { serverId: record.serverId }),
+      kind: record.kind,
+      status: record.status,
+      inputSummary: record.inputSummary,
+      ...(record.output === undefined ? {} : { output: record.output }),
+      ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
+    })
+  }
+  return views
+}
+
+/**
+ * 错误码 → **默认中文文案**（`shared/src/errors.ts` 的 `DEFAULT_MESSAGE_BY_ERROR_CODE`）。
+ *
+ * ⚠️ 存在的理由是"**别再写第四张映射表**"：本仓已经有三处涉及错误码 → 文案 ——
+ * `app/feedback.ts`（toast/notification 通道）、`api/client.ts#describeError`（`ApiError` → 文案）、
+ * 以及 `shared` 的 `DEFAULT_MESSAGE_BY_ERROR_CODE`（唯一的事实来源）。
+ * 前两者都**只接受一个错误对象**（`ApiError` / `Error`），而工具卡手上只有一个从
+ * `tool_calls` 里读出来的**字符串错误码** —— 硬塞给 `describeError` 会掉进它最后那条兜底
+ * （"服务内部错误"），把 `NEED_CREDENTIAL` 显示成一句完全无关的话。
+ *
+ * 取值域外的字符串 ⇒ `null`（卡片只显示原文，不编一句"未知错误"）。
+ */
+export function errorCodeLabel(errorCode: string | undefined): string | null {
+  if (errorCode === undefined) return null
+  if (!(ERROR_CODES as readonly string[]).includes(errorCode)) return null
+  return DEFAULT_MESSAGE_BY_ERROR_CODE[errorCode as ErrorCode]
+}
+
+/**
  * 历史消息 → 视图模型。
  *
  * `SYSTEM` 角色：本仓不写入 SYSTEM 消息（`MESSAGE_ROLES` 有它是因为 DB 的取值域，
@@ -176,9 +303,9 @@ export function messageToView(item: MessageItem): ChatMessageView {
     text: pickString(content, 'text'),
     thinking: pickString(content, 'thinking'),
     citations: pickCitations(content),
-    // ⚠️ 工具卡 / 产物卡的**历史还原**要等它们的写入端形状定下来（P0-2 / P0-3），
-    //    见文件头。此处恒空，不是"忘了做"。
-    tools: [],
+    // 工具卡的历史还原（P0-2-11 接回，见 `pickToolCalls`）。
+    // 产物卡仍恒空：它的写入端（沙箱产物，P0-3）还没有，见文件头。
+    tools: pickToolCalls(content),
     artifacts: [],
     createdAt: item.createdAt,
     status: 'complete',

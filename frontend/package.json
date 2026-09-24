@@ -12,6 +12,7 @@
     "verify:chat-sse": "node --import tsx scripts/verify-chat-sse.mjs",
     "verify:knowledge-ui": "node --import tsx scripts/verify-knowledge-ui.mjs",
     "verify:admin-ui": "node --import tsx scripts/verify-admin-ui.mjs",
+    "verify:mcp-ui": "node --import tsx scripts/verify-mcp-ui.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

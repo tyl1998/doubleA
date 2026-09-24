@@ -362,6 +362,19 @@ export const toolCallRecordSchema = z.object({
   toolName: z.string().min(1),
   /** 工具来自哪个系统（`kind=SANDBOX` 时为空串）—— 展示用 */
   serverName: z.string(),
+  /**
+   * 工具所属 MCP server 的 **id**（`kind=SANDBOX` 时没有这个键）。
+   *
+   * ⚠️ **P0-2-11 的契约增量**，理由只有一条：`02` §9.3 要求"缺凭据 ⇒ 工具卡带『去配置』跳转"，
+   * 而那个跳转的落点是 `/mcp/credentials?serverId=…`（`03` §4.2 / §4.5 的 `?serverId=` 定位）。
+   * {@link serverName} **做不到**这件事：它是展示名（可重名、也不是那条路径的参数形态）。
+   * 从 `toolName` 反推更不行 —— `mcp_{slug}_{tool}` 那段 slug **刻意不唯一**（`shared/src/mcp.ts`
+   * 文件头 ③），反推会指到别的 server 上，而症状是"点了去配置、落在另一台 server 的分组上"。
+   *
+   * ⚠️ 它是 `optional` 而**不是** nullable：`kind=SANDBOX`（P0-3）的工具压根不属于任何 server，
+   * "没有这个键"与"有但是空"是两件事（同 `output` / `errorCode` 的口径）。
+   */
+  serverId: z.string().optional(),
   kind: z.enum(TOOL_CALL_KINDS),
   status: z.enum(TOOL_CALL_STATUSES),
   /** 给用户看的**参数摘要**（截断过；凭据值已抹除，见 `chatContext#summarizeToolInput`） */
