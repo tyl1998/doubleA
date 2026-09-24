@@ -57,6 +57,26 @@
  * 传行进去的话，每个调用点都得自己再写一次 `findUnique` + 五个 `select` 字段（漏一个就
  * 变成"注入时模板是空的"这种静默 bug）。⇒ 收在这里查一次，顺带把"server 已被删除"翻成 404。
  * 第二参用 `viewer` 而不是裸 `userId`，与 `mcpCredential.service.ts` / `mcpServer.service.ts` 同形。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑤ 本文件在 P0-2-8 长出两个新出口，分工是"**列表** vs **执行**"
+ * ─────────────────────────────────────────────────────────────────────
+ * 工具循环（`chatBot.ts`）需要两样东西，而它们**必须分开**（合成一个函数是最容易犯的错）：
+ *   · {@link resolveMcpToolCatalog} —— **组装工具表**：读 `tool_cache` 列（**不联网**、**不碰凭据**）
+ *     + `toolSchema.ts#toOpenAiTools` 做名字去重与截断。每一次对话开头都要调。
+ *   · {@link executeMcpToolCall} —— **真的点一次工具**：这时才需要凭据（{@link resolveMcpCallContext}）
+ *     + 连接 + `tools/call` + 关闭。只有模型真的要求调用时才调。
+ * 分开的收益正是 `02` §9.3 那条："没配凭据"**不在列表阶段暴露** —— 否则用户一进对话页就会看到
+ * 一堆"缺凭据"的报错，而他可能根本没打算用那台 server。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑥ 工具表的**顺序**是正确性的一部分（`06` P0-2-6 坑预判 3 的接回点）
+ * ─────────────────────────────────────────────────────────────────────
+ * `slug` 刻意不唯一、纯中文名会整串折成 `server` ⇒ **不同 server 的工具名天然会撞**，
+ * 跨 server 的唯一性只能靠"依次把前面已占用的名字喂给 `toOpenAiTools`"。
+ * 于是"处理顺序"必须**确定**且**只有一处** ⇒ {@link resolveMcpToolCatalog} 自己按
+ * `(name, id)` 升序排（调用方只给一个集合，顺序不参与接口）。把这条约束留给调用方
+ * 等于把它变成一个提醒，而"提醒"在第三次改代码时就不见了。
  */
 
 import {
@@ -65,9 +85,10 @@ import {
   normalizeCredentialSchema,
 } from '@doubulea/shared'
 
+import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import type { McpClientOptions } from '../mcp/client.js'
+import { McpClient, type McpClientOptions } from '../mcp/client.js'
 import {
   buildCredentialInjection,
   createCredentialFetch,
@@ -75,6 +96,8 @@ import {
   type InjectedCredentialKeys,
   type SkippedCredentialKey,
 } from '../mcp/inject.js'
+import { parseToolCache } from '../mcp/toolCache.js'
+import { toOpenAiTools, type McpToolRoute, type OpenAiFunctionTool } from '../mcp/toolSchema.js'
 import { decryptMyCredentialValues } from './mcpCredential.service.js'
 
 /**
@@ -218,4 +241,189 @@ export async function resolveMcpCallContext(
   )
 
   return context
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 组装工具表（文件头 ⑤ 的前一半；**不联网、不碰凭据**）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 目录里的一台 server —— 只为**展示与日志**（工具卡片显示 `name`，日志用 `id`） */
+export interface McpCatalogServer {
+  id: string
+  name: string
+  /** 这次**真的下发给模型**的工具数（`truncated` 非 null 时会小于 `total`） */
+  toolCount: number
+  /** 被 `MCP_TOOL_LIMIT` 截断时的实况；没截断是 `null` */
+  truncated: { total: number; kept: number } | null
+}
+
+/** 本轮能下发给模型的全部 MCP 工具（`chatBot.ts` 的消费形态） */
+export interface McpToolCatalog {
+  /** 直接进 `ChatOptions.tools`（OpenAI 形态）；**空数组 = 一个工具都没有** */
+  tools: OpenAiFunctionTool[]
+  /**
+   * 模型回的工具名 → "要调哪台 server 的哪个工具"。
+   * ⚠️ 它是唯一的映射来源（`toolSchema.ts` 的口径 4）：**绝不从名字里 split 出 server**。
+   */
+  routes: Record<string, McpToolRoute>
+  /** 参与的 server，顺序 = 名字分配的顺序（见文件头 ⑥） */
+  servers: McpCatalogServer[]
+}
+
+/** 组装目录要用到的列（`slug` 只用于拼名字，不进 `routes` —— 见 `toolSchema.ts`） */
+const CATALOG_SERVER_SELECT = { id: true, name: true, slug: true, toolCache: true } as const
+
+/**
+ * "Agent 绑了哪几台 MCP server" → "这一轮能下发给模型的工具表"。
+ *
+ * 工具**只从 `tool_cache` 列读**（不联网）：
+ *   · 聊天路径上多一次上游往返是不可接受的（`tools/list` 可能几秒）；
+ *   · 而 `tools/list` 本来就不带用户凭据（P0-2-5 定案 ⇒ 缓存是**全员共享**的那一份）⇒
+ *     它不依赖"谁在问"，读缓存不会串用户。
+ * 缓存空（从没成功拉过 / 被失效清掉）的 server **只记账 + 打一条 warn**，不影响别的 server ——
+ * 一台没拉过工具的 server 不该让其他 server 的工具也下发不了。
+ *
+ * @param serverIds Agent 绑定的 server id（**集合语义**：顺序不参与结果，见文件头 ⑥；重复值会去重）
+ */
+export async function resolveMcpToolCatalog(serverIds: readonly string[]): Promise<McpToolCatalog> {
+  const unique = [...new Set(serverIds)]
+  if (unique.length === 0) return { tools: [], routes: {}, servers: [] }
+
+  const logger = getLogger()
+  const db = getPrisma()
+  const rows = await db.mcpServer.findMany({ where: { id: { in: unique } }, select: CATALOG_SERVER_SELECT })
+
+  // 绑定里有查不到的 server：`DELETE` 那一侧有 409 拦着（P0-2-2）⇒ 走到这里说明数据异常
+  if (rows.length !== unique.length) {
+    const found = new Set(rows.map((row) => row.id))
+    logger.warn(
+      { conversationMissingServerIds: unique.filter((id) => !found.has(id)) },
+      'Agent 绑定里有查不到的 MCP server（绑定未被清理）⇒ 这些 server 的工具本轮不会下发',
+    )
+  }
+
+  // ⚠️ 名字分配的顺序源（文件头 ⑥）：`(name, id)` 升序 —— `name` 不是唯一列，故用 `id` 兜底
+  const ordered = [...rows].sort((a, b) =>
+    a.name === b.name ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name),
+  )
+
+  const tools: OpenAiFunctionTool[] = []
+  const routes: Record<string, McpToolRoute> = {}
+  const servers: McpCatalogServer[] = []
+  /** 已被占用的下发给模型的名字（跨 server，**逐台累积** —— 见文件头 ⑥） */
+  const taken = new Set<string>()
+
+  for (const row of ordered) {
+    const cache = parseToolCache(row.toolCache)
+    if (cache === null) {
+      // "从没成功拉过"与"缓存已被失效清掉"在这里是同一件事：手上一份工具都没有
+      logger.warn(
+        { mcpServerId: row.id, name: row.name },
+        'MCP server 没有可用的工具缓存 ⇒ 本轮它一个工具都不会下发（去 /api/mcp/servers/:id/tools?refresh=1 或点「测试」拉一次）',
+      )
+      servers.push({ id: row.id, name: row.name, toolCount: 0, truncated: null })
+      continue
+    }
+
+    const conversion = toOpenAiTools({ id: row.id, slug: row.slug }, cache.tools, config.mcp.toolLimit, taken)
+    for (const name of Object.keys(conversion.routes)) taken.add(name)
+    tools.push(...conversion.tools)
+    // 名字恒以 `mcp_` 开头 ⇒ 不会撞上 `Object.prototype` 的键，普通对象当映射表是安全的
+    Object.assign(routes, conversion.routes)
+
+    if (conversion.truncated !== null) {
+      // `06` P0-2-6 的验收原文是"超过 MCP_TOOL_LIMIT **截断并告警**"，告警落点就在这里
+      logger.warn(
+        { mcpServerId: row.id, name: row.name, ...conversion.truncated, limit: config.mcp.toolLimit },
+        'MCP 工具数超过 MCP_TOOL_LIMIT，已截断（被截掉的工具模型永远看不到，界面也只能靠这条日志发现）',
+      )
+    }
+    servers.push({
+      id: row.id,
+      name: row.name,
+      toolCount: conversion.tools.length,
+      truncated: conversion.truncated,
+    })
+  }
+
+  logger.debug(
+    {
+      serverCount: servers.length,
+      toolCount: tools.length,
+      servers: servers.map((server) => ({ id: server.id, name: server.name, toolCount: server.toolCount })),
+    },
+    '已组装本轮 MCP 工具目录（读 tool_cache，未联网）',
+  )
+
+  return { tools, routes, servers }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 执行一次工具调用（文件头 ⑤ 的后一半；**这时才需要凭据**）
+// ═════════════════════════════════════════════════════════════════════
+
+/** {@link executeMcpToolCall} 的入参 */
+export interface McpToolCallInput {
+  serverId: string
+  viewer: McpCallViewer
+  /** MCP 侧的**原始**工具名（`routes` 给的那个；不是下发给模型的 `mcp_{slug}_{tool}`） */
+  toolName: string
+  /** 已解析的参数。⚠️ 解析属**编排层**：它要为"参数不是合法 JSON"给出一个结论（见 P0-2-8 门槛 2） */
+  args: Record<string, unknown>
+  /** 用户的「停止」 */
+  signal?: AbortSignal
+}
+
+/**
+ * {@link executeMcpToolCall} 的产出。
+ *
+ * ⚠️ **不含任何凭据**（凭据只在 `clientOptions.secrets` 里，且那个字段的用途只有脱敏）；
+ * `text` 是**原样全量** —— 截断由调用方做（`06` P0-2-8 坑预判 3：给模型的与给卡片看的必须
+ * 是**同一份**，所以只能在一个地方截）。
+ */
+export interface McpToolExecution {
+  /** 展示名（工具卡片显示"工具来自哪个系统"） */
+  serverName: string
+  /** 服务端明确表示这次调用**失败**（`isError:true`）—— 传输是成功的，见 `McpToolResult` 的三分法 */
+  isError: boolean
+  /** 文本块拼接（给模型与日志的唯一可读形态）；可能很大 */
+  text: string
+}
+
+/**
+ * 真的点一次工具：**组装上下文（凭据）→ 连接 → `tools/call` → 关掉**。
+ *
+ * ⚠️ **一次调用一个新 client、用完就关**（P0-2-8 的取舍）：
+ *   · 复用会话要维护"哪个 serverId 的会话还活着"这张会过期的表，而**QUERY 注入把参数拼在
+ *     *每个请求*的 URL 上**（P0-2-7 的探针结论）⇒ 复用并不省下什么；
+ *   · 一轮对话里的工具调用是**个位数**次，握手成本可接受。
+ *   接回点：真要连接池，键必须是 **`(serverId, userId)`** —— 凭据按用户注入，
+ *   按 serverId 复用会让 A 的调用带着 B 的凭据（`02` §9.3 的不变式）。
+ *
+ * ⚠️ 用 `new McpClient(...)` + `try/finally` 而**不**用 `connectMcpClient(...)`：
+ * 后者在 `connect()` 抛错时不会返回客户端，于是那次失败**没有机会 `close()`**
+ * （`mcpServer.service.ts#probeServer` 是同款写法）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) server 不存在 / `NEED_CREDENTIAL`(424) 凭据没配齐 /
+ *   `UPSTREAM_ERROR`(502)、`UPSTREAM_TIMEOUT`(504) —— 这三类是"**我们没调到它**"，
+ *   与 `isError:true`（"工具说它没干成"）是两回事，调用方的处置也不同（`McpToolResult` 的表格）
+ * @throws {McpAbortError} 用户点了停止（**不是**错误，那条流要以 `STOPPED` 收尾）
+ */
+export async function executeMcpToolCall(input: McpToolCallInput): Promise<McpToolExecution> {
+  // 凭据的**全部**判据都在这里面：含"未配齐 ⇒ 在 new McpClient() 之前就抛 424"
+  const context = await resolveMcpCallContext(input.serverId, input.viewer)
+  const client = new McpClient(context.clientOptions)
+  try {
+    await client.connect()
+    const result = await client.callTool(
+      input.toolName,
+      input.args,
+      input.signal === undefined ? {} : { signal: input.signal },
+    )
+    return { serverName: context.serverName, isError: result.isError, text: result.text }
+  } finally {
+    // `close()` 自己吞错并 warn（先 DELETE 终止会话、再关传输）⇒ 放 `finally` 不会
+    // 把一次**成功**的调用变成 500，也不会盖掉上面抛出来的真错误
+    await client.close()
+  }
 }

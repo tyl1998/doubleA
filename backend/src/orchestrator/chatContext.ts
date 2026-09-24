@@ -18,11 +18,22 @@
  * （`verify:app` 的"上下文组装"一节，见 `06` P0-1-18 的"能无依赖验的纯逻辑别粘依赖"）。
  * 于是本文件**不 import 任何运行期模块**（`import type` 会被 `verbatimModuleSyntax` 抹掉）：
  * `config` / `prisma` / 日志一律不碰 —— 用到 `config` 的部分留在 `chatBot.ts`。
+ *
+ * ⚠️ 唯一一处**运行期** import 是 `@doubulea/shared` 的 `toolCallRecordSchema`（P0-2-8）——
+ * 它没有任何副作用、也不碰上面那三样，而"历史里的 `tool_calls` 长什么样"**必须**与写入端
+ * 共用同一个 schema（自己再写一遍收窄逻辑就是两处一起腐烂的开端）。
+ * 先例：同为零依赖档的 `mcp/toolCache.ts` 也这么用 `mcpToolDescriptorSchema`。
  */
 
-import type { CitationItem, MessageContent, RetrievalHit } from '@doubulea/shared'
+import {
+  toolCallRecordSchema,
+  type CitationItem,
+  type MessageContent,
+  type RetrievalHit,
+  type ToolCallRecord,
+} from '@doubulea/shared'
 
-import type { ChatMessage } from '../llm/client.js'
+import type { ChatMessage, ChatToolCall } from '../llm/client.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // system prompt
@@ -166,9 +177,29 @@ export function textOfHistoryRow(row: HistoryRow): string {
 }
 
 /**
+ * 从一条历史行的 `content` 里取出**工具调用记录**（P0-2-8）—— 读不出来就是"没有"。
+ *
+ * ⚠️ 用**写入端那一个** `toolCallRecordSchema` 逐条校验（不是自己 `as` 一下）：
+ * `content` 是跨版本读的（同 {@link textOfHistoryRow}），一条坏记录不该让整轮对话失败，
+ * 但也不该被当成"看起来像就拿来用"—— 逐条 `safeParse`、坏的就跳过。
+ */
+function toolCallsOfHistoryRow(row: HistoryRow): ToolCallRecord[] {
+  const content = row.content
+  if (typeof content !== 'object' || content === null || Array.isArray(content)) return []
+  const raw = (content as { tool_calls?: unknown }).tool_calls
+  if (!Array.isArray(raw)) return []
+  const records: ToolCallRecord[] = []
+  for (const entry of raw) {
+    const parsed = toolCallRecordSchema.safeParse(entry)
+    if (parsed.success) records.push(parsed.data)
+  }
+  return records
+}
+
+/**
  * 取最近 `rounds` 轮的对话历史（`CONTEXT_ROUNDS=20`），还原成 LLM 入参。
  *
- * 三条口径（每一条都对应一种"看不太出来"的坏结果）：
+ * 四条口径（每一条都对应一种"看不太出来"的坏结果）：
  *   ① **一轮 = 一问一答，故取 `rounds × 2` 条**：只按"条"取 20 条等于只给 10 轮，
  *      而 `02` §六 写的是"最近 20 轮"；
  *   ② **截断后必须从 `user` 开始**：截点常常落在一个助手的回答中间 ⇒ 开头是一条没有问题的回答，
@@ -177,6 +208,8 @@ export function textOfHistoryRow(row: HistoryRow): string {
  *      （P0-1-27 停止时"已生成部分保留"，一个字都没生成时只有用户消息——
  *      但若先吐了 thinking 再被停止，就会留下"有 thinking 没 text"的助手行）。
  *      一条 `content: ''` 的 assistant 消息对上下文没有贡献，却会让严格的实现直接报 400。
+ *      ⚠️ **例外**：**有工具调用**的助手行即便正文为空也要留（P0-2-8）—— 它不是空消息。
+ *   ④ **工具段只在"每个调用都有结果"时才还原**（P0-2-8，见下面的长注释）。
  *
  * ⚠️ **本版本刻意不做 token 级裁剪**：唯一的边界手段是"轮数"。理由：
  * `model.maxContext` 存在库里但**没有可用的 tokenizer**（embedding 用的是另一套模型），
@@ -191,14 +224,215 @@ export function selectHistoryMessages(rows: readonly HistoryRow[], rounds: numbe
   for (const row of recent) {
     if (row.role === 'SYSTEM') continue // 本版本没有写入 SYSTEM 消息的路径（`02` §三 的取值域里留着）
     const text = textOfHistoryRow(row)
-    if (text === '') continue // 见 ③
-    mapped.push({ role: row.role === 'USER' ? 'user' : 'assistant', content: text })
+    if (row.role === 'USER') {
+      if (text === '') continue // 见 ③（用户消息为空只可能是脏数据）
+      mapped.push({ role: 'user', content: text })
+      continue
+    }
+
+    /**
+     * 助手行：正文 + 工具段。
+     *
+     * ⚠️ **工具段只在"每个调用都有结果"时还原**（P0-2-8 的核心判据）。三协议都要求
+     * `tool_calls` 与工具结果**成对**：一条没有结果的调用是 400
+     * （Anthropic："tool_use ids were found without tool_result blocks"；OpenAI 同理）。
+     * 而"工具跑到一半被停止 / 那一轮整体失败"正好会留下这种半截记录 ⇒
+     * **整个工具段一起丢**（只留正文），而不是留下一条会让**之后每一轮**都 400 的记录
+     * —— 后者的症状是"这个会话从此再也发不出消息"，且完全指不到历史里那一行。
+     *
+     * ⚠️ 已知的**保真度折损**（记在这里，别当 bug）：落库单位是"一轮问答"，而模型实际调了
+     * 好几次上游 ⇒ 还原出来的顺序是 `assistant{正文+toolCalls}` → `tool{结果}`，
+     * 即"最终正文"排在了"工具结果"**之前**。结构上合法（每个调用后都有结果），
+     * 语义上略有倒置。要修得先改成"按上游调用粒度落库"，那是一次独立的改动。
+     */
+    const calls = toolCallsOfHistoryRow(row)
+    const answered = calls.filter((call) => call.status !== 'RUNNING' && call.output !== undefined)
+    const restorable = calls.length > 0 && answered.length === calls.length
+
+    if (text === '' && !restorable) continue // 见 ③
+    if (restorable) {
+      mapped.push({
+        role: 'assistant',
+        content: text,
+        toolCalls: answered.map((call) => ({
+          id: call.callId,
+          name: call.toolName,
+          // 完整入参在库里（`arguments`）；老记录没这一列时给空串 —— `parseToolArguments('')` = `{}`
+          arguments: call.arguments ?? '',
+        })),
+      })
+      for (const call of answered) {
+        mapped.push({
+          role: 'tool',
+          toolCallId: call.callId,
+          content: call.output ?? '',
+          isError: call.status === 'ERROR',
+        })
+      }
+      continue
+    }
+    mapped.push({ role: 'assistant', content: text })
   }
 
   let start = 0
   while (start < mapped.length && mapped[start]?.role !== 'user') start += 1
   return mapped.slice(start)
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// 工具调用（P0-2-8）—— 全是纯函数
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * **回填给模型**的工具结果上限（字符，按码点算）。
+ *
+ * 为什么必须有上界：一个工具可以回几百 KB（搜索结果、日志、表格导出），而它会被塞进
+ * **下一轮请求**的报文里 —— 不设界就是"模型侧 400 / 拖垮一次问答"，且用户完全看不懂。
+ *
+ * ⚠️ 口径是"**给模型的那份**与**给卡片看的那份是同一份**"（`06` P0-2-8 坑预判 3，
+ * 同 P0-1-27 为引用片段立的那条规矩）：两处各截一次，症状是"用户核对不了模型到底看到了什么"。
+ * ⚠️ 刻意是**常量而不是配置项**（`06` 原文"定上界（常量）"）：要按 server 调就必须做成
+ * server 级配置，而那会顺带引出"界面上怎么展示这个配置"—— 属 P1。
+ */
+export const TOOL_RESULT_MAX_CHARS = 8000
+
+/** 工具卡上"参数摘要"的上限（字符）—— 它是要画在卡片上的一行字（`01` 决策 17） */
+export const TOOL_INPUT_SUMMARY_MAX_CHARS = 200
+
+/**
+ * 截断标记。⚠️ 它是**文本的一部分**，所以模型与用户都会看到 ——
+ * 于是它不能只说"已截断"，得把"接下来该怎么办"一起说了（模型据此换成更精确的调用参数）。
+ */
+export const TOOL_RESULT_TRUNCATED_MARK = '\n\n…（结果过长，已截断；以上是不完整的内容）'
+
+/**
+ * 按**码点**截断（不是 `String.prototype.slice`）。
+ *
+ * 为什么不用 `slice`：它按 UTF-16 码元切，会把代理对（emoji / 罕用汉字）**劈成两半**、
+ * 产出非法字符串，而这一层**毫无报错**（P0-1-18 的老坑，`shared` 里有一处同款注释）。
+ * 快路径：UTF-16 长度 ≤ 码点数 ⇒ 长度没超上限时一定没超，省掉一次整串展开。
+ */
+function truncateChars(text: string, max: number): string {
+  if (text.length <= max) return text
+  return [...text].slice(0, max).join('')
+}
+
+/**
+ * 工具结果 → 给模型与卡片看的**那一份**（见 {@link TOOL_RESULT_MAX_CHARS}）。
+ *
+ * 空结果给一句明确的话而不是空串：空串在报文里是一个"什么都没有"的内容块，
+ * 有的实现会把它当成非法报文；而且模型看到空串会以为工具"什么都没返回"并开始瞎猜。
+ */
+export function truncateToolResult(text: string): string {
+  const trimmed = text.trim() === '' ? '（工具执行成功，但没有返回内容）' : text
+  if (trimmed.length <= TOOL_RESULT_MAX_CHARS) return trimmed
+  // ⚠️ 标记本身要占额度：先按"上限 - 标记长度"截，再拼 —— 反过来拼会让结果超上限
+  const head = truncateChars(trimmed, TOOL_RESULT_MAX_CHARS - TOOL_RESULT_TRUNCATED_MARK.length)
+  return `${head}${TOOL_RESULT_TRUNCATED_MARK}`
+}
+
+/**
+ * 参数名**看起来像凭据**的判定（大小写不敏感；只匹配这几个词，不用"包含 `key` 就算"）。
+ *
+ * ⚠️ **这是尽力而为，不是安全边界**。真正的保证在另一条线上：**凭据从不下发给模型**
+ * （`02` §九 不变式 —— 注入发生在传输层，模型只看到工具的参数 schema）⇒
+ * 参数里出现的值**只可能是用户自己贴进对话的内容**。因此这里遮的是"别在卡片上回显
+ * 用户自己的秘密"，而不是"防止凭据泄漏"（后者不是靠这行判断做到的）。
+ * 不写"包含 `key` 就遮"：`{"key": "查询关键词"}` 是很常见的普通参数，遮了反而看不懂卡片。
+ */
+const SENSITIVE_PARAM_KEYS = [
+  'token',
+  'secret',
+  'password',
+  'passwd',
+  'apikey',
+  'api_key',
+  'authorization',
+  'credential',
+  'cookie',
+  'session',
+] as const
+
+function looksLikeSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase()
+  return SENSITIVE_PARAM_KEYS.some((hint) => lower.includes(hint))
+}
+
+/**
+ * 参数 → 卡片上的**摘要**（`tool_call.inputSummary`）。
+ *
+ * 三条口径：
+ *   · **截断**（{@link TOOL_INPUT_SUMMARY_MAX_CHARS}）：这是要画在卡片上的一行字；
+ *   · **凭据形状的参数值遮掉**（{@link looksLikeSensitiveKey}）—— 只遮**顶层**参数名，
+ *     嵌套里的不管（卡片上也不看嵌套）；
+ *   · 保持 JSON 的形状（`JSON.stringify`）而**不是**自己拼 `key=value`：
+ *     模型给的参数本来就是 JSON，原样透出让用户能逐字对上"模型到底传了什么"。
+ *
+ * ⚠️ 不抛错：到不了这里的是"参数无法序列化"（它来自 `JSON.parse`，理论上不可能），
+ * 真到了也绝不能让一次工具调用把整轮对话变成 500。
+ */
+export function summarizeToolInput(args: Record<string, unknown>): string {
+  const masked: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(args)) {
+    masked[key] = looksLikeSensitiveKey(key) ? '***' : value
+  }
+  let serialized: string
+  try {
+    serialized = JSON.stringify(masked) || '{}'
+  } catch {
+    serialized = '（参数无法序列化）'
+  }
+  return truncateChars(serialized, TOOL_INPUT_SUMMARY_MAX_CHARS)
+}
+
+/** 一次工具执行的**结论**（编排层算好之后交给纯函数的部分 —— 这三样正好是回填要的全部） */
+export interface ToolOutcome {
+  /** 对应哪一个调用（= 上游给的 `id`） */
+  callId: string
+  /** 给模型与卡片看的**同一份**文本（已过 {@link truncateToolResult}） */
+  text: string
+  /** 工具自报失败（`isError`）—— **不是**"我们没调到它"（那类走 `errorCode`） */
+  isError: boolean
+}
+
+/**
+ * 工具结果 → 协议无关的消息（`role:'tool'`）。
+ *
+ * **三协议怎么落到报文里由 `protocol.buildBody` 负责**（OpenAI 的 `role:'tool'` +
+ * `tool_call_id`、Anthropic 的用户消息里 `tool_result` 块、Responses 的
+ * `function_call_output` item）—— 编排层**绝不能**在这里手拼报文（`06` 坑预判 2：
+ * 那样"换了协议就调不动工具"，而 `verify:llm` 不会红 —— 它不跑编排循环）。
+ */
+export function buildToolResultMessages(outcomes: readonly ToolOutcome[]): ChatMessage[] {
+  return outcomes.map((outcome) => ({
+    role: 'tool',
+    toolCallId: outcome.callId,
+    content: outcome.text,
+    isError: outcome.isError,
+  }))
+}
+
+/**
+ * 助手那一轮"我要调这些工具"的消息 —— **必须排在工具结果之前**（三协议都要求成对）。
+ *
+ * `text` 是这一轮已经吐出来的正文（通常是空的：模型决定调工具时往往不说话；也有一边说
+ * "我查一下"一边调的）。它**不截断** —— 它是模型的正式输出，会原样落库并展示。
+ */
+export function buildAssistantToolCallsMessage(text: string, toolCalls: readonly ChatToolCall[]): ChatMessage {
+  return { role: 'assistant', content: text, toolCalls: [...toolCalls] }
+}
+
+/**
+ * 超过轮数上限时**注入的那条提示**（`06` 门槛 3："注入一条『工具调用已达上限』的提示并禁工具"）。
+ *
+ * ⚠️ 它是一条 `user` 消息而不是"系统提示"：我们**不改 system**（那一份是本轮的静态上下文，
+ * 中途改它会让上游的提示缓存失效、也让"模型看到的规则"与"日志里记的规则"不一致）。
+ * 用 `user` 角色还有一个好处：Anthropic/OpenAI 都保证它会被当成"最新的一轮输入"。
+ * ⚠️ 措辞是**给模型**的指令（不是给用户看的），所以要说清"做什么"，不是只说"到上限了"。
+ */
+export const TOOL_LOOP_LIMIT_NOTICE =
+  '（系统提示：本次回答中可用的工具调用次数已达上限，后续不能再调用任何工具。' +
+  '请仅根据已获得的信息给出最终回答；如果信息仍不完整，请如实说明还缺什么。）'
 
 // ═════════════════════════════════════════════════════════════════════
 // 落库形态
@@ -209,20 +443,28 @@ export interface AssistantContentInput {
   text: string
   thinking: string
   citations: readonly CitationItem[]
+  /** 本轮的**工具调用记录**（按发生顺序；P0-2-8 起定型，见 `shared#toolCallRecordSchema`） */
+  toolCalls?: readonly ToolCallRecord[]
 }
 
 /**
  * 组装助手消息的 `content`（jsonb）—— **只写实际产生过的部分**。
  *
- * 两条口径：
- *   · **空的 `thinking` / 空的 `citations` 不加键**：省掉这个键表示"这一段本来就没有"，
- *     与"有但是空"在界面上是两件事（`03` §五：思考折叠区与引用区都是**有才出现**）；
+ * 三条口径：
+ *   · **空的 `thinking` / 空的 `citations` / 空的 `tool_calls` 不加键**：省掉这个键表示
+ *     "这一段本来就没有"，与"有但是空"在界面上是两件事（`03` §五：思考折叠区、引用区、
+ *     工具区都是**有才出现**）；
  *   · **`text` 恒写**（可以是空串）：它是历史重建时唯一进入上下文的部分
- *     （见 {@link selectHistoryMessages}）—— 缺了键，P0-1-28 的读取端会把它当"旧版本的行"。
+ *     （见 {@link selectHistoryMessages}）—— 缺了键，P0-1-28 的读取端会把它当"旧版本的行"；
+ *   · 工具记录**原样落库**（含完整 `arguments`）：卡片的 `inputSummary` 只是摘要，
+ *     而"模型到底传了什么"只有完整入参能回答（`06` P0-2-8 的原文）。
  */
 export function buildAssistantContent(input: AssistantContentInput): MessageContent {
   const content: MessageContent = { text: input.text }
   if (input.thinking !== '') content.thinking = input.thinking
   if (input.citations.length > 0) content.citations = [...input.citations]
+  if (input.toolCalls !== undefined && input.toolCalls.length > 0) {
+    content.tool_calls = [...input.toolCalls]
+  }
   return content
 }

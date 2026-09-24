@@ -56,12 +56,15 @@
  * 就会在"刷新后重放历史"时凭空消失，而**没有任何报错**（`01` §3.4「完整还原」要求的正是
  * "工具卡 / 引用卡都能还原"）。服务端的职责只有一条：**把那一列原封不动地交出去**。
  * 前端渲染时再按已知的三段取值（未知段原样留着）。
+ * ✅ **P0-2-8 起 `tool_calls` 已定型**（{@link toolCallRecordSchema}）：这条"原样透出"的口径
+ * 因此**不用改**，P0-2-11 只要在前端 `messageToView` 里加一段映射（那正是它留的接回点）。
  */
 
 import { z } from 'zod'
 
 import { AGENT_TYPES } from './agent.js'
 import { cursorPageOf, offsetPageOf } from './envelope.js'
+import { ERROR_CODES } from './errors.js'
 
 // ───────────────────────────── 取值域与判据 ─────────────────────────────
 
@@ -302,27 +305,84 @@ export const citationItemSchema = z.object({
 })
 export type CitationItem = z.infer<typeof citationItemSchema>
 
+// ───────────────────────────── 工具调用（P0-2-8）─────────────────────────────
+
+/**
+ * 工具来源（`02` §5.1 的 `tool_call.kind`）：ChatBot 的 MCP 工具 / TaskAgent 的沙箱工具。
+ *
+ * ⚠️ **P0-2-8 起家在本文**（P0-1-26 时定义在 `sse.ts`）。搬家的理由：同一套取值域现在要出现在
+ * **落库**（`messages.content.tool_calls[].kind`）与**事件**（`tool_call` 的 payload）两处，
+ * 而"两处各写一份字面量"必然有一处先腐烂。`sse.ts` 改成 `import`（前端从包根 import，**无感**）。
+ */
+export const TOOL_CALL_KINDS = ['MCP', 'SANDBOX'] as const
+export type ToolCallKind = (typeof TOOL_CALL_KINDS)[number]
+
+/** 工具调用状态机（`RUNNING` → `SUCCESS` / `ERROR`）；`02` §5.1 */
+export const TOOL_CALL_STATUSES = ['RUNNING', 'SUCCESS', 'ERROR'] as const
+export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number]
+
+/**
+ * 一次工具调用的**持久化记录**（`messages.content.tool_calls[]`）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么它是"卡片"这件事的唯一形状（`sseToolCallPayloadSchema` 由它 `.omit()` 派生）
+ * ─────────────────────────────────────────────────────────────────────
+ * 同一张工具卡有**两个来源**（`03` §六 的"单一渲染路径"）：流里的 `tool_call` 事件、
+ * 刷新后从 `GET /:id/messages` 的 jsonb 里恢复。两者字段一旦分叉，症状是"流里有的卡片、
+ * 刷新之后少一块"，而**没有任何报错**（P0-1-28 的文件头 ⑥ 就是为这件事写的）。
+ * ⇒ 事件 payload = **记录去掉 `arguments`**（完整入参只留档、不上线）—— 派生而不是各写一份，
+ * 于是"加字段忘了同步"这件事**结构上不可能发生**（同 `conversationActiveSchema` 的手法）。
+ *
+ * `arguments` **不在事件里**、只在库里（`06` P0-2-8 的原文："完整入参留在库里"）：
+ * 卡片要的是**摘要**（`inputSummary`），完整入参是排查"模型为什么这么调"的唯一线索。
+ */
+export const toolCallRecordSchema = z.object({
+  /** 上游给的调用 id（同一 id 的多次推送 = 状态机流转；前端按它 upsert） */
+  callId: z.string().min(1),
+  /** **下发给模型的那个名字**（`mcp_{slug}_{tool}`，不是 MCP 侧的原始工具名） */
+  toolName: z.string().min(1),
+  /** 工具来自哪个系统（`kind=SANDBOX` 时为空串）—— 展示用 */
+  serverName: z.string(),
+  kind: z.enum(TOOL_CALL_KINDS),
+  status: z.enum(TOOL_CALL_STATUSES),
+  /** 给用户看的**参数摘要**（截断过；凭据值已抹除，见 `chatContext#summarizeToolInput`） */
+  inputSummary: z.string(),
+  /** 结果文本（`RUNNING` 时没有；与回填给模型的**是同一份**，见 `chatContext#truncateToolResult`） */
+  output: z.string().optional(),
+  /**
+   * 失败时的错误码（`shared/src/errors.ts` 的取值域），**不是 HTTP 状态码**。
+   *
+   * 为什么非要它：`02` §9.3 要求"无凭据 ⇒ `tool_call{ERROR}` → 前端卡片带**『去配置』跳转**"
+   * ——`output` 是一句人话，前端从里面认不出"这是缺凭据"，只能靠一个**结构化**的信号。
+   */
+  errorCode: z.enum(ERROR_CODES).optional(),
+  /** 模型给出的参数 **JSON 原样**（含不合法 JSON 的原样）；卡片不显示，留档排查用 */
+  arguments: z.string().optional(),
+})
+export type ToolCallRecord = z.infer<typeof toolCallRecordSchema>
+
 /**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *
  * 设计口径（三条，都是"改了就会让历史读不出来"的）：
  *   · **`text` 必填**（可以是空串）：它是历史重建时唯一进入 LLM 上下文的部分
  *     （`orchestrator/chatContext.ts#selectHistoryMessages`）—— 缺了它，多轮对话就断了。
- *   · `thinking` / `citations` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
- *     与"它有但是空的"在界面上是两件事（思考折叠区该不该出现、引用区该不该出现）。
- *   · `tool_calls` / `attachments` **本版本刻意不定型**：工具属 **P0-2**（MCP）、附件属 **P1**
- *     （`files` 表），现在写进去只会是"猜的形状"，而 `02` §三 已写明"结构一经写入**不改语义**"。
+ *   · `thinking` / `citations` / `tool_calls` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
+ *     与"它有但是空的"在界面上是两件事（思考折叠区 / 引用区 / 工具区该不该出现）。
+ *   · `attachments` **当前仍未定型**：附件属 **P1**（`files` 表），现在写进去只会是"猜的形状"，
+ *     而 `02` §三 已写明"结构一经写入**不改语义**"。`tool_calls` 已在 **P0-2-8** 定型
+ *     （见 {@link toolCallRecordSchema}）—— 定型的判据是"写入端与读取端都已落地"，
+ *     不是"字段想清楚了"（P0-1-27 当时留着它，正是因为那时**没有写入端**）。
  *     ⚠️ 本 schema **不是 `passthrough` 也**不是 `.strict()` —— 未声明的键会被 Zod **静默剥掉**
- *     （不报错）。P0-1-27 在这里留下的告诫是"将来加字段必须同时回到 shared 加"；
- *     **P0-1-28 落地读取端时按更彻底的办法处置**：读取端**根本不用这个 schema 过滤**
- *     （`messageItemSchema.content` 是 `z.unknown()`，原样透出，见文件头 ⑥）⇒
- *     P0-2/P1 加段时**不必回头改这里**，也不会有"刷新之后卡片少了一块"的风险。
+ *     （不报错）。**读取端刻意不用它**（`messageItemSchema.content` 是 `z.unknown()`，原样透出，
+ *     见文件头 ⑥）⇒ 将来加段不必回头改这里，也不会有"刷新之后卡片少了一块"的风险。
  *     本 schema 的用途因此收窄为：**写入端**（`chatBot.ts#buildAssistantContent`）的形态约束。
  */
 export const messageContentSchema = z.object({
   text: z.string(),
   thinking: z.string().optional(),
   citations: z.array(citationItemSchema).optional(),
+  tool_calls: z.array(toolCallRecordSchema).optional(),
 })
 export type MessageContent = z.infer<typeof messageContentSchema>
 

@@ -35,6 +35,9 @@
  *    ⚠️ P0-1-37 起，上面前四条里"取哪个字段"的部分**搬到了 `./protocol.ts`**（按 Provider 的
  *      `protocol` 分流）；本文件只留"与协议无关"的那部分：读流 / 计时 / 汇总 / 脱敏 / 回调。
  *      **这条边界要守住** —— 往这里加 `if (protocol === '…')` 就是把差异又摊回了外壳。
+ *    ⚠️ P0-2-8 起多了一样**跑不掉**的东西：**工具调用的分片累积**（`protocol.ts` 文件头 ③）。
+ *      它留着是对的 —— "按片攒字符串"是**与协议无关**的动作（三协议的差异只是"这一帧取哪个字段"，
+ *      已经由钩子归一成同一种分片）。唯一不许做的是在这里 `JSON.parse` 参数：那是编排层的事。
  *
  * **③ 超时与中断分三级，且各有去处**（不这样做的话，一个卡死的上游会永久占住
  *    ChatBot 的并发闸）：
@@ -63,12 +66,17 @@ import { AppError, type UpstreamProtocol } from '@doubulea/shared'
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import {
+  absorbToolCalls,
+  createToolCallBuffer,
   mergeUsage,
   protocolOf,
+  readToolCalls,
   type ChatMessage,
+  type ChatToolCall,
   type ChatUsage,
   type DecodedFrame,
   type ProtocolDecodeContext,
+  type ProtocolToolDefinition,
 } from './protocol.js'
 import {
   Deadline,
@@ -89,6 +97,10 @@ export { LlmAbortError, redactSecret }
 // 同理：`ChatMessage` / `ChatUsage` 的实现（定义）P0-1-37 起搬到了 `./protocol.ts`
 // （依赖方向原因，见那边的文件头），**调用点同样不用改 import 路径**。
 export type { ChatMessage, ChatUsage, DecodedFrame } from './protocol.js'
+// P0-2-8：工具调用的**协议无关形态**与参数解析也在这里再导出 —— 编排层（`chatBot.ts`）只
+// import `llm/client.js`，不必知道 `protocol.ts` 的存在（它与 `ChatMessage` 是同一条纪律）。
+export { parseToolArguments, sumUsages } from './protocol.js'
+export type { ChatToolCall, ProtocolToolDefinition, ToolArgumentsParse } from './protocol.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 对外类型（F 包的编排层只依赖这几项）
@@ -135,6 +147,14 @@ export interface ChatResult {
    */
   rawFinishReason: string | null
   usage: ChatUsage | null
+  /**
+   * 本次上游调用**请求**的工具（P0-2-8）。
+   *
+   * ⚠️ 编排层的工具循环走的是 {@link chatStream}（它要持续透传 `delta`），这里保留工具字段
+   * 只是为了"非流式入口不把工具信息吃掉"—— 否则同一个上游在"忽略 `stream:true`"时会**静默**
+   * 丢失工具调用（`chatStream` 的非流式兜底路径就是靠它）。当前**没有消费方**。
+   */
+  toolCalls: ChatToolCall[]
   /** 本次上游调用的耗时（毫秒）；TTFT 由编排层自己打点（`02` §十三） */
   durationMs: number
 }
@@ -148,6 +168,18 @@ export interface ChatStreamSummary {
   deltaCount: number
   /** 跳过的畸形帧数（网关偶发截断时非零）；有值即已打 warn */
   malformedFrames: number
+  /**
+   * 本次调用请求的工具（**已累积完成**，参数是原样 JSON 字符串）。
+   *
+   * ⚠️ 只在流结束（或 `finish_reason==='tool_calls'`）之后才有正确值 —— 见 `protocol.ts` 文件头 ③。
+   */
+  toolCalls: ChatToolCall[]
+  /**
+   * 收到分片但缺 `id`/`name`（调不了）而被丢弃的段数；非零即已打 warn。
+   *
+   * 它必须能出来：丢掉的症状是"模型说要调工具、界面上什么都没有"，而这条是唯一的解释。
+   */
+  incompleteToolCalls: number
   durationMs: number
 }
 
@@ -163,6 +195,13 @@ export interface ChatOptions {
   /** `max_tokens`；`undefined` 就不带这个字段（交给上游默认） */
   maxTokens?: number
   temperature?: number
+  /**
+   * 下发给模型的工具（**OpenAI 形态**，P0-2-6 的产出）。
+   *
+   * `undefined` = 不带 `tools` 字段（**不是**带一个空数组：有的网关见空数组会 400）。
+   * 各协议的报文投影由 `protocol.buildBody` 负责（见 `protocol.ts` 文件头 ③）。
+   */
+  tools?: readonly ProtocolToolDefinition[]
   /** 调用方的取消信号（用户的"停止"）→ 抛 {@link LlmAbortError} */
   abortSignal?: AbortSignal
   /** 覆盖配置的"到响应头"超时（测试/一次性任务用） */
@@ -170,8 +209,9 @@ export interface ChatOptions {
   /** 覆盖配置的"流内空闲"超时 */
   idleTimeoutMs?: number
   /**
-   * 原样并入请求体的额外字段（`tools` / `top_p` / 多模态 part 之类）。
+   * 原样并入请求体的额外字段（`top_p` / 多模态 part 之类）。
    * **本层不校验它** —— 这是给 F 包留的逃生口：上游差异不该逼着改传输层。
+   * ⚠️ 它在 `buildBody` 的最后被 `Object.assign` ⇒ **能覆盖**同名的协议字段（含 `tools`）。
    */
   extraBody?: Record<string, unknown>
 }
@@ -228,8 +268,11 @@ function decodeContextOf(target: LlmTarget): ProtocolDecodeContext {
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 一次性对话（F 包的"工具循环二次调用"、连通测试、以及**本项目验收门槛点名的
- * 「对一个真实 provider 发一次极小请求（`max_tokens: 1`）」**都走它）。
+ * 一次性对话（连通测试 / **本项目验收门槛点名的「对一个真实 provider 发一次极小请求
+ * （`max_tokens: 1`）」**都走它）。
+ *
+ * ⚠️ **工具循环不走这里**（`06` P0-2-8）：它每一轮都要把 `delta` 实时透传给用户，
+ * 而本函数是"回一坨"。工具调用也走 {@link chatStream}（`LlmTarget` 那一侧没有差别）。
  *
  * @throws {AppError} `UPSTREAM_ERROR`(502) 上游非 2xx / 报文不可解析；
  *                    `UPSTREAM_TIMEOUT`(504) 到响应头或读 body 超时
@@ -251,6 +294,7 @@ export async function chat(
     stream: false,
     maxTokens: options.maxTokens,
     temperature: options.temperature,
+    tools: options.tools,
     extraBody: options.extraBody,
   })
 
@@ -266,12 +310,16 @@ export async function chat(
   })
 
   const parsed = protocol.readNonStream(payload, decodeContextOf(target))
+  // 走**同一个**累积器（即使非流式的分片是一次给全的）：两种入口的产出形态因此逐字一致
+  const buffer = createToolCallBuffer()
+  absorbToolCalls(buffer, parsed.toolCalls)
   return {
     text: parsed.text,
     // 结束原因已由协议归一化到 OpenAI 词表（`protocol.ts` 文件头口径 ①）——
     // 上层（`chatBot`）靠 `!== 'stop'` 判"可能被截断"，三协议必须是同一套词表
     rawFinishReason: parsed.finishReason,
     usage: parsed.usage,
+    toolCalls: readToolCalls(buffer).calls,
     durationMs: Date.now() - startedAt,
   }
 }
@@ -289,6 +337,10 @@ export async function chat(
  *
  * 返回**而不是**抛异常来表示"正常结束"：正常结束有多种形态（有/无 `[DONE]`、
  * 有/无 `finish_reason`），都归到 {@link ChatStreamSummary}；只有真故障才抛。
+ *
+ * 工具（P0-2-8）：`tools` 传下去，上游回的 `tool_calls` **在这里只累积、不解析**
+ * （`arguments` 是逐段拼出来的，第一片就 parse 会得到空参数）⇒ 汇总里给的是**完整的**
+ * {@link ChatStreamSummary.toolCalls}。工具循环（`chatBot.ts`）据此决定"再调一轮还是收尾"。
  *
  * @throws {AppError} `UPSTREAM_ERROR` / `UPSTREAM_TIMEOUT`
  * @throws {LlmAbortError} 调用方中断（用户点停止）—— 已收到的增量留在 `onDelta` 那侧，
@@ -309,6 +361,13 @@ export async function chatStream(
   const endpoint = endpointOf(target)
   const protocol = protocolOf(target.protocol)
   const decodeCtx = decodeContextOf(target)
+  /**
+   * 工具调用的累积器（**半成品只活在这里**，见 `protocol.ts` 文件头 ③）。
+   *
+   * 它必须在 `buildBody` 之前就位：**非流式兜底那一路**（上游忽略 `stream:true`）
+   * 也要往同一个累积器里灌，否则同一个上游会在"这次回了 JSON"时静默丢掉工具调用。
+   */
+  const toolBuffer = createToolCallBuffer()
 
   const body = protocol.buildBody({
     model: target.modelName,
@@ -316,6 +375,7 @@ export async function chatStream(
     stream: true,
     maxTokens: options.maxTokens,
     temperature: options.temperature,
+    tools: options.tools,
     extraBody: options.extraBody,
   })
   // ⚠️ 刻意不写 `stream_options`（见文件头 ②）：它是 400 的常见来源，而 usage 只是锦上添花
@@ -372,12 +432,20 @@ export async function chatStream(
     if (parsed.text !== '') callbacks.onDelta(parsed.text)
     if (parsed.thinking !== '') callbacks.onThinking?.(parsed.thinking)
     if (parsed.usage !== null) callbacks.onUsage?.(parsed.usage)
+    // ⚠️ 这一路也要灌累积器：上游忽略 `stream:true` 时工具调用**照样可能在报文里**
+    absorbToolCalls(toolBuffer, parsed.toolCalls)
+    const fallback = readToolCalls(toolBuffer)
+    if (fallback.incomplete > 0) {
+      logIncompleteToolCalls(target, fallback.incomplete)
+    }
     return {
       text: parsed.text,
       rawFinishReason: parsed.finishReason,
       usage: parsed.usage,
       deltaCount: parsed.text === '' ? 0 : 1,
       malformedFrames: 0,
+      toolCalls: fallback.calls,
+      incompleteToolCalls: fallback.incomplete,
       durationMs: Date.now() - startedAt,
     }
   }
@@ -427,10 +495,13 @@ export async function chatStream(
        * ⚠️ 是**合并**不是替换：Anthropic 把一个 usage 拆在 `message_start`（input_tokens）
        * 与 `message_delta`（output_tokens）两帧里 —— 直接替换会丢掉前一半。
        * 对"一次给全"的 OpenAI 系来说，合并等价于赋值。
+       * ⚠️ 与"多轮相加"（{@link sumUsages}）是两件事：这里是**同一次调用的两半**。
        */
       state.usage = mergeUsage(state.usage, frame.usage)
       callbacks.onUsage?.(state.usage)
     }
+    // ⚠️ **只累积，不解析**（`arguments` 此刻可能只是 `{"a":`）—— 见 `protocol.ts` 文件头 ③
+    if (frame.toolCalls.length > 0) absorbToolCalls(toolBuffer, frame.toolCalls)
     if (frame.done) endSignalSeen = true
   }
 
@@ -508,14 +579,33 @@ export async function chatStream(
     // 措辞刻意中立：`[DONE]` 只是三种协议的结束信号之一（另有 `message_stop` / `response.completed`）
     getLogger().debug({ ...describeTarget(target), protocol: protocol.id }, '上游发来了流结束信号')
   }
+  const toolCalls = readToolCalls(toolBuffer)
+  if (toolCalls.incomplete > 0) {
+    /**
+     * 到这里还缺 `id` / `name` 的分片**调不了**，只能丢。⚠️ 必须留下线索：
+     * 丢掉的症状是"模型说要调工具、界面上却什么都没有"，这条 warn 是唯一的解释
+     * （告警落点刻意在调用方 —— `protocol.ts` 是纯函数层，见 P0-2-6 的同款手法）。
+     */
+    logIncompleteToolCalls(target, toolCalls.incomplete)
+  }
   return {
     text: state.text,
     rawFinishReason: state.rawFinishReason,
     usage: state.usage,
     deltaCount: state.deltaCount,
     malformedFrames: state.malformedFrames,
+    toolCalls: toolCalls.calls,
+    incompleteToolCalls: toolCalls.incomplete,
     durationMs: Date.now() - startedAt,
   }
+}
+
+/** {@link readToolCalls} 里"缺 id/name 的段"的统一告警口（两处调用点共用同一句文案） */
+function logIncompleteToolCalls(target: LlmTarget, count: number): void {
+  getLogger().warn(
+    { ...describeTarget(target), incompleteToolCalls: count },
+    '上游给出的工具调用缺 id 或 name（无法执行，已丢弃）—— 模型可能报了一个残缺的工具调用',
+  )
 }
 
 interface StreamState {

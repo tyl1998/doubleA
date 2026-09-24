@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-7 凭据注入（mcp/inject.ts 纯函数：模板是唯一路由表 ⇒ 模板删掉的 key 天然不注入 / HEADER·QUERY·BODY 三处共用 transport 的 fetch 选项一个口子（H4）/ QUERY 每请求拼 URL ⇒ 不必放弃连接复用（坑预判 2 探针证伪）/ 保留头名等历史脏数据「跳过 + 记账」不报错 / service 侧 resolveMcpCallContext 在发请求之前判必填，缺则 424 NEED_CREDENTIAL）',
+    step: 'P0-2-8 编排循环接工具调用 + 10 轮上限（chatBot.ts 的 for(;;) 工具循环：LLM 流式 tool_calls 分片累积 ⇒ 映射 routes ⇒ 取凭据（P0-2-7）⇒ 执行 ⇒ tool_call{RUNNING}→{SUCCESS|ERROR} ⇒ 结果回填续流 / 到 TOOL_LOOP_LIMIT 当轮撤掉 tools 并注入提示 / 工具失败≠这一轮失败（唯一例外是中断）/ tool_calls 结构化落库进助手消息 content；危险判定接回点已预留在执行之前，属 P0-2-9）',
     address,
   })
   logger.info(

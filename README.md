@@ -1598,9 +1598,179 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
 # ㉒-h **【门槛⑤】`slug` 的稳定性**：改名**不影响**工具名
 curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP | jq '.data | {name, slug}'
 #  → `slug` 与 ⑳ 注册时那一个逐字相同（`PATCH` 的 body 里根本没有 `slug` 这个字段）。
-#    ⚠️ **本批只能验到这里**：`mcp_{slug}_{toolName}` 那个**拼出来的名字**属 **P0-2-6**（`toOpenAiTools`），
-#       到那时才有得比 —— 现在别急着在库里找工具名前缀。
+#    ✅ **`mcp_{slug}_{toolName}` 那个"拼出来的名字"已于 P0-2-8 接线**（`toOpenAiTools` 在编排循环里
+#       被真的用上了）—— 但它**不对应任何端点**，只能在两处看到：① 发给上游的报文（假 LLM 会打印
+#       `首个工具=…`）；② 落库的 `content.tool_calls[].toolName`。两边都在 ㉓ 里验。
+
+# ㉓ 工具调用闭环（P0-2-8）—— 工具闭环的**整条链**第一次跑通：
+#    LLM 流式吐 `tool_calls`（分片）⇒ 后端累积 ⇒ 映射到 MCP 工具 ⇒ 取凭据（这里 authType=NONE，跳过）
+#    ⇒ 执行 `tools/call` ⇒ 卡片 `RUNNING`→`SUCCESS` ⇒ 结果回填 ⇒ **续流** ⇒ `tool_calls` 落进助手消息。
+#    ⚠️ **本批没有界面**（`/mcp` 页仍是占位页）⇒ 这一整节都是**命令行**档；`tool_call` 事件是 SSE 帧，
+#       `curl -N` 就能逐帧看到（前端 `ToolCard` 渲染同一份数据属 P0-2-11）。
+#    ⚠️ **危险判定本批不做**（属 P0-2-9）⇒ 所有工具**一律直接执行、不弹确认卡** —— 这是**预期**，别当 bug。
+#    前置：承接 ⑳（有一台 server）或**直接照这段新建一台**；另需要一个**假 LLM 上游**（下面 ㉓-⓪ 一起起）。
+
+# ㉓-⓪ 另开一个终端：**同时**起"假 MCP server + 假 LLM"两个上游，前台常驻（Ctrl-C 收工）
+#      ⚠️ 同样是**内联**的（仓库里不放夹具文件，见 ⑳-⓪ 的说明）。它打印 `MCPURL=` 与 `LLMURL=`（抄下来）。
+#      假 MCP 除了 `tools/list` 还实现了 `tools/call`；假 LLM 按"用户那句话里的关键词"决定行为：
+#        · 普通话        ⇒ 先吐一个 `tool_calls`（`arguments` **故意拆成两片**）⇒ 拿到工具结果后**续流收尾**（门槛 1）
+#        · 含 `boom`     ⇒ 去调那个**自己报错**的工具 ⇒ 卡片 `ERROR`（门槛 2）
+#        · 含 `loop`     ⇒ **每轮都接着要工具**（直到后端把 `tools` 撤掉）⇒ 验 10 轮上限（门槛 3）
+node --input-type=module -e '
+const http = await import("node:http");
+let mcpN = 0, llmN = 0;
+const mcp = http.createServer(async (req, res) => {
+  if (req.method !== "POST") { console.log(`[假MCP] ${req.method}（不计入）`); res.writeHead(200).end(); return; }
+  let body = ""; for await (const c of req) body += c;
+  const msg = body === "" ? null : JSON.parse(body);
+  mcpN += 1; console.log(`[假MCP] #${mcpN} ${msg?.method ?? "(无 method)"}`);
+  if (msg === null || msg.id === undefined) { res.writeHead(202).end(); return; }
+  const result =
+    msg.method === "initialize" ? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake-mcp", version: "1.0.0" } }
+    : msg.method === "tools/list" ? { tools: [
+        { name: "echo", description: "原样回显传入的 text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
+        { name: "boom", description: "故意失败（验「工具失败错误可见」）", inputSchema: { type: "object", properties: {} } } ] }
+    : msg.method === "tools/call"
+      ? (msg.params?.name === "boom"
+          ? { isError: true, content: [ { type: "text", text: "工具自己报错：boom 永远失败" } ] }
+          : { content: [ { type: "text", text: "echo <- " + JSON.stringify(msg.params?.arguments ?? {}) } ] })
+      : {};
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+});
+const llm = http.createServer(async (req, res) => {
+  if (!req.url.endsWith("/chat/completions")) { res.writeHead(404).end(); return; }
+  let body = ""; for await (const c of req) body += c;
+  const p = JSON.parse(body || "{}");
+  const msgs = p.messages ?? [];
+  const tools = p.tools ?? [];
+  const lastUser = String([...msgs].reverse().find((m) => m.role === "user")?.content ?? "");
+  const sawToolResult = msgs.some((m) => m.role === "tool");
+  const wantBoom = lastUser.includes("boom"), wantLoop = lastUser.includes("loop");
+  const pick = (wantBoom ? tools.find((t) => t.function.name.endsWith("boom")) : tools[0])?.function?.name;
+  // 要工具的三个条件：这一轮确实下发了 tools、选得出一个、且（还没拿到过结果 或 说话人要求 loop）
+  const shouldCall = pick !== undefined && (wantLoop || !sawToolResult);
+  llmN += 1;
+  console.log(`[假LLM] #${llmN} stream=${p.stream === true} 含tool结果=${sawToolResult} 下发工具数=${tools.length} 首个工具=${pick ?? "(无)"} ⇒ ${shouldCall ? "要工具" : "给正文"}`);
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  const send = (o) => res.write("data: " + JSON.stringify(o) + "\n\n");
+  const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", created: 1, model: p.model };
+  if (shouldCall) {
+    const full = pick.endsWith("boom") ? "{}" : "{\"text\":\"你好\"}";
+    const cut = Math.max(1, Math.floor(full.length / 2));            // 故意拆两片 ⇒ 验「分片累积」
+    send({ ...base, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: pick, arguments: full.slice(0, cut) } }] }, finish_reason: null }] });
+    send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: full.slice(cut) } }] }, finish_reason: null }] });
+    send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+  } else {
+    for (const t of ["我已按需调用工具，", "现在给出最终回答：", "这是一段普通的流式回答。"]) {
+      send({ ...base, choices: [{ index: 0, delta: { content: t }, finish_reason: null }] });
+    }
+    send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+  }
+  res.write("data: [DONE]\n\n"); res.end();
+});
+mcp.listen(0, "127.0.0.1", () => console.log("MCPURL=http://127.0.0.1:" + mcp.address().port + "/mcp"));
+llm.listen(0, "127.0.0.1", () => console.log("LLMURL=http://127.0.0.1:" + llm.address().port + "/v1"));
+'
+#  → 两行：`MCPURL=http://127.0.0.1:<p1>/mcp`、`LLMURL=http://127.0.0.1:<p2>/v1`
+#  ⚠️ 记账口径（与 ⑳-⓪ 同）：一次成功的"连接 + tools/list"固定 **3 条** POST；
+#     每次工具调用是**额外一条** `tools/call`（㉓-e 的"恰 1 条"、㉓-g 的"恰 10 条"都数它）。
+
+# ㉓-a 注册这台 server（name 用 ASCII ⇒ slug 可预测，工具名就是 `mcp_fakemcp_echo` / `mcp_fakemcp_boom`）
+#      ⚠️ 纯中文名会被 `slugifyServerName` 整串折空 ⇒ 回落 `server`（工具名变 `mcp_server_*`）——
+#        不影响本节（假 LLM 自动挑 `tools[0]`），但想手对名字就起个 ASCII 名。
+MCP2=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers \
+  -H 'content-type: application/json' \
+  -d '{"name":"fakemcp","endpointUrl":"'"$MCPURL"'","authType":"NONE"}' \
+  | tee /tmp/mcp2.json | jq -r '.data.server.id')
+jq '.data.server | {id, name, slug, status}' /tmp/mcp2.json ; echo "MCP2=$MCP2"
+# ㉓-a′ 刷一次工具缓存（编排循环只读 `tool_cache` ⇒ **必须先成功拉过一次**，否则下发给模型的工具数是 0）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP2/tools?refresh=1" \
+  | jq '.data | {tools: [.tools[].name], cached}'
+#  → 两个工具 `echo` / `boom`、`cached:false`（这是**真拉**；假上游 # 里多 3 条）
+
+# ㉓-b 建一个指向假 LLM 的 Provider（Key 给个占位串即可 —— 假上游不看鉴权头）
+#      🔑 baseUrl 就是 `$LLMURL`（它已经带 `/v1`，别再拼一遍）
+PROVIDER2=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/model-providers \
+  -H 'content-type: application/json' \
+  -d '{"name":"假LLM","baseUrl":"'"$LLMURL"'","type":"CHAT","apiKey":"sk-fake"}' \
+  | tee /tmp/prov2.json | jq -r '.data.id')
+MODEL2=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/models \
+  -H 'content-type: application/json' \
+  -d "{\"providerId\":\"$PROVIDER2\",\"modelName\":\"fake-chat\",\"label\":\"假模型\",\"type\":\"CHAT\"}" \
+  | tee /tmp/model2.json | jq -r '.data.id')
+echo "PROVIDER2=$PROVIDER2 MODEL2=$MODEL2"
+#  → `protocol` 缺省即 `OPENAI_COMPAT`（假 LLM 走 `/chat/completions`，正好对上）
+
+# ㉓-c 建一个 ChatBot 并**同时**绑模型 + 绑这台 MCP server
+AGENT2=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/agents \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"工具闭环验机\",\"type\":\"CHATBOT\",\"modelId\":\"$MODEL2\"}" \
+  | tee /tmp/agent2.json | jq -r '.data.id')
+curl -sS --noproxy '*' -b "$COOKIE" -X PUT $BASE/api/agents/$AGENT2/components \
+  -H 'content-type: application/json' \
+  -d "{\"components\":[{\"componentType\":\"MCP\",\"refId\":\"$MCP2\"}]}" \
+  | jq '.data | {id, components}'
+echo "AGENT2=$AGENT2"
+#  → `components` 里出现 `{componentType:"MCP", refId:"…"}`（P0-1-23 的绑定在 P0-2-2 起**接回了**存在性校验，
+#    不再是"含 MCP 一律 400"）
+
+# ㉓-d 建会话
+CONV2=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations \
+  -H 'content-type: application/json' -d "{\"agentId\":\"$AGENT2\"}" \
+  | tee /tmp/conv2.json | jq -r '.data.id')
+echo "CONV2=$CONV2"
+
+# ㉓-e **【门槛 1 + 5】一次工具调用 + 卡片状态流转 + 结果回填续流**
+curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/chat \
+  -H 'content-type: application/json' -d '{"content":"帮我用工具查一下"}'
+#  → 帧序（`curl -N` 逐帧到）：
+#      event: tool_call  data: {"callId":"call_1","toolName":"mcp_fakemcp_echo","serverName":"fakemcp","kind":"MCP","status":"RUNNING","inputSummary":"{\"text\":\"你好\"}"}
+#      event: tool_call  data: {…同 callId…,"status":"SUCCESS","output":"echo <- {\"text\":\"你好\"}"}
+#      event: delta      data: {"text":"我已按需调用工具，"…}   ← **续流**：结果回填后又长出来了
+#      event: done       data: {"finishReason":"COMPLETE","messageId":"…","usage":{…}}
+#     ⚠️ **同一 `callId` 推了两次**（RUNNING → SUCCESS）—— 前端按 `callId` **upsert**（门槛 5）；
+#        `inputSummary` 是**给用户看的摘要**（截断 200、像凭据的参数名遮值），不是完整入参。
+#     ⚠️ 帧里**没有 `arguments`** —— 完整入参**只进库**（㉓-f 那边能看到），卡片只给 `inputSummary`。
+#     ⚠️ 假上游那边这一轮应出现 **恰好 1 条** `tools/call`（+ 握手/列表那 3 条老账）。
+#     ⚠️ `arguments` 是**分两片**到达的 —— 若哪天改成"第一片就 `JSON.parse`"，这里会变成
+#        `inputSummary:"{}"` 且 `output:"echo <- {}"`，**不报错**（这就是坑预判 1 要守的东西）。
+
+# ㉓-f **【门槛 1 后半】落库**：`tool_calls` 进了助手消息的 `content`（**与 `GET /messages` 读回一致**）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/conversations/$CONV2/messages" \
+  | jq '.data.items[] | select(.role=="ASSISTANT") | {text: .content.text, tool_calls: .content.tool_calls}'
+#  → 助手那条的 `content.tool_calls[]` 是**完整记录**（含 `arguments` 原样串、`status`、`output`、`serverName`）；
+#    它**原样透出**（读取端刻意不用 `messageContentSchema` 过滤 ⇒ 不会把 `tool_calls` 静默剥掉）。
+
+# ㉓-g **【门槛 2】工具自身报错 ⇒ 卡片 ERROR，但这一轮不失败**
+curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/chat \
+  -H 'content-type: application/json' -d '{"content":"boom 一下"}'
+#  → `tool_call` 卡 `status:ERROR`（`output` 含"工具自己报错：boom 永远失败"），**随后仍有 `delta`**：
+#    错误文本被回填给模型 ⇒ 它自己决定怎么说。**别期待整轮 `error` 帧** —— 那才是错的形态
+#    （用户会只看到一张错误卡、拿不到任何解释）。
+#    ⚠️ 对照：**中断**（工具执行中按 ⑯-c 停止）是**真的停下来** —— 那是唯一"工具失败要中断整轮"的情形。
+
+# ㉓-h **【门槛 3】10 轮上限**（`loop` 让假 LLM 每轮都接着要工具）
+curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/chat \
+  -H 'content-type: application/json' -d '{"content":"loop 到上限"}'
+#  → 前端会看到**连续 10 组** `tool_call{RUNNING→SUCCESS}`，然后**忽然不再要工具**、直接给正文、
+#    `done{finishReason:"COMPLETE"}` 收尾。
+#  → 取证：假上游那个终端里 `tools/call` 的**计数恰好 +10**（第 11 轮那次请求里**没有 `tools` 字段** ——
+#    假 LLM 的 `下发工具数=0` 那行就是它）。⚠️ 判据是"**已执行了几轮**"而不是"要了几次"：
+#    后端是**当轮就把 `tools` 撤掉**再注一句提示，**不是**等模型第 11 次要了再拒。
+#    ⚠️ 若模型在被撤掉工具后**仍**硬吐一个工具名 → 后端不再执行、记一条 warn 直接收尾（防死循环）。
+
+# ㉓-i **【门槛 4】工具执行中按停止**：在 ㉓-e 的流还没收尾时（假上游紧接着回）不易掐点，
+#    改在 ㉓-h 的 long 流里另开终端按 ⑯-c
+#  → 收到 `done{finishReason:"STOPPED"}`、**已生成部分照常落库**（同 ⑰-d 的口径）；
+#    `McpAbortError` 是**唯一**能让工具循环真的停下来的错误（其余失败都只是那一条工具失败）。
 ```
+
+> ⚠️ **㉓ 的已知边界（别当 bug）**：① **危险判定不做**（属 P0-2-9）⇒ 工具**一律直接执行**、
+> 不弹确认卡；② **一轮里多个 `tool_calls` 按顺序执行**（不并行）；③ **确认流（`/confirm`）属 P0-2-10**，
+> 现在打它得到统一信封 404，**不是坏了**；④ 工具结果有**截断上限**（8000 字符，给模型的那份与
+> 给卡片看的那份**是同一份**）；⑤ `tool_call.inputSummary` 的"凭据形状遮值"是**尽力而为**、
+> 不是安全边界（真正的保证是**凭据从不下发给模型**）；⑥ `/mcp` 页面前端仍是**占位页** ⇒
+> `tool_call` 卡片的**可视化**属 P0-2-11（本节看到的是 SSE 原帧）。
 
 **已知边界（别当 bug）**：① 接口现在是七组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
 （`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员 + P0-1-12 新增的
@@ -1982,8 +2152,9 @@ doubuleA/
 | 2026-09-24 | — | **P0-1-38 完成（「P0-1 收尾」；⚠️ 纯文档批次，P0-1 整条线 38 步走完）**：把 `01` §五 阶段一出口验收收口成一份**可照抄的人工清单**。**零业务代码改动、零新增依赖、零新增环境变量、零 `shared`/`schema` 改动**（唯一动过的代码文件是 `backend/src/index.ts` 启动信封的 `step`）。**本批新增**：本文「**阶段一出口验收（人工）**」整节（前置四步表 + **R1~R7 逐条"怎么跑 / 看什么"** + **TTFT 取数命令** + 三条"最容易误判成 bug"的边界）；`docs/06`（路线图步数 29→38、包进度总表 G 行、P0-1-38 状态块与落地要点、版本记录）。**三条最值得记的**：① **"收尾"没编号会让 `pnpm check:batch` 恒真** —— 自检脚本按 `^####\s+(P\d+-\d+-\d+)\s+` 取"最后一个 `[✓]` 批次"，而它一直写作「P0-1 收尾」⇒ 机器永远看到 P0-1-37，**自检退化成一句永远成立的话**；处置是**编号 `P0-1-38`**（标题保留「P0-1 收尾」），**不改自检脚本**。② **TTFT 取数不能想当然用 `jq`** —— 本机 `infra/.env` 的 `LOG_PRETTY=true` 让它输出**美化文本**而非 JSON ⇒ 取数命令写成**两种形态都吃**的正则，并附 `n / min / median / max` 汇总；同时写明"`ttftMs` = 从本轮请求到第一个增量帧，**不含前端渲染**、**不能事后补**"。③ **出口验收第 4 条在单标签页里"点不出来"**（`CONFLICT` 要第二个标签页进同一会话才看得到）⇒ 这类"验收项与实现互相矛盾"的角落必须在清单里**点名**，否则会被当成"防重没生效"（P0-1-35 第 ⑥ 条的第二次应用）。**取证方式**：⚠️ **由用户人工执行 R1~R7**（2026-09-23 用户定案：智能体不再代跑验收/回归）；智能体侧**没有跑任何验收脚本、没有跑浏览器**。既有 `pnpm verify:chat-package`（24 项，夹具假上游）是"契约接对了"的旁证，**不等于**"人工出口验收通过"。**⚠️ 下一步 = P0-2**（工具闭环；同批已把 `docs/06` §四 的 12 步骨架扩写成与 P0-1 同粒度的**详规**，含 4.0 全局口径 / 4.1 五档验收 / 4.2 第五族权限 / P0-2-1~12 逐步验收门槛与坑预判）。 |
 | 2026-09-24 | — | **P0-2-1 完成（P0-2 工具闭环起步 1/12）：MCP client 底座** —— **新增** `backend/src/mcp/client.ts`（`McpClient`：`connect`/`listTools`/`callTool`/`close` + 出口**显式投影** `McpToolDescriptor`/`McpToolResult`；camelCase 之外**零 SDK 对象外泄**）、`backend/src/mcp/errors.ts`（SDK 异常 → 本仓错误码 + 可读中文 + 脱敏：`toMcpFailure`/`describeCauseChain`/`redactAll`/`mcpSnippet`/`McpAbortError`）、`backend/scripts/fixtures/mcp-upstream.mjs`（**假 MCP server**：Streamable HTTP 单 URL、**JSON 与 SSE 两种响应形态**、`setFailing`/`setUnauthorized`/`setSlow`/`setRawBody`/`setElicit`/`setRpcError`/`setToolsListPayload` 七种故障注入 + `setSessionRequired` + 全套请求流水记账）、`backend/scripts/verify-mcp-client.mjs`（**新增档 `pnpm verify:mcp-client` 34 项**）、`backend/src/config.ts` 的 **`mcp` 配置组（`MCP_REQUEST_TIMEOUT_MS`/`MCP_CONFIRM_TIMEOUT_SEC`/`MCP_TOOL_LIMIT`，3 个新环境变量）**、`infra/.env.example` + `infra/.env` 的 `[C] MCP` 段。**改动** `backend/src/index.ts`（启动信封 `step`）。**唯一新增依赖 `@modelcontextprotocol/sdk@1.30.1`**（`pnpm add` 输出 +75 −72 包、**未报** `ERR_PNPM_IGNORED_BUILDS`）；**零 `shared` 改动、零 schema 改动**（`mcp_servers`/`mcp_credentials` 属 P0-2-2/P0-2-4）。**五条最值得记的**：① ⚠️ **协议版本不可控** —— SDK 把请求版本**写死**在 `LATEST_PROTOCOL_VERSION='2025-11-25'`（无 setter）⇒ 设计目标 `2025-06-18` 的正确落法是**"请求最新、接受降级、协商结果留痕"**（服务端回 `2025-06-18` 时 SDK 接受并此后每条都带该头；回支持集外则 SDK 抛裸 `Error` ⇒ 我们翻成 502 并列出支持集）；`docs/06` §4.0 已按实测订正。② ⚠️ **中断与超时不能靠错误码分开** —— SDK 把任意中断原因包装成 `McpError(RequestTimeout)` ⇒ 必须由调用点传 `aborted`，且**判定顺序排在错误码之前**。③ ⚠️ **"会话丢了"伪装成"端点不存在"**（同码 404）⇒ 加判据"响应体提到 `session` 就改口"；且 `Client.close()` **不终止会话** ⇒ `McpClient.close()` 固定"**先 `DELETE`、后 close**"。④ ⚠️ **能力声明必须与实际相符**（`registerCapabilities({elicitation:{}})` 只在真传了 `onElicit` 时做；声明了却答不出来比不声明更难查），且它**只能在 connect 之前**调（之后直接抛）。⑤ **本档不需要 PG / Redis** —— "客户端层不认识数据库"这条设计约束因此变成**可执行断言**，`verify:mcp-client` 成了本仓**第一档"只要 dist + `infra/.env`"**的第四档验收。**取证**：`pnpm verify:mcp-client` **34 项全通过**（A 握手/会话/版本 6 / B 投影 3 / C `tools/call` 三分法 6 / D 失败分类 9 / E elicitation 3 / F 优雅关闭 4 / G 入口校验与配置 3），lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致；**上游是夹具** ⇒ 只证"契约与配置接对了"。**⚠️ 本批不是端测里程碑**（无界面、无路由）—— `§4.4` 的第一个端测点是 **P0-2-2 之后**的命令行档。归档：`issue_fix/问题记录-P0-2-1-MCP客户端底座.md` |
 | 2026-09-24 | — | **P0-2-2 完成（P0-2 工具闭环 2/12）——🎯 P0-2 第一个命令行端测里程碑**：MCP server 注册 CRUD + 连通测试。**新增** `shared/src/mcp.ts`（**契约层**：`MCP_AUTH_TYPES`/`MCP_SERVER_STATUSES` + slug 纯函数 `slugifyServerName`/`uniqueSlug` + 工具描述符 schema + `normalizeCredentialSchema` + 投影四段 + 请求侧三段；**`mcpEndpointUrlSchema` 用字段级 `superRefine` 自判 scheme**）、`backend/src/mcp/toolCache.ts`（**读不出来一律 `null`、整体作废**；**不 import 任何运行期模块** ⇒ 可被 `verify:app` 无依赖断言）、`backend/src/services/mcpServer.service.ts`（列表/建/改/删/**测试连通**/工具列表读侧 + **`sameJson` 键序无关比较** + `assertAuthTypeSupported`(OAUTH⇒400) + `probeServer`(**永不抛**)）、`backend/src/routes/mcpServers.ts`（**六条路由，只挂 `requireAuth`**）+ `app.ts` 接线、`backend/scripts/verify-mcp-servers.mjs`（**新档 `pnpm verify:mcp-servers` 31 项**）。**改动** 两个 `package.json`、`backend/src/index.ts`（启动信封 `step`）、**`assertComponentRefsBindable` 的 `MCP` 分支从"一律 400"换成存在性校验**（P0-1-23 的接回点兑现）+ `verify-agents.mjs` / `verify-agent-package.mjs` 的**对偶断言翻转**。**零新增依赖、零新增环境变量**（`mcp_servers` 表与迁移在 P0-2-2 落地）。**五条最值得记的**：① **权限第五族 = 登录即可、无 owner 列收窄**（最接近 knowledge-bases）—— `created_by` **只作留痕**，任何登录用户都能改/删别人注册的 server（`01` 决策 22 的直接推论）；验收用**两个 MEMBER** 且含两条**反向守卫**（"B 能改 A 建的""B 能删 A 建的"）。② **`POST /:id/test` 恒 HTTP 200** —— `ok:false` 是一条**结论**（这个 server 现在通不通）而非错误，只有 **id 不存在才 404**；成功时**顺手刷 `tool_cache`**、失败时**一个字节都不动**。③ **注册不强制连通**（上游抖动不该变成"建不了 server"）⇒ create 响应形态 = **`{server,test}`**（**不是**"裸 item 多一个键" —— 那等于承认同一份数据有两种形状）。④ **缓存失效判据是"真的变了"** —— `endpointUrl`/`credentialSchema`/`authType` 任一变了才清 `tool_cache`；只改 `name` **不动 slug、也不清缓存**；jsonb 往返**键序无关**比较（PG 会重排键 ⇒ 直比会产生**假阳**）。⑤ **`endpoint_url` 是 SSRF 面** —— P0 **只校验 scheme**（拒 `file:`/`gopher:`），**不做内网黑名单/端口白名单**（属 P1 安全加固，**已知且刻意**）。**⚠️ 三条验证脚本自身踩的坑**：**端口 1（含 7/9）是 fetch 规范的 bad port**（`undici` 发包前就拒 ⇒ 造"连接被拒绝"必须用"起个假 server 拿端口再关掉"）；**中文名被 `slugify` 折掉导致多用例共用 slug 族**（序号涨到 `-9` 撞车 ⇒ 独立序号用例改用专属 ASCII 名）；**历史欠账**（`verify:app` 的 Provider 投影夹具漏了 P0-1-37 的必填 `protocol`，一直被 `verify:model-providers` 遮住）。**验收**：`pnpm verify:mcp-servers` **31 项全通过**（真 PG + Redis + 假 MCP server，**不需要 MinIO**；跑完自清并断言残留为零）；`verify:app` **128 项**、`verify:agents` **35 项**、`verify:agent-package` **13 项**、`verify:model-providers` **18 项**全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`/api/mcp/servers` 与 `/api/mcp/credentials` 在界面上**仍是占位页**（MCP 管理页属 P0-2 后续）；`POST /:id/test` **不带用户凭据**（"注册者视角"，P0-2-5 定案）、凭据 CRUD 属 **P0-2-4**、工具名转换属 **P0-2-6**；`OAUTH` 注册 ⇒ 400 指向 **P1**。归档：`issue_fix/问题记录-P0-2-2-MCP-server-注册.md` |
-| 2026-09-24 | **P0-2-3 完成（P0-2 工具闭环 3/12）：凭据参数模板（`credential_schema`）** —— **零新增依赖、零新增环境变量、零 `schema.prisma` 改动**（`mcp_credentials` 表属 P0-2-4）。`shared/src/mcp.ts` 补**深度校验三件套**（`MCP_RESERVED_HEADER_NAMES` 平台自发头名单 / `MCP_JSONRPC_RESERVED_KEYS` 四个保留键 / RFC 7230 `token` 头名正则；**`credentialSchemaDeepIssues()` 是语义层唯一实现** —— `superRefine` 挂**数组**上（判重跨行、且要把原始 `index` 传回去）与**独立入口** `validateCredentialSchema`（永不抛错）都调它；`diffCredentialSchema` **只按 key 判、顺序不算改动**）+ **`credentialSchemaImpactOf`**（空 diff ⇒ `null`）+ `credentialSchemaImpactSchema` + **`updateMcpServerResultSchema`**；`mcpServer.service.ts` 的 `updateMcpServer` 回包从**裸 item** 变 **`{server, credentialSchemaImpact}`**（⚠️ **本批唯一一次契约变更**，与 `POST /` 的 `{server,test}` 同族）；`verify-app` 新增"凭据模板契约"6 条、`verify-mcp-servers` 新增 H 组 5 条、`verify-mcp-client` 新增 H 组 4 条（**BODY 注入的协议线探针**）、假夹具补 `query` 与 `headerNames` 两个记账字段。**四条最值得记的**：① **BODY 注入能不能做是探出来的**（坑预判 1）：非保留的顶层额外字段**能到达服务端且不影响这次调用**（可行）；塞进 `params.arguments` 会**污染工具入参**、塞成 `params` 的兄弟键则**凭据等于白注**；与四个保留键**撞名会改掉报文语义**（撞 `method` 变成另一次调用、撞 `params` 工具名丢失回 `-32602`、撞 `id` 会让响应 id 被顶成凭据值并**回显到线上**）⇒ 结论从"BODY 不能用"改写成"**这四个键不能用**"；② **"拿什么去注入"也问清了** —— transport 的 **`fetch` 选项**能同时改 URL/头/报文体 ⇒ 三种位置一个口子（**P0-2-7 的接回点**，`McpClient` 加一个可选参数即可）；⚠️ 实测只对本仓夹具成立 ⇒ P0-2-7 用真 server 复验；③ **"缓存该不该清"与"该提示什么"是两个判据**（只改 `label` ⇒ 提示 `null` 但缓存**照清**）；④ **`affectedCredentials` 恒 `null`、刻意不填 `0`**（凭据表属 P0-2-4，此刻没能力回答；`null` 只有一个含义="本次没有需要提示的影响"；验收 H1 守着它、P0-2-4 落地时翻转）。**验收**：`verify:mcp-servers` **31 → 36 项**、`verify:mcp-client` **34 → 38 项**、`verify:app` **129 → 135 项**（⚠️ 顺带订正一处历史计数：P0-2-2 记录里的 `verify:app` **128** 实为 **129**）全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`credentialSchemaImpact` 已能从命令行看到（「手工端测 · 命令行」⑳-e′），但凭据本身**还没有任何写入路径**、`affectedCredentials` 恒 `null`、`/mcp` 页仍是占位页 ⇒ **本批不是端测里程碑**（`§4.4` 的浏览器档仍是 **P0-2-11 之后**）。归档：`issue_fix/问题记录-P0-2-3-凭据参数模板.md` |
+| 2026-09-24 | — | **P0-2-3 完成（P0-2 工具闭环 3/12）：凭据参数模板（`credential_schema`）** —— **零新增依赖、零新增环境变量、零 `schema.prisma` 改动**（`mcp_credentials` 表属 P0-2-4）。`shared/src/mcp.ts` 补**深度校验三件套**（`MCP_RESERVED_HEADER_NAMES` 平台自发头名单 / `MCP_JSONRPC_RESERVED_KEYS` 四个保留键 / RFC 7230 `token` 头名正则；**`credentialSchemaDeepIssues()` 是语义层唯一实现** —— `superRefine` 挂**数组**上（判重跨行、且要把原始 `index` 传回去）与**独立入口** `validateCredentialSchema`（永不抛错）都调它；`diffCredentialSchema` **只按 key 判、顺序不算改动**）+ **`credentialSchemaImpactOf`**（空 diff ⇒ `null`）+ `credentialSchemaImpactSchema` + **`updateMcpServerResultSchema`**；`mcpServer.service.ts` 的 `updateMcpServer` 回包从**裸 item** 变 **`{server, credentialSchemaImpact}`**（⚠️ **本批唯一一次契约变更**，与 `POST /` 的 `{server,test}` 同族）；`verify-app` 新增"凭据模板契约"6 条、`verify-mcp-servers` 新增 H 组 5 条、`verify-mcp-client` 新增 H 组 4 条（**BODY 注入的协议线探针**）、假夹具补 `query` 与 `headerNames` 两个记账字段。**四条最值得记的**：① **BODY 注入能不能做是探出来的**（坑预判 1）：非保留的顶层额外字段**能到达服务端且不影响这次调用**（可行）；塞进 `params.arguments` 会**污染工具入参**、塞成 `params` 的兄弟键则**凭据等于白注**；与四个保留键**撞名会改掉报文语义**（撞 `method` 变成另一次调用、撞 `params` 工具名丢失回 `-32602`、撞 `id` 会让响应 id 被顶成凭据值并**回显到线上**）⇒ 结论从"BODY 不能用"改写成"**这四个键不能用**"；② **"拿什么去注入"也问清了** —— transport 的 **`fetch` 选项**能同时改 URL/头/报文体 ⇒ 三种位置一个口子（**P0-2-7 的接回点**，`McpClient` 加一个可选参数即可）；⚠️ 实测只对本仓夹具成立 ⇒ P0-2-7 用真 server 复验；③ **"缓存该不该清"与"该提示什么"是两个判据**（只改 `label` ⇒ 提示 `null` 但缓存**照清**）；④ **`affectedCredentials` 恒 `null`、刻意不填 `0`**（凭据表属 P0-2-4，此刻没能力回答；`null` 只有一个含义="本次没有需要提示的影响"；验收 H1 守着它、P0-2-4 落地时翻转）。**验收**：`verify:mcp-servers` **31 → 36 项**、`verify:mcp-client` **34 → 38 项**、`verify:app` **129 → 135 项**（⚠️ 顺带订正一处历史计数：P0-2-2 记录里的 `verify:app` **128** 实为 **129**）全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`credentialSchemaImpact` 已能从命令行看到（「手工端测 · 命令行」⑳-e′），但凭据本身**还没有任何写入路径**、`affectedCredentials` 恒 `null`、`/mcp` 页仍是占位页 ⇒ **本批不是端测里程碑**（`§4.4` 的浏览器档仍是 **P0-2-11 之后**）。归档：`issue_fix/问题记录-P0-2-3-凭据参数模板.md` |
 | 2026-09-24 | — | **P0-2-4 完成（P0-2 工具闭环 4/12）：我的凭据（每用户每 server，AES-256-GCM）+ 未配置清单** —— ⚠️ **本批同时改掉了"批次怎么收尾"**（见末段）。**新增** `mcp_credentials` 表 + 迁移 `20260924114259_add_mcp_credentials`（`uniq(server_id,user_id)`、两条 `CASCADE`）、`backend/src/services/mcpCredential.service.ts`（`mcpCredentialAad(serverId,userId,key)` + 读/写/删我的 + **`countAffectedCredentials`**）、`backend/src/routes/mcpCredentials.ts`（三条，**只挂 `requireAuth`**）+ `app.ts` ⑬、`shared/src/mcp.ts` 的**凭据值契约段**（`credentialValueKeys` / `isCredentialConfigured` / `McpCredentialItem` / `putMyCredentialBodySchema` / `:serverId` 路径参数）。**改动** `mcpServer.service.ts`（`updateMcpServer` 真的查库数 `affectedCredentials`）、`index.ts`（`step`）。**兑现 P0-2-3 的接回点**：`credentialSchemaImpactOf(diff, affectedCredentials)` 第二参数变**必填**、字段的 `.nullable()` 从契约里去掉。**六条最值得记的**：① ⚠️ **读路径必须真解一次**（坑预判只说"解密失败要降级"，落地发现判据本身就在解密上）—— AAD 是**绑定**不是**格式**，"粘密文"在 `GET` 上立刻显形（退回未配置），解不开一律降级 + 只带键名的 warn + **绝不 500**；② `PUT` **合并**语义与 `components`（整体替换）**刻意相反**（分辨方式：不可回填的字段只能合并）；③ **空串 = 删键**、清到一个不剩 ⇒ **删行**；④ `configured` 按**当前模板**逐 key 判，与 `updatedAt`（有没有行）**分两个字段**；⑤ `fields` 按模板投影、`hasValue` 覆盖 `values_enc` 全部 key（模板里删掉的 key 的值仍在库里等用户自己清）；⑥ `DELETE` 没配过 ⇒ **404**，**整个凭据路由没有 403**。**权限**：收窄在 `user_id` 上（与 server 那个前缀**同前缀两族**），ADMIN 无后门。**⚠️ 同批的范围变更（用户定案）**：`backend/scripts/**`（全部 `verify-*.mjs` + 假上游夹具 + `serve-upstreams.mjs`）与 `issue_fix/` 的历史归档**由用户删除**；本批清掉两个 `package.json` 里 26+26 条指向它们的 `verify:*` / `serve:upstreams` 条目，并给 README/`docs/06` 加了政策注记 ⇒ **后续每步只有三样产出：代码 + 文档回写 + README 里可照抄的人工端测步骤**（本批的人工步骤 = **新增的 ㉑ 一节**，从"改模板 → 填一个 key → 合并 → 清空 → 三层取证 → 换账号 → 粘密文看降级 → 删 → 看 `affectedCredentials` 变真数"整条串一遍）。**取证方式**：⚠️ **由用户人工端测**（㉑）；智能体侧只做了两件**确定性**的事 —— `pnpm db:deploy`（迁移真的应用到 dev 库）与 `pnpm db:generate`（客户端真的认识了 `mcpCredential`），**没跑任何验收脚本、没跑浏览器**。**⚠️ 本批不是端测里程碑**（`/mcp/credentials` 页仍是占位页；浏览器档在 P0-2-11 之后），但**命令行可验**。**下一步 = P0-2-5**（工具发现：缓存 + `?refresh=1`）。 |
 | 2026-09-24 | — | **P0-2-5 完成（P0-2 工具闭环 5/12）：工具发现（`tools/list` + 缓存 + 变更刷新）** —— 本批给"工具列表"加上了**生命周期**：从 P0-2-2 起它只有"读缓存"一种取法，现在有了 `?refresh=1`。**改动**：`backend/src/services/mcpServer.service.ts`（新增 **`refreshServerTools()`** = 全文件唯一的"联网 + 落库"入口（三个调用点共用）+ **`readCachedTools()`**（解析 + 一条 warn 的唯一落点）；`applyProbeResult()` 加 `fetchedAt` 形参；`createMcpServer` / `testMcpServer` 改走新入口；**`getMcpServerTools(id, { refresh })`** 加刷新分支）、`backend/src/routes/mcpServers.ts`（`GET /:id/tools` 接 querystring schema）、`shared/src/mcp.ts`（新增 **`mcpServerToolsQuerySchema`** —— `refresh` 白名单 + `transform` → boolean；`mcpServerToolsResultSchema` 的注释改写）、`backend/src/mcp/errors.ts`（新增 **`MCP_STAGE_LIST_TOOLS`** 常量 + 401/403 **按 stage 分支**）、`backend/src/mcp/client.ts`（`listTools` 用那个常量）、`backend/src/index.ts`（`step`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动，响应形状一个字没改**（`cached` 这个字段从 P0-2-2 就在契约里等着分叉）。**六条最值得记的**：① ⚠️ **"拉不到"有三个出口，分界线是"我们还能不能答出这个问题"**：拉到 ⇒ `cached:false`；拉不到但**有缓存** ⇒ **200** + `cached:true`；拉不到且**缓存也空** ⇒ **502** —— 第三种**不能**是"200 + 空数组"：那个形状与"这个 server **确实没有**工具"**逐字一样**，界面只会显示"0 个工具"、用户于是去上游找一个**其实不存在**的配置问题（**给不出的东西不要拿空值代替**）；⚠️ 它与 `POST /:id/test` **恒 200** 不矛盾 —— 判据是"**响应形状里有没有『失败』的位置**"（`{ok,tools?,error?}` 有、`{tools,fetchedAt,cached}` 没有），**别把两条路由的出口"统一"起来**。② ⚠️ **旧缓存必须在刷新之前读出来**（刷新一落库旧值就没了，而"回落"全靠它）；与之配对的是**成功路径从"落库后的列"把值读回来**（顺带验了"写得进、读得出"；真读不回是 **500 + 可上报文案**，不是静默返回空列表）。③ ⚠️ **`refresh` 必须是白名单，不能用 `z.coerce.boolean()`**：`Boolean('0') === true` ⇒ `?refresh=0` 被判成"要刷新"，而**零症状**（用户以为关掉了、其实每次请求都联网）；放宽成任意字符串同样有零症状的一面（`?refresh=yes` 静默等于不刷新）⇒ 收窄成 `1`/`0`/`true`/`false`，**拼错就 400**（字段级 `path` = `querystring.refresh`）。④ **`tools/list` 不带用户凭据 ⇒ `tool_cache` 全员共享**，且**文案要按 stage 分**：拉列表阶段的 401/403 不能说"请检查凭据是否已配置"（那会把人引向一个**治不好的动作** —— 列表请求从来不带凭据）⇒ 那句"本阶段不支持带用户凭据拉列表"的**唯一生产点**是 `errors.ts`，`stage` 因此必须是共享常量（两处各写一份字符串，这条分支就静默失效）。⑤ **顺手修掉一处"文档引用了不存在的文件"**：README ⑳-⓪ 原本让人 import `backend/scripts/fixtures/mcp-upstream.mjs`，而那个夹具已随 P0-2-4 的定案删除 ⇒ **整条 ⑳ 当时是跑不起来的**；改成**一段可粘贴的内联假 MCP server**（约 15 行、前台常驻、**逐条打印收到的 `method`** —— 它同时补上了门槛①缺的那个"请求计数"），且**不再往仓库里放夹具文件**。⑥ **门槛⑤只能验到一半**（如实标出）：改名**不动 `slug`** 可验（`PATCH` 的 body 里根本没有这个字段），但 `mcp_{slug}_{tool}` 那个**拼出来的名字属 P0-2-6**（`toOpenAiTools`），到那时才有得比。**⚠️ 坑预判 4（`tool_cache` 的 jsonb 键序无关比较）本批未触发** —— 刷新是**纯写**、读是**纯解析**，本批没有任何一处需要"比缓存内容变没变"（已有的比较点在 `updateMcpServer` 的 `credentialSchema`，那是 P0-2-3 的 `sameJson`）。**⚠️ 同时订正 `docs/06` §4.3 两处"P0-2-4 落地后没跟着改"的过期描述**（`values_enc` 由"整对象一个信封"改为**逐 key 一条独立密文**；凭据三条的信封改为 `{items, unconfigured}` / 裸 `McpCredentialItem` / `{serverId, serverName}`；并**作废**该节"掩码给首尾各 2 字符"那句 —— P0-2-4 定案是连掩码都不下发）。**取证方式**：⚠️ **由用户人工端测**（**新增 ㉒ 一节**：`?refresh=1` 真拉 → **纯读零请求（盯假上游那个终端的 `#` 计数）** → **停掉上游**看"200 回缓存" → 清空缓存看"502" → `?refresh=yes` 看 400 → 改注册信息看缓存失效 → 看 `slug` 不变）；智能体侧只做了一件**确定性**的事：把新契约真的 import 一次并 `safeParse` 六种输入（`{}` / `1` / `0` / `true` / `false` / `yes`），**没跑任何验收脚本、没跑浏览器**。**⚠️ 本批不是端测里程碑**（`/mcp` 页仍是占位页；**第二个端测点仍是 P0-2-11 之后的浏览器档**），但**命令行可验**。**下一步 = P0-2-6**（`inputSchema` → OpenAI function 转换：`toOpenAiTools` + 工具名 token 化；`toolSchema.ts` 是纯函数、可进无依赖档，且**反向映射表是"名字 → 工具"的唯一事实来源**）。 |
 | 2026-09-24 | — | **P0-2-6 完成（P0-2 工具闭环 6/12）：`inputSchema` → OpenAI function 转换** —— **新增** `backend/src/mcp/toolSchema.ts`（纯函数 `toOpenAiTools(server, tools, limit, taken?)` → `{ tools, routes, truncated }`，**不 import 任何运行期模块**）；`shared/src/mcp.ts` 的四个常量（`MCP_TOOL_NAME_MAX=64` / `MCP_TOOL_NAME_PREFIX='mcp_'` / `MCP_TOOL_DESCRIPTION_MAX=1024` / `MCP_TOOL_WRAPPER_KEY='input'`）；`backend/src/index.ts`（启动信封 `step`）。**本步不改任何端点**（消费方是 **P0-2-8** 的编排循环）⇒ **没有新的手工端测步骤**。**八条最值得记的**：① **只做三件有理由的兼容处理**（剥 `$schema` / 缺 `type` 补 `object` / 非 object 根包一层），**其余一律原样透出** —— `additionalProperties`（`false` 是**有约束力的**，不是元信息）与 `required` 逐键实测保留，理由是"**丢掉的约束会让模型传错参数、而报错发生在服务端**"。② **签名与设计稿有两处偏离、都不是优化**：第 1 参 `serverSlug` → `{ id, slug }`（反向映射表要 **`serverId`**，否则每个调用点都得自己再查一次库）、新增第 4 参 `taken`。③ **截断与序号必须一起做**（与 `shared#uniqueSlug` 逐字同款，先按后缀长度截短 base）：只截断 ⇒ 两个长名字撞在一起、**后者静默覆盖前者**，模型永远调不到它。④ **映射表只存 `toolName` + `serverId`、连 slug 都不存** —— 从根上断掉"从名字里 split 出 server"的念头。⑤ **`taken` 是"跨 server 唯一"的唯一落点**（slug 刻意不唯一 + 纯中文名折成 `server` ⇒ 不同 server 天然产出同名工具）⇒ P0-2-8 拼多 server 时**依次**把前一个的 `routes` 键喂给下一个（**顺序即正确性**）。⑥ **`routes` 与 `truncated` 都进返回值**：零依赖不 import 日志 ⇒ 门槛里的"告警"落点在 P0-2-8 的调用点；未截断时是 `null`（让"要不要告警"退化成真值判断）。⑦ ⚠️ **本批实际写错一次（`typecheck` 全绿）**：`limit` 的自我保护写成 `Number.isFinite(limit) ? … : total` 而注释写"`NaN` ⇒ 0" —— **`NaN` 恰好不是 finite** ⇒ 走到 `total`、把 512 个工具**全放行**，**与注释正好相反**；定案 `NaN ⇒ 0`、显式 `Infinity` ⇒ 不截断。⑧ `description` 兜底链 `description → title → ''`、按**码点**截断 1024（实测结果里**没有 `\uFFFD`**）。**已知边界**：非 object 根**包一层后这次调用必失败**（模型传 `{ input: … }` 而工具想要顶层标量）—— 仍选择包（保留原始约束 + 用户能从工具卡片看到真因），详见 `docs/02` §9.7。**取证方式**：⚠️ 本批**无自动化验收档**（脚本与夹具 2026-09-24 已删）；智能体侧只做了一件**确定性**的事 —— `node --import tsx` 真 `import` 一次源码 + 逐条比 **11 组**断言，**ALL PASS**（首跑 2 条红，**都是核查脚本与注释自己的问题**）；**没跑构建/回归/浏览器，本批不是端测里程碑**。**下一步 = P0-2-7**（凭据注入：`buildCredentialInjection` + `resolveMcpCallContext`）。 |
 | 2026-09-24 | — | **P0-2-7 完成（P0-2 工具闭环 7/12）：凭据注入（调用时取 currentUser 凭据解密注入）** —— **新增** `backend/src/mcp/inject.ts`（**纯函数 + 一个 fetch 中间件，零依赖**：`buildCredentialInjection(schema, values)` → `{ headers, query, bodyPatch, applied, skipped }`、`applyQueryToUrl` / `applyBodyPatch` / `createCredentialFetch`）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext(serverId, viewer)` —— P0-2-8 的编排循环就调它拿 `clientOptions`）。**改动** `backend/src/mcp/client.ts`（**透出 `fetch` 选项**、**删掉 P0-2-1 那个 `headers` 选项**）、`mcpCredential.service.ts`（新增 `decryptMyCredentialValues`、解密循环抽成唯一实现）、`shared/src/mcp.ts`（新增四个判据函数，写端闸门与注入端共用）、`backend/src/index.ts`（`step`）。**本步不改任何端点**（消费方是 **P0-2-8**）⇒ **没有新的手工端测步骤**；零新增依赖 / 零环境变量 / 零 schema 改动。**八条最值得记的**：① ⚠️ **注入口从"headers 参数"改成 transport 的 `fetch` 选项，并删掉前者**（H4 结论：三种位置一个口子全包）—— 留着两条路径的后果是它们**在同一个点上打架**（症状："某个凭据时而生效、时而被顶掉"）；注入是**在 SDK 已拼好的 `Headers` 之上 `set`**（不是替换）⇒ `accept` / `mcp-session-id` 一个都不丢。② ⚠️ **坑预判 2 的探针做了、代价没有发生**：`send()` / `terminateSession()` / `_startOrAuthSse()` 三处都是 `await (this._fetch ?? fetch)(this._url, init)` ⇒ **URL 是每次调用现传的**（`_url` 整个会话不变）⇒ QUERY 拼在每请求 URL 上安全 ⇒ **不需要**为 QUERY 注入放弃连接复用。③ **模板是唯一的路由表**（只遍历 `schema`）⇒ "模板里删掉的 key 不会被注入"**结构性成立**，与 P0-2-3 的"只提示、绝不自动清理"能同时成立。④ ⚠️ **注入端要再判一次那三条判据，处置是"跳过 + 记账"不是报错** —— 读取端**刻意不跑语义层校验** ⇒ 库里可能有历史脏数据，而照注更坏（注 `accept` 顶掉响应形态协商头、注非法头名/CRLF 让 `new Headers()` 抛、注 `method`/`id` 毁报文甚至**把凭据回显到线上**）⇒ 判据函数**上收到 `shared`** 两处共用。⑤ ⚠️ **"空注入"必须原样返回 baseFetch（同一个函数对象）**，两个应用函数在没东西要注入时**逐字返回输入** —— 否则 `new URL()` 往返会把 URL 规范化，"没注入任何东西的 server 的请求被悄悄改写"是最不该有的副作用。⑥ **未配齐 ⇒ 一个上游请求都不发**：在 `new McpClient()` **之前**抛 424 `NEED_CREDENTIAL`，按**当前模板**逐 key 判必填（不是"表里有没有行"）、文案**点名缺哪些 key**；解密失败走同一条路 ⇒ **绝不 500**。⑦ **`secrets` 给"全部解密出来的明文"**（不是"真的注出去的那几个"）—— 它唯一用途是抹掉**上游回显**里的凭据，"多抹是安全的、少抹不可逆"。⑧ ⚠️ **签名与设计稿有两处偏离**：`(server, userId)` → `(serverId, viewer)`（P0-2-8 手上只有 `routes` 给的 `serverId`）。**权限**：本批**不新增路由**；"A 绝不串 B"有**两道独立防线**（查询范围固定在 `(serverId,userId)` + AAD 含 `userId`）。**取证方式**：⚠️ **本批无自动化验收档**（脚本 2026-09-24 已删）；智能体侧只做了一件**确定性**的事 —— `node --import tsx` 真 `import` 源码 + 逐条比 **22 组**断言，**ALL PASS**（含 **真实 `StreamableHTTPClientTransport` 路径探针** 2 组）；首跑红两条、**都是核查脚本自己的问题**（没 `await` 异步用例 / 把 `send()` 的返回值当应答值 —— `send()` 返回 `undefined`、帧走 `onmessage`），实现零改动。**验收门槛 1/3/4 的端到端取证需真库 + 假 MCP server ⇒ 明确留给人工/后续**。**未跑构建/回归/浏览器，本批不是端测里程碑**（`02` §9.3 那条链路要到 P0-2-8 才跑得起来，且 P0-2-8 之后仍无界面）。**下一步 = P0-2-8**（编排循环接工具调用 + 10 轮上限：危险判定 ⇒ **取 `resolveMcpCallContext`** ⇒ 执行 ⇒ `tool_call{RUNNING}`→`{SUCCESS\|ERROR}` ⇒ 结果回填续流）。 |
+| 2026-09-24 | — | **P0-2-8 完成（P0-2 工具闭环 8/12）· 🎯 工具闭环的「整条链」首次在命令行层跑通**：编排循环接工具调用 + 10 轮上限。**手工跑法见「手工端测 · 命令行」㉓**（内联假 LLM 吐分片 `tool_calls` + 内联假 MCP 执行 `tools/call`，两段 `node --input-type=module -e '…'` 前台常驻、**不依赖仓库里有夹具文件**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/conversation.ts`（`tool_calls` **从"刻意不定型"升级为定型**：迁入 `TOOL_CALL_KINDS`/`TOOL_CALL_STATUSES` + 新增 `toolCallRecordSchema` + `messageContentSchema` 加 `tool_calls`；**判据 = 写入端与读取端都已落地**）；`shared/src/sse.ts`（`sseToolCallPayloadSchema` 改为 `toolCallRecordSchema.omit({arguments:true})` **派生**，两常量**刻意不再导出** —— `export *` 会让同名变"歧义名"）；`backend/src/llm/protocol.ts`（**本批最大改动**：工具调用抽象 —— `ChatToolCall`/`ToolCallChunk`/分片累积器 `ToolCallBuffer`/`parseToolArguments`（空串⇒`{}`、非法 JSON⇒`{ok:false,reason}`、**不猜**）/`sumUsages`（多轮**相加**，与 `mergeUsage` 的"同一次调用的两半**覆盖**"刻意不同）+ 三协议各自的工具定义形状与**结果回填形态**：OpenAI `role:'tool'`+`tool_call_id`、Responses `function_call`/`function_call_output` item、Anthropic 把 `tool_result` **合成一条 user 消息** + 相邻同角色合并）；`backend/src/llm/client.ts`（`tools` 选项 + `toolCalls` 汇总 + **同一个累积器**在 `chat()`/`chatStream()` 都用、半成品不外泄）；`backend/src/services/mcpCall.service.ts`（新增 `resolveMcpToolCatalog`（读 `tool_cache`、**不联网不碰凭据**、`taken` 逐台累积去重）+ `executeMcpToolCall`（`resolveMcpCallContext` → connect → `callTool` → `finally close()`））；`backend/src/orchestrator/chatContext.ts`（工具结果 → 消息的**纯函数**：`truncateToolResult`(8000)/`summarizeToolInput`(200, 凭据形状遮值)/`buildToolResultMessages`/`buildAssistantToolCallsMessage`/`TOOL_LOOP_LIMIT_NOTICE`/历史**成对**还原）；`backend/src/orchestrator/chatBot.ts`（**核心**：`for(;;)` 工具循环 + `toolRecords` 落进助手消息 `content`）；`backend/src/index.ts`（信封 `step`）。**六条最值得记的**：① ⚠️ **流式 `tool_calls` 是"分片累积"的** ⇒ **绝不能在第一片 `JSON.parse`**（`arguments` 是不完整 JSON，**不报错、只解析出空参数**）；② ⚠️ **工具结果报文形态跨协议全不同** ⇒ 编排层只吐协议无关的 `role:'tool'`，**手拼报文一律归 `buildBody`**（否则"换协议就调不动工具"且 `verify:llm` 不会红）；③ **工具失败 ≠ 这一轮失败**：`isError`/缺凭据 424/上游 502/504 全变 `tool_call{ERROR}` + 回填给模型自己解释，**唯一例外是中断**（`McpAbortError`）；④ **"还允不允许要工具"的判据是"已执行了几轮"**（到 10 轮**当轮撤掉 `tools`** + 注一次提示；模型仍硬报就只能收尾）；⑤ ⚠️ **历史还原必须"成对"**（半截记录 = 400 ⇒ **整段丢**，否则"这个会话从此再也发不出消息"且指不到那一行）；⑥ **凭据主语来自"当前会话"**（`viewer.userId` 懒加载现查）。**已知边界（同时写进 `02` §6.3）**：**危险判定不做**（属 P0-2-9，接回点已预留在取凭据与发 `RUNNING` 卡**之前**）⇒ 工具一律直接执行；一轮多调用**按顺序**执行；还原顺序是 `assistant{正文+toolCalls}` → `tool{结果}`（**最终正文排在工具结果之前** ⇒ 保真度折损，别当 bug）；`usage_records` 仍属 P1。**取证方式**：⚠️ 本批**无自动化验收档**（脚本与夹具已删）；**未跑 typecheck/build/回归/浏览器**；命令行人工程序 = `README` ㉓。**下一步 = P0-2-9**（危险判定 `mcp/risk.ts` 纯函数）。 |

@@ -34,6 +34,30 @@
  *    库里那一列是 PG enum，不可能有非法值；但验收脚本/手工构造的报文里可能不带 `protocol`
  *    （P0-1-37 之前的脚本全部如此）。回落让"老脚本 + 新代码"逐字保持原行为，
  *    而错误永远不会被静默吞掉 —— 回落目标是**默认协议**，也就是"没有这项配置时该怎么办"。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ③ 工具调用（P0-2-8）：三处差异全部收在本文件，外壳只做"累积"
+ * ─────────────────────────────────────────────────────────────────────
+ * 工具循环（`06` P0-2-8）最容易被写成"只在 OpenAI 兼容协议下能跑" —— 因为差异有**三处**，
+ * 而每一处都不会报错、只会"调不动工具"或"调了个空工具"：
+ *
+ *   · **流式分片必须累积**（`06` 坑预判 1）：OpenAI 的 `delta.tool_calls[]` 是
+ *     `index` + `id` + `function.name` + `function.arguments` **逐段**到达的，`arguments`
+ *     本身还是**不完整的 JSON**；Anthropic 是 `content_block_start`（给 id/name）+
+ *     若干 `content_block_delta`（`input_json_delta.partial_json`）；Responses 是
+ *     `response.output_item.added` + 若干 `response.function_call_arguments.delta`。
+ *     ⇒ 本文件把三者归一成同一种**分片**（{@link ToolCallChunk}），累积器
+ *     （{@link absorbToolCalls} / {@link readToolCalls}）也是同一份。**绝不在第一片 parse**。
+ *   · **工具结果回填的消息形态不同**（坑预判 2）：OpenAI 是 `role:'tool'` + `tool_call_id`；
+ *     Anthropic 是**用户消息里的 `tool_result` 块**；Responses 是顶层
+ *     `{type:'function_call_output', call_id}`。⇒ 全在各自的 `buildBody` 里映射，
+ *     编排层只产出**协议无关**的 {@link ChatMessage}（`role:'tool'` + `toolCallId`）。
+ *   · **`tools` 定义本身的形状不同**：OpenAI `{type:'function',function:{…}}`、
+ *     Responses `{type:'function',name,description,parameters}`、Anthropic `{name,input_schema}`。
+ *     P0-2-6 的转换产出的是 OpenAI 形态，故另外两家要在这里**再投影一次**。
+ *
+ * ⚠️ **加第四个协议时，这三处都必须在新对象里实现**（`docs/02` §6.1 差异收敛清单 16~18 条）——
+ *    漏掉任何一处都表现为"这个协议下模型不会用工具"，而**日志里什么都不会说**。
  */
 
 import { AppError, DEFAULT_UPSTREAM_PROTOCOL, type UpstreamProtocol } from '@doubulea/shared'
@@ -49,11 +73,64 @@ import { describeForMessage, redactSecret, snippet, upstreamHeaders, type Upstre
 //    `client.ts → protocol.ts → upstream.ts`。调用点的 import 路径**不用改**。
 // ═════════════════════════════════════════════════════════════════════
 
-/** 对话消息（本批只到"文本进、文本出"；工具/多模态 part 由 `extraBody` 逃生口承接） */
-export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string
+/**
+ * 一次工具调用**请求**（累积完成后的形态）。
+ *
+ * `arguments` 刻意保留**上游原样的 JSON 字符串**（而不是解析好的对象）：
+ *   · OpenAI 系要求把它**原样回传**（`function.arguments` 是字符串）；
+ *   · 落库（`messages.content.tool_calls[].arguments`）要的是"模型到底给了什么"，原样才有排查价值；
+ *   · 解析只发生在真正要执行的那一刻（`client.ts` / `chatBot.ts` 用 {@link parseToolArguments}）——
+ *     解析失败要能**说清是哪一串坏了**，先解析再回传就把这串丢了。
+ */
+export interface ChatToolCall {
+  id: string
+  /** **下发给模型的名字**（`mcp_{slug}_{tool}`），不是 MCP 侧的原始工具名 */
+  name: string
+  /** 参数 JSON 的**原始字符串**（可能不合法 —— 模型偶尔给半截 JSON） */
+  arguments: string
 }
+
+/**
+ * 流式里的一片工具调用增量（**永远不是完整的**，见文件头 ③）。
+ *
+ * 三协议都归一到这里：OpenAI 的 `delta.tool_calls[].index/id/function.name/function.arguments`、
+ * Anthropic 的 `content_block_start`(+`input_json_delta`)、Responses 的
+ * `response.output_item.added`(+`response.function_call_arguments.delta`)。
+ */
+export interface ToolCallChunk {
+  /** 上游给的段序号（同名工具的多次调用靠它分开）；缺省时按 `0` 处理 */
+  index: number
+  id?: string
+  name?: string
+  /** 参数 JSON 的**片段**（可能是 `{"a":` 这种半截）—— ⚠️ 绝不能在这里 `JSON.parse` */
+  argumentsDelta?: string
+  /**
+   * **整体**参数（只在"还没收到过任何 `argumentsDelta`"时生效）。
+   *
+   * 存在的唯一理由：Responses 的 `response.output_item.done` / `function_call_arguments.done`
+   * 给的是**完整**参数，而同一轮里前面的 delta 已经拼过了 —— 把它当 delta 追加会**翻倍**，
+   * 丢掉又会在"只发 done 不发 delta"的网关上**一个参数都没有**。故另开一条通道。
+   */
+  argumentsReplace?: string
+}
+
+/** 对话消息 —— **协议无关**的形态（各协议怎么落到报文里由 `buildBody` 负责，见文件头 ③） */
+export type ChatMessage =
+  | {
+      role: 'system' | 'user' | 'assistant'
+      content: string
+      /** 助手这一轮**请求调用**的工具（`finish_reason=tool_calls` 时才有） */
+      toolCalls?: ChatToolCall[]
+    }
+  | {
+      /** 工具执行结果 —— OpenAI/Responses/Anthropic 各有一种落法（文件头 ③） */
+      role: 'tool'
+      content: string
+      /** 对应哪一个调用（= 上游给的 `id`） */
+      toolCallId: string
+      /** 工具自报失败（只映射到 Anthropic 的 `is_error`；另两家没有这个字段） */
+      isError?: boolean
+    }
 
 export interface ChatUsage {
   tokensIn: number | null
@@ -71,27 +148,48 @@ export interface DecodedFrame {
   usage: ChatUsage | null
   /** 这一帧就是"流结束信号"（`message_stop` / `response.completed`）；`[DONE]` 走 {@link ChatProtocol.isDoneSentinel} */
   done: boolean
+  /** 这一帧带来的工具调用**分片**（见文件头 ③；累积归外壳，本层只负责取字段） */
+  toolCalls: ToolCallChunk[]
 }
 
 /** 造一帧：只写非默认字段，省掉每个 return 都补齐六个键 */
 function dec(partial: Partial<DecodedFrame> = {}): DecodedFrame {
-  return { text: '', thinking: '', finishReason: null, usage: null, done: false, ...partial }
+  return { text: '', thinking: '', finishReason: null, usage: null, done: false, toolCalls: [], ...partial }
 }
 
 // ═════════════════════════════════════════════════════════════════════
 // 协议钩子的形状
 // ═════════════════════════════════════════════════════════════════════
 
+/**
+ * 工具定义（**OpenAI 形态**，即 `mcp/toolSchema.ts#toOpenAiTools` 的产出）。
+ *
+ * ⚠️ 刻意**不复用 `mcp/toolSchema.ts` 的 `OpenAiFunctionTool`**（与 {@link McpFetch} 那条同款纪律，
+ * 也见 `mcp/client.ts` 的注释）：那会让 LLM 层依赖 MCP 层，而这一层要能在**没有 MCP** 的情况下
+ * 被理解与断言。形状**逐字相同** ⇒ 赋值是结构性成立的，不需要 `as`。
+ */
+export interface ProtocolToolDefinition {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    /** JSON Schema，**object 根**（P0-2-6 已保证） */
+    parameters: Record<string, unknown>
+  }
+}
+
 /** 一次对话调用的"协议无关"输入（由 `client.ts` 从 `LlmTarget` + `ChatOptions` 组装） */
 export interface ProtocolChatRequest {
   /** 上游真实型号名 */
   model: string
-  /** **原样**的消息数组（含 system）—— 要不要把 system 挪到顶层由协议自己决定 */
+  /** **原样**的消息数组（含 system 与 tool 结果）—— 要不要把 system 挪到顶层由协议自己决定 */
   messages: ChatMessage[]
   stream: boolean
   maxTokens?: number
   temperature?: number
-  /** 原样并入请求体的逃生口（`tools` / `top_p` 之类），协议特有字段最后仍可覆盖 */
+  /** 下发给模型的工具（OpenAI 形态；形状投影由各协议自己做，见文件头 ③）。缺省 = 不带 `tools` */
+  tools?: readonly ProtocolToolDefinition[]
+  /** 原样并入请求体的逃生口（`top_p` 之类），协议特有字段最后仍可覆盖 */
   extraBody?: Record<string, unknown>
 }
 
@@ -119,7 +217,12 @@ export interface ChatProtocol {
   readonly modelsPath: string
   /** 请求头（鉴权形状各协议不同：Bearer vs `x-api-key`） */
   headers(endpoint: UpstreamEndpoint, options?: ProtocolHeadersOptions): Record<string, string>
-  /** 请求体（含"system 放哪 / 上限字段叫什么 / 有没有必填项"） */
+  /**
+   * 请求体（含"system 放哪 / 上限字段叫什么 / 有没有必填项"）。
+   *
+   * ⚠️ **工具相关的三件事都必须在这里映射**（见文件头 ③）：`request.tools` 的投影、
+   * `role:'tool'` 消息的落法、带 `toolCalls` 的助手消息的落法。
+   */
   buildBody(request: ProtocolChatRequest): Record<string, unknown>
   /**
    * 极廉价的"结束哨兵"判定：**只有 `[DONE]` 这一种字面量**。
@@ -212,8 +315,209 @@ function throwUpstreamErrorFrame(ctx: ProtocolDecodeContext, errorField: unknown
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 工具调用：累积器 + 参数解析 + 多轮用量累加（三协议共用，见文件头 ③）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 一段**正在累积**的工具调用（`id` / `name` 可能还没到，`args` 可能是半截 JSON）。
+ *
+ * 刻意不在这里暴露出去：它是"半成品"，而半成品一旦被别处拿到，就一定会有人去 parse 它。
+ */
+interface ToolCallSegment {
+  id: string | null
+  name: string | null
+  args: string
+}
+
+/**
+ * 累积器。**半成品只活在 `client.ts` 的一个局部变量里**（它不认识工具、也不解析参数）。
+ *
+ * 用 `Map` 而不是数组：段的到达顺序**不保证**（网关可能把 index=1 的片先发出来），
+ * 而 `Map` 既保插入序、又按键去重 —— 输出顺序因此是"上游给 index 的顺序"，
+ * 与 `06` 坑预判 4 的"一次多个 `tool_calls` 按顺序执行"对得上。
+ */
+export interface ToolCallBuffer {
+  readonly segments: Map<number, ToolCallSegment>
+}
+
+export function createToolCallBuffer(): ToolCallBuffer {
+  return { segments: new Map() }
+}
+
+/** 把一帧带来的分片并进累积器（**只做字符串拼接，不解析**） */
+export function absorbToolCalls(buffer: ToolCallBuffer, chunks: readonly ToolCallChunk[]): void {
+  for (const chunk of chunks) {
+    const segment = buffer.segments.get(chunk.index) ?? { id: null, name: null, args: '' }
+    // 空串按"这一片没带"处理（有的网关会先发一个 `id: ""` 的占位片，覆盖会把真 id 冲掉）
+    if (chunk.id !== undefined && chunk.id !== '') segment.id = chunk.id
+    if (chunk.name !== undefined && chunk.name !== '') segment.name = chunk.name
+    if (chunk.argumentsDelta !== undefined) segment.args += chunk.argumentsDelta
+    // 见 {@link ToolCallChunk.argumentsReplace}：只补"一片 delta 都没收到"的空档
+    if (chunk.argumentsReplace !== undefined && segment.args === '') segment.args = chunk.argumentsReplace
+    buffer.segments.set(chunk.index, segment)
+  }
+}
+
+/** {@link readToolCalls} 的产出 */
+export interface ToolCallSnapshot {
+  /** 可以执行的调用（`id` + `name` 都齐了） */
+  calls: ChatToolCall[]
+  /**
+   * 收到了分片、但缺 `id` 或 `name` 的段数 —— **它调不了**，只能丢。
+   *
+   * 为什么要报数而不是静默丢：丢掉的症状是"模型说要调工具，界面上却什么都没有"，
+   * 而这条是唯一能解释它的线索。**告警落点在调用方**（本模块不 import 日志，同 P0-2-6 的手法）。
+   */
+  incomplete: number
+}
+
+/** 读累积结果（**在 `finish_reason==='tool_calls'` 或流结束之后才调**，见文件头 ③） */
+export function readToolCalls(buffer: ToolCallBuffer): ToolCallSnapshot {
+  const calls: ChatToolCall[] = []
+  let incomplete = 0
+  for (const segment of buffer.segments.values()) {
+    if (segment.id === null || segment.name === null) {
+      incomplete += 1
+      continue
+    }
+    calls.push({ id: segment.id, name: segment.name, arguments: segment.args })
+  }
+  return { calls, incomplete }
+}
+
+/** {@link parseToolArguments} 的产出（判别联合：失败时带**给人看的原因**） */
+export type ToolArgumentsParse =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; reason: string }
+
+/**
+ * 解析模型给的参数 JSON —— **唯一实现**（编排层真的要用，Anthropic 那次**投影**也要用）。
+ *
+ * 三条口径：
+ *   · **空串按 `{}`**（不是失败）：没有任何参数的工具，多数网关给的 `arguments` 就是 `""`；
+ *     判成失败会让"调一个无参工具"永远失败，而这是最常见的一类工具；
+ *   · **解析失败 / 不是对象都算失败**，且 `reason` 是给**用户与模型**看的中文（会被回填给模型，
+ *     它据此改一次就可能成功）—— 不在这里抛错：一条坏参数只该让**这一次调用**失败，见 P0-2-8 门槛 2；
+ *   · ⚠️ **不猜测**（不截断、不补全、不去里面捞一个像样的子串）：猜出来的参数会让工具**静默做错事**，
+ *     比"模型收到一条错误说明、再试一次"坏得多（同 `mcp/toolSchema.ts` 文件头的判断）。
+ */
+export function parseToolArguments(raw: string): ToolArgumentsParse {
+  const trimmed = raw.trim()
+  if (trimmed === '') return { ok: true, value: {} }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return { ok: false, reason: '模型给出的参数不是合法 JSON' }
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: '模型给出的参数不是 JSON 对象' }
+  }
+  return { ok: true, value: parsed as Record<string, unknown> }
+}
+
+/**
+ * **多轮之间**的用量累加（工具循环里一次问答要调好几轮上游）。
+ *
+ * ⚠️ 与 {@link mergeUsage} 是**两种不同的合并口径**，别混用：
+ *   · `mergeUsage` = "**同一次**调用的两半"（Anthropic 分帧给）⇒ 非空字段**覆盖**；
+ *   · 本函数 = "**这一轮问答的若干次**调用" ⇒ 非空字段**相加**。
+ * 任一字段有一个 `null`（某次上游没给）⇒ 结果该字段为 `null`：**加起来不等于知道**
+ * （与 `schema.prisma` 的 `tokens_*` 可空同款口径：不知道就不编一个 0）。
+ * 三字段关系恒满足 `total = in + out`（只在两者都齐时才算，否则 `null`）。
+ */
+export function sumUsages(a: ChatUsage | null, b: ChatUsage | null): ChatUsage | null {
+  if (a === null) return b
+  if (b === null) return a
+  const add = (left: number | null, right: number | null): number | null =>
+    left === null || right === null ? null : left + right
+  const tokensIn = add(a.tokensIn, b.tokensIn)
+  const tokensOut = add(a.tokensOut, b.tokensOut)
+  return {
+    tokensIn,
+    tokensOut,
+    tokensTotal: tokensIn === null || tokensOut === null ? null : tokensIn + tokensOut,
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // ① OPENAI_COMPAT —— 默认协议，P0-1-12 起的全部行为
 // ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 助手消息的 `tool_calls`（OpenAI 形态；`arguments` **原样字符串**，不解析）。
+ *
+ * `type: 'function'` 是必填：少了它有的网关直接 400（"Invalid type for tool_calls"）。
+ */
+function toOpenAiToolCalls(toolCalls: readonly ChatToolCall[]): Record<string, unknown>[] {
+  return toolCalls.map((call) => ({
+    id: call.id,
+    type: 'function',
+    function: { name: call.name, arguments: call.arguments },
+  }))
+}
+
+/**
+ * 协议无关的 {@link ChatMessage} → OpenAI 报文里的消息。
+ *
+ * 两处**必须**映射（而不是把消息对象原样透出去）：
+ *   · 工具结果 ⇒ `role:'tool'` + `tool_call_id`（OpenAI 的字段名，不是 `toolCallId`）；
+ *   · 助手的 `toolCalls` ⇒ `tool_calls[]`，且 **`content` 给 `null` 而不是空串**
+ *     （带 `tool_calls` 时空串会让一部分网关 400；`null` 是规范允许的形态）。
+ * ⚠️ 原样透出还有第二个坏处：`toolCallId` / `isError` 这些**我们自己的字段名**会漏到线上。
+ */
+function toOpenAiMessages(messages: readonly ChatMessage[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: message.toolCallId, content: message.content })
+      continue
+    }
+    const row: Record<string, unknown> = { role: message.role, content: message.content }
+    if (message.toolCalls !== undefined && message.toolCalls.length > 0) {
+      row.tool_calls = toOpenAiToolCalls(message.toolCalls)
+      if (message.content === '') row.content = null
+    }
+    out.push(row)
+  }
+  return out
+}
+
+/** 流的 `choices[].delta.tool_calls[]`：**分片**，`index` 由上游给（缺省归 0） */
+function readOpenAiToolCallDeltas(raw: unknown): ToolCallChunk[] {
+  if (!Array.isArray(raw)) return []
+  const chunks: ToolCallChunk[] = []
+  for (const entry of raw) {
+    const row = asRecord(entry)
+    if (row === null) continue
+    const fn = asRecord(row.function) ?? {}
+    chunks.push({
+      index: num(row.index) ?? 0,
+      id: str(row.id) ?? undefined,
+      name: str(fn.name) ?? undefined,
+      argumentsDelta: str(fn.arguments) ?? undefined,
+    })
+  }
+  return chunks
+}
+
+/** 非流式的 `message.tool_calls[]`：**完整**，且没有 `index`（数组位置就是段序号） */
+function readOpenAiToolCalls(raw: unknown): ToolCallChunk[] {
+  if (!Array.isArray(raw)) return []
+  const chunks: ToolCallChunk[] = []
+  raw.forEach((entry, index) => {
+    const row = asRecord(entry)
+    if (row === null) return
+    const fn = asRecord(row.function) ?? {}
+    chunks.push({
+      index,
+      id: str(row.id) ?? undefined,
+      name: str(fn.name) ?? undefined,
+      argumentsDelta: str(fn.arguments) ?? undefined,
+    })
+  })
+  return chunks
+}
 
 const openAiCompat: ChatProtocol = {
   id: 'OPENAI_COMPAT',
@@ -227,12 +531,14 @@ const openAiCompat: ChatProtocol = {
   buildBody(request) {
     const body: Record<string, unknown> = {
       model: request.model,
-      messages: request.messages,
+      messages: toOpenAiMessages(request.messages),
       stream: request.stream,
     }
     // ⚠️ `undefined` 就不带这个字段（交给上游默认），而不是写一个 `null` 上去
     if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens
     if (request.temperature !== undefined) body.temperature = request.temperature
+    // 本协议的 `tools` 就是 OpenAI 形态 ⇒ 原样（另两家的投影在各自己的分支里）
+    if (request.tools !== undefined) body.tools = request.tools
     Object.assign(body, request.extraBody ?? {})
     // 刻意不写 `stream_options`（见 `02` §6.1 差异收敛清单 1）：它是 400 的常见来源
     return body
@@ -264,6 +570,7 @@ const openAiCompat: ChatProtocol = {
       thinking: readTextParts(message.reasoning_content ?? message.reasoning),
       finishReason: str(choice.finish_reason),
       usage: readUsage(record.usage),
+      toolCalls: readOpenAiToolCalls(message.tool_calls),
     })
   },
 
@@ -275,6 +582,7 @@ const openAiCompat: ChatProtocol = {
     let text = ''
     let thinking = ''
     let finishReason: string | null = null
+    const toolCalls: ToolCallChunk[] = []
     // `choices` 可能是空数组（保活帧）—— 循环自然跳过，不需要特判
     const choices = Array.isArray(record.choices) ? record.choices : []
     for (const rawChoice of choices) {
@@ -286,8 +594,10 @@ const openAiCompat: ChatProtocol = {
       // 首帧常常只有 `role`；思考增量有写 `reasoning_content`（DeepSeek 系）也有写 `reasoning` 的
       thinking += readTextParts(delta.reasoning_content ?? delta.reasoning)
       text += readTextParts(delta.content)
+      // ⚠️ 只**累积分片**，不在这里 parse（`arguments` 此刻可能只是 `{"a":`，见文件头 ③）
+      toolCalls.push(...readOpenAiToolCallDeltas(delta.tool_calls))
     }
-    return dec({ text, thinking, finishReason, usage: readUsage(record.usage) })
+    return dec({ text, thinking, finishReason, usage: readUsage(record.usage), toolCalls })
   },
 }
 
@@ -311,6 +621,66 @@ function incompleteReasonOf(record: Record<string, unknown>): string | null {
   return str(asRecord(record.incomplete_details)?.reason)
 }
 
+/**
+ * Responses 的 `input` —— ⚠️ 与其他两家最大的不同：**"工具活动"是与消息同级的 item**
+ * （不是挂在消息上的一个字段），故一次助手工具调用会展开成"一条 assistant 消息 + N 条
+ * `function_call` item"，工具结果则是 `function_call_output`（见文件头 ③）。
+ *
+ * `call_id` 而不是 `item.id`：前者是与 `function_call_output` 配对的那个键
+ * （在 Responses 里 item 自己的 `id` 与 `call_id` 是**两个**东西）。
+ * ⚠️ `item` 的完整形态（是否要带 `status`）**未对着真上游验过**（本仓没有 Responses 的假上游）
+ * —— 这里只写**规范里最小的那组字段**，待有一家可达的 Responses 实现时再补。
+ */
+function toResponsesInput(messages: readonly ChatMessage[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  for (const message of messages) {
+    if (message.role === 'system') continue // 顶层 `instructions`（见 buildBody）
+    if (message.role === 'tool') {
+      out.push({ type: 'function_call_output', call_id: message.toolCallId, output: message.content })
+      continue
+    }
+    // 带 `tool_calls` 而正文为空是常态（模型直接给调用、不回一句话）⇒ 空正文不占一个 item
+    if (message.content !== '') out.push({ role: message.role, content: message.content })
+    for (const call of message.toolCalls ?? []) {
+      out.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments })
+    }
+  }
+  return out
+}
+
+/** OpenAI 形态的工具 → Responses 的工具（**字段位置不同**：`name`/`parameters` 在顶层） */
+function toResponsesTools(tools: readonly ProtocolToolDefinition[]): Record<string, unknown>[] {
+  return tools.map((tool) => ({
+    type: 'function',
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+  }))
+}
+
+/**
+ * Responses 的 `output[]` 里 `type='function_call'` 的 item → 分片（**完整**形态，故走 `argumentsDelta`）。
+ *
+ * `index` 取**数组位置**：非流式里这些 item 是一次给全的，没有"段序号"这回事；
+ * 反正到了执行那一步，顺序由这里定。
+ */
+function readResponsesToolCalls(rawOutput: unknown): ToolCallChunk[] {
+  if (!Array.isArray(rawOutput)) return []
+  const chunks: ToolCallChunk[] = []
+  rawOutput.forEach((rawItem, index) => {
+    const item = asRecord(rawItem)
+    if (item === null || str(item.type) !== 'function_call') return
+    chunks.push({
+      index,
+      // `call_id` 才是与 `function_call_output` 配对的键；`item.id` 是另一个东西（见 `toResponsesInput`）
+      id: str(item.call_id) ?? str(item.id) ?? undefined,
+      name: str(item.name) ?? undefined,
+      argumentsDelta: str(item.arguments) ?? undefined,
+    })
+  })
+  return chunks
+}
+
 const openAiResponses: ChatProtocol = {
   id: 'OPENAI_RESPONSES',
   label: 'OpenAI Responses',
@@ -321,21 +691,19 @@ const openAiResponses: ChatProtocol = {
   headers: (endpoint, options = {}) => upstreamHeaders(endpoint, options),
 
   buildBody(request) {
-    // 系统提示挪到顶层 `instructions`（`02` §6.1 映射表）；`input` 只留 user/assistant
+    // 系统提示挪到顶层 `instructions`（`02` §6.1 映射表）；`input` 只留 user/assistant/工具活动
     const instructions = request.messages
       .filter((message) => message.role === 'system')
       .map((message) => message.content)
       .join('\n\n')
-    const input = request.messages
-      .filter((message) => message.role !== 'system')
-      // `EasyInputMessage.content` 允许裸字符串 —— 比 part 数组更"谁都认"
-      .map((message) => ({ role: message.role, content: message.content }))
+    const input = toResponsesInput(request.messages)
 
     const body: Record<string, unknown> = { model: request.model, input, stream: request.stream }
     if (instructions !== '') body.instructions = instructions
     // ⚠️ 字段名不一样：Responses 是 `max_output_tokens`
     if (request.maxTokens !== undefined) body.max_output_tokens = request.maxTokens
     if (request.temperature !== undefined) body.temperature = request.temperature
+    if (request.tools !== undefined) body.tools = toResponsesTools(request.tools)
     Object.assign(body, request.extraBody ?? {})
     return body
   },
@@ -399,6 +767,7 @@ const openAiResponses: ChatProtocol = {
       thinking,
       finishReason: finishReasonFromResponsesStatus(status, incompleteReasonOf(record)),
       usage: readUsage(record.usage),
+      toolCalls: readResponsesToolCalls(output),
     })
   },
 
@@ -438,8 +807,38 @@ const openAiResponses: ChatProtocol = {
           '在流中',
         )
       }
-      // `response.created` / `response.in_progress` / `response.output_item.*` /
-      // `response.content_part.*` / `response.output_text.done` …：对"累积文本"没有增量贡献
+      // ── 工具调用（P0-2-8）──
+      // `output_item.added` 给 id/name，`function_call_arguments.delta` 给参数**分片**；
+      // 两个 `.done` 给的是**完整**参数 ⇒ 走 `argumentsReplace`（当 delta 追加会翻倍，见该字段的注释）
+      case 'response.output_item.added':
+      case 'response.output_item.done': {
+        const item = asRecord(record.item)
+        // ⚠️ 只认 `function_call`：`message` / `reasoning` / `web_search_call` 之类与工具循环无关
+        if (item === null || str(item.type) !== 'function_call') return dec()
+        const chunk: ToolCallChunk = {
+          index: num(record.output_index) ?? 0,
+          id: str(item.call_id) ?? str(item.id) ?? undefined,
+          name: str(item.name) ?? undefined,
+        }
+        if (type === 'response.output_item.done') {
+          const args = str(item.arguments)
+          if (args !== null && args !== '') chunk.argumentsReplace = args
+        }
+        return dec({ toolCalls: [chunk] })
+      }
+      case 'response.function_call_arguments.delta': {
+        return dec({
+          toolCalls: [{ index: num(record.output_index) ?? 0, argumentsDelta: str(record.delta) ?? '' }],
+        })
+      }
+      case 'response.function_call_arguments.done': {
+        const args = str(record.arguments)
+        const chunk: ToolCallChunk = { index: num(record.output_index) ?? 0 }
+        if (args !== null && args !== '') chunk.argumentsReplace = args
+        return dec({ toolCalls: [chunk] })
+      }
+      // `response.created` / `response.in_progress` / `response.content_part.*` /
+      // `response.output_text.done` …：对"累积文本"没有增量贡献
       default:
         return dec()
     }
@@ -479,6 +878,92 @@ function finishReasonFromAnthropic(stopReason: string | null): string | null {
   return ANTHROPIC_FINISH_REASONS[stopReason] ?? stopReason
 }
 
+/** Anthropic 的一个 content block（我们只产出 `text` / `tool_use` / `tool_result` 三种） */
+type AnthropicBlock = Record<string, unknown>
+
+/**
+ * 参数 → Anthropic 的 `tool_use.input`（**必须是对象**，不是字符串 —— 这是唯一需要解析的地方）。
+ *
+ * ⚠️ 解不出来时给 `{}`，而**不是**在"给一个猜出来的参数"与"整条请求失败"之间选一个更坏的：
+ *   · 这个调用**不会**被执行 —— 编排层已经用 `tool_call{ERROR}`（"参数不是合法 JSON"）
+ *     把结论给了用户，并把同一句话作为 `tool_result` 回填给模型；
+ *   · Anthropic 这一侧只需要看到一个**形状合法**的 `tool_use`，紧跟着的 `tool_result`
+ *     （内容是那句错误说明）不会让模型误以为"参数是空的"。
+ *   · 反过来"猜"（截断/补全）会让工具**静默做错事** —— 见 {@link parseToolArguments} 的口径 ③。
+ */
+function toolInputOf(raw: string): Record<string, unknown> {
+  const parsed = parseToolArguments(raw)
+  return parsed.ok ? parsed.value : {}
+}
+
+/**
+ * 协议无关的 {@link ChatMessage} → Anthropic 的 `messages`。
+ *
+ * ⚠️ 与其他两家最大的不同在**工具结果**：Anthropic **没有 `role:'tool'`** —— 结果是**用户消息里**
+ * 的 `tool_result` 块（差异收敛清单 17）。两条连带后果：
+ *   · 同一轮的多个结果必须**合成一条** user 消息（一条一个 user 会让角色不交替 ⇒ 400）；
+ *   · 于是"相邻同角色合并"必须一并处理：用户连发两条、或某一轮**被停止**（只留用户消息、
+ *     没有助手消息）时，历史里就是 USER,USER —— Anthropic 要求角色交替，不合并会被拒。
+ *     ⚠️ 这条在**多轮**里必然发生（不是理论情况），所以合并是按角色**通用**做的，不是只合工具结果。
+ *
+ * `content` 一律用**块数组**（不用裸字符串）：一条规则比"有时字符串、有时数组"少一类边界，
+ * 而 Anthropic 两种都收。
+ */
+function toAnthropicMessages(
+  messages: readonly ChatMessage[],
+): { role: 'user' | 'assistant'; content: AnthropicBlock[] }[] {
+  const out: { role: 'user' | 'assistant'; content: AnthropicBlock[] }[] = []
+  /** 追加一段块；与上一条同角色就并进去（见本函数注释） */
+  const append = (role: 'user' | 'assistant', blocks: AnthropicBlock[]): void => {
+    if (blocks.length === 0) return
+    const previous = out[out.length - 1]
+    if (previous !== undefined && previous.role === role) {
+      // 就地改：`out` 与这些数组都是本函数刚造的，没有别名
+      previous.content.push(...blocks)
+      return
+    }
+    out.push({ role, content: blocks })
+  }
+
+  for (const message of messages) {
+    if (message.role === 'system') continue // 顶层 `system`（见 buildBody）
+    if (message.role === 'tool') {
+      const block: AnthropicBlock = {
+        type: 'tool_result',
+        tool_use_id: message.toolCallId,
+        content: message.content,
+      }
+      // `is_error` 只有 Anthropic 有（另两家没有对应字段）⇒ 协议无关层带着它过来
+      if (message.isError === true) block.is_error = true
+      append('user', [block])
+      continue
+    }
+    // 正文与"工具调用请求"可以同时存在（模型先说一句、再调工具）；两者都空则不占一条消息
+    if (message.content !== '') append(message.role, [{ type: 'text', text: message.content }])
+    const toolCalls = message.toolCalls
+    if (toolCalls === undefined || toolCalls.length === 0) continue
+    append(
+      'assistant',
+      toolCalls.map((call) => ({
+        type: 'tool_use',
+        id: call.id,
+        name: call.name,
+        input: toolInputOf(call.arguments),
+      })),
+    )
+  }
+  return out
+}
+
+/** OpenAI 形态的工具 → Anthropic 的工具（`input_schema` 而不是 `parameters`；**没有** `type` 字段） */
+function toAnthropicTools(tools: readonly ProtocolToolDefinition[]): Record<string, unknown>[] {
+  return tools.map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters,
+  }))
+}
+
 const anthropicMessages: ChatProtocol = {
   id: 'ANTHROPIC_MESSAGES',
   label: 'Anthropic Messages',
@@ -511,9 +996,7 @@ const anthropicMessages: ChatProtocol = {
       .filter((message) => message.role === 'system')
       .map((message) => message.content)
       .join('\n\n')
-    const messages = request.messages
-      .filter((message) => message.role !== 'system')
-      .map((message) => ({ role: message.role, content: message.content }))
+    const messages = toAnthropicMessages(request.messages)
 
     const body: Record<string, unknown> = {
       model: request.model,
@@ -523,6 +1006,7 @@ const anthropicMessages: ChatProtocol = {
     }
     if (system !== '') body.system = system
     if (request.temperature !== undefined) body.temperature = request.temperature
+    if (request.tools !== undefined) body.tools = toAnthropicTools(request.tools)
     Object.assign(body, request.extraBody ?? {})
     return body
   },
@@ -542,6 +1026,7 @@ const anthropicMessages: ChatProtocol = {
 
     let text = ''
     let thinking = ''
+    const toolCalls: ToolCallChunk[] = []
     for (const rawBlock of Array.isArray(record.content) ? record.content : []) {
       const block = asRecord(rawBlock)
       if (block === null) continue
@@ -549,12 +1034,22 @@ const anthropicMessages: ChatProtocol = {
       if (blockType === 'text') text += str(block.text) ?? ''
       // 扩展思考块（`thinking` 开头的模型会回）；`redacted_thinking` 的内容是密文，不取
       else if (blockType === 'thinking') thinking += str(block.thinking) ?? ''
+      else if (blockType === 'tool_use') {
+        // 非流式里 `input` 已经是**对象** ⇒ 序列化回字符串，与流式路径**同一种分片形态**
+        toolCalls.push({
+          index: toolCalls.length,
+          id: str(block.id) ?? undefined,
+          name: str(block.name) ?? undefined,
+          argumentsDelta: block.input === undefined ? '{}' : JSON.stringify(block.input),
+        })
+      }
     }
     return dec({
       text,
       thinking,
       finishReason: finishReasonFromAnthropic(str(record.stop_reason)),
       usage: readUsage(record.usage),
+      toolCalls,
     })
   },
 
@@ -575,6 +1070,18 @@ const anthropicMessages: ChatProtocol = {
         const block = asRecord(record.content_block) ?? {}
         if (str(block.type) === 'text') return dec({ text: str(block.text) ?? '' })
         if (str(block.type) === 'thinking') return dec({ thinking: str(block.thinking) ?? '' })
+        if (str(block.type) === 'tool_use') {
+          // 起始帧只给 id/name（参数在后面的 `input_json_delta` 里逐段来）
+          return dec({
+            toolCalls: [
+              {
+                index: num(record.index) ?? 0,
+                id: str(block.id) ?? undefined,
+                name: str(block.name) ?? undefined,
+              },
+            ],
+          })
+        }
         return dec()
       }
       case 'content_block_delta': {
@@ -586,9 +1093,13 @@ const anthropicMessages: ChatProtocol = {
           case 'thinking_delta':
             return dec({ thinking: str(delta.thinking) ?? '' })
           case 'input_json_delta':
+            // 工具参数**片段**（`partial_json` 可能是 `{"a":` 这种半截）⇒ 只累积，不解析
+            return dec({
+              toolCalls: [{ index: num(record.index) ?? 0, argumentsDelta: str(delta.partial_json) ?? '' }],
+            })
           case 'signature_delta':
           case 'citations_delta':
-            return dec() // 工具调用参数 / 思考签名 / 引用：本批不消费
+            return dec() // 思考签名 / 引用：本批不消费
           default: {
             const text = str(delta.text)
             return text === null ? dec() : dec({ text })
@@ -650,6 +1161,9 @@ export function protocolOf(id: UpstreamProtocol | null | undefined): ChatProtoco
  * 若让"先到先得"的 total 活下来，最终 `12 + 8 = 20` 的账会报成 `13` —— 一个**自相矛盾**的
  * usage（报表按 total 算钱，就会少算）。而 OpenAI 系一次给全、且 `total = prompt + completion`
  * 恒成立，所以"以 in+out 为准"对它们逐字等价。
+ *
+ * ⚠️ **别拿它去合"多轮"的用量**（工具循环里一次问答会调好几轮上游）—— 那是 {@link sumUsages}，
+ * 口径是**相加**而不是覆盖。两者混用会把"三轮的用量"报成"最后一轮的"。
  */
 export function mergeUsage(previous: ChatUsage | null, incoming: ChatUsage): ChatUsage {
   const tokensIn = incoming.tokensIn ?? previous?.tokensIn ?? null

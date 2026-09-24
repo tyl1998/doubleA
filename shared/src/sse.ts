@@ -59,7 +59,7 @@
 
 import { z } from 'zod'
 
-import { citationItemSchema } from './conversation.js'
+import { citationItemSchema, toolCallRecordSchema } from './conversation.js'
 import { ERROR_CODES } from './errors.js'
 
 // ───────────────────────────── 事件名与取值域 ─────────────────────────────
@@ -98,13 +98,15 @@ export type SseEventName = (typeof SSE_EVENT_NAMES)[number]
 export const CHAT_FINISH_REASONS = ['COMPLETE', 'STOPPED', 'ERROR'] as const
 export type ChatFinishReason = (typeof CHAT_FINISH_REASONS)[number]
 
-/** 工具来源（`02` §5.1 的 `tool_call.kind`）：ChatBot 的 MCP 工具 / TaskAgent 的沙箱工具 */
-export const TOOL_CALL_KINDS = ['MCP', 'SANDBOX'] as const
-export type ToolCallKind = (typeof TOOL_CALL_KINDS)[number]
-
-/** 工具调用状态机（`RUNNING` → `SUCCESS` / `ERROR`） */
-export const TOOL_CALL_STATUSES = ['RUNNING', 'SUCCESS', 'ERROR'] as const
-export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number]
+/**
+ * 工具来源与状态机（`02` §5.1 的 `tool_call.kind` / `.status`）。
+ *
+ * ⚠️ **P0-2-8 起它们的家在 `conversation.ts`**（那里是**落库**形态：`messages.content.tool_calls[]`）
+ * —— 同一套取值域现在同时出现在"落库"与"事件"两处，各写一份字面量必然有一处先腐烂。
+ * 本文件**刻意不在这里再导出一次**（`shared/src/index.ts` 是 `export *`，同一名字从两个模块
+ * 星导出会让它在包根变成"歧义名"）⇒ 调用方一律从包根 `import { TOOL_CALL_STATUSES } from '@doubulea/shared'`，
+ * 一个字都不用改。
+ */
 
 /** SSE 响应的 Content-Type（含 charset —— 中文增量必须明确编码，否则有的客户端按 latin-1 解） */
 export const SSE_CONTENT_TYPE = 'text/event-stream; charset=utf-8'
@@ -120,21 +122,16 @@ export const sseThinkingPayloadSchema = z.object({ text: z.string() })
 export type SseThinkingPayload = z.infer<typeof sseThinkingPayloadSchema>
 
 /**
- * `tool_call`：工具卡片。
+ * `tool_call`：工具卡片（同一 `callId` 多次推送 = 状态机流转）。
  *
- * `output` 可省：`RUNNING` 时还没有结果。`inputSummary` 是**摘要**（完整入参留在库里/由历史接口给），
+ * ⚠️ **由 `conversation.ts#toolCallRecordSchema` 派生（P0-2-8）**，只去掉 `arguments`：
+ * 那张卡有**两个来源**（本事件、刷新后从 `messages.content.tool_calls` 恢复），
+ * 派生保证"加字段忘了同步"在结构上不可能（同 `conversationActiveSchema` 的手法）。
+ * `output` 可省（`RUNNING` 时还没有结果）；`inputSummary` 是**摘要**（完整入参只在库里），
  * 因为这是要画在卡片上的一行字（`01` 决策 17「名称 + 参数摘要 + 状态」）。
+ * `errorCode` 也是可省的 —— `02` §9.3 要的"『去配置』跳转"需要一个**结构化**信号（人话里认不出来）。
  */
-export const sseToolCallPayloadSchema = z.object({
-  callId: z.string().min(1),
-  toolName: z.string().min(1),
-  /** MCP server 名（`kind=MCP` 时有值，展示"工具来自哪个系统"） */
-  serverName: z.string(),
-  kind: z.enum(TOOL_CALL_KINDS),
-  status: z.enum(TOOL_CALL_STATUSES),
-  inputSummary: z.string(),
-  output: z.string().optional(),
-})
+export const sseToolCallPayloadSchema = toolCallRecordSchema.omit({ arguments: true })
 export type SseToolCallPayload = z.infer<typeof sseToolCallPayloadSchema>
 
 /** `confirm`：等待用户确认（P0 只有确认/取消二元语义，不做自由输入表单，`02` §六 第 4 步） */

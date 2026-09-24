@@ -41,13 +41,34 @@
  *    （P0-1 的 10 张表里不含它）。本批做的是"计量**透传**"：`done.usage` 事件给前端 +
  *    结束日志里带 `tokensIn/tokensOut`。**接回点**：P1 建表后，在 {@link chatBotProducer}
  *    落库的那个事务里加一条 `usageRecord.create`，并把本段注释改掉。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ④ 工具循环（P0-2-8）的三条判据
+ * ─────────────────────────────────────────────────────────────────────
+ * ① **"还允不允许要工具"的判据是"已执行了几轮"，不是"请求了几次"**（`06` 门槛 3 的口径）：
+ *    到 `TOOL_LOOP_LIMIT` 后**当轮就把 `tools` 撤掉**，而不是等模型第 11 次要了再拒。
+ *    两者的可观测结果一致（门槛 3 取证的是"假 MCP 的调用计数恰好 **10** + `done{COMPLETE}`"），
+ *    但撤掉省一次明知不会执行的上游往返；而且**只有"请求里没有 `tools` 字段"才是真的禁工具**
+ *    —— 只在提示里写"不许调"，模型仍可能吐一个工具名出来（那时只能收尾，见循环里那个分支）。
+ * ② **工具失败 ≠ 这一轮失败**（门槛 2）：`isError` / 缺凭据 / 传输故障**全部**变成
+ *    `tool_call{ERROR}` 卡 + 把错误文本回填给模型，让模型自己决定怎么说 ——
+ *    这才是 `01` §3.6"失败错误可见"的正确形态（整轮失败会让用户只看到一张错误卡、
+ *    拿不到任何解释）。**唯一的例外是中断**（`McpAbortError`）—— 那要真的停下来。
+ * ③ **凭据的主语来自"当前会话"**（`02` §9.3 不变式）：`viewer.userId` 从 `conversations` 行
+ *    **现查**（懒加载，只有真要执行工具时才查一次），不从请求体、不从路径、不顺着调用链传
+ *    —— 传一次就多一个"传错人"的机会，而现查的代价只有一次主键查询。
  */
 
 import {
   AppError,
+  DEFAULT_MESSAGE_BY_ERROR_CODE,
   type CitationItem,
+  type ErrorCode,
   type RetrievalHit,
   type SseEvent,
+  type SseToolCallPayload,
+  type ToolCallRecord,
+  type ToolCallStatus,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -56,19 +77,29 @@ import { getPrisma } from '../infra/prisma.js'
 import {
   LlmAbortError,
   chatStream,
+  parseToolArguments,
+  sumUsages,
   type ChatMessage,
   type ChatStreamSummary,
   type ChatUsage,
 } from '../llm/client.js'
+import { McpAbortError } from '../mcp/client.js'
+import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
 import { MESSAGE_CHRONO_ORDER, touchConversation } from '../services/conversation.service.js'
 import { searchKnowledgeBase } from '../services/retrieval.js'
 import {
+  TOOL_LOOP_LIMIT_NOTICE,
   buildAssistantContent,
+  buildAssistantToolCallsMessage,
   buildSystemPrompt,
+  buildToolResultMessages,
   mergeRetrievalHits,
   selectHistoryMessages,
+  summarizeToolInput,
   toCitationItems,
+  truncateToolResult,
   type HistoryRow,
+  type ToolOutcome,
 } from './chatContext.js'
 import { createSemaphore } from './semaphore.js'
 import { ChatStoppedError, type ChatProducer, type ChatStopReason } from './sse.js'
@@ -121,26 +152,36 @@ export const chatBotProducer: ChatProducer = async (input) => {
   let assistantText = ''
   let thinkingText = ''
   let citations: CitationItem[] = []
-  let usage: ChatUsage | null = null
+  /**
+   * 本轮的**工具调用记录**（P0-2-8）。
+   *
+   * 放在外层（而不是循环里）是因为它要活到收尾：落库时它是助手消息的 `content.tool_calls`
+   * —— **工具调用也是"这一轮发生的事"**，中断/故障照样落库（同下面那条 `assistantText`）。
+   */
+  const toolRecords: ToolCallRecord[] = []
 
   try {
     const db = getPrisma()
 
-    // ── ② 智能体与绑定的知识库 ──
+    // ── ② 智能体与它绑定的知识库 / MCP server ──
     const agent = await db.agent.findFirst({
       where: { id: agentId, deletedAt: null },
       select: {
         systemPrompt: true,
-        components: {
-          where: { componentType: 'KNOWLEDGE' },
-          orderBy: { refId: 'asc' },
-          select: { refId: true },
-        },
+        // ⚠️ 一次取全部组件再在内存里分流（`componentType` 是判别列）：Prisma 不允许在同一次
+        //    查询里对同一个关系写两个 `select` 分支，而分两次查会多一次往返。
+        //    `orderBy: refId asc` 与 P0-1-23 起的历史口径相同 —— 两个列表都按它排序。
+        components: { orderBy: { refId: 'asc' }, select: { componentType: true, refId: true } },
       },
     })
     // 走到这里还查不到 = 软删与发消息的竞态（`assertConversationSendable` 已用 409 挡过一次）
     if (agent === null) throw AppError.notFound('智能体不存在')
-    const kbIds = agent.components.map((component) => component.refId)
+    const kbIds = agent.components
+      .filter((component) => component.componentType === 'KNOWLEDGE')
+      .map((component) => component.refId)
+    const mcpServerIds = agent.components
+      .filter((component) => component.componentType === 'MCP')
+      .map((component) => component.refId)
 
     // ── ③ 逐库检索（`02` §六 第 2 步）──
     // ⚠️ 每个库各调一次 `searchKnowledgeBase` ⇒ **同一句 query 会被 embed 多次**。
@@ -165,6 +206,26 @@ export const chatBotProducer: ChatProducer = async (input) => {
       await input.emit({ name: 'citations', data: { items: citations } })
     }
 
+    // ── ③′ 本轮可用的 MCP 工具（P0-2-8）──
+    /**
+     * 读 `tool_cache` 列组装工具表：**不联网、不碰凭据**（见 `mcpCall.service.ts` 文件头 ⑤）。
+     *
+     * ⚠️ 凭据不在这里判 —— "没配凭据"要到**真的点这个工具**时才以
+     * `tool_call{ERROR, NEED_CREDENTIAL}` 的形式出现（`02` §9.3）。反过来做的代价：
+     * 用户一进对话页就会看到一堆"缺凭据"，而他可能压根没打算用那台 server。
+     */
+    const catalog = await resolveMcpToolCatalog(mcpServerIds)
+    /** `serverId → 展示名`：工具卡片要显示"工具来自哪个系统"，**失败时也要显示** */
+    const serverNameById = new Map(catalog.servers.map((server) => [server.id, server.name]))
+    if (mcpServerIds.length > 0 && catalog.tools.length === 0) {
+      // 绑了 server 却一个工具都没下发：最可能的原因是"从没成功拉过工具列表"
+      // （每台这样的 server 在 `resolveMcpToolCatalog` 里已各有一条 warn，这里只记本轮）
+      logger.warn(
+        { conversationId, agentId, mcpServerCount: mcpServerIds.length },
+        '本轮绑定了 MCP server，但没有一个工具下发给模型（工具缓存为空）',
+      )
+    }
+
     // ── ④ 历史（最近 N 轮）+ system + 本轮用户消息 ──
     const rounds = config.limits.contextRounds
     const historyRows = await db.message.findMany({
@@ -186,7 +247,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
       { role: 'user', content },
     ]
 
-    // ── ⑤ LLM 流式调用（`delta` / `thinking` 透传）──
+    // ── ⑤ LLM 流式调用 + 工具循环（`delta` / `thinking` 透传；P0-2-8 起含 MCP 工具）──
     /**
      * 帧的**串行队列**。
      *
@@ -204,46 +265,244 @@ export const chatBotProducer: ChatProducer = async (input) => {
       })
     }
 
+    /** 发一张工具卡（同一 `callId` 多次推送 = 状态机流转；前端按 `callId` upsert） */
+    const emitToolCard = (payload: SseToolCallPayload): void => {
+      enqueue({ name: 'tool_call', data: payload })
+    }
+
     /** TTFT（`02` §十三：阶段一"首字 < 3s"验收的**唯一**测量依据，不能事后补） */
     const requestedAtMs = Date.parse(input.startedAt)
     let ttftLogged = false
 
     let summary: ChatStreamSummary | null = null
     let failure: unknown = null
+    /**
+     * 本轮的**总**用量：工具循环里每一轮上游各给一份 ⇒ 相加（`sumUsages`，
+     * **不是** `mergeUsage` —— 那个合的是"同一次调用的两半"，见 `protocol.ts`）。
+     */
+    let totalUsage: ChatUsage | null = null
+    /** 本轮累计收到多少个非空增量（跨多轮之和，日志用） */
+    let totalDeltas = 0
+    /** 已经**执行**过几轮工具（判据是"执行了几轮"，见文件头 ④①） */
+    let toolRounds = 0
+    /** "已达上限"那条提示**只注入一次**（否则每次都要多一轮上游往返） */
+    let limitNoticeSent = false
+    /** 实际流过的上游轮数（= 1 + 工具轮数；日志与排查用） */
+    let upstreamRounds = 0
+
+    /**
+     * 调用者（会话的 owner）—— **懒加载**（见文件头 ④③）。
+     *
+     * 只有"真的要执行一个工具"时才查：绝大多数轮次根本不碰 MCP，为一次不存在的需求
+     * 每轮多查一次 `conversations` 是白花钱。查到就缓存（同一轮里多个工具共用一个）。
+     */
+    let viewerUserId: string | null = null
+    const resolveViewer = async (): Promise<{ userId: string }> => {
+      if (viewerUserId === null) {
+        const row = await db.conversation.findUnique({
+          where: { id: conversationId },
+          select: { userId: true },
+        })
+        // 会话在流中途消失基本不可能（进门前 `assertConversationSendable` 已查过）
+        if (row === null) throw AppError.notFound('会话不存在')
+        viewerUserId = row.userId
+      }
+      return { userId: viewerUserId }
+    }
+
     try {
-      summary = await chatStream(
-        input.target,
-        messages,
-        {
-          onDelta: (text) => {
-            if (!ttftLogged) {
-              ttftLogged = true
-              logger.info(
+      for (;;) {
+        const limit = config.limits.toolLoopLimit
+        /**
+         * "还允不允许要工具"（见文件头 ④①）：到上限后就**当轮撤掉 `tools`** + 注入提示。
+         * 撤掉比"等它要了再拒"少一次上游往返，而且**只有请求里没有 `tools` 才是真的禁工具**。
+         */
+        const atToolLimit = toolRounds >= limit
+        const withTools = catalog.tools.length > 0 && !atToolLimit
+        if (atToolLimit && !limitNoticeSent) {
+          limitNoticeSent = true
+          messages.push({ role: 'user', content: TOOL_LOOP_LIMIT_NOTICE })
+        }
+
+        upstreamRounds += 1
+        const round = await chatStream(
+          input.target,
+          messages,
+          {
+            onDelta: (text) => {
+              if (!ttftLogged) {
+                ttftLogged = true
+                logger.info(
+                  {
+                    conversationId,
+                    agentId,
+                    modelId: input.target.modelId,
+                    ttftMs: Date.now() - requestedAtMs,
+                    historyMessages: messages.length - 2, // 去掉 system 与本轮用户消息
+                    citations: citations.length,
+                    tools: catalog.tools.length,
+                  },
+                  '本轮首字延迟（TTFT）',
+                )
+              }
+              assistantText += text
+              enqueue({ name: 'delta', data: { text } })
+            },
+            onThinking: (text) => {
+              thinkingText += text
+              enqueue({ name: 'thinking', data: { text } })
+            },
+            // ⚠️ **不写 `onUsage`**：用量从每一轮返回的 `round.usage` 里取（那是外壳合并好的
+            //    完整值）。两者同时算会把同一轮的用量记两遍（`onUsage` 回的就是 `round.usage`）。
+          },
+          withTools ? { abortSignal: signal, tools: catalog.tools } : { abortSignal: signal },
+        )
+        summary = round
+        totalUsage = sumUsages(totalUsage, round.usage)
+        totalDeltas += round.deltaCount
+
+        // 没有工具请求 ⇒ 这一轮就是最终回答
+        if (round.toolCalls.length === 0) break
+
+        if (atToolLimit) {
+          /**
+           * 已经撤掉 `tools` 并且提示过"不能再调工具"，模型**仍然**报了一个工具调用 ——
+           * 模型侧的行为不可控 ⇒ 只能收尾：不能执行（那就是突破上限），
+           * 也不能再追加一次提示（那会变成无限循环）。
+           */
+          logger.warn(
+            {
+              conversationId,
+              agentId,
+              limit,
+              toolCalls: round.toolCalls.map((call) => call.name),
+            },
+            '已禁用工具并提示达上限，模型仍要求调用工具 ⇒ 不再执行，直接收尾',
+          )
+          break
+        }
+
+        // 助手这一轮"我要调这些工具"的消息 —— **必须排在结果之前**（三协议都要求成对）
+        messages.push(buildAssistantToolCallsMessage(round.text, round.toolCalls))
+
+        const outcomes: ToolOutcome[] = []
+        for (const call of round.toolCalls) {
+          const route = catalog.routes[call.name]
+          // `serverName` 从目录取（**不依赖执行成功**：失败时卡片也要显示"来自哪台 server"）
+          const serverName = route === undefined ? '' : (serverNameById.get(route.serverId) ?? '')
+          /**
+           * 卡片与落库记录共用的那几列（`status` / `output` / `errorCode` 逐条不同）。
+           *
+           * ⚠️ **刻意不含 `arguments`**：SSE 的 `tool_call` payload 由
+           * `toolCallRecordSchema.omit({ arguments: true })` 派生（完整入参**只留档、不上线**，见
+           * `shared/src/conversation.ts`），而 `emit()` **序列化的是原对象、不是 `parsed.data`**
+           * （zod 的 strip 只在 `parsed.data` 上生效）⇒ 一旦把 `arguments` 混进 payload 对象，
+           * 它就会**原样出现在流里**。所以完整入参只在**落库那一份**上补（见下面 `toolRecords.push`）。
+           */
+          const base = {
+            callId: call.id,
+            toolName: call.name,
+            serverName,
+            kind: 'MCP' as const,
+          }
+          const parsed = parseToolArguments(call.arguments)
+          // 摘要取**解析后**的参数（与真的要发出去的那份一致）；解析失败时退回原串（如实展示）
+          const inputSummary = parsed.ok
+            ? summarizeToolInput(parsed.value)
+            : summarizeToolInput({ raw: call.arguments })
+
+          emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+          await input.updateSnapshot({ currentTool: call.name })
+
+          let status: ToolCallStatus = 'SUCCESS'
+          let output: string
+          let errorCode: ErrorCode | undefined
+          let isError = false
+
+          /**
+           * ⚠️⚠️ **P0-2-9 的接回点 —— 危险判定（`annotations` ⇒ 平台强制 confirm）就插在这里。**
+           *
+           * 位置是刻意的：**在取凭据与发 `RUNNING` 卡之前**。晚一步的后果是"确认卡上已经写着
+           * 『运行中』、工具也已经发出去了"，而确认的意义正是"发出去之前问一句"。
+           * 判据（`destructiveHint === true` ⇒ 危险；`readOnlyHint` 缺失 ⇒ 危险）与真值表见
+           * `06` P0-2-9；**本批不做判定**（`mcp/risk.ts` 还不存在）⇒ 所有工具一律直接执行。
+           * 接线时还要注意两件事：① `confirm` 是**挂起等 `/confirm` 应答**（上限 120s，P0-2-10），
+           * 那段等待**必须**也能被 `signal` 打断（否则停止按钮在确认卡上失效）；
+           * ② 用户取消 ⇒ 回填一条"用户拒绝执行"的 `tool_result`（**不是**把整轮搞失败）。
+           */
+          if (route === undefined) {
+            status = 'ERROR'
+            isError = true
+            output =
+              `工具调用失败：本轮没有向模型提供名为「${call.name}」的工具` +
+              '（可能是模型自己编的名字，或该工具所属的 MCP server 已被解绑）。'
+          } else if (!parsed.ok) {
+            status = 'ERROR'
+            isError = true
+            // 回填原参数（截断过）：模型据此改一次往往就成了 —— 这才是"失败可自愈"的形态
+            output = `工具调用失败：${parsed.reason}。模型给出的原文：${truncateToolResult(call.arguments)}`
+          } else {
+            try {
+              const execution = await executeMcpToolCall({
+                serverId: route.serverId,
+                viewer: await resolveViewer(),
+                // ⚠️ MCP 侧的**原始**工具名（`routes` 里那个），不是下发给模型的 `call.name`
+                toolName: route.toolName,
+                args: parsed.value,
+                signal,
+              })
+              isError = execution.isError
+              status = execution.isError ? 'ERROR' : 'SUCCESS'
+              output = truncateToolResult(execution.text)
+            } catch (error) {
+              // 用户的「停止」**不是**工具失败 —— 它要真的中断这一轮（见文件头 ④②）
+              if (error instanceof McpAbortError) throw error
+              /**
+               * 其余全部（缺凭据 424 / server 没了 404 / 上游 502/504）都**只是这一条工具失败**：
+               * 卡片报错 + 错误文本回填，让模型自己决定怎么说（`01` §3.6"失败错误可见"的形态）。
+               * 整轮失败会让用户只看到一张错误卡、拿不到任何解释 —— 比"这一轮答得不好"更差。
+               */
+              status = 'ERROR'
+              isError = true
+              errorCode = error instanceof AppError ? error.code : 'INTERNAL'
+              output = truncateToolResult(
+                `工具调用失败：${
+                  error instanceof AppError ? error.message : DEFAULT_MESSAGE_BY_ERROR_CODE.INTERNAL
+                }`,
+              )
+              logger.warn(
                 {
                   conversationId,
                   agentId,
-                  modelId: input.target.modelId,
-                  ttftMs: Date.now() - requestedAtMs,
-                  historyMessages: messages.length - 2, // 去掉 system 与本轮用户消息
-                  citations: citations.length,
+                  toolName: call.name,
+                  mcpServerId: route.serverId,
+                  errorCode,
+                  err: error,
                 },
-                '本轮首字延迟（TTFT）',
+                'MCP 工具执行失败（已作为错误结果回填给模型，本轮不因此失败）',
               )
             }
-            assistantText += text
-            enqueue({ name: 'delta', data: { text } })
-          },
-          onThinking: (text) => {
-            thinkingText += text
-            enqueue({ name: 'thinking', data: { text } })
-          },
-          onUsage: (value) => {
-            usage = value
-          },
-        },
-        { abortSignal: signal },
-      )
-      usage = summary.usage ?? usage
+          }
+
+          const finished = {
+            ...base,
+            status,
+            inputSummary,
+            output,
+            ...(errorCode === undefined ? {} : { errorCode }),
+          }
+          emitToolCard(finished)
+          // ⚠️ 完整入参**只补在落库这一份**上（`base` 里刻意没有它，见上面那段注释）——
+          //    卡片要的是 `inputSummary` 摘要，而"模型到底传了什么"只有完整入参能回答。
+          toolRecords.push({ ...finished, arguments: call.arguments })
+          outcomes.push({ callId: call.id, text: output, isError })
+        }
+
+        messages.push(...buildToolResultMessages(outcomes))
+        // 工具段结束：`/active` 的 `currentTool` 要清掉（否则重连的人会以为还在跑那个工具）
+        await input.updateSnapshot({ currentTool: null })
+        toolRounds += 1
+      }
     } catch (error) {
       // 中断与故障在这里**都**只是"记下来"，统一的收尾在下面（见文件头 ①）：
       // 两条路都要落库（锁丢那一路除外），只是最终发出去的帧不同
@@ -296,7 +555,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
       assistantText,
       thinkingText,
       citations,
-      usage,
+      toolRecords,
+      usage: totalUsage,
       logger,
     })
 
@@ -309,7 +569,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
       // （SSE 契约只有 COMPLETE|STOPPED|ERROR）⇒ 如实按 COMPLETE 收尾，但**必须留痕**，
       // 否则"回答被腰斩"在服务端没有任何线索（`02` §6.1：归一化会丢掉这个决策信息）
       logger.warn(
-        { conversationId, rawFinishReason: summary.rawFinishReason, deltaCount: summary.deltaCount },
+        { conversationId, rawFinishReason: summary.rawFinishReason, deltaCount: totalDeltas },
         '上游的结束原因不是 stop（回答可能被截断），契约里按 COMPLETE 收尾',
       )
     }
@@ -328,10 +588,15 @@ export const chatBotProducer: ChatProducer = async (input) => {
         finishReason,
         messageId,
         citations: citations.length,
-        deltaCount: summary?.deltaCount ?? 0,
+        // 工具循环的三条实况：调过几次工具 / 下发了几个工具 / 上游共流了几轮
+        toolCalls: toolRecords.length,
+        tools: catalog.tools.length,
+        upstreamRounds,
+        deltaCount: totalDeltas,
         durationMs: Date.now() - requestedAtMs,
-        tokensIn: usage?.tokensIn ?? null,
-        tokensOut: usage?.tokensOut ?? null,
+        // ⚠️ 多轮的**总**用量（`sumUsages`）；某次上游没给 usage ⇒ 该字段为 `null`（不知道就不编）
+        tokensIn: totalUsage?.tokensIn ?? null,
+        tokensOut: totalUsage?.tokensOut ?? null,
       },
       'ChatBot 本轮结束',
     )
@@ -339,7 +604,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
     return {
       messageId,
       finishReason,
-      usage: usage === null ? null : { tokensIn: usage.tokensIn, tokensOut: usage.tokensOut },
+      usage: totalUsage === null ? null : { tokensIn: totalUsage.tokensIn, tokensOut: totalUsage.tokensOut },
     }
   } finally {
     release()
@@ -353,6 +618,8 @@ interface PersistRoundInput {
   assistantText: string
   thinkingText: string
   citations: CitationItem[]
+  /** 本轮的工具调用记录（P0-2-8）—— 落进助手消息的 `content.tool_calls` */
+  toolRecords: readonly ToolCallRecord[]
   usage: ChatUsage | null
   logger: ReturnType<typeof getLogger>
 }
@@ -365,10 +632,12 @@ interface PersistRoundInput {
  * 它自己不开事务，否则"消息落库"与"活跃时间"会变成两次写入（中间失败就出现
  * "会话里有消息、侧栏却不动"）。
  *
- * 助手消息**只在真的有内容时才写**：`text` / `thinking` / `citations` 三者全空时
+ * 助手消息**只在真的有内容时才写**：`text` / `thinking` / `citations` / `tool_calls` 四者全空时
  * （用户刚发出去就点了停止）不写助手行 —— 留一条空消息会在界面上画出一个空气泡。
  * 此时 `done.messageId` 为 `null`，它的语义正是"**这一轮没有产生可持久化的消息**"
  * （`shared/src/sse.ts` 文件头 ④）。
+ * ⚠️ **工具记录也算内容**（P0-2-8）：一轮"只调了工具、还没等到最终回答就被停止"的生成
+ * 在界面上是有东西的（工具卡），把它当成"空"会让那一轮的卡片在刷新后消失。
  *
  * **落库失败不外抛**：回答已经完整地流给用户看了，此时再用 `error` 帧覆盖掉
  * "回答成功"这件事，是拿一条基础设施故障去否定一个已经发生的事实。
@@ -376,8 +645,9 @@ interface PersistRoundInput {
  * 前端据此可以说"本条未写入历史"。⚠️ 代价写在这里：这一轮在历史里查不到（刷新后会消失）。
  */
 async function persistRoundQuietly(input: PersistRoundInput): Promise<string | null> {
-  const { conversationId, content, assistantText, thinkingText, citations, usage, logger } = input
-  const hasAssistantContent = assistantText !== '' || thinkingText !== '' || citations.length > 0
+  const { conversationId, content, assistantText, thinkingText, citations, toolRecords, usage, logger } = input
+  const hasAssistantContent =
+    assistantText !== '' || thinkingText !== '' || citations.length > 0 || toolRecords.length > 0
   try {
     const db = getPrisma()
     return await db.$transaction(async (tx) => {
@@ -390,7 +660,12 @@ async function persistRoundQuietly(input: PersistRoundInput): Promise<string | n
           data: {
             conversationId,
             role: 'ASSISTANT',
-            content: buildAssistantContent({ text: assistantText, thinking: thinkingText, citations }),
+            content: buildAssistantContent({
+              text: assistantText,
+              thinking: thinkingText,
+              citations,
+              toolCalls: toolRecords,
+            }),
             // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）
             tokensIn: usage?.tokensIn ?? null,
             tokensOut: usage?.tokensOut ?? null,
