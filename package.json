@@ -46,6 +46,7 @@
     "verify:chatbot": "pnpm --filter @doubulea/backend verify:chatbot",
     "verify:chat-package": "pnpm --filter @doubulea/backend verify:chat-package",
     "verify:e2e": "pnpm --filter @doubulea/backend verify:e2e",
+    "verify:mcp-client": "pnpm --filter @doubulea/backend verify:mcp-client",
     "verify:chat-sse": "pnpm --filter @doubulea/frontend verify:chat-sse",
     "verify:knowledge-ui": "pnpm --filter @doubulea/frontend verify:knowledge-ui",
     "verify:admin-ui": "pnpm --filter @doubulea/frontend verify:admin-ui",

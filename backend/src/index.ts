@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-1-38 P0-1 收尾（阶段一出口验收清单 + TTFT 统计口径；⚠️ 本批纯文档，后端代码未改动，仅本标识随批次前进）',
+    step: 'P0-2-1 MCP client 底座（官方 TS SDK 1.30.1 / Streamable HTTP / 握手留痕 + tools/list + tools/call + 优雅关闭）',
     address,
   })
   logger.info(

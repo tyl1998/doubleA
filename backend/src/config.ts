@@ -432,6 +432,31 @@ const envSchema = z
      */
     LLM_STREAM_IDLE_TIMEOUT_MS: intVar('LLM_STREAM_IDLE_TIMEOUT_MS', 120_000, { min: 1_000, max: 3_600_000 }),
 
+    // ── MCP（P0-2-1 起；`02` §4.7 / `06` §四 4.3）──
+    /**
+     * MCP 单次请求的上限（毫秒）：「到响应头」与 `tools/call` 的等待共用它。
+     *
+     * 为什么比 `LLM_REQUEST_TIMEOUT_MS`(30s) 小：MCP 工具调用是**一问一答**的短事务
+     * （拉列表、调工具），而对话是一整段流式生成。给 20s 是"够慢的服务端也别把界面吊住"。
+     * ⚠️ 交付验收要靠**注入小值**来验超时分支（`06` P0-2-1 验收门槛 3），所以它必须是配置项。
+     */
+    MCP_REQUEST_TIMEOUT_MS: intVar('MCP_REQUEST_TIMEOUT_MS', 20_000, { min: 200, max: 600_000 }),
+    /**
+     * 危险工具调用等用户确认的上限（秒），超时按**取消**处理（P0-2-10 消费）。
+     *
+     * ⚠️ 现在是**登记但不消费**（P0-2-1 只做客户端底座）；写在这里是为了把三个 MCP 配置一次落位，
+     * 免得 P0-2-10 再回来改 schema（`SANDBOX_IMAGE` / `TOOL_LOOP_LIMIT` 都是同一手法）。
+     * `01` §3.6 的验收要点「取消后流程可继续」必须能注入一个小值才验得了。
+     */
+    MCP_CONFIRM_TIMEOUT_SEC: intVar('MCP_CONFIRM_TIMEOUT_SEC', 120, { min: 1, max: 3600 }),
+    /**
+     * 单个 MCP server 进 function 列表的工具数上限（P0-2-6 消费；超限**截断并告警**）。
+     *
+     * 同样"登记但不消费"。定 64 的理由：一个 server 的工具全塞进上下文会挤掉对话本身，
+     * 而模型对几十个工具的挑选准确率也会掉。
+     */
+    MCP_TOOL_LIMIT: intVar('MCP_TOOL_LIMIT', 64, { min: 1, max: 512 }),
+
     // ── 知识库流水线（子方案① §二 参数总表）──
     CHUNK_SIZE_DEFAULT: intVar('CHUNK_SIZE_DEFAULT', 512),
     CHUNK_OVERLAP_DEFAULT: intVar('CHUNK_OVERLAP_DEFAULT', 64, { min: 0 }),
@@ -520,6 +545,18 @@ export interface AppConfig {
     requestTimeoutMs: number
     /** 流式响应体「两次数据之间的间隔」上限（毫秒） */
     streamIdleTimeoutMs: number
+  }
+  /**
+   * MCP 客户端（P0-2-1）。三个值都来自环境变量，见 `infra/.env.example` 的 MCP 段。
+   * ⚠️ P0-2-1 只消费 `requestTimeoutMs`；另两个是 P0-2-6 / P0-2-10 的（已落位，未接线）。
+   */
+  mcp: {
+    /** 单次请求上限（毫秒）：到响应头 / `tools/call` 的等待 */
+    requestTimeoutMs: number
+    /** 危险调用的确认等待上限（秒）；超时按取消（P0-2-10） */
+    confirmTimeoutSec: number
+    /** 单个 server 进 function 列表的工具数上限；超限截断并告警（P0-2-6） */
+    toolLimit: number
   }
   limits: {
     uploadBodyLimitRaw: string
@@ -733,6 +770,11 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       requestTimeoutMs: vars.LLM_REQUEST_TIMEOUT_MS,
       streamIdleTimeoutMs: vars.LLM_STREAM_IDLE_TIMEOUT_MS,
     },
+    mcp: {
+      requestTimeoutMs: vars.MCP_REQUEST_TIMEOUT_MS,
+      confirmTimeoutSec: vars.MCP_CONFIRM_TIMEOUT_SEC,
+      toolLimit: vars.MCP_TOOL_LIMIT,
+    },
     limits: {
       uploadBodyLimitRaw: vars.UPLOAD_BODY_LIMIT.raw,
       uploadBodyLimitBytes: vars.UPLOAD_BODY_LIMIT.bytes,
@@ -796,6 +838,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     concurrency: value.concurrency,
     sandbox: { idleTtlMin: value.sandbox.idleTtlMin, image: value.sandbox.image ?? null },
     llm: value.llm,
+    mcp: value.mcp,
     limits: {
       uploadBodyLimit: `${value.limits.uploadBodyLimitRaw}（${value.limits.uploadBodyLimitBytes} 字节）`,
       ssePingIntervalSec: value.limits.ssePingIntervalSec,

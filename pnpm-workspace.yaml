@@ -46,3 +46,5 @@ allowBuilds:
   prisma: true
   '@prisma/engines': true
   bcrypt: true
+minimumReleaseAgeExclude:
+  - '@modelcontextprotocol/sdk@1.30.1'

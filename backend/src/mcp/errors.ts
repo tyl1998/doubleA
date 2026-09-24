@@ -1,0 +1,416 @@
+/**
+ * MCP 传输层的错误翻译（P0-2-1）
+ *
+ * 依据：`docs/06-实施计划.md` §四 P0-2-1（验收门槛 3 / 4）+ §4.0 全局口径 1
+ *      + `docs/02-后端设计.md` §4.7（MCP 接入）/ §四（统一错误码）
+ *
+ * 职责与 `llm/upstream.ts` **同一层**：把 SDK 抛出来的各种东西翻译成
+ * **本仓的错误码 + 可读中文 + 脱敏后的响应片段**。不认识数据库、不认识用户。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么不全盘复用 `llm/upstream.ts#toUpstreamFailure`
+ * ─────────────────────────────────────────────────────────────────────
+ * 那个函数的消息主语是「Provider / 模型」，阶段名也是 LLM 专属的；而 MCP 这一侧：
+ *   · 主语是「MCP server 名 / endpoint」；
+ *   · **多两类故障**：协议版本不被支持、**非 MCP 端点（回 HTML）**；
+ *   · JSON-RPC 层错误码（-32601 等）也带自己的修复提示。
+ * 硬改名复用会把两边的文案搅在一起，而**文案正是排查时唯一看得见的东西**。
+ * ⇒ 只复用真正与协议无关的文本工具（`redactSecret` / `UPSTREAM_BODY_SNIPPET`）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 三条**实测**得来的判据（SDK 1.30.1；详见 `issue_fix/问题记录-P0-2-1-*.md`）
+ * ─────────────────────────────────────────────────────────────────────
+ * 1. ⚠️ **`AbortSignal` 中断会被 SDK 包成 `McpError(RequestTimeout)`**。
+ *    `shared/protocol.js#cancel()` 的原文是
+ *    `reason instanceof McpError ? reason : new McpError(ErrorCode.RequestTimeout, String(reason))`
+ *    ⇒ **不能靠错误码区分「用户停止」与「真超时」**。调用点必须把 `signal.aborted`
+ *    显式传进来（{@link McpFailureContext.aborted}），这也是本函数**先看 aborted、
+ *    再看错误码**的原因 —— 顺序即正确性。
+ * 2. `StreamableHTTPError` **不设 `name`**（实例的 `name === 'Error'`），只有一个
+ *    `code: number`；且它**不是** `McpError` 的子类 ⇒ 只能按形状认
+ *    （`code` 是数字且 `name === 'McpError'` 不成立）。
+ * 3. `fetch` 连不通时抛的是 `TypeError: fetch failed`，**真正的原因在 `.cause` 链上**
+ *    （`ENOTFOUND` / `ECONNREFUSED` …）⇒ 不走 {@link describeCauseChain} 就只有一个
+ *    毫无信息量的 "fetch failed"。验收门槛 4（三种连不通都要给出可读原因）靠它。
+ */
+
+import { AppError, isAppError } from '@doubulea/shared'
+
+import { getLogger } from '../infra/logger.js'
+import { UPSTREAM_BODY_SNIPPET, redactSecret } from '../llm/upstream.js'
+
+/**
+ * 一个 MCP 上游端点。
+ *
+ * ⚠️ `secrets` 是**明文**（P0-2-7 解密后的用户凭据值），只允许在进程内存里存在：
+ *   · 不要把它塞进任何响应体 / 日志 / 错误消息；
+ *   · 要记日志时用 {@link describeMcpEndpoint}（只打「有没有」）。
+ * 它出现的**唯一正当理由**是把上游回显里的凭据抹掉（{@link mcpSnippet}）——
+ * 上游 401 的响应体经常把收到的 `Authorization` 原样回显，不抹就等于借错误消息泄密。
+ */
+export interface McpEndpoint {
+  /** 展示名（`mcp_servers.name`），进日志与错误消息 */
+  serverName: string
+  /** 展示用端点（`mcp_servers.endpoint_url`） */
+  endpointUrl: string
+  /** 该次调用注入的凭据明文；无凭据时省略或空数组 */
+  secrets?: readonly string[]
+  /** 额外的日志字段（如 serverId）；**不参与**消息文案 */
+  logFields?: Record<string, unknown>
+}
+
+/** 只打「有没有凭据」的日志形态 —— **唯一**允许用来记录 {@link McpEndpoint} 的方式 */
+export function describeMcpEndpoint(endpoint: McpEndpoint): Record<string, unknown> {
+  return {
+    serverName: endpoint.serverName,
+    endpointUrl: endpoint.endpointUrl,
+    hasCredential: (endpoint.secrets?.length ?? 0) > 0,
+    ...(endpoint.logFields ?? {}),
+  }
+}
+
+/** 把多条凭据从文本里抹掉（顺序遍历；`redactSecret` 自己会跳过过短的串） */
+export function redactAll(text: string, secrets: readonly string[] | undefined): string {
+  if (secrets === undefined || secrets.length === 0) return text
+  return secrets.reduce((accumulated, secret) => redactSecret(accumulated, secret), text)
+}
+
+/**
+ * 上游响应片段：**先脱敏、再截断**（进日志 / 进错误消息的片段一律走它）。
+ * 与 `llm/upstream.ts#snippet` 同口径，只是支持多条凭据。
+ */
+export function mcpSnippet(text: string, secrets?: readonly string[]): string {
+  const redacted = redactAll(text, secrets)
+  return redacted.length > UPSTREAM_BODY_SNIPPET
+    ? `${redacted.slice(0, UPSTREAM_BODY_SNIPPET)}…（已截断）`
+    : redacted
+}
+
+/**
+ * 调用方主动中断（用户的「停止」）。
+ *
+ * 独立一个类而不是复用 `LlmAbortError`：语义同样是「**不是故障**」，但消费方不同
+ * （P0-2-8 的编排循环要靠它把 `tool_call` 收成 `CANCELLED` 而不是 `ERROR`），
+ * 且跨包名读起来不该带 LLM 的帽子。
+ */
+export class McpAbortError extends Error {
+  constructor(message = 'MCP 调用已被中断') {
+    super(message)
+    this.name = 'McpAbortError'
+  }
+}
+
+/** 判定 SDK 的 JSON-RPC 层错误（`McpError` 显式设了 `name`，可靠） */
+function isMcpError(error: unknown): error is { name: string; code: number; message: string; data?: unknown } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'McpError' &&
+    typeof (error as { code?: unknown }).code === 'number'
+  )
+}
+
+/**
+ * 判定 SDK 的 HTTP 传输层错误（`StreamableHTTPError`）。
+ *
+ * ⚠️ 该类的实现**没有** `this.name = 'StreamableHTTPError'`（所以 `name` 是 `'Error'`），
+ * 只有 `code: number` 与 `'Streamable HTTP error: '` 的消息前缀。判据写在这里一处，
+ * 别在别处再猜一次。
+ */
+function isStreamableHttpError(error: unknown): error is { code: number; message: string } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name !== 'McpError' &&
+    typeof (error as { code?: unknown }).code === 'number' &&
+    typeof (error as { message?: unknown }).message === 'string' &&
+    (error as { message: string }).message.startsWith('Streamable HTTP error:')
+  )
+}
+
+/**
+ * `ErrorCode.RequestTimeout` 的字面量。
+ * ⚠️ 刻意写死而不是 `import { ErrorCode }`：本模块的定位是"把 SDK 的东西翻译成人话"，
+ * 让它反过来依赖 SDK 的运行时枚举就等于把两边的生命周期绑在一起（理由同下方版本集注释）。
+ */
+const MCP_ERROR_CODE_REQUEST_TIMEOUT = -32001
+
+/** JSON-RPC 错误码 → 中文修复提示（缺省时不加提示，只报原码与原消息） */
+const MCP_ERROR_HINTS: Readonly<Record<string, string>> = {
+  '-32700': '请求体不是合法 JSON（本仓发出的报文坏了，属平台侧问题；请上报）',
+  '-32600': 'MCP 服务端认为请求非法',
+  '-32601': 'MCP 服务端不认识这个方法（大概率不是 MCP 端点，或协议版本差得太远）',
+  '-32602': 'MCP 服务端认为参数非法（工具名或参数不符合它声明的 inputSchema）',
+  '-32603': 'MCP 服务端内部错误',
+  '-32000': '连接已关闭（服务端主动断开，或会话已失效）',
+  '-32001': '请求超时',
+}
+
+/**
+ * 判定 SDK 的 zod 校验失败（`client/index.js` 里 `safeParse` 失败会把 `ZodError` 直接 reject）。
+ * 按形状认（`issues` 是数组且元素带 `path`/`message`），不 import zod 的类型。
+ */
+function isSchemaError(error: unknown): error is { issues: unknown[] } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    Array.isArray((error as { issues?: unknown }).issues) &&
+    (error as { issues: unknown[] }).issues.length > 0
+  )
+}
+
+/** 把 zod issues 压成一行可读文本（最多 3 条 —— 再多也没人看，且会把消息撑爆） */
+function summarizeSchemaIssues(error: { issues: unknown[] }): string {
+  const parts: string[] = []
+  for (const issue of error.issues.slice(0, 3)) {
+    if (typeof issue !== 'object' || issue === null) continue
+    const path = (issue as { path?: unknown }).path
+    const message = (issue as { message?: unknown }).message
+    const where = Array.isArray(path) && path.length > 0 ? path.join('.') : '(根)'
+    parts.push(`${where}：${typeof message === 'string' ? message : '校验失败'}`)
+  }
+  const more = error.issues.length > 3 ? `（另有 ${error.issues.length - 3} 条）` : ''
+  return `${parts.join('；')}${more}`
+}
+
+/** 网络层错误码 → 中文原因（Node/undici 的 `code`；键名取自实测） */
+const NETWORK_CODES: Readonly<Record<string, string>> = {
+  ENOTFOUND: 'DNS 解析失败（域名不存在，或本机 DNS 不可用）',
+  EAI_AGAIN: 'DNS 临时失败（解析超时）',
+  ECONNREFUSED: '连接被拒绝（目标端口没有服务在监听）',
+  ECONNRESET: '连接被对端重置',
+  EPIPE: '连接中断（对端提前关闭）',
+  ETIMEDOUT: '连接超时',
+  EHOSTUNREACH: '主机不可达',
+  ENETUNREACH: '网络不可达',
+  UND_ERR_CONNECT_TIMEOUT: '连接超时（undici）',
+  UND_ERR_HEADERS_TIMEOUT: '等待响应头超时（undici）',
+  UND_ERR_BODY_TIMEOUT: '读取响应体超时（undici）',
+  UND_ERR_SOCKET: '套接字错误（对端关闭或网络中断）',
+  CERT_HAS_EXPIRED: 'TLS 证书已过期',
+  DEPTH_ZERO_SELF_SIGNED_CERT: '自签 TLS 证书不被信任',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'TLS 证书链校验失败',
+}
+
+/** `.cause` 链的最大回溯层数（undici 一般 1~2 层，留余量即可，防异常对象成环） */
+const MAX_CAUSE_DEPTH = 5
+
+export interface CauseChain {
+  /** 链上第一个**认识**的错误码（进 `NETWORK_CODES` 的那种），没有则 null */
+  code: string | null
+  /** 该码对应的中文原因；不认识则为 null */
+  reason: string | null
+  /** 链上各层的 `CODE: message`（从外到内），进日志用 */
+  chain: string[]
+}
+
+/**
+ * 沿着 `.cause` 链把真正的失败原因挖出来。
+ *
+ * ⚠️ 不做这件事的后果在验收门槛 4 里写着：DNS 失败 / 连接被拒 / 非 MCP 端点三种
+ * 都要给出**可读原因**，而 `fetch` 在这三种情况下抛的都是同一句 `fetch failed`。
+ */
+export function describeCauseChain(error: unknown): CauseChain {
+  const chain: string[] = []
+  let cursor: unknown = error
+  let code: string | null = null
+  let reason: string | null = null
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && cursor !== null && cursor !== undefined; depth += 1) {
+    if (typeof cursor !== 'object') {
+      chain.push(String(cursor))
+      break
+    }
+    const node = cursor as { code?: unknown; message?: unknown; cause?: unknown }
+    const nodeCode = typeof node.code === 'string' ? node.code : null
+    const nodeMessage = typeof node.message === 'string' ? node.message : String(cursor)
+    chain.push(nodeCode === null ? nodeMessage : `${nodeCode}: ${nodeMessage}`)
+    if (code === null && nodeCode !== null && NETWORK_CODES[nodeCode] !== undefined) {
+      code = nodeCode
+      reason = NETWORK_CODES[nodeCode]
+    }
+    cursor = node.cause
+  }
+
+  return { code, reason, chain }
+}
+
+export interface McpFailureContext {
+  endpoint: McpEndpoint
+  /** 出错阶段（`initialize（握手）` / `tools/list（拉工具列表）` / `tools/call（调用工具）`） */
+  stage: string
+  /**
+   * 调用方的 `AbortSignal` 是否已 abort。
+   * ⚠️ **必须先判它**，否则「用户点了停止」会被 SDK 的包装骗成「超时」（见文件头判据 1）。
+   */
+  aborted: boolean
+}
+
+/**
+ * 统一的 MCP 失败出口。
+ *
+ * @throws {AppError} `UPSTREAM_TIMEOUT`(504) 超时；`UPSTREAM_ERROR`(502) 其余全部
+ * @throws {McpAbortError} 调用方中断（**不是**故障，由上层区分）
+ */
+export function toMcpFailure(error: unknown, context: McpFailureContext): never {
+  const { endpoint, stage } = context
+  const secrets = endpoint.secrets
+
+  // ① 已经是我们自己的领域错误：原样放行（那些消息是精心写的，再包一层只会丢信息）
+  if (isAppError(error)) throw error
+
+  // ② 调用方中断 —— 必须排在错误码判定**之前**
+  if (context.aborted) {
+    throw new McpAbortError(`MCP 调用已被调用方中断（${stage}）：${endpoint.serverName}`)
+  }
+
+  const rawMessage = error instanceof Error ? error.message : String(error)
+  const detail = mcpSnippet(rawMessage, secrets)
+
+  // ③ SDK 的 JSON-RPC 层错误（服务端**答了**，但答的是错误帧）
+  if (isMcpError(error)) {
+    const hint = MCP_ERROR_HINTS[String(error.code)] ?? ''
+    getLogger().warn(
+      { ...describeMcpEndpoint(endpoint), stage, rpcCode: error.code },
+      'MCP 服务端返回 JSON-RPC 错误',
+    )
+    if (error.code === MCP_ERROR_CODE_REQUEST_TIMEOUT) {
+      throw AppError.upstreamTimeout(
+        `调用 MCP server 超时（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
+          `原始消息：${detail}`,
+      )
+    }
+    throw AppError.upstreamError(
+      `MCP 服务端返回错误 ${error.code}（${stage}）：${endpoint.serverName}` +
+        `${hint === '' ? '' : `。${hint}`}。原始消息：${detail}`,
+      { mcpRpcCode: error.code },
+    )
+  }
+
+  // ④ SDK 的 HTTP 传输层错误（没答 JSON-RPC，答的是 HTTP 状态 / 不认识的 content-type）
+  if (isStreamableHttpError(error)) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage, upstreamStatus: error.code }, 'MCP 上游返回非 2xx')
+    throw AppError.upstreamError(`${describeHttpFailure(error.code, error.message, endpoint, stage)}`, {
+      upstreamStatus: error.code,
+    })
+  }
+
+  // ⑤ 协议版本不被支持（SDK 抛的是**裸 Error**，只能按消息认）
+  if (rawMessage.includes('protocol version is not supported')) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 服务端协议版本不在 SDK 支持集内')
+    throw AppError.upstreamError(
+      `MCP 服务端回了本 SDK 不支持的协议版本（${stage}）：${endpoint.serverName}。` +
+        `SDK 支持集：${SUPPORTED_PROTOCOL_VERSIONS.join(' / ')}。原始消息：${detail}`,
+    )
+  }
+
+  // ⑤' 帧不是合法 JSON：`200 + 空体`（网关吞了 body）或"头写 application/json、内容其实是 HTML"
+  if (error instanceof SyntaxError) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 端点返回的帧不是合法 JSON')
+    throw AppError.upstreamError(
+      `MCP 端点返回的内容不是合法 JSON（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
+        '常见原因：端点其实不是 MCP（回了 HTML），或中间有网关把响应体吞掉了。' +
+        `原始消息：${detail}`,
+    )
+  }
+
+  // ⑤'' 帧是 JSON，但不符合 MCP 的 schema（SDK 用 zod 校验后直接 reject）
+  if (isSchemaError(error)) {
+    getLogger().warn(
+      { ...describeMcpEndpoint(endpoint), stage, issues: summarizeSchemaIssues(error) },
+      'MCP 端点返回的帧不符合协议 schema',
+    )
+    throw AppError.upstreamError(
+      `MCP 端点返回的帧不符合 MCP 协议（${stage}）：${endpoint.serverName}。` +
+        `字段问题：${summarizeSchemaIssues(error)}`,
+    )
+  }
+
+  // ⑥ 网络层：走 `.cause` 链才有可读原因
+  const cause = describeCauseChain(error)
+  getLogger().warn(
+    { ...describeMcpEndpoint(endpoint), stage, causeCode: cause.code, causeChain: cause.chain },
+    '连接 MCP server 失败',
+  )
+  if (cause.reason !== null) {
+    throw AppError.upstreamError(
+      `无法连接 MCP server（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
+        `${cause.reason}（${cause.code}）`,
+    )
+  }
+
+  // ⑦ 兜底：把 `.cause` 链摊开，至少让下一次排查有东西可看
+  const chainText = cause.chain.length > 1 ? `；原因链：${cause.chain.join(' ← ')}` : ''
+  throw AppError.upstreamError(
+    `调用 MCP server 失败（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
+      `原始错误：${detail}${chainText}`,
+  )
+}
+
+/**
+ * HTTP 层失败的文案。
+ *
+ * 四个分支各自对应一种**真实会碰到**的部署错，写清「去哪儿看一眼」：
+ * 401/403 = 凭据没带对（但注意 P0 的 `tools/list` 刻意不带用户凭据，见 `06` P0-2-5 坑 1）；
+ * 404 = `endpoint_url` 少了路径段；405 = 端点不接受我们用的方法；
+ * -1 = SDK 明说的「不认识的 content-type」⇒ **多半根本不是 MCP 端点**（最典型是回了一个 HTML 页面）。
+ */
+function describeHttpFailure(code: number, message: string, endpoint: McpEndpoint, stage: string): string {
+  const who = `${endpoint.serverName}（${endpoint.endpointUrl}）`
+  const body = mcpSnippet(message, endpoint.secrets)
+  if (code === -1) {
+    return (
+      `MCP 端点返回了本 SDK 不认识的内容类型（${stage}）：${who}。` +
+      '大概率这个地址**不是** MCP 端点（常见：网关回了一个 HTML 页面或登录页）。' +
+      `原始消息：${body}`
+    )
+  }
+  if (code === 401 || code === 403) {
+    return (
+      `MCP 端点拒绝了这个请求（${stage}，HTTP ${code}）：${who}。` +
+      '请检查该 server 的凭据是否已配置且有效。' +
+      `原始消息：${body}`
+    )
+  }
+  if (code === 404) {
+    // ⚠️ 这条分支是**实测**补的（`06` P0-2-1 坑预判 2）：会话 id 丢失/过期时，
+    // Streamable HTTP 规范要求服务端回 **404** —— 与"路径写错了"是同一个状态码，
+    // 而 404 的默认提示会把人引向 endpoint_url。靠服务端响应体里有没有 "session" 分开。
+    const sessionHint = /session/i.test(message)
+      ? ' ⚠️ 服务端的响应里提到了 session —— 多半是 mcp-session-id 丢了或已过期：' +
+        'Streamable HTTP 用 404 表示"这个会话不存在"（与"路径不存在"同码，容易看错）。'
+      : ''
+    return (
+      `MCP 端点不存在（${stage}，HTTP 404）：${who}。` +
+      '请检查 endpoint_url 是否包含了正确的路径段（例如 /mcp）。' +
+      `${sessionHint}原始消息：${body}`
+    )
+  }
+  if (code === 405) {
+    return (
+      `MCP 端点不接受该 HTTP 方法（${stage}，HTTP 405）：${who}。` +
+      'Streamable HTTP 要求端点同时接受 POST 与 DELETE（后者用于优雅关闭会话）。' +
+      `原始消息：${body}`
+    )
+  }
+  return `MCP 端点返回 HTTP ${code}（${stage}）：${who}。原始消息：${body}`
+}
+
+/**
+ * SDK 支持的协议版本集。
+ *
+ * ⚠️ 这里**刻意写死**而不是 `import { SUPPORTED_PROTOCOL_VERSIONS }`：
+ * 本模块是"把 SDK 的错误翻译成人话"的那一层，若它反过来依赖 SDK 的运行时导出，
+ * 就变成"SDK 升了个级、错误文案跟着变"——文案属于我们，版本集才是 SDK 的。
+ * 版本集与 SDK 的对齐由 `client.ts` 的握手留痕（`negotiatedProtocolVersion`）负责：
+ * 真不一致时在**那一条日志**上看得见，不必靠文案。
+ *
+ * 实测（SDK 1.30.1）：`['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07']`
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
+  '2025-11-25',
+  '2025-06-18',
+  '2025-03-26',
+  '2024-11-05',
+  '2024-10-07',
+]
