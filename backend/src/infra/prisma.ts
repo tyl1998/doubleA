@@ -101,3 +101,9 @@ export async function closePrisma(): Promise<void> {
 // 不必到处写 `../../generated/prisma/...` 这种深路径（生成物位置将来若变，只改这一处）。
 export { PrismaClient } from '../../generated/prisma/client.js'
 export * from '../../generated/prisma/enums.js'
+// ⚠️ `Prisma` 命名空间也一并转发（P0-2-2 起）：业务代码需要 `Prisma.InputJsonValue` 才能
+//    给 jsonb 列赋值（`tool_cache` 里的 `inputSchema` 是 `unknown`），也需要 `Prisma.DbNull`
+//    才能把可空 jsonb 列**写回 SQL NULL**（Prisma 不接字面量 `null` —— 那会被判成
+//    "写一个 jsonb 里的 null"，与"这个列没有值"是两件事，见 `mcpServer.service.ts`）。
+//    "业务代码只 import 本模块"这条约定不变。
+export { Prisma } from '../../generated/prisma/client.js'

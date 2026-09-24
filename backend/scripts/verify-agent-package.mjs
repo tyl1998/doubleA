@@ -6,10 +6,10 @@
  * "两种类型 Agent 可 CRUD，可绑知识库，权限校验生效"），每行一个组：
  *   R1 门槛① 两种类型 CRUD     CHATBOT + TASK_AGENT 各一条：建 → 列表可见 → 详情 → 改 → 列表消失、详情 404
  *   R2 门槛② 绑 2 库 → 解绑 1  绑 2 个知识库 → 详情完整回显 → 解绑 1 个 → 详情立即反映
- *                              + **MCP 对偶**：明确拒绝且文案指向 P0-2（`docs/06` 的口径变更）
+ *                              + **MCP**：绑定/解绑一个真实 server（P0-2-2 落地）；引用不存在的 server 被拒
  *   R3 门槛③ 权限             他人（MEMBER）改被拒 403；本人改成功；ADMIN 改同一个也成功
  *   R4 门槛④ 删除的连带      删 Agent 后**会话仍在且转只读**、组件绑定已解、**被绑的库此刻删得掉**
- *   R5 清场                   自清理 + 残留复核（8 张表 + 会话键）
+ *   R5 清场                   自清理 + 残留复核（9 张表 + 会话键）
  *
  * ─────────────────────────────────────────────────────────────────────
  * 为什么还要一个"包级"脚本（前面两批各有自己的验收）
@@ -27,11 +27,14 @@
  * 所以本脚本**不重复** `verify-agents` 的细粒度断言，只跑这四行要的**端到端**证据。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ⚠️ 两处"部分完成"（结论表里单列，别混进 ✅）
+ * ⚠️ 一处"部分完成"的历史（结论表里单列，别混进 ✅）
  * ─────────────────────────────────────────────────────────────────────
- * ① **门槛② 的 MCP 那一半**：`docs/06` 原文写的是"绑 2 个知识库 + **1 个 MCP server**"，
- *    但 `mcp_servers` 表要到 **P0-2** 才建（P0-1-23 已定案并回写三处文档）。本包验的是
- *    **对偶形态**："含 MCP 的提交被明确拒绝，且文案指向 P0-2" —— 这才是现在能成立的事实。
+ * ① **门槛② 的 MCP 那一半 —— 已在 P0-2-2 补齐。** 本包收口（P0-1-24）时 `mcp_servers` 表
+ *    还不存在，验的是**对偶形态**（"含 MCP 的提交被明确拒绝，且文案指向 P0-2"）。
+ *    P0-2-2 建表并把 `assertComponentRefsBindable` 的 MCP 分支从"一律 400"换成**存在性校验**
+ *    ⇒ 本包那条对偶断言**同批翻转**成"引用不存在的 server ⇒ 404"，并**补上正面用例**
+ *    （绑/解绑一个真实 server）。这正是 `06` §七"刻意未注册型断言的保质期"的又一次发作 ——
+ *    **只有全量回归能抓到它**（`verify-agents` 里那条同款断言也是同批翻的）。
  * ② **门槛④ 的"只读"**：P0-1-24 收口时**没有**任何 HTTP 出口能观察"这个会话读得到"，
  *    故当时只在 **DB 层**取证（`conversations` 行还在、`status=FINISHED`、消息还在、
  *    `finishedConversations` 数得对）并标了 ⚠️。
@@ -181,6 +184,8 @@ const createdModelIds = []
 const createdAgentIds = []
 const createdKbIds = []
 const createdConversationIds = []
+/** P0-2-2 起 MCP 引用走**存在性校验** ⇒ 正面用例要有一个真 server（`created_by` 是 RESTRICT 外键） */
+const createdMcpIds = []
 /** 被软删的那些（软删是**保留行**的，故与 `createdAgentIds` 分开记，清理时要一起删） */
 const softDeletedAgentIds = []
 
@@ -396,7 +401,7 @@ try {
   groupStart(
     'R2',
     '门槛② 绑定 2 个知识库 → 详情完整回显 → 解绑 1 个 → 详情立即反映',
-    'MCP 那一半按 docs/06 的口径变更为对偶形态（明确拒绝 + 文案指向 P0-2），见文件头 ⚠️①',
+    'MCP：P0-2-2 起走存在性校验 ⇒ 真 server 可绑可解、不存在的被拒（见文件头 ⚠️①）',
   )
   // ═══════════════════════════════════════════════════════════════════
 
@@ -450,15 +455,20 @@ try {
     )
   })
 
-  await it('MCP 对偶：含 MCP 的提交被**明确拒绝**，且文案指向 P0-2（口径变更的守门断言）', async () => {
+  await it('MCP 接回（P0-2-2 翻转）：引用不存在的 server ⇒ 404；引用真实 server ⇒ 绑得上、解得掉', async () => {
+    // ① 语法合法（uuid）但 `mcp_servers` 里没有这个 id ⇒ 404。
+    //    ⚠️ 期望值由 P0-1 的 **400 + 文案指向 P0-2** 翻成 **404 + NOT_FOUND**：
+    //       判据从"这个版本还没有这张表"变成"这个 id 查不到"（`06` P0-2-2 坑预判 4）。
+    //       只保留"仍要给出可读原因"这一半 —— 它才是这条断言跨版本不变的内核。
     const response = await putComponents(ownerCookie, created.chatbot.id, [
       { componentType: 'KNOWLEDGE', refId: kbB.id },
-      { componentType: 'MCP', refId: other.id }, // 语法合法（uuid），但 mcp_servers 表 P0-2 才建
+      { componentType: 'MCP', refId: other.id }, // 那是**用户 id**，不是 mcp_server
     ])
-    assertEqual(response.statusCode, 400, '含 MCP 应被拒')
+    assertEqual(response.statusCode, 404, '引用不存在的 MCP server 应 404')
     const body = response.json()
-    assertIncludes(body.msg, 'MCP', '顶层 msg 点出是 MCP 的问题')
-    assertIncludes(body.msg, 'P0-2', '⚠️ 文案必须**指向版本号**（否则"拒绝"被改成 500 或文案变模糊都没人发现）')
+    assertEqual(body.code, 'NOT_FOUND', '信封 code')
+    assertIncludes(body.msg, 'MCP', '顶层 msg 必须点出是 MCP 的问题（两个 404 都写"知识库不存在"会把人引偏）')
+    assertIncludes(body.msg, other.id, '文案要带上具体是哪个 id')
 
     // 被拒之后原有的那条绑定必须**原样还在**（校验在写之前 —— P0-1-23 的顺序不变式）
     const rows = await prisma.agentComponent.findMany({
@@ -467,6 +477,46 @@ try {
     })
     assertEqual(rows.length, 1, '被拒的提交不得影响库里已有的绑定')
     assertEqual(rows[0].refId, kbB.id, '剩下的仍应是 B')
+
+    // ② **对偶的另一半**（P0-2-2 新增）：引用一个**真实存在**的 server ⇒ 必须写得进去。
+    //    只验 ① 的话，"服务层把 MCP 一律 404" 也能全绿 —— 而那是另一种坏法。
+    const mcp = await prisma.mcpServer.create({
+      data: {
+        name: mkName('MCP'),
+        slug: `verify-agentpkg-mcp-${suffix}`,
+        endpointUrl: 'http://127.0.0.1:1/mcp',
+        authType: 'NONE',
+        createdBy: owner.id,
+      },
+      select: { id: true },
+    })
+    createdMcpIds.push(mcp.id)
+    const bound = await putComponents(ownerCookie, created.chatbot.id, [
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+      { componentType: 'MCP', refId: mcp.id },
+    ])
+    assertEqual(bound.statusCode, 200, '真实 server 必须绑得上')
+    assertEqual(
+      JSON.stringify(agentItemSchema.parse(bound.json().data).components.map((item) => item.componentType).sort()),
+      JSON.stringify(['KNOWLEDGE', 'MCP']),
+      '写端点响应里两种类型都在',
+    )
+    const withMcp = await getAgent(ownerCookie, created.chatbot.id)
+    assertEqual(withMcp.item.components.length, 2, '详情回显两条（同一套投影）')
+
+    // ③ 解绑 MCP（提交里去掉它）⇒ 详情**立即**只剩知识库那条。
+    //    这条与上面"解绑 1 个知识库"是同一个不变式的两次应用：MCP 那条也得是真删，
+    //    不然绑定集合会越攒越多。
+    const unbound = await putComponents(ownerCookie, created.chatbot.id, [
+      { componentType: 'KNOWLEDGE', refId: kbB.id },
+    ])
+    assertEqual(unbound.statusCode, 200, '解绑 MCP 的状态码')
+    const after = await getAgent(ownerCookie, created.chatbot.id)
+    assertEqual(after.item.components.length, 1, '详情里只剩 1 条')
+    assert(
+      after.item.components.every((component) => component.refId !== mcp.id),
+      '⚠️ 解绑之后详情里不能再出现那个 server',
+    )
   })
 
   // ═══════════════════════════════════════════════════════════════════
@@ -738,6 +788,10 @@ try {
     await prisma.model.deleteMany({ where: { modelName: { contains: suffix } } })
     await prisma.modelProvider.deleteMany({ where: { id: { in: createdProviderIds } } })
     await prisma.modelProvider.deleteMany({ where: { name: { contains: suffix } } })
+    // MCP server 在 users 之**前**删：`created_by` 是 RESTRICT 外键
+    await prisma.mcpServer.deleteMany({
+      where: { OR: [{ id: { in: createdMcpIds } }, { slug: { contains: suffix } }] },
+    })
     for (const userId of createdUserIds) {
       // ⚠️ 快照必须显式删：`requireAuth` 每请求会写 `auth-user:{userId}`（TTL 60s），
       //    不删就要等窗口过去才算干净（`06` P0-1-7 坑 5 的教训）
@@ -769,6 +823,7 @@ try {
     models: await prisma.model.count({ where: { modelName: { contains: suffix } } }).catch(() => -1),
     providers: await prisma.modelProvider.count({ where: { name: { contains: suffix } } }).catch(() => -1),
     users: await prisma.user.count({ where: { username: { contains: suffix } } }).catch(() => -1),
+    mcpServers: await prisma.mcpServer.count({ where: { slug: { contains: suffix } } }).catch(() => -1),
   }
   const dirty = Object.entries(residue).filter(([, count]) => count !== 0)
   const sessionsLeft = []
@@ -778,12 +833,12 @@ try {
 
   // ⚠️ 分组计数**手工补**：这一组的断言写在 `finally` 里（不走 `it()` 的包裹），
   //    而结论表是按组统计的 —— 忘了这一步的话，"清场"那一行会永远显示 "(0 项全通过)"
-  groupStart('R5', '清场：自清理 + 残留复核', '八张表 + 会话键，全部要能复核为 0（不靠"我没报错"）')
+  groupStart('R5', '清场：自清理 + 残留复核', '九张表 + 会话键，全部要能复核为 0（不靠"我没报错"）')
   if (dirty.length === 0 && sessionsLeft.length === 0) {
     const detail = Object.entries(residue)
       .map(([table, count]) => `${table}=${count}`)
       .join(' ')
-    console.log(`  ${c.g}[PASS]${c.x} 残留复核：8 张表全部为 0（${detail}），${sessionIds.length} 个会话键全部清空`)
+    console.log(`  ${c.g}[PASS]${c.x} 残留复核：9 张表全部为 0（${detail}），${sessionIds.length} 个会话键全部清空`)
     passed += 1
     currentGroup.passed += 1
   } else {
@@ -805,8 +860,8 @@ for (const g of groups) {
   console.log(`  ${mark} ${g.id} ${g.title}  ${c.d}(${g.passed} 项${g.failed > 0 ? ` / ${g.failed} 项失败` : '全通过'})${c.x}`)
 }
 console.log(
-  `  ${c.y}⚠️${c.x} 门槛② 的 **MCP** 那一半：P0-1 阶段明确拒绝（400 + 指向 P0-2），` +
-    `由 P0-2 接回 —— 本包验的是**对偶形态**`,
+  `  ${c.g}✅${c.x} 门槛② 的 **MCP** 那一半：**P0-2-2 已补齐** —— 绑定/解绑真实 server 走端点取证，` +
+    `引用不存在的 server ⇒ 404（P0-1 的"400 + 指向 P0-2"同批翻转，见文件头 ⚠️①）`,
 )
 console.log(
   `  ${c.g}✅${c.x} 门槛④ 的"只读"：**读得到**走端点取证（P0-1-25 回补）+ **写不进去**走 chat 闸门 409` +

@@ -57,7 +57,10 @@
  *    三条：
  *      ① `KNOWLEDGE` 逐条查 `knowledge_bases` 存在性（`ref_id` 是多态外键、**没有 FK 兜底**，
  *         引用完整性只能由服务层负责 —— `kb.service.ts` 文件头 ④ 已把"孤儿绑定"定性为难查的坏法）；
- *      ② `MCP` **明确拒绝**（`mcp_servers` 表要到 P0-2 才建，现在无从验证真伪 ⇒ 不写进去）；
+ *      ② `MCP` 逐条查 `mcp_servers` 存在性（**P0-2-2 起**）。⚠️ P0-1-23 时这一条写的是
+ *         "一律拒绝 + 文案指向 P0-2"，因为那时 `mcp_servers` 表还不存在 ⇒ 收到的 MCP 引用
+ *         必然无从验证。当时的约定就是"**等 P0-2 有了表，把这条换成存在性校验、接口形态不变**"
+ *         —— 本批正是那个接回点（见 {@link assertComponentRefsBindable}）；
  *      ③ **集合相同就不写库**（同一份绑定重复提交不产生任何副作用，见 {@link replaceAgentComponents}）。
  *    全程**不动 `agents.updated_at`**（它只是列表排序键，见 ⑤）。
  */
@@ -528,43 +531,56 @@ function sameComponentSet(a: AgentComponentRef[], b: AgentComponentInput[]): boo
 /**
  * 校验"这批引用能不能落库"。**两道，且都在写库之前**（见 {@link replaceAgentComponents} 的顺序）。
  *
- * ① **`MCP` 一律拒绝**：`mcp_servers` 表要到 **P0-2** 才建（`02` §3.1 已写明），
- *    现在收到一个 MCP 引用**无从验证真伪** —— 既不可能是界面里选出来的（没有 server 列表端点），
- *    也修不了（用户看不到那个 server）。放行等于往库里写"永远修不好的孤儿绑定"，
- *    而 `kb.service.ts` 文件头 ④ 已经把这类数据定性为"症状是检索时才炸且查不出来"。
- *    ⇒ **宁可现在明确拒绝，等 P0-2 有了 `mcp_servers` 再把这条换成存在性校验**。
- *    文案要指向 P0-2（用户能理解"功能还没上线"），而不是甩一句"参数不合法"。
- *
- * ② **`KNOWLEDGE` 逐条查存在性**：`ref_id` 是多态外键、**刻意没有 FK**（`02` §3.1），
+ * ① **两类引用都逐条查存在性**：`ref_id` 是多态外键、**刻意没有 FK**（`02` §3.1），
  *    数据库不会拦 —— 引用完整性只能由这一层负责。查不到就整体拒绝（`02` §4.4 的坑预判：
  *    "引用不存在的 KB 必须拒绝而非静默丢弃"）：静默丢弃会让"我提交了 3 个库"变成
  *    "库里只有 2 个"而用户以为自己选上了。文案里带上具体 id，前端 `message.error` 能直接说清。
  *
- * ⚠️ 刻意**不校验**知识库的"有没有文档 / 是否可检索"：那是检索层的事（`02` §八 的
- * `vectorPathSkipped` / 告警负责表达），绑一个还没传文档的库完全合法（刚建好、马上要传）。
+ *    ⚠️ **`MCP` 分支的保质期到了（P0-2-2 接回）**：P0-1-23 时它写的是"一律 400 + 文案指向 P0-2"
+ *    —— 那时 `mcp_servers` 表还不存在，收到的 MCP 引用**必然**是伪造或过期的 uuid，
+ *    而放行等于往库里写"永远修不好的孤儿绑定"。本批 `mcp_servers` 落地 ⇒ 按当时的约定
+ *    换成**存在性校验**，**接口形态一个字没变**（仍是 `PUT …/components` 里的一次校验、
+ *    失败仍是标准的错误信封）。`verify:agents` 与 `verify:agent-package` 里那两条
+ *    "含 MCP ⇒ 400 且文案指向 P0-2"的对偶断言**已同步翻转**。
  *
- * @throws {AppError} `VALIDATION`(400) 含 MCP 引用 / `NOT_FOUND`(404) 引用的知识库不存在
+ * ② **一次 `Promise.all` 查两张表**（而不是两次 `await` 串行）：两条查询互不依赖，
+ *    串行只是白等一个 RTT。刻意**不用 `$transaction`** —— 存在性校验不需要快照一致性
+ *    （真在两次查询之间被删掉的行，会在写库时撞外键/留下引用，那是另一个量级的问题，
+ *    并且 `replaceAgentComponents` 的"校验在写之前"不变式管的是它自己那次校验的时序）。
+ *
+ * ⚠️ 刻意**不校验**知识库的"有没有文档 / 是否可检索"，也**不校验** MCP server 的
+ *    "通不通 / 有没有工具"：那是检索层与调用层的事（`02` §八 的 `vectorPathSkipped`、
+ *    `tool_call{ERROR}` 负责表达），绑一个还没传文档的库、或一个暂时连不上的 server
+ *    都**完全合法**（刚建好、马上要传文档 / 那个 server 只是此刻在重启）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 引用的知识库或 MCP server 不存在
  */
 async function assertComponentRefsBindable(components: AgentComponentInput[]): Promise<void> {
-  const mcpCount = components.filter((item) => item.componentType === 'MCP').length
-  if (mcpCount > 0) {
-    throw AppError.validation(
-      `MCP 服务器功能尚未开放（P0-2 才提供注册与绑定）：本次提交里有 ${mcpCount} 条 MCP 绑定，请先移除`,
-    )
+  // 去重后再查：同一批里"同一个目标"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
+  const refIdsOf = (type: AgentComponentInput['componentType']): string[] => [
+    ...new Set(components.filter((item) => item.componentType === type).map((item) => item.refId)),
+  ]
+  const knowledgeIds = refIdsOf('KNOWLEDGE')
+  const mcpIds = refIdsOf('MCP')
+  if (knowledgeIds.length === 0 && mcpIds.length === 0) return
+
+  const db = getPrisma()
+  const [kbRows, mcpRows] = await Promise.all([
+    knowledgeIds.length === 0
+      ? Promise.resolve([])
+      : db.knowledgeBase.findMany({ where: { id: { in: knowledgeIds } }, select: { id: true } }),
+    mcpIds.length === 0
+      ? Promise.resolve([])
+      : db.mcpServer.findMany({ where: { id: { in: mcpIds } }, select: { id: true } }),
+  ])
+
+  const missingKb = knowledgeIds.filter((refId) => !kbRows.some((row) => row.id === refId))
+  if (missingKb.length > 0) {
+    throw AppError.notFound(`知识库不存在或已被删除：${missingKb.join('、')}`)
   }
-
-  // 去重后再查：同一批里"同一个库"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
-  const refIds = [...new Set(components.map((item) => item.refId))]
-  if (refIds.length === 0) return
-
-  const rows = await getPrisma().knowledgeBase.findMany({
-    where: { id: { in: refIds } },
-    select: { id: true },
-  })
-  const found = new Set(rows.map((row) => row.id))
-  const missing = refIds.filter((refId) => !found.has(refId))
-  if (missing.length > 0) {
-    throw AppError.notFound(`知识库不存在或已被删除：${missing.join('、')}`)
+  const missingMcp = mcpIds.filter((refId) => !mcpRows.some((row) => row.id === refId))
+  if (missingMcp.length > 0) {
+    throw AppError.notFound(`MCP server 不存在或已被删除：${missingMcp.join('、')}`)
   }
 }
 
@@ -598,8 +614,8 @@ async function assertComponentRefsBindable(components: AgentComponentInput[]): P
  * 的列表排序键，而"解绑一个知识库"跟"编辑智能体"是两件事 —— 动了它，用户会看到
  * "列表自己跳了一下"。验收里有一条断言 `updated_at` **逐字不变**守着。
  *
- * @throws {AppError} `NOT_FOUND`(404) 智能体不存在或已软删 / 引用的知识库不存在
- *                    / `FORBIDDEN`(403) 非创建者且非 ADMIN / `VALIDATION`(400) 含 MCP 引用
+ * @throws {AppError} `NOT_FOUND`(404) 智能体不存在或已软删 / 引用的知识库或 MCP server 不存在
+ *                    / `FORBIDDEN`(403) 非创建者且非 ADMIN
  */
 export async function replaceAgentComponents(
   id: string,

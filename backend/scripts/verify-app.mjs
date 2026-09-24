@@ -89,6 +89,16 @@
  *              **新页在前**）"、"同毫秒的两条不会被吞掉"、以及时间口径常量
  *              `MESSAGE_CHRONO_ORDER`（与上下文窗口**同源**）。
  *              行为侧（真 PG 上的游标 SQL 与跨页翻取）归 `verify-conversations.mjs` 的 H 组。
+ *   · P0-2-2：**MCP server 的路由表与契约** —— 六条路由已注册 + 三条**刻意不注册**
+ *              （`/credentials**` 属 P0-2-4；`/:id` 详情与 `PUT /:id` 本批不提供）、
+ *              投影的键集合（**没有 `oauthConfig` / `toolCache`**）、
+ *              `mcpServerTestResultSchema` 的**两分支互斥**（union：`{ok:true}` 缺 `tools`
+ *              与 `{ok:false}` 缺 `error` 都必须被拒）、`GET /:id/tools` 的三态字段语义
+ *              （`null` 与 `0` 是两件事）、以及三个纯函数族：`slugifyServerName` /
+ *              `uniqueSlug`（中文回落、截断 32、**后缀不得被截掉**）、`normalizeCredentialSchema`
+ *              （逐条过滤、永不抛错）、`toolCache` 的读写（**坏数据整体作废**，不是逐条过滤）。
+ *              三个被测模块**都不 import 运行期模块** ⇒ 本档（无依赖、可进 CI）直接断言；
+ *              行为侧（真 PG + 真假 MCP 上游 + 全员权限 + 409 守卫）归 `verify-mcp-servers.mjs`。
  *
  * 会话与认证的**行为**（Cookie 属性、限速锁定、首登闸门 403、改密）离不开真实 Redis/PG，
  * 分别由 `verify-session.mjs` / `verify-auth.mjs` 覆盖 —— 那两档要 `pnpm infra:up`。
@@ -209,6 +219,28 @@ import {
   listMessagesQuerySchema,
   messageItemSchema,
   messagePageResultSchema,
+  // MCP server 注册（P0-2-2）
+  CREDENTIAL_INJECT_LOCATIONS,
+  MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES,
+  MCP_ENDPOINT_URL_MAX,
+  MCP_SERVER_NAME_MAX,
+  MCP_SERVER_STATUSES,
+  MCP_SLUG_FALLBACK,
+  MCP_SLUG_MAX,
+  createMcpServerBodySchema,
+  listMcpServersQuerySchema,
+  mcpServerCreateResultSchema,
+  mcpServerIdParamsSchema,
+  mcpServerItemSchema,
+  mcpServerListResultSchema,
+  mcpServerTestResultSchema,
+  mcpServerToolsResultSchema,
+  mcpToolDescriptorSchema,
+  normalizeCredentialSchema,
+  removeMcpServerResultSchema,
+  slugifyServerName,
+  uniqueSlug,
+  updateMcpServerBodySchema,
   updateModelBodySchema,
   updateModelProviderBodySchema,
   updateKnowledgeBaseBodySchema,
@@ -287,6 +319,10 @@ import { createSemaphore } from '../dist/backend/src/orchestrator/semaphore.js'
 // "不重不漏"这条验收的**全部**正确性就在这几行里，而它在真库上只表现为"某次翻页少/多一条"
 // —— 一个 SQL 写对的实现配一个错的取页逻辑，照样能顺利跑完。行为侧归 `verify-conversations` 的 H 组。
 import { MESSAGE_CHRONO_ORDER, toMessagePage } from '../dist/backend/src/services/conversation.service.js'
+// `tool_cache` 的读写（P0-2-2）同样**刻意不 import 任何运行期模块**
+// （不碰 config/prisma/日志/SDK）⇒ 这一档能直接断言"库里塞了半截数据时三处读端给出同一种降级"。
+// 它的错没有任何 HTTP 表现：`toolCount` 会比真实值小一点，而界面上看不出来。
+import { buildToolCache, parseToolCache, toolCountOf } from '../dist/backend/src/mcp/toolCache.js'
 // 夹具是纯 JS 生成器（手写 PDF/DOCX/ZIP 字节），不引依赖、不读外部文件 ⇒ 仍然满足本档"无依赖"
 import * as fixtures from './fixtures/documents.mjs'
 
@@ -1078,6 +1114,10 @@ await it('shared Provider 输出形态：只含掩码与 hasKey，无任何 apiK
     name: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     type: 'CHAT',
+    // ⚠️ `protocol` 是 **P0-1-37** 加进投影的（上游协议扩展）；本夹具当时漏改，
+    //    于是这一条一直红着而没人看见（§七"刻意未注册型断言的保质期"的同款 —— 只有全量回归能抓到）。
+    //    P0-2-2 顺手补上，并把它变成一条**真断言**（下一条用例）。
+    protocol: 'OPENAI_COMPAT',
     enabled: true,
     hasKey: true,
     apiKeyPreview: 'sk-****cdef',
@@ -1095,6 +1135,23 @@ await it('shared Provider 输出形态：只含掩码与 hasKey，无任何 apiK
     modelProviderItemSchema.safeParse({ ...item, type: 'EMBEDDING' }).success,
     true,
     'EMBEDDING 也是合法类型',
+  )
+  // 三协议：**必填**（不是 nullable、也没有默认值）—— 省略它意味着"要发到哪个上游说不清"，
+  // 而上游协议一旦猜错，症状是"模型回的东西完全不对"，不会在别处报错。
+  assertEqual(
+    modelProviderItemSchema.safeParse({ ...item, protocol: undefined }).success,
+    false,
+    '⚠️ `protocol` 必填（P0-1-37 起）：漏了它就是"发到哪个上游说不清"',
+  )
+  assertEqual(
+    modelProviderItemSchema.safeParse({ ...item, protocol: 'GEMINI' }).success,
+    false,
+    '取值域之外一律拒（取值域唯一落点：`UPSTREAM_PROTOCOLS`）',
+  )
+  assertSameSet(
+    Object.keys(modelProviderItemSchema.shape),
+    ['apiKeyPreview', 'baseUrl', 'createdAt', 'enabled', 'hasKey', 'id', 'modelCount', 'name', 'protocol', 'type', 'updatedAt'],
+    '投影键集合（`protocol` 必须在；任何密文字段都不得在）',
   )
   // 形态自检：schema 的键集合里**不允许**出现任何 apiKey* 以外的敏感名
   const keys = Object.keys(modelProviderItemSchema.shape)
@@ -3225,6 +3282,299 @@ await it('契约同源：引用卡形状只定义一次，SSE 事件与落库共
   const stripped = messageContentSchema.safeParse({ text: 't', ext: 1 })
   assertEqual(stripped.success, true, '未声明的键不会让解析失败')
   assertSameSet(Object.keys(stripped.data), ['text'], '⚠️ 而是被**静默剥掉**')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// P0-2-2：MCP server 注册 —— 路由表 / 契约 / 三个纯函数族
+//
+// 这一节守的错**大多没有 HTTP 表现**：
+//   · 路由漏注册一条 ⇒ 前端"点了没反应"，而所有后端单测照样绿；
+//   · 投影多一个恒 `null` 的键 ⇒ 诱使前端写永远走不到的分支（`oauthConfig` 就是这样被拿掉的）；
+//   · slug 的后缀被 `slice(0,32)` 截掉 ⇒ 两个 server 抢同一个工具名前缀（P0-2-6 才炸）；
+//   · `tool_cache` 半截数据被逐条过滤 ⇒ "模型能调到的工具少了几个"，界面上完全看不出来。
+// 三处被测模块都**刻意不 import 任何运行期模块** ⇒ 这一档（无依赖、可进 CI）能直接断言；
+// 行为侧（真 PG + 假 MCP 上游 + 全员权限 + 409 守卫）归 `verify-mcp-servers.mjs`。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+console.log(`\n${c.b}── MCP server 注册（P0-2-2）：路由表 / 投影 / slug 与缓存纯函数 ──${c.x}`)
+
+/** 一个契约完备的 `McpServerItem`（每条用例按需覆写一两个字段） */
+const mcpItemFixture = {
+  id: '01930000-0000-7000-8000-000000000001',
+  name: '内部工单平台',
+  slug: 'server',
+  endpointUrl: 'http://127.0.0.1:1/mcp',
+  authType: 'NONE',
+  credentialSchema: [],
+  toolCount: 0,
+  status: 'UNKNOWN',
+  createdBy: '01930000-0000-7000-8000-000000000002',
+  createdAt: '2026-09-24T00:00:00.000Z',
+  updatedAt: '2026-09-24T00:00:00.000Z',
+}
+
+/** 一个契约完备的 `McpToolDescriptor`（四个契约键 + `hasOutputSchema`，缺失的写成 `null`） */
+const mcpToolFixture = {
+  name: 'echo',
+  title: null,
+  description: null,
+  inputSchema: { type: 'object', properties: {} },
+  annotations: null,
+  hasOutputSchema: false,
+}
+
+await it('六条路由已注册；三条**刻意不注册**（凭据属 P0-2-4，详情与整对象 PUT 本批不提供）', () => {
+  const registered = [
+    ['GET', '/api/mcp/servers', '列表'],
+    ['POST', '/api/mcp/servers', '注册'],
+    ['PATCH', '/api/mcp/servers/:id', '部分更新'],
+    ['DELETE', '/api/mcp/servers/:id', '删除'],
+    ['POST', '/api/mcp/servers/:id/test', '连通测试'],
+    ['GET', '/api/mcp/servers/:id/tools', '工具列表（读缓存）'],
+  ]
+  for (const [method, url, label] of registered) {
+    assertEqual(app.hasRoute({ method, url }), true, `${label}路由应已注册`)
+  }
+  // ⚠️ "刻意不注册"同样是要守的契约：多一条 = 提前承诺了没实现的东西
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/mcp/servers/:id' }), false, '详情属 P0-2-5')
+  assertEqual(app.hasRoute({ method: 'PUT', url: '/api/mcp/servers/:id' }), false, '只有 PATCH（不提供整对象 PUT）')
+  assertEqual(
+    app.hasRoute({ method: 'GET', url: '/api/mcp/credentials' }),
+    false,
+    '⚠️ 凭据三条属 P0-2-4（收窄在 `user_id` 上、要建表），不要顺手补',
+  )
+  // 顺带守一条"本资源没有第二套投影"：它不像模型池那样需要 `/available`
+  assertEqual(app.hasRoute({ method: 'GET', url: '/api/mcp/servers/available' }), false, '不需要 /available 子路径')
+})
+
+await it('投影 `McpServerItem`：十一个键；**刻意没有** `oauthConfig` / `toolCache`', () => {
+  assertSameSet(
+    Object.keys(mcpServerItemSchema.shape),
+    [
+      'authType',
+      'createdAt',
+      'createdBy',
+      'credentialSchema',
+      'endpointUrl',
+      'id',
+      'name',
+      'slug',
+      'status',
+      'toolCount',
+      'updatedAt',
+    ],
+    '投影键集合',
+  )
+  assertEqual(mcpServerItemSchema.safeParse(mcpItemFixture).success, true, '契约完备的条目应通过')
+  assertEqual(mcpServerItemSchema.safeParse({ ...mcpItemFixture, toolCount: -1 }).success, false, 'toolCount 不能为负')
+  assertEqual(
+    mcpServerItemSchema.safeParse({ ...mcpItemFixture, status: 'DISABLED' }).success,
+    false,
+    `status 取值域固定为 ${MCP_SERVER_STATUSES.join('/')}（它**不是启停开关**）`,
+  )
+  assertEqual(
+    mcpServerItemSchema.safeParse({ ...mcpItemFixture, authType: 'OAUTH' }).success,
+    true,
+    'OAUTH 在取值域内（拒绝发生在服务层 —— "接口留位、能力不做"）',
+  )
+  // ⚠️ 这条不是"要求报错"，而是把**坑本身**钉住：Zod 默认**静默剥掉**未声明的键。
+  //    将来给这张表加字段时，忘了同时改 shared 不会报任何错，只让响应里少一块。
+  const stripped = mcpServerItemSchema.safeParse({ ...mcpItemFixture, oauthConfig: { clientId: 'x' } })
+  assertEqual(stripped.success, true, '未声明的键不会让解析失败')
+  assertEqual('oauthConfig' in stripped.data, false, '⚠️ 而是被**静默剥掉**（恒 `null` 的字段不进契约）')
+})
+
+await it('`mcpServerTestResultSchema`：两分支**互斥**（union，而不是两个可选键）', () => {
+  assertEqual(mcpServerTestResultSchema.safeParse({ ok: true, tools: [mcpToolFixture] }).success, true, '成功分支')
+  assertEqual(mcpServerTestResultSchema.safeParse({ ok: false, error: '连接被拒绝' }).success, true, '失败分支')
+  // 写成两个 `.optional()` 会放过下面两种"前端渲染不出来"的中间态
+  assertEqual(mcpServerTestResultSchema.safeParse({ ok: true }).success, false, '⚠️ `ok:true` 必须带 `tools`')
+  assertEqual(mcpServerTestResultSchema.safeParse({ ok: false }).success, false, '⚠️ `ok:false` 必须带 `error`')
+  assertEqual(mcpServerTestResultSchema.safeParse({ tools: [] }).success, false, '`ok` 是判别式，不能缺')
+  // 工具投影的六个键**恒存在**（缺失的一律 `null`）—— 前端据此少写一堆可选链
+  const tool = mcpToolDescriptorSchema.parse(mcpToolFixture)
+  assertSameSet(
+    Object.keys(tool),
+    ['annotations', 'description', 'hasOutputSchema', 'inputSchema', 'name', 'title'],
+    '工具投影六个键',
+  )
+  assertEqual(
+    mcpToolDescriptorSchema.safeParse({ name: 'echo' }).success,
+    false,
+    '⚠️ 缺失的键也必须显式给 `null`（"少一个键"与"值为 null"在渲染时是两件事）',
+  )
+  assertEqual(
+    mcpToolDescriptorSchema.parse({ ...mcpToolFixture, inputSchema: { any: 'thing' } }).inputSchema.any,
+    'thing',
+    'inputSchema **原样**透传（任何兼容处理属 P0-2-6）',
+  )
+})
+
+await it('`GET /:id/tools`：`fetchedAt:null` 与 `tools:[]` 是**两件事**（写进契约、界面据此留白）', () => {
+  assertEqual(
+    mcpServerToolsResultSchema.safeParse({ tools: [], fetchedAt: null, cached: false }).success,
+    true,
+    '从未拉过',
+  )
+  assertEqual(
+    mcpServerToolsResultSchema.safeParse({ tools: [], fetchedAt: '2026-01-01T00:00:00.000Z', cached: true }).success,
+    true,
+    '确实就是 0 个工具（界面上要显示 `0` 而不是 `—`）',
+  )
+  assertEqual(
+    mcpServerToolsResultSchema.safeParse({ tools: [], fetchedAt: null, cached: true }).success,
+    true,
+    '⚠️ 契约刻意**不**约束两者一致：P0-2-5 的 `?refresh=1` 会让它们分叉（拉失败但缓存还在）',
+  )
+  assertEqual(mcpServerToolsResultSchema.safeParse({ tools: [] }).success, false, '`fetchedAt`/`cached` 必填')
+})
+
+await it('注册响应是 `{server,test}`（不是"裸 item 多一个键"）；列表与删除各回自己的形状', () => {
+  // ⚠️ 不做成"裸 item 再多一个键"：同一份数据两种形状 = 前端两套渲染分支（P0-1-21 的教训）
+  assertSameSet(Object.keys(mcpServerCreateResultSchema.shape), ['server', 'test'], '两个键')
+  assertEqual(
+    mcpServerCreateResultSchema.safeParse({ server: mcpItemFixture, test: { ok: false, error: 'x' } }).success,
+    true,
+    '失败探测也照样是一份合法响应（注册**不**因它失败）',
+  )
+  assertEqual(mcpServerCreateResultSchema.safeParse({ server: mcpItemFixture }).success, false, '⚠️ `test` 必填')
+  assertSameSet(Object.keys(mcpServerListResultSchema.shape), ['items', 'limit', 'offset', 'total'], '列表四件套')
+  assertSameSet(Object.keys(removeMcpServerResultSchema.shape), ['id', 'name'], '删除只回 id + name（与删 Provider 同口径）')
+})
+
+await it('请求侧：endpoint 只认 http/https 且 `path` 精确到字段；三态与"至少一个字段"', () => {
+  const min = { name: '内部工单平台', endpointUrl: 'https://mcp.example.com/mcp' }
+  assertEqual(createMcpServerBodySchema.safeParse(min).success, true, '最小合法体')
+  assertEqual(
+    createMcpServerBodySchema.safeParse({ ...min, endpointUrl: 'http://127.0.0.1:1/mcp' }).success,
+    true,
+    'http 也认（本地/内网端点很常见）',
+  )
+  // ⚠️ `z.string().url()` 用的是 `new URL()` —— 它**接受任何协议**（ftp/file/ws 全过）。
+  //    所以"其它协议 400"这条**必须自己判 scheme**，否则这条断言是假的。
+  for (const endpointUrl of ['ftp://mcp.example.com/mcp', 'file:///etc/passwd', 'ws://mcp.example.com/mcp', 'not a url', '']) {
+    const parsed = createMcpServerBodySchema.safeParse({ ...min, endpointUrl })
+    assertEqual(parsed.success, false, `${JSON.stringify(endpointUrl)} 应被拒`)
+    assertEqual(
+      parsed.error.issues[0].path[0],
+      'endpointUrl',
+      `${JSON.stringify(endpointUrl)} 的字段路径要能定位到输入框（object 级 refine() 给不出 path）`,
+    )
+  }
+  assertEqual(
+    createMcpServerBodySchema.safeParse({ ...min, endpointUrl: `http://x/${'a'.repeat(MCP_ENDPOINT_URL_MAX)}` })
+      .success,
+    false,
+    `endpoint 超过 ${MCP_ENDPOINT_URL_MAX} 字符应被拒`,
+  )
+  assertEqual(
+    createMcpServerBodySchema.safeParse({ ...min, name: 'x'.repeat(MCP_SERVER_NAME_MAX + 1) }).success,
+    false,
+    `名称超过 ${MCP_SERVER_NAME_MAX} 字符应被拒`,
+  )
+  // 三态：`authType` **不是**三态字段（枚举没有"清空"可言）；`credentialSchema` 的"清空"就是提交 `[]`
+  assertEqual(
+    createMcpServerBodySchema.parse(min).credentialSchema,
+    undefined,
+    '省略 ⇒ 留 undefined 给服务层落成 []（不在 schema 层给默认值 —— 那会让"省略"与"给 []"变得无法区分）',
+  )
+  assertEqual(createMcpServerBodySchema.parse(min).authType, undefined, 'authType 省略 ⇒ 服务层落 NONE')
+  assertEqual(updateMcpServerBodySchema.safeParse({}).success, false, '空体 ⇒ 400（"什么都没改"不该发请求）')
+  assertEqual(
+    updateMcpServerBodySchema.safeParse({ credentialSchema: [] }).success,
+    true,
+    '清空模板 = 提交 `[]`（本轮是**整体替换**语义，与 P0-2-4 的凭据**值**合并语义刻意相反）',
+  )
+  // ⚠️ `slug` 不在 PATCH 契约里：它进工具名前缀，跟着改名会让历史消息的 tool_calls 对不上
+  assertEqual(
+    'slug' in updateMcpServerBodySchema.parse({ name: 'n', slug: 'hacked' }),
+    false,
+    '⚠️ `slug` 被静默剥掉（只剩它时就等于"没给任何字段" ⇒ 400）',
+  )
+})
+
+await it('路径参数与列表参数：uuid 校验 + coercion 与上下限', () => {
+  assertEqual(mcpServerIdParamsSchema.safeParse({ id: 'not-a-uuid' }).success, false, '非法 uuid ⇒ 400')
+  assertEqual(mcpServerIdParamsSchema.safeParse({ id: mcpItemFixture.id }).success, true, '合法 uuid')
+  const defaults = listMcpServersQuerySchema.parse({})
+  assertEqual(defaults.offset, 0, 'offset 默认 0')
+  assertEqual(defaults.limit, 20, 'limit 默认 20')
+  assertEqual(listMcpServersQuerySchema.parse({ offset: '10', limit: '5' }).offset, 10, 'query 是字符串 ⇒ 必须 coercion')
+  assertEqual(listMcpServersQuerySchema.safeParse({ limit: '0' }).success, false, 'limit 至少 1（0 会让列表永远空）')
+  assertEqual(listMcpServersQuerySchema.safeParse({ limit: '101' }).success, false, 'limit 上限 100')
+  assertEqual(listMcpServersQuerySchema.safeParse({ offset: '-1' }).success, false, 'offset 不能为负')
+})
+
+await it('`slugifyServerName`：小写化 / 折 `-` / 截断 32 / 去尾 `-` / 纯中文回落', () => {
+  assertEqual(slugifyServerName('GitHub Issues'), 'github-issues', '空格折成 -')
+  assertEqual(slugifyServerName('  Trimmed  '), 'trimmed', '首尾空白')
+  assertEqual(slugifyServerName('a___b'), 'a-b', '连续的非字母数字折成**一个** -')
+  assertEqual(slugifyServerName('--Leading'), 'leading', '去首 -（否则工具名前缀以 - 开头）')
+  assertEqual(slugifyServerName('内部工单平台'), MCP_SLUG_FALLBACK, '⚠️ 纯中文整串折空 ⇒ 回落（工具名只认 ASCII）')
+  assertEqual(slugifyServerName(''), MCP_SLUG_FALLBACK, '空串同样回落')
+  assertEqual(slugifyServerName('a'.repeat(60)).length, MCP_SLUG_MAX, `截断到 ${MCP_SLUG_MAX}`)
+  assertEqual(
+    slugifyServerName(`${'a'.repeat(MCP_SLUG_MAX - 1)}-b`),
+    'a'.repeat(MCP_SLUG_MAX - 1),
+    '⚠️ 截断正好落在分隔符上 ⇒ 必须再去尾 `-`（否则下一步会产出 `foo--2` 这种名字）',
+  )
+})
+
+await it('`uniqueSlug`：撞名加序号，且**加后缀时先截短 base**（否则后缀被截掉又撞名）', () => {
+  assertEqual(uniqueSlug('foo', []), 'foo', '没占用就直接用')
+  assertEqual(uniqueSlug('foo', ['foo']), 'foo-2', '占用 ⇒ -2')
+  assertEqual(uniqueSlug('foo', ['foo', 'foo-2', 'foo-3']), 'foo-4', '依次递增')
+  assertEqual(uniqueSlug('foo', new Set(['foo'])), 'foo-2', '接受任意 Iterable')
+  const full = 'b'.repeat(MCP_SLUG_MAX)
+  const next = uniqueSlug(full, [full])
+  assertEqual(next.length <= MCP_SLUG_MAX, true, `结果不得超长（实际 ${next.length}）`)
+  assertEqual(next.endsWith('-2'), true, '⚠️ 后缀必须完整留下 —— 直接 `slice(0,32)` 会把 `-2` 截掉，于是两个 slug 又一样')
+  // 尾 `-` 的那一例：`slice` 把 base 截在分隔符上 ⇒ 再去尾后才拼后缀
+  const tailed = `${'a'.repeat(MCP_SLUG_MAX - 1)}-`
+  assertEqual(uniqueSlug(tailed, [tailed]), `${'a'.repeat(MCP_SLUG_MAX - 2)}-2`, '不产出 `…--2`')
+})
+
+await it('`normalizeCredentialSchema`：**逐条过滤**、永不抛错、守住 64 条上限', () => {
+  const emptyCases = [null, undefined, {}, 'x', 42, [[]]]
+  for (const raw of emptyCases) {
+    assertEqual(JSON.stringify(normalizeCredentialSchema(raw)), '[]', `非数组（${JSON.stringify(raw)}）⇒ []，永不抛错`)
+  }
+  const good = { key: 'token', label: '访问令牌', type: 'string', inject: 'HEADER' }
+  assertEqual(normalizeCredentialSchema([good]).length, 1, '好条目留下')
+  assertEqual(
+    normalizeCredentialSchema([good, { key: '', label: 'x', type: 'string', inject: 'HEADER' }, good]).length,
+    2,
+    '⚠️ 坏条目丢掉、好条目保留（**逐条过滤**而不是整份作废 —— 这份模板要下发给前端渲染表单）',
+  )
+  assertEqual(normalizeCredentialSchema([{ ...good, inject: 'COOKIE' }]).length, 0, '取值域外的 inject 丢掉')
+  assertEqual(normalizeCredentialSchema([{ ...good, type: 'number' }]).length, 0, 'type 非 string 丢掉（P0 只支持 string）')
+  assertEqual(
+    normalizeCredentialSchema(
+      Array.from({ length: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES + 20 }, (_value, index) => ({ ...good, key: `k${index}` })),
+    ).length,
+    MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES,
+    `截断到 ${MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES} 条（与契约用同一个常量 —— 它同时是渲染上限）`,
+  )
+  assertEqual(CREDENTIAL_INJECT_LOCATIONS.join('/'), 'HEADER/QUERY/BODY', '注入位置取值域')
+})
+
+await it('`toolCache` 读写：坏数据**整体作废** + 三处读端同一套降级（`0` 与"没有"要分得开）', () => {
+  assertEqual(parseToolCache(null), null, '`NULL` ⇒ 没有缓存')
+  assertEqual(parseToolCache(undefined), null, '`undefined` ⇒ 没有缓存')
+  assertEqual(parseToolCache({ fetchedAt: 'x' }), null, '⚠️ 缺 `tools` ⇒ **整份**作废')
+  assertEqual(parseToolCache({ tools: [mcpToolFixture] }), null, '⚠️ 缺 `fetchedAt` ⇒ 整份作废')
+  assertEqual(
+    parseToolCache({ fetchedAt: 'x', tools: [mcpToolFixture, { name: 'bad' }] }),
+    null,
+    '⚠️ 工具数组里混着坏条目 ⇒ 整份作废' +
+      '（留下半份 = "模型能调到的工具少了几个"，而界面上只是那个数字小了一点、没人看得出来）',
+  )
+  const cache = buildToolCache([mcpToolFixture], '2026-01-01T00:00:00.000Z')
+  assertSameObject(parseToolCache(cache), cache, '良性往返（`fetchedAt` 是 ISO 字符串，不过 `Date`）')
+  assertEqual(toolCountOf(cache), 1, '正常计数')
+  assertEqual(toolCountOf(null), 0, '没有缓存 ⇒ 0（⚠️ 界面据此显示 `—` 而不是 `0`）')
+  assertEqual(toolCountOf({ fetchedAt: 'x' }), 0, '坏数据同样退化成 0，不抛错')
+  assertEqual(cache.tools[0].name, 'echo', '缓存里存的是**投影后**的工具（与出口同一份 schema）')
 })
 
 await app.close()

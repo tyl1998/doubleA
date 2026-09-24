@@ -26,6 +26,7 @@ import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
+import { registerMcpServerRoutes } from './routes/mcpServers.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerUserRoutes } from './routes/users.js'
@@ -159,6 +160,11 @@ export function buildApp(): FastifyInstance {
   //    互斥锁 + 心跳 + 停止信号；**handler 内会 hijack 响应**，故它不返回信封）
   //    与 `POST /:id/stop`（写停止信号）。
   registerConversationRoutes(app)
+  // ⑫ MCP server 注册（P0-2-2）。权限是**登录即可**（`06` §4.2 的第五族，最接近知识库）——
+  //    这里一个 `requireAdmin` 都没有，且路由/服务层都**刻意不做**"只有创建者能改删"的收窄
+  //    （`mcp_servers.created_by` 只作**留痕**，理由见 routes/mcpServers.ts 文件头）。
+  //    ⚠️ 凭据那三条路由（`/api/mcp/credentials**`）属 **P0-2-4**，本批**不注册**。
+  registerMcpServerRoutes(app)
 
   return app
 }

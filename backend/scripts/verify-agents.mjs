@@ -142,6 +142,8 @@ const createdModelIds = []
 const createdAgentIds = []
 const createdKbIds = []
 const createdConversationIds = []
+// P0-2-2 起 `PUT …/components` 会对 MCP 引用做**存在性校验** ⇒ 正面用例要有一个真 server
+const createdMcpIds = []
 
 /** 一个语法合法但**不存在**的 uuid（用来验 404，而不撞 400 的参数校验） */
 const MISSING_UUID = '01930000-0000-7000-8000-000000000000'
@@ -863,8 +865,9 @@ try {
     ])
     assertEqual(bound.statusCode, 200, '用真端点 PUT 绑定知识库')
 
-    // ⚠️ MCP 那一行**只能手工插**：P0-1-23 起 `PUT …/components` 会**明确拒绝** MCP 引用
-    //    （`mcp_servers` 表要到 P0-2 才建、当前无从验证真伪）。这恰好造出一个更狠的取证对象 ——
+    // ⚠️ 指向"不存在的 server"的 MCP 行**只能手工插**：P0-2-2 起 `PUT …/components` 会对
+    //    MCP 引用做**存在性校验**（指向真 server 才写得进去，见本组后面那条对偶用例），
+    //    而这里要的恰好是一条**悬空引用**。它造出的取证对象更狠 ——
     //    **手工塞进库的脏行也必须被软删清干净**，否则那条悬空引用会永远留在库里
     //    （`kb.service.ts` 文件头 ④ 说的"孤儿绑定"就是这个形状）。
     await prisma.agentComponent.createMany({
@@ -1178,7 +1181,7 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
     if (index >= 0) createdKbIds.splice(index, 1)
   })
 
-  await it('⚠️ 校验失败时**旧绑定逐字不变**（校验必须在删除之前）+ MCP 引用被明确拒绝', async () => {
+  await it('⚠️ 校验失败时**旧绑定逐字不变**（校验必须在删除之前）+ 引用不存在的 MCP server 被拒', async () => {
     const agent = await createAgent(ownerCookie, {
       name: `验证智能体-失败不动-${suffix}`,
       type: 'CHATBOT',
@@ -1207,18 +1210,47 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
       '⚠️ 失败的 PUT 不该动任何一行（**含 `id`**：先删后校验的实现会在这里红）',
     )
 
-    // ② 含 MCP 引用 → 400（`mcp_servers` 表要到 P0-2 才建，现在无从验证 ⇒ 明确拒绝而不是写进去）
+    // ② 引用一个**语法合法但 mcp_servers 里不存在**的 id
+    //    ⚠️ 这条断言在 P0-2-2 **被翻转**过：P0-1 阶段 MCP 一律 400 且文案指向"功能还没上线"，
+    //       现在接回点是**存在性校验**（`06` P0-2-2 坑预判 4）。判断依据从"版本没到"变成
+    //       "这个 id 查不到"，故期望值由 400/VALIDATION 改成 404/NOT_FOUND
+    //       —— 这是 §七"刻意未注册型断言的保质期"的又一次性发作。
     const withMcp = await putComponents(ownerCookie, agent.id, [
       { componentType: 'KNOWLEDGE', refId: kb.id },
-      { componentType: 'MCP', refId: other.id },
+      { componentType: 'MCP', refId: other.id }, // 语法合法（uuid），但那是**用户 id**，不在 mcp_servers 里
     ])
-    assertEqual(withMcp.statusCode, 400, '含 MCP 引用应 400')
-    assertEqual(withMcp.json().code, 'VALIDATION', '信封 code')
-    assertIncludes(withMcp.json().msg, 'P0-2', '⚠️ 文案要指向"功能还没上线"，而不是甩一句"参数不合法"')
+    assertEqual(withMcp.statusCode, 404, '引用不存在的 MCP server 应 404')
+    assertEqual(withMcp.json().code, 'NOT_FOUND', '信封 code')
+    assertIncludes(withMcp.json().msg, 'MCP', '⚠️ 文案要点出是 MCP 的问题（两个 404 都写成"知识库不存在"会把人引偏）')
+    assertIncludes(withMcp.json().msg, other.id, '文案要带上具体是哪个 id')
     assertEqual(
       rowsFingerprint(await componentRowsOf(agent.id)),
       rowsFingerprint(before),
       '⚠️ 被拒的 PUT 也不该动任何一行',
+    )
+
+    // ③ **对偶的另一半**（P0-2-2 新增）：引用一个**真实存在**的 server ⇒ 写进去
+    //    只验 ② 的话，"服务层把 MCP 一律 404" 也能全绿 —— 而那是另一种坏法。
+    const mcp = await prisma.mcpServer.create({
+      data: {
+        name: `验证 MCP server-${suffix}`,
+        slug: `verify-mcp-agents-${suffix}`,
+        endpointUrl: 'http://127.0.0.1:1/mcp',
+        authType: 'NONE',
+        createdBy: owner.id,
+      },
+      select: { id: true },
+    })
+    createdMcpIds.push(mcp.id)
+    const bound = await putComponents(ownerCookie, agent.id, [
+      { componentType: 'KNOWLEDGE', refId: kb.id },
+      { componentType: 'MCP', refId: mcp.id },
+    ])
+    assertEqual(bound.statusCode, 200, '引用真实存在的 MCP server 必须能绑上')
+    assertEqual(
+      JSON.stringify(agentItemSchema.parse(bound.json().data).components.map((item) => item.componentType).sort()),
+      JSON.stringify(['KNOWLEDGE', 'MCP']),
+      '响应里两种类型都要在',
     )
   })
 
@@ -1419,7 +1451,8 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
     const kbKeep = await createKb(ownerCookie, { name: `智能体验证库-留-${suffix}` })
     const kbStale = await createKb(ownerCookie, { name: `智能体验证库-旧-${suffix}` })
 
-    // 手工造两条"历史遗留"：一条指向另一个库、一条 MCP（P0-1-23 起 PUT 已**不可能**写入它）
+    // 手工造两条"历史遗留"：一条指向另一个库、一条**悬空的** MCP（P0-2-2 起 PUT 只会
+    // 写入真实存在的 server ⇒ 这条"引用已失效"的行仍然只能手工造，也仍然必须被清掉）
     await prisma.agentComponent.createMany({
       data: [
         { agentId: agent.id, componentType: ComponentType.KNOWLEDGE, refId: kbStale.id },
@@ -1468,6 +1501,10 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
     await prisma.model.deleteMany({ where: { modelName: { contains: suffix } } })
     await prisma.modelProvider.deleteMany({ where: { id: { in: createdProviderIds } } })
     await prisma.modelProvider.deleteMany({ where: { name: { contains: suffix } } })
+    // MCP server 在 users 之**前**删：`created_by` 是 RESTRICT 外键
+    await prisma.mcpServer.deleteMany({
+      where: { OR: [{ id: { in: createdMcpIds } }, { slug: { contains: suffix } }] },
+    })
     for (const userId of createdUserIds) {
       // ⚠️ 快照必须显式删：`requireAuth` 每请求会写 `auth-user:{userId}`（TTL 60s），
       //    不删就要等窗口过去才算干净（`06` P0-1-7 坑 5 的教训）
@@ -1488,6 +1525,7 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
     providers: await prisma.modelProvider.count({ where: { name: { contains: suffix } } }).catch(() => -1),
     users: await prisma.user.count({ where: { username: { contains: suffix } } }).catch(() => -1),
     agentComponents: await prisma.agentComponent.count({ where: { agentId: { in: createdAgentIds } } }).catch(() => -1),
+    mcpServers: await prisma.mcpServer.count({ where: { slug: { contains: suffix } } }).catch(() => -1),
   }
   const dirty = Object.entries(residue).filter(([, count]) => count !== 0)
   const sessionsLeft = []
@@ -1495,7 +1533,7 @@ await it('七条路由都在（含 P0-1-25 的会话列表），仅"复制"是 P
     if ((await redis.exists(sessionKey(sid)).catch(() => 0)) !== 0) sessionsLeft.push(sid)
   }
   if (dirty.length === 0 && sessionsLeft.length === 0) {
-    console.log(`  ${c.g}[PASS]${c.x} 残留复核：7 张表全部为 0，${sessionIds.length} 个会话键全部清空`)
+    console.log(`  ${c.g}[PASS]${c.x} 残留复核：8 张表全部为 0，${sessionIds.length} 个会话键全部清空`)
     passed += 1
   } else {
     console.log(`  ${c.r}[FAIL]${c.x} 残留复核：表 ${JSON.stringify(residue)}｜会话键 ${sessionsLeft.length} 个`)

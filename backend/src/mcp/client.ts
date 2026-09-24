@@ -47,7 +47,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ElicitRequestSchema, LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js'
 import type { ElicitRequestParams } from '@modelcontextprotocol/sdk/types.js'
 
-import { AppError } from '@doubulea/shared'
+import { AppError, type McpToolDescriptor } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger, SERVICE_VERSION } from '../infra/logger.js'
@@ -73,33 +73,17 @@ export const MCP_DESIGN_TARGET_PROTOCOL_VERSION = '2025-06-18'
 /**
  * 工具描述符 —— `tools/list` 的**投影**。
  *
- * ⚠️ 不透传 SDK 的 `Tool` 对象（`06` P0-2-1 坑预判 5：泄漏内部类型、字段不可控）。
- * 四个契约键（`name`/`title`/`description`/`inputSchema`/`annotations`）**恒存在**，
- * 缺失的一律 `null` —— 路由层序列化时键不会消失，前端不必写三处 `?.`。
+ * ⚠️ **类型本体在 `shared/src/mcp.ts`（P0-2-2 起）**，这里只重导出。
+ * 为什么搬走又不改调用点：它同时是 `GET /api/mcp/servers/:id/tools` 的 **HTTP 契约**，
+ * 两处各写一份 interface 的后果是"client 加了字段、HTTP 出口不知道"，而 `typecheck`
+ * 不会报 —— 契约与实现是同一个东西时这个风险才结构性消失（同 P0-1-27 的"引用卡形状
+ * 只定义一次"）。用 `export type { … } from` 重导出，既有的 import 点一个字都不用改
+ * （P0-1-13 抽公共模块的同款纪律）。
+ *
+ * 字段语义（六键恒存在、缺失一律 `null`、`inputSchema` 原样、`hasOutputSchema` 为什么留痕）
+ * 见 shared 里那份的注释 —— 那里是唯一的那一处。
  */
-export interface McpToolDescriptor {
-  name: string
-  /** 服务端给的人读标题；缺失 → `null` */
-  title: string | null
-  /** 给模型看的说明；缺失 → `null`（`''` 原样保留，非缺失） */
-  description: string | null
-  /**
-   * MCP 声明的 JSON Schema，**原样**。
-   * ⚠️ 刻意不在这里做任何兼容处理（剥 `$schema` / 补 `type:'object'` / 非 object 根包一层）——
-   * 那三件事属于 P0-2-6（`toolSchema.ts`），有它自己的验收门槛与理由。
-   */
-  inputSchema: unknown
-  /** 危险判定的依据（P0-2-9 消费）；缺失 → `null` */
-  annotations: Record<string, unknown> | null
-  /**
-   * 服务端是否声明了 `outputSchema`。
-   *
-   * 为什么单单把它拎出来留痕：SDK 对**声明了 `outputSchema` 却回不出 `structuredContent`**
-   * 的工具会直接抛 `McpError(-32600)`（`client/index.js#callTool`），
-   * 症状是"调用明明成功，我们这边却当成上游错误"。有这面旗子，排查时一眼能对上。
-   */
-  hasOutputSchema: boolean
-}
+export type { McpToolDescriptor } from '@doubulea/shared'
 
 /** 内容块：`text` 之外的类型**原样**留痕（P0 只渲染文本，但不要在读取端丢掉信息） */
 export type McpContentBlock =

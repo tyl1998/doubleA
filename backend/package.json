@@ -37,6 +37,7 @@
     "verify:chat-package": "pnpm run build:shared && pnpm run build && node scripts/verify-chat-package.mjs",
     "verify:e2e": "pnpm run build:shared && pnpm run build && node scripts/verify-e2e.mjs",
     "verify:mcp-client": "pnpm run build:shared && pnpm run build && node scripts/verify-mcp-client.mjs",
+    "verify:mcp-servers": "pnpm run build:shared && pnpm run build && node scripts/verify-mcp-servers.mjs",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "db:generate": "prisma generate",

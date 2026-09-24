@@ -84,7 +84,7 @@ pnpm config:check      # 校验 + 打印脱敏后的生效配置（密码/密钥
 > 本机 `BACKEND_PORT` 已避让为 **13000**（3000 被别的项目占用）；前端 dev 代理需同步
 > `VITE_DEV_PROXY_TARGET=http://localhost:13000 pnpm dev:frontend`。
 
-### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 与组件绑定从 P0-1-22/23 起；**会话管理从 P0-1-25 起；SSE 出口（发消息 / 停止 / 互斥 / 心跳）从 P0-1-26 起；ChatBot 编排循环（检索块 / 流式透传 / 引用 / 落库 / 并发闸）从 P0-1-27 起；消息历史（游标分页 / `content` 原样透出）从 P0-1-28 起**；对话包验收从 P0-1-29 起；**前端从 P0-1-30 起**；**知识库页面的判据从 P0-1-35 起**；**管理页的判据从 P0-1-36 起；上游协议扩展（Provider `protocol`：OpenAI Responses / Anthropic 原生 Messages）从 P0-1-37 起**；**MCP client 从 P0-2-1 起**）
+### 静态检查与验收（P0-1-4 起；数据层从 P0-1-5 起；会话从 P0-1-6 起；认证从 P0-1-7 起；用户管理从 P0-1-8 起；端到端从 P0-1-9 起；模型池从 P0-1-10/11/12 起；embedding 从 P0-1-13 起；知识库数据层从 P0-1-14 起；知识库 CRUD 从 P0-1-15 起；文档上传从 P0-1-16 起；异步队列与 worker 从 P0-1-17 起；空文本检测与分块从 P0-1-18 起；入库与覆盖重建从 P0-1-19 起；双路检索与 RRF 从 P0-1-20 起；列表/下载与包验收从 P0-1-21 起；Agent CRUD 与组件绑定从 P0-1-22/23 起；**会话管理从 P0-1-25 起；SSE 出口（发消息 / 停止 / 互斥 / 心跳）从 P0-1-26 起；ChatBot 编排循环（检索块 / 流式透传 / 引用 / 落库 / 并发闸）从 P0-1-27 起；消息历史（游标分页 / `content` 原样透出）从 P0-1-28 起**；对话包验收从 P0-1-29 起；**前端从 P0-1-30 起**；**知识库页面的判据从 P0-1-35 起**；**管理页的判据从 P0-1-36 起；上游协议扩展（Provider `protocol`：OpenAI Responses / Anthropic 原生 Messages）从 P0-1-37 起**；**MCP client 从 P0-2-1 起；MCP server 注册与连通测试从 P0-2-2 起**）
 
 ```bash
 pnpm lint              # ESLint（扁平配置；业务代码禁 console，必须走 pino）
@@ -101,6 +101,7 @@ pnpm verify:model-providers  # 模型池 Provider 验收：Key 加密/读脱敏/
 pnpm verify:models     # 模型管理验收：两套投影/可选列表过滤/六条守卫，**需要真实 PG + Redis**（17 项）
 pnpm verify:llm        # LLM client 验收：起真 HTTP 假上游，报文/流式边界/超时中断/上游模型列表 + **三协议（P0-1-37：OpenAI 兼容 / OpenAI Responses / Anthropic 原生 Messages）** —— 路径 / 鉴权头（`Authorization` 与 `x-api-key` **是换不是加**）/ 报文形状 / 结束原因归一化 / usage 两半合并，**需要真实 PG + Redis**（34 项）
 pnpm verify:mcp-client # **MCP client 底座验收（P0-2-1）**：起一个**假 MCP server**（Streamable HTTP 单 URL），断言握手留痕（请求版本 `2025-11-25` / 协商版本 / 是否落回设计目标 `2025-06-18`）+ `tools/list` 投影（四键恒存在、缺失落 `null`、`inputSchema` **原样透传**）+ `tools/call` 三分法（成功 / `isError:true` 不抛 / 传输失败抛）+ 失败分类（超时 / 中断按 `aborted` 判而不是错误码 / DNS / 连接被拒 / 非 MCP 端点回 HTML / 空体 / 会话丢失伪装成 404 / 凭据回显脱敏）+ 服务端主动 elicitation 完整往返 + 优雅关闭（**先 `DELETE` 终止会话、后 close**）。⚠️ **本档不需要 PG / Redis**（客户端层不认识数据库），只要 `pnpm -r build` 出 dist（34 项）
+pnpm verify:mcp-servers # **MCP server 注册验收（P0-2-2）**：`/api/mcp/servers` 六条路由 —— 权限**第五族 = 登录即可**（**两个用户都用 MEMBER**；含两条反向守卫："B 能改 A 建的""B 能删 A 建的" ⇒ 证明 `created_by` **不参与判定**）+ 连通测试（`POST /:id/test` **恒 200**：成功 `{ok:true,tools}` **并顺手刷 `tool_cache`**，失败 `{ok:false,error}` 且 `tool_cache` **逐字不动**）+ 删除守卫（被 Agent 绑定 ⇒ 409，判据 = 数 `agent_components`；解绑后立刻删得掉）+ **注册不强制连通**（endpoint 不通也 200）+ `endpoint_url` 只收 http/https（**SSRF 面**，P0 只校验 scheme）+ `authType:'OAUTH'` ⇒ 400 指向 P1 + `created_by` 是留痕 + slug 派生/best-effort 唯一 + **缓存失效判据是"真的变了"**（jsonb 往返**键序无关**比较）。起一个**假 MCP server**（复用 P0-2-1 的夹具）；⚠️ **需要真实 PG + Redis**（server 表在库里），**不需要 MinIO**（31 项）
 pnpm verify:knowledge  # 知识库数据层验收：扩展/算子类/两条特殊索引/migrate diff 无漂移/EXPLAIN 命中，**只需真实 PG**（23 项）
 pnpm verify:knowledge-bases  # 知识库 CRUD 验收：建库快照/局部合并/级联+S3/全员权限，**需要真实 PG + Redis + MinIO**（19 项）
 pnpm verify:documents  # 文档端点验收：四道前置校验/文件头魔数/四格式解析/上传即入队/按库判重/**列表分页与排序/下载字节流与两个头**，**需要真实 PG + Redis + MinIO**（44 项）
@@ -123,6 +124,8 @@ pnpm verify:admin-ui   # **管理页前端验收（P0-1-36）**：用户状态�
 #   P0-1-35 起知识库页面的判据也有了专用档 = 上面的 verify:knowledge-ui；
 #   P0-1-36 起管理页的判据 = 上面的 verify:admin-ui（**至此包 G 的七批各有一个可断言的落点**）
 #   P0-1-37 起上游协议的判据 = verify:llm 的 C 组（三协议报文/头/结束原因）+ verify:admin-ui 的 K 组（协议下拉与请求体）
+#   P0-2-2 起 MCP server 注册的判据 = verify:mcp-servers（真 PG + Redis + 假 MCP server；
+#     测试恒 200 / 失败不动缓存 / 删被绑定的 409 / 全员可注册，且两个用户都用 MEMBER）
 #   （三档都**只证明"判据与契约接对了"** —— "真的传上去了 / 状态真的变了 / 分数算得对不对 /
 #     Key 真的存进去了"分别归浏览器（README 的端测清单）与 verify:documents /
 #     verify:knowledge-bases / verify:retrieval / verify:model-providers）
@@ -1347,18 +1350,75 @@ pnpm verify:conversations
 
 pnpm verify:chatbot
 #  → 21 项全通过（需要 PG + Redis，**不需要 MinIO**；脚本自己起进程 + 两个假上游，跑完删净）。
+
+# ⑳ MCP server 注册与连通测试（P0-2-2）—— 工具闭环第 2 步：注册 server → 测连通（拿 tools/list）→ 看工具清单
+#     这一段**不需要 ADMIN**：`/api/mcp/**` 是**权限第五族 = 登录即可**（与知识库同族 —— 同一个资源
+#     "人人可见、人人可改"）。`created_by` 只是**留痕**（界面显示"谁注册的"），不参与判定
+#     ⇒ 任何登录用户都能改/删别人注册的 server（`01` 决策 22 的直接推论，**不是 bug**）；
+#     P0-2 的收窄落在**凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4），**不在 server 上**。
+
+# ⑳-⓪ 另开一个终端：起一个**假 MCP server** 并前台常驻（Ctrl-C 收工）—— 它打印的地址就是 $MCPURL
+node --input-type=module -e 'const { startFakeMcpServer } = await import("./backend/scripts/fixtures/mcp-upstream.mjs"); const s = await startFakeMcpServer({}); console.log("MCPURL=" + s.url);'
+#  → 形如 `MCPURL=http://127.0.0.1:54321/mcp`（Streamable HTTP 端点是**单一 URL**，不拼路径段）
+
+# ⑳-a 注册（注册**不要求上游可达** —— endpoint 写错也照常建成功，连通留给 test 那一步）
+MCP=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers \
+  -H 'content-type: application/json' \
+  -d '{"name":"本地假 MCP","endpointUrl":"'"$MCPURL"'","authType":"NONE"}' \
+  | tee /tmp/mcp.json | jq -r '.data.server.id')
+jq . /tmp/mcp.json ; echo "MCP=$MCP"
+#  → data = `{ server:{…}, test:{…} }`：**多包一层**（不是裸 item）⇒ 取 id 要写 `.data.server.id`
+#     （别抄成 `.data.id`，会得 null）；`server` 里还有派生的 `slug`、`status`（UNKNOWN/OK/ERROR）、
+#     `createdBy`/`createdAt`；`test` 是这次 best-effort 探测的结论。
+
+# ⑳-b 连通测试 → **HTTP 恒 200**，结论在 body 里（成功顺手把工具写进 tool_cache）
+curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers/$MCP/test | jq .
+#  → `{ok:true, tools:[…]}`；每个工具含 **6 个契约键**（name/title/description/inputSchema/
+#     annotations/hasOutputSchema），缺失的一律投影成 `null`，`inputSchema` **原样透传**（转换属 P0-2-6）。
+
+# ⑳-c 看工具清单（读侧，**纯读缓存、绝不联网**）
+curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP/tools | jq .
+#  → 裸 `{tools, fetchedAt, cached}`：刚 test 成功过 ⇒ `cached:true` 且 `fetchedAt` 是那一刻；
+#     一次都没测过 ⇒ `tools:[]` + `fetchedAt:null`（"拉过但零工具"与"从没拉过"**是两件事**）。
+
+# ⑳-d 失败**也是 200**：把 endpointUrl 改到一个**没在监听**的端口再测
+#     ⚠️ 别用 `http://127.0.0.1:1/mcp`（也别用 7/9）—— 它们属 fetch 规范的 **bad port**，`undici` 在
+#        **发包之前**就拒掉（原因链是 `fetch failed ← bad port`），根本走不到 TCP，验不到"连接被拒绝"的翻译
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"endpointUrl":"http://127.0.0.1:65000/mcp"}' | jq .
+curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers/$MCP/test | jq .
+#  → 仍 **HTTP 200**，body 是 `{ok:false, error:"…可读原因…"}`（**不是** 4xx/5xx —— `ok:false` 是一条
+#     "这个 server 现在通不通"的**信息**，映射成 502 会让界面把"一个可用结论"渲染成"一个错误"）；
+#     ⚠️ 而且这次 `tool_cache` **一个字节都没动**（缓存只在成功时刷新）。只有 id 不存在才是 404
+#     （那是"请求本身的问题"）。
+
+# ⑳-e 改注册信息（`endpointUrl` / `credentialSchema` / `authType` 任一变了）⇒ **清工具缓存**
+#     （"改了 endpoint、工具列表还是旧 server 的"就是这条漏了）；只改 `name` 不动 slug、**也不清缓存**
+#     （name 不参与连通，清了只会让用户白等一次重拉）；`endpointUrl` 只收 http/https；
+#     改 `authType:"OAUTH"` ⇒ **400 + 文案指向 P1**（OAuth 属 P1，不是本批）
+
+# ⑳-f 列表（分页口径同 `/api/users`、`/api/knowledge-bases`）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers?limit=100" | jq '.data | {total, n:(.items|length)}'
+
+# ⑳-g 删除 → `{id,name}`；⚠️ **被 Agent 绑定**时删不掉（409，文案含"N 个"与"解绑"）
+curl -sS --noproxy '*' -b "$COOKIE" -X DELETE $BASE/api/mcp/servers/$MCP | jq .
+#  ⚠️ 想让后面的步骤"有东西可查"就**别现在删**（同 ⑧⑪⑭-f⑮-f 那四条 ⚠️）
+
+# ⑳-h 自动版：pnpm verify:mcp-servers
+#  → 31 项全通过（真 PG + Redis + 假 MCP server，**不需要 MinIO**），跑完自清并断言残留为零。
 ```
 
-**已知边界（别当 bug）**：① 接口只有六组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
+**已知边界（别当 bug）**：① 接口现在是七组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
 （`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员 + P0-1-12 新增的
 `GET /api/model-providers/:id/remote-models` 仅 ADMIN）、**知识库 `/api/knowledge-bases`（P0-1-15，
 登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
 `reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**、**智能体 `/api/agents`（P0-1-22，
 登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**、
-**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**。
-**"MEMBER 能用的业务接口"现在有三处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
-以及 `/api/agents` 的列表/详情/创建 —— 四族**权限口径刻意各不相同**（模型池全程 ADMIN；
-知识库**没有 owner 列**故登录即可读写；智能体有 `created_by` 列故编删按行判定；
+**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**、**MCP server `/api/mcp/servers`（P0-2-2，**登录即可** —— 权限第五族，最接近知识库；五条业务路由 + `POST /:id/test` 恒 200 的连通测试）**。
+**"MEMBER 能用的业务接口"现在有四处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
+`/api/agents` 的列表/详情/创建、以及**整个 `/api/mcp/servers/*`（P0-2-2）** —— 五族**权限口径刻意各不相同**（模型池全程 ADMIN；
+知识库**没有 owner 列**故登录即可读写；**MCP server 与知识库同族** —— 它虽有 `created_by` 列但**只作留痕、不参与判定**
+⇒ 任何登录用户都能改/删别人注册的；智能体有 `created_by` 列故编删按行判定；
 **会话有 `user_id` 列故仅本人**）。**会话现在能"说话"、历史也能原样拉回来了**：
 `POST /:id/chat`（P0-1-26）是 SSE 流，真正的编排循环（检索 → LLM 流式 → `citations` → 落库）
 在 **P0-1-27** 落地；**`GET /:id/messages`（P0-1-28）** 就是"刷新页面重新画出整个对话页"的那**一个**请求
@@ -1387,6 +1447,15 @@ pnpm verify:chatbot
 · **`usage_records` 表属 P1** ⇒ `done.usage` 只是**透传计量、不落表**；本版本**不做 token 级裁剪**（只按轮数截断，
 因为库里没有可用的 tokenizer —— 按字符估算等于"假保护"）。
 · **`POST /:id/confirm`（HITL 确认）属 P0-2**（它真正的前置是 `mcp_servers` 表），现在打它得到统一信封 404，**不是坏了**。
+**MCP server 专项边界（P0-2-2）**：· 权限是**第五族 = 登录即可**（`created_by` 只作留痕、不参与判定）⇒ **任何登录用户
+都能改/删别人注册的 server**，这是 `01` 决策 22 的直接推论、**不是 bug**（要收窄得先改 `01`/`02`）；P0-2 的收窄落在
+**凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4）。· **连通测试恒 HTTP 200** —— `ok:false` 是一条结论
+（"这个 server 现在通不通"）而非错误，只有 **id 不存在才 404**；**失败时工具缓存一个字节都不动**（只在成功时刷）。
+· **注册不强制连通**（上游抖动不该变成"建不了 server"），响应里那次 `test` 只是 best-effort 结论。
+· ⚠️ **`endpoint_url` 是 SSRF 面** —— 任何登录用户都能让后端去连**任意 http/https 地址**（含内网地址与云元数据端点）；
+P0 **只校验 scheme**（拒 `file:`/`gopher:` 之类），**不做内网黑名单 / 端口白名单 / DNS 重绑定防护** ——
+那属 **P1 安全加固**，本阶段是**已知且刻意**的边界。· ⚠️ `POST /:id/test` **不带用户凭据**（用"注册者视角"，
+P0-2-5 定案），有些 server 的 `tools/list` 也要求鉴权 ⇒ 那时会如实报 `ok:false` + 可读原因，**不是坏了**。
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
 **文档上传专项边界（P0-1-16）**：本批能验的是"进门校验"与"解析器本身"（`pnpm verify:documents`
 的 A/C/D 组真跑四个夹具文件）；`.doc` 是刻意拒收（提示另存为 `.docx`），不是没做完；
@@ -1542,6 +1611,7 @@ worker 是**进程内**的（`PIPELINE_CONCURRENCY=2`，不是独立进程）—
 | `issue_fix/问题记录-P0-1-37-上游协议扩展.md` | **本批的坑有一条共性：凡是"协议差异"泄漏到与协议无关的层，症状都是静默的** —— ① **鉴权头是"换"不是"加"**（`fetchUpstreamJson` 的 `headers` 入参做成**整体覆盖**；做成合并语义，`upstream.ts` 就被迫认识协议名，而它现在的四个职责——看门狗 / 中断 / 状态码映射 / 脱敏——**与协议无关**）；② **`rawFinishReason` 必须归一化到 OpenAI 词表**（Anthropic 的 `end_turn`、Responses 的 `completed` 直通，会让 `chatBot` 里 `!== 'stop'` 的判据给**每一条正常回答**打「可能被截断」的 warn —— 纯日志噪音，极难被注意到）；③ **`usage` 是两半合并、`total` 是从属量**（Anthropic 把 `input_tokens` 放 `message_start`、`output_tokens` 放 `message_delta`，而前者那份 `total` 是**临时值**；`mergeUsage` 第一版让"先到的 total"活了下来（期望 20、实测 13），**被验收 C 组抓出** ⇒ `in`/`out` 齐时必须 `in + out`，否则任何按 `total` 算钱的报表都会少算）；④ **前端 `undefined` 会被判成"改了一次"**（`values.protocol !== provider.protocol` 在 `undefined` 时恒真 ⇒ 请求体多出 `protocol: undefined` ⇒ `Object.keys(body).length === 0` 失效、本该 `return null` 的"零改动"变成 `PATCH {}` 被契约打成 400；**这条是 `verify:admin-ui` 既有 D4/D5/E2 三条用例真红出来的**，修复后补 K7 钉住）。**兼容性做法**：`LlmTarget.protocol` **可选** + `protocolOf()` **一处回落** ⇒ 既有调用点与脚本一个字不用改（`verify:llm` 原有 22 项一条未改也全绿）；`EMBEDDING` + 非默认协议在**服务层**拦 400（跨 `create`/`update` 两个入口、且要看最终生效值）。**迁移**：反向探针**无任何 `DROP`**（HNSW / GIN 索引与分区表未被触碰），库里既有行全部取默认值。**⚠️ 取证与边界**：`verify:llm` **22 → 34 项**（A13 / **C8 三协议** / B13）+ `verify:admin-ui` **74 → 82 项**（K1~K7 + J14）+ lint/typecheck/build 三连全绿；**上游仍是本仓夹具** ⇒ 只证明"三协议契约与配置接对了"，**不等于**真厂商端点一定对 |
 | `issue_fix/问题记录-P0-1-29-对话包验收.md` | **本批的「坑」全在「包级验收」这件事本身，而且六条里有五条是「断言写错了」而不是「代码坏了」** —— 这正是包级脚本与单端点脚本的分工：单端点脚本验「这个端点对不对」，包级脚本验「串起来还成不成立」，而后者最容易把「夹具碰巧成立」当成契约。① **引用片段不是整块正文** —— 上一批的夹具里 `snippet` 恰好等于整块 chunk 正文（块比 ±80 码点的窗口短），于是顺手写成 `snippet === chunk.content`；换成三篇真 PDF 立刻红。真实契约是三条：**片段 ⊆ 原文**（子串）、**片段含查询词**、**长度不超 `SNIPPET_WINDOW_CHARS` 上界**。② **「被拒的那一轮不落库」只对了一半** —— 绑了知识库的 Agent 上，**检索跑在 LLM 之前** ⇒ 即使这一轮被并发闸拒掉 / 一个字都没吐，`citations` 已经发出去、**这一轮真的发生过** ⇒ 库里多一条「正文空 + 带引用卡」的助手消息（那不是脏数据，落库判据是「这一轮真的发生过」）；断言要写 `rows.length === 2`、第 2 条是 `ASSISTANT`、正文 `''`、`citations.length >= 1`。③ **历史里数错第几条** —— 被中断的那半条回答是 `rows[1]`（USER 与 ASSISTANT 成对），写 `rows[3]` 会拿到下一条用户消息。④ **密码字母表的注释与常量不一致** —— `crypto.ts` 的注释写「剔除 0/O/o/1/l/I」，而常量其实**保留小写 `o`** ⇒ 验收里那条 `!/[0Oo1lI]/` 正则约 **1/4 概率随机红**；两处置法：断言改成与常量同源的 `!/[01IlO]/`（且长度取 `INITIAL_PASSWORD_LENGTH`），并**删掉同一件事的第二处写法** —— 同一口径在两处各写一遍，必有一处先腐烂。⑤ **证据要在断言之前收集** —— R7 的 `chosenPasswordLoginStatus` 写在 R1 的断言之后 ⇒ R1 一红，R7 就报「期望 401 实际 undefined」，把「一个失败」放大成「两个失败」。⑥ **门槛⑦「全程无手工干预数据」不能写成「我们没插 SQL」**（那是**恒真**的废断言，同族陷阱见技能里「断言形态」那一档）⇒ 拆成**四条只有服务端能产生的证据** + 一份端点台账：自选密码登这个新号 **401**、`POST /api/users` 回的 `initialPassword` **200**（长度/字母表对得上）、每篇 chunk 正文含**各自的上传特征短语**且列表端点 `chunkCount` == `chunks` 表行数、助手正文 == 事件流增量拼接、`agent.createdBy` == 会话用户 id；唯一直接写库的地方是自举管理员账号。**⚠️ 三处「部分完成」在结论表里单列、不混进 ✅**：R3「刷新页面」只到 **HTTP 层**（浏览器渲染属 P0-1-32~34）、R1 的 3 篇 PDF 是 **ASCII 夹具**（`makePdf` 走 Helvetica + latin1，**装不下中文**；真中文 PDF 由 `verify:documents` 的 A 组单独验）、R6 的 TTFT 是**链路值**不是模型值（上游是本地假夹具，证明的是「打点存在 + 口径正确 + 全链路没有隐藏等待」）。 |
 | `issue_fix/问题记录-P0-2-1-MCP客户端底座.md` | **⚠️ 协议版本不是我们可控的东西**（SDK 1.30.1 把请求版本**写死**在 `LATEST_PROTOCOL_VERSION='2025-11-25'`、**无 setter** ⇒ "协议 2025-06-18"的正确落法是"请求最新、接受降级、协商结果留痕"）、**SDK 把任意中断原因包装成 `McpError(RequestTimeout)`**（`reason instanceof McpError ? reason : new McpError(RequestTimeout, String(reason))`）⇒ **"用户点了停止"与"真超时"不能靠错误码分开**，必须由调用点把 `signal.aborted` 传进错误翻译层、且**判定顺序排在错误码之前**、**"会话丢了"会伪装成"端点不存在"**（Streamable HTTP 规定会话无效回 **404**，与"路径写错"**同码** ⇒ 判据加一条：404 且响应体提到 `session` 就改口）、**`Client.close()` 不会终止会话**（它只 `transport.close()` ⇒ 必须"**先 `DELETE`、后 close**"）、**`registerCapabilities()` 在 connect 之后调用直接抛**（能力声明必须在构造函数里、且只在真传了 `onElicit` 时才声明）、`StreamableHTTPError` **不设 `name`**（只能按形状 `code` + 前缀认）、`fetch` 连不通抛 `TypeError: fetch failed`**真因在 `.cause` 链上**、**`allowBuilds` 不需要登记 SDK**（无 install 脚本，P0-1-1 的坑预判在本批证伪） |
+| `issue_fix/问题记录-P0-2-2-MCP-server-注册.md` | **本批三处真问题都是"跑验收脚本自己撞出来的"**：① **造"连接被拒绝"不能用 `http://127.0.0.1:1`** —— 端口 1（含 7/9）属 fetch 规范的 **bad port**，`undici` 在**发包之前**就拒掉（原因链是 `fetch failed ← bad port`），根本走不到 TCP，验不到"连接被拒绝"的翻译 ⇒ 取"先起一个假 server 拿端口、再立刻关掉"的地址；② **中文名会被 `slugifyServerName` 整段折掉 ⇒ 多个用例共用同一族 slug**（"验证 MCP-xx-<suffix>" 全折成 `mcp-<suffix>`，序号一路涨到 `-9` 而撞车）⇒ 需要独立序号的用例改用**专属 ASCII 名字族**（"中文名靠序号区分"是**设计内行为**，不是 bug）；③ **jsonb 的键序会被 PG 重排** ⇒ "原样提交不该清缓存"若用 `JSON.stringify` 直比会**假阳**（每次保存白清一次缓存）⇒ 缓存失效判据必须**键序无关**，且断言要**先证明 PG 确实重排了键**，否则空转。另有两条纪律型：**P0-1-23 的接回点要"翻转"而不是"删掉"**（`assertComponentRefsBindable` 的 `MCP` 分支从"一律 400"换成**存在性校验**，**同步翻转 `verify:agents` / `verify:agent-package` 的对偶断言并各补一条正面用例** —— 否则"一律 404"也照样全绿）、**顺手修掉一条历史欠账**（`verify:app` 里 Provider 投影夹具漏了 P0-1-37 加的必填 `protocol`，这条断言**一直红着**，只因打真端点的 `verify:model-providers` 把它遮住了） |
 
 > ⚠️ **每批动依赖或改基础设施前，先读对应的 `issue_fix` 记录**（施工纪律 §六·3）。
 > SSE 编排协议已并入 `docs/02-后端设计.md` 第五~七节，不单独拆分。
@@ -1726,3 +1796,4 @@ doubuleA/
 | 2026-09-23 | — | **P0-1-37 完成（P0-1 收尾前最后一批）：上游协议扩展 —— OpenAI Responses 与 Anthropic 原生 Messages**（用户 2026-09-23 提出「模型增加只支持 chat 类型的不支持 response 以及 Anthropic 的吗」⇒ 两个都要，仅 `CHAT` 类型）。**新增** `backend/src/llm/protocol.ts`（**协议适配层唯一落点**：`ChatProtocol` 钩子 + `PROTOCOLS`/`protocolOf()`/`mergeUsage()` + 结束原因词表）、`backend/prisma/migrations/20260923100320_add_upstream_protocol/`；**改动** `schema.prisma`（`enum UpstreamProtocol` + `ModelProvider.protocol`，默认 `OPENAI_COMPAT`）、`shared/src/modelProvider.ts`（三值枚举 + 标签 + `protocolAllowedForType()`）、`backend/src/llm/{client,upstream}.ts`、`model.service.ts`、`index.ts`（`step`）、`frontend/src/pages/admin/`（表单加协议下拉、列表加协议列）。**零新增依赖**。**架构 = 「一条外壳 + 一个协议钩子」**：`client.ts` 只做读流/计时/汇总/回调（**不认识任何协议字段名**）、`protocol.ts` 是路径/头/报文/结束原因的唯一落点、`upstream.ts` 继续与协议无关。**四条最值得记的**：① `rawFinishReason` **先归一化到 OpenAI 词表**（否则 `chatBot` 的 `!== 'stop'` 会给每条正常回答打 warn）；② `usage` **两半合并、`total` 是从属量**（这条 implement 时先写错、被验收 C 组抓出）；③ **鉴权头是"换"不是"加"**（`headers` 整体覆盖）；④ **前端 `undefined` 会被判成"改了一次"** ⇒ 零改动变成 `PATCH {}`（400）—— 由 `verify:admin-ui` 既有的 D4/D5/E2 真红出来的，修复后补 K7。**兼容性**：`LlmTarget.protocol` 可选 + `protocolOf()` 一处回落 ⇒ 既有调用点/脚本一个字不用改。**取证**：`verify:llm` **22 → 34 项**、`verify:admin-ui` **74 → 82 项**、三连全绿、迁移反向探针无 `DROP`；**上游是夹具** ⇒ 只证"契约与配置接对了"。归档：`issue_fix/问题记录-P0-1-37-上游协议扩展.md` |
 | 2026-09-24 | — | **P0-1-38 完成（「P0-1 收尾」；⚠️ 纯文档批次，P0-1 整条线 38 步走完）**：把 `01` §五 阶段一出口验收收口成一份**可照抄的人工清单**。**零业务代码改动、零新增依赖、零新增环境变量、零 `shared`/`schema` 改动**（唯一动过的代码文件是 `backend/src/index.ts` 启动信封的 `step`）。**本批新增**：本文「**阶段一出口验收（人工）**」整节（前置四步表 + **R1~R7 逐条"怎么跑 / 看什么"** + **TTFT 取数命令** + 三条"最容易误判成 bug"的边界）；`docs/06`（路线图步数 29→38、包进度总表 G 行、P0-1-38 状态块与落地要点、版本记录）。**三条最值得记的**：① **"收尾"没编号会让 `pnpm check:batch` 恒真** —— 自检脚本按 `^####\s+(P\d+-\d+-\d+)\s+` 取"最后一个 `[✓]` 批次"，而它一直写作「P0-1 收尾」⇒ 机器永远看到 P0-1-37，**自检退化成一句永远成立的话**；处置是**编号 `P0-1-38`**（标题保留「P0-1 收尾」），**不改自检脚本**。② **TTFT 取数不能想当然用 `jq`** —— 本机 `infra/.env` 的 `LOG_PRETTY=true` 让它输出**美化文本**而非 JSON ⇒ 取数命令写成**两种形态都吃**的正则，并附 `n / min / median / max` 汇总；同时写明"`ttftMs` = 从本轮请求到第一个增量帧，**不含前端渲染**、**不能事后补**"。③ **出口验收第 4 条在单标签页里"点不出来"**（`CONFLICT` 要第二个标签页进同一会话才看得到）⇒ 这类"验收项与实现互相矛盾"的角落必须在清单里**点名**，否则会被当成"防重没生效"（P0-1-35 第 ⑥ 条的第二次应用）。**取证方式**：⚠️ **由用户人工执行 R1~R7**（2026-09-23 用户定案：智能体不再代跑验收/回归）；智能体侧**没有跑任何验收脚本、没有跑浏览器**。既有 `pnpm verify:chat-package`（24 项，夹具假上游）是"契约接对了"的旁证，**不等于**"人工出口验收通过"。**⚠️ 下一步 = P0-2**（工具闭环；同批已把 `docs/06` §四 的 12 步骨架扩写成与 P0-1 同粒度的**详规**，含 4.0 全局口径 / 4.1 五档验收 / 4.2 第五族权限 / P0-2-1~12 逐步验收门槛与坑预判）。 |
 | 2026-09-24 | — | **P0-2-1 完成（P0-2 工具闭环起步 1/12）：MCP client 底座** —— **新增** `backend/src/mcp/client.ts`（`McpClient`：`connect`/`listTools`/`callTool`/`close` + 出口**显式投影** `McpToolDescriptor`/`McpToolResult`；camelCase 之外**零 SDK 对象外泄**）、`backend/src/mcp/errors.ts`（SDK 异常 → 本仓错误码 + 可读中文 + 脱敏：`toMcpFailure`/`describeCauseChain`/`redactAll`/`mcpSnippet`/`McpAbortError`）、`backend/scripts/fixtures/mcp-upstream.mjs`（**假 MCP server**：Streamable HTTP 单 URL、**JSON 与 SSE 两种响应形态**、`setFailing`/`setUnauthorized`/`setSlow`/`setRawBody`/`setElicit`/`setRpcError`/`setToolsListPayload` 七种故障注入 + `setSessionRequired` + 全套请求流水记账）、`backend/scripts/verify-mcp-client.mjs`（**新增档 `pnpm verify:mcp-client` 34 项**）、`backend/src/config.ts` 的 **`mcp` 配置组（`MCP_REQUEST_TIMEOUT_MS`/`MCP_CONFIRM_TIMEOUT_SEC`/`MCP_TOOL_LIMIT`，3 个新环境变量）**、`infra/.env.example` + `infra/.env` 的 `[C] MCP` 段。**改动** `backend/src/index.ts`（启动信封 `step`）。**唯一新增依赖 `@modelcontextprotocol/sdk@1.30.1`**（`pnpm add` 输出 +75 −72 包、**未报** `ERR_PNPM_IGNORED_BUILDS`）；**零 `shared` 改动、零 schema 改动**（`mcp_servers`/`mcp_credentials` 属 P0-2-2/P0-2-4）。**五条最值得记的**：① ⚠️ **协议版本不可控** —— SDK 把请求版本**写死**在 `LATEST_PROTOCOL_VERSION='2025-11-25'`（无 setter）⇒ 设计目标 `2025-06-18` 的正确落法是**"请求最新、接受降级、协商结果留痕"**（服务端回 `2025-06-18` 时 SDK 接受并此后每条都带该头；回支持集外则 SDK 抛裸 `Error` ⇒ 我们翻成 502 并列出支持集）；`docs/06` §4.0 已按实测订正。② ⚠️ **中断与超时不能靠错误码分开** —— SDK 把任意中断原因包装成 `McpError(RequestTimeout)` ⇒ 必须由调用点传 `aborted`，且**判定顺序排在错误码之前**。③ ⚠️ **"会话丢了"伪装成"端点不存在"**（同码 404）⇒ 加判据"响应体提到 `session` 就改口"；且 `Client.close()` **不终止会话** ⇒ `McpClient.close()` 固定"**先 `DELETE`、后 close**"。④ ⚠️ **能力声明必须与实际相符**（`registerCapabilities({elicitation:{}})` 只在真传了 `onElicit` 时做；声明了却答不出来比不声明更难查），且它**只能在 connect 之前**调（之后直接抛）。⑤ **本档不需要 PG / Redis** —— "客户端层不认识数据库"这条设计约束因此变成**可执行断言**，`verify:mcp-client` 成了本仓**第一档"只要 dist + `infra/.env`"**的第四档验收。**取证**：`pnpm verify:mcp-client` **34 项全通过**（A 握手/会话/版本 6 / B 投影 3 / C `tools/call` 三分法 6 / D 失败分类 9 / E elicitation 3 / F 优雅关闭 4 / G 入口校验与配置 3），lint + 三包 typecheck/build 全绿，`pnpm check:batch` 一致；**上游是夹具** ⇒ 只证"契约与配置接对了"。**⚠️ 本批不是端测里程碑**（无界面、无路由）—— `§4.4` 的第一个端测点是 **P0-2-2 之后**的命令行档。归档：`issue_fix/问题记录-P0-2-1-MCP客户端底座.md` |
+| 2026-09-24 | — | **P0-2-2 完成（P0-2 工具闭环 2/12）——🎯 P0-2 第一个命令行端测里程碑**：MCP server 注册 CRUD + 连通测试。**新增** `shared/src/mcp.ts`（**契约层**：`MCP_AUTH_TYPES`/`MCP_SERVER_STATUSES` + slug 纯函数 `slugifyServerName`/`uniqueSlug` + 工具描述符 schema + `normalizeCredentialSchema` + 投影四段 + 请求侧三段；**`mcpEndpointUrlSchema` 用字段级 `superRefine` 自判 scheme**）、`backend/src/mcp/toolCache.ts`（**读不出来一律 `null`、整体作废**；**不 import 任何运行期模块** ⇒ 可被 `verify:app` 无依赖断言）、`backend/src/services/mcpServer.service.ts`（列表/建/改/删/**测试连通**/工具列表读侧 + **`sameJson` 键序无关比较** + `assertAuthTypeSupported`(OAUTH⇒400) + `probeServer`(**永不抛**)）、`backend/src/routes/mcpServers.ts`（**六条路由，只挂 `requireAuth`**）+ `app.ts` 接线、`backend/scripts/verify-mcp-servers.mjs`（**新档 `pnpm verify:mcp-servers` 31 项**）。**改动** 两个 `package.json`、`backend/src/index.ts`（启动信封 `step`）、**`assertComponentRefsBindable` 的 `MCP` 分支从"一律 400"换成存在性校验**（P0-1-23 的接回点兑现）+ `verify-agents.mjs` / `verify-agent-package.mjs` 的**对偶断言翻转**。**零新增依赖、零新增环境变量**（`mcp_servers` 表与迁移在 P0-2-2 落地）。**五条最值得记的**：① **权限第五族 = 登录即可、无 owner 列收窄**（最接近 knowledge-bases）—— `created_by` **只作留痕**，任何登录用户都能改/删别人注册的 server（`01` 决策 22 的直接推论）；验收用**两个 MEMBER** 且含两条**反向守卫**（"B 能改 A 建的""B 能删 A 建的"）。② **`POST /:id/test` 恒 HTTP 200** —— `ok:false` 是一条**结论**（这个 server 现在通不通）而非错误，只有 **id 不存在才 404**；成功时**顺手刷 `tool_cache`**、失败时**一个字节都不动**。③ **注册不强制连通**（上游抖动不该变成"建不了 server"）⇒ create 响应形态 = **`{server,test}`**（**不是**"裸 item 多一个键" —— 那等于承认同一份数据有两种形状）。④ **缓存失效判据是"真的变了"** —— `endpointUrl`/`credentialSchema`/`authType` 任一变了才清 `tool_cache`；只改 `name` **不动 slug、也不清缓存**；jsonb 往返**键序无关**比较（PG 会重排键 ⇒ 直比会产生**假阳**）。⑤ **`endpoint_url` 是 SSRF 面** —— P0 **只校验 scheme**（拒 `file:`/`gopher:`），**不做内网黑名单/端口白名单**（属 P1 安全加固，**已知且刻意**）。**⚠️ 三条验证脚本自身踩的坑**：**端口 1（含 7/9）是 fetch 规范的 bad port**（`undici` 发包前就拒 ⇒ 造"连接被拒绝"必须用"起个假 server 拿端口再关掉"）；**中文名被 `slugify` 折掉导致多用例共用 slug 族**（序号涨到 `-9` 撞车 ⇒ 独立序号用例改用专属 ASCII 名）；**历史欠账**（`verify:app` 的 Provider 投影夹具漏了 P0-1-37 的必填 `protocol`，一直被 `verify:model-providers` 遮住）。**验收**：`pnpm verify:mcp-servers` **31 项全通过**（真 PG + Redis + 假 MCP server，**不需要 MinIO**；跑完自清并断言残留为零）；`verify:app` **128 项**、`verify:agents` **35 项**、`verify:agent-package` **13 项**、`verify:model-providers` **18 项**全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`/api/mcp/servers` 与 `/api/mcp/credentials` 在界面上**仍是占位页**（MCP 管理页属 P0-2 后续）；`POST /:id/test` **不带用户凭据**（"注册者视角"，P0-2-5 定案）、凭据 CRUD 属 **P0-2-4**、工具名转换属 **P0-2-6**；`OAUTH` 注册 ⇒ 400 指向 **P1**。归档：`issue_fix/问题记录-P0-2-2-MCP-server-注册.md` |

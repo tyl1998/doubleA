@@ -136,6 +136,29 @@ enum DocumentStatus {
   @@map("document_status")
 }
 
+/// MCP server 的注册方式（`02` §三：`auth_type(NONE|OAUTH)`）。
+/// ⚠️ **P0 只接受 `NONE`**：`OAUTH` 的列先建出来（免得 P1 改表），但注册时收到它就 400 ——
+/// 与 P0-1-23 拒绝 `MCP` 绑定同一条定案（`06` §4.0 口径 1："接口留位、能力不做"，
+/// 不要"先收下、等以后有实现再收拾"）。OAuth 2.1 属 **P1**（`04` 评审 A7 建议 (a)）。
+enum McpAuthType {
+  NONE
+  OAUTH
+
+  @@map("mcp_auth_type")
+}
+
+/// MCP server 的**连通健康态**（`02` §三 原文只写了列名 `status`，取值域由 P0-2-2 补定）。
+/// `UNKNOWN` = 从未测过（刚注册且探测失败）；`OK` / `ERROR` = 最近一次 `POST /:id/test` 的结论。
+/// ⚠️ 它**不是启停开关** —— P0 不提供"停用"入口（"停用后工具不可见"属 P0-2-5/P0-2-6，
+/// 现在加一个只有写入、没有读取方的状态位只会造出"看着能停、其实照跑"的假开关）。
+enum McpServerStatus {
+  UNKNOWN
+  OK
+  ERROR
+
+  @@map("mcp_server_status")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -159,6 +182,7 @@ model User {
 
   agents        Agent[]
   conversations Conversation[]
+  mcpServers    McpServer[]
 
   @@map("users")
 }
@@ -475,4 +499,46 @@ model Chunk {
   ///   于是**每次 diff 都想把它改名**（实测），迁移与库两边名字必须钉死。
   @@index([content(ops: raw("gin_bigm_ops"))], type: Gin, map: "idx_chunks_bigram")
   @@map("chunks")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MCP（P0-2-2；`02` §三 的 `mcp_servers`）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// MCP server 注册表（`02` §三；按 `06` §4.3 的 ⚠️ 补两列 `slug` / `updated_at`）。
+///
+/// 三条口径（细节与理由见 `shared/src/mcp.ts` 文件头）：
+///   · **没有 owner 列的收窄** —— `created_by` 只作**留痕**、不参与权限判定
+///     （`06` §4.2 的第五族：`/api/mcp/**` 全员可注册、人人可见，与知识库同族；
+///     代价是"任何登录用户都能改/删别人注册的 server"，这是 `01` 决策 22 的推论）；
+///   · `slug` 从 `name` 派生、**创建时生成后不再变**（它要进工具名前缀 `mcp_{slug}_{tool}`，
+///     跟着改名会让历史消息里的 `content.tool_calls` 对不上真实调用）⇒ **刻意不加唯一约束**
+///     （best-effort，见 `uniqueSlug()` 的注释：并发的同名注册不该有一个 500；
+///     最终唯一性由 P0-2-6 的"工具名冲突加序号"保证）；
+///   · `oauth_config` 是 P1 的字段（列先建出来免得再改表），**不进任何响应契约**
+///     —— 下发一个恒为 `NULL` 的字段只会诱使前端写永远走不到的分支。
+model McpServer {
+  id               String          @id @default(uuid(7)) @db.Uuid
+  name             String          @db.VarChar(128)
+  /// 工具名前缀的派生名（小写 ASCII、≤32 字符；纯中文名回落 `server`）
+  slug             String          @db.VarChar(32)
+  /// Streamable HTTP 的**单一 URL**（不是 baseUrl + 路径拼接）
+  endpointUrl      String          @map("endpoint_url") @db.VarChar(2048)
+  authType         McpAuthType     @default(NONE) @map("auth_type")
+  /// P1（OAuth 2.1）的配置载体；P0 恒为 `NULL`
+  oauthConfig      Json?           @map("oauth_config") @db.JsonB
+  /// 注册者定义的凭据参数模板（形状属 P0-2-2、深度校验属 P0-2-3）
+  credentialSchema Json            @default("[]") @map("credential_schema") @db.JsonB
+  /// `{ fetchedAt, tools:[…] }`；`NULL` = **从未成功拉过**（形状属 P0-2-5）
+  toolCache        Json?           @map("tool_cache") @db.JsonB
+  status           McpServerStatus @default(UNKNOWN)
+  /// **留痕**：谁注册的。⚠️ 不参与权限判定（本表没有 owner 列收窄）
+  createdBy        String          @map("created_by") @db.Uuid
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  creator User @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([createdBy])
+  @@map("mcp_servers")
 }
