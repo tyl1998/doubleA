@@ -5,6 +5,9 @@
  * 消费方是 **P0-2-8** 的编排循环（本批只交纯函数，**不接线** —— 与 `mcp/toolCache.ts`、
  * `pipeline/chunk/` 同款：本模块**不 import 任何运行期模块**（不碰 config / prisma / 日志 / SDK），
  * 于是它的断言不需要起依赖）。
+ * ⚠️ **P0-2-9 起有一个例外**：`import { isDangerousTool } from './risk.js'` —— 它同样是叶子模块
+ * （只有一条 `import type`），加它是为了在**这里**就把"这个工具危不危险"算进 `routes`
+ * （判定需要工具自己的 `annotations`，而工具描述符只有本函数手上才有，见 {@link McpToolRoute}）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 为什么"只做三件兼容处理"，而不是顺手把 schema 理顺
@@ -29,6 +32,8 @@ import {
   MCP_TOOL_WRAPPER_KEY,
   type McpToolDescriptor,
 } from '@doubulea/shared'
+
+import { isDangerousTool } from './risk.js'
 
 /** 出一个 server 的 slug 之外还**必须要 `id`**：见 {@link McpToolRoute} 的注释 */
 export interface McpServerRef {
@@ -64,6 +69,17 @@ export interface McpToolRoute {
   /** MCP 侧的**原始**工具名（`tools/call` 要原样回给它，不是我们改写过的那个） */
   toolName: string
   serverId: string
+  /**
+   * 这个工具要不要走平台的确认流（**P0-2-9** 的判定结果；判据表见 `mcp/risk.ts` / `02` §9.9）。
+   *
+   * ⚠️ **为什么算在这里、而不是留给编排层现算**：判定要看工具自己的 `annotations`，
+   * 而"工具描述符"只有本函数手上才有（`01` 决策 22 + `06` P0-2-9 坑预判 2：判定输入是
+   * **这个工具**、不是**这台 server**）。编排层拿到的是"模型回的名字 + 这张映射表"，
+   * 若不给它这一列，它只能**再查一次库/缓存**去凑描述符 —— 多一次 round-trip，还多一个
+   * "查到的那份与刚才下发给模型的那份不是同一份"（缓存被刷新过）的出错点。
+   * ⚠️ 它也**不进** {@link OpenAiFunctionTool}：这是**我们的策略**，不是给模型的提示。
+   */
+  dangerous: boolean
 }
 
 /** {@link toOpenAiTools} 的产出 */
@@ -124,7 +140,7 @@ export function toOpenAiTools(
     })
     // 名字恒以 `mcp_` 开头 ⇒ 不会撞上 `Object.prototype` 的键（constructor / toString…），
     // 所以这里用普通对象当映射表是安全的（P0-2-8 直接 `routes[name]` 取值）
-    routes[name] = { toolName: tool.name, serverId: server.id }
+    routes[name] = { toolName: tool.name, serverId: server.id, dangerous: isDangerousTool(tool) }
   }
 
   return {

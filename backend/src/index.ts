@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-8 编排循环接工具调用 + 10 轮上限（chatBot.ts 的 for(;;) 工具循环：LLM 流式 tool_calls 分片累积 ⇒ 映射 routes ⇒ 取凭据（P0-2-7）⇒ 执行 ⇒ tool_call{RUNNING}→{SUCCESS|ERROR} ⇒ 结果回填续流 / 到 TOOL_LOOP_LIMIT 当轮撤掉 tools 并注入提示 / 工具失败≠这一轮失败（唯一例外是中断）/ tool_calls 结构化落库进助手消息 content；危险判定接回点已预留在执行之前，属 P0-2-9）',
+    step: 'P0-2-9 危险判定（mcp/risk.ts 纯函数 isDangerousTool：readOnlyHint === true 且 destructiveHint !== true ⇒ 安全，其余含读不出注解一律危险；结果由 toolSchema.ts 算进 McpToolRoute.dangerous，接线点是 chatBot.ts 工具循环里取凭据 / 发 RUNNING 卡之前那一处；⚠️ 缺的只是「挂起等 /confirm」那一半，属 P0-2-10 ⇒ 所有工具仍一律直接执行）',
     address,
   })
   logger.info(
