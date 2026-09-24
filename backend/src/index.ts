@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-9 危险判定（mcp/risk.ts 纯函数 isDangerousTool：readOnlyHint === true 且 destructiveHint !== true ⇒ 安全，其余含读不出注解一律危险；结果由 toolSchema.ts 算进 McpToolRoute.dangerous，接线点是 chatBot.ts 工具循环里取凭据 / 发 RUNNING 卡之前那一处；⚠️ 缺的只是「挂起等 /confirm」那一半，属 P0-2-10 ⇒ 所有工具仍一律直接执行）',
+    step: 'P0-2-10 elicitation 确认流（confirm 事件挂起 + POST /:id/confirm 应答 + 120s 超时按取消 / 两条来源统一走 SseChannel#awaitConfirm：PLATFORM=危险工具先问后执行、SERVER=MCP elicitation/create 途中问；应答槽 chat.confirm:{id} 存 {confirmId,accepted} 按 id 匹配、读到即删；取消/超时都回填 tool_result 且**流程继续**；重复/迟到的应答一律 200 + applied:false）',
     address,
   })
   logger.info(

@@ -5,9 +5,10 @@
  *      + §四 约定（信封 / offset-limit 分页）+ §五（SSE 协议全文）+ §5.2（互斥 / 心跳 / 停止 / 断线）
  *      + `01` §3.3 功能表第 9 条 + `03` §4.1（会话侧栏与输入区状态机）/ §七（会话删除是级联删除）。
  *
- * 八条已落地（P0-1-25 五条 + P0-1-26 两条 + **P0-1-28 的消息历史**）：Agent 会话列表 / 新建 /
- * 重命名 / 删除 / `/active` / **`/chat`（SSE）** / **`/stop`** / **`/messages`**。
- * `02` §4.5 那张表的九条路由至此只剩一条没有出口：`/:id/confirm`（**P0-2**，要 `mcp_servers` 表）。
+ * 九条已全部落地（P0-1-25 五条 + P0-1-26 两条 + **P0-1-28 的消息历史** +
+ * **P0-2-10 的确认应答**）：Agent 会话列表 / 新建 / 重命名 / 删除 / `/active` /
+ * **`/chat`（SSE）** / **`/stop`** / **`/messages`** / **`/confirm`**。
+ * `02` §4.5 那张表的九条路由**至此无缺口** ⇒ 本文头部"仍缺一条"的旧注记已删除。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 权限：**只有本人**，且靠"查询条件里带 userId"实现，路由层没有任何判据
@@ -34,6 +35,7 @@
 
 import {
   chatRequestBodySchema,
+  confirmRequestBodySchema,
   conversationIdParamsSchema,
   createConversationBodySchema,
   listConversationsQuerySchema,
@@ -43,6 +45,7 @@ import {
   agentIdParamsSchema,
   type AgentIdParams,
   type ChatRequestBody,
+  type ConfirmRequestBody,
   type ConversationIdParams,
   type CreateConversationBody,
   type ListConversationsQuery,
@@ -52,7 +55,7 @@ import {
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { resolveChatProducer } from '../orchestrator/index.js'
-import { signalStop, streamChatReply } from '../orchestrator/sse.js'
+import { answerConfirm, signalStop, streamChatReply } from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
   assertConversationSendable,
@@ -239,6 +242,46 @@ export function registerConversationRoutes(app: FastifyInstance): void {
       const active = await getConversationActive(request.params.id, viewerOf(request))
       if (!active.streaming) return ok({ id: request.params.id, signaled: false })
       return ok({ id: request.params.id, signaled: await signalStop(request.params.id) })
+    },
+  )
+
+  /**
+   * 确认 / 取消一次挂起中的确认（`02` §4.5 的第九条路由；P0-2-10，`docs/02` §9.10）。
+   *
+   * 它是 `confirm` 事件的**唯一应答口**：流在"危险工具 / 服务端 elicitation"处挂起
+   * （`orchestrator/sse.ts#awaitConfirm`）等待本端点的答案，上限 `MCP_CONFIRM_TIMEOUT_SEC`
+   * （默认 120s），超时按取消处理（`02` §5.2）。
+   *
+   * ── 判据只有一条：**有没有人在等这个 `confirmId`** ──
+   * 与 `/stop` 同款：先读 `/active`（**顺带完成"这不是我的会话就 404"**，判据是
+   * `services/conversation.service.ts` 文件头 ① 那一条，本处**不另起一套**），
+   * 再把 `pendingConfirmId` 原样交给 `answerConfirm` 按 id 匹配。
+   *
+   * 刻意**不**在这里分"会话只读（Agent 被软删）"那一支（`06` P0-2-10 门槛 4 的原文写了 409）：
+   * 只读会话**必定**没有活跃流 ⇒ `pendingConfirmId === null` ⇒ 走"幂等忽略"、结论一模一样；
+   * 而单开那一支会让"Agent 在流中途被软删、用户正在看确认卡"这一路误报 409
+   * （那时流还在跑、这次确认**是**有效的）。完整推理见 `orchestrator/sse.ts#answerConfirm`。
+   *
+   * ⚠️ **顺序：先读 `/active`、再写信号**（与 `/stop` 同一条纪律）。反了会在"确认刚好超时"
+   * 时往一个没人消费的槽位写一条应答；它虽然会被下一次 `awaitConfirm` 的清理点抹掉，
+   * 但那 60s 里 Redis 里躺着一个查不明白的键。
+   *
+   * 三种结局都是 200（**幂等**）：`applied:true` = 有一个等待中的流收到了这个答案；
+   * `applied:false` = 没有人在等（已超时/已取消/这一轮早结束了/`confirmId` 是上一轮的迟到点击
+   * —— 见 `shared#confirmConversationResultSchema`）。做成 4xx 只会让用户看到一个
+   * 没有信息量的报错，而**重复点击**必然发生（用户看到卡片没消失就会再点一次）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: ConfirmRequestBody }>(
+    '/api/conversations/:id/confirm',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: confirmRequestBodySchema },
+    },
+    async (request) => {
+      const active = await getConversationActive(request.params.id, viewerOf(request))
+      return ok(
+        await answerConfirm(request.params.id, request.body, active.pendingConfirmId),
+      )
     },
   )
 }

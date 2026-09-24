@@ -259,6 +259,38 @@ export function chatStopKey(conversationId: string): string {
 }
 
 /**
+ * `chat.confirm:{conversationId}` 键名 —— **确认应答槽**（P0-2-10，`02` §9.10）。
+ *
+ * 依据：`02` §5.2「confirm 挂起：确认等待上限 120s，超时按取消处理」+ §六 第 4 步
+ *      （`elicitation 请求 → confirm 事件挂起 → /confirm 应答`）。
+ *
+ * ⚠️ **一个会话只有一个槽位、且值是结构化的**（`{confirmId, accepted}`）—— 这两条都与
+ * `chat.stop:{id}` 刻意不同，理由各一条：
+ *   · 停止信号是"有没有"（布尔），而确认应答要回答"**答的是哪一个提问**"。用"有没有"的形态
+ *     会让上一轮的迟到点击被下一轮当成答案消费掉，症状是"**确认卡一闪而过**"
+ *     （`06` P0-2-10 坑预判 2）⇒ 值里必须带 `confirmId`，由消费方按 id 匹配；
+ *   · 槽位只有一个：同一会话同一时刻只可能有一个待答确认（流是串行的、工具是**顺序**执行的）。
+ *     写第二个应答只会覆盖第一个 —— 而那是"用户点了两次"的正常形态，覆盖掉的又恰好是同一个值。
+ *
+ * ⚠️ 消费方（`orchestrator/sse.ts#awaitConfirm`）**读到匹配的应答后立即 DEL**：
+ * 不清的话下一轮 `awaitConfirm` 会立刻拿到上一轮的答案（同一个"一闪而过"的症状）。
+ * 新起一轮等待时还会**再清一次** —— 两道防线，与 `chat.stop` 同款。
+ */
+export function chatConfirmKey(conversationId: string): string {
+  return `chat.confirm:${conversationId}`
+}
+
+/**
+ * 确认应答键的 TTL（秒）。
+ *
+ * 与 {@link CHAT_STOP_TTL_SEC} **同一条推理**、取同一个量级：正常路径下消费方读到就删
+ * （延迟 = 一次轮询，250ms–2s），TTL 只为"键写了、流却已经死了"兜底。
+ * 不能取长：残留的应答会让**下一次** `awaitConfirm` 立刻命中一个**不同的** `confirmId`
+ * ⇒ 被按 id 不匹配丢弃（安全），但"为什么 Redis 里躺着一个没人要的应答"会变成一个查不明白的问题。
+ * ⚠️ 也不能短于一次轮询周期 —— 应答在消费方读到之前过期，用户就会看到"点了确认但没反应"。
+ */
+export const CHAT_CONFIRM_TTL_SEC = 60
+/**
  * 停止信号的 TTL（秒）—— `02` §5.2 明文规定 60s，不是随手取的数。
  *
  * 它是**兜底**：正常路径下流结束时（`finally`）就把键删掉；TTL 只为"键写了、流却已经死了"

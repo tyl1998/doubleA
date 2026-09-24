@@ -134,11 +134,44 @@ export type SseThinkingPayload = z.infer<typeof sseThinkingPayloadSchema>
 export const sseToolCallPayloadSchema = toolCallRecordSchema.omit({ arguments: true })
 export type SseToolCallPayload = z.infer<typeof sseToolCallPayloadSchema>
 
-/** `confirm`：等待用户确认（P0 只有确认/取消二元语义，不做自由输入表单，`02` §六 第 4 步） */
+/**
+ * 确认请求的**来源**（P0-2-10；`02` §9.10）。
+ *
+ * 两件不同的事必须收进**同一个** `confirm` 事件（前端只有一种确认卡形态）：
+ *   · `PLATFORM` —— **平台强制**的确认：工具被判为危险（`mcp/risk.ts`，判定表见 `02` §9.9）
+ *     ⇒ 在**编排层**发起，不依赖 server 主动请求（`01` 决策 22）；
+ *   · `SERVER` —— MCP server 在 `tools/call` 途中反向发起的 `elicitation/create`
+ *     （应答方是 `mcp/client.ts` 注册的 handler，见其文件头判据 5）。
+ *
+ * ⚠️ 判据是"**谁在问**"，不是"问了什么"：两者的 payload 形状、挂起原语、应答端点完全一致
+ * （都走 `POST /:id/confirm` 的确认/取消二元语义），差异只在**前端那句说明文案**上
+ * —— 所以它是一个**判别字段**，而不是两个事件。
+ */
+export const CONFIRM_SOURCES = ['PLATFORM', 'SERVER'] as const
+export type ConfirmSource = (typeof CONFIRM_SOURCES)[number]
+
+/**
+ * `confirm`：等待用户确认（P0 只有确认/取消二元语义，不做自由输入表单，`02` §六 第 4 步）。
+ *
+ * ⚠️ **P0-2-10 的契约增量**：多了 `source` 与 `expiresAt` 两个键（原先只有三个）。
+ *   · `source` 见 {@link CONFIRM_SOURCES}：前端据此选说明文案（"工具需要确认" / "对方要求确认"）；
+ *   · `expiresAt` 是**服务端**这次等待的截止时刻（ISO 8601，= 发起时刻 + `MCP_CONFIRM_TIMEOUT_SEC`）。
+ *     为什么由服务端给：`03` §4.1 的"120s 倒计时"**是服务端超时在前端的投影** ——
+ *     让前端自己另起一个 120s，两边只要有一点点差（网络、时钟、重连）就会变成
+ *     "界面说还没到、服务端已按取消处理"，而用户看到的是"我点了确认但什么都没发生"
+ *     （`06` P0-2-11 坑预判 3）。有了绝对时刻，重连之后也能算对剩余时间。
+ *
+ * ⚠️ **`toolName` 的含义随 `source` 变**：`PLATFORM` 时是**下发给模型的那个工具名**
+ * （`mcp_{slug}_{tool}`，与 `tool_call` 卡一致）；`SERVER` 时是**正在执行的那个工具**
+ * （elicitation 发生在它的 `tools/call` 途中）—— 所以两处都不为空，前端不必分支。
+ */
 export const sseConfirmPayloadSchema = z.object({
   confirmId: z.string().min(1),
+  source: z.enum(CONFIRM_SOURCES),
   toolName: z.string().min(1),
   inputSummary: z.string(),
+  /** 服务端等待的截止时刻（ISO 8601）—— 前端倒计时**只**读它，不自己另起一个 120s */
+  expiresAt: z.string(),
 })
 export type SseConfirmPayload = z.infer<typeof sseConfirmPayloadSchema>
 
@@ -291,3 +324,60 @@ export const stopConversationResultSchema = z.object({
   signaled: z.boolean(),
 })
 export type StopConversationResult = z.infer<typeof stopConversationResultSchema>
+
+// ───────────────────────────── 确认应答（P0-2-10）─────────────────────────────
+
+/**
+ * `POST /api/conversations/:id/confirm` 的请求体（`02` §4.5 的表：`{confirmId, accepted}`）。
+ *
+ * ⚠️ **这个请求的全部结果都走 JSON 信封**（含"幂等忽略"的 `applied:false`），
+ * **绝不**往那条 SSE 流里补帧：它是独立于流的一次普通请求，主语是"这一次答复"，
+ * 而不是"这一轮生成"（`shared/src/sse.ts` 文件头 ③ 的两类失败口径）。
+ *
+ * `confirmId` 是 `confirm` 事件里那个 id —— **它存在的唯一理由是"答案是回答哪一个提问"**：
+ * 一个会话的应答键只有一个槽位，没有它就无法区分"回答当前这个"与"上一轮的迟到点击"
+ * （后者若被当成当前答案消费掉，症状是"**确认卡一闪而过**"，`06` P0-2-10 坑预判 2）。
+ *
+ * ⚠️ 刻意**不写 `.uuid()`**：id 的形态是**实现细节**（现在是 `randomUUID()` 的 v4），
+ * 而这里要判的是"答的是不是这一个"，不是"它长得像不像 uuid"。用 `.min(1)` 只挡空值，
+ * 其余交给服务端的**匹配**去判 —— 否则某天换了 id 生成方式，这一行会静默把所有应答变成 400。
+ */
+export const confirmRequestBodySchema = z.object({
+  confirmId: z
+    .string({
+      required_error: '缺少 confirmId（应回传 confirm 事件里的那个值）',
+      invalid_type_error: 'confirmId 必须是字符串',
+    })
+    .min(1, 'confirmId 不能为空'),
+  accepted: z.boolean({
+    required_error: '缺少 accepted（true = 确认执行，false = 取消）',
+    invalid_type_error: 'accepted 必须是布尔值',
+  }),
+})
+export type ConfirmRequestBody = z.infer<typeof confirmRequestBodySchema>
+
+/**
+ * 确认应答的结果。
+ *
+ * `applied` 是**这个端点的全部信息量**（其余三列是把请求原样回带，便于前端对账）：
+ *   · `true` = 这个答复确实交给了**正在等待**的那一轮，工具会照此执行或跳过；
+ *   · `false` = **幂等忽略**：那个提问已经不存在了（超时按取消处理完 / 已被答复过 /
+ *     这一轮已经结束），所以什么都没发生。
+ *
+ * ⚠️ **`applied:false` 是 200 而不是 4xx** —— 与 `/stop` 的 `signaled:false`**同一条理由**：
+ * "确认卡刚超时、用户此刻正好点了确认"这个竞态**必然存在**（`02` §5.2 的 120s 上限就是这么定的），
+ * 而它是一条**正常的终局**（那一轮已经按取消走完了），不是用户的错误操作。
+ * 把它做成 4xx，前端就会为一个用户无法处理、也无从理解的竞态弹一条红色报错。
+ * ⇒ 拿不准的时候，用户应当看到的是"这次确认没生效、这一轮已按取消处理"，
+ * 而不是"确认失败：请求与当前状态冲突"。
+ *
+ * ⚠️ **刻意没有 `status` 之类的会话状态回带**：调用方要状态就查 `/active`，
+ * 这里多回一列等于给"会话状态"开第二个读取点（P0-1-21 的"同一份数据不许有第二种形状"）。
+ */
+export const confirmConversationResultSchema = z.object({
+  id: z.string(),
+  confirmId: z.string(),
+  accepted: z.boolean(),
+  applied: z.boolean(),
+})
+export type ConfirmConversationResult = z.infer<typeof confirmConversationResultSchema>

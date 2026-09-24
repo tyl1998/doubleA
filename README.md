@@ -1607,8 +1607,8 @@ curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP | jq '.data | {na
 #    ⇒ 执行 `tools/call` ⇒ 卡片 `RUNNING`→`SUCCESS` ⇒ 结果回填 ⇒ **续流** ⇒ `tool_calls` 落进助手消息。
 #    ⚠️ **本批没有界面**（`/mcp` 页仍是占位页）⇒ 这一整节都是**命令行**档；`tool_call` 事件是 SSE 帧，
 #       `curl -N` 就能逐帧看到（前端 `ToolCard` 渲染同一份数据属 P0-2-11）。
-#    ⚠️ **危险判定已经算出来了（P0-2-9 起 `route.dangerous` 就是对的），但"确认"这一半属 P0-2-10**
-#       ⇒ 所有工具**仍然一律直接执行、不弹确认卡** —— 这是**预期**，别把"判定做了"读成"确认流做了"。
+#    ⚠️ **危险判定（P0-2-9）与"确认"（P0-2-10）都已落地** ⇒ 本节调的是**安全**工具（`echo`/`boom`
+#       声明了 `readOnlyHint:true`）故**不弹确认**；危险工具（下面那个 `purge`）走 ㉔ 那一节。
 #    前置：承接 ⑳（有一台 server）或**直接照这段新建一台**；另需要一个**假 LLM 上游**（下面 ㉓-⓪ 一起起）。
 
 # ㉓-⓪ 另开一个终端：**同时**起"假 MCP server + 假 LLM"两个上游，前台常驻（Ctrl-C 收工）
@@ -1617,6 +1617,14 @@ curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP | jq '.data | {na
 #        · 普通话        ⇒ 先吐一个 `tool_calls`（`arguments` **故意拆成两片**）⇒ 拿到工具结果后**续流收尾**（门槛 1）
 #        · 含 `boom`     ⇒ 去调那个**自己报错**的工具 ⇒ 卡片 `ERROR`（门槛 2）
 #        · 含 `loop`     ⇒ **每轮都接着要工具**（直到后端把 `tools` 撤掉）⇒ 验 10 轮上限（门槛 3）
+#        · 含 `purge`    ⇒ 去调那个**危险工具** ⇒ **先弹确认**（P0-2-10 起，㉔ 那一节验）
+#      ⚠️ 假 LLM 判"该给正文了"用的是"**上一条就是工具结果**"（不是"历史里出现过工具结果"）——
+#        后端每轮都发**完整历史**，用后者会让"第二次对话"永远不再要工具（㉓-g 与 ㉔-a/㉔-b 全都被静默跳过，
+#        而那三节看起来只是"没反应"）。**这条是 P0-2-10 写 ㉔ 时发现并修掉的**，见下面那行注释。
+#      ⚠️ **三个工具的 `annotations` 是刻意的**（`02` §9.9 真值表的两种输入，P0-2-10 起才有可观测差别）：
+#        `echo` / `boom` 声明 `readOnlyHint:true` ⇒ 判为**安全** ⇒ 直接执行（㉓ 这一节因此**不弹确认**）；
+#        `purge` **什么注解都不声明** ⇒ 读不出「只读」⇒ 判为**危险** ⇒ 先挂起问用户。**这不是 bug**。
+#        换句话说：**如果你把 `annotations` 那几行删掉，㉓ 整节都会变成"每调一次工具先弹一次确认"**。
 node --input-type=module -e '
 const http = await import("node:http");
 let mcpN = 0, llmN = 0;
@@ -1629,12 +1637,13 @@ const mcp = http.createServer(async (req, res) => {
   const result =
     msg.method === "initialize" ? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake-mcp", version: "1.0.0" } }
     : msg.method === "tools/list" ? { tools: [
-        { name: "echo", description: "原样回显传入的 text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
-        { name: "boom", description: "故意失败（验「工具失败错误可见」）", inputSchema: { type: "object", properties: {} } } ] }
+        { name: "echo", description: "原样回显传入的 text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] }, annotations: { readOnlyHint: true } },
+        { name: "boom", description: "故意失败（验「工具失败错误可见」）", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } },
+        { name: "purge", description: "会改数据（验确认流：先问、后执行）", inputSchema: { type: "object", properties: { target: { type: "string" } } } } ] }
     : msg.method === "tools/call"
       ? (msg.params?.name === "boom"
           ? { isError: true, content: [ { type: "text", text: "工具自己报错：boom 永远失败" } ] }
-          : { content: [ { type: "text", text: "echo <- " + JSON.stringify(msg.params?.arguments ?? {}) } ] })
+          : { content: [ { type: "text", text: msg.params?.name + " <- " + JSON.stringify(msg.params?.arguments ?? {}) } ] })
       : {};
   res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
 });
@@ -1645,18 +1654,23 @@ const llm = http.createServer(async (req, res) => {
   const msgs = p.messages ?? [];
   const tools = p.tools ?? [];
   const lastUser = String([...msgs].reverse().find((m) => m.role === "user")?.content ?? "");
-  const sawToolResult = msgs.some((m) => m.role === "tool");
+  // ⚠️ 判据是"**上一条就是工具结果**"（这一轮已经回填过了 ⇒ 该给正文了），**不是**"历史里出现过工具结果"：
+  //    后端每轮都把**完整历史**发过来（含前几轮的工具结果），用后者的话第二次对话就永远不再要工具了
+  //    —— ㉓-g（boom）与 ㉔-a/㉔-b（purge）**都是"新建一轮"**，全会被静默跳过。
+  const sawToolResult = msgs[msgs.length - 1]?.role === "tool";
   const wantBoom = lastUser.includes("boom"), wantLoop = lastUser.includes("loop");
-  const pick = (wantBoom ? tools.find((t) => t.function.name.endsWith("boom")) : tools[0])?.function?.name;
-  // 要工具的三个条件：这一轮确实下发了 tools、选得出一个、且（还没拿到过结果 或 说话人要求 loop）
+  const wantPurge = lastUser.includes("purge");
+  const pick = (wantPurge ? tools.find((t) => t.function.name.endsWith("purge"))
+    : wantBoom ? tools.find((t) => t.function.name.endsWith("boom")) : tools[0])?.function?.name;
+  // 要工具的三个条件：这一轮确实下发了 tools、选得出一个、且（**这一轮**还没回填过结果 或 说话人要求 loop）
   const shouldCall = pick !== undefined && (wantLoop || !sawToolResult);
   llmN += 1;
-  console.log(`[假LLM] #${llmN} stream=${p.stream === true} 含tool结果=${sawToolResult} 下发工具数=${tools.length} 首个工具=${pick ?? "(无)"} ⇒ ${shouldCall ? "要工具" : "给正文"}`);
+  console.log(`[假LLM] #${llmN} stream=${p.stream === true} 已回填=${sawToolResult} 下发工具数=${tools.length} 首个工具=${pick ?? "(无)"} ⇒ ${shouldCall ? "要工具" : "给正文"}`);
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   const send = (o) => res.write("data: " + JSON.stringify(o) + "\n\n");
   const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", created: 1, model: p.model };
   if (shouldCall) {
-    const full = pick.endsWith("boom") ? "{}" : "{\"text\":\"你好\"}";
+    const full = pick.endsWith("purge") ? "{\"target\":\"日志\"}" : pick.endsWith("boom") ? "{}" : "{\"text\":\"你好\"}";
     const cut = Math.max(1, Math.floor(full.length / 2));            // 故意拆两片 ⇒ 验「分片累积」
     send({ ...base, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: pick, arguments: full.slice(0, cut) } }] }, finish_reason: null }] });
     send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: full.slice(cut) } }] }, finish_reason: null }] });
@@ -1687,7 +1701,7 @@ jq '.data.server | {id, name, slug, status}' /tmp/mcp2.json ; echo "MCP2=$MCP2"
 # ㉓-a′ 刷一次工具缓存（编排循环只读 `tool_cache` ⇒ **必须先成功拉过一次**，否则下发给模型的工具数是 0）
 curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP2/tools?refresh=1" \
   | jq '.data | {tools: [.tools[].name], cached}'
-#  → 两个工具 `echo` / `boom`、`cached:false`（这是**真拉**；假上游 # 里多 3 条）
+#  → 三个工具 `echo` / `boom` / `purge`、`cached:false`（这是**真拉**；假上游 # 里多 3 条）
 
 # ㉓-b 建一个指向假 LLM 的 Provider（Key 给个占位串即可 —— 假上游不看鉴权头）
 #      🔑 baseUrl 就是 `$LLMURL`（它已经带 `/v1`，别再拼一遍）
@@ -1764,15 +1778,99 @@ curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/ch
 #    改在 ㉓-h 的 long 流里另开终端按 ⑯-c
 #  → 收到 `done{finishReason:"STOPPED"}`、**已生成部分照常落库**（同 ⑰-d 的口径）；
 #    `McpAbortError` 是**唯一**能让工具循环真的停下来的错误（其余失败都只是那一条工具失败）。
+
+# ㉔ 确认流（P0-2-10）—— **危险工具先问后执行**（HITL，`01` §3.6 / `02` §9.10）
+#    承接 ㉓（同一台假上游、同一个 AGENT2）⇒ **不用重起任何东西**。
+#    验的是四件事：① 危险工具在用户点头**之前**绝不发 `tools/call`；② 点取消 ⇒ 工具没执行、
+#    但**这一轮继续**（模型拿到"未执行"的结果照样给出正文）；③ 不点 ⇒ 等满
+#    `MCP_CONFIRM_TIMEOUT_SEC`（默认 120s）按取消；④ 重复点 / 迟到点 / 别人的会话 ⇒ **200 但不生效**。
+#    ⚠️ **本批仍没有界面**（确认卡是 P0-2-11）⇒ 这一节是**命令行**档：`confirm` 是 SSE 帧，
+#      应答要靠 `POST /:id/confirm` 手打 —— 所以**必须开着两个终端**。
+
+# ㉔-a **【门槛 1 + 2】挂起 → 取消 → 工具没执行、流程继续（含"两个确认不串台"）**
+#    终端 A（起流，`curl -N` 会一直挂着 —— 这就是"挂起"）：
+curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/chat \
+  -H 'content-type: application/json' -d '{"content":"帮我 purge 一下"}'
+#  → 帧序：先 `event: confirm`
+#      data: {"confirmId":"<一串 uuid>","source":"PLATFORM","toolName":"mcp_fakemcp_purge","inputSummary":"{\"target\":\"日志\"}","expiresAt":"…"}
+#    然后**就停在这里等**（只有 `ping` 在继续）。⚠️ **这一帧之前不该出现任何 `tool_call{RUNNING}`** ——
+#    卡片排在确认之后就没意义了（"先问、后发运行中"）。
+
+#    终端 B：先看 `/active` —— 挂起是否**可观测**（断线重连的客户端就靠这个知道"有个提问在等我"）
+curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/conversations/$CONV2/active | jq '.data'
+#  → `{"streaming":true,…,"pendingConfirmId":"<与上面 confirmId 逐字相同>"}`
+
+#    终端 B：**取消**（把上面抄下来的 confirmId 填进去，注意带引号）
+CID='<粘贴 confirmId>'
+curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/confirm \
+  -H 'content-type: application/json' -d '{"confirmId":"'"$CID"'","accepted":false}' | jq .
+#  → `{"code":0,…,"data":{"id":"…","confirmId":"…","accepted":false,"applied":true}}`
+#    ⚠️ `applied:true` = 有一个人在等这个 id 并**真的收到了**（这与 payload 里的 `accepted` 是两件事）
+
+#  → 终端 A 紧接着吐出：
+#      event: tool_call  data: {…,"status":"ERROR","inputSummary":"{\"target\":\"日志\"}","output":"工具调用未执行：用户已取消本次操作。请不要重试…"}
+#      event: delta      data: {"text":"…"}      ← **流程继续**：模型拿到"未执行"照样续流
+#      event: done       data: {"finishReason":"COMPLETE",…}
+#    ⚠️ **只有一张 ERROR 卡、没有 RUNNING 卡**（`callId` 相同 ⇒ 前端 upsert 只显示最终态）。
+#    ⚠️ **取证点（槛 1）**：假上游那个终端里 `tools/call` 的计数**不涨**（purge **一次都没发出去**）。
+#       假 MCP 只该多出"握手那 3 条"（这一次的懒连接），或一条都不多（连接已复用）。
+
+# ㉔-b **【门槛 1 的另一半】确认 ⇒ 才真的执行**
+#    终端 A 再发一次同样的请求，终端 B 这次 `accepted:true`
+curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/chat \
+  -H 'content-type: application/json' -d '{"content":"再 purge 一下"}'
+#    （终端 B：`-d '{"confirmId":"'"$CID"'","accepted":true}'`，CID 用这一轮新拿到的那一个）
+#  → 终端 A：`confirm` ⇒ 挂起 ⇒ 应答后 `tool_call{RUNNING}` → `tool_call{SUCCESS, output:"purge <- {\"target\":\"日志\"}"}`
+#    ⇒ `delta` ⇒ `done{COMPLETE}`。**这一次假上游的 `tools/call` 计数 +1**（真的执行了）。
+#    ⚠️ **这一节同时是"两个确认不串台"的断言**（`06` P0-2-10 坑预判 2 要的那条）：这一轮的
+#       `confirmId` 与 ㉔-a **必须是两个不同的值**，且这张卡要**停住**等应答 —— 若它"一闪而过"
+#       （`confirm` 帧刚到就自己没了），说明上一轮的应答被这一轮消费掉了（判据 = 应答槽按 id 匹配）。
+#       ⚠️ 换 `CID` 是最容易漏的一步：**用上一轮的旧 id 打这一轮** ⇒ `applied:false`、卡会一直挂到超时。
+
+# ㉔-c **【门槛 4】幂等：同一张卡的重复点击 / 迟到点击 / 别人的会话**
+#    ① 用**已经用过**的那个 CID（上一轮早结束了）再打一次 ⇒ **200 但 `applied:false`**
+curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/confirm \
+  -H 'content-type: application/json' -d '{"confirmId":"'"$CID"'","accepted":true}' | jq '.data'
+#  → `{"…","applied":false}` —— 不是一个 4xx。理由：用户看到卡片没消失就会**再点一次**，
+#    那是正常操作而不是错误；同理"这一轮已经按超时走完了，用户此刻才点"也是常态。
+#    ⚠️ **绝不能变成第二次执行**（"重复确认导致工具跑两遍"是这一步最危险的退化）。
+# ② **没有待答确认时**也一样（会话此刻空闲）⇒ `applied:false`
+# ③ **别人的会话 / 不存在的会话** ⇒ 统一信封 **404**（与其余会话端点同族，不是 403）
+# ④ `confirmId` 不是非空字符串 / `accepted` 不是布尔 ⇒ **400** + `data.fields[]`
+#    分别指到 `body.confirmId` / `body.accepted`（顶层 `msg` 恒「请求参数校验失败」）
+
+# ㉔-d **【门槛 3】超时按取消** —— 这条**必须**把等待上限调小，别真等 120s：
+#    ① 停掉后端，用 2 秒的上限重启（`infra/.env` 里也可以改 `MCP_CONFIRM_TIMEOUT_SEC`）
+#       ⚠️ 端口见 `infra/.env`（本仓是 13000）；`dev:backend` 是 tsx watch，Ctrl-C 即退
+MCP_CONFIRM_TIMEOUT_SEC=2 pnpm dev:backend
+#    ② 外面重跑 ㉔-a 的**起流**那一条，**什么都不答**（也不要动 `$CID`）
+#  → 约 2 秒后终端 A 自己吐出 `tool_call{ERROR, output:"工具调用未确认：等待确认超时…"}`，
+#    随后 `delta` + `done{COMPLETE}` —— **超时按取消，且流程继续**（`02` §5.2 原文）。
+#    ⚠️ 回填给模型的那句话与 ㉔-a 的**刻意不同**（"超时" vs "你取消了"）：前者是"没人应答"、
+#       后者是"用户的决定"，合成一句用户就读不出自己那一按到底生效了没有。
+#    ⚠️ **门槛 5 顺带在这里看**：这 2 秒里 `ping` 照发、`/active` 全程 `streaming:true`
+#       （心跳是无条件的、锁跟着心跳续期 ⇒ 挂起**不会**让锁过期）。
+#    ③ 验完把上限改回来（不带环境变量重起，或把 `.env` 改回 120）
+
+# ㉔-e **【挂起期间按停止】** 在 ㉔-a 的挂起里（还没答），另开终端按 ⑯-c 打 `/stop`
+#  → 收到 `done{finishReason:"STOPPED"}`（**不是**等满 120s 之后才动）⇒ `awaitConfirm` 被 `signal`
+#    打断、抛 `ChatStoppedError`，按"本轮被中断"收尾（同 ㉓-i 的口径）。
+#    ⚠️ 若这里变成"点了停止要等 2 分钟才停"，就是坑预判 5 说的那条退化。
 ```
 
-> ⚠️ **㉓ 的已知边界（别当 bug）**：① **危险判定已落地（P0-2-9）但"确认卡"属 P0-2-10** ⇒ 工具
-> **仍然一律直接执行**（`route.dangerous` 已经是对的，缺的只是"危险 ⇒ 挂起等 `/confirm`"那一半）；
-> ② **一轮里多个 `tool_calls` 按顺序执行**（不并行）；③ **确认流（`/confirm`）属 P0-2-10**，
-> 现在打它得到统一信封 404，**不是坏了**；④ 工具结果有**截断上限**（8000 字符，给模型的那份与
+> ⚠️ **㉓ / ㉔ 的已知边界（别当 bug）**：① **危险判定（P0-2-9）与确认流（P0-2-10）都已落地** ⇒
+> `readOnlyHint:true` 的工具直接执行，**判为危险的工具（含"什么注解都不声明"的）一律先问**
+> —— ㉓ 那三个工具里 `purge` 就是这种，㉔ 专门验它；
+> ② **一轮里多个 `tool_calls` 按顺序执行**（不并行）⇒ 一次只会有一张确认卡（挂起也是串行的）；
+> ③ **`/confirm` 是幂等的**（`applied:false` 是 200，不是错误）；**别人的会话一律 404**；
+> ④ 工具结果有**截断上限**（8000 字符，给模型的那份与
 > 给卡片看的那份**是同一份**）；⑤ `tool_call.inputSummary` 的"凭据形状遮值"是**尽力而为**、
 > 不是安全边界（真正的保证是**凭据从不下发给模型**）；⑥ `/mcp` 页面前端仍是**占位页** ⇒
-> `tool_call` 卡片的**可视化**属 P0-2-11（本节看到的是 SSE 原帧）。
+> `tool_call` 卡片与**确认卡**的**可视化**属 P0-2-11（本节看到的是 SSE 原帧）；
+> ⑦ **`expiresAt` 是服务端算的截止时刻**（前端倒计时只读它，不自己另起一个 120s）；
+> ⑧ **服务端反向 elicitation**（`tools/call` 途中的 `elicitation/create`）走**同一个** `confirm` 帧与
+> 同一个应答端点，只有 `source` 不同（`SERVER` vs `PLATFORM`）—— 假上游**不发** elicitation，
+> 所以这一半在 ㉔ 里验不到（要真上游；契约与映射见 `docs/02` §9.10）。
 
 **已知边界（别当 bug）**：① 接口现在是七组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
 （`/api/model-providers`、`/api/models` 仅 ADMIN + `/api/models/available` 全员 + P0-1-12 新增的
@@ -1812,7 +1910,9 @@ curl -N -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/conversations/$CONV2/ch
 `beforeId` 给到**别的会话的 id 或一个非 UUID** 会 **400**（不是"当成没有游标"静默回第一页）。
 · **`usage_records` 表属 P1** ⇒ `done.usage` 只是**透传计量、不落表**；本版本**不做 token 级裁剪**（只按轮数截断，
 因为库里没有可用的 tokenizer —— 按字符估算等于"假保护"）。
-· **`POST /:id/confirm`（HITL 确认）属 P0-2**（它真正的前置是 `mcp_servers` 表），现在打它得到统一信封 404，**不是坏了**。
+· **`POST /:id/confirm`（HITL 确认）已于 P0-2-10 落地**（`02` §4.5 的九条路由**至此无缺口**）：
+危险工具在用户点头之前**绝不发 `tools/call`**；取消 / 超时都**按"未执行"回填且这一轮继续**；
+应答**幂等**（重复点 / 迟到点 ⇒ 200 + `applied:false`，别人的会话一律 404）—— 手工跑法见 ㉔。
 **MCP 凭据专项边界（P0-2-4）**：· 权限是**第四族 = 仅本人**（`/api/mcp/credentials/**` 只能读写**自己的那一份**，**ADMIN 也没有后门**）——
 它与 `/api/mcp/servers/**` **同一个前缀却是两族**（那边是"登录即可、人人可改"），**别照抄**。
 · **`PUT` 是合并语义**（只动提交里出现的 key，没提交的逐字保留）：与 P0-1 的 `components`（整体替换）**刻意相反**，
@@ -2161,3 +2261,4 @@ doubuleA/
 | 2026-09-24 | — | **P0-2-7 完成（P0-2 工具闭环 7/12）：凭据注入（调用时取 currentUser 凭据解密注入）** —— **新增** `backend/src/mcp/inject.ts`（**纯函数 + 一个 fetch 中间件，零依赖**：`buildCredentialInjection(schema, values)` → `{ headers, query, bodyPatch, applied, skipped }`、`applyQueryToUrl` / `applyBodyPatch` / `createCredentialFetch`）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext(serverId, viewer)` —— P0-2-8 的编排循环就调它拿 `clientOptions`）。**改动** `backend/src/mcp/client.ts`（**透出 `fetch` 选项**、**删掉 P0-2-1 那个 `headers` 选项**）、`mcpCredential.service.ts`（新增 `decryptMyCredentialValues`、解密循环抽成唯一实现）、`shared/src/mcp.ts`（新增四个判据函数，写端闸门与注入端共用）、`backend/src/index.ts`（`step`）。**本步不改任何端点**（消费方是 **P0-2-8**）⇒ **没有新的手工端测步骤**；零新增依赖 / 零环境变量 / 零 schema 改动。**八条最值得记的**：① ⚠️ **注入口从"headers 参数"改成 transport 的 `fetch` 选项，并删掉前者**（H4 结论：三种位置一个口子全包）—— 留着两条路径的后果是它们**在同一个点上打架**（症状："某个凭据时而生效、时而被顶掉"）；注入是**在 SDK 已拼好的 `Headers` 之上 `set`**（不是替换）⇒ `accept` / `mcp-session-id` 一个都不丢。② ⚠️ **坑预判 2 的探针做了、代价没有发生**：`send()` / `terminateSession()` / `_startOrAuthSse()` 三处都是 `await (this._fetch ?? fetch)(this._url, init)` ⇒ **URL 是每次调用现传的**（`_url` 整个会话不变）⇒ QUERY 拼在每请求 URL 上安全 ⇒ **不需要**为 QUERY 注入放弃连接复用。③ **模板是唯一的路由表**（只遍历 `schema`）⇒ "模板里删掉的 key 不会被注入"**结构性成立**，与 P0-2-3 的"只提示、绝不自动清理"能同时成立。④ ⚠️ **注入端要再判一次那三条判据，处置是"跳过 + 记账"不是报错** —— 读取端**刻意不跑语义层校验** ⇒ 库里可能有历史脏数据，而照注更坏（注 `accept` 顶掉响应形态协商头、注非法头名/CRLF 让 `new Headers()` 抛、注 `method`/`id` 毁报文甚至**把凭据回显到线上**）⇒ 判据函数**上收到 `shared`** 两处共用。⑤ ⚠️ **"空注入"必须原样返回 baseFetch（同一个函数对象）**，两个应用函数在没东西要注入时**逐字返回输入** —— 否则 `new URL()` 往返会把 URL 规范化，"没注入任何东西的 server 的请求被悄悄改写"是最不该有的副作用。⑥ **未配齐 ⇒ 一个上游请求都不发**：在 `new McpClient()` **之前**抛 424 `NEED_CREDENTIAL`，按**当前模板**逐 key 判必填（不是"表里有没有行"）、文案**点名缺哪些 key**；解密失败走同一条路 ⇒ **绝不 500**。⑦ **`secrets` 给"全部解密出来的明文"**（不是"真的注出去的那几个"）—— 它唯一用途是抹掉**上游回显**里的凭据，"多抹是安全的、少抹不可逆"。⑧ ⚠️ **签名与设计稿有两处偏离**：`(server, userId)` → `(serverId, viewer)`（P0-2-8 手上只有 `routes` 给的 `serverId`）。**权限**：本批**不新增路由**；"A 绝不串 B"有**两道独立防线**（查询范围固定在 `(serverId,userId)` + AAD 含 `userId`）。**取证方式**：⚠️ **本批无自动化验收档**（脚本 2026-09-24 已删）；智能体侧只做了一件**确定性**的事 —— `node --import tsx` 真 `import` 源码 + 逐条比 **22 组**断言，**ALL PASS**（含 **真实 `StreamableHTTPClientTransport` 路径探针** 2 组）；首跑红两条、**都是核查脚本自己的问题**（没 `await` 异步用例 / 把 `send()` 的返回值当应答值 —— `send()` 返回 `undefined`、帧走 `onmessage`），实现零改动。**验收门槛 1/3/4 的端到端取证需真库 + 假 MCP server ⇒ 明确留给人工/后续**。**未跑构建/回归/浏览器，本批不是端测里程碑**（`02` §9.3 那条链路要到 P0-2-8 才跑得起来，且 P0-2-8 之后仍无界面）。**下一步 = P0-2-8**（编排循环接工具调用 + 10 轮上限：危险判定 ⇒ **取 `resolveMcpCallContext`** ⇒ 执行 ⇒ `tool_call{RUNNING}`→`{SUCCESS\|ERROR}` ⇒ 结果回填续流）。 |
 | 2026-09-24 | — | **P0-2-8 完成（P0-2 工具闭环 8/12）· 🎯 工具闭环的「整条链」首次在命令行层跑通**：编排循环接工具调用 + 10 轮上限。**手工跑法见「手工端测 · 命令行」㉓**（内联假 LLM 吐分片 `tool_calls` + 内联假 MCP 执行 `tools/call`，两段 `node --input-type=module -e '…'` 前台常驻、**不依赖仓库里有夹具文件**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/conversation.ts`（`tool_calls` **从"刻意不定型"升级为定型**：迁入 `TOOL_CALL_KINDS`/`TOOL_CALL_STATUSES` + 新增 `toolCallRecordSchema` + `messageContentSchema` 加 `tool_calls`；**判据 = 写入端与读取端都已落地**）；`shared/src/sse.ts`（`sseToolCallPayloadSchema` 改为 `toolCallRecordSchema.omit({arguments:true})` **派生**，两常量**刻意不再导出** —— `export *` 会让同名变"歧义名"）；`backend/src/llm/protocol.ts`（**本批最大改动**：工具调用抽象 —— `ChatToolCall`/`ToolCallChunk`/分片累积器 `ToolCallBuffer`/`parseToolArguments`（空串⇒`{}`、非法 JSON⇒`{ok:false,reason}`、**不猜**）/`sumUsages`（多轮**相加**，与 `mergeUsage` 的"同一次调用的两半**覆盖**"刻意不同）+ 三协议各自的工具定义形状与**结果回填形态**：OpenAI `role:'tool'`+`tool_call_id`、Responses `function_call`/`function_call_output` item、Anthropic 把 `tool_result` **合成一条 user 消息** + 相邻同角色合并）；`backend/src/llm/client.ts`（`tools` 选项 + `toolCalls` 汇总 + **同一个累积器**在 `chat()`/`chatStream()` 都用、半成品不外泄）；`backend/src/services/mcpCall.service.ts`（新增 `resolveMcpToolCatalog`（读 `tool_cache`、**不联网不碰凭据**、`taken` 逐台累积去重）+ `executeMcpToolCall`（`resolveMcpCallContext` → connect → `callTool` → `finally close()`））；`backend/src/orchestrator/chatContext.ts`（工具结果 → 消息的**纯函数**：`truncateToolResult`(8000)/`summarizeToolInput`(200, 凭据形状遮值)/`buildToolResultMessages`/`buildAssistantToolCallsMessage`/`TOOL_LOOP_LIMIT_NOTICE`/历史**成对**还原）；`backend/src/orchestrator/chatBot.ts`（**核心**：`for(;;)` 工具循环 + `toolRecords` 落进助手消息 `content`）；`backend/src/index.ts`（信封 `step`）。**六条最值得记的**：① ⚠️ **流式 `tool_calls` 是"分片累积"的** ⇒ **绝不能在第一片 `JSON.parse`**（`arguments` 是不完整 JSON，**不报错、只解析出空参数**）；② ⚠️ **工具结果报文形态跨协议全不同** ⇒ 编排层只吐协议无关的 `role:'tool'`，**手拼报文一律归 `buildBody`**（否则"换协议就调不动工具"且 `verify:llm` 不会红）；③ **工具失败 ≠ 这一轮失败**：`isError`/缺凭据 424/上游 502/504 全变 `tool_call{ERROR}` + 回填给模型自己解释，**唯一例外是中断**（`McpAbortError`）；④ **"还允不允许要工具"的判据是"已执行了几轮"**（到 10 轮**当轮撤掉 `tools`** + 注一次提示；模型仍硬报就只能收尾）；⑤ ⚠️ **历史还原必须"成对"**（半截记录 = 400 ⇒ **整段丢**，否则"这个会话从此再也发不出消息"且指不到那一行）；⑥ **凭据主语来自"当前会话"**（`viewer.userId` 懒加载现查）。**已知边界（同时写进 `02` §6.3）**：**危险判定不做**（属 P0-2-9，接回点已预留在取凭据与发 `RUNNING` 卡**之前**）⇒ 工具一律直接执行；一轮多调用**按顺序**执行；还原顺序是 `assistant{正文+toolCalls}` → `tool{结果}`（**最终正文排在工具结果之前** ⇒ 保真度折损，别当 bug）；`usage_records` 仍属 P1。**取证方式**：⚠️ 本批**无自动化验收档**（脚本与夹具已删）；**未跑 typecheck/build/回归/浏览器**；命令行人工程序 = `README` ㉓。**下一步 = P0-2-9**（危险判定 `mcp/risk.ts` 纯函数）。 |
 | 2026-09-24 | — | **P0-2-9 完成（P0-2 工具闭环 9/12）：危险判定（`annotations` ⇒ 平台侧强制确认）** —— ⚠️ **本批只做"判定"，"确认"（弹卡等应答）仍属 P0-2-10** ⇒ **不是端测里程碑**、命令行与界面都验不到新东西（**所有工具仍然一律直接执行**）。**新增** `backend/src/mcp/risk.ts`（纯函数 `isDangerousTool(tool)`，**只有一条 `import type`** ⇒ 真值表断言不需要起依赖）。判据一句话：**`readOnlyHint === true` 且 `destructiveHint !== true` ⇒ 安全，其余（含读不出注解）一律危险** —— 即"**拿不准就确认**"。⚠️ **唯一超出"新增一个文件"的改动**：`mcp/toolSchema.ts` 的 `McpToolRoute` 多了 **`dangerous: boolean`**（`toOpenAiTools` 里算好，因为判定要用工具自己的 `annotations`、而描述符只有那个函数手上才有）；它**不进** `OpenAiFunctionTool`（是我们的策略、不是给模型的提示）。**四条取舍**：`annotations` **服务端自报、不可信**（`readOnlyHint: true` 即可绕过 ⇒ P0 边界到此、平台强制名单属 P1）／判定输入是**这个工具**不是这台 server／`idempotentHint`·`openWorldHint` **刻意不参与**／**严格 `=== true`**、非布尔按缺失（宽松写法会让拼错类型的 server 静默拿到"只读"资格，而症状是"确认卡该弹没弹"）。**取证**：`/tmp` 临时脚本 + `node --import tsx` 真 import，**55 条断言 ALL PASS**（3×3 全枚举 + 两个 hint 的不变量 + 非布尔 + 读不出注解 + 真实描述符 + **接线 6 组**）；首跑红 9 条**全是核查脚本自己把"安全"当成了返回值**，实现零改动；**未跑构建/回归/浏览器**。回写：`docs/02` 新增 **§9.9** 判定表 + §十 一行；`docs/06` 进度 **9/12**。**下一步 = P0-2-10**（`POST /:id/confirm` + 挂起 + 120s 超时按取消） |
+| 2026-09-24 | — | **P0-2-10 完成（P0-2 工具闭环 10/12）：elicitation 确认流（`confirm` 事件挂起 + `POST /:id/confirm` 应答 + 120s 超时按取消）** —— **手工跑法见「手工端测 · 命令行」㉔**（承接 ㉓ 的同一台内联假上游，不用重起；`purge` 工具**刻意不声明 `annotations`** 故按真值表判为危险。⚠️ ㉓ 里 `echo`/`boom` 那两行 `annotations: { readOnlyHint: true }` 是**本批加的**、不是装饰：**删掉它们，㉓ 整节会变成"每调一次工具先弹一次确认"**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/sse.ts`（`CONFIRM_SOURCES = ['PLATFORM','SERVER']` + `sseConfirmPayloadSchema` 增量 **`source` / `expiresAt`** + 新增 `confirmRequestBodySchema` 与 `confirmConversationResultSchema`）、`shared/src/conversation.ts`（活跃流快照加**第四个字段** `pendingConfirmId` —— `EMPTY_ACTIVE_SNAPSHOT` / `parseActiveSnapshot` / zod schema **三处一起改**）、`backend/src/infra/redis.ts`（`chatConfirmKey` = `chat.confirm:{id}` + `CHAT_CONFIRM_TTL_SEC = 60`；**值是结构化的**而不是布尔）、`backend/src/orchestrator/sse.ts`（**核心**：`ConfirmQuestion` / `ConfirmDecision`（`CONFIRMED` 与 `REJECTED` 与 `TIMEOUT`）/ `parseConfirmAnswer` / `clearConfirmSignal` / `answerConfirm` + `SseChannel#awaitConfirm` 与 `#waitForConfirm` + `ChatProducerInput` 多一个 `awaitConfirm` 成员；`stopPollIntervalMs` 改名 `signalPollIntervalMs` 两类信号共用）、`backend/src/orchestrator/chatContext.ts`（`TOOL_CONFIRM_REJECTED_OUTPUT` / `TOOL_CONFIRM_TIMEOUT_OUTPUT` 两个常量，**刻意分开**）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext` / `executeMcpToolCall` 透传 `onElicit`）、`backend/src/orchestrator/chatBot.ts`（**挂起点就插在"取凭据 / 发 `RUNNING` 卡之前"** —— 即 P0-2-9 留的那处接回点；另加 `onElicit` 处理器把三个结局映射成 `accept` / `decline` / `cancel`）、`backend/src/routes/conversations.ts`（**第九条路由**，`02` §4.5 那张表至此无缺口）、`backend/src/index.ts`（`step`）。**八条最值得记的**：① **两条来源、一个原语** —— 平台强制确认（`PLATFORM`）与服务端反向 elicitation（`SERVER`）走**同一个** `confirm` 事件、同一个应答端点、同一个 `awaitConfirm`，差别只在 payload 的 `source`（决定前端选哪句文案）；② ⚠️ **应答必须带 `confirmId`**（键里存 `{confirmId, accepted}`、消费时按 id 匹配、读到即删、新一次等待开始前**再清一次**）—— 否则上一轮的迟到点击会被下一轮当成答案消费掉，症状是"**确认卡一闪而过**"且**零报错**；③ **三种结局必须分得开** ——"用户已取消"与"等待确认超时"回填**不同**文案（前者是用户的决定、后者是没人应答），合成一句话用户就读不出自己那一按到底生效了没有；④ **取消与超时都不让这一轮失败**（回填一条"未执行"的工具结果、流程继续 —— `01` §3.6 原文），**唯一的例外是中断**（`awaitConfirm` 抛 `ChatStoppedError`，交回"本轮被中断"的收尾）；⑤ **被拦下的调用不发 `RUNNING` 卡**（那张卡的含义是"已经在跑"，而它其实没跑过 ⇒ 只发最终那张 ERROR 卡，前端按 `callId` upsert）；⑥ **超时与心跳是两个独立机制** ⇒ 挂起期间 `ping` 照发、锁跟着心跳续期（**没有**第二条续期路径 —— 另起一条迟早与心跳那条打架）；⑦ **`applied:false` 是 200 不是 4xx**（用户看到卡片没消失就会再点一次，那是常态），且**不为"会话只读"单开 409**（只读会话**必定**没有活跃流 ⇒ 已被同一条判据覆盖，单开会让"流中途 Agent 被软删、用户正在看确认卡"误报）；⑧ ⚠️ **本批实际写错一次（`typecheck` 抓到）** —— `streamChatReply` 里 `acquireConversationLock` 的初始快照是**逐字段手写**的，加第四个字段时它**少一个键**，而后果是"**所有 `/confirm` 应答都变成 `applied:false`**"（静默到只有类型检查能抓）⇒ 改成 `{ ...EMPTY_ACTIVE_SNAPSHOT, startedAt }`，从根上断掉这一类。**已知边界**：`annotations` **服务端自报、不可信**（声明 `readOnlyHint: true` 即可绕过 ⇒ 平台强制名单属 **P1**）；假上游**不发** elicitation ⇒ `SERVER` 那一路在 ㉔ 里验不到（要真上游；契约与三条映射见 `docs/02` §9.10）。**取证方式**：⚠️ **本批无自动化验收档**（脚本与夹具 2026-09-24 已删；浏览器档 = **P0-2-11 之后**）；智能体侧只跑了 `pnpm -r typecheck`（三包全绿，**且首跑抓到上面第 ⑧ 条那个静默 bug**）与 `pnpm check:batch`；**未跑构建/回归/浏览器，本批不是端测里程碑**。回写：`docs/02` 新增 **§9.10** + §4.5 / §5.1 / §5.2 / §六 第 4 步 / §9.9 的落地标记同步；`docs/06` 进度 **10/12**。**下一步 = P0-2-11**（前端确认卡 + `/mcp` 页面 —— **它才是浏览器可端测里程碑**） |

@@ -144,6 +144,19 @@ const CALL_SERVER_SELECT = {
   credentialSchema: true,
 } as const
 
+/** `{@link resolveMcpCallContext}` 的可选覆写 —— **只有 elicitation 应答方**一项（P0-2-10） */
+export interface McpCallContextOptions {
+  /**
+   * 服务端主动 elicitation 的应答方（`02` §六 第 4 步的 ⑤）。
+   *
+   * ⚠️ **传了它才声明 `elicitation` 能力**（`mcp/client.ts` 文件头判据 5：声明了却答不出来，
+   * 服务端会照发请求而我们静默失败，比不声明更难查）⇒ 调用方**只在真能应答时才传**。
+   * 这也是它必须从编排层传下来的原因：只有编排层手上有"这一个用户、这一条流"的上下文
+   * （`awaitConfirm` 挂在 SSE 通道上，见 `orchestrator/sse.ts`）。
+   */
+  onElicit?: McpClientOptions['onElicit']
+}
+
 /**
  * 组装一次 MCP 调用的上下文（见文件头 ①~④）。
  *
@@ -158,6 +171,7 @@ const CALL_SERVER_SELECT = {
 export async function resolveMcpCallContext(
   serverId: string,
   viewer: McpCallViewer,
+  options: McpCallContextOptions = {},
 ): Promise<McpCallContext> {
   const db = getPrisma()
 
@@ -223,6 +237,8 @@ export async function resolveMcpCallContext(
       // 全部解密出来的明文（见文件头 ③：多抹是安全侧）
       secrets: Object.values(values),
       logFields: { mcpServerId: server.id, userId: viewer.userId },
+      // 见 {@link McpCallContextOptions#onElicit}：**只在调用方真的能应答时**才带上它
+      ...(options.onElicit === undefined ? {} : { onElicit: options.onElicit }),
     },
     injected: injection.applied,
     skipped: injection.skipped,
@@ -372,6 +388,14 @@ export interface McpToolCallInput {
   args: Record<string, unknown>
   /** 用户的「停止」 */
   signal?: AbortSignal
+  /**
+   * 服务端在 `tools/call` 途中反向 elicitation 时的应答方（P0-2-10）。
+   *
+   * 编排层把它接到 `awaitConfirm`（同一个挂起原语、同一个 `confirm` 事件）——
+   * `06` P0-2-10 坑预判 1 要的就是这个统一：不接的话"server 反请求"这一半需求只能验一半，
+   * `mcp/client.ts` 里那个 `onElicit` 开关也就白留了。
+   */
+  onElicit?: McpClientOptions['onElicit']
 }
 
 /**
@@ -411,7 +435,11 @@ export interface McpToolExecution {
  */
 export async function executeMcpToolCall(input: McpToolCallInput): Promise<McpToolExecution> {
   // 凭据的**全部**判据都在这里面：含"未配齐 ⇒ 在 new McpClient() 之前就抛 424"
-  const context = await resolveMcpCallContext(input.serverId, input.viewer)
+  const context = await resolveMcpCallContext(
+    input.serverId,
+    input.viewer,
+    input.onElicit === undefined ? {} : { onElicit: input.onElicit },
+  )
   const client = new McpClient(context.clientOptions)
   try {
     await client.connect()

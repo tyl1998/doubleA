@@ -71,16 +71,21 @@
  *   · **并发闸**（`CHATBOT_CONCURRENCY` 满则 429 `BUSY`）→ **P0-1-27**：它是进程级信号量，
  *     而本层只跑"一进一出"的通道（见 `conversation.service.ts#assertConversationSendable` 的注释）；
  *   · `queued` 事件的**产生者**（沙箱排队位次）→ P0-3；
- *   · `confirm` 的**应答端点** `POST /:id/confirm` → **P0-2**（要 `mcp_servers` 表）；
  *   · 断线重连的**前端**逻辑（先查 `/active` 再拉历史）→ P0-1-32；本层只保证"断开即释放锁
  *     + `/active` 读得到进度"这两半。
+ * ✅ `confirm` 挂起（{@link SseChannel#awaitConfirm}）与其应答端点（{@link answerConfirm} +
+ *    `routes/conversations.ts` 的第九条路由）**已在 P0-2-10 落地** —— 从"刻意不做"一栏移出。
  */
 
 import {
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
+  EMPTY_ACTIVE_SNAPSHOT,
   SSE_CONTENT_TYPE,
   SSE_PAYLOAD_SCHEMAS,
+  type ConfirmConversationResult,
+  type ConfirmRequestBody,
+  type ConfirmSource,
   type ConversationActiveSnapshot,
   type SseDonePayload,
   type SseErrorPayload,
@@ -89,12 +94,15 @@ import {
 } from '@doubulea/shared'
 import type { FastifyReply } from 'fastify'
 import type { ServerResponse } from 'node:http'
+import { randomUUID } from 'node:crypto'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import {
+  CHAT_CONFIRM_TTL_SEC,
   CHAT_STOP_TTL_SEC,
   chatActiveKey,
+  chatConfirmKey,
   chatStopKey,
   ensureRedisConnected,
   getRedis,
@@ -148,8 +156,13 @@ export function serializeSseFrame(event: SseEvent): string {
   return `event: ${event.name}\ndata: ${JSON.stringify(event.data)}\n\n`
 }
 
-/** 停止信号的轮询间隔（毫秒）：心跳周期的 1/10，夹在 250ms–2s（见文件头 ④） */
-function stopPollIntervalMs(): number {
+/**
+ * 信号（停止 / 确认应答）的轮询间隔（毫秒）：心跳周期的 1/10，夹在 250ms–2s（见文件头 ④）。
+ *
+ * 两类信号共用同一个间隔、同一个量级 —— 它们的**时效要求完全一样**（都是"用户按了按钮之后
+ * 多久生效"），分成两个常量只会在调一个的时候忘掉另一个。
+ */
+function signalPollIntervalMs(): number {
   const tenth = (config.limits.ssePingIntervalSec * 1000) / 10
   return Math.min(2000, Math.max(250, tenth))
 }
@@ -170,6 +183,20 @@ function lockTtlSec(): number {
  * 技术原因（过期 / 被清理）由 `#renewLock` 的 warn 日志承载，工程排查不缺线索。
  */
 const LOCK_LOST_MESSAGE = '会话状态异常，本次生成已中断，请重新发送消息'
+
+/**
+ * 把中断信号翻成一个**带用户文案**的错误。
+ *
+ * 为什么需要它：`ChatStoppedError` 是 `SseChannel#fail` 唯一放行 `message` 的两个类型之一
+ * （另一个是 `AppError`）—— 若在这里抛一个裸 `Error`，用户看到的会从
+ * "用户已停止生成"退化成通用的"服务内部错误"（P0-1-26 全量回归抓过的同款问题）。
+ * 正常路径下 `signal.reason` 一定是 `ChatStoppedError`（`abort()` 装配的）；
+ * fallback 只为"运行时允许 `abort(undefined)`"这件事兜底。
+ */
+function abortErrorOf(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason
+  return reason instanceof ChatStoppedError ? reason : new ChatStoppedError('client', '本次生成已中断')
+}
 
 // ═════════════════════════════════════════════════════════════════════
 // 停止信号（`chat.stop:{id}`）：路由写入、通道轮询
@@ -209,6 +236,142 @@ export async function clearStopSignal(conversationId: string): Promise<void> {
     // 清不掉不阻塞开工/收尾：最坏是这一轮被残留信号秒停（可重发），而抛出去会让"发消息"整个失败
     getLogger().warn({ err: error, conversationId }, '清除停止信号失败（本次流可能被残留信号中断）')
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 确认应答（`chat.confirm:{id}`）：路由写入、通道等待（P0-2-10）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 一次确认提问 —— **两条来源共用的形状**（`shared/src/sse.ts#CONFIRM_SOURCES`）。
+ *
+ * `source` 决定前端选哪句说明文案（"这个工具需要确认" / "对方要求确认"），
+ * 而**挂起与应答的机制完全相同**：这正是 `06` P0-2-10 坑预判 1 要的"一个共同的挂起原语"
+ * —— 不为 elicitation 单开一套（那会让第二个来源只能"验一半"，`mcp/client.ts` 里那个
+ * `onElicit` 开关也就白留了）。
+ */
+export interface ConfirmQuestion {
+  source: ConfirmSource
+  /** 提问是关于哪个工具的（`PLATFORM` 是下发给模型的名字，`SERVER` 是正在执行的那个） */
+  toolName: string
+  /** 给用户看的一句话（`PLATFORM` 是参数摘要，`SERVER` 是服务端给的消息原文） */
+  inputSummary: string
+}
+
+/**
+ * 等待的三种结局。
+ *
+ * ⚠️ **三条都通向"不执行这个工具"**，但它们**必须分得开**：回填给模型的那句话里，
+ * "用户已取消"与"等待确认超时"是两件不同的事 —— 前者是用户的决定（模型不该再劝），
+ * 后者是没人应答（模型可以说"这次没能执行"）。合成一种会让用户在界面上读不出
+ * 自己刚才那一按到底生效了没有。
+ *
+ * ⚠️ **中断不在这里**（用户点停止 / 客户端断开 / 锁丢失）：那三种是 `awaitConfirm`
+ * **抛出** `ChatStoppedError`（`signal.reason`），由 `streamChatReply` 按"本轮被中断"收尾 ——
+ * 它们不是"确认的结局"，而是"这一轮结束了"。
+ */
+export type ConfirmDecision = 'CONFIRMED' | 'REJECTED' | 'TIMEOUT'
+
+/** 应答槽里的值（见 `infra/redis.ts#chatConfirmKey`） */
+interface ConfirmAnswer {
+  confirmId: string
+  accepted: boolean
+}
+
+/**
+ * 解析应答槽的值。**不抛错**（与 `readStartedAt` / `parseActiveSnapshot` 同款）：
+ * 值坏（人工改过 / 旧格式）⇒ `null` ⇒ 消费方按"还没答"处理，下一轮再试；
+ * 而"值坏"这件事值得留痕 —— 它会表现为"用户点了确认但一直等到超时"。
+ */
+function parseConfirmAnswer(raw: string): ConfirmAnswer | null {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const { confirmId, accepted } = parsed as Partial<ConfirmAnswer>
+    if (typeof confirmId !== 'string' || confirmId === '') return null
+    if (typeof accepted !== 'boolean') return null
+    return { confirmId, accepted }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 清应答槽。**两个调用点**（与 `clearStopSignal` 同款，但语义更硬）：
+ *   · **新一次等待开始前**：上一轮的答案、或上一轮 `/confirm` 的**迟到点击**，
+ *     绝不能被这一次等待消费掉 —— 否则症状是"确认卡一闪而过"（`06` P0-2-10 坑预判 2，
+ *     本步最容易出的静默 bug）；
+ *   · **本次等待结束时**（`awaitConfirm` 的 `finally`，含超时与中断）：不清的话这个键要挂 60s，
+ *     而 `/active` 的 `pendingConfirmId` 已经回 `null` ⇒ 那两个出口就开始互相矛盾。
+ *
+ * 失败只告警：清不掉最多是"这次等待被一条残留应答提前结束"（用户重发一次即可），
+ * 而抛出去会让一次**已经成功**的确认变成 500。
+ */
+export async function clearConfirmSignal(conversationId: string): Promise<void> {
+  try {
+    await getRedis().del(chatConfirmKey(conversationId))
+  } catch (error) {
+    getLogger().warn({ err: error, conversationId }, '清除确认应答失败（本次等待可能被残留应答提前结束）')
+  }
+}
+
+/**
+ * 写一条确认应答（`POST /api/conversations/:id/confirm` 的落点）。
+ *
+ * ── 为什么第二参是"调用方刚读到的 `pendingConfirmId`"，而不是本函数自己再读一次 ──
+ * 那个值只有一个合法来源：`GET /:id/active`（它同时承担"这不是我的会话就 404"的判据）。
+ * 让本函数再读一遍就是**同一次请求读两遍**，而两遍之间可能变化（确认刚好超时）⇒
+ * 判据会变成"两次读里较新/较旧的那一次"，这种不确定性没有任何好处。
+ * ⚠️ 残留的 TOCTOU 是**已知且无害**的：两读之间确认刚好结束 ⇒ 我们往一个没人消费的槽位写
+ * 一条应答，`applied` 略微乐观；那条键会在下一次 `awaitConfirm` 的 ① 里被清掉。
+ *
+ * ── `applied:false`（幂等忽略）覆盖的全部情形 ──
+ *   · 这个会话当前没有活跃流（`streaming:false` ⇒ 一定没有待答确认）；
+ *   · 有流、但当前没有待答确认（`pendingConfirmId === null`）—— 最常见的是"这一轮已经按超时
+ *     取消走完了"，用户此刻才点；
+ *   · `confirmId` 对不上（上一轮卡片的迟到点击、或用户开着两个标签页）。
+ * 三种都是**正常终局**，故回 200 + `applied:false`（理由见 `confirmConversationResultSchema`）。
+ *
+ * ⚠️ 刻意**不**为"会话只读（Agent 被软删）"单开一个 409（`06` P0-2-10 门槛 4 的原文）：
+ * 会话只读**必定**没有活跃流 ⇒ 它已经被第一条覆盖，结论完全一样；而为它单开一个分支会让
+ * "Agent 在流中途被软删、用户正在看确认卡"这一路拿到一个**错误**的 409（那时流还在跑、
+ * 确认是有效的）。所以判据只有一条：**有没有人在等这个 id**。
+ *
+ * @param pendingConfirmId 调用方刚从 `/active` 读到的 `pendingConfirmId`（唯一判据来源）
+ * @throws {AppError} `INTERNAL`(500) Redis 写失败 —— 这一条**不能**吞：用户点的是"执行"，
+ *   我们告诉他"已确认"而信号其实没写进去，等于把一次破坏性操作的失败说成成功。
+ */
+export async function answerConfirm(
+  conversationId: string,
+  input: ConfirmRequestBody,
+  pendingConfirmId: string | null,
+): Promise<ConfirmConversationResult> {
+  const result: ConfirmConversationResult = {
+    id: conversationId,
+    confirmId: input.confirmId,
+    accepted: input.accepted,
+    applied: false,
+  }
+  if (pendingConfirmId === null || pendingConfirmId !== input.confirmId) {
+    getLogger().info(
+      { conversationId, confirmId: input.confirmId, pendingConfirmId, accepted: input.accepted },
+      '确认应答不属于当前提问 ⇒ 幂等忽略（这一轮可能已按取消/超时走完）',
+    )
+    return result
+  }
+
+  const redis = await ensureRedisConnected()
+  await redis.set(
+    chatConfirmKey(conversationId),
+    JSON.stringify({ confirmId: input.confirmId, accepted: input.accepted } satisfies ConfirmAnswer),
+    'EX',
+    CHAT_CONFIRM_TTL_SEC,
+  )
+  getLogger().info(
+    { conversationId, confirmId: input.confirmId, accepted: input.accepted },
+    '确认应答已交给等待中的那一轮',
+  )
+  return { ...result, applied: true }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -349,13 +512,15 @@ export interface ChatProducerResult {
 /**
  * producer 能用的东西（编排层唯一依赖的接口）。
  *
- * 三个成员各有明确用途，**都不是便利方法**：
+ * 四个成员各有明确用途，**都不是便利方法**：
  *   · `emit` —— 写一帧（带 schema 校验与背压等待，见文件头 ①）。**已结束/客户端断开后静默丢弃**：
  *     producer 收尾时不必自己判断"还能不能写"。
  *   · `signal` —— 中断信号。必须传给它发起的每一次上游调用（`chatStream` 的 `abortSignal`），
  *     否则点"停止"只会停止我方的循环、上游连接还挂着（P0-1-12 的教训：中断要在每帧之前显式生效）。
- *   · `updateSnapshot` —— 更新 `/active` 快照（`currentTool` / `queuedPosition`）。
+ *   · `updateSnapshot` —— 更新 `/active` 快照（`currentTool` / `queuedPosition` / `pendingConfirmId`）。
  *     断线重连的用户就是靠它知道"现在在干什么"（`02` §5.2）。
+ *   · `awaitConfirm` —— **挂起等用户应答**（P0-2-10，见其注释）。它与前三个的区别是它**会等**：
+ *     前三个都是"发出去就返回"，它是唯一会占住这一轮的地方。
  */
 export interface ChatProducerInput {
   conversationId: string
@@ -376,6 +541,26 @@ export interface ChatProducerInput {
   signal: AbortSignal
   emit: (event: SseEvent) => Promise<void>
   updateSnapshot: (patch: Partial<ConversationActiveSnapshot>) => Promise<void>
+  /**
+   * 挂起并等待用户对一次确认的应答（P0-2-10；`02` §9.10、`shared#sseConfirmPayloadSchema`）。
+   *
+   * **编排层唯一该调它的地方**是"真的要动那个危险工具之前"（`chatBot.ts` 工具循环里
+   * 取凭据 / 发 `RUNNING` 卡**之前**那一处）—— 晚一步的后果是"确认卡上已经写着『运行中』"，
+   * 而确认的全部意义就是"发出去之前问一句"。
+   *
+   * 四条实现约定（都由通道保证，调用方不必自己处理）：
+   *   · **超时按取消**：`MCP_CONFIRM_TIMEOUT_SEC`（默认 120s）到点返回 `'TIMEOUT'`
+   *     —— 不抛错（超时是一条**正常结论**，见 `ConfirmDecision`）；
+   *   · **中断抛出**：用户点停止 / 客户端断开 / 锁丢失 ⇒ 抛 `signal.reason`（一个
+   *     `ChatStoppedError`）⇒ 由 `streamChatReply` 按"本轮被中断"收尾。
+   *     ⚠️ 这条是**必须**的：挂起期间停止按钮不能失效（`06` P0-2-10 坑预判 5）；
+   *   · **挂起期间心跳与锁照常**：心跳是无条件周期、锁跟着心跳续期（文件头 ②③），
+   *     所以"挂起是安全的"这件事不需要本方法做额外的续期 —— 门槛 5 那两条是**既有机制**的推论；
+   *   · **幂等前提**：同一时刻一条流只该有一个待答确认（工具是顺序执行的）。并发调用
+   *     （一轮里并行问两次）会让后一个覆盖前一个的 `pendingConfirmId`，前一个只能等到超时
+   *     —— 不是被允许，而是当前编排层**不会**这么调。
+   */
+  awaitConfirm: (question: ConfirmQuestion) => Promise<ConfirmDecision>
 }
 
 /** 编排循环（P0-1-27）要实现的形状；本批的占位实现见 `orchestrator/index.ts` */
@@ -521,7 +706,7 @@ class SseChannel {
 
     this.#stopTimer = setInterval(() => {
       void this.#pollStopSignal()
-    }, stopPollIntervalMs())
+    }, signalPollIntervalMs())
     this.#stopTimer.unref()
   }
 
@@ -568,6 +753,146 @@ class SseChannel {
     } catch (error) {
       getLogger().warn({ err: error, conversationId: this.#conversationId }, '读取停止信号失败（本轮跳过，下轮再试）')
     }
+  }
+
+  /**
+   * 挂起并等待用户对一次确认的应答（P0-2-10 的核心，`02` §9.10）。
+   *
+   * 时序（每一步的顺序都是正确性）：
+   * ```
+   * ① 清应答槽        ← 上一轮的答案 / 迟到点击绝不能被本轮消费（坑预判 2）
+   * ② 登记 pendingConfirmId  ← 必须早于 ③：反过来的话，用户在事件到达的一瞬间点确认会拿到
+   *                           `applied:false`（槽位里还是旧的 `null`）
+   * ③ 发 `confirm` 帧  ← 前端据此弹卡（带 `expiresAt`，倒计时读它）
+   * ④ 轮询应答槽（受 signal 与超时约束）
+   * ⑤ finally：清应答槽 + `pendingConfirmId` 回 null  ← 不管什么结局都要清
+   *    （不清 ⇒ `/active` 一直说"有确认待答"，而 `/confirm` 会继续接受一个已经不存在的提问）
+   * ```
+   *
+   * ⚠️ **`confirmId` 用 `randomUUID()`（v4）**：本仓"别手搓 uuid7"那条纪律针对的是**主键**
+   * （`@default(uuid(7))` 是它唯一合法的来源）；这里要的是一个**一次性、不可预测**的标识，
+   * v4 正是普通 `randomUUID()` 的用途（同 S3 键的做法），不存在版本位语义。
+   *
+   * ⚠️ **等待期间不做任何"续期"动作**：心跳是无条件周期、锁跟着心跳续期（文件头 ②③）
+   * ⇒ 挂起时 `ping` 照发、锁不丢（`06` P0-2-10 门槛 5 的两条**都是既有机制的推论**）。
+   * 若在这里另起一个续期，就会造出第二条续期路径（迟早与心跳那条打架）。
+   */
+  async awaitConfirm(question: ConfirmQuestion): Promise<ConfirmDecision> {
+    await clearConfirmSignal(this.#conversationId)
+
+    const confirmId = randomUUID()
+    const timeoutMs = config.mcp.confirmTimeoutSec * 1000
+    const expiresAt = new Date(Date.now() + timeoutMs).toISOString()
+
+    // 见 ②：登记在发帧**之前**
+    await this.updateSnapshot({ pendingConfirmId: confirmId })
+    try {
+      await this.emit({
+        name: 'confirm',
+        data: {
+          confirmId,
+          source: question.source,
+          toolName: question.toolName,
+          inputSummary: question.inputSummary,
+          expiresAt,
+        },
+      })
+      getLogger().info(
+        {
+          conversationId: this.#conversationId,
+          confirmId,
+          source: question.source,
+          toolName: question.toolName,
+          timeoutSec: config.mcp.confirmTimeoutSec,
+        },
+        '已发出确认请求（本轮挂起等待应答）',
+      )
+      return await this.#waitForConfirm(confirmId, timeoutMs)
+    } finally {
+      // 见 ⑤：结局无论如何都要把"待答"清干净（`updateSnapshot` 在流已收尾时会自己短路）
+      await clearConfirmSignal(this.#conversationId)
+      await this.updateSnapshot({ pendingConfirmId: null })
+    }
+  }
+
+  /**
+   * 轮询应答槽，直到"有人答了"或"到点"或"被中断"。
+   *
+   * 三条判据的**顺序**（与 `06` P0-2-1 判据 2 的"顺序即正确性"同族）：
+   *   ① **中断优先**：信号已中止就直接抛，不必再读 Redis —— 用户按了停止之后还去消费一个
+   *      应答、甚至继续跑完这段等待，是"停止按钮失效"的经典形态（坑预判 5）。
+   *   ② **先看应答、再看截止时刻**：两者同时到达时按"用户答了"处理 —— 他不知道截止时刻
+   *      与服务端是否同一刻，而"点了确认却被说超时"是更坏的那个结果。
+   *      （`confirmId` 不匹配的应答被丢弃，所以这里不存在"消费了别人的答案"的风险。）
+   *   ③ 读 Redis 失败**不结束等待**（当"还没答"，下一轮再试）：Redis 抖一下不该让一次
+   *      已经展示给用户的确认直接失败。
+   *
+   * ⚠️ **不 `await` 在 `setTimeout` 上的写法**（`await sleep(...)`）：那样没法把 `signal` 与
+   * 超时都收进同一个 promise，还得再挂一个 abort 监听器去 `clearTimeout`（P0-1-26 的教训：
+   * 监听器泄漏 / 事件已经过去了）。这里用"每轮 tick 自己 schedule"的形态，退出点只有
+   * `done` / `fail` 两个，都在里面 `clearTimeout`。
+   */
+  #waitForConfirm(confirmId: string, timeoutMs: number): Promise<ConfirmDecision> {
+    const deadline = Date.now() + timeoutMs
+    const pollMs = signalPollIntervalMs()
+    return new Promise<ConfirmDecision>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined
+      const done = (decision: ConfirmDecision): void => {
+        if (timer !== undefined) clearTimeout(timer)
+        resolve(decision)
+      }
+      const fail = (error: unknown): void => {
+        if (timer !== undefined) clearTimeout(timer)
+        reject(error)
+      }
+
+      const tick = async (): Promise<void> => {
+        if (this.#controller.signal.aborted) {
+          fail(abortErrorOf(this.#controller.signal))
+          return
+        }
+        try {
+          const redis = await ensureRedisConnected()
+          const raw = await redis.get(chatConfirmKey(this.#conversationId))
+          if (raw !== null) {
+            const answer = parseConfirmAnswer(raw)
+            // 无论匹配与否都**删掉**：它是"一条待消费的应答"，而唯一的消费者就是本次等待
+            // （匹配按 id）⇒ 不匹配的那种永远不会有人要（迟到点击 / 手工写的脏值）。
+            await redis.del(chatConfirmKey(this.#conversationId))
+            if (answer !== null && answer.confirmId === confirmId) {
+              getLogger().info(
+                { conversationId: this.#conversationId, confirmId, accepted: answer.accepted },
+                '收到确认应答（本轮继续）',
+              )
+              done(answer.accepted ? 'CONFIRMED' : 'REJECTED')
+              return
+            }
+            getLogger().warn(
+              { conversationId: this.#conversationId, confirmId, receivedConfirmId: answer?.confirmId ?? null },
+              '丢弃一条不属于本次等待的确认应答（可能是上一轮的迟到点击）',
+            )
+          }
+        } catch (error) {
+          getLogger().warn(
+            { err: error, conversationId: this.#conversationId },
+            '读取确认应答失败（本轮跳过，下轮再试）',
+          )
+        }
+        if (Date.now() >= deadline) {
+          getLogger().info(
+            { conversationId: this.#conversationId, confirmId, timeoutSec: config.mcp.confirmTimeoutSec },
+            '等待确认超时 ⇒ 按取消处理（`02` §5.2）',
+          )
+          done('TIMEOUT')
+          return
+        }
+        timer = setTimeout(() => {
+          void tick()
+        }, pollMs)
+      }
+
+      void tick()
+    })
   }
 
   /**
@@ -710,9 +1035,11 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
   const startedAt = new Date().toISOString()
 
   // ① 会话互斥（`02` §5.2）。`streaming` 与锁是同一件事（`infra/redis.ts#chatActiveKey`）
+  // ⚠️ 用 `EMPTY_ACTIVE_SNAPSHOT` 铺底而**不是**逐字段手写（P0-2-10 改这里时正好踩过）：
+  //    手写的版本在加第四个字段 `pendingConfirmId` 时**不会报错也不会漂** —— 它只是少一个键，
+  //    而少这一个键的后果是"所有 `/confirm` 应答都变成 `applied:false`"（静默到只有类型检查能抓）。
   const locked = await acquireConversationLock(conversationId, {
-    queuedPosition: null,
-    currentTool: null,
+    ...EMPTY_ACTIVE_SNAPSHOT,
     startedAt,
   })
   if (!locked) {
@@ -737,6 +1064,12 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
     reply.raw.flushHeaders()
 
     channel = new SseChannel(reply.raw, conversationId, startedAt)
+    /**
+     * 非空别名：`channel` 是 `let`（外层 `finally` 要读它），而 TS 在**闭包**里会把它重置为
+     * `SseChannel | undefined` ⇒ `channel.awaitConfirm(...)` 编不过。用 `const` 取一次，
+     * 新的那个成员就不必写 `?.` 兜底（`emit` / `updateSnapshot` 的 `?.` 是历史写法，保持不动）。
+     */
+    const activeChannel = channel
     channel.start()
 
     // ⑤ 客户端断开 = 流结束。**这一条是"锁不会漏"的关键**：没有它，用户关掉标签页之后
@@ -773,6 +1106,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
         signal: channel.signal,
         emit: (event) => channel?.emit(event) ?? Promise.resolve(),
         updateSnapshot: (patch) => channel?.updateSnapshot(patch) ?? Promise.resolve(),
+        awaitConfirm: (question) => activeChannel.awaitConfirm(question),
       })
       // ⚠️ producer **正常返回**不等于"流正常结束"：锁在生成过程中丢掉时，producer 可能压根没察觉
       //    （占位实现就只是等 abort；真实的编排循环也可能把中断吞在某个 `catch` 里）。

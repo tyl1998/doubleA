@@ -48,6 +48,9 @@
  * 响应里由键**是否存在**派生出 `streaming`（{@link conversationActiveSchema}）。
  * ⚠️ 写侧归 **P0-1-26**（`orchestrator/sse.ts` 在流开始时写、结束时删）；本批只实现读侧，
  * 所以现在**恒为 `{streaming:false}`** —— 这一条在 `docs/06` P0-1-25 里明写，并作为验收断言。
+ * ✅ 那个写侧已在 P0-1-26 落地（`streaming` 从此是真值）；**P0-2-10 又给快照加了第四个字段
+ * `pendingConfirmId`**（正在等待应答的确认 id，见其注释）—— 它同样**不是**"给界面看的进度"，
+ * 而是 `/confirm` 端点判断"这个迟到的答复该不该被接受"的**唯一**来源。
  * ─────────────────────────────────────────────────────────────────────
  * ⑥ 消息历史（P0-1-28）：**读取端不解释 `content`**，原样透出
  * ─────────────────────────────────────────────────────────────────────
@@ -217,16 +220,23 @@ export type RemoveConversationResult = z.infer<typeof removeConversationResultSc
 /**
  * 活跃流**快照**（Redis `chat.active:{conversationId}` 的值形态，**不含 `streaming`**，见文件头 ⑤）。
  *
- * 三个字段都是「断线重连要恢复的进度视图」（`02` §5.2、`03` §4.1 的输入区状态机）：
+ * 四个字段都是「断线重连要恢复的进度视图」（`02` §5.2、`03` §4.1 的输入区状态机）：
  *   · `queuedPosition` —— 沙箱并发满时的排队位次（`02` §5.1 的 `queued` 事件，**1 = 下一个**）；
  *   · `currentTool` —— **工具名**而不是整张工具卡片：重连时界面只需要"它在干什么"，
  *     完整的卡片结构由历史消息与事件流提供（`02` §5.2 的"事件即真相、历史读库"）；
  *   · `startedAt` —— 流的开始时刻（ISO 8601），界面可以据此显示已用时。
+ *   · `pendingConfirmId` —— **正在等待用户应答的那个确认**的 id（P0-2-10 的契约增量，`02` §9.10）。
+ *     它**不是**"给界面看的进度"，而是 `/confirm` 端点**唯一**的判据来源：应答要能回答
+ *     "我答的是不是当前这个问题"（`confirmConversationResultSchema.applied`）——
+ *     没有它，任何迟到的点击都会被当成当前答案写进去，症状是"**确认卡一闪而过**"
+ *     （`06` P0-2-10 坑预判 2）。顺带它也让重连的客户端知道"有一个提问在等我"。
+ *     `null` = 当前没有待答的确认（绝大多数时刻）。
  */
 export const conversationActiveSnapshotSchema = z.object({
   queuedPosition: z.number().int().min(1).nullable(),
   currentTool: z.string().nullable(),
   startedAt: z.string().nullable(),
+  pendingConfirmId: z.string().nullable(),
 })
 export type ConversationActiveSnapshot = z.infer<typeof conversationActiveSnapshotSchema>
 
@@ -245,6 +255,7 @@ export const EMPTY_ACTIVE_SNAPSHOT: ConversationActiveSnapshot = Object.freeze({
   queuedPosition: null,
   currentTool: null,
   startedAt: null,
+  pendingConfirmId: null,
 })
 
 /**
@@ -271,7 +282,7 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
   if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) return empty()
 
   const record = decoded as Record<string, unknown>
-  const { queuedPosition, currentTool, startedAt } = record
+  const { queuedPosition, currentTool, startedAt, pendingConfirmId } = record
   return {
     queuedPosition:
       typeof queuedPosition === 'number' && Number.isInteger(queuedPosition) && queuedPosition >= 1
@@ -281,6 +292,14 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
       typeof currentTool === 'string' && currentTool.trim() !== '' ? currentTool.trim() : null,
     startedAt:
       typeof startedAt === 'string' && !Number.isNaN(Date.parse(startedAt)) ? startedAt : null,
+    // ⚠️ **这一行不加就会有"静默失效"的后果**（P0-2-10）：读取端是本函数、写入端是
+    // `orchestrator/sse.ts` 的 `updateSnapshot` —— 漏掉它，`/confirm` 会永远读到 `null`
+    // ⇒ 所有应答都变成 `applied:false`（"确认卡点了没反应"），而没有任何报错。
+    // 与 `currentTool` 同款：非空字符串才算，其余（含缺失键的旧快照）一律 `null`。
+    pendingConfirmId:
+      typeof pendingConfirmId === 'string' && pendingConfirmId.trim() !== ''
+        ? pendingConfirmId.trim()
+        : null,
   }
 }
 

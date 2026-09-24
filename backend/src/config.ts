@@ -548,7 +548,9 @@ export interface AppConfig {
   }
   /**
    * MCP 客户端（P0-2-1）。三个值都来自环境变量，见 `infra/.env.example` 的 MCP 段。
-   * ⚠️ P0-2-1 只消费 `requestTimeoutMs`；另两个是 P0-2-6 / P0-2-10 的（已落位，未接线）。
+   * ⚠️ 三个**都已接线**：`requestTimeoutMs` 自 P0-2-1、`toolLimit` 自 P0-2-6、
+   *    `confirmTimeoutSec` 自 **P0-2-10**（消费方 `orchestrator/sse.ts#awaitConfirm`，
+   *    以及 `shared/src/sse.ts#sseConfirmPayloadSchema.expiresAt` 那个倒计时起点）。
    */
   mcp: {
     /** 单次请求上限（毫秒）：到响应头 / `tools/call` 的等待 */

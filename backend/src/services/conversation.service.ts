@@ -67,12 +67,18 @@
  *    ⇒ "模型看到的最近几轮"与"用户在界面上看到的最近几条"不可能对不上。
  *
  * ⚠️ 各批**刻意不做**的（属后续批次，不要顺手补）：
- *   · `POST /:id/confirm`（elicitation）→ 随 MCP 工具循环落地（**P0-2**，需要 `mcp_servers` 表）；
  *   · `/api/conversations/:id/artifacts` → **P0-3**（`artifacts` 表）。
  * ⚠️ P0-1-26 起**已落地**（不再是"刻意不做"）：`POST /:id/chat`（SSE，闸门见
  *   {@link assertConversationSendable}）与 `POST /:id/stop`（停止信号）。
  * ⚠️ P0-1-28 起**已落地**：`GET /:id/messages`（{@link listMessages}，游标分页）。
- *   于是 `02` §4.5 那张表的九条路由只剩 `POST /:id/confirm` 一条没有出口（属 P0-2）。
+ * ⚠️ P0-2-10 起**已落地**：`POST /:id/confirm`（确认应答；它的**判据不在本文件** —— 见下一段）——
+ *   于是 `02` §4.5 那张表的九条路由**全部有出口**，本文头部这句"仍缺一条"的旧注记已删除。
+ *
+ * ⚠️ `/confirm` 的判据**刻意不落在本服务层**：它读的 `pendingConfirmId` 是 `/active` 快照的
+ *   一个字段（{@link getConversationActive}，四个字段之一），而匹配与写入在
+ *   `orchestrator/sse.ts#answerConfirm`（那里同时是"这个会话的流到底在等哪个 id"的唯一真相源）。
+ *   若在这里再判一次"该不该应用这条应答"，就出现了第二个实现 —— 而两者只要有一天不一致，
+ *   症状是"确认点了没反应"，且**两处各自看都是对的**。
  */
 
 import {

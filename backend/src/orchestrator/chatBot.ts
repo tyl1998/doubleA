@@ -6,7 +6,7 @@
  *  1. 并发闸：信号量（上限 50），满则 error{code: BUSY}
  *  2. 组装上下文：system = agent.system_prompt + 检索块；history = 最近 20 轮；user = content
  *  3. LLM 流式调用 → delta / thinking 透传
- *  4. 工具循环（MCP）→ P0-2（本批不做）
+ *  4. 工具循环（MCP）→ 已落地（P0-2-8 起；危险工具先过确认 ⇒ P0-2-10）
  *  5. done：整条消息落库 + usage 透传
  * ```
  *
@@ -57,6 +57,18 @@
  * ③ **凭据的主语来自"当前会话"**（`02` §9.3 不变式）：`viewer.userId` 从 `conversations` 行
  *    **现查**（懒加载，只有真要执行工具时才查一次），不从请求体、不从路径、不顺着调用链传
  *    —— 传一次就多一个"传错人"的机会，而现查的代价只有一次主键查询。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑤ 确认闸门（P0-2-10）的两条判据
+ * ─────────────────────────────────────────────────────────────────────
+ * ① **"要不要问"读 `route.dangerous`，本层不再判一次**：判定是 `mcp/risk.ts` 的纯函数，
+ *    结果由 `toolSchema.ts` 算进路由表（真值表见 `02` §9.9）—— 两处判 = 迟早有一处先腐烂。
+ *    挂起点**排在取凭据 / 发 `RUNNING` 卡之前**：确认的全部意义就是"发出去之前问一句"。
+ * ② **"问了之后"不是二选一，是三选一**（`ConfirmDecision` = 确认 / 取消 / 超时），
+ *    而**三条里的两条都通向"不执行但这一轮继续"**：取消与超时都回填一条"未执行"的工具结果
+ *    （文案刻意分开，见 `chatContext.ts` 的两个常量），让模型自己解释 —— 这与 ④② 同一条形态
+ *    （`01` §3.6「取消后流程可继续」）。⚠️ **中断（用户点停止）不走这条路**：那不是"确认的结局"，
+ *    而是"这一轮结束了"，由 `awaitConfirm` 抛出 `ChatStoppedError` 交给收尾（见文件头 ①）。
  */
 
 import {
@@ -83,11 +95,17 @@ import {
   type ChatStreamSummary,
   type ChatUsage,
 } from '../llm/client.js'
-import { McpAbortError } from '../mcp/client.js'
+import {
+  McpAbortError,
+  type McpElicitReply,
+  type McpElicitRequest,
+} from '../mcp/client.js'
 import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
 import { MESSAGE_CHRONO_ORDER, touchConversation } from '../services/conversation.service.js'
 import { searchKnowledgeBase } from '../services/retrieval.js'
 import {
+  TOOL_CONFIRM_REJECTED_OUTPUT,
+  TOOL_CONFIRM_TIMEOUT_OUTPUT,
   TOOL_LOOP_LIMIT_NOTICE,
   buildAssistantContent,
   buildAssistantToolCallsMessage,
@@ -102,7 +120,12 @@ import {
   type ToolOutcome,
 } from './chatContext.js'
 import { createSemaphore } from './semaphore.js'
-import { ChatStoppedError, type ChatProducer, type ChatStopReason } from './sse.js'
+import {
+  ChatStoppedError,
+  type ChatProducer,
+  type ChatStopReason,
+  type ConfirmDecision,
+} from './sse.js'
 
 /**
  * 进程级并发闸（`02` §六 第 1 步）。**模块级单例**：名额是"这个进程同时在跑几轮生成"，
@@ -411,29 +434,53 @@ export const chatBotProducer: ChatProducer = async (input) => {
             ? summarizeToolInput(parsed.value)
             : summarizeToolInput({ raw: call.arguments })
 
-          emitToolCard({ ...base, status: 'RUNNING', inputSummary })
-          await input.updateSnapshot({ currentTool: call.name })
+          /**
+           * ⚠️⚠️ **P0-2-10 的挂起点（原"接回点"）—— 危险工具必须先拿到用户确认才执行。**
+           *
+           * 位置是刻意的：**在取凭据、发 `RUNNING` 卡之前**。晚一步的后果是"确认卡上已经写着
+           * 『运行中』、工具也已经发出去了"，而确认的全部意义就是"发出去之前问一句"。
+           *
+           * 三条判据（每条都对应一种"问了或没问都不该发生"的情形）：
+           *   · **要不要问**读的是 `route.dangerous` —— 判定本身**已在 P0-2-9 做好**
+           *     （`mcp/risk.ts`，判定表见 `02` §9.9）⇒ 本处**不再判一次**（两处判 = 迟早有一处先腐烂）。
+           *   · **只对"本来能执行"的调用发问**：`route === undefined`（模型编了个名字）与
+           *     `!parsed.ok`（参数不是合法 JSON）两条路**无论如何都不会执行任何东西** ——
+           *     让用户在那种时候点一次确认，是在为一个必然失败的调用付交互成本。
+           *   · **答案不是"确认"就不执行**（三种结局见 `ConfirmDecision`），但**这一轮不失败**：
+           *     回填一条"未执行"的结果给模型，让它自己决定怎么说 —— 与 P0-2-8 门槛 2 同一条形态
+           *     （`01` §3.6 的"取消后流程可继续"）。
+           */
+          const blocked =
+            route !== undefined && parsed.ok && route.dangerous
+              ? await input.awaitConfirm({ source: 'PLATFORM', toolName: call.name, inputSummary })
+              : null
+          const blockedOutput =
+            blocked === null || blocked === 'CONFIRMED'
+              ? null
+              : blocked === 'TIMEOUT'
+                ? TOOL_CONFIRM_TIMEOUT_OUTPUT
+                : TOOL_CONFIRM_REJECTED_OUTPUT
+
+          /**
+           * 被用户拦下的调用**不发 `RUNNING` 卡**：那张卡的含义是"已经在跑"，而它其实没跑过。
+           * 前端按 `callId` upsert（`shared#toolCallRecordSchema`）⇒ 只发那最后一张 ERROR 卡就够，
+           * 不会出现"先运行中、再取消"的假状态流转。
+           */
+          if (blockedOutput === null) {
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+          }
 
           let status: ToolCallStatus = 'SUCCESS'
           let output: string
           let errorCode: ErrorCode | undefined
           let isError = false
 
-          /**
-           * ⚠️⚠️ **P0-2-10 的接回点 —— "危险工具 ⇒ 挂起等确认"就插在这里。**
-           *
-           * 位置是刻意的：**在取凭据与发 `RUNNING` 卡之前**。晚一步的后果是"确认卡上已经写着
-           * 『运行中』、工具也已经发出去了"，而确认的意义正是"发出去之前问一句"。
-           * ⚠️ **判定本身已经在 P0-2-9 做好了**：`route.dangerous`（判据表 / 真值表见
-           * `mcp/risk.ts` 与 `02` §9.9）—— 本处**不要再判一次**（两处判 = 迟早有一处先腐烂），
-           * 只读这一列；`route === undefined`（模型编了个名字）那一支**没有** `dangerous` 可读，
-           * 但它本来就直接报错、不执行任何东西，不需要判定。
-           * 缺的只是**挂起这一半**：① `confirm` 是**挂起等 `/confirm` 应答**（上限 120s），
-           * 那段等待**必须**也能被 `signal` 打断（否则停止按钮在确认卡上失效）；
-           * ② 用户取消 ⇒ 回填一条"用户拒绝执行"的 `tool_result`（**不是**把整轮搞失败）；
-           * ③ 确认必须**排在 `RUNNING` 卡之前**（先问、后发"运行中"）。
-           */
-          if (route === undefined) {
+          if (blockedOutput !== null) {
+            status = 'ERROR'
+            isError = true
+            output = blockedOutput
+          } else if (route === undefined) {
             status = 'ERROR'
             isError = true
             output =
@@ -446,6 +493,43 @@ export const chatBotProducer: ChatProducer = async (input) => {
             output = `工具调用失败：${parsed.reason}。模型给出的原文：${truncateToolResult(call.arguments)}`
           } else {
             try {
+              /**
+               * server 反向 elicitation（`tools/call` 途中的 `elicitation/create`）⇒
+               * **同一个挂起原语**（`06` P0-2-10 坑预判 1）：前端只有一种确认卡形态，
+               * 所以两条来源都发 `confirm` 事件、都由 `POST /:id/confirm` 应答，
+               * 差别只在 payload 的 `source`（决定前端那句话怎么写）。
+               *
+               * 三条映射口径（MCP 的 `ElicitResult.action` 只有这三个值）：
+               *   · 用户确认 ⇒ `accept`，**不带 `content`** —— P0 只有确认/取消二元语义
+               *     （`02` §六 第 4 步明写"不做自由输入表单"）⇒ 没有表单值可回；
+               *   · 用户取消 ⇒ `decline`（MCP 的语义是"用户明确拒绝"）；
+               *   · **超时 ⇒ `cancel`**（语义是"用户没给出答复就结束了"）——
+               *     与 `decline` 分开，是因为服务端可能对这两种的处理不同。
+               *
+               * ⚠️ **与 `PLATFORM` 的挂起不同：拒答之后工具照常执行完** —— 那是服务端自己的
+               * elicitation 流程（它拿到 `decline`/`cancel` 之后怎么做是它的事），
+               * 我方不替它决定"这一条工具算不算没执行"（`isError` 由服务端回什么就是什么）。
+               * ⚠️ 中断（用户点停止）在这里翻成 `cancel` 而不是抛出去：让上游收到一个**正常的**
+               * 答复（它不会看到一个协议错误），而本轮的收尾由**信号**负责 —— 紧接着的下一次
+               * 上游调用会以 `LlmAbortError` 结束，`chatBot` 据此按 `STOPPED` 收尾。
+               */
+              const onElicit = async (request: McpElicitRequest): Promise<McpElicitReply> => {
+                let decision: ConfirmDecision
+                try {
+                  decision = await input.awaitConfirm({
+                    source: 'SERVER',
+                    toolName: call.name,
+                    // 服务端给的那句话原样给用户看（`02` §9.3：elicitation 请求 → confirm 事件挂起）
+                    inputSummary: request.message,
+                  })
+                } catch (error) {
+                  if (error instanceof ChatStoppedError) return { action: 'cancel' }
+                  throw error
+                }
+                if (decision === 'CONFIRMED') return { action: 'accept' }
+                return decision === 'TIMEOUT' ? { action: 'cancel' } : { action: 'decline' }
+              }
+
               const execution = await executeMcpToolCall({
                 serverId: route.serverId,
                 viewer: await resolveViewer(),
@@ -453,6 +537,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
                 toolName: route.toolName,
                 args: parsed.value,
                 signal,
+                onElicit,
               })
               isError = execution.isError
               status = execution.isError ? 'ERROR' : 'SUCCESS'
