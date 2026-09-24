@@ -59,6 +59,18 @@ export interface McpEndpoint {
   logFields?: Record<string, unknown>
 }
 
+/**
+ * `tools/list` 这一阶段的**标识串**（唯一落点）。
+ *
+ * ⚠️ 为什么要把它提成常量而不是继续内联：{@link describeHttpFailure} 要**按阶段分支** ——
+ * 401/403 出现在「拉工具列表」时的处置与「调用工具」时**完全不同**（见那里的注释）。
+ * 两处各写一份字符串的后果是：谁改了其中一份，那条分支就**静默失效**，退回一句
+ * 会把人引向死路的文案（"请检查该 server 的凭据" —— 而列表请求从来不带凭据）。
+ *
+ * 常量落在本模块（而不是 `client.ts`）是为了**避开循环 import**：`client.ts` 已经 import 本模块。
+ */
+export const MCP_STAGE_LIST_TOOLS = 'tools/list（拉工具列表）'
+
 /** 只打「有没有凭据」的日志形态 —— **唯一**允许用来记录 {@link McpEndpoint} 的方式 */
 export function describeMcpEndpoint(endpoint: McpEndpoint): Record<string, unknown> {
   return {
@@ -350,8 +362,10 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
 /**
  * HTTP 层失败的文案。
  *
- * 四个分支各自对应一种**真实会碰到**的部署错，写清「去哪儿看一眼」：
- * 401/403 = 凭据没带对（但注意 P0 的 `tools/list` 刻意不带用户凭据，见 `06` P0-2-5 坑 1）；
+ * 五个分支各自对应一种**真实会碰到**的部署错，写清「去哪儿看一眼」：
+ * 401/403 在**拉列表**阶段 = 端点要求 `tools/list` 也鉴权，而本阶段不带凭据（`06` P0-2-5 坑 1）
+ *   ⇒ 文案要指向**已知边界**，不能叫人去配凭据（配了也不会被带上）；
+ * 401/403 在**握手 / 调用工具**阶段 = 凭据没带对或已失效；
  * 404 = `endpoint_url` 少了路径段；405 = 端点不接受我们用的方法；
  * -1 = SDK 明说的「不认识的 content-type」⇒ **多半根本不是 MCP 端点**（最典型是回了一个 HTML 页面）。
  */
@@ -362,6 +376,19 @@ function describeHttpFailure(code: number, message: string, endpoint: McpEndpoin
     return (
       `MCP 端点返回了本 SDK 不认识的内容类型（${stage}）：${who}。` +
       '大概率这个地址**不是** MCP 端点（常见：网关回了一个 HTML 页面或登录页）。' +
+      `原始消息：${body}`
+    )
+  }
+  if ((code === 401 || code === 403) && stage === MCP_STAGE_LIST_TOOLS) {
+    // ⚠️ 拉列表这一阶段**不带任何用户凭据**（`06` P0-2-5 坑预判 1 的定案）⇒
+    //    这里若照抄下面那句"请检查凭据是否已配置"，就把用户引向一个**治不好的动作**：
+    //    配了凭据也不会被带上（列表是**全员共享**的缓存，带上个人凭据等于"谁先点过测试，
+    //    别人的列表就是谁的视角"）。文案要说清"本阶段做不到这件事"，而不是"去配凭据"。
+    return (
+      `工具列表需要鉴权（${stage}，HTTP ${code}）：${who}。` +
+      '⚠️ 本阶段拉取工具列表**不带任何用户凭据**（列表缓存全员共享）⇒ 该 server 要求 `tools/list` 也通过鉴权时，' +
+      '平台当前**不支持带用户凭据拉列表**（已知边界，见 README）。' +
+      '可选处置：在该 server 上关闭"拉列表需鉴权"，或改用一个允许匿名拉列表的端点。' +
       `原始消息：${body}`
     )
   }

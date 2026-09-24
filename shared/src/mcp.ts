@@ -9,7 +9,8 @@
  * 本文件对应的 `mcp_servers` 表**没有 owner 列的收窄** —— `created_by` 只作**留痕**
  * （记"谁注册的这个 server"），不参与任何权限判定。⇒ 代价是"任何登录用户都能改/删别人注册的
  * server"，这是 `01` 决策 22 的直接推论，**不是实现疏漏**；要收紧得先改 `01`/`02`。
- * `verify:mcp-servers` 里专门有一条**反向守卫**盯着它（"能删掉别人建的 server"）。
+ * （历史上 `verify:mcp-servers` 有一条**反向守卫**盯着它；脚本已于 2026-09-24 移除，
+ * 现在这条靠人工端测：用 `MEMBER` 账号去删别人建的 server，看是不是 200。）
  *
  * ─────────────────────────────────────────────────────────────────────
  * ② `auth_type` / `oauth_config` 是**接口留位、能力不做**（`06` §4.0 口径 1）
@@ -69,6 +70,21 @@
  *     不能在字段之间搬运；**刻意不带行 id** —— 那样 upsert 就得先有 id（P0-1-10 的 Provider 是
  *     反例：它的 AAD 含 id，所以加密只能发生在拿到 id 之后）。
  *   · **`configured` 按当前模板逐 key 判**，不是"表里有没有行"（见 {@link isCredentialConfigured}）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑥ 工具列表（P0-2-5）：两种取法 / `refresh` 是白名单 / 缓存是"每个 server 一份"
+ * ─────────────────────────────────────────────────────────────────────
+ *   · **不传 `refresh` = 纯读缓存**（绝不联网、无副作用）；**`refresh=1` = 真拉一次并落库**。
+ *     响应形状**一个字没改** —— `cached` 从 P0-2-2 就在契约里等着今天分叉：拉到 ⇒ `false`；
+ *     拉不到但**有缓存** ⇒ `true`（`fetchedAt` 偏旧，这是"不是刚拉的"的**全部**信号）；
+ *     **拉不到且缓存也空 ⇒ 502**（**不在**这个形状里，理由见 {@link mcpServerToolsResultSchema}：
+ *     `{tools:[]}` 会冒充"这个 server 没有工具"）。
+ *   · **`refresh` 是白名单**（{@link mcpServerToolsQuerySchema}）：只收 `1`/`0`/`true`/`false`，
+ *     **拼错就 400**。⚠️ 不能用 `z.coerce.boolean()`：`Boolean('0') === true` 会把
+ *     `?refresh=0` 判成"要刷新"，而这是**零症状**的（用户以为关掉了，其实每次都联网打上游）。
+ *   · **`tools/list` 不带用户凭据** ⇒ 缓存与"谁在看"无关（每个 server 一份、全员共享）。
+ *     ⚠️ 这条直接决定 401/403 的文案：**拉列表阶段不能说"去配凭据"**（配了也不会被带上），
+ *     而要说"本阶段不支持带用户凭据拉列表"（后端 `mcp/errors.ts` 按 `stage` 分支）。
  */
 
 import { z } from 'zod'
@@ -845,16 +861,67 @@ export const updateMcpServerResultSchema = z.object({
 export type UpdateMcpServerResult = z.infer<typeof updateMcpServerResultSchema>
 
 /**
+ * `?refresh=` 的取值域（**白名单**，`06` P0-2-5 定案）。前两个是"要刷新"。
+ *
+ * ⚠️ **刻意不用 `z.coerce.boolean()`**：`Boolean('0') === true` —— `?refresh=0` 会被判成
+ * "要刷新"，而这种错**零症状**（用户以为关掉了刷新，其实每次请求都联网打上游）。
+ * 反过来，放宽成"任意字符串"同样不行：`?refresh=yes` 静默等于不刷新，
+ * 用户点了刷新却看到旧列表（又一种零症状的失败）。
+ * ⇒ 收窄成白名单，**拼错就 400**（字段级 path 是 `querystring.refresh`，见 `02` §四）。
+ *
+ * 收 `true`/`false` 是因为前端 `URLSearchParams` 拼出来就是这个形态（`1`/`0` 是 curl 习惯）。
+ * 名单与判据挨着放：分成两处写，改一处忘另一处就会静默腐烂。
+ */
+const MCP_REFRESH_VALUES = ['1', 'true', '0', 'false'] as const
+type McpRefreshValue = (typeof MCP_REFRESH_VALUES)[number]
+
+/** 白名单里哪些表示"要刷新"——**唯一**判据，`transform` 复用它（别在别处再写一遍 `=== '1'`） */
+function isRefreshRequested(value: McpRefreshValue): boolean {
+  return value === '1' || value === 'true'
+}
+
+/**
+ * `GET /api/mcp/servers/:id/tools` 的查询参数（`06` P0-2-5）。
+ *
+ * `schema.querystring` 上的 `.default()` + `.transform()` 都会被 `zodValidatorCompiler`
+ * 写回 `request.query`（`plugins/errorHandler.ts` 的注释），所以 handler 拿到的是 **boolean**。
+ */
+export const mcpServerToolsQuerySchema = z.object({
+  // ⚠️ 用 `{ message }` 而**不是** `{ errorMap }`：zod v3 的 `processCreateParams` 在
+  //    "同时给 `errorMap` 与 `required_error`" 时**模块加载期就抛**（`types.js:50`），
+  //    而 `message` 这条短路既够用、又不碰那个雷（enum 的 `invalid_enum_value` 会取它）
+  refresh: z
+    .enum(MCP_REFRESH_VALUES, { message: 'refresh 只接受 1 / 0 / true / false' })
+    .default('0')
+    .transform(isRefreshRequested),
+})
+export type McpServerToolsQuery = z.infer<typeof mcpServerToolsQuerySchema>
+
+/**
  * `GET /api/mcp/servers/:id/tools` 的响应（**裸对象**，`06` §4.3 定的第五族形态）。
  *
- * 本批它是**纯读缓存**（绝不联网、无副作用）—— "真去拉"走 `POST /:id/test`。
- * `cached` 的语义 = **这份列表来自 `tool_cache` 列**（而不是本次实时拉取）：
- * 对该只读接口它恒等于 `fetchedAt !== null`。P0-2-5 加 `?refresh=1` 之后这两个值才会分叉
- * （"拉失败但缓存还在 ⇒ `cached:true`"），故现在就把它写进契约、界面不必改。
+ * 两种取法（P0-2-5 起）：
+ *   · **不传 `refresh`** —— 纯读缓存，绝不联网、无副作用；
+ *   · **`?refresh=1`** —— 真去拉一次并**落库**（`status` 变 `OK`）。
+ *
+ * `cached` 的语义 = **这份列表来自 `tool_cache` 列**（而不是本次实时拉取的）：
+ *   · 纯读 ⇒ 恒等于 `fetchedAt !== null`；
+ *   · `?refresh=1` 且拉成功 ⇒ `false`（`fetchedAt` 就是刚刚那一刻）；
+ *   · `?refresh=1` 但拉失败、缓存还在 ⇒ **`true`** —— 这是"你看到的**不是**刚拉的"的**唯一信号**
+ *     （`fetchedAt` 会明显偏旧）。⚠️ 刻意**不加** `warning` 之类的字段来复述这件事：
+ *     界面按 `cached` + `fetchedAt` 就能画"缓存于 X"，多一个字段等于同一件事两个来源。
+ *
+ * ⚠️ **拉失败且缓存也空 ⇒ 整个请求 502**（本形状里**没有**"失败字段"）。
+ * 理由（`02` §九）：「给不出工具列表」是**请求本身**的失败，与「这个 server 没有工具」
+ * （`{tools:[], fetchedAt:'<时刻>', cached:true}`）**必须分得开** ——
+ * 后者是一句真话（它确实没工具），前者是一句"我们答不了"。把它做成 200 + 空数组，
+ * 界面就只能显示"0 个工具"，而用户会去 MCP server 上找一个其实不存在的配置问题。
+ * 这与 `POST /:id/test` **恒 200** 不矛盾：那个端点**有** `{ok:false,error}` 这个合法形态
+ * 来承载"连不上"，而这个端点没有。
  */
 export const mcpServerToolsResultSchema = z.object({
   tools: z.array(mcpToolDescriptorSchema),
-  /** 上一次成功拉取的时间（ISO 8601）；从未拉过 → `null` */
+  /** **这份列表被拉到**的时刻（ISO 8601）；从未成功拉过 → `null`（与 `tools:[]` 组合起来才是"从没拉过"） */
   fetchedAt: z.string().nullable(),
   /** 这份列表是否来自缓存（见上） */
   cached: z.boolean(),

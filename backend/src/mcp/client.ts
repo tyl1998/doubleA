@@ -51,7 +51,14 @@ import { AppError, type McpToolDescriptor } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger, SERVICE_VERSION } from '../infra/logger.js'
-import { McpAbortError, describeMcpEndpoint, mcpSnippet, toMcpFailure, type McpEndpoint } from './errors.js'
+import {
+  MCP_STAGE_LIST_TOOLS,
+  McpAbortError,
+  describeMcpEndpoint,
+  mcpSnippet,
+  toMcpFailure,
+  type McpEndpoint,
+} from './errors.js'
 
 /**
  * 本仓作为 MCP **客户端**向服务端自报的名字（进服务端日志，便于对方排查）。
@@ -363,9 +370,16 @@ export class McpClient {
     )
   }
 
-  /** `tools/list` → 本仓投影。⚠️ P0 的列表请求**不带用户凭据**（`06` P0-2-5 坑 1） */
+  /**
+   * `tools/list` → 本仓投影。
+   *
+   * ⚠️ P0 的列表请求**不带用户凭据**（`06` P0-2-5 坑 1）：本方法没有"凭据"参数，
+   * 凭据只能经构造函数注入 `headers`，而**调用点一律不传**（`mcpServer.service.ts#probeServer`）。
+   * 有些 server 的 `tools/list` 也要求鉴权 —— 那时上游回 401/403，
+   * 而 `errors.ts` 会按 `stage` 给出**指向已知边界**的文案（不是"去配凭据"）。
+   */
   async listTools(options: McpCallOptions = {}): Promise<McpToolDescriptor[]> {
-    const stage = 'tools/list（拉工具列表）'
+    const stage = MCP_STAGE_LIST_TOOLS
     this.assertUsable(stage)
     try {
       const result = await this.inner.listTools(undefined, this.requestOptions(options))

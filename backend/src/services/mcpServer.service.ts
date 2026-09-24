@@ -4,10 +4,11 @@
  * 依据：`docs/02-后端设计.md` §4.7（六条路由）+ §三（`mcp_servers` 表）+ §九（注册者定义模板）
  *      + `docs/06-实施计划.md` §四 P0-2-2（内容 / 验收门槛 1~5 / 坑预判 1~4）
  *        与 P0-2-3（凭据模板的深度校验 / `credentialSchemaImpact` / 坑预判 2）
+ *        与 P0-2-5（工具发现：`?refresh=1` / 缓存命中零请求 / 上游不通的两个出口）
  *        与 §4.2、§4.3
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件的**六条口径**（每条都对应一条验收门槛或坑预判）
+ * 本文件的**七条口径**（每条都对应一条验收门槛或坑预判）
  * ─────────────────────────────────────────────────────────────────────
  * **① 权限是"登录即可"，且**没有 owner 列收窄**（`06` §4.2 第五族 / 验收门槛 1）。**
  *    `created_by` 只作**留痕**：它出现在响应里（前端能显示"谁注册的"），但**不参与任何判定** ——
@@ -45,6 +46,16 @@
  *    因为"用户临时改错模板"⇒ 值被清掉是**不可逆**的，而他什么都没做。⚠️ 这与"缓存该不该清"是**两个判据**：缓存用 `sameJson`
  *    判"模板整体变没变"（连 `label` 改了也清），impact 用 `diffCredentialSchema` 判
  *    "**已存凭据会受什么影响**"（只有 key 级的三种改动才算）。
+ *
+ * **⑦ "拉不到"有两个出口，分界线是"我们还能不能答出这个问题"（P0-2-5 门槛 2/4）。**
+ *    `GET /:id/tools?refresh=1` 刷新失败时：
+ *      · **缓存还在 ⇒ 200**，回上一次成功的那份 + `cached:true`（`fetchedAt` 明显偏旧）
+ *        —— 用户要的是"工具列表"，我们**答得出来**（只是不是最新的），答得出来就必须答；
+ *      · **缓存也空 ⇒ 502** —— 这时唯一能给的就是 `{tools:[]}`，而它会**冒充**一句
+ *        "这个 server 没有工具"。**给不出的东西不要拿空值代替**（老口径）。
+ *    ⚠️ 与 `POST /:id/test` **恒 200** 不冲突：那个端点的响应形状里**有** `{ok:false,error}`
+ *    这个合法位置来承载"连不上"，而 `{tools,fetchedAt,cached}` **没有**这样的位置。
+ *    两条路由都在写库（成功刷缓存 / 失败只写 `status`），见 ③④。
  */
 
 import {
@@ -70,7 +81,7 @@ import {
 import { getLogger } from '../infra/logger.js'
 import { getPrisma, Prisma } from '../infra/prisma.js'
 import { McpClient } from '../mcp/client.js'
-import { buildToolCache, parseToolCache, toolCountOf } from '../mcp/toolCache.js'
+import { buildToolCache, parseToolCache, toolCountOf, type McpToolCache } from '../mcp/toolCache.js'
 import { countAffectedCredentials } from './mcpCredential.service.js'
 
 /** 调用者（只用到 id：本资源没有 owner 收窄，`created_by` 只是留痕，见文件头 ①） */
@@ -207,7 +218,7 @@ async function nextSlug(name: string): Promise<string> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// 连通测试（唯一的"联网"入口）
+// 连通测试与工具缓存刷新（**全文件唯一的"联网"入口**）
 // ═════════════════════════════════════════════════════════════════════
 
 /**
@@ -218,8 +229,10 @@ async function nextSlug(name: string): Promise<string> {
  * （`connect()` 内部失败时自己已经关过一次）。
  *
  * ⚠️ 错误消息来自 `mcp/errors.ts` 的翻译层（已经是**可读中文 + 已脱敏**）；
- *    非 `AppError` 的意外错误原样带出 —— 它们是**给我们看的**，会被 `status=ERROR` 之外
- *    再进日志的 warn（`testMcpServer` 里）。
+ *    非 `AppError` 的意外错误原样带出 —— 它们是**给我们看的**。
+ *    三个调用点各自决定怎么用它：`testMcpServer` 收成一条 warn（结论照常回给调用方）、
+ *    `getMcpServerTools` 在"回退到既有缓存"时进一条 warn，而在"连缓存都没有"时
+ *    把它**原样作为 502 的消息**给用户（那时它就是用户唯一能看到的原因）。
  */
 async function probeServer(target: { id: string; name: string; endpointUrl: string }): Promise<McpServerTestResult> {
   const client = new McpClient({
@@ -243,19 +256,45 @@ async function probeServer(target: { id: string; name: string; endpointUrl: stri
  *
  * 成功 ⇒ `status=OK` + 写 `tool_cache`；失败 ⇒ **只改 `status=ERROR`**（文件头 ④）。
  * 一次 `update` 同时覆盖两种结果（不是"先查再写"）—— 顺带把 `updated_at` 交给 Prisma 维护。
+ *
+ * ⚠️ `fetchedAt` 由**调用方**给（不在这里 `new Date()`）：同一个时刻要同时进**库**与
+ * **响应体**。两处各取一次"现在"的后果是界面显示的时刻与缓存里那个差几毫秒 ——
+ * 一个没法复现、也没人会去报的偏差（`buildToolCache` 的注释同款理由）。
  */
-async function applyProbeResult(id: string, test: McpServerTestResult): Promise<McpServerRow> {
+async function applyProbeResult(
+  id: string,
+  test: McpServerTestResult,
+  fetchedAt: string,
+): Promise<McpServerRow> {
   const db = getPrisma()
   return db.mcpServer.update({
     where: { id },
     data: test.ok
-      ? {
-          status: 'OK',
-          toolCache: toJsonInput(buildToolCache(test.tools, new Date().toISOString())),
-        }
+      ? { status: 'OK', toolCache: toJsonInput(buildToolCache(test.tools, fetchedAt)) }
       : { status: 'ERROR' },
     select: MCP_SERVER_SELECT,
   })
+}
+
+/**
+ * **刷新**一次工具缓存（= 连一次上游 + 落库）—— 本文件里"真的联网"的唯一入口。
+ *
+ * 三处调用点共用它：注册时的 best-effort 探测、`POST /:id/test`、`GET /:id/tools?refresh=1`。
+ * 三处各写一遍"连一次 + 落库"的后果是"失败时 `tool_cache` 一字节不动"这条口径
+ * 迟早会在其中一处腐烂（那正是文件头 ④ 说的最坏形态）。
+ *
+ * ⚠️ 返回的 `row` 是**落库后**的行：成功时 `row.toolCache` 就是刚写进去的值
+ * （`getMcpServerTools` 顺手拿它验一次"写得进、读得出"）；失败时它仍是**上一次成功**的那份
+ * （本函数刻意不碰它，见 `applyProbeResult`）。
+ */
+async function refreshServerTools(server: {
+  id: string
+  name: string
+  endpointUrl: string
+}): Promise<{ test: McpServerTestResult; row: McpServerRow }> {
+  const test = await probeServer(server)
+  const row = await applyProbeResult(server.id, test, new Date().toISOString())
+  return { test, row }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -296,7 +335,7 @@ export async function listMcpServers(query: ListMcpServersQuery): Promise<Offset
  *      免得留下一个"注册成功但永远用不了"的 server。
  *   ② 派生 slug（查一次库；见 `nextSlug`）。
  *   ③ 落库。
- *   ④ **best-effort 探测**（文件头 ②）—— 它**不参与成败**：`probeServer` 永不抛，
+ *   ④ **best-effort 探测**（文件头 ②）—— 它**不参与成败**：`refreshServerTools` 永不抛，
  *      失败只是让 `status=ERROR`。
  *
  * ⚠️ 第 ④ 步会让"建一个打不通的地址"也耗时到 `MCP_REQUEST_TIMEOUT_MS`（默认 20s）——
@@ -325,8 +364,7 @@ export async function createMcpServer(
     select: MCP_SERVER_SELECT,
   })
 
-  const test = await probeServer(created)
-  const refreshed = await applyProbeResult(created.id, test)
+  const { test, row: refreshed } = await refreshServerTools(created)
 
   getLogger().info(
     { mcpServerId: created.id, name: created.name, slug, testOk: test.ok },
@@ -502,6 +540,10 @@ export async function removeMcpServer(id: string): Promise<RemoveMcpServerResult
  * 只有"server 不存在"才抛 404 —— 那是**请求本身**的问题（主语是"这个请求"），
  * 与"这一轮连不上"（主语是"这次执行"）必须分开（`02` §5.2 的两类失败口径）。
  *
+ * ⚠️ P0-2-5 起它与 `GET /:id/tools?refresh=1` **都**会刷新缓存，但**出口不同**：
+ * 这里恒 200（连不上是 `{ok:false,error}`），那边缓存空且拉不到时是 **502**（文件头 ⑦）。
+ * 差别不在实现而在**响应形状里有没有"失败"的位置** —— 别把两条路由的出口"统一"起来。
+ *
  * @throws {AppError} `NOT_FOUND`(404)
  */
 export async function testMcpServer(id: string): Promise<McpServerTestResult> {
@@ -512,8 +554,7 @@ export async function testMcpServer(id: string): Promise<McpServerTestResult> {
   })
   if (target === null) throw AppError.notFound('MCP server 不存在')
 
-  const test = await probeServer(target)
-  await applyProbeResult(id, test)
+  const { test } = await refreshServerTools(target)
 
   if (!test.ok) {
     // 失败进 warn（成功那条走 info）—— "哪个 server 现在打不通"是运维最想一眼看到的东西
@@ -523,27 +564,85 @@ export async function testMcpServer(id: string): Promise<McpServerTestResult> {
 }
 
 /**
+ * 读 `tool_cache` 列 → {@link McpToolCache}，**永不抛错**（读不出来一律 `null` = 当作没有缓存）。
+ *
+ * 抽成一处是为了让"库里有一份我们解析不了的缓存"这条异常**只在一个地方留痕**：
+ * 本端点要读两次（刷新**前**的旧值、刷新**后**的新值），两处各写一遍 parse + warn 的话，
+ * 那条 warn 的文案会分叉 —— 而它正是排查"缓存为什么没生效"的唯一线索。
+ *
+ * ⚠️ 列表页用的是 {@link toolCountOf}（只要数量、**不刷 warn**）：列表是翻页的高频接口，
+ * 让一行脏数据在每个请求上打一条日志会把日志冲掉，而那里也做不了任何处置。
+ */
+function readCachedTools(raw: unknown, serverId: string): McpToolCache | null {
+  const cache = parseToolCache(raw)
+  if (cache === null && raw !== null && raw !== undefined) {
+    getLogger().warn({ mcpServerId: serverId }, 'tool_cache 内容不符合契约，按「无缓存」处理')
+  }
+  return cache
+}
+
+/**
  * 工具列表（`GET /api/mcp/servers/:id/tools`，登录即可）。
  *
- * **本批是纯读缓存**：不联网、无副作用（"真去拉"走 `POST /:id/test`，P0-2-5 会加 `?refresh=1`）。
- * 从未成功拉过 ⇒ `{tools: [], fetchedAt: null, cached: false}` —— ⚠️ 这与"这个 server
- * 没有工具"（`{tools: [], fetchedAt: '<时刻>', cached: true}`）是**两件事**，
- * 界面必须能分开显示（前者提示"点「测试」拉取"，后者显示"0 个工具"）。
+ * 两种取法（P0-2-5）：
+ *   · **纯读缓存**（不传 `refresh`）：绝不联网、无副作用。从未成功拉过 ⇒
+ *     `{tools: [], fetchedAt: null, cached: false}` —— ⚠️ 它与"这个 server **确实没有**工具"
+ *     （`{tools: [], fetchedAt: '<时刻>', cached: true}`）是**两件事**，界面必须分开显示
+ *     （前者提示"点「测试」拉取"，后者显示"0 个工具"）。
+ *   · **`refresh: true`**：真拉一次并落库。三个出口见文件头 ⑦ —— 拉到 ⇒ `cached:false`；
+ *     拉不到但有缓存 ⇒ 200 + `cached:true`；拉不到且无缓存 ⇒ **502**。
  *
- * @throws {AppError} `NOT_FOUND`(404) server 不存在
+ * ⚠️ 旧缓存必须在**刷新之前**取出来：刷新一旦落库，行里的旧值就没了 ——
+ * 而"拉不到时回落到上一次成功的那份"正是靠它（这也是本函数不在刷新后重新查行的原因）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) server 不存在；`UPSTREAM_ERROR`(502) 拉不到且无缓存可回落
  */
-export async function getMcpServerTools(id: string): Promise<McpServerToolsResult> {
+export async function getMcpServerTools(
+  id: string,
+  options: { refresh: boolean },
+): Promise<McpServerToolsResult> {
   const db = getPrisma()
-  const row = await db.mcpServer.findUnique({ where: { id }, select: { id: true, toolCache: true } })
+  const row = await db.mcpServer.findUnique({
+    where: { id },
+    // `name` / `endpointUrl` 是"要联网"那条路要用的（`probeServer` 拿它们拼请求与错误消息）
+    select: { id: true, name: true, endpointUrl: true, toolCache: true },
+  })
   if (row === null) throw AppError.notFound('MCP server 不存在')
 
-  const cache = parseToolCache(row.toolCache)
-  if (cache === null) {
-    if (row.toolCache !== null) {
-      // 有值但读不出来 ⇒ 值得一条 warn（那是"库里有一份我们解析不了的缓存"，属异常数据）
-      getLogger().warn({ mcpServerId: id }, 'tool_cache 内容不符合契约，按「无缓存」处理')
-    }
-    return { tools: [], fetchedAt: null, cached: false }
+  /** 上一次**成功**拉到的缓存（库里那份解析不了时按"没有"处理，并留一条 warn） */
+  const previous = readCachedTools(row.toolCache, id)
+
+  if (!options.refresh) {
+    return previous === null
+      ? { tools: [], fetchedAt: null, cached: false }
+      : { tools: previous.tools, fetchedAt: previous.fetchedAt, cached: true }
   }
-  return { tools: cache.tools, fetchedAt: cache.fetchedAt, cached: true }
+
+  const { test, row: refreshed } = await refreshServerTools(row)
+
+  if (!test.ok) {
+    // 出口之一：**答得出来就答** —— 用户要的是"工具列表"，我们手上有上一次成功的那份。
+    // `cached:true` + 偏旧的 `fetchedAt` 就是"这不是刚拉的"的**全部**信号（契约里刻意不加
+    // `warning` 字段，见 `shared` 里那份注释）
+    if (previous !== null) {
+      getLogger().warn(
+        { mcpServerId: id, name: row.name, error: test.error, cachedFetchedAt: previous.fetchedAt },
+        '工具列表刷新失败，已回退到既有缓存',
+      )
+      return { tools: previous.tools, fetchedAt: previous.fetchedAt, cached: true }
+    }
+    // 出口之二：**缓存也空** ⇒ 拿 `{tools:[]}` 冒充"这个 server 没有工具"是一句**假话**，
+    // 用户会去上游找一个其实不存在的配置问题 ⇒ 如实报"给不出工具列表"
+    throw AppError.upstreamError(`无法获取 MCP server 的工具列表：${row.name}。${test.error}`)
+  }
+
+  // 成功：⚠️ 从**落库后的行**把值读回来（而不是直接用 `test.tools`）—— 顺带验了"写得进、读得出"。
+  // jsonb 往返只重排对象键、不动值，所以这一步同时是驱动与契约的自检。
+  const fresh = readCachedTools(refreshed.toolCache, id)
+  if (fresh === null) {
+    // 刚写进去的值读不出来 ⇒ 驱动或契约出了问题（不是用户输入问题 ⇒ 500，且消息要可上报）
+    getLogger().error({ mcpServerId: id }, '刷新后写入的 tool_cache 无法解析（驱动或契约异常）')
+    throw AppError.internal('工具列表已刷新但读不回缓存，请重试；若持续出现请上报')
+  }
+  return { tools: fresh.tools, fetchedAt: fresh.fetchedAt, cached: false }
 }

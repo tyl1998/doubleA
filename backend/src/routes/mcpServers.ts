@@ -21,7 +21,8 @@
  * `mcp_servers.created_by` 只是**留痕**（前端显示"谁注册的"），不参与判定。
  * 代价是"任何登录用户都能改/删别人注册的 server"，这是 `01` 决策 22 的直接推论 ——
  * 要收紧得先改 `01`/`02`，**本批不自行发明权限模型**。
- * `verify:mcp-servers` 里有两条反向守卫盯着它（MEMBER 能改、MEMBER 能删别人建的）。
+ * （历史上 `verify:mcp-servers` 有两条反向守卫盯着它；该脚本随 2026-09-24 的定案移除，
+ * 现在这两条要靠人工端测 —— 用 `MEMBER` 账号去改/删别人建的 server，看是不是 200。）
  *
  * ─────────────────────────────────────────────────────────────────────
  * 六条路由与它们的信封（第五族的形态见 `shared/src/mcp.ts` 的注释）
@@ -31,7 +32,8 @@
  *   PATCH  /:id         改   → **`{server,credentialSchemaImpact}`**（P0-2-3 加的复合响应）
  *   DELETE /:id         删   → `{id,name}`
  *   POST   /:id/test    测试 → **恒 200** + `{ok,tools}` / `{ok,error}`
- *   GET    /:id/tools   工具 → 裸 `{tools,fetchedAt,cached}`（本批纯读缓存）
+ *   GET    /:id/tools   工具 → 裸 `{tools,fetchedAt,cached}`（**不传 `refresh` = 纯读缓存；
+ *                        `?refresh=1` = 真拉一次并落库**，P0-2-5；拉不到且无缓存 ⇒ 502）
  *
  * ⚠️ **`PATCH` 的回包在 P0-2-3 变过一次**（原先是裸 item）：模板变更要带回一条"本次请求特有"的
  * 提示（`credentialSchemaImpact`），而进 item 就破了"全端点唯一形状"（P0-2-2 定案 ② 的同一条
@@ -39,8 +41,15 @@
  * `credentialSchemaImpact` 为 `null` = 本次没有需要提示的影响（没提交模板 / 提交了但等价），
  * 且**它只提示、绝不自动删任何已存凭据**（P0-2-3 坑预判 2）。
  *
- * ⚠️ 凭据那三条（`/api/mcp/credentials**`）**属 P0-2-4**，**不要顺手补**：
- * 它们的收窄不在角色上而在 `user_id` 上（只能动自己的），且要有 `mcp_credentials` 表。
+ * ⚠️ 凭据那三条（`/api/mcp/credentials**`）**属 P0-2-4**（已落地）：它们的收窄不在角色上、
+ * 而在 `user_id` 上（只能动自己的）—— 与本文件的 `/api/mcp/servers/**` **同一个前缀却刻意两族**，
+ * 别照抄（差别见 `routes/mcpCredentials.ts` 文件头）。
+ *
+ * ⚠️ **工具列表与连通测试都**不带用户凭据**（P0-2-5 坑预判 1 的定案）**：`tools/list` 走
+ * "注册者视角"，于是 `tool_cache` 也是**每个 server 一份、全员共享**的（与用户无关）。
+ * 有些 server 要求 `tools/list` 也鉴权 ⇒ 那时如实报出"本阶段不支持带用户凭据拉列表"
+ * （文案在 `mcp/errors.ts`、按 `stage` 分支）——**不要**顺手带上某个人的凭据：
+ * 那会造出"工具列表依赖谁先点过测试"的诡异状态。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
@@ -49,11 +58,13 @@ import {
   createMcpServerBodySchema,
   listMcpServersQuerySchema,
   mcpServerIdParamsSchema,
+  mcpServerToolsQuerySchema,
   ok,
   updateMcpServerBodySchema,
   type CreateMcpServerBody,
   type ListMcpServersQuery,
   type McpServerIdParams,
+  type McpServerToolsQuery,
   type UpdateMcpServerBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -138,10 +149,25 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
     async (request) => ok(await testMcpServer(request.params.id)),
   )
 
-  /** 工具列表（登录即可）。本批**纯读缓存**，不联网（P0-2-5 会加 `?refresh=1`） */
-  app.get<{ Params: McpServerIdParams }>(
+  /**
+   * 工具列表（登录即可）。**不传 `refresh` = 纯读缓存**（绝不联网、无副作用）；
+   * **`?refresh=1` = 真拉一次并落库**（P0-2-5）。
+   *
+   * ⚠️ 两个出口的分界（`02` §九 / 服务层文件头 ⑦）：拉不到但**有缓存 ⇒ 200**（回缓存、
+   * `cached:true`）；拉不到且**缓存空 ⇒ 502** —— 那时唯一的"成功响应"只能是 `{tools:[]}`，
+   * 而它会冒充"这个 server 没有工具"。这与 `POST /:id/test` **恒 200** 不冲突：
+   * 那个端点的形状里**有** `{ok:false,error}` 这个位置来承载"连不上"。
+   *
+   * `refresh` 的取值域是白名单（`1`/`0`/`true`/`false`），**拼错就是 400** ——
+   * 见 `shared#mcpServerToolsQuerySchema` 的注释（`z.coerce.boolean()` 会把 `'0'` 判成真）。
+   */
+  app.get<{ Params: McpServerIdParams; Querystring: McpServerToolsQuery }>(
     '/api/mcp/servers/:id/tools',
-    { preHandler: app.requireAuth, schema: { params: mcpServerIdParamsSchema } },
-    async (request) => ok(await getMcpServerTools(request.params.id)),
+    {
+      preHandler: app.requireAuth,
+      schema: { params: mcpServerIdParamsSchema, querystring: mcpServerToolsQuerySchema },
+    },
+    async (request) =>
+      ok(await getMcpServerTools(request.params.id, { refresh: request.query.refresh })),
   )
 }

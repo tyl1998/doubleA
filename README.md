@@ -1328,8 +1328,35 @@ pnpm verify:chatbot
 #     P0-2 的收窄落在**凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4），**不在 server 上**。
 
 # ⑳-⓪ 另开一个终端：起一个**假 MCP server** 并前台常驻（Ctrl-C 收工）—— 它打印的地址就是 $MCPURL
-node --input-type=module -e 'const { startFakeMcpServer } = await import("./backend/scripts/fixtures/mcp-upstream.mjs"); const s = await startFakeMcpServer({}); console.log("MCPURL=" + s.url);'
+#     ⚠️ 这一段是**内联**的：仓库里**不再放夹具文件**（夹具已随 2026-09-24 的定案删除 —— 上一版这里
+#        引用的 `backend/scripts/fixtures/mcp-upstream.mjs` 已经不存在了，整条 ⑳ 当时是跑不起来的）。
+#        它**逐条打印收到的 method**，那就是"上游到底被请求了几次"的**唯一取证方式**（见 ㉒-b）。
+node --input-type=module -e '
+const http = await import("node:http");
+let n = 0;
+const srv = http.createServer(async (req, res) => {
+  if (req.method !== "POST") { console.log(`[假上游] ${req.method}（不计入）`); res.writeHead(200).end(); return; }
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  const msg = body === "" ? null : JSON.parse(body);
+  n += 1;
+  console.log(`[假上游] #${n} ${msg?.method ?? "(无 method)"}`);
+  if (msg === null || msg.id === undefined) { res.writeHead(202).end(); return; }
+  const result = msg.method === "initialize"
+    ? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake-mcp", version: "1.0.0" } }
+    : msg.method === "tools/list"
+      ? { tools: [ { name: "echo", description: "原样回显传入的 text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
+                   { name: "now", description: "返回服务器当前时间", inputSchema: { type: "object", properties: {} } } ] }
+      : {};
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+});
+srv.listen(0, "127.0.0.1", () => console.log("MCPURL=http://127.0.0.1:" + srv.address().port + "/mcp"));
+'
 #  → 形如 `MCPURL=http://127.0.0.1:54321/mcp`（Streamable HTTP 端点是**单一 URL**，不拼路径段）
+#  ⚠️ **记账口径**（先看清楚再数，别自己吓自己）：一次成功的"连接 + 拉列表"固定是 **3 条** ——
+#     `initialize` + `notifications/initialized` + `tools/list`；握手后 SDK 还会发一个 **GET**
+#     （想开 SSE 推送流），那一条**不计入**（假上游对非 POST 一律回 200 并单独打印）。
+#     ⇒ 想验"某条路径到底联没联网"，**数 # 的增量**就行 —— 这是 ㉒-b 的取证方式。
 
 # ⑳-a 注册（注册**不要求上游可达** —— endpoint 写错也照常建成功，连通留给 test 那一步）
 MCP=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers \
@@ -1346,10 +1373,11 @@ curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers/$MCP/test | jq
 #  → `{ok:true, tools:[…]}`；每个工具含 **6 个契约键**（name/title/description/inputSchema/
 #     annotations/hasOutputSchema），缺失的一律投影成 `null`，`inputSchema` **原样透传**（转换属 P0-2-6）。
 
-# ⑳-c 看工具清单（读侧，**纯读缓存、绝不联网**）
+# ⑳-c 看工具清单（读侧，**纯读缓存、绝不联网** —— "真拉"是 `?refresh=1`，见 ㉒）
 curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP/tools | jq .
 #  → 裸 `{tools, fetchedAt, cached}`：刚 test 成功过 ⇒ `cached:true` 且 `fetchedAt` 是那一刻；
 #     一次都没测过 ⇒ `tools:[]` + `fetchedAt:null`（"拉过但零工具"与"从没拉过"**是两件事**）。
+#     ⚠️ 不传 `refresh` 时这条请求**一个上游请求都不会发**（P0-2-5 起有 `?refresh=1` 作对照，见 ㉒-b）。
 
 # ⑳-d 失败**也是 200**：把 endpointUrl 改到一个**没在监听**的端口再测
 #     ⚠️ 别用 `http://127.0.0.1:1/mcp`（也别用 7/9）—— 它们属 fetch 规范的 **bad port**，`undici` 在
@@ -1398,7 +1426,9 @@ curl -sS --noproxy '*' -b "$COOKIE" -X DELETE $BASE/api/mcp/servers/$MCP | jq .
 #  ⚠️ 想让后面的步骤"有东西可查"就**别现在删**（同 ⑧⑪⑭-f⑮-f 那四条 ⚠️）
 
 # ⑳-h ⚠️ 历史上的自动版（`pnpm verify:mcp-servers`）已随脚本一起移除（2026-09-24）——
-#      上面的手工步骤就是全部；下面 ㉑ 的凭据也是同一口径。
+#      上面的手工步骤就是全部；下面 ㉑ 的凭据与 ㉒ 的工具发现也是同一口径。
+#      ⚠️ 本段起，**假上游也不再是仓库里的夹具文件**，而是 ⑳-⓪ 那段内联命令（它删过一次，
+#         上一版 README 的 ⑳-⓪ 因此指向了一个不存在的路径 —— 已修）。
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ㉑ 我的凭据：每用户每 server 一份（P0-2-4）—— 工具闭环第 4 步：模板定好后，每个使用者填自己的令牌
@@ -1483,6 +1513,93 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
   | jq '.data.credentialSchemaImpact'
 #  → `removedKeys:["X-User-Token"]` + `affectedCredentials:1`（= `values_enc` 里含该 key 的行数，全库口径）
 #  ⚠️ 它**只提示、什么都不删**：A 的那条值还在库里（只是 `fields` 里不再出现 —— 它已不会被注入）。
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ㉒ 工具发现与缓存（P0-2-5）—— 工具闭环第 5 步：工具列表有了**两种取法**（读缓存 / 真拉），
+#     而"拉不到时答什么"被分成了**三个出口**（这一批最值钱的一条判据）
+#     前置：承接 ⑳（假上游在 ⑳-⓪ 那个终端里跑着、$MCP 是那台 server 的 id）
+#     ⚠️ **本段大部分步骤要盯着 ⑳-⓪ 那个终端数 `#` 的增量** —— 那是"到底联没联网"的唯一取证方式
+#        （记账口径见 ⑳-⓪ 末尾：一次"连接 + 拉列表"固定 3 条，握手后的 GET 不计入）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ㉒-a `?refresh=1` = **真拉一次并落库**（不是"读缓存"）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools?refresh=1" \
+  | jq '{n:(.data.tools|length), fetchedAt:.data.fetchedAt, cached:.data.cached}'
+#  → `n:2`、`cached:false`、`fetchedAt` 是**刚刚**；假上游那边应多出 **3 条**（initialize / initialized / tools-list）
+#  ⚠️ `cached:false` 的含义是"**这份不是从缓存列读的**"（本次真拉）—— 与 ⑳-c 的 `cached:true` 对照着看
+
+# ㉒-b **【门槛①】缓存命中时上游零请求** —— 先看一眼那个终端现在是第几条，然后：
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools" | jq '.data.cached'
+#  → `true`。⚠️ **假上游那边一行都不该多** —— 这就是"纯读缓存、绝不联网"的**全部**证据。
+#    只断言"响应里有工具"是验不出这条的（一个每次都真拉的实现照样给得出工具）。
+#  ⚠️ 顺带：不传 refresh 时 `status` 也不会变 —— 这条路径**只读不写**。
+
+# ㉒-c **【门槛④前半】拉不到、但缓存还在 ⇒ 200 回缓存**（⚠️ **关键是别动 endpoint**）
+#     —— 去 ⑳-⓪ 那个终端按 **Ctrl-C**，把假上游停掉（缓存列**不受影响**；改 endpoint 才会清缓存，
+#        那测的就不是这一条了）
+curl -sS -o /tmp/tools.json -w '%{http_code}\n' --noproxy '*' -b "$COOKIE" \
+  "$BASE/api/mcp/servers/$MCP/tools?refresh=1"
+jq '{n:(.data.tools|length), fetchedAt:.data.fetchedAt, cached:.data.cached}' /tmp/tools.json
+#  → **200**（不是 502！），`n:2`、`cached:true`、**`fetchedAt` 与 ㉒-a 那个逐字相同**
+#    ⚠️ 这三条一起才是铁证：**200 且工具还在且时间戳没动** = "回退到了上一次成功的那份"。
+#      （`cached:true` + 偏旧的 `fetchedAt` 就是"你看到的不是刚拉的"**全部**信号 ——
+#        契约里**刻意没有** warning 字段，真正的失败原因在服务端日志里）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers?limit=100" \
+  | jq "[.data.items[]|select(.id==\"$MCP\")|.status]"   # → ["ERROR"]（status 记的是**最近一次尝试的结论**）
+
+# ㉒-d 让上游活过来（**新端口**）⇒ 把 endpoint 改过去 ⇒ 缓存**被清**（因为 endpoint 真的变了）
+#    ⚠️ 重新跑 ⑳-⓪ 那段，把新打印的地址重新 export 成 $MCPURL（`listen(0)` ⇒ 端口每次都不同）
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"endpointUrl":"'"$MCPURL"'"}' \
+  | jq '.data.server | {toolCount, status}'          # → `{toolCount:0, status:"UNKNOWN"}`（缓存已清）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools?refresh=1" >/dev/null   # 拉回来
+
+# ㉒-e **【门槛④后半】拉不到、缓存也空 ⇒ 502**（⚠️ **这一步会清掉缓存，所以放在最后**）
+docker exec -i doubulea-postgres psql -U doubulea -d doubulea -c \
+  "update mcp_servers set tool_cache = null, status = 'UNKNOWN' where id = '$MCP';"
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools" | jq .   # 纯读 ⇒ 确认真的空了
+#  停掉上游（Ctrl-C），再 refresh：
+curl -sS -o /tmp/tools2.json -w '%{http_code}\n' --noproxy '*' -b "$COOKIE" \
+  "$BASE/api/mcp/servers/$MCP/tools?refresh=1"
+jq '{code, msg}' /tmp/tools2.json
+#  → **502** + 统一信封（`code:"UPSTREAM_ERROR"`、msg 以"无法获取 MCP server 的工具列表："开头、后面跟着可读原因）。
+#    ⚠️ **它绝不能是"200 + 空数组"** —— 空数组会被读成"这个 server 没有工具"，
+#       用户于是跑去上游找一个**其实不存在**的配置问题。契约里 `{tools,fetchedAt,cached}` **没有**放"失败"的位置，
+#       所以给不出就是 502；这与 `POST /:id/test` **恒 200** 不矛盾（那个形状**有** `{ok:false,error}`）。
+
+# ㉒-f `refresh` 是**白名单**：拼错 ⇒ 400（不是"静默不刷新"）
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools?refresh=yes" \
+  | jq '{code, fields:.data.fields}'
+#  → 400 + `fields[0].path == "querystring.refresh"`、msg「refresh 只接受 1 / 0 / true / false」
+#  ⚠️ 两条**反例**解释为什么它必须收窄（都属"看起来工作了"的假象）：
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools?refresh=0" | jq '.data.cached'  # → true
+#    ① `?refresh=0` **不是** 400、也**不**刷新（`cached:true`）—— 若用 `z.coerce.boolean()`，
+#       `Boolean('0') === true` 会让它变成"要刷新"，而**零症状**（用户以为关掉了，其实每次都联网）；
+#    ② 放宽成"任意字符串"的话 `?refresh=yes` 会静默等于"不刷新" —— 点了刷新却看到旧列表。
+
+# ㉒-g **【门槛③】缓存的失效判据 = "真的变了"**（P0-2-2 已落，这里顺带看一眼三行）
+#     前置：上游活着（重启 ⑳-⓪ 并重新 export $MCPURL）+ 缓存已拉回来：
+curl -sS --noproxy '*' -b "$COOKIE" "$BASE/api/mcp/servers/$MCP/tools?refresh=1" | jq '.data.cached'  # → false
+#  ① 只改 `name` ⇒ **不清**（名字不参与连通，清了只会让人白等一次重拉）
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"name":"改个名试试"}' | jq '.data.server | {name, slug, toolCount}'
+#  → `name` 变了、**`toolCount` 还是 2**（没清）、`slug` 逐字不变
+#  ② **原样**提交（`endpointUrl` 与库里逐字相同）⇒ **同样不清** —— 这一条是"键序无关比较"的守门：
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"endpointUrl":"'"$MCPURL"'"}' | jq '.data.server.toolCount'
+#  → **2**（不是 0）。⚠️ 若这里看到 0，就是 `sameJson` 失效了：PG 的 `jsonb` 会**重排对象键**，
+#     逐字比较会把"没改"判成"改了" ⇒ 症状是"每次保存工具数都归零"（P0-2-2 的坑预判 4）。
+#  ③ 改一个**真的不同**的值 ⇒ 清（`toolCount` 归 0、`status` 回 `UNKNOWN`）：
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"endpointUrl":"http://127.0.0.1:65000/mcp"}' \
+  | jq '.data.server | {toolCount, status}'   # → `{toolCount:0, status:"UNKNOWN"}`
+#  ⚠️ 记得改回来（`-d '{"endpointUrl":"'"$MCPURL"'"}'`）再继续 —— 否则后面每步都不通。
+
+# ㉒-h **【门槛⑤】`slug` 的稳定性**：改名**不影响**工具名
+curl -sS --noproxy '*' -b "$COOKIE" $BASE/api/mcp/servers/$MCP | jq '.data | {name, slug}'
+#  → `slug` 与 ⑳ 注册时那一个逐字相同（`PATCH` 的 body 里根本没有 `slug` 这个字段）。
+#    ⚠️ **本批只能验到这里**：`mcp_{slug}_{toolName}` 那个**拼出来的名字**属 **P0-2-6**（`toOpenAiTools`），
+#       到那时才有得比 —— 现在别急着在库里找工具名前缀。
 ```
 
 **已知边界（别当 bug）**：① 接口现在是七组：`/api/auth/*`、`/api/users`（仅 ADMIN）、模型池
@@ -1491,7 +1608,7 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
 登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
 `reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**、**智能体 `/api/agents`（P0-1-22，
 登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**、
-**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**、**MCP server `/api/mcp/servers`（P0-2-2，**登录即可** —— 权限第五族，最接近知识库；五条业务路由 + `POST /:id/test` 恒 200 的连通测试）**。
+**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**、**MCP server `/api/mcp/servers`（P0-2-2，**登录即可** —— 权限第五族，最接近知识库；五条业务路由 + `POST /:id/test` 恒 200 的连通测试；**P0-2-5 起 `GET /:id/tools` 有两种取法** —— 不传 `refresh` 纯读缓存、`?refresh=1` 真拉并落库）**。
 **"MEMBER 能用的业务接口"现在有四处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
 `/api/agents` 的列表/详情/创建、以及**整个 `/api/mcp/servers/*`（P0-2-2）** —— 五族**权限口径刻意各不相同**（模型池全程 ADMIN；
 知识库**没有 owner 列**故登录即可读写；**MCP server 与知识库同族** —— 它虽有 `created_by` 列但**只作留痕、不参与判定**
@@ -1534,19 +1651,28 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
 · ⚠️ **绑定层会降级而不是 500**：密文被粘到别的 `(server,user,key)` 上 ⇒ 解密失败 ⇒ 该参数**退回"未配置"**、
 服务端打一条只带键名的 warn（主密钥轮换、密文损坏走的是同一条路）。
 · `/mcp/credentials` 的**前端仍是占位页**（属 P0-2-11）—— 现在要看只能用 ㉑ 的 curl。
-**MCP server 专项边界（P0-2-2；P0-2-3 补模板的深度校验与"变更影响"提示）**：· 权限是**第五族 = 登录即可**（`created_by` 只作留痕、不参与判定）⇒ **任何登录用户
+**MCP server 专项边界（P0-2-2；P0-2-3 补模板的深度校验与"变更影响"提示；P0-2-5 补工具列表的两种取法与"拉不到"的三个出口）**：· 权限是**第五族 = 登录即可**（`created_by` 只作留痕、不参与判定）⇒ **任何登录用户
 都能改/删别人注册的 server**，这是 `01` 决策 22 的直接推论、**不是 bug**（要收窄得先改 `01`/`02`）；P0-2 的收窄落在
 **凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4）。· **连通测试恒 HTTP 200** —— `ok:false` 是一条结论
 （"这个 server 现在通不通"）而非错误，只有 **id 不存在才 404**；**失败时工具缓存一个字节都不动**（只在成功时刷）。
 · **注册不强制连通**（上游抖动不该变成"建不了 server"），响应里那次 `test` 只是 best-effort 结论。
 · ⚠️ **`endpoint_url` 是 SSRF 面** —— 任何登录用户都能让后端去连**任意 http/https 地址**（含内网地址与云元数据端点）；
 P0 **只校验 scheme**（拒 `file:`/`gopher:` 之类），**不做内网黑名单 / 端口白名单 / DNS 重绑定防护** ——
-那属 **P1 安全加固**，本阶段是**已知且刻意**的边界。· ⚠️ `POST /:id/test` **不带用户凭据**（用"注册者视角"，
-P0-2-5 定案），有些 server 的 `tools/list` 也要求鉴权 ⇒ 那时会如实报 `ok:false` + 可读原因，**不是坏了**。
+那属 **P1 安全加固**，本阶段是**已知且刻意**的边界。· ⚠️ **`POST /:id/test` 与 `GET /:id/tools?refresh=1` 都**不带用户凭据**（"注册者视角"，P0-2-5 定案）**，
+于是 `tool_cache` 是**每个 server 一份、全员共享**的（与"谁在看"无关）。有些 server 的 `tools/list` 也要求鉴权 ⇒
+那时会如实报出 **「工具列表需要鉴权（本阶段不支持带用户凭据拉列表）」**，**不是坏了** ——
+⚠️ 配上凭据也**没有用**（拉列表根本不带它），别把这条当成"要去填凭据"。
+· ⚠️ **`?refresh=1` 有三个出口，分界线是"我们还能不能答出这个问题"**（P0-2-5）：拉到 ⇒ `cached:false`；
+**拉不到但有缓存** ⇒ **200** + `cached:true`（`fetchedAt` 明显偏旧，这就是"不是刚拉的"的全部信号）；
+**拉不到且缓存也空** ⇒ **502**。⚠️ 第三种**不能**是"200 + 空数组" —— 那会被读成"这个 server 没有工具"，
+用户于是去上游找一个**其实不存在**的配置问题。它与 `POST /:id/test` **恒 200** 不矛盾：
+那个形状里**有** `{ok:false,error}` 这个放结论的位置，`{tools,fetchedAt,cached}` **没有**。
+· ⚠️ `refresh` 只接受 **`1`/`0`/`true`/`false`**，**拼错就 400**（如 `?refresh=yes`）——
+刻意不用 `z.coerce.boolean()`：`Boolean('0') === true` 会让 `?refresh=0` 变成"要刷新"，而这是**零症状**的。
 · ⚠️ **`PATCH` 的回包在 P0-2-3 变过一次**：从**裸 item** 改成 **`{server, credentialSchemaImpact}`**
 （`POST /` 的 `{server,test}` 同族）⇒ 旧的 `.data.id` 要写成 `.data.server.id`；`credentialSchemaImpact`
-**只提示、绝不自动清理**已填的凭据（值没了是不可逆的，而用户只是临时改错模板），且它的
-`affectedCredentials` **此刻恒为 `null`**（凭据表属 **P0-2-4**，后端没能力回答"几条凭据受影响" ⇒ 宁可留白也不填 `0`）。
+**只提示、绝不自动清理**已填的凭据（值没了是不可逆的，而用户只是临时改错模板），
+`affectedCredentials` 从 **P0-2-4 起是全库的**真数**（= `values_enc` 里含 `removedKeys` 的行数；P0-2-3 时恒 `null`）。
 ② 浏览器里的登录页/强制改密跳转是 **P0-1-30** 的事，本里程碑只到命令行；
 **文档上传专项边界（P0-1-16）**：本批能验的是"进门校验"与"解析器本身"（`pnpm verify:documents`
 的 A/C/D 组真跑四个夹具文件）；`.doc` 是刻意拒收（提示另存为 `.docx`），不是没做完；
@@ -1858,3 +1984,4 @@ doubuleA/
 | 2026-09-24 | — | **P0-2-2 完成（P0-2 工具闭环 2/12）——🎯 P0-2 第一个命令行端测里程碑**：MCP server 注册 CRUD + 连通测试。**新增** `shared/src/mcp.ts`（**契约层**：`MCP_AUTH_TYPES`/`MCP_SERVER_STATUSES` + slug 纯函数 `slugifyServerName`/`uniqueSlug` + 工具描述符 schema + `normalizeCredentialSchema` + 投影四段 + 请求侧三段；**`mcpEndpointUrlSchema` 用字段级 `superRefine` 自判 scheme**）、`backend/src/mcp/toolCache.ts`（**读不出来一律 `null`、整体作废**；**不 import 任何运行期模块** ⇒ 可被 `verify:app` 无依赖断言）、`backend/src/services/mcpServer.service.ts`（列表/建/改/删/**测试连通**/工具列表读侧 + **`sameJson` 键序无关比较** + `assertAuthTypeSupported`(OAUTH⇒400) + `probeServer`(**永不抛**)）、`backend/src/routes/mcpServers.ts`（**六条路由，只挂 `requireAuth`**）+ `app.ts` 接线、`backend/scripts/verify-mcp-servers.mjs`（**新档 `pnpm verify:mcp-servers` 31 项**）。**改动** 两个 `package.json`、`backend/src/index.ts`（启动信封 `step`）、**`assertComponentRefsBindable` 的 `MCP` 分支从"一律 400"换成存在性校验**（P0-1-23 的接回点兑现）+ `verify-agents.mjs` / `verify-agent-package.mjs` 的**对偶断言翻转**。**零新增依赖、零新增环境变量**（`mcp_servers` 表与迁移在 P0-2-2 落地）。**五条最值得记的**：① **权限第五族 = 登录即可、无 owner 列收窄**（最接近 knowledge-bases）—— `created_by` **只作留痕**，任何登录用户都能改/删别人注册的 server（`01` 决策 22 的直接推论）；验收用**两个 MEMBER** 且含两条**反向守卫**（"B 能改 A 建的""B 能删 A 建的"）。② **`POST /:id/test` 恒 HTTP 200** —— `ok:false` 是一条**结论**（这个 server 现在通不通）而非错误，只有 **id 不存在才 404**；成功时**顺手刷 `tool_cache`**、失败时**一个字节都不动**。③ **注册不强制连通**（上游抖动不该变成"建不了 server"）⇒ create 响应形态 = **`{server,test}`**（**不是**"裸 item 多一个键" —— 那等于承认同一份数据有两种形状）。④ **缓存失效判据是"真的变了"** —— `endpointUrl`/`credentialSchema`/`authType` 任一变了才清 `tool_cache`；只改 `name` **不动 slug、也不清缓存**；jsonb 往返**键序无关**比较（PG 会重排键 ⇒ 直比会产生**假阳**）。⑤ **`endpoint_url` 是 SSRF 面** —— P0 **只校验 scheme**（拒 `file:`/`gopher:`），**不做内网黑名单/端口白名单**（属 P1 安全加固，**已知且刻意**）。**⚠️ 三条验证脚本自身踩的坑**：**端口 1（含 7/9）是 fetch 规范的 bad port**（`undici` 发包前就拒 ⇒ 造"连接被拒绝"必须用"起个假 server 拿端口再关掉"）；**中文名被 `slugify` 折掉导致多用例共用 slug 族**（序号涨到 `-9` 撞车 ⇒ 独立序号用例改用专属 ASCII 名）；**历史欠账**（`verify:app` 的 Provider 投影夹具漏了 P0-1-37 的必填 `protocol`，一直被 `verify:model-providers` 遮住）。**验收**：`pnpm verify:mcp-servers` **31 项全通过**（真 PG + Redis + 假 MCP server，**不需要 MinIO**；跑完自清并断言残留为零）；`verify:app` **128 项**、`verify:agents` **35 项**、`verify:agent-package` **13 项**、`verify:model-providers` **18 项**全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`/api/mcp/servers` 与 `/api/mcp/credentials` 在界面上**仍是占位页**（MCP 管理页属 P0-2 后续）；`POST /:id/test` **不带用户凭据**（"注册者视角"，P0-2-5 定案）、凭据 CRUD 属 **P0-2-4**、工具名转换属 **P0-2-6**；`OAUTH` 注册 ⇒ 400 指向 **P1**。归档：`issue_fix/问题记录-P0-2-2-MCP-server-注册.md` |
 | 2026-09-24 | **P0-2-3 完成（P0-2 工具闭环 3/12）：凭据参数模板（`credential_schema`）** —— **零新增依赖、零新增环境变量、零 `schema.prisma` 改动**（`mcp_credentials` 表属 P0-2-4）。`shared/src/mcp.ts` 补**深度校验三件套**（`MCP_RESERVED_HEADER_NAMES` 平台自发头名单 / `MCP_JSONRPC_RESERVED_KEYS` 四个保留键 / RFC 7230 `token` 头名正则；**`credentialSchemaDeepIssues()` 是语义层唯一实现** —— `superRefine` 挂**数组**上（判重跨行、且要把原始 `index` 传回去）与**独立入口** `validateCredentialSchema`（永不抛错）都调它；`diffCredentialSchema` **只按 key 判、顺序不算改动**）+ **`credentialSchemaImpactOf`**（空 diff ⇒ `null`）+ `credentialSchemaImpactSchema` + **`updateMcpServerResultSchema`**；`mcpServer.service.ts` 的 `updateMcpServer` 回包从**裸 item** 变 **`{server, credentialSchemaImpact}`**（⚠️ **本批唯一一次契约变更**，与 `POST /` 的 `{server,test}` 同族）；`verify-app` 新增"凭据模板契约"6 条、`verify-mcp-servers` 新增 H 组 5 条、`verify-mcp-client` 新增 H 组 4 条（**BODY 注入的协议线探针**）、假夹具补 `query` 与 `headerNames` 两个记账字段。**四条最值得记的**：① **BODY 注入能不能做是探出来的**（坑预判 1）：非保留的顶层额外字段**能到达服务端且不影响这次调用**（可行）；塞进 `params.arguments` 会**污染工具入参**、塞成 `params` 的兄弟键则**凭据等于白注**；与四个保留键**撞名会改掉报文语义**（撞 `method` 变成另一次调用、撞 `params` 工具名丢失回 `-32602`、撞 `id` 会让响应 id 被顶成凭据值并**回显到线上**）⇒ 结论从"BODY 不能用"改写成"**这四个键不能用**"；② **"拿什么去注入"也问清了** —— transport 的 **`fetch` 选项**能同时改 URL/头/报文体 ⇒ 三种位置一个口子（**P0-2-7 的接回点**，`McpClient` 加一个可选参数即可）；⚠️ 实测只对本仓夹具成立 ⇒ P0-2-7 用真 server 复验；③ **"缓存该不该清"与"该提示什么"是两个判据**（只改 `label` ⇒ 提示 `null` 但缓存**照清**）；④ **`affectedCredentials` 恒 `null`、刻意不填 `0`**（凭据表属 P0-2-4，此刻没能力回答；`null` 只有一个含义="本次没有需要提示的影响"；验收 H1 守着它、P0-2-4 落地时翻转）。**验收**：`verify:mcp-servers` **31 → 36 项**、`verify:mcp-client` **34 → 38 项**、`verify:app` **129 → 135 项**（⚠️ 顺带订正一处历史计数：P0-2-2 记录里的 `verify:app` **128** 实为 **129**）全通过；`pnpm lint` + `pnpm -r build` 三包 Done；`pnpm check:batch` 一致。**⚠️ 边界**：`credentialSchemaImpact` 已能从命令行看到（「手工端测 · 命令行」⑳-e′），但凭据本身**还没有任何写入路径**、`affectedCredentials` 恒 `null`、`/mcp` 页仍是占位页 ⇒ **本批不是端测里程碑**（`§4.4` 的浏览器档仍是 **P0-2-11 之后**）。归档：`issue_fix/问题记录-P0-2-3-凭据参数模板.md` |
 | 2026-09-24 | — | **P0-2-4 完成（P0-2 工具闭环 4/12）：我的凭据（每用户每 server，AES-256-GCM）+ 未配置清单** —— ⚠️ **本批同时改掉了"批次怎么收尾"**（见末段）。**新增** `mcp_credentials` 表 + 迁移 `20260924114259_add_mcp_credentials`（`uniq(server_id,user_id)`、两条 `CASCADE`）、`backend/src/services/mcpCredential.service.ts`（`mcpCredentialAad(serverId,userId,key)` + 读/写/删我的 + **`countAffectedCredentials`**）、`backend/src/routes/mcpCredentials.ts`（三条，**只挂 `requireAuth`**）+ `app.ts` ⑬、`shared/src/mcp.ts` 的**凭据值契约段**（`credentialValueKeys` / `isCredentialConfigured` / `McpCredentialItem` / `putMyCredentialBodySchema` / `:serverId` 路径参数）。**改动** `mcpServer.service.ts`（`updateMcpServer` 真的查库数 `affectedCredentials`）、`index.ts`（`step`）。**兑现 P0-2-3 的接回点**：`credentialSchemaImpactOf(diff, affectedCredentials)` 第二参数变**必填**、字段的 `.nullable()` 从契约里去掉。**六条最值得记的**：① ⚠️ **读路径必须真解一次**（坑预判只说"解密失败要降级"，落地发现判据本身就在解密上）—— AAD 是**绑定**不是**格式**，"粘密文"在 `GET` 上立刻显形（退回未配置），解不开一律降级 + 只带键名的 warn + **绝不 500**；② `PUT` **合并**语义与 `components`（整体替换）**刻意相反**（分辨方式：不可回填的字段只能合并）；③ **空串 = 删键**、清到一个不剩 ⇒ **删行**；④ `configured` 按**当前模板**逐 key 判，与 `updatedAt`（有没有行）**分两个字段**；⑤ `fields` 按模板投影、`hasValue` 覆盖 `values_enc` 全部 key（模板里删掉的 key 的值仍在库里等用户自己清）；⑥ `DELETE` 没配过 ⇒ **404**，**整个凭据路由没有 403**。**权限**：收窄在 `user_id` 上（与 server 那个前缀**同前缀两族**），ADMIN 无后门。**⚠️ 同批的范围变更（用户定案）**：`backend/scripts/**`（全部 `verify-*.mjs` + 假上游夹具 + `serve-upstreams.mjs`）与 `issue_fix/` 的历史归档**由用户删除**；本批清掉两个 `package.json` 里 26+26 条指向它们的 `verify:*` / `serve:upstreams` 条目，并给 README/`docs/06` 加了政策注记 ⇒ **后续每步只有三样产出：代码 + 文档回写 + README 里可照抄的人工端测步骤**（本批的人工步骤 = **新增的 ㉑ 一节**，从"改模板 → 填一个 key → 合并 → 清空 → 三层取证 → 换账号 → 粘密文看降级 → 删 → 看 `affectedCredentials` 变真数"整条串一遍）。**取证方式**：⚠️ **由用户人工端测**（㉑）；智能体侧只做了两件**确定性**的事 —— `pnpm db:deploy`（迁移真的应用到 dev 库）与 `pnpm db:generate`（客户端真的认识了 `mcpCredential`），**没跑任何验收脚本、没跑浏览器**。**⚠️ 本批不是端测里程碑**（`/mcp/credentials` 页仍是占位页；浏览器档在 P0-2-11 之后），但**命令行可验**。**下一步 = P0-2-5**（工具发现：缓存 + `?refresh=1`）。 |
+| 2026-09-24 | — | **P0-2-5 完成（P0-2 工具闭环 5/12）：工具发现（`tools/list` + 缓存 + 变更刷新）** —— 本批给"工具列表"加上了**生命周期**：从 P0-2-2 起它只有"读缓存"一种取法，现在有了 `?refresh=1`。**改动**：`backend/src/services/mcpServer.service.ts`（新增 **`refreshServerTools()`** = 全文件唯一的"联网 + 落库"入口（三个调用点共用）+ **`readCachedTools()`**（解析 + 一条 warn 的唯一落点）；`applyProbeResult()` 加 `fetchedAt` 形参；`createMcpServer` / `testMcpServer` 改走新入口；**`getMcpServerTools(id, { refresh })`** 加刷新分支）、`backend/src/routes/mcpServers.ts`（`GET /:id/tools` 接 querystring schema）、`shared/src/mcp.ts`（新增 **`mcpServerToolsQuerySchema`** —— `refresh` 白名单 + `transform` → boolean；`mcpServerToolsResultSchema` 的注释改写）、`backend/src/mcp/errors.ts`（新增 **`MCP_STAGE_LIST_TOOLS`** 常量 + 401/403 **按 stage 分支**）、`backend/src/mcp/client.ts`（`listTools` 用那个常量）、`backend/src/index.ts`（`step`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动，响应形状一个字没改**（`cached` 这个字段从 P0-2-2 就在契约里等着分叉）。**六条最值得记的**：① ⚠️ **"拉不到"有三个出口，分界线是"我们还能不能答出这个问题"**：拉到 ⇒ `cached:false`；拉不到但**有缓存** ⇒ **200** + `cached:true`；拉不到且**缓存也空** ⇒ **502** —— 第三种**不能**是"200 + 空数组"：那个形状与"这个 server **确实没有**工具"**逐字一样**，界面只会显示"0 个工具"、用户于是去上游找一个**其实不存在**的配置问题（**给不出的东西不要拿空值代替**）；⚠️ 它与 `POST /:id/test` **恒 200** 不矛盾 —— 判据是"**响应形状里有没有『失败』的位置**"（`{ok,tools?,error?}` 有、`{tools,fetchedAt,cached}` 没有），**别把两条路由的出口"统一"起来**。② ⚠️ **旧缓存必须在刷新之前读出来**（刷新一落库旧值就没了，而"回落"全靠它）；与之配对的是**成功路径从"落库后的列"把值读回来**（顺带验了"写得进、读得出"；真读不回是 **500 + 可上报文案**，不是静默返回空列表）。③ ⚠️ **`refresh` 必须是白名单，不能用 `z.coerce.boolean()`**：`Boolean('0') === true` ⇒ `?refresh=0` 被判成"要刷新"，而**零症状**（用户以为关掉了、其实每次请求都联网）；放宽成任意字符串同样有零症状的一面（`?refresh=yes` 静默等于不刷新）⇒ 收窄成 `1`/`0`/`true`/`false`，**拼错就 400**（字段级 `path` = `querystring.refresh`）。④ **`tools/list` 不带用户凭据 ⇒ `tool_cache` 全员共享**，且**文案要按 stage 分**：拉列表阶段的 401/403 不能说"请检查凭据是否已配置"（那会把人引向一个**治不好的动作** —— 列表请求从来不带凭据）⇒ 那句"本阶段不支持带用户凭据拉列表"的**唯一生产点**是 `errors.ts`，`stage` 因此必须是共享常量（两处各写一份字符串，这条分支就静默失效）。⑤ **顺手修掉一处"文档引用了不存在的文件"**：README ⑳-⓪ 原本让人 import `backend/scripts/fixtures/mcp-upstream.mjs`，而那个夹具已随 P0-2-4 的定案删除 ⇒ **整条 ⑳ 当时是跑不起来的**；改成**一段可粘贴的内联假 MCP server**（约 15 行、前台常驻、**逐条打印收到的 `method`** —— 它同时补上了门槛①缺的那个"请求计数"），且**不再往仓库里放夹具文件**。⑥ **门槛⑤只能验到一半**（如实标出）：改名**不动 `slug`** 可验（`PATCH` 的 body 里根本没有这个字段），但 `mcp_{slug}_{tool}` 那个**拼出来的名字属 P0-2-6**（`toOpenAiTools`），到那时才有得比。**⚠️ 坑预判 4（`tool_cache` 的 jsonb 键序无关比较）本批未触发** —— 刷新是**纯写**、读是**纯解析**，本批没有任何一处需要"比缓存内容变没变"（已有的比较点在 `updateMcpServer` 的 `credentialSchema`，那是 P0-2-3 的 `sameJson`）。**⚠️ 同时订正 `docs/06` §4.3 两处"P0-2-4 落地后没跟着改"的过期描述**（`values_enc` 由"整对象一个信封"改为**逐 key 一条独立密文**；凭据三条的信封改为 `{items, unconfigured}` / 裸 `McpCredentialItem` / `{serverId, serverName}`；并**作废**该节"掩码给首尾各 2 字符"那句 —— P0-2-4 定案是连掩码都不下发）。**取证方式**：⚠️ **由用户人工端测**（**新增 ㉒ 一节**：`?refresh=1` 真拉 → **纯读零请求（盯假上游那个终端的 `#` 计数）** → **停掉上游**看"200 回缓存" → 清空缓存看"502" → `?refresh=yes` 看 400 → 改注册信息看缓存失效 → 看 `slug` 不变）；智能体侧只做了一件**确定性**的事：把新契约真的 import 一次并 `safeParse` 六种输入（`{}` / `1` / `0` / `true` / `false` / `yes`），**没跑任何验收脚本、没跑浏览器**。**⚠️ 本批不是端测里程碑**（`/mcp` 页仍是占位页；**第二个端测点仍是 P0-2-11 之后的浏览器档**），但**命令行可验**。**下一步 = P0-2-6**（`inputSchema` → OpenAI function 转换：`toOpenAiTools` + 工具名 token 化；`toolSchema.ts` 是纯函数、可进无依赖档，且**反向映射表是"名字 → 工具"的唯一事实来源**）。 |

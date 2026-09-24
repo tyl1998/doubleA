@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-4 我的凭据（mcp_credentials 表 / 每用户每 server 一份 AES-256-GCM 逐 key 加密 / 三条路由只动自己的 / PUT 合并语义 / 未配置清单）',
+    step: 'P0-2-5 工具发现（GET /:id/tools 加 ?refresh=1 真拉落库 / 拉不到时：有缓存回缓存 200 + cached:true、无缓存 502 / 纯读缓存零联网 / tools/list 不带用户凭据⇒缓存全员共享）',
     address,
   })
   logger.info(
