@@ -29,10 +29,11 @@
  *    ⇒ 首包 `initialize` **不带**该头，这是**正确**行为（那时还没协商）。
  *      头名是**全小写** `mcp-protocol-version`（不是 `MCP-Protocol-Version`）。
  * 3. ⚠️ **我们的头合并顺序在最后**：`_commonHeaders()` 是
- *    `new Headers({...auth, ...sessionId, ...protocolVersion, ...extraHeaders})`
- *    ⇒ `requestInit.headers` **会覆盖** SDK 自己那三个头。
+ *    `new Headers({...auth, ...sessionId, ...protocolVersion, ...extraHeaders})`，
+ *    而**注入中间件（判据 6）是在它之上 `set`** ⇒ 我们设的头**会覆盖** SDK 自己那三个头。
  *    因此**绝不能**把 `mcp-session-id` / `mcp-protocol-version` / `Authorization`
- *    放进调用方传的 `headers`（那会悄悄改掉会话与版本）。
+ *    放进去（那会悄悄改掉会话与版本）。这条约束落成 `shared` 的 `MCP_RESERVED_HEADER_NAMES`
+ *    —— 模板层拦一次、`mcp/inject.ts` 再拦一次（库里可能有历史数据）。
  * 4. ⚠️ **`Client.close()` 不会终止会话**（它只 `transport.close()`）。
  *    不显式 `terminateSession()` 的后果是**服务端累积僵尸会话**，我们自己看不到任何症状
  *    ⇒ 关闭顺序固定为「先 DELETE、后 close」，见 {@link McpClient.close}。
@@ -40,6 +41,15 @@
  *    （`Cannot register capabilities after connecting to transport`）
  *    ⇒ 能力声明只能在构造函数里做。且**只在真的有 elicitation 应答方时才声明**：
  *    声明了却答不出来，服务端会照发请求、我们静默失败（比不声明更难查）。
+ * 6. ⚠️ **transport 的 `fetch` 选项是所有网络请求的唯一出口**（P0-2-7 的 H4 探针定案）：
+ *    `send()` / `terminateSession()` / `_startOrAuthSse()` 三处都是
+ *    `await (this._fetch ?? fetch)(this._url, init)` —— **URL 是每次现传给 fetch 的**
+ *    （不是构造 transport 时冻住的，`_url` 本身整个会话不变），而 `init` 里已经装好了
+ *    SDK 自己拼好的 `Headers`。⇒ 它**同时**能改 URL / 请求头 / 报文体
+ *    ⇒ 凭据注入的三个位置（HEADER / QUERY / BODY）**一个口子全包**。
+ *    ⚠️ 也正因如此，{@link McpClientOptions} **没有** `headers` 选项（P0-2-1 曾有一个，
+ *    注释写着"凭据注入口"）：留着它就是**第二条注入路径**，而两条路径在这一个点上打架的症状
+ *    是"某个凭据时而生效、时而被顶掉"—— 那是最难查的一类。要加静态头就写一个 `fetch` 包装。
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -141,16 +151,29 @@ export type McpElicitReply =
 
 // ───────────────────────────── 选项 ─────────────────────────────
 
+/**
+ * 自定义 fetch —— 与 SDK 的 `FetchLike`（`node_modules/…/shared/transport.d.ts`）
+ * **逐字同形**，所以能直接交给 transport 的 `fetch` 选项。
+ *
+ * ⚠️ 刻意**不复用 SDK 的类型导出**（与 `errors.ts` 不 import SDK 运行时导出同一条纪律）：
+ * 这个形状是我们与 transport 之间的契约，它变化时我们该**自己**知道，而不是被动跟着编译。
+ * 形状严格相同 ⇒ 赋值是结构性成立的，不需要 `as`。
+ */
+export type McpFetch = (url: string | URL, init?: RequestInit) => Promise<Response>
+
 export interface McpClientOptions {
   /** 展示名（`mcp_servers.name`），进日志与错误消息 */
   name: string
   /** 端点（`mcp_servers.endpoint_url`），Streamable HTTP 的单一 URL */
   url: string
   /**
-   * 额外请求头 —— **凭据注入口**（P0-2-7）。
-   * ⚠️ 不许放 `mcp-session-id` / `mcp-protocol-version` / `Authorization`（见文件头判据 3）。
+   * 自定义 fetch —— **唯一**的请求改写口（判据 6）。凭据注入（P0-2-7）就装在这里
+   * （`mcp/inject.ts#createCredentialFetch`：HEADER 进头、QUERY 进 URL、BODY 进报文顶层）。
+   *
+   * ⚠️ 不传 = 用全局 `fetch`（本仓 `tools/list` / `POST /:id/test` 两条路径就是如此：
+   * 它们**刻意不带任何用户凭据**，见 `mcpServer.service.ts` 口径 ⑤）。
    */
-  headers?: Record<string, string>
+  fetch?: McpFetch
   /**
    * 单次请求的上限（毫秒）。缺省 = `config.mcp.requestTimeoutMs`。
    * 交付验收要"注入小值"来验超时分支（`06` P0-2-1 验收门槛 3）。
@@ -292,7 +315,8 @@ export class McpClient {
     }
 
     this.transport = new StreamableHTTPClientTransport(url, {
-      ...(options.headers === undefined ? {} : { requestInit: { headers: options.headers } }),
+      // 判据 6：注入中间件就装在这一个点上（HEADER / QUERY / BODY 三种位置共用它）
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
     })
     // 恢复会话时补上版本头（首次握手由 SDK 在 initialize 成功后写入，这里不该抢）

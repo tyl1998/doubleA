@@ -85,6 +85,16 @@
  *   · **`tools/list` 不带用户凭据** ⇒ 缓存与"谁在看"无关（每个 server 一份、全员共享）。
  *     ⚠️ 这条直接决定 401/403 的文案：**拉列表阶段不能说"去配凭据"**（配了也不会被带上），
  *     而要说"本阶段不支持带用户凭据拉列表"（后端 `mcp/errors.ts` 按 `stage` 分支）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⑦ 注入端（P0-2-7）：**模板是唯一的路由表**，模板里没有的 key 一律不注入
+ * ─────────────────────────────────────────────────────────────────────
+ * `buildCredentialInjection`（backend `mcp/inject.ts`）**只遍历模板**、不遍历用户存了什么 ——
+ * 于是"模板里删掉的 key 不会被注入"这件事**结构性成立**，不靠"清理过期值"来保证
+ * （P0-2-3 的定案是**只提示、绝不自动清理**；两者必须能同时成立）。
+ * ⚠️ 因此 `normalizeCredentialSchema`（读取端）与 `credentialSchemaDeepIssues`（写端）的分工
+ * 在注入端**必须各自被尊重**：注入端既不能因语义问题丢行（那会让界面少一行），
+ * 也不能把不合法/保留名的 key 真注入出去（见下面三个判据函数）。
  */
 
 import { z } from 'zod'
@@ -220,6 +230,36 @@ export const MCP_JSONRPC_RESERVED_KEYS: readonly string[] = ['jsonrpc', 'id', 'm
  * `X-User Token` 与 `X-User:Token` 都会在注入时被 fetch/undici 直接拒绝（或更糟：静默截断）。
  */
 const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+
+// ───────────────────────────── 注入前的三条判据（P0-2-7 复用，唯一实现）─────────────────────────────
+//
+// ⚠️ **这三条判据有两个消费方、必须只有一份实现**：
+//   · **写端闸门**（`credentialSchemaDeepIssues`）—— 模板落地的**那一刻**拦下不合法的 key；
+//   · **注入端**（backend `mcp/inject.ts`）—— 库里可能**已经存着**不合法的 key（P0-2-3 落地前
+//     存进去的、或手工改库的），而 `normalizeCredentialSchema` **刻意不跑语义层校验**
+//     （读取端既不报错也不丢行）。⇒ 注入端必须**再判一次并跳过**。
+// 两处各写一份的后果与 P0-1-29 的 `PASSWORD_ALPHABET` 一模一样：谁改了一处，
+// 另一处就**静默腐烂**（而这里腐烂的表现是"某个凭据悄悄不生效"）。
+
+/** `key` 是不是合法的 HTTP 头名（RFC 7230 `token`）；**唯一实现**（写端与注入端共用） */
+export function isValidHttpHeaderName(name: string): boolean {
+  return HTTP_HEADER_NAME_RE.test(name)
+}
+
+/** `key` 是不是平台自己要发的头（**按小写比较** —— HTTP 头名不区分大小写） */
+export function isReservedHeaderName(name: string): boolean {
+  return MCP_RESERVED_HEADER_NAMES.includes(name.toLowerCase())
+}
+
+/** `key` 是不是 JSON-RPC **请求**对象的保留成员（**按字面**比较 —— JSON 的键区分大小写） */
+export function isReservedJsonRpcKey(key: string): boolean {
+  return MCP_JSONRPC_RESERVED_KEYS.includes(key)
+}
+
+/** `key` 是不是会切开 URL 查询串的字符组合（`QUERY` 注入的判据） */
+export function hasQueryDelimiter(key: string): boolean {
+  return key.includes('&') || key.includes('=')
+}
 
 /** `slug` 上限（`06` P0-2-5 坑预判 2 定案：小写 + 非字母数字转 `-` + 截断 32） */
 export const MCP_SLUG_MAX = 32
@@ -373,25 +413,25 @@ function credentialSchemaDeepIssues(
   for (const { index, entry } of entries) {
     const { key, inject } = entry
     if (inject === 'HEADER') {
-      if (MCP_RESERVED_HEADER_NAMES.includes(key.toLowerCase())) {
+      if (isReservedHeaderName(key)) {
         issues.push({
           path: [index, 'key'],
           message: `「${key}」是平台自己要用到的请求头，不能作为凭据参数名（换个名字，例如 X-User-Token）`,
         })
-      } else if (!HTTP_HEADER_NAME_RE.test(key)) {
+      } else if (!isValidHttpHeaderName(key)) {
         issues.push({
           path: [index, 'key'],
           message: 'HTTP 头名不能含空格、冒号或非 ASCII 字符（只能用小写/大写字母、数字与 !#$%&\'*+-.^_`|~）',
         })
       }
     } else if (inject === 'QUERY') {
-      if (key.includes('&') || key.includes('=')) {
+      if (hasQueryDelimiter(key)) {
         issues.push({
           path: [index, 'key'],
           message: 'URL 查询参数名不能含 `&` 或 `=`（它们会把查询串切开，服务端收到的键名与这里写的不同）',
         })
       }
-    } else if (MCP_JSONRPC_RESERVED_KEYS.includes(key)) {
+    } else if (isReservedJsonRpcKey(key)) {
       // BODY：顶层额外字段本身可行（H 组有取证），但撞上保留键会覆盖报文语义
       issues.push({
         path: [index, 'key'],

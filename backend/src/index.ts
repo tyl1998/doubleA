@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-6 inputSchema → OpenAI function 转换（mcp_{slug}_{tool} 过 [A-Za-z0-9_-] 后截断 64 + 撞名加序号 / 反向映射表 OpenAI名→{toolName,serverId} / 只做三件有理由的兼容：剥 $schema、缺 type 补 object、非 object 根包一层（additionalProperties 等一律原样留）/ 超 MCP_TOOL_LIMIT 截断，告警由调用方打；纯函数未接线，接回点 P0-2-8）',
+    step: 'P0-2-7 凭据注入（mcp/inject.ts 纯函数：模板是唯一路由表 ⇒ 模板删掉的 key 天然不注入 / HEADER·QUERY·BODY 三处共用 transport 的 fetch 选项一个口子（H4）/ QUERY 每请求拼 URL ⇒ 不必放弃连接复用（坑预判 2 探针证伪）/ 保留头名等历史脏数据「跳过 + 记账」不报错 / service 侧 resolveMcpCallContext 在发请求之前判必填，缺则 424 NEED_CREDENTIAL）',
     address,
   })
   logger.info(

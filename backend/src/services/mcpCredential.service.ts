@@ -16,9 +16,11 @@
  *    连入口都没有（少一个 id 就少一整类越权可能）。
  *
  * **② 值有进无出：出网只有 `key` + `hasValue`（连掩码都没有）。**
- *    `values` 这一列只在本文件被读写，且**只读给两件事**：① 判某个 key 有没有值；
- *    ② （P0-2-7）解密后注入到上游请求。任何出参都不带值 —— {@link toCredentialItem} 是
- *    唯一的出口，它压根没有"值"这个字段。⚠️ 与 Provider Key 的 `apiKeyPreview` **刻意不同**：
+ *    `values` 这一列只在本文件被读写，且**只读给两件事**：① 判某个 key 有没有值（读路径）；
+ *    ② （P0-2-7）解密后注入到上游请求 —— 那一条只经 {@link decryptMyCredentialValues} 出去，
+ *    由 `mcpCall.service.ts` 交给 `mcp/inject.ts` 与 `McpClientOptions.secrets`（脱敏），
+ *    **别处一处都不许出现**。任何出参都不带值 —— {@link toCredentialItem} 是唯一的出口，
+ *    它压根没有"值"这个字段。⚠️ 与 Provider Key 的 `apiKeyPreview` **刻意不同**：
  *    那是管理员配的一份、掩码用于"确认没配错"；这是每个人自己的令牌，下发掩码收益为零。
  *
  * **③ 读路径**必须真解一次**，解不开 ⇒ 当"没有值"（降级），**绝不 500**（坑预判 5）。**
@@ -109,21 +111,27 @@ function readCipherMap(raw: unknown): Record<string, string> {
 }
 
 /**
- * 密文映射 → **真正可用的 key 集合**（见文件头 ③：解密成功才算"有值"）。
+ * 密文映射 → **明文映射**（**解密循环的唯一实现**，P0-2-4 的读路径与 P0-2-7 的注入端共用）。
  *
- * @returns `keys` 为可解密（= 归属于这一格）的 key；`broken` 为解不开的 key（已记 warn）
+ * ⚠️ **只有解密成功才算"有值"**（见文件头 ③）：AAD 是"绑定"而不是"格式"，一段结构完全合法的
+ * `v1.<iv>.<tag>.<ct>` 可能根本不属于这一格（别处粘来的、主密钥换过）。解不开的 key
+ * **不进 `values`** ⇒ 调用方（判"已配置"、算"缺哪些必填"、组注入）自然按"没值"处理。
+ *
+ * 为什么把"解密"与"读行"拆开：调用方有两种 —— ① 手上已经有密文映射的（`toCredentialItem`
+ * 在一次查询里算了所有 server）；② 手上只有一个 `(serverId, userId)` 的
+ * （{@link decryptMyCredentialValues}）。两者**必须走同一个循环**，否则
+ * "解不开怎么办"会在两处各写一份（P0-1-29 的 `PASSWORD_ALPHABET` 就是那么腐烂的）。
  */
-function verifiedKeys(
+function decryptCipherMap(
   serverId: string,
   userId: string,
   cipherMap: Record<string, string>,
-): { keys: Set<string>; broken: string[] } {
-  const keys = new Set<string>()
+): { values: Record<string, string>; broken: string[] } {
+  const values: Record<string, string> = {}
   const broken: string[] = []
   for (const [key, ciphertext] of Object.entries(cipherMap)) {
     try {
-      decryptSecret(ciphertext, mcpCredentialAad(serverId, userId, key))
-      keys.add(key)
+      values[key] = decryptSecret(ciphertext, mcpCredentialAad(serverId, userId, key))
     } catch {
       // ⚠️ 只记 key 名，不记密文、不记明文、不记原始错误（原始错误里可能带上下文）
       broken.push(key)
@@ -135,7 +143,50 @@ function verifiedKeys(
       'MCP 凭据解密失败（密文与 (server,user,key) 不匹配，或主密钥已更换）⇒ 该参数按「未配置」处理，等待用户重新填写',
     )
   }
-  return { keys, broken }
+  return { values, broken }
+}
+
+/**
+ * 密文映射 → **可用的 key 集合**（`toCredentialItem` 只用得上"有没有"，用不上值）。
+ * 判据来源仍是 {@link decryptCipherMap}（同上：解密循环只有一份）。
+ */
+function verifiedKeys(serverId: string, userId: string, cipherMap: Record<string, string>): Set<string> {
+  return new Set(Object.keys(decryptCipherMap(serverId, userId, cipherMap).values))
+}
+
+/** {@link decryptMyCredentialValues} 的结论 */
+export interface McpDecryptedCredentials {
+  /**
+   * 该用户在这一台 server 上的**明文**值（`key → 值`）。
+   * ⚠️ 只允许流向两处：**注入**（`mcp/inject.ts`）与**脱敏**（`McpClientOptions.secrets`）。
+   * 日志 / 响应体 / 错误消息 / `tool_call.inputSummary` 一处都不许出现（P0-2-4 文件头 ②）。
+   */
+  values: Record<string, string>
+  /** 解不开的 key（已记 warn，调用方按"没值"处理即可，不必再判） */
+  brokenKeys: string[]
+}
+
+/**
+ * 我的凭据 → **明文**（P0-2-7 的注入端唯一入口）。
+ *
+ * 这是 `values` 这一列的**第二个、也是最后一个**出口（第一个是"只判有没有值"）：
+ * 文件头 ② 说的"值有进无出"针对的是**出网**，而"解密后注入到上游请求"正是
+ * `02` §9.3 明写的用途。**没有行 / 行里没这个 key ⇒ 就是没有**（不报错，交给调用方判必填）。
+ *
+ * ⚠️ 解密失败**不抛**（降级成"没值"，同文件头 ③ 的坑预判 5）：主密钥轮换后
+ * "某人需要重填一个令牌"绝不该表现成"这个系统坏了"。
+ */
+export async function decryptMyCredentialValues(
+  serverId: string,
+  userId: string,
+): Promise<McpDecryptedCredentials> {
+  const db = getPrisma()
+  const row = await db.mcpCredential.findUnique({
+    where: { serverId_userId: { serverId, userId } },
+    select: { valuesEnc: true },
+  })
+  const { values, broken } = decryptCipherMap(serverId, userId, readCipherMap(row === null ? null : row.valuesEnc))
+  return { values, brokenKeys: broken }
 }
 
 /**
@@ -152,7 +203,7 @@ function toCredentialItem(
 ): McpCredentialItem {
   const schema = normalizeCredentialSchema(server.credentialSchema)
   const cipherMap = readCipherMap(row === null ? null : row.valuesEnc)
-  const { keys: presentKeys } = verifiedKeys(server.id, viewerId, cipherMap)
+  const presentKeys = verifiedKeys(server.id, viewerId, cipherMap)
 
   const missingKeys = missingRequiredCredentialKeys(schema, presentKeys)
   return {
