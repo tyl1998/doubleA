@@ -170,8 +170,10 @@ export interface McpClientOptions {
    * 自定义 fetch —— **唯一**的请求改写口（判据 6）。凭据注入（P0-2-7）就装在这里
    * （`mcp/inject.ts#createCredentialFetch`：HEADER 进头、QUERY 进 URL、BODY 进报文顶层）。
    *
-   * ⚠️ 不传 = 用全局 `fetch`（本仓 `tools/list` / `POST /:id/test` 两条路径就是如此：
-   * 它们**刻意不带任何用户凭据**，见 `mcpServer.service.ts` 口径 ⑤）。
+   * ⚠️ 不传 = 用全局 `fetch`（**只用于"这次调用不需要任何凭据"的情形**）。
+   * ⚠️ **P0-2-12 起 `tools/list` / `POST /:id/test` 不再属于那一类** —— 它们改为带
+   * **注册者（所属人）**的凭据（见 `mcpServer.service.ts` 口径 ⑤）。本可选参数保留：
+   * 它仍是"这次调用要不要注入凭据"的唯一开关。
    */
   fetch?: McpFetch
   /**

@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-11 前端 MCP 管理页 / 我的凭据页 / 确认卡片（/mcp 与 /mcp/credentials 两条占位路由换真页面；ConfirmCard 接真数据源：倒计时只读服务端 expiresAt、收卡由 store#clearConfirm 显式承担；Agent 编辑页 MCP 多选接回；工具失败卡"去配置凭据"跳 /mcp/credentials?serverId=…；契约只增量一个 toolCallRecordSchema.serverId）',
+    step: 'P0-2-12 MCP server 所属人（改/删按行判定）+ 探测改用所属人凭据（`mcp_servers.created_by` 从"只作留痕"升为权限判据 ⇒ 改/删 = 注册者 + ADMIN，`shared#canEditMcpServer` 唯一实现、`McpServerItem` 加 `creatorName`/`canEdit`；`POST /:id/test` 与 `GET /:id/tools` 改用**注册者**凭据连上游 —— 原口径"不带任何用户凭据"作废，`tool_cache` 仍是 server 级共享、串用户被结构性排除；`tools/call` 仍用**调用者**凭据；零迁移）',
     address,
   })
   logger.info(

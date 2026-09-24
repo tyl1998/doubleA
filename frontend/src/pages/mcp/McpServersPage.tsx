@@ -8,13 +8,17 @@
  *      `docs/02` §4.7（六条端点的权限与信封）、`design/mcp.html`。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ① 权限口径：**登录即可**，而且人人可改可删（第五族）
+ * ① 权限口径：**建/看/测试/调用全员可用；改/删只有所属人 + ADMIN**（⚠️ P0-2-12 改过）
  * ─────────────────────────────────────────────────────────────────────
- * `mcp_servers` **没有 owner 列**，`createdBy` 只留痕（`02` §4.7 / `01` 决策 22）。
- * ⇒ 本页**不做任何按角色/创建者的按钮过滤**。看着"应该"只让创建者删自己建的 server
- * 是一种很自然的冲动，但那是**发明权限模型** —— 后端会放行，界面上藏起来只会让
- * "能点的都点得了、点不了的其实也能点"变成一句假话。界面上做的是**如实展示**
- * （"由谁注册"），不是代替后端判权限。
+ * 原文是"登录即可、人人可改可删（第五族）、`createdBy` 只留痕、本页**不做任何按钮过滤**"。
+ * **2026-09-24 起**：`createdBy` 升为**权限判据**，服务端在**改/删**上**先 404 再 403**
+ * （判据 `shared#canEditMcpServer`）。⇒ 本页的「编辑」「删除」按**服务端给的 `canEdit`** 渲染，
+ * **不**按角色或"我是不是创建者"自己判 —— `canEdit` 已经把"ADMIN 也算"算进去了，
+ * 自己拿 `createdBy` 比 id 会让管理员连自己的编辑入口都没有（服务端却放行 ⇒ 两边对不上）。
+ * ⚠️ **「测试」不做过滤**：它对全员开放，用的是**所属人**的凭据（见 ④）—— 收窄它只会造出
+ * "server 建完就没人能测了"。
+ * ⚠️ 页面顶部那条 Alert 必须**如实转述当前口径**：界面上写着"人人可改可删"而实际不是，
+ * 与写着"能过滤"而实际不能，是同一种谎（原文那段注释讲的正是这个道理，口径换了、道理不变）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ② 「我的凭据」徽标的数字**只有一个来源**
@@ -30,6 +34,16 @@
  * ⇒ `ok:false` 走 `feedback.note`（中性）而**不是** `fail`（红 + 错误码）：
  * 把一条正常结论渲染成"失败"会让用户以为操作没生效、反复重点。
  * `fail` 只留给真正的 4xx/5xx（server 不存在 404、网络层失败）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ④ 「测试 / 工具列表」的主语是**所属人**，不是点按钮的人（P0-2-12）
+ * ─────────────────────────────────────────────────────────────────────
+ * `tool_cache` 是 **server 级共享**的一份 ⇒ 探测主语必须**唯一确定** = `mcp_servers.created_by`
+ * （换成"点按钮的人"就是**串用户**：A 点过测试 ⇒ B 看到的是 A 的凭据拉到的列表 —— 那正是
+ * P0-2-5 当初定"不带凭据"要挡的东西，而"主语唯一"这个性质它挡不掉）。⇒ 界面上要能
+ * **看出这一位是谁**（「所属人」列，放**名字**不是 uuid），并且在页头把"测试报凭据无效该找谁"
+ * 讲清楚。⚠️ 而 `tools/call`（对话里真调工具）注入的仍是**调用者自己**的凭据 ——
+ * 两条链路的主语不同（`06` §4.2 那张表），是本页最容易讲错的一件事。
  */
 
 import { Alert, Button, Popconfirm, Table, Tag, type TableColumnsType } from 'antd'
@@ -77,8 +91,10 @@ export function McpServersPage() {
       render: (_, server) => (
         <div className="agent-cell">
           <span className="agent-cell__name">{server.name}</span>
-          {/* slug 是工具名前缀的来源，藏起来会让用户看不懂 `mcp_git_xxx` 里的 `git` 是什么 */}
-          <span className="agent-cell__sub">工具名前缀 mcp_{server.slug}_ · 由 {server.createdBy} 注册</span>
+          {/* slug 是工具名前缀的来源，藏起来会让用户看不懂 `mcp_git_xxx` 里的 `git` 是什么。
+              ⚠️ 副行**不再写"由 X 注册"**（P0-2-12 起）：那一格原本是个 uuid，用户读不出是谁；
+              「所属人」现在有**专门的列**，而且它已经从留痕字段升成**权限主语**。 */}
+          <span className="agent-cell__sub">工具名前缀 mcp_{server.slug}_</span>
         </div>
       ),
     },
@@ -114,6 +130,19 @@ export function McpServersPage() {
           </span>
         )
       },
+    },
+    {
+      title: '所属人',
+      dataIndex: 'creatorName',
+      width: 130,
+      render: (_, server) => (
+        // ⚠️ 这一格**不只是**"谁建的这个 server"（P0-2-12）：**连通测试与工具列表都用这位的凭据**。
+        //    所以放**名字**（`creatorName`，昵称优先回落用户名）而不是 uuid，并把"探测主语"
+        //    写在 title 上 —— 用户问"测试报凭据无效，我该改哪儿"时，答案是这里。
+        <span title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据">
+          {server.creatorName}
+        </span>
+      ),
     },
     {
       title: '我的凭据',
@@ -169,26 +198,38 @@ export function McpServersPage() {
           >
             测试
           </Button>
-          <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openEdit(server)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="删除这个 server？"
-            description="删除后绑定它的智能体将失去这些工具，绑定关系会一并清理。这个动作不可撤销。"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={() => {
-              removeServer.mutate(server.id, {
-                onSuccess: (result) => feedback.ok(`已删除 server「${result.name}」`),
-                onError: (error) => feedback.fail(error, '删除失败'),
-              })
-            }}
-          >
-            <Button type="link" size="small" danger style={{ padding: 0 }}>
-              删除
-            </Button>
-          </Popconfirm>
+          {server.canEdit ? (
+            <>
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openEdit(server)}>
+                编辑
+              </Button>
+              <Popconfirm
+                title="删除这个 server？"
+                description="删除后绑定它的智能体将失去这些工具，绑定关系会一并清理。这个动作不可撤销。"
+                okText="删除"
+                okButtonProps={{ danger: true }}
+                cancelText="取消"
+                onConfirm={() => {
+                  removeServer.mutate(server.id, {
+                    onSuccess: (result) => feedback.ok(`已删除 server「${result.name}」`),
+                    onError: (error) => feedback.fail(error, '删除失败'),
+                  })
+                }}
+              >
+                <Button type="link" size="small" danger style={{ padding: 0 }}>
+                  删除
+                </Button>
+              </Popconfirm>
+            </>
+          ) : (
+            // ⚠️ 判据是**服务端给的 `canEdit`**（P0-2-12），不自己拿 `createdBy` 跟当前用户 id 比 ——
+            //    那样 ADMIN 会在界面上连自己的编辑入口都没有，而服务端允许他改 ⇒ 两边对不上。
+            //    ⚠️「测试」**不在这里**：它对全员开放（用的是所属人凭据），收窄它只会让人没法排查。
+            //    文案与 `/agents` 列表页保持一致（同一件事在两个页面说法不同最容易被当成 bug）。
+            <span className="ratio" title="只有该 server 的所属人或管理员可以编辑 / 删除">
+              无编辑权限
+            </span>
+          )}
         </div>
       ),
     },
@@ -238,15 +279,16 @@ export function McpServersPage() {
         </div>
       </div>
 
-      {/* 已登录即可见 —— 但"人人可改可删"这件事**必须说出来**：不说的话，用户会以为
-          「编辑」只对自己建的 server 生效（那正是他习惯的模型），直到改坏了别人的才发现。
-          `01` 决策 22 是有意的取舍（全员可注册的内部工具台），界面如实转述它。 */}
+      {/* 权限口径在 P0-2-12 **收窄过** —— 界面必须如实转述**当前**那一条（原文是
+          "任何登录用户都可以注册、修改、删除"）。现在：**建/看/测/调用**全员可用，
+          **改/删**只有「所属人」或管理员。⚠️ 顺带把"测试用**所属人**的凭据"说出来 ——
+          不然用户会拿自己的凭据去解释测试结果（P0-2-12 的实测就是这么翻车的）。 */}
       <Alert
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="任何登录用户都可以注册、修改、删除 MCP server"
-        description="这族资源没有「创建者」权限收窄：改成全员共享的公共设施。删除一台被智能体绑定的 server 会被后端拒绝（409），需要先去编辑页解绑。"
+        message="任何人登录后都能注册 server、测试连通、调用工具；但只有「所属人」或管理员能编辑 / 删除"
+        description="连通测试与工具列表用的是「所属人」的凭据（工具缓存是全员共享的一份）—— 所以测试若报「凭据无效 / 尚未配置」，该找的是所属人而不是你自己。而调用工具注入的是「你自己」的凭据。删除一台被智能体绑定的 server 会被后端拒绝（409），需要先去编辑页解绑。"
       />
 
       {credentials.isError ? (

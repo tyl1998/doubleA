@@ -533,7 +533,12 @@ model McpServer {
   /// `{ fetchedAt, tools:[…] }`；`NULL` = **从未成功拉过**（形状属 P0-2-5）
   toolCache        Json?           @map("tool_cache") @db.JsonB
   status           McpServerStatus @default(UNKNOWN)
-  /// **留痕**：谁注册的。⚠️ 不参与权限判定（本表没有 owner 列收窄）
+  /// **注册者（= 所属人）**。⚠️ **P0-2-12 起它是权限判据** —— **改/删 = 注册者 + ADMIN**
+  /// （判据的唯一实现是 `shared/src/mcp.ts#canEditMcpServer`；原注释"只作留痕、不参与权限判定"
+  /// **已作废**）。本表**没有"转移所属人"的入口**（ownership 转让属 P1）。
+  /// ⚠️ 它同时是**探测主语**：`POST /:id/test` 与 `GET /:id/tools` 用**他**的凭据连上游
+  /// （`tool_cache` 是 server 级共享的 ⇒ 主语必须唯一确定，不能是"谁点的测试"）；
+  /// 而 `tools/call` 仍用**调用者自己**的凭据。
   createdBy        String          @map("created_by") @db.Uuid
   createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)

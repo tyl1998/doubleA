@@ -6,23 +6,23 @@
  *      + `03` §4.4（MCP 管理页）、`01` §3.6（决策 22：全员可注册）
  *
  * ─────────────────────────────────────────────────────────────────────
- * 本文件最要紧的一件事：**权限是「登录即可」，且没有 owner 列收窄**
+ * 本文件最要紧的一件事：**建/看登录即可；改/删 = 注册者 + ADMIN**（⚠️ P0-2-12 改过口径）
  * ─────────────────────────────────────────────────────────────────────
- * `06` §4.2 把这一族定得很清楚：`/api/mcp/**` 一律"登录即可"，
- * **最接近 knowledge-bases**（同样没有 owner 列、同样是"人人可见的共享资源"）。三族的差别：
+ * **原文（P0-2-2）是"`/api/mcp/**` 一律登录即可、没有 owner 列收窄、最接近 knowledge-bases"**；
+ * 2026-09-24 收窄了**改/删**那两条。四族的现状：
  *
  * | 资源 | 路由挂什么 | 判据 |
  * |------|-----------|------|
  * | `/api/users`、`/api/model-providers`、`/api/models` | `requireAdmin` | `(A)` 端点 |
- * | `/api/knowledge-bases`、**`/api/mcp/servers`** | **`requireAuth`** | **无 owner 列** |
+ * | `/api/knowledge-bases` | `requireAuth` | **无 owner 列** |
+ * | **`/api/mcp/servers`** | **`requireAuth`** + **改/删行级判定** | `mcp_servers.created_by` ⇒ `shared#canEditMcpServer` |
  * | `/api/agents` | `requireAuth` + **行级判定** | `01` 决策 18（创建者 + ADMIN） |
  *
- * ⇒ **一个 `requireAdmin` 都没有**，而且**刻意不做**"只有创建者能改/删"的收窄：
- * `mcp_servers.created_by` 只是**留痕**（前端显示"谁注册的"），不参与判定。
- * 代价是"任何登录用户都能改/删别人注册的 server"，这是 `01` 决策 22 的直接推论 ——
- * 要收紧得先改 `01`/`02`，**本批不自行发明权限模型**。
- * （历史上 `verify:mcp-servers` 有两条反向守卫盯着它；该脚本随 2026-09-24 的定案移除，
- * 现在这两条要靠人工端测 —— 用 `MEMBER` 账号去改/删别人建的 server，看是不是 200。）
+ * ⇒ 仍然**一个 `requireAdmin` 都没有**（行级判定**不走路由钩子**，与 `agents` 同款实现）：
+ * 服务层**先 404 再 403**。⚠️ **`POST /:id/test` 与 `GET /:id/tools` 两条刻意不判定** ——
+ * 它们是"**使用**"不是编辑，收窄它们只会造出"server 建完就没人能测了"（注册者离职/停用）。
+ * ⚠️ 与 `/api/mcp/credentials/**` **同一个前缀却仍是两族**（那边按 `user_id` 收窄、ADMIN 无后门，
+ * 见那个文件头）—— 别照抄。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 六条路由与它们的信封（第五族的形态见 `shared/src/mcp.ts` 的注释）
@@ -45,11 +45,12 @@
  * 而在 `user_id` 上（只能动自己的）—— 与本文件的 `/api/mcp/servers/**` **同一个前缀却刻意两族**，
  * 别照抄（差别见 `routes/mcpCredentials.ts` 文件头）。
  *
- * ⚠️ **工具列表与连通测试都**不带用户凭据**（P0-2-5 坑预判 1 的定案）**：`tools/list` 走
- * "注册者视角"，于是 `tool_cache` 也是**每个 server 一份、全员共享**的（与用户无关）。
- * 有些 server 要求 `tools/list` 也鉴权 ⇒ 那时如实报出"本阶段不支持带用户凭据拉列表"
- * （文案在 `mcp/errors.ts`、按 `stage` 分支）——**不要**顺手带上某个人的凭据：
- * 那会造出"工具列表依赖谁先点过测试"的诡异状态。
+ * ⚠️ **工具列表与连通测试用**注册者（所属人）的凭据**（P0-2-12；原文是"都不带用户凭据"）**：
+ * `tools/list` 的主语是 `mcp_servers.created_by` ⇒ `tool_cache` 仍是**每个 server 一份、
+ * 全员共享**的，与"谁点的测试"无关（**串用户**被结构性排除掉了）。
+ * ⚠️ 这**不是**"顺手带上某个人的凭据"—— 那正是原文要挡的；换主语的正当理由是
+ * **注册者唯一确定**（见 `services` 文件头 ⑤）。
+ * 注册者没配齐必填凭据时**不发起上游请求**（`ok:false` 点名"所属人尚未配置"）。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
@@ -84,17 +85,21 @@ import {
  * 取调用者。用 `requireAuthContext` 而不是自己判 `request.auth === null`：本文件的每条路由
  * 都挂了 `requireAuth`，"走到 handler 就一定有身份"是那个中间件的契约；
  * 自己判会让"漏挂 preHandler"变成**静默的匿名可写**（而 `requireAuthContext` 会抛 401）。
+ *
+ * ⚠️ P0-2-12 起要带上 `role`：改/删的**行级判定**（`shared#canEditMcpServer`）要用它判
+ * "ADMIN 也算"。少带它编译期就过不去（`McpViewer.role` 是必填）。
  */
 function viewerOf(request: FastifyRequest): McpViewer {
-  return { userId: requireAuthContext(request).user.id }
+  const { user } = requireAuthContext(request)
+  return { userId: user.id, role: user.role }
 }
 
 export function registerMcpServerRoutes(app: FastifyInstance): void {
-  /** 列表（登录即可；`03` §4.4 的 MCP 管理页表格） */
+  /** 列表（登录即可 —— **看**不收窄；每项带 `canEdit`，`03` §4.4 的 MCP 管理页据此决定按钮） */
   app.get<{ Querystring: ListMcpServersQuery }>(
     '/api/mcp/servers',
     { preHandler: app.requireAuth, schema: { querystring: listMcpServersQuerySchema } },
-    async (request) => ok(await listMcpServers(request.query)),
+    async (request) => ok(await listMcpServers(request.query, viewerOf(request))),
   )
 
   /**
@@ -111,9 +116,10 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
   )
 
   /**
- * 部分更新（登录即可）。三条闸门的位置要点：
+ * 部分更新（**只有注册者或 ADMIN** —— P0-2-12 起；原文"登录即可"已作废）。三条闸门的位置要点：
  *   · `OAUTH` 400 与**模板深度校验**（P0-2-3）都在**路由级 schema** 上 ⇒ 校验失败时
  *     服务层根本不会被调用（"先校验、后写库"这条在框架层就成立了）；
+ *   · **行级判定在服务层**（先 404 再 403）—— 它要读那一行才知道 `created_by`，路由层拿不到；
  *   · 注册信息变更 ⇒ 清工具缓存，语义在服务层收口；
  *   · 模板变更 ⇒ 回包里带 `credentialSchemaImpact`（**只提示、不删任何已存凭据**）。
  */
@@ -123,14 +129,18 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
       preHandler: app.requireAuth,
       schema: { params: mcpServerIdParamsSchema, body: updateMcpServerBodySchema },
     },
-    async (request) => ok(await updateMcpServer(request.params.id, request.body)),
+    async (request) => ok(await updateMcpServer(request.params.id, request.body, viewerOf(request))),
   )
 
-  /** 删除（登录即可）。被 Agent 绑定时 409（`agent_components` 是多态外键、没有 FK 兜底） */
+  /**
+   * 删除（**只有注册者或 ADMIN** —— P0-2-12 起）。被 Agent 绑定时 409
+   * （`agent_components` 是多态外键、没有 FK 兜底）；⚠️ 它还会**连带删掉所有人的凭据**
+   * （`mcp_credentials` 是 `ON DELETE CASCADE`）⇒ 权限必须收窄。
+   */
   app.delete<{ Params: McpServerIdParams }>(
     '/api/mcp/servers/:id',
     { preHandler: app.requireAuth, schema: { params: mcpServerIdParamsSchema } },
-    async (request) => ok(await removeMcpServer(request.params.id)),
+    async (request) => ok(await removeMcpServer(request.params.id, viewerOf(request))),
   )
 
   /**
@@ -140,8 +150,10 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
    * `ok:false` 是一条**信息**（这个 server 现在通不通），把它映射成 502/504 会让界面
    * 把"一个可用的结论"渲染成"一个错误"。只有 server 不存在才是 404（请求本身的问题）。
    *
-   * ⚠️ **本层不带用户凭据**（P0-2-5 坑预判 1 定案）：`tools/list` 用"注册者视角"。
-   * 有些 server 的 `tools/list` 也要求鉴权 —— 那时这里会如实报 `ok:false` + 可读原因。
+   * ⚠️ **P0-2-12 起它用注册者（所属人）的凭据**（原文"本层不带用户凭据"已作废）：
+   * 有些 server 的 `tools/list` 也要求鉴权 —— 以前那类 server 在这里恒 401（⇒ 工具数恒 0
+   * ⇒ 对话里永远触发不了工具），现在带**注册者**的凭据就能拉到。
+   * ⚠️ 注册者没配齐必填凭据时**不发起上游请求**，`ok:false` 的文案点名"所属人尚未配置"。
    */
   app.post<{ Params: McpServerIdParams }>(
     '/api/mcp/servers/:id/test',

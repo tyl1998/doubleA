@@ -1,16 +1,22 @@
 /**
- * MCP server 契约（P0-2-2；`02` §三 + §4.7 + §九，`06` §四 4.0 / 4.2 / 4.3，`01` §3.6，`03` §4.4）
+ * MCP server 契约（P0-2-2 起；`02` §三 + §4.7 + §九，`06` §四 4.0 / 4.2 / 4.3，`01` §3.6，`03` §4.4）
  *
  * ─────────────────────────────────────────────────────────────────────
- * ① 权限：**登录即可（全员可注册）**，且**没有 owner 列收窄** —— 与知识库同族
+ * ① 权限：**建/看登录即可；改/删 = 注册者（`created_by`）+ ADMIN**（⚠️ P0-2-12 改过口径）
  * ─────────────────────────────────────────────────────────────────────
- * `06` §4.2 的第五族：`/api/mcp/**` 一律"登录即可"，与 users（ADMIN）、conversations（仅本人）
- * 都不像。⚠️ 但**凭据那几条路径**（P0-2-4）的收窄不在角色上而在 `user_id` 上。
- * 本文件对应的 `mcp_servers` 表**没有 owner 列的收窄** —— `created_by` 只作**留痕**
- * （记"谁注册的这个 server"），不参与任何权限判定。⇒ 代价是"任何登录用户都能改/删别人注册的
- * server"，这是 `01` 决策 22 的直接推论，**不是实现疏漏**；要收紧得先改 `01`/`02`。
- * （历史上 `verify:mcp-servers` 有一条**反向守卫**盯着它；脚本已于 2026-09-24 移除，
- * 现在这条靠人工端测：用 `MEMBER` 账号去删别人建的 server，看是不是 200。）
+ * **原文（P0-2-2 定的"第五族"）是"`/api/mcp/**` 一律登录即可、`mcp_servers` 没有 owner 列收窄"**
+ * —— 那是 `01` 决策 22"全员可注册"的直接推论。**2026-09-24（P0-2-12）用户改了口径**：
+ * `created_by` 升为**权限判据**（⇒ 本族从"与知识库同族"变成"**与 `agents` 同族**"）。三段切分：
+ *   · **建 / 看**（`GET`、`POST /api/mcp/servers`）—— **登录即可**（不变）；
+ *   · **改 / 删**（`PATCH`、`DELETE /:id`）—— **注册者 + ADMIN**，判据 {@link canEditMcpServer}；
+ *   · **测试 / 工具列表**（`POST /:id/test`、`GET /:id/tools`）—— **登录即可**，它们是"**使用**"
+ *     而不是编辑（不写任何人的东西，只刷 server 级的 `tool_cache` / `status`）。
+ * ⚠️ 凭据那几条路径（P0-2-4）的收窄**不在角色上、而在 `user_id` 上**（第四族同源，ADMIN 无后门），
+ * 与本节**是两个判据**，别混。
+ * ⚠️ **`created_by` 同时是"探测主语"**（P0-2-12）：测试 / 工具列表用**注册者**的凭据连上游
+ * （`mcpServer.service.ts#probeServer`），而 `tools/call` 仍用**调用者**的凭据。理由：`tool_cache`
+ * 是 **server 级共享**的 ⇒ 主语必须**唯一确定**，不能是"谁点的测试"（那会造出
+ * "谁先点过测试、别人的列表就是谁的视角"的**串用户** —— 正是 P0-2-5 当初定"不带凭据"要挡的东西）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ② `auth_type` / `oauth_config` 是**接口留位、能力不做**（`06` §4.0 口径 1）
@@ -99,7 +105,36 @@
 
 import { z } from 'zod'
 
+import { type UserRole } from './auth.js'
 import { offsetPageOf } from './envelope.js'
+
+// ───────────────────────────── 权限判据（唯一实现）─────────────────────────────
+
+/** `UserRole` 里的管理员字面量（与 `agent.ts#ADMIN_ROLE` 同款：`shared` 里刻意各写一份，见下） */
+const ADMIN_ROLE: UserRole = 'ADMIN'
+
+/**
+ * "这台 MCP server 我能不能改/删"（P0-2-12；`06` §4.2、`02` §三③、`01` §3.6）。
+ *
+ * 规则与 {@link canEditAgent} **逐字同源**（`01` §3.6 的"注册者 + ADMIN"）—— 本函数是**唯一实现**：
+ * 服务端判 403 用它、`McpServerItem.canEdit` 也由它算。漏掉"注册者本人"或"ADMIN 也算"
+ * 任一半都会立刻红（前者 ⇒ 注册者改不了自己的 server，后者 ⇒ 管理员在界面上没有编辑入口）。
+ *
+ * ⚠️ 与 `canEditAgent` **刻意不同的一处**：这里**没有 `deletedAt` 那一半**。`mcp_servers` 是
+ * **硬删**（`02` §三：没有 `deleted_at` 列）⇒ 删掉的 server 就是不存在（404），
+ * 不存在"软删之后还能读到一个不能再编辑的行"这种中间态。
+ *
+ * ⚠️ 它**不参与**"测试 / 工具列表"的判定（见文件头 ①）：那两个端点是**使用** —— 全员可用，
+ * 只是**用注册者的凭据**连上游。别顺手把本函数用到那两条路由上：那会造出
+ * "server 建完就没人能测了"（注册者离职/停用 ⇒ 一台能用的 server 永远显示不了工具）。
+ */
+export function canEditMcpServer(
+  server: { createdBy: string },
+  viewer: { id: string; role: UserRole },
+): boolean {
+  if (viewer.role === ADMIN_ROLE) return true
+  return server.createdBy === viewer.id
+}
 
 // ───────────────────────────── 取值域与上限（常量即契约）─────────────────────────────
 
@@ -814,8 +849,23 @@ export const mcpServerItemSchema = z.object({
   toolCount: z.number().int().min(0),
   /** 连通健康态（见 {@link MCP_SERVER_STATUSES}） */
   status: z.enum(MCP_SERVER_STATUSES),
-  /** **留痕**字段：谁注册的。⚠️ 不参与权限判定（见文件头 ①） */
+  /**
+   * 注册者 id（= **所属人**，`mcp_servers.created_by`）。
+   * ⚠️ **P0-2-12 起它是权限判据**（原注释"**留痕**字段、不参与权限判定"已作废，见文件头 ①）。
+   */
   createdBy: z.string(),
+  /**
+   * 注册者**显示名**（昵称优先、回落用户名 —— 同 `AgentItem.creatorName` 的口径）。
+   * 列表对**全员**开放 ⇒ 用户必须能看出"这台 server 该找谁去配凭据"，只给一个 uuid 是没有用的。
+   */
+  creatorName: z.string(),
+  /**
+   * P0-2-12：**我能不能改/删这台 server**（判据 = {@link canEditMcpServer}，注册者 + ADMIN）。
+   * ⚠️ 由**服务端现算**（它依赖 viewer）—— 前端**不要**自己拿 `createdBy` 跟当前用户 id 比：
+   * 那样"ADMIN 也能改"这半条会在界面上消失（页面只认 id 相等，管理员反而没有编辑入口）。
+   * 与 `AgentItem.canEdit` / `modelAvailable` 同族：服务端算好的**非表列**字段。
+   */
+  canEdit: z.boolean(),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),

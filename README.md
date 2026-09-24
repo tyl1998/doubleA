@@ -716,8 +716,8 @@ VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend   # → http://lo
 
 | # | 该测的路径 | 预期 |
 |---|-----------|------|
-| ① | 左侧导航点「MCP」 | 是**真列表页**（不再是"属哪个批次"的占位说明）；顶部一条 Alert 说明**任何登录用户都可以注册 / 修改 / 删除**（第五族权限，与模型池只有 ADMIN **刻意相反**）；右上角有「我的凭据」入口，带**未配置数量**徽标 |
-| ② | 点「注册 server」：填名称 + endpoint（假上游的 URL）+ 在**模板编辑器**里加一行（`token` / 说明 / 注入位置选 **请求头（HEADER）**）→ 保存 | 提示「已注册…」；列表出现该行。⚠️ **工具数列此时显示 `—`**（**没测过 = 说不出来**，不是 `0`）；状态列写「**未测试**」（不是「异常」） |
+| ① | 左侧导航点「MCP」 | 是**真列表页**（不再是"属哪个批次"的占位说明）；顶部一条 Alert 说明**任何登录用户都可以注册 / 测试 / 调用**，但**只有「所属人」或管理员能编辑 / 删除**；连通测试与工具列表用的是**所属人**的凭据，调用工具注入的是**你自己**的凭据；右上角有「我的凭据」入口，带**未配置数量**徽标 |
+| ② | 点「注册 server」：填名称 + endpoint（假上游的 URL）+ 在**模板编辑器**里加一行（`token` / 说明 / 注入位置选 **请求头（HEADER）**）→ 保存 | 提示「已注册…」；列表出现该行。⚠️ **工具数列此时显示 `—`**（**没测过 = 说不出来**，不是 `0`）；状态列写「**未测试**」（不是「异常」）。**「所属人」列显示你自己的名字**（昵称优先、没设昵称就是用户名）。⚠️ **警告：`test.ok` 恒 `false`**，因为此时你还没填凭据 —— 回包里那句「所属人尚未在「我的凭据」里配齐参数」是**预期行为**（见下面的【所属人】组）。 |
 | ③ | 点该行「测试」→ 再点「工具数」那一列 | 测试成功给一条提示（⚠️ **`/:id/test` 恒 200**，连不上是**结论**不是报错）；工具数变成真数字；工具清单弹窗列出 `echo` / `boom` / `purge` 等，底部标「**刚刚拉取**」；**关掉再点开** ⇒ 标「**来自缓存**」；点「重新拉取」⇒ 又是「刚刚拉取」 |
 | ④ | 点「我的凭据」 | 未配置的 server **置顶**并红字列出缺哪些参数；**只填 `token` 一个 key** → 「保存该 server 的凭据」⇒ 成功 |
 | ⑤ | ⭐ 回 `/mcp`，编辑该 server，**再加一行** `site`（注入位置选 **查询参数（QUERY）**）→ 保存 | 保存成功后弹一句影响提示，含「新增的参数：site（需要在「我的凭据」里填）」并**必须**带「**已填的值不会被自动清理**」；⚠️ **不许出现「已清理」「已删除」**（那是承诺，系统只提示不清理） |
@@ -742,8 +742,9 @@ VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend   # → http://lo
 - **凭据保存是合并语义**（只动你这次填的 key）—— 与智能体 `components` 的**整体替换**刻意相反：
   不可回填的字段只能合并；因此"留空"= 不变，绝不能被当成"清空"；
 - **模板校验与后端是同一份**：`key` 撞平台保留头（`accept` 等）/ 含空格 `QUERY` 名含 `&=`/`BODY` 名撞 `jsonrpc`·`id`·`method`·`params`/ 同模板内重名 —— 都会在**行内当场报红**，不会等到提交后 400；
-- **删除一台被别的智能体绑着的 server 会 409**（那是"先解绑"的信号，不是坏了）；
+- **删除一台被别的智能体绑着的 server 会 409**（那是"先解绑"的信号，不是坏了）；⚠️ 但**无权限的人看不到这个 409** —— 他会先拿到 403（顺序是 404 → 403 → 409，免得从"被几个智能体绑着"这句话里读出信息）；
 - **两台 server 的 `name` 可以重名**（展示名而已）⇒ 定位到分组靠的是 `serverId`，不是名字。
+- ⚠️ **操作列里的「无编辑权限」是灰字、不是禁用按钮**（P0-2-12）：能不能改由服务端现算的 `canEdit` 决定，**不是**前端拿 `createdBy` 跟你自己的 id 比 —— 所以**管理员看别人的 server 也照样有「编辑 / 删除」**（那正是这条口径的反例守卫）。
 
 > **⚠️ 这一节证明什么、不证明什么**：智能体侧**没有**代跑浏览器（用户 2026-09-23/24 定案）。
 > 判据侧只有**无依赖纯逻辑档** `pnpm verify:mcp-ui`（**53 项**：凭据表单"只改一个 key"的请求体合并语义 /
@@ -753,7 +754,36 @@ VITE_DEV_PROXY_TARGET=http://127.0.0.1:13000 pnpm dev:frontend   # → http://lo
 > 只在**你自己动手**的这一刻才算数。
 > ⚠️ **真后端那一半**（注册的 400 文案、`PATCH` 的影响计数、`/:id/test` 恒 200、`/:id/tools` 的 502 与
 > "有缓存就 200"）归「手工端测 · 命令行」**㉒/㉓** 的内联假上游，**不归本档**。
-> ⚠️ 本节的门槛**尚未取证** —— 它是 P0-2-12（P0-2 包验收）的前置。
+> ⚠️ 本节的门槛**尚未取证** —— 它是 P0-2-13（P0-2 包验收）的前置（⚠️ 原写 `P0-2-12`，该编号 2026-09-24 已让给「所属人」批）。
+
+#### 【所属人】组（⭐ P0-2-12 起；编号在本节里**另起一组**）
+
+> **为什么单独一组**：上面那⑮条用的是**无鉴权的假上游** ⇒ 它**验不到**"用所属人凭据连上游"这件事
+> （假上游从不回 401）。本组的 ⑤~⑦ 要的正是这条。⚠️ **本组的①②③④和 ⑤⑥⑦是两条独立的链**，
+> 可以分开跑；但**都建议开两个浏览器窗口**（一个登 `member`、一个登 `admin`）—— 权限那几条必须
+> **两个身份同时在场**才验得干净。
+>
+> ⚠️ **前置**：同上一节（依赖服务 + 后端 1300 + 前端 5174）；假上游**仍是同一段内联脚本**（见「手工端测 · 命令行」㉒/㉓），
+> 它的 **stdout 逐条打印收到的 method** —— 那就是"上游到底有没有收到请求"的取证方式。
+
+| # | 该测的路径 | 预期 |
+|---|-----------|------|
+| ① | 用 **`member`（记为 A）** 建一台 server（名字如 `owner-test`） | 建好；「所属人」列显示 A 的名字 |
+| ② | **换个窗口用 `admin`** 登录、进 `/mcp` | 那台 `owner-test` **在列表里**（**看**不收窄）；**操作列有「编辑 / 删除」**（⚠️ 管理员也算有权限 —— 这一条专门守"前端不许自己算 `canEdit`"） |
+| ③ | 在那个窗口用 ADMIN **删掉** `owner-test` | **200**、列表里消失（门槛 1 的正向那一半） |
+| ④ | 再建一台（这次**用 A 建**），然后 **A 自己**改一次名字、再自己删掉 | 两次都**成功**（⚠️ 守的是"别顺手加 `requireAdmin`"—— 只验②③ 的话，把权限写成"只有 ADMIN 能改"也能蒙过去） |
+| ⑤ | ⭐ **A** 新建一台 server，**先不去填凭据**，直接点该行「测试」 | 提示里是 `ok:false` + 文案含「**所属人尚未在「我的凭据」里配齐参数**」；⚠️ **假上游终端里一行都不打印**（= 上游**零请求** —— 它压根没被连过，所以你不会拿到一句把人引向"我的令牌错了"的 401） |
+| ⑥ | ⭐ **A** 去 `/mcp/credentials` 把该 server 的 `token` 填上 → 回 `/mcp` 再点「测试」 | `ok:true`；工具数变成真数字；状态列「**正常**」。（这时才真的发出上游请求） |
+| ⑦ | ⭐⭐ **换回 `member-B`（另一个人）的窗口**：**他自己不填任何凭据**，去点同一台 server 的「测试」 | **仍然 `ok:true`**（工具数照旧）—— 这就是"**探测主语是所属人、不是点按钮的人**"的实证。再顺手：B 改/删 A 的这台 ⇒ **403**；B 改一个**不存在**的 id ⇒ **404**（两条都要，证明 403 不是被 404 冒充的） |
+
+**已知边界（本组）**：
+- ⚠️ **本组验不到 `tools/call` 那一半的"凭据也是分人的"** —— 那一条在上一节的 ⑨~⑫ 与「手工端测 · 命令行」㉓
+  的链路里（A 填了能调通、B 没填得 **424 `NEED_CREDENTIAL`** + 工具卡"去配置凭据"）。**两条合起来**才是完整口径
+  （"**测试/列表看所属人，调用看自己**"）。
+- ⚠️ **没有"转移所属人"的入口**（P1）：`created_by` 建完就定了，**改不了**。要换人只能删了重建
+  （⚠️ 删会**连带删掉所有人的凭据**，`ON DELETE CASCADE`）—— 说这个是因为它**不是 bug、是当前边界**。
+- ⚠️ **注册者离职 / 被停用 ⇒ 这台 server 的测试与工具列表就废了**（探测主语没了）。平台**没有**兜底
+  （"ADMIN 用自己凭据代探"这类属 P1）；这也是为什么**测试这条路刻意不判权限** —— 至少别人还能点一下、拿到那句"所属人尚未配置"。
 
 ### 阶段一出口验收（人工 · P0-1-38 收尾；`01` §五 阶段一，7 条门槛）
 
@@ -1386,10 +1416,14 @@ pnpm verify:chatbot
 #  → 21 项全通过（需要 PG + Redis，**不需要 MinIO**；脚本自己起进程 + 两个假上游，跑完删净）。
 
 # ⑳ MCP server 注册与连通测试（P0-2-2）—— 工具闭环第 2 步：注册 server → 测连通（拿 tools/list）→ 看工具清单
-#     这一段**不需要 ADMIN**：`/api/mcp/**` 是**权限第五族 = 登录即可**（与知识库同族 —— 同一个资源
-#     "人人可见、人人可改"）。`created_by` 只是**留痕**（界面显示"谁注册的"），不参与判定
-#     ⇒ 任何登录用户都能改/删别人注册的 server（`01` 决策 22 的直接推论，**不是 bug**）；
-#     P0-2 的收窄落在**凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4），**不在 server 上**。
+#     这一段**不需要 ADMIN**：`/api/mcp/**` 的**建 / 看**是"登录即可"。
+#     ⚠️⚠️ **本段的权限口径在 P0-2-12（2026-09-24）改过一次** —— 原文写的是"权限第五族 = 登录即可、
+#         `created_by` 只是留痕、任何登录用户都能改/删别人注册的 server"。**现在不是了**：
+#         **改/删 = 注册者（= 所属人，`created_by`）+ ADMIN**（与智能体同族）；建 / 看 / 测试 / 调用仍全员可用。
+#         下面 ⑳-* 各条的命令行**照旧能敲**（$MCP_USER 自己建的就是自己所属的，改/删自己是 200），
+#         但"拿 $MEMBER_USER 删 $MCP_USER 建的 server 会 200"那半句**已作废** ⇒ 现在是 **403**
+#         （浏览器侧的跑法见「浏览器端测 · MCP」的**【所属人】组** ②~④⑦）。
+#     ⚠️ P0-2 的凭据收窄（`/api/mcp/credentials` 只能动自己的，P0-2-4）与本节是**两个判据**，别混。
 
 # ⑳-⓪ 另开一个终端：起一个**假 MCP server** 并前台常驻（Ctrl-C 收工）—— 它打印的地址就是 $MCPURL
 #     ⚠️ 这一段是**内联**的：仓库里**不再放夹具文件**（夹具已随 2026-09-24 的定案删除 —— 上一版这里
@@ -1430,7 +1464,11 @@ MCP=$(curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers \
 jq . /tmp/mcp.json ; echo "MCP=$MCP"
 #  → data = `{ server:{…}, test:{…} }`：**多包一层**（不是裸 item）⇒ 取 id 要写 `.data.server.id`
 #     （别抄成 `.data.id`，会得 null）；`server` 里还有派生的 `slug`、`status`（UNKNOWN/OK/ERROR）、
-#     `createdBy`/`createdAt`；`test` 是这次 best-effort 探测的结论。
+#     `createdBy`/`creatorName`（**所属人** —— 改/删的判据、也是探测主语）、`canEdit`（**服务端现算**：
+#     我能不能改/删这台；⚠️ 管理员看别人的 server 也是 `true`）、`createdAt`；
+#     `test` 是这次 best-effort 探测的结论。
+#     ⚠️ **新建后第一次的 `test.ok` 通常是 `false`** —— 探测用的是**你（所属人）**的凭据，而这时你还没填
+#        ⇒ 文案是「所属人尚未在「我的凭据」里配齐参数」，且**上游一个请求都没收到**。这是**预期行为**。
 
 # ⑳-b 连通测试 → **HTTP 恒 200**，结论在 body 里（成功顺手把工具写进 tool_cache）
 curl -sS --noproxy '*' -b "$COOKIE" -X POST $BASE/api/mcp/servers/$MCP/test | jq .
@@ -1496,9 +1534,12 @@ curl -sS --noproxy '*' -b "$COOKIE" -X DELETE $BASE/api/mcp/servers/$MCP | jq .
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ㉑ 我的凭据：每用户每 server 一份（P0-2-4）—— 工具闭环第 4 步：模板定好后，每个使用者填自己的令牌
-#     ⚠️ 与 ⑳ 是**两族权限**：`/api/mcp/servers/**` 是人人都能改的共享资源（第五族）；
-#        `/api/mcp/credentials/**` 只能动**自己的那一份**（`user_id` 收窄，**ADMIN 也没有后门**）。
+#     ⚠️ 与 ⑳ 是**两族权限**：`/api/mcp/servers/**` 是**公开可见的共享资源**（建/看全员可用，
+#        ⚠️ **P0-2-12 起改/删只有注册者或 ADMIN**）；`/api/mcp/credentials/**` 只能动**自己的那一份**
+#        （`user_id` 收窄，**ADMIN 也没有后门**）。
 #        路径里只有 `:serverId`（没有凭据行 id）⇒ "删别人的凭据"这件事**连入口都没有**。
+#     ⚠️ **本节的 $COOKIE 是 admin 的 jar**（①步登的就是它）⇒ 本节里"注册者"= admin，
+#        所以下面的 PATCH/DELETE 都是 200。想看 403 得用 B 去动它 —— **㉑-k** 就是这一条。
 #     前置：承接 ⑳（已有一台 server）；另需**第二个账号**（ADMIN 在 /admin/users 建一个 MEMBER 即可）
 #        —— 下面用 $MEMBER_USER / $MEMBER_PASS 指代它。
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1555,7 +1596,10 @@ curl -sS --noproxy '*' -c /tmp/b.jar -X POST $BASE/api/auth/login \
 curl -sS --noproxy '*' -b /tmp/b.jar $BASE/api/mcp/credentials \
   | jq '[.data.items[]|select(.serverId=="'"$MCP"'")|{configured,missingKeys}]'
 #  → configured:false + missingKeys 里有 required 的那个（**同一台 server、两份互不影响的凭据**）
-#  ⚠️ 用 ADMIN 看同一台 server 也是"未配置"（除非 ADMIN 自己填过）—— 凭据**没有管理员后门**。
+#  ⚠️ "凭据**没有管理员后门**"这条在本次跑法里是**反过来**看到的：本节的 $COOKIE（= A）**就是 admin**
+#     （①步登的），而 B 只是一个 MEMBER ⇒ B 看到 configured:false 就已经证明了"管理员填过的东西
+#     对别人一个字节都不生效"。想更直白地看"ADMIN 也没有后门"，再建一个**第三个**账号（或直接看
+#     B 的行：A 是 admin 也读不到 B 的密文 —— ㉑-h 那次"粘密文"就是这条的反证）。
 
 # ㉑-h 三层取证之③·绑定层：把 A 的密文**粘到 B 的行**上，读接口要**降级**（不是 500）
 docker exec -i doubulea-postgres psql -U doubulea -d doubulea -c \
@@ -1577,6 +1621,23 @@ curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
   | jq '.data.credentialSchemaImpact'
 #  → `removedKeys:["X-User-Token"]` + `affectedCredentials:1`（= `values_enc` 里含该 key 的行数，全库口径）
 #  ⚠️ 它**只提示、什么都不删**：A 的那条值还在库里（只是 `fields` 里不再出现 —— 它已不会被注入）。
+
+# ㉑-k ⭐ **【所属人 · 权限】P0-2-12**：B（MEMBER）去**改/删 A 建的 server** ⇒ **403**；
+#       ⚠️ 顺序是 **404 → 403 → 409** ⇒ 无权限的人看到的**不是**"被几个智能体绑着"（那条文案本身是信息泄露面）
+#       ⚠️ 但**测试 / 工具列表不判权限**（那是"使用"不是编辑）—— B 照样能点、只是用的是 **A 的凭据**
+curl -sS --noproxy '*' -b /tmp/b.jar -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"name":"B改的"}' | jq '{code,msg}'    # → 403 + 「…注册者或管理员…」
+curl -sS --noproxy '*' -b /tmp/b.jar -X DELETE $BASE/api/mcp/servers/$MCP | jq '{code,msg}'   # → 403（**不是** 409）
+curl -sS -o /dev/null -w '%{http_code}\n' --noproxy '*' -b /tmp/b.jar -X DELETE \
+  $BASE/api/mcp/servers/00000000-0000-7000-8000-000000000000                        # → 404（守门：403 不是被 404 冒充的，
+                                                                                    #    所以上面必须是**真实存在**的 id）
+curl -sS --noproxy '*' -b "$COOKIE" -X PATCH $BASE/api/mcp/servers/$MCP \
+  -H 'content-type: application/json' -d '{"name":"A改的"}' | jq '.data.server.name'  # → "A改的"（**A 自己 200** —— 别顺手改成 requireAdmin）
+#  ⚠️ 还要看一眼 **B 点测试**：它**不报 403**，而是用 **A 的凭据**去连。
+#     ⚠️ 此刻模板已没有 `required` 参数（㉑-j 改成只剩 tenant_id）⇒ 直接 `ok:true`；
+#     "**所属人没配齐必填凭据** ⇒ `ok:false` + 文案含「所属人尚未配置」+ **上游零请求**"那一条
+#     在「浏览器端测 · MCP」的**【所属人】组 ⑤**里验（那里建的是**新** server，还没填凭据）。
+curl -sS --noproxy '*' -b /tmp/b.jar -X POST $BASE/api/mcp/servers/$MCP/test | jq '{ok}'      # → {ok:true}（**主语是 A，不是 B**）
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ㉒ 工具发现与缓存（P0-2-5）—— 工具闭环第 5 步：工具列表有了**两种取法**（读缓存 / 真拉），
@@ -1942,11 +2003,12 @@ MCP_CONFIRM_TIMEOUT_SEC=2 pnpm dev:backend
 登录即可，不是 ADMIN；P0-1-16 加了它下面的 `POST .../documents` 上传、P0-1-19 加了
 `reupload`/`retry`/`DELETE`、P0-1-20 加了 `POST .../search`）**、**智能体 `/api/agents`（P0-1-22，
 登录即可"建与看"，编/删收窄到创建者 + ADMIN；P0-1-23 补齐第六条路由 `PUT .../components`）**、
-**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**、**MCP server `/api/mcp/servers`（P0-2-2，**登录即可** —— 权限第五族，最接近知识库；五条业务路由 + `POST /:id/test` 恒 200 的连通测试；**P0-2-5 起 `GET /:id/tools` 有两种取法** —— 不传 `refresh` 纯读缓存、`?refresh=1` 真拉并落库）**。
+**会话 `/api/conversations/*`（P0-1-25，**仅创建者本人** —— 连 ADMIN 也没有后门，别人的会话一律 404；P0-1-26 加了 `POST /:id/chat`（SSE）与 `POST /:id/stop`；P0-1-28 加了 `GET /:id/messages` 消息历史）**、**MCP server `/api/mcp/servers`（P0-2-2，**建/看登录即可 + 改/删按行判定（⚠️ P0-2-12 收窄，原"权限第五族 = 登录即可"已作废）** —— 与智能体同族；五条业务路由 + `POST /:id/test` 恒 200 的连通测试；**P0-2-5 起 `GET /:id/tools` 有两种取法** —— 不传 `refresh` 纯读缓存、`?refresh=1` 真拉并落库；**P0-2-12 起测试与列表用「所属人」的凭据连上游**）**。
 **"MEMBER 能用的业务接口"现在有四处**：`/api/models/available`、整个 `/api/knowledge-bases/*`、
-`/api/agents` 的列表/详情/创建、以及**整个 `/api/mcp/servers/*`（P0-2-2）** —— 五族**权限口径刻意各不相同**（模型池全程 ADMIN；
-知识库**没有 owner 列**故登录即可读写；**MCP server 与知识库同族** —— 它虽有 `created_by` 列但**只作留痕、不参与判定**
-⇒ 任何登录用户都能改/删别人注册的；智能体有 `created_by` 列故编删按行判定；
+`/api/agents` 的列表/详情/创建、以及**整个 `/api/mcp/servers/*`（P0-2-2）** —— 权限口径**刻意各不相同**（模型池全程 ADMIN；
+知识库**没有 owner 列**故登录即可读写；**MCP server 有 `created_by` 列故与智能体同族** —— 建/看/测试/调用全员可用、
+**改/删 = 注册者 + ADMIN**（⚠️ **P0-2-12 收窄**：原文写的是"MCP server 与知识库同族、`created_by` 只作留痕、任何登录用户都能改/删" —— **已作废**）；
+智能体有 `created_by` 列故编删按行判定；
 **会话有 `user_id` 列故仅本人**）。**会话现在能"说话"、历史也能原样拉回来了**：
 `POST /:id/chat`（P0-1-26）是 SSE 流，真正的编排循环（检索 → LLM 流式 → `citations` → 落库）
 在 **P0-1-27** 落地；**`GET /:id/messages`（P0-1-28）** 就是"刷新页面重新画出整个对话页"的那**一个**请求
@@ -1987,17 +2049,28 @@ MCP_CONFIRM_TIMEOUT_SEC=2 pnpm dev:backend
 · ⚠️ **绑定层会降级而不是 500**：密文被粘到别的 `(server,user,key)` 上 ⇒ 解密失败 ⇒ 该参数**退回"未配置"**、
 服务端打一条只带键名的 warn（主密钥轮换、密文损坏走的是同一条路）。
 · `/mcp/credentials` 的**前端仍是占位页**（属 P0-2-11）—— 现在要看只能用 ㉑ 的 curl。
-**MCP server 专项边界（P0-2-2；P0-2-3 补模板的深度校验与"变更影响"提示；P0-2-5 补工具列表的两种取法与"拉不到"的三个出口）**：· 权限是**第五族 = 登录即可**（`created_by` 只作留痕、不参与判定）⇒ **任何登录用户
-都能改/删别人注册的 server**，这是 `01` 决策 22 的直接推论、**不是 bug**（要收窄得先改 `01`/`02`）；P0-2 的收窄落在
-**凭据**上（`/api/mcp/credentials` 只能动自己的，属 P0-2-4）。· **连通测试恒 HTTP 200** —— `ok:false` 是一条结论
+**MCP server 专项边界（P0-2-2；P0-2-3 补模板的深度校验与"变更影响"提示；P0-2-5 补工具列表的两种取法与"拉不到"的三个出口；⚠️ P0-2-12 改过权限口径与探测主语）**：· ⚠️⚠️ **权限在 P0-2-12（2026-09-24）改过一次** —— 原文是"**第五族 = 登录即可**（`created_by` 只作留痕、
+不参与判定）⇒ **任何登录用户都能改/删别人注册的 server**，这是 `01` 决策 22 的直接推论、**不是 bug**"。
+**现在不是了**：`created_by` 升为**权限判据**（= 所属人）⇒ **改 / 删 = 注册者 + ADMIN**（与智能体同族，判据 `shared#canEditMcpServer`），
+**建 / 看 / 测试 / 调用仍全员可用**；**403 而不是 404**（server 是公开可见资源，藏 id 没意义），顺序 **404 → 403 → 409**。
+· 凭据那族（`/api/mcp/credentials`，第四族）的收窄仍在 `user_id` 上、**与本节是两个判据**。· **连通测试恒 HTTP 200** —— `ok:false` 是一条结论
 （"这个 server 现在通不通"）而非错误，只有 **id 不存在才 404**；**失败时工具缓存一个字节都不动**（只在成功时刷）。
-· **注册不强制连通**（上游抖动不该变成"建不了 server"），响应里那次 `test` 只是 best-effort 结论。
+· **注册不强制连通**（上游抖动不该变成"建不了 server"），响应里那次 `test` 只是 best-effort 结论；
+⚠️ **新建后第一次 `test.ok` 通常是 `false`**（所属人还没填凭据）—— **预期行为**。
 · ⚠️ **`endpoint_url` 是 SSRF 面** —— 任何登录用户都能让后端去连**任意 http/https 地址**（含内网地址与云元数据端点）；
 P0 **只校验 scheme**（拒 `file:`/`gopher:` 之类），**不做内网黑名单 / 端口白名单 / DNS 重绑定防护** ——
-那属 **P1 安全加固**，本阶段是**已知且刻意**的边界。· ⚠️ **`POST /:id/test` 与 `GET /:id/tools?refresh=1` 都**不带用户凭据**（"注册者视角"，P0-2-5 定案）**，
-于是 `tool_cache` 是**每个 server 一份、全员共享**的（与"谁在看"无关）。有些 server 的 `tools/list` 也要求鉴权 ⇒
-那时会如实报出 **「工具列表需要鉴权（本阶段不支持带用户凭据拉列表）」**，**不是坏了** ——
-⚠️ 配上凭据也**没有用**（拉列表根本不带它），别把这条当成"要去填凭据"。
+那属 **P1 安全加固**，本阶段是**已知且刻意**的边界。· ⚠️ **`POST /:id/test` 与 `GET /:id/tools?refresh=1` 用的是「所属人」的凭据**（⚠️ **P0-2-12 改过**：
+原文是"**不带任何用户凭据**、'注册者视角'、配上凭据也没用"—— 那句**已作废**），
+于是 `tool_cache` 仍是**每个 server 一份、全员共享**的，但主语**唯一确定** = `mcp_servers.created_by`
+（⇒ 不存在"谁先点过测试、别人的列表就是谁的视角"的**串用户**）。⚠️ 而**调用工具**（`tools/call`）用的是**调用者自己**的凭据 ——
+"**测试/列表看所属人，调用看自己**"这两句要一起读，缺一句就会配错地方。
+· ⚠️ **所属人没配齐必填凭据 ⇒ 探测连一个上游请求都不发**（`ok:false` + 文案点名「所属人尚未配置」）——
+这是刻意的：发出去只会拿到一句 401，而那句话会把人引向"我的令牌错了"（实际是**根本没带令牌**）。
+· ⚠️ **没有"转移所属人"的入口**（属 P1）：`created_by` 建完就定了；**注册者被停用 ⇒ 这台 server 的测试与工具列表就废了**，
+平台没有兜底（这也是"测试这条路刻意不判权限"的另一半理由：至少别人还能点一下、拿到那句"所属人尚未配置"）。
+· 有些 server 的 `tools/list` 也要求鉴权且**所属人那份凭据本身就无效/过期** ⇒ 那时会如实报出
+**「工具列表需要鉴权（…请让所属人到「我的凭据」页确认…）」**，**不是坏了** ——
+⚠️ 这句的主语是**所属人**：当前登录的人自己配了也**不影响**这条路径（他改的是自己那份）。
 · ⚠️ **`?refresh=1` 有三个出口，分界线是"我们还能不能答出这个问题"**（P0-2-5）：拉到 ⇒ `cached:false`；
 **拉不到但有缓存** ⇒ **200** + `cached:true`（`fetchedAt` 明显偏旧，这就是"不是刚拉的"的全部信号）；
 **拉不到且缓存也空** ⇒ **502**。⚠️ 第三种**不能**是"200 + 空数组" —— 那会被读成"这个 server 没有工具"，
@@ -2326,4 +2399,5 @@ doubuleA/
 | 2026-09-24 | — | **P0-2-8 完成（P0-2 工具闭环 8/12）· 🎯 工具闭环的「整条链」首次在命令行层跑通**：编排循环接工具调用 + 10 轮上限。**手工跑法见「手工端测 · 命令行」㉓**（内联假 LLM 吐分片 `tool_calls` + 内联假 MCP 执行 `tools/call`，两段 `node --input-type=module -e '…'` 前台常驻、**不依赖仓库里有夹具文件**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/conversation.ts`（`tool_calls` **从"刻意不定型"升级为定型**：迁入 `TOOL_CALL_KINDS`/`TOOL_CALL_STATUSES` + 新增 `toolCallRecordSchema` + `messageContentSchema` 加 `tool_calls`；**判据 = 写入端与读取端都已落地**）；`shared/src/sse.ts`（`sseToolCallPayloadSchema` 改为 `toolCallRecordSchema.omit({arguments:true})` **派生**，两常量**刻意不再导出** —— `export *` 会让同名变"歧义名"）；`backend/src/llm/protocol.ts`（**本批最大改动**：工具调用抽象 —— `ChatToolCall`/`ToolCallChunk`/分片累积器 `ToolCallBuffer`/`parseToolArguments`（空串⇒`{}`、非法 JSON⇒`{ok:false,reason}`、**不猜**）/`sumUsages`（多轮**相加**，与 `mergeUsage` 的"同一次调用的两半**覆盖**"刻意不同）+ 三协议各自的工具定义形状与**结果回填形态**：OpenAI `role:'tool'`+`tool_call_id`、Responses `function_call`/`function_call_output` item、Anthropic 把 `tool_result` **合成一条 user 消息** + 相邻同角色合并）；`backend/src/llm/client.ts`（`tools` 选项 + `toolCalls` 汇总 + **同一个累积器**在 `chat()`/`chatStream()` 都用、半成品不外泄）；`backend/src/services/mcpCall.service.ts`（新增 `resolveMcpToolCatalog`（读 `tool_cache`、**不联网不碰凭据**、`taken` 逐台累积去重）+ `executeMcpToolCall`（`resolveMcpCallContext` → connect → `callTool` → `finally close()`））；`backend/src/orchestrator/chatContext.ts`（工具结果 → 消息的**纯函数**：`truncateToolResult`(8000)/`summarizeToolInput`(200, 凭据形状遮值)/`buildToolResultMessages`/`buildAssistantToolCallsMessage`/`TOOL_LOOP_LIMIT_NOTICE`/历史**成对**还原）；`backend/src/orchestrator/chatBot.ts`（**核心**：`for(;;)` 工具循环 + `toolRecords` 落进助手消息 `content`）；`backend/src/index.ts`（信封 `step`）。**六条最值得记的**：① ⚠️ **流式 `tool_calls` 是"分片累积"的** ⇒ **绝不能在第一片 `JSON.parse`**（`arguments` 是不完整 JSON，**不报错、只解析出空参数**）；② ⚠️ **工具结果报文形态跨协议全不同** ⇒ 编排层只吐协议无关的 `role:'tool'`，**手拼报文一律归 `buildBody`**（否则"换协议就调不动工具"且 `verify:llm` 不会红）；③ **工具失败 ≠ 这一轮失败**：`isError`/缺凭据 424/上游 502/504 全变 `tool_call{ERROR}` + 回填给模型自己解释，**唯一例外是中断**（`McpAbortError`）；④ **"还允不允许要工具"的判据是"已执行了几轮"**（到 10 轮**当轮撤掉 `tools`** + 注一次提示；模型仍硬报就只能收尾）；⑤ ⚠️ **历史还原必须"成对"**（半截记录 = 400 ⇒ **整段丢**，否则"这个会话从此再也发不出消息"且指不到那一行）；⑥ **凭据主语来自"当前会话"**（`viewer.userId` 懒加载现查）。**已知边界（同时写进 `02` §6.3）**：**危险判定不做**（属 P0-2-9，接回点已预留在取凭据与发 `RUNNING` 卡**之前**）⇒ 工具一律直接执行；一轮多调用**按顺序**执行；还原顺序是 `assistant{正文+toolCalls}` → `tool{结果}`（**最终正文排在工具结果之前** ⇒ 保真度折损，别当 bug）；`usage_records` 仍属 P1。**取证方式**：⚠️ 本批**无自动化验收档**（脚本与夹具已删）；**未跑 typecheck/build/回归/浏览器**；命令行人工程序 = `README` ㉓。**下一步 = P0-2-9**（危险判定 `mcp/risk.ts` 纯函数）。 |
 | 2026-09-24 | — | **P0-2-9 完成（P0-2 工具闭环 9/12）：危险判定（`annotations` ⇒ 平台侧强制确认）** —— ⚠️ **本批只做"判定"，"确认"（弹卡等应答）仍属 P0-2-10** ⇒ **不是端测里程碑**、命令行与界面都验不到新东西（**所有工具仍然一律直接执行**）。**新增** `backend/src/mcp/risk.ts`（纯函数 `isDangerousTool(tool)`，**只有一条 `import type`** ⇒ 真值表断言不需要起依赖）。判据一句话：**`readOnlyHint === true` 且 `destructiveHint !== true` ⇒ 安全，其余（含读不出注解）一律危险** —— 即"**拿不准就确认**"。⚠️ **唯一超出"新增一个文件"的改动**：`mcp/toolSchema.ts` 的 `McpToolRoute` 多了 **`dangerous: boolean`**（`toOpenAiTools` 里算好，因为判定要用工具自己的 `annotations`、而描述符只有那个函数手上才有）；它**不进** `OpenAiFunctionTool`（是我们的策略、不是给模型的提示）。**四条取舍**：`annotations` **服务端自报、不可信**（`readOnlyHint: true` 即可绕过 ⇒ P0 边界到此、平台强制名单属 P1）／判定输入是**这个工具**不是这台 server／`idempotentHint`·`openWorldHint` **刻意不参与**／**严格 `=== true`**、非布尔按缺失（宽松写法会让拼错类型的 server 静默拿到"只读"资格，而症状是"确认卡该弹没弹"）。**取证**：`/tmp` 临时脚本 + `node --import tsx` 真 import，**55 条断言 ALL PASS**（3×3 全枚举 + 两个 hint 的不变量 + 非布尔 + 读不出注解 + 真实描述符 + **接线 6 组**）；首跑红 9 条**全是核查脚本自己把"安全"当成了返回值**，实现零改动；**未跑构建/回归/浏览器**。回写：`docs/02` 新增 **§9.9** 判定表 + §十 一行；`docs/06` 进度 **9/12**。**下一步 = P0-2-10**（`POST /:id/confirm` + 挂起 + 120s 超时按取消） |
 | 2026-09-24 | — | **P0-2-10 完成（P0-2 工具闭环 10/12）：elicitation 确认流（`confirm` 事件挂起 + `POST /:id/confirm` 应答 + 120s 超时按取消）** —— **手工跑法见「手工端测 · 命令行」㉔**（承接 ㉓ 的同一台内联假上游，不用重起；`purge` 工具**刻意不声明 `annotations`** 故按真值表判为危险。⚠️ ㉓ 里 `echo`/`boom` 那两行 `annotations: { readOnlyHint: true }` 是**本批加的**、不是装饰：**删掉它们，㉓ 整节会变成"每调一次工具先弹一次确认"**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/sse.ts`（`CONFIRM_SOURCES = ['PLATFORM','SERVER']` + `sseConfirmPayloadSchema` 增量 **`source` / `expiresAt`** + 新增 `confirmRequestBodySchema` 与 `confirmConversationResultSchema`）、`shared/src/conversation.ts`（活跃流快照加**第四个字段** `pendingConfirmId` —— `EMPTY_ACTIVE_SNAPSHOT` / `parseActiveSnapshot` / zod schema **三处一起改**）、`backend/src/infra/redis.ts`（`chatConfirmKey` = `chat.confirm:{id}` + `CHAT_CONFIRM_TTL_SEC = 60`；**值是结构化的**而不是布尔）、`backend/src/orchestrator/sse.ts`（**核心**：`ConfirmQuestion` / `ConfirmDecision`（`CONFIRMED` 与 `REJECTED` 与 `TIMEOUT`）/ `parseConfirmAnswer` / `clearConfirmSignal` / `answerConfirm` + `SseChannel#awaitConfirm` 与 `#waitForConfirm` + `ChatProducerInput` 多一个 `awaitConfirm` 成员；`stopPollIntervalMs` 改名 `signalPollIntervalMs` 两类信号共用）、`backend/src/orchestrator/chatContext.ts`（`TOOL_CONFIRM_REJECTED_OUTPUT` / `TOOL_CONFIRM_TIMEOUT_OUTPUT` 两个常量，**刻意分开**）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext` / `executeMcpToolCall` 透传 `onElicit`）、`backend/src/orchestrator/chatBot.ts`（**挂起点就插在"取凭据 / 发 `RUNNING` 卡之前"** —— 即 P0-2-9 留的那处接回点；另加 `onElicit` 处理器把三个结局映射成 `accept` / `decline` / `cancel`）、`backend/src/routes/conversations.ts`（**第九条路由**，`02` §4.5 那张表至此无缺口）、`backend/src/index.ts`（`step`）。**八条最值得记的**：① **两条来源、一个原语** —— 平台强制确认（`PLATFORM`）与服务端反向 elicitation（`SERVER`）走**同一个** `confirm` 事件、同一个应答端点、同一个 `awaitConfirm`，差别只在 payload 的 `source`（决定前端选哪句文案）；② ⚠️ **应答必须带 `confirmId`**（键里存 `{confirmId, accepted}`、消费时按 id 匹配、读到即删、新一次等待开始前**再清一次**）—— 否则上一轮的迟到点击会被下一轮当成答案消费掉，症状是"**确认卡一闪而过**"且**零报错**；③ **三种结局必须分得开** ——"用户已取消"与"等待确认超时"回填**不同**文案（前者是用户的决定、后者是没人应答），合成一句话用户就读不出自己那一按到底生效了没有；④ **取消与超时都不让这一轮失败**（回填一条"未执行"的工具结果、流程继续 —— `01` §3.6 原文），**唯一的例外是中断**（`awaitConfirm` 抛 `ChatStoppedError`，交回"本轮被中断"的收尾）；⑤ **被拦下的调用不发 `RUNNING` 卡**（那张卡的含义是"已经在跑"，而它其实没跑过 ⇒ 只发最终那张 ERROR 卡，前端按 `callId` upsert）；⑥ **超时与心跳是两个独立机制** ⇒ 挂起期间 `ping` 照发、锁跟着心跳续期（**没有**第二条续期路径 —— 另起一条迟早与心跳那条打架）；⑦ **`applied:false` 是 200 不是 4xx**（用户看到卡片没消失就会再点一次，那是常态），且**不为"会话只读"单开 409**（只读会话**必定**没有活跃流 ⇒ 已被同一条判据覆盖，单开会让"流中途 Agent 被软删、用户正在看确认卡"误报）；⑧ ⚠️ **本批实际写错一次（`typecheck` 抓到）** —— `streamChatReply` 里 `acquireConversationLock` 的初始快照是**逐字段手写**的，加第四个字段时它**少一个键**，而后果是"**所有 `/confirm` 应答都变成 `applied:false`**"（静默到只有类型检查能抓）⇒ 改成 `{ ...EMPTY_ACTIVE_SNAPSHOT, startedAt }`，从根上断掉这一类。**已知边界**：`annotations` **服务端自报、不可信**（声明 `readOnlyHint: true` 即可绕过 ⇒ 平台强制名单属 **P1**）；假上游**不发** elicitation ⇒ `SERVER` 那一路在 ㉔ 里验不到（要真上游；契约与三条映射见 `docs/02` §9.10）。**取证方式**：⚠️ **本批无自动化验收档**（脚本与夹具 2026-09-24 已删；浏览器档 = **P0-2-11 之后**）；智能体侧只跑了 `pnpm -r typecheck`（三包全绿，**且首跑抓到上面第 ⑧ 条那个静默 bug**）与 `pnpm check:batch`；**未跑构建/回归/浏览器，本批不是端测里程碑**。回写：`docs/02` 新增 **§9.10** + §4.5 / §5.1 / §5.2 / §六 第 4 步 / §9.9 的落地标记同步；`docs/06` 进度 **10/12**。**下一步 = P0-2-11**（前端确认卡 + `/mcp` 页面 —— **它才是浏览器可端测里程碑**） |
-| 2026-09-24 | — | **P0-2-11 完成（P0-2 工具闭环 11/12）· 🎯 阶段二唯一的「浏览器端测」里程碑达成**：MCP 管理页 + 我的凭据页 + 确认卡接真数据源 + Agent 编辑页 MCP 多选接回 + 工具失败卡「去配置」跳转。**手工跑法见新增的本文「浏览器端测 · MCP」一节（①~⑮）** —— ⚠️ 它**前置三样**：依赖+迁移+两个进程、一台可注册的 MCP server（复用「手工端测 · 命令行」㉒/㉓ 的**内联假上游**）、**一个会主动要工具的假 LLM**（真模型不会去调一个刚注册的工具 ⇒ 少了它，"对话里触发工具"这一段走不到）。**新增 8 个文件**：`frontend/src/api/mcp.ts`（两条 query key 树 + 六条端点 hooks + `confirmConversation`；服务器列表与凭据清单**刻意都不分页**）、`frontend/src/pages/mcp/mcpModel.ts`（**零依赖纯逻辑 515 行**：server 表单 / 模板编辑器 / 凭据表单 / 列表读数 / 定位目标）、`frontend/src/features/chat/confirmModel.ts`（确认卡倒计时与文案 —— **放 `features/` 而不是 `pages/` 是为了不造出反向依赖**）、`pages/mcp/` 的四个组件页、`frontend/scripts/verify-mcp-ui.mjs`（**53 项**，A~I 九组）。**改动 9 处**：`shared/src/conversation.ts`（**本批唯一契约增量 `toolCallRecordSchema.serverId?`**）、`backend/src/orchestrator/chatBot.ts`（`base` 按**三态**带上 `serverId`）、`app/{App,nav,paths}.ts`（两条占位路由与两条 `batch` 台账一起删 —— **台账不删会变成"哪些页还没做"的错误答案**）、`features/chat/{ConfirmCard,ToolCard,messageModel,roundReducer,ChatInput}.tsx`、`stores/chatStream.ts`（新增 **`clearConfirm()`**）、`pages/chat/ChatPage.tsx`、`pages/agents/{AgentFormPage,agentModel}.ts`（MCP 多选接回）、`styles/app.css`、根/前端 `package.json`（`verify:mcp-ui`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动、零后端路由改动**。**六条最值得记的**：① ⚠️ **`serverId` 是"工具名反推不出来"才必须加的** —— `serverName` 可重名、`toolName` 里的 slug **刻意不唯一**（同 `mcp.ts` 文件头 ③）⇒ 反推会指到别的 server，症状是"点了去配置、落在另一台 server 的分组上"；且因 `sseToolCallPayloadSchema = toolCallRecordSchema.omit({arguments:true})` 它是**派生**的，这个字段自动同时出现在落库那份与上流那份上，**别顺手做成必填**（历史行里没有它）。② ⚠️ **`StreamRound.confirm` 是"类型比事实窄"**（只声明三个键、payload 有五个）⇒ 补齐 `source`/`expiresAt`；倒计时**只读 `expiresAt`**、到点停在「已超时」+ 两键禁用、**卡不自己撤**（撤卡的判据在服务端）。③ ⚠️ **"收卡"没有服务端事件**（答复走独立于流的 `/confirm`，流里那个提问已被消费）⇒ store 上新增显式动作 `clearConfirm()`；不做则症状是**确认卡一闪而过之后又回来**。④ **模板编辑器不重写校验**：直接调 `shared#validateCredentialSchema`（四条语义规则后端已有一份），前端只把 `path[index,'key']` 还原成"哪一行哪一列"；⚠️ 写断言时踩过一次 —— 拿 `Authorization` 当"撞保留头"的夹具，而它**既不在** `MCP_RESERVED_HEADER_NAMES`、**也是**合法头名 ⇒ 什么都不报（真夹具是 `Accept` 或含空格的 `X-User Token`）。⑤ **"没改就不发"用集合语义判等**（`diffCredentialSchema`，不是 `JSON.stringify`）—— 换两行顺序或只改 `label` 都不算改动，否则会发一次无意义的 `PATCH` 并弹一条本不该有的"影响了 N 份凭据"。⑥ **坑预判 1 点名的五处，实际只有一处还需要动手**：`assertComponentRefsBindable` 的 MCP 分支**早在 P0-2-2 就翻了**；`verify:agents` / `verify:agent-package` / `verify-app.mjs` **三个脚本 2026-09-24 已随 `backend/scripts/**` 删除** ⇒ 那几处断言**无从翻转**（后者还先被 P0-2-10 作废）；真正动手的只有 `AgentFormPage` 的 MCP 多选。**取证方式**：⚠️ **浏览器那条路由人工走**（本文「浏览器端测 · MCP」①~⑮，**尚未取证**、是 P0-2-12 的前置）；智能体侧只跑了 `pnpm verify:mcp-ui`（**53/53**）与 `pnpm -r typecheck`（**三包全绿**；⚠️ 首跑抓到 4 处编译错，都是"搬文件 / 改签名之后的尾巴"：`ConfirmCard` 还从 `pages/mcp/` import 三个函数、`mcpModel` 残留未用的 `ConfirmSource`、`removeTemplateRow` 的 `readonly` 出参与可变草稿对不上）。⚠️ **未跑构建/浏览器/真后端** ⇒ 只证明**契约与接线**对，**不证明界面点得动**。**顺带订正一处 README 自身的不准确**：本节上面那句"现在敲任何一个 `verify:*` 都会 `Command not found`"只对**后端**那批成立 —— `frontend/scripts/**` 的四档（`chat-sse` / `knowledge-ui` / `admin-ui` / **`mcp-ui`**）**还在且可跑**，但按用户定案「验收一律人工端测」⇒ **存在 ≠ 要跑**。回写：`docs/03` §二（十条路由全部落地、**删掉** P0-2-10 那条"确认卡未接"告警）·§4.1·§4.2·§4.4·§4.5·§五·§六·§八；`docs/02` §5.1 的 `tool_call` 行补 `serverId?` + §9.3 新增"为什么只靠 `errorCode` 还不够" + §十四；`docs/06` 进度 **11/12** + §七 第 7 行。**下一步 = P0-2-12**（P0-2 包验收 R1/R2 —— ⚠️ **它要等你先把浏览器那条路走一遍**） |
+| 2026-09-24 | — | **P0-2-11 完成（P0-2 工具闭环 11/12）· 🎯 阶段二唯一的「浏览器端测」里程碑达成**：MCP 管理页 + 我的凭据页 + 确认卡接真数据源 + Agent 编辑页 MCP 多选接回 + 工具失败卡「去配置」跳转。**手工跑法见新增的本文「浏览器端测 · MCP」一节（①~⑮）** —— ⚠️ 它**前置三样**：依赖+迁移+两个进程、一台可注册的 MCP server（复用「手工端测 · 命令行」㉒/㉓ 的**内联假上游**）、**一个会主动要工具的假 LLM**（真模型不会去调一个刚注册的工具 ⇒ 少了它，"对话里触发工具"这一段走不到）。**新增 8 个文件**：`frontend/src/api/mcp.ts`（两条 query key 树 + 六条端点 hooks + `confirmConversation`；服务器列表与凭据清单**刻意都不分页**）、`frontend/src/pages/mcp/mcpModel.ts`（**零依赖纯逻辑 515 行**：server 表单 / 模板编辑器 / 凭据表单 / 列表读数 / 定位目标）、`frontend/src/features/chat/confirmModel.ts`（确认卡倒计时与文案 —— **放 `features/` 而不是 `pages/` 是为了不造出反向依赖**）、`pages/mcp/` 的四个组件页、`frontend/scripts/verify-mcp-ui.mjs`（**53 项**，A~I 九组）。**改动 9 处**：`shared/src/conversation.ts`（**本批唯一契约增量 `toolCallRecordSchema.serverId?`**）、`backend/src/orchestrator/chatBot.ts`（`base` 按**三态**带上 `serverId`）、`app/{App,nav,paths}.ts`（两条占位路由与两条 `batch` 台账一起删 —— **台账不删会变成"哪些页还没做"的错误答案**）、`features/chat/{ConfirmCard,ToolCard,messageModel,roundReducer,ChatInput}.tsx`、`stores/chatStream.ts`（新增 **`clearConfirm()`**）、`pages/chat/ChatPage.tsx`、`pages/agents/{AgentFormPage,agentModel}.ts`（MCP 多选接回）、`styles/app.css`、根/前端 `package.json`（`verify:mcp-ui`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动、零后端路由改动**。**六条最值得记的**：① ⚠️ **`serverId` 是"工具名反推不出来"才必须加的** —— `serverName` 可重名、`toolName` 里的 slug **刻意不唯一**（同 `mcp.ts` 文件头 ③）⇒ 反推会指到别的 server，症状是"点了去配置、落在另一台 server 的分组上"；且因 `sseToolCallPayloadSchema = toolCallRecordSchema.omit({arguments:true})` 它是**派生**的，这个字段自动同时出现在落库那份与上流那份上，**别顺手做成必填**（历史行里没有它）。② ⚠️ **`StreamRound.confirm` 是"类型比事实窄"**（只声明三个键、payload 有五个）⇒ 补齐 `source`/`expiresAt`；倒计时**只读 `expiresAt`**、到点停在「已超时」+ 两键禁用、**卡不自己撤**（撤卡的判据在服务端）。③ ⚠️ **"收卡"没有服务端事件**（答复走独立于流的 `/confirm`，流里那个提问已被消费）⇒ store 上新增显式动作 `clearConfirm()`；不做则症状是**确认卡一闪而过之后又回来**。④ **模板编辑器不重写校验**：直接调 `shared#validateCredentialSchema`（四条语义规则后端已有一份），前端只把 `path[index,'key']` 还原成"哪一行哪一列"；⚠️ 写断言时踩过一次 —— 拿 `Authorization` 当"撞保留头"的夹具，而它**既不在** `MCP_RESERVED_HEADER_NAMES`、**也是**合法头名 ⇒ 什么都不报（真夹具是 `Accept` 或含空格的 `X-User Token`）。⑤ **"没改就不发"用集合语义判等**（`diffCredentialSchema`，不是 `JSON.stringify`）—— 换两行顺序或只改 `label` 都不算改动，否则会发一次无意义的 `PATCH` 并弹一条本不该有的"影响了 N 份凭据"。⑥ **坑预判 1 点名的五处，实际只有一处还需要动手**：`assertComponentRefsBindable` 的 MCP 分支**早在 P0-2-2 就翻了**；`verify:agents` / `verify:agent-package` / `verify-app.mjs` **三个脚本 2026-09-24 已随 `backend/scripts/**` 删除** ⇒ 那几处断言**无从翻转**（后者还先被 P0-2-10 作废）；真正动手的只有 `AgentFormPage` 的 MCP 多选。**取证方式**：⚠️ **浏览器那条路由人工走**（本文「浏览器端测 · MCP」①~⑮，**尚未取证**、是 P0-2-12 的前置）；智能体侧只跑了 `pnpm verify:mcp-ui`（**53/53**）与 `pnpm -r typecheck`（**三包全绿**；⚠️ 首跑抓到 4 处编译错，都是"搬文件 / 改签名之后的尾巴"：`ConfirmCard` 还从 `pages/mcp/` import 三个函数、`mcpModel` 残留未用的 `ConfirmSource`、`removeTemplateRow` 的 `readonly` 出参与可变草稿对不上）。⚠️ **未跑构建/浏览器/真后端** ⇒ 只证明**契约与接线**对，**不证明界面点得动**。**顺带订正一处 README 自身的不准确**：本节上面那句"现在敲任何一个 `verify:*` 都会 `Command not found`"只对**后端**那批成立 —— `frontend/scripts/**` 的四档（`chat-sse` / `knowledge-ui` / `admin-ui` / **`mcp-ui`**）**还在且可跑**，但按用户定案「验收一律人工端测」⇒ **存在 ≠ 要跑**。回写：`docs/03` §二（十条路由全部落地、**删掉** P0-2-10 那条"确认卡未接"告警）·§4.1·§4.2·§4.4·§4.5·§五·§六·§八；`docs/02` §5.1 的 `tool_call` 行补 `serverId?` + §9.3 新增"为什么只靠 `errorCode` 还不够" + §十四；`docs/06` 进度 **11/12** + §七 第 7 行。**下一步 = P0-2-12**（P0-2 包验收 R1/R2 —— ⚠️ **它要等你先把浏览器那条路走一遍**） ⚠️ **本行的编号于 2026-09-24 顺延**：用户当天提出"MCP server 加所属人"的新需求，它插在包验收之前 ⇒ 新需求占 `P0-2-12`、**包验收改称 `P0-2-13`**；下一行即新需求那一批 |
+| 2026-09-24 | — | **P0-2-12 完成（P0-2 工具闭环 12/13）：MCP server 所属人（改/删按行判定）+ 探测改用所属人凭据** —— 用户 2026-09-24 提案「这个 MCP 加一个所属人，测试的时候使用所属人的，其他的人不能编辑。但可以调用，调用的人使用自己的凭据」，三条判据全部落地。**手工跑法见本文「浏览器端测 · MCP」的【所属人】组（①~⑦）** 与「手工端测 · 命令行」**㉑-k**。⚠️ **这不是新功能、是一次口径收窄**（原文明确写着"这族权限**刻意**不收窄"）⇒ 严格执行"**先 `01` → 再 `02`/`06` → 最后代码**"，四份文档先改口径再动代码。**改动 13 个文件、487+/148-，零新增依赖、零新增环境变量、⚠️ **零 `schema.prisma` 迁移****（`mcp_servers.created_by` 列 **P0-2-2 就存在**，本批**只改语义 + 改注释** —— 这是"当年那个'多余的列'救了今天"的一次，反过来也提醒**列上的注释也是一种契约**）。**`shared/src/mcp.ts`**：新增 **`canEditMcpServer(server, viewer)` 唯一判据**（与 `canEditAgent` 逐字同源，但**刻意少了 `deletedAt` 那一半** —— `mcp_servers` 是**硬删**、没有"软删后还能读到一行"的中间态）+ `mcpServerItemSchema` 加 **`creatorName`**（昵称优先、回落用户名）与 **`canEdit`**（**服务端现算**的非表列字段）。**`backend/src/services/mcpServer.service.ts`**（最大一块）：`McpViewer` 加 **必填 `role: UserRole`**（少带它**编译期就过不去**——故意的）；`MCP_SERVER_SELECT` 加 `creator:{select:{username,nickname}}`（**只取这两列**，不写 `creator:true`）；`toItem(row, viewer)` 因此多一个参数、`listMcpServers` 跟着多 `viewer`；`updateMcpServer` / `removeMcpServer` 各加 **403**（**顺序 404 → 403 → 409**，403 排在 409 前是因为**那条 409 的文案本身就是信息泄露面**：无权限的人不该从"被几个智能体绑着"读出任何信息）；**`probeServer` 签名扩成 `{…,credentialSchema,createdBy}`**，内部 `decryptMyCredentialValues(id, createdBy)` ⇒ `buildCredentialInjection` ⇒ `createCredentialFetch(injection)` 交给 `McpClient`，明文经 `secrets` **只用于错误消息脱敏**（日志只记 `missingKeys` 与条数）；**缺必填凭据 ⇒ 提前 return `{ok:false,error}`、一个上游请求都不发**；`refreshServerTools`（建 server 时的 best-effort 探测）签名同步扩两个字段（漏改一处就是编译错）。**`backend/src/routes/mcpServers.ts`**：`viewerOf` 从 `{userId}` 变 `{userId, role}`；三条路由传 `viewerOf(request)`；⚠️ **`POST /:id/test` 与 `GET /:id/tools` 一行权限代码都没加 —— 它们是"使用"不是编辑**，收窄它们只会造出"**server 建完就没人能测了**"（注册者离职 ⇒ 一台能用的 server 永远显示不了工具数）。**`backend/src/mcp/errors.ts`**：`tools/list` 撞 401/403 的文案**换主语**（"本阶段做不到、去配也没用" → "**请让所属人去配**"）—— ⚠️ 当前登录的人自己配了**不影响**这条路径。**`frontend/`**：列表页新增**「所属人」列**、操作列改 `server.canEdit ? (编辑+删除) : <span>无编辑权限</span>`、顶部 Alert 改写、`api/mcp.ts` 与两个页面的文件头同步。**六条最值得记的**：① ⚠️⚠️ **`canEdit` 不许前端自己算** —— 前端若只认 `createdBy === 我`，就把"**ADMIN 也能改**"这半条在界面上抹掉了，而服务端 403 判据把他算成有权限 ⇒ 症状是"**管理员没有编辑入口**"，两边对不上且**只在管理员账号下复现**（同 `AgentItem.canEdit` / `modelAvailable`）；② ⚠️ **"用注册者凭据"能解掉 P0-2-5 当年的反对理由** —— 原文反对带凭据是因为"工具列表会依赖**谁先点过测试**"（**串用户**），那个顾虑针对的是"**发起人**凭据"；换成**注册者**后主语**唯一确定**，顾虑被结构性排除，同时解掉一个**产品级缺口**："要求鉴权的 server（真实 MCP 生态里是绝大多数）一律 401 ⇒ `tool_cache` 恒空 ⇒ 下发给模型的工具数恒 0 ⇒ **对话里永远触发不了工具**"；③ **"测试/列表看所属人，调用看自己"必须一起读** —— 只说前一句会让用户把凭据填到错的人名下；④ ⚠️ **缺必填凭据时不发请求**（与调用路径"发请求之前拦 424"同判据）—— 否则用户拿到一句 401，而那句话会把他引向"我的令牌错了"（实际是**根本没带令牌**）；`status` 仍落 `ERROR`、`tool_cache` 一字不动；⑤ ⚠️ **改凭据不清工具缓存**（失效判据仍只认 `endpoint_url` / `auth_type` / `credential_schema` 三列）—— 否则"**任意使用者**改自己那份凭据"都会触发一台**共享** server 的缓存失效，多写者互相踩；⑥ **建完第一次探测必然 `ok:false`**（所属人还没填）—— **预期行为**，不是 bug。**取证方式**：⚠️ **本批无自动化验收档、也没有跑任何 `verify`**（用户 2026-09-24 定案：新契约不自证、收尾不跑 lint/typecheck/build/verify、不做条目数交叉核对）⇒ `frontend/scripts/verify-mcp-ui.mjs`（**53 项，未随本批改动**）**没有增补也没跑**，`canEditMcpServer` 的真值表与两个新字段的取证**落在人工端测**（【所属人】组 ①~④ / ⑦）。智能体侧只跑了 **一次 `pnpm -r typecheck`** —— 这是 §七 写明的**唯一例外**（**跨文件接线批次**：契约加两个字段 + 五个函数签名变更 + `McpViewer` 加必填字段），**三包全绿、零编译错**；收尾 `pnpm check:batch` 一致。⚠️ **未跑构建/回归/浏览器/真后端** ⇒ 只证明**接线接对了**，**不证明权限真的拦得住**（403 是纯服务层逻辑，正是 `typecheck` 够不到的地方）。**README 增量**：⑳ 的文件头口径改写 + ⑳-a 的投影说明（`creatorName`/`canEdit` + 首次 `test.ok` 恒 false）、㉑ 的文件头与该节"$COOKIE 就是 admin"的澄清、**㉑-k（⭐ 403 / 404 / 200 与"B 点测试仍用 A 的凭据"）**、㉒ 与「已知边界」多处的口径订正、**新增【所属人】组 ①~⑦**（两条独立链 + 三条已知边界）。**回写**：`docs/01` 决策 22/23 + §3.6 两行；`docs/02` §三③ · §4.7① · §9.3 · §9.6① · §六；`docs/06` 本批新增节（含 13 条落地要点 + 逐条验收门槛 + 取证方式）+ §4.0 / §4.1（包验收行顺延）+ **§4.2 整节重写**（三族表 → **四族表** + 三点理由）+ §4.4 追加"更强取证"段 + 包验收节顺延为 `P0-2-13` + §四 进度 `11/13` → **`12/13`**；`backend/src/index.ts` 信封 `step`。**⚠️ P0-2 只剩最后一步**：**P0-2-13 包验收**（R1/R2）—— 它**要等你先把「浏览器端测 · MCP」①~⑮ 与【所属人】组走一遍** |

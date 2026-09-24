@@ -10,10 +10,12 @@
  * ─────────────────────────────────────────────────────────────────────
  * 本文件的**七条口径**（每条都对应一条验收门槛或坑预判）
  * ─────────────────────────────────────────────────────────────────────
- * **① 权限是"登录即可"，且**没有 owner 列收窄**（`06` §4.2 第五族 / 验收门槛 1）。**
- *    `created_by` 只作**留痕**：它出现在响应里（前端能显示"谁注册的"），但**不参与任何判定** ——
- *    没有"只有创建者能改"这一说。所以本文件里**一个权限判断都没有**，删/改别人建的 server
- *    是**刻意允许**的（与 Agent 第三族相反）。验收里有一条反向守卫专门盯这件事。
+ * **① 权限：建/看登录即可；改/删 = 注册者 + ADMIN（⚠️ P0-2-12 改过口径）。**
+ *    原文是"`created_by` 只作**留痕**、本文件里**一个权限判断都没有**"。**2026-09-24 起**
+ *    `created_by` 升为**权限判据**：`updateMcpServer` / `removeMcpServer` **先 404 再 403**
+ *    （判据 `shared#canEditMcpServer`），`listMcpServers` 把 `canEdit` 算进投影。
+ *    ⚠️ **`POST /:id/test` 与 `GET /:id/tools` 仍不判权限** —— 它们是"**使用**"不是编辑，
+ *    收窄它们只会造出"server 建完就没人能测了"（注册者离职 ⇒ 一台能用的 server 永远显示不了工具）。
  *
  * **② 注册**不强制连通**（坑预判 2 / 验收门槛 4）。**
  *    `01` §3.6 的验收要点写着"注册时连通测试"，但把它做成**注册前置**是错的：
@@ -33,11 +35,15 @@
  *    失败时只改 `status=ERROR`：上游抖一下不该毁掉上一次成功拉到的工具列表 ——
  *    那是"用户明明能用（缓存里的工具还在）却被我们清空了"的最坏形态。
  *
- * **⑤ 本层刻意**不带用户凭据**（P0-2-5 坑预判 1 定案）。**
- *    `tools/list` 用"注册者视角"（无凭据）。有些 MCP server 的 `tools/list` 也要求鉴权，
- *    本方案下拉不到 —— 那时 `POST /:id/test` 会**如实报出**（`ok:false` + 可读原因），
- *    而**不许**"顺手带上某个人的凭据"（那会造出"工具列表依赖谁先点过测试"的诡异状态）。
- *    这也意味着 `tool_cache` 是**每个 server 一份、全员共享**的，与用户无关。
+ * **⑤ ⚠️ 探测带"注册者"的凭据（原文"刻意不带用户凭据"已作废 —— P0-2-12 改）。**
+ *    原文的理由（"带上某个人的凭据会造出'**工具列表依赖谁先点过测试**'"）**仍然成立** ——
+ *    但它针对的是**"发起人凭据"**。换成**注册者凭据**（`mcp_servers.created_by`）之后那个顾虑
+ *    自动消失：注册者是**确定的、每台 server 唯一**的 ⇒ `tool_cache` 仍是**每个 server 一份、
+ *    全员共享**的，与"谁点的测试"无关（**串用户**这条被结构性地排除掉了）。
+ *    改口径的收益很硬：不带的后果是"要求鉴权的 server（真实 MCP 生态里是绝大多数）一律 401
+ *    ⇒ `tool_cache` 恒空 ⇒ 下发给模型的工具数恒 0 ⇒ **对话里永远触发不了工具**"。
+ *    ⚠️ 注册者没配齐**必填**凭据时**不发起上游请求**（见 `probeServer`），与调用路径的 424 同判据 ——
+ *    否则用户拿到一句 401，而那句话会把他引向"我的令牌错了"（实际是**根本没带令牌**）。
  *
  * **⑥ 改模板时**只提示、绝不自动清理**已存的凭据（P0-2-3 坑预判 2 / 门槛 3）。**
  *    `credentialSchema` 变更后，响应里带回 `credentialSchemaImpact`（增/删/换注入位置三类 key 级的
@@ -60,8 +66,10 @@
 
 import {
   AppError,
+  canEditMcpServer,
   credentialSchemaImpactOf,
   diffCredentialSchema,
+  missingRequiredCredentialKeys,
   normalizeCredentialSchema,
   slugifyServerName,
   uniqueSlug,
@@ -76,17 +84,26 @@ import {
   type RemoveMcpServerResult,
   type UpdateMcpServerBody,
   type UpdateMcpServerResult,
+  type UserRole,
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma, Prisma } from '../infra/prisma.js'
 import { McpClient } from '../mcp/client.js'
+import { buildCredentialInjection, createCredentialFetch } from '../mcp/inject.js'
 import { buildToolCache, parseToolCache, toolCountOf, type McpToolCache } from '../mcp/toolCache.js'
-import { countAffectedCredentials } from './mcpCredential.service.js'
+import { countAffectedCredentials, decryptMyCredentialValues } from './mcpCredential.service.js'
 
-/** 调用者（只用到 id：本资源没有 owner 收窄，`created_by` 只是留痕，见文件头 ①） */
+/**
+ * 调用者。
+ *
+ * ⚠️ P0-2-12 起 `role` 是**必需**的：改/删要走行级判定（`shared#canEditMcpServer`）。
+ * 而 `userId` 有**两个用途**、别混：① 建 server 时当 `createdBy`；② 判"我能不能改这台"。
+ * （**探测**用的不是它 —— 那边的主语是**注册者**，见 `probeServer`。）
+ */
 export interface McpViewer {
   userId: string
+  role: UserRole
 }
 
 /**
@@ -104,6 +121,12 @@ const MCP_SERVER_SELECT = {
   toolCache: true,
   status: true,
   createdBy: true,
+  /**
+   * 注册者显示名（P0-2-12 加的；`creatorName` 昵称优先、回落用户名）。
+   * ⚠️ **只取这两列**，别图省事写 `creator: true` —— 那会把密码哈希 / 状态 / 角色整行拉出来，
+   * 而"手上有没有"决定了下一个人顺手 `...row` 时会不会漏（同 `agent.service.ts` 的取法）。
+   */
+  creator: { select: { username: true, nickname: true } },
   createdAt: true,
   updatedAt: true,
 } as const
@@ -118,6 +141,7 @@ type McpServerRow = {
   toolCache: unknown
   status: 'UNKNOWN' | 'OK' | 'ERROR'
   createdBy: string
+  creator: { username: string; nickname: string | null }
   createdAt: Date
   updatedAt: Date
 }
@@ -126,7 +150,14 @@ type McpServerRow = {
 // 投影与小工具
 // ═════════════════════════════════════════════════════════════════════
 
-function toItem(row: McpServerRow): McpServerItem {
+/**
+ * 行 → 契约投影。
+ *
+ * ⚠️ P0-2-12 起它需要 `viewer`：`canEdit` 是**依赖调用者**的（同一行对不同人给出不同答案）。
+ * 别把这个字段挪到前端去算 —— 前端只认"`createdBy === 我`"的话，**ADMIN 也会被算成无权限**，
+ * 而服务端 403 判据把他算成有权限 ⇒ 界面上"管理员没有编辑入口"，两边对不上（同 `AgentItem.canEdit`）。
+ */
+function toItem(row: McpServerRow, viewer: McpViewer): McpServerItem {
   return {
     id: row.id,
     name: row.name,
@@ -138,6 +169,8 @@ function toItem(row: McpServerRow): McpServerItem {
     toolCount: toolCountOf(row.toolCache),
     status: row.status,
     createdBy: row.createdBy,
+    creatorName: row.creator.nickname ?? row.creator.username,
+    canEdit: canEditMcpServer(row, { id: viewer.userId, role: viewer.role }),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }
@@ -224,9 +257,16 @@ async function nextSlug(name: string): Promise<string> {
 /**
  * 连一次上游、拉一次 `tools/list`，**永不抛错**（除编程错误）。
  *
- * 这里刻意**不传 `headers`**（= 不带任何凭据，见文件头 ⑤）：`tools/list` 是"注册者视角"，
- * 与调用它的人无关。`McpClient` 的 `close()` 幂等，故 `finally` 里关两次也无害
- * （`connect()` 内部失败时自己已经关过一次）。
+ * ⚠️ **P0-2-12 起它带"注册者（所属人）"的凭据**（原文"刻意不传 `headers` ⇒ 一个凭据都不带"
+ * 已作废，见文件头 ⑤）。主语是 `target.createdBy` —— **不是**"发起这次测试的人"：
+ * `tool_cache` 是 **server 级共享**的，主语必须**唯一确定**，否则就是**串用户**
+ * （A 点过测试 ⇒ B 看到的是 A 的凭据拉到的列表）。这也正是"为什么不干脆用发起人的凭据"的答案。
+ *
+ * ⚠️ 注册者**没配齐必填凭据时不发起上游请求**：直接给 `{ok:false}` —— 与调用路径
+ * "在发请求之前拦 424"同判据。否则用户会拿到一句 401，而那句话会把他引向"我的令牌错了"
+ * （实际是**根本没带令牌**）。
+ *
+ * `McpClient` 的 `close()` 幂等，故 `finally` 里关两次也无害（`connect()` 内部失败时自己关过一次）。
  *
  * ⚠️ 错误消息来自 `mcp/errors.ts` 的翻译层（已经是**可读中文 + 已脱敏**）；
  *    非 `AppError` 的意外错误原样带出 —— 它们是**给我们看的**。
@@ -234,11 +274,45 @@ async function nextSlug(name: string): Promise<string> {
  *    `getMcpServerTools` 在"回退到既有缓存"时进一条 warn，而在"连缓存都没有"时
  *    把它**原样作为 502 的消息**给用户（那时它就是用户唯一能看到的原因）。
  */
-async function probeServer(target: { id: string; name: string; endpointUrl: string }): Promise<McpServerTestResult> {
+async function probeServer(target: {
+  id: string
+  name: string
+  endpointUrl: string
+  credentialSchema: unknown
+  createdBy: string
+}): Promise<McpServerTestResult> {
+  const schema = normalizeCredentialSchema(target.credentialSchema)
+  const { values } = await decryptMyCredentialValues(target.id, target.createdBy)
+
+  const missingKeys = missingRequiredCredentialKeys(schema, Object.keys(values))
+  if (missingKeys.length > 0) {
+    // ⚠️ 只记**键名**与条数（值一个字都不许进日志 —— 同 `mcpCall.service.ts` 的口径）
+    getLogger().warn(
+      {
+        mcpServerId: target.id,
+        ownerId: target.createdBy,
+        missingKeys,
+        presentKeyCount: Object.keys(values).length,
+      },
+      'MCP server 的注册者尚未配齐必填凭据 ⇒ 探测未发起上游请求',
+    )
+    return {
+      ok: false,
+      error:
+        `该 server 的所属人尚未在「我的凭据」里配齐参数（还缺：${missingKeys.join('、')}）。` +
+        '连通测试与工具列表都用**所属人**的凭据 ⇒ 请让所属人补上后重试。',
+    }
+  }
+
+  const injection = buildCredentialInjection(schema, values)
   const client = new McpClient({
     name: target.name,
     url: target.endpointUrl,
-    logFields: { mcpServerId: target.id },
+    // ⚠️ 空注入时 `createCredentialFetch` 原样返回全局 fetch（不多套一层、不改 URL）
+    fetch: createCredentialFetch(injection),
+    // 解密出来的明文**只用于错误消息脱敏**（绝不进日志）
+    secrets: Object.values(values),
+    logFields: { mcpServerId: target.id, ownerId: target.createdBy },
   })
   try {
     await client.connect()
@@ -291,6 +365,8 @@ async function refreshServerTools(server: {
   id: string
   name: string
   endpointUrl: string
+  credentialSchema: unknown
+  createdBy: string
 }): Promise<{ test: McpServerTestResult; row: McpServerRow }> {
   const test = await probeServer(server)
   const row = await applyProbeResult(server.id, test, new Date().toISOString())
@@ -302,13 +378,19 @@ async function refreshServerTools(server: {
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * server 列表（`GET /api/mcp/servers`，登录即可）。
+ * server 列表（`GET /api/mcp/servers`，登录即可 —— **看**不收窄）。
+ *
+ * ⚠️ 但**每一项的 `canEdit` 依赖 viewer**（P0-2-12）：同一台 server 对注册者/ADMIN 是 `true`、
+ * 对别人是 `false`。前端**不自己算**（见 `toItem` 的注释）。
  *
  * 排序 `createdAt asc, id asc`：与 `/api/users`、`/api/models`、`/api/knowledge-bases` 同一口径
  * （按录入顺序展示最直观，`id` 兜底让 offset 分页稳定 —— uuid7 时间有序，但只靠它
  * 会在同毫秒插入时抖动）。
  */
-export async function listMcpServers(query: ListMcpServersQuery): Promise<OffsetPage<McpServerItem>> {
+export async function listMcpServers(
+  query: ListMcpServersQuery,
+  viewer: McpViewer,
+): Promise<OffsetPage<McpServerItem>> {
   const db = getPrisma()
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位
   const [rows, total] = await db.$transaction([
@@ -320,7 +402,7 @@ export async function listMcpServers(query: ListMcpServersQuery): Promise<Offset
     }),
     db.mcpServer.count(),
   ])
-  return { items: rows.map(toItem), total, offset: query.offset, limit: query.limit }
+  return { items: rows.map((row) => toItem(row, viewer)), total, offset: query.offset, limit: query.limit }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -328,7 +410,12 @@ export async function listMcpServers(query: ListMcpServersQuery): Promise<Offset
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 注册（`POST /api/mcp/servers`，登录即可）。
+ * 注册（`POST /api/mcp/servers`，登录即可 —— **建**不收窄）。
+ *
+ * ⚠️ **建的人就是所属人**（`createdBy = viewer.userId`，P0-2-12）：他从此是唯一（除 ADMIN 外）
+ * 能改/删这台 server 的人，**也是"测试 / 工具列表"的探测主语**。所以紧接着那句"注册时的
+ * best-effort 探测"用的就是**他**的凭据 —— 刚建完通常还没有凭据，探测会以
+ * `{ok:false, error:"…所属人尚未配置…"}` 结束（**不发上游请求**），这是**预期行为**。
  *
  * 顺序（每一环的位置都有理由）：
  *   ① 先拒 `OAUTH`（见 `assertAuthTypeSupported`）—— 在**任何写库之前**，
@@ -370,7 +457,7 @@ export async function createMcpServer(
     { mcpServerId: created.id, name: created.name, slug, testOk: test.ok },
     '已注册 MCP server',
   )
-  return { server: toItem(refreshed), test }
+  return { server: toItem(refreshed, viewer), test }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -378,7 +465,11 @@ export async function createMcpServer(
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 改注册信息（`PATCH /api/mcp/servers/:id`，登录即可）。
+ * 改注册信息（`PATCH /api/mcp/servers/:id`）。
+ *
+ * ⚠️ **P0-2-12 起只有注册者（所属人）或 ADMIN 能改**（原文"登录即可"**已作废**）：**先 404 再 403**，
+ * 与 `agents` 同口径 —— `server` 是**公开可见**的资源（列表全员能读）⇒ 藏 id 没有意义，
+ * "404 而不是 403"那套留给**只有本人能看见**的资源（会话族）。
  *
  * 三件事：
  *   · `OAUTH` 照拒（同建库）；
@@ -395,17 +486,22 @@ export async function createMcpServer(
  * ⚠️ **非法模板进不到这里**（P0-2-3：按 `inject` 判 `key`、同模板内判重都在路由级 schema 上，
  * 报错 path 精确到 `body.credentialSchema.<i>.key`）⇒ 本函数拿到的模板一定是合法的。
  *
- * @throws {AppError} `NOT_FOUND`(404) server 不存在 / `VALIDATION`(400) 传了 OAUTH
+ * @throws {AppError} `NOT_FOUND`(404) 不存在 / `FORBIDDEN`(403) 既不是注册者也不是 ADMIN /
+ *   `VALIDATION`(400) 传了 OAUTH
  */
 export async function updateMcpServer(
   id: string,
   input: UpdateMcpServerBody,
+  viewer: McpViewer,
 ): Promise<UpdateMcpServerResult> {
   const db = getPrisma()
   assertAuthTypeSupported(input.authType)
 
   const current = await db.mcpServer.findUnique({ where: { id }, select: MCP_SERVER_SELECT })
   if (current === null) throw AppError.notFound('MCP server 不存在')
+  if (!canEditMcpServer(current, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以修改它')
+  }
 
   /** 库里那份模板的**可用化**版本（jsonb 里可能混着坏条目，见 `normalizeCredentialSchema`） */
   const currentSchema = normalizeCredentialSchema(current.credentialSchema)
@@ -473,7 +569,7 @@ export async function updateMcpServer(
     },
     invalidatesCache ? '已更新 MCP server（注册信息变更，工具缓存已失效）' : '已更新 MCP server',
   )
-  return { server: toItem(updated), credentialSchemaImpact: impact }
+  return { server: toItem(updated, viewer), credentialSchemaImpact: impact }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -481,7 +577,11 @@ export async function updateMcpServer(
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 删除（`DELETE /api/mcp/servers/:id`，登录即可）。
+ * 删除（`DELETE /api/mcp/servers/:id`）。
+ *
+ * ⚠️ **P0-2-12 起只有注册者（所属人）或 ADMIN 能删**（原文"登录即可"已作废），且**排在 409 之前**：
+ * 无权限的人不该从"被几个智能体绑着"这句话里读出任何信息。删除的后果比"改"更重 ——
+ * 它会**连带删掉所有人的凭据**（`mcp_credentials` 是 `ON DELETE CASCADE`）⇒ 必须归注册者。
  *
  * ⚠️ **被 Agent 绑定时 409**（验收门槛 3）：`agent_components.ref_id` 是**多态外键、
  * 刻意不建 FK**（`02` §3.1），数据库不会拦 —— 引用完整性由服务层负责。放任删除会留下
@@ -495,15 +595,21 @@ export async function updateMcpServer(
  * 并发"的推论；同时"删 server"会**连带删掉所有人的凭据**（`03` §七 的删除分级里它属"普通删除"
  * —— 凭据不是用户可见的资产，且它引用的模板已不存在）。
  *
- * @throws {AppError} `NOT_FOUND`(404) 不存在 / `CONFLICT`(409) 正被 Agent 绑定
+ * @throws {AppError} `NOT_FOUND`(404) 不存在 / `FORBIDDEN`(403) 既不是注册者也不是 ADMIN /
+ *   `CONFLICT`(409) 正被 Agent 绑定
  */
-export async function removeMcpServer(id: string): Promise<RemoveMcpServerResult> {
+export async function removeMcpServer(id: string, viewer: McpViewer): Promise<RemoveMcpServerResult> {
   const db = getPrisma()
   const target = await db.mcpServer.findUnique({
     where: { id },
-    select: { id: true, name: true },
+    select: { id: true, name: true, createdBy: true },
   })
   if (target === null) throw AppError.notFound('MCP server 不存在')
+  // ⚠️ 顺序：404 → **403** → 409。403 必须排在 409 前面（见 doc：不能让人靠"绑定数"这句话
+  //    探到信息），也必须排在删除动作前面（否则就是"删完才发现没权限"）。
+  if (!canEditMcpServer(target, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以删除它')
+  }
 
   const boundAgents = await db.agentComponent.count({
     where: { componentType: 'MCP', refId: id },
@@ -537,6 +643,10 @@ export async function removeMcpServer(id: string): Promise<RemoveMcpServerResult
  * **HTTP 恒 200**（`06` §4.3）：`ok:false` 是一个**结论**，不是一次失败。
  * 两条副作用（验收门槛 2）：成功顺手刷 `tool_cache`；失败只把 `status` 打成 `ERROR`。
  *
+ * ⚠️ **P0-2-12 起它用注册者（所属人）的凭据**（原文"本层不带用户凭据"已作废，见文件头 ⑤）——
+ * 于是"**谁点这个按钮**"完全不影响结论，只有"**注册者配没配凭据**"影响（`06` §4.2 那张表）。
+ * 缺必填凭据时**不发起上游请求**，`ok:false` 的文案点名"所属人尚未配置"。
+ *
  * 只有"server 不存在"才抛 404 —— 那是**请求本身**的问题（主语是"这个请求"），
  * 与"这一轮连不上"（主语是"这次执行"）必须分开（`02` §5.2 的两类失败口径）。
  *
@@ -550,7 +660,8 @@ export async function testMcpServer(id: string): Promise<McpServerTestResult> {
   const db = getPrisma()
   const target = await db.mcpServer.findUnique({
     where: { id },
-    select: { id: true, name: true, endpointUrl: true },
+    // `credentialSchema` / `createdBy` 是 P0-2-12 加的：探测要用**注册者**的凭据（见 `probeServer`）
+    select: { id: true, name: true, endpointUrl: true, credentialSchema: true, createdBy: true },
   })
   if (target === null) throw AppError.notFound('MCP server 不存在')
 
@@ -604,8 +715,16 @@ export async function getMcpServerTools(
   const db = getPrisma()
   const row = await db.mcpServer.findUnique({
     where: { id },
-    // `name` / `endpointUrl` 是"要联网"那条路要用的（`probeServer` 拿它们拼请求与错误消息）
-    select: { id: true, name: true, endpointUrl: true, toolCache: true },
+    // `name` / `endpointUrl` / `credentialSchema` / `createdBy` 都是"要联网"那条路要用的
+    // （`probeServer` 拿它们拼请求、取**注册者**的凭据、拼错误消息）
+    select: {
+      id: true,
+      name: true,
+      endpointUrl: true,
+      credentialSchema: true,
+      createdBy: true,
+      toolCache: true,
+    },
   })
   if (row === null) throw AppError.notFound('MCP server 不存在')
 
