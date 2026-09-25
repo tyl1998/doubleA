@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-12 MCP server 所属人（改/删按行判定）+ 探测改用所属人凭据（`mcp_servers.created_by` 从"只作留痕"升为权限判据 ⇒ 改/删 = 注册者 + ADMIN，`shared#canEditMcpServer` 唯一实现、`McpServerItem` 加 `creatorName`/`canEdit`；`POST /:id/test` 与 `GET /:id/tools` 改用**注册者**凭据连上游 —— 原口径"不带任何用户凭据"作废，`tool_cache` 仍是 server 级共享、串用户被结构性排除；`tools/call` 仍用**调用者**凭据；零迁移）',
+    step: 'P0-2-13 P0-2 包验收（阶段二出口验收 R1/R2 —— ⚠️ 纯文档批次：`06` 原文点名的 `verify-mcp-package.mjs` 增补计划**作废**，`backend/scripts/**` 已于 2026-09-24 删除 ⇒ 实际产出 = `README` 新增「阶段二出口验收（人工）」整节（前置六步 / R1·R2 / 三条附加门槛 / 逐行结论表 / 四条边界 / 复位）+ 两段内联假上游：①「需鉴权的假 MCP」（打印收到的 `authorization`，R1 的"凭据自动注入"由间接证据变成上游侧可读读数）② embedding 假上游最小替身；后端代码未改动，仅本标识随批次前进）',
     address,
   })
   logger.info(

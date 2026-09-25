@@ -843,6 +843,136 @@ grep -oE 'ttftMs[": ]+[0-9]+' /tmp/backend.log | grep -oE '[0-9]+$' | sort -n \
 > ⚠️ **走查完请复位**：把 ③ 改掉的 Provider `baseUrl` 指回去（或删掉那个 Provider），种子账号若在走查中被改密，
 > 按「浏览器端测」首节的复位命令重置。
 
+### 阶段二出口验收（人工 · P0-2-13 收尾；`01` §五 阶段二，2 条门槛 + 3 条附加门槛）
+
+> 前面「浏览器端测 · MCP」（含【所属人】组）是**逐批**的端测清单；**这一节是阶段二的收口清单** ——
+> 把 `01` §五 要求的出口流程串成一趟，并补上"**包级才成立**"的三条（跨包串 / **新账号自己走一遍** / 读写投影逐字一致）。
+> ⚠️ **由用户人工执行、智能体不代跑**（`docs/06` §六 第 30 条）⇒ 这里只给"怎么跑 / 看什么"，**不给"已通过"的结论**。
+> 建议**全程同一个浏览器窗口 + 同一个终端**做下来，别中途换。
+> ⚠️ **本批没有产出验收脚本**：`06` 原文点名的 `backend/scripts/verify-mcp-package.mjs` 属"**计划文本里的产出行**"，
+> 而 `backend/scripts/**`（连同假上游夹具）已于 2026-09-24 随用户定案一起删除 ⇒ **验收脚本增补计划作废**，
+> **本节这张清单就是它的人工替身**。
+
+**前置（六步，缺一条后面就会看到"不是 bug 的怪现象"）**
+
+| # | 做什么 | 为什么 |
+|---|--------|--------|
+| ① | `pnpm infra:up && pnpm db:deploy && pnpm db:seed` | 依赖 + 表 + 两个种子账号（记下 admin 的初始密码） |
+| ② | 另开终端跑「手工端测 · 命令行」**㉓-⓪** 那段**内联脚本**（前台常驻），**只抄它的 `LLMURL=`** | R1/R2 需要一个"**会主动要工具的模型**"；⚠️ **真模型不会主动去调一个刚注册的工具**，没有它"提问触发工具"这一步走不到。③ 的授权假上游会替掉它里面那台假 MCP |
+| ③ | ⭐ 再开一个终端跑下面这段「**需鉴权**假 MCP」（前台常驻，抄下 `AUTHMCPURL=`） | R1 的原文是"注册一个**需要 token** 的 server" ⇒ ③ 这台就是它；它的 stdout **打印收到的 `authorization` 头**，那是"凭据真的注入了"的**唯一直接取证** |
+| ④ | 在 `/admin/models` 建一个 Provider 指向 ② 的 `$LLMURL`（Key 填占位串即可，假上游不看鉴权头），再建一个 `CHAT` 模型 | 模型池接口仅 ADMIN ⇒ 用 admin 做 ③④；R1 里"用户 A"可以是 admin 自己 |
+| ⑤ | 起后端（**13000**）与前端（**5174**） | R1/R2 都是浏览器路径（命令见「浏览器端测 · 对话」③④）。**附加① 还要带 `EMBEDDING_*` 三项**（见下面那一小段） |
+| ⑥ | 用 `/admin/users` **建一个全新账号**（MEMBER 即可），并**再开一个浏览器窗口**用另一个身份登录 | 附加② 要的是"**一个新建的账号自己走一遍**"；R2 与附加② **两个身份同时在场**才验得干净 |
+
+```bash
+# ③ 需鉴权的假 MCP server（R1 的"需要 token 的 server"）—— ⚠️ 与 ⑳-⓪ / ㉓-⓪ 一样是**内联**的，
+#    仓库里不再放夹具文件。它**不校验** token（只把收到的 authorization 打印出来），
+#    因为"验证令牌本身"不是本档要证明的事：本档要证明的是"**平台把所属人/调用者那份凭据带出来了**"。
+node --input-type=module -e '
+const http = await import("node:http");
+let n = 0;
+const srv = http.createServer(async (req, res) => {
+  if (req.method !== "POST") { console.log(`[需鉴权MCP] ${req.method}（不计入）`); res.writeHead(200).end(); return; }
+  let body = ""; for await (const c of req) body += c;
+  const msg = body === "" ? null : JSON.parse(body);
+  n += 1;
+  console.log(`[需鉴权MCP] #${n} ${msg?.method ?? "(无 method)"} authorization=${req.headers["authorization"] ?? "(一个都没带)"}`);
+  if (msg === null || msg.id === undefined) { res.writeHead(202).end(); return; }
+  const result =
+    msg.method === "initialize" ? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "auth-mcp", version: "1.0.0" } }
+    : msg.method === "tools/list" ? { tools: [
+        { name: "echo", description: "原样回显传入的 text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] }, annotations: { readOnlyHint: true } },
+        { name: "purge", description: "会改数据（验确认流：先问、后执行）", inputSchema: { type: "object", properties: { target: { type: "string" } } } } ] }
+    : msg.method === "tools/call" ? { content: [ { type: "text", text: msg.params?.name + " <- " + JSON.stringify(msg.params?.arguments ?? {}) } ] }
+    : {};
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+});
+srv.listen(0, "127.0.0.1", () => console.log("AUTHMCPURL=http://127.0.0.1:" + srv.address().port + "/mcp"));
+'
+#  → `AUTHMCPURL=http://127.0.0.1:<port>/mcp`
+#  ⚠️ 记账口径同 ⑳-⓪：一次成功的"连接 + tools/list"固定 **3 条** POST；每次工具调用**额外 +1** 条 `tools/call`。
+#  ⚠️ 模板行要写成 key = `Authorization`、注入位置 = **请求头（HEADER）** —— HEADER 注入里 `key` 就是**头名**
+#     （写成 `token` 只会多出一个没人看的 `token:` 头）。`Authorization` **不在**平台保留头名单里
+#     （保留的是 accept / content-type / content-length / host / mcp-session-id / mcp-protocol-version），可以占。
+```
+
+> 只有当你要跑**附加①**（跨包串）时才需要下面这一段 —— 「浏览器端测 · 对话」①③④ 里引用的
+> `pnpm serve:upstreams` **已随 `backend/scripts/**` 一起删除**（README 里还有三处引用它，见本节末尾的 ⚠️）
+> ⇒ 这里给它的**最小替身**（够让文档走到 `READY`、检索拿得到 query 向量）：
+>
+> ```bash
+> node --input-type=module -e '
+> const http = await import("node:http");
+> const srv = http.createServer(async (req, res) => {
+>   let body = ""; for await (const c of req) body += c;
+>   const p = JSON.parse(body || "{}");
+>   const inputs = Array.isArray(p.input) ? p.input : [p.input];
+>   const vec = (s) => {
+>     const v = new Array(1024).fill(0);
+>     for (const ch of String(s)) v[(ch.codePointAt(0) * 31) % 1024] += 1;
+>     const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
+>     return v.map((x) => x / norm);
+>   };
+>   res.writeHead(200, { "content-type": "application/json" })
+>      .end(JSON.stringify({ object: "list", data: inputs.map((s, i) => ({ object: "embedding", index: i, embedding: vec(s) })) }));
+> });
+> srv.listen(0, "127.0.0.1", () => console.log("EMBEDDINGURL=http://127.0.0.1:" + srv.address().port + "/v1"));
+> '
+> #   → 抄下 `EMBEDDINGURL=`，然后**先带这三个变量起后端、再建知识库**：
+> #     EMBEDDING_MODE=api EMBEDDING_API_URL=<抄到的> EMBEDDING_API_KEY=dev-fake-key \
+> #       EMBEDDING_API_MODEL=<自定义模型名> pnpm dev:backend
+> #   ⚠️ 库里存的是建库那一刻的 `api:<模型名>` 快照 ⇒ 变量必须与之后检索时一致；
+> #      不同值**不报错**，只会让 `citations` 一会儿有一会儿没有（那是 P0-1-20 的**降级路径**，不是 bug）。
+> #   ⚠️ 它是"字符袋"向量（字面重合越多余弦越大）⇒ 只保证"含关键词的块更近"，
+> #      **不含**原夹具的 thinking / deltaDelayMs / semantic 三个开关 ⇒ 走它的对话**看不到思考块**、也看不到流式的"慢"。
+> ```
+
+**R1 / R2 怎么跑 / 看什么**
+
+| # | 门槛（`01` §五 原文） | 在哪跑（本节不重复步骤，指向既有段） | 看什么 |
+|---|---------------------|--------------------------------|--------|
+| R1 | 注册一个**需要 token** 的 server → 用户 A 填凭据 → 提问触发工具 → **凭据自动注入** → **确认卡** → 结果返回 | 「浏览器端测 · MCP」②（注册，endpoint 填 `$AUTHMCPURL`，模板加一行 `Authorization` / **HEADER**）→ ③（点「测试」+「工具数」）→ ④（**只填那一个 key**，值随便如 `Bearer dev-owner-token`）→ ⑦⑧（建/编智能体并勾该 server）→ ⑨（提问触发工具）→ ⑩⑪⑫（危险工具 `purge`：弹确认 → 先取消、再确认） | ① ③ 的终端里出现 `authorization=Bearer dev-owner-token` —— 这就是"**凭据自动注入**"（测试/列表走**所属人**凭据，见【所属人】组）；② 工具卡 **RUNNING → SUCCESS**、展开能看到入参出参摘要，且上游那台**恰好 +1 条 `tools/call`**；③ 危险工具 `purge` **先弹确认卡**：点「取消」⇒ 工具卡"用户已取消（未执行）"且**这一轮继续给出正文**，再触发一次点「确认」⇒ 上游计数**再 +1** |
+| R2 | 用户 B **未填**凭据 → 工具标记**「需配置」**（且**不发起上游调用**） | 同节的 ⑦（建/编智能体时看 MCP 多选框）+ ④（换成 B 的身份看凭据页） | ⚠️ **两个口径都要看到，别用一个含糊的"标记了"混过去**：① **server 级** = 编辑智能体时该勾选项旁的「未配置凭据」**红点** + 「去配置凭据」链接（含义："我没配这个 server"）；② **调用级** = B 在对话里触发同一台 server 的工具 ⇒ 这一轮以 **424 `NEED_CREDENTIAL`** 收口、工具卡带「去配置凭据」（含义："这一轮工具失败、原因是需配置"）；③ 全程 **③ 的终端里一行都不该多**（= 一个上游请求都没发） |
+
+**三条"包级才成立"的附加门槛**（`docs/06` P0-2-13 验收门槛原文）
+
+| # | 门槛 | 怎么验 | 看什么 |
+|---|------|--------|--------|
+| ① | **跨包串一遍**（P0-1 的 A~F 链路 + P0-2 的 MCP 链路） | 用**同一个** ChatBot 走"知识库 RAG + MCP 工具"两件事：建库传文档（「知识库」㊳㊴㊵，⚠️ 前置要 up）⇒ 给同一个智能体**同时**绑该库**与**那台 server ⇒ 提问 | 同一轮里**引用卡与工具卡都在**：回答既引用了你传的文档、又调用了工具 —— 两条链路共存于**同一条 SSE 流**（前两节是**各自**验的，串起来才成立） |
+| ② | **一个新建的账号自己走一遍** | 「管理页」②③④ 建新号 → 首登改密 → **用它自己**走一遍 R1 的 ②③④⑨：注册 server / 测试 / 填**自己**的凭据 / 触发工具 | 新号**不依赖 admin 的任何既存数据**也能走通；⚠️ 守的是"别顺手加 `requireAdmin`"（本仓**已踩过两次**：五档各自全绿也不代表新账号能走通） |
+| ③ | **写入端与读取端的投影逐字对得上** | 附加① 那一轮**F5 刷新**，比对刷新前后的工具卡 | 流里的工具卡（`tool_call` 帧）与刷新后（走 `GET /messages` 的 `content.tool_calls`）**同一形状**：`callId` / `toolName` / `serverName` / `serverId` / `status` / `output` 逐字一致；⚠️ 两处**刻意**的差异只有一对：`inputSummary`（截断 200 的**摘要**）只在上流那份、`arguments`（**完整入参**）只在落库那份 —— 见「浏览器端测 · MCP」⑭ |
+
+**逐行结论（自己填；⚠️ "部分完成 / 等价形态"**单列**、别混进 ✅）**
+
+| 门槛 | 结论 | 备注 / 取证（哪台终端、哪一行读数） |
+|------|------|-----------------------------------|
+| R1 | ☐ | |
+| R2 | ☐ | |
+| 附加① 跨包串 | ☐ | |
+| 附加② 新账号 | ☐ | |
+| 附加③ 读写投影 | ☐ | |
+
+**四条"最容易误判成 bug"的边界**
+
+1. **"凭据注入"本档只能靠"上游打印出来的 `authorization` + 调用没被挡下"取证** —— ③ 那台假上游**不校验** token。要看"**真 401 场景**下所属人凭据是否够用"，走「浏览器端测 · MCP」**【所属人】组 ⑤⑥⑦**（那条用的是本机**真的要求鉴权**的上游）。
+2. **R2 看不到确认卡** —— 缺凭据时是**在取凭据那一步就 424 收口**的，根本走不到危险判定 ⇒ 这是**正确行为**。
+3. **`source=SERVER` 的确认卡（MCP 反向 `elicitation/create`）本档验不到** —— 与 ㉓/㉔ 同一条既有边界：假上游不发 elicitation。
+4. **确认卡只在"平台判为危险"时出现** —— 本档里 `purge` **什么注解都不声明** ⇒ 判危险、先问后执行；`echo` 声明了 `readOnlyHint:true` ⇒ 直接执行、**不弹卡**。把 ③ 那段里的 `annotations` 删掉，整条链会变成"每调一次先弹一次确认"（那是 `docs/02` §9.9 真值表的**另一种输入**，不是 bug）。
+
+> **⚠️ 这一节证明什么、不证明什么**：本批（P0-2-13）**没有产出验收脚本**（见开头），
+> 也没有代跑浏览器 / 命令行 —— 智能体侧只做了三件**确定性**的事：把 `docs/06` 的 P0-2-13 段收口（含"脚本增补计划作废"）、
+> 把本节与两份版本记录写出来、把启动信封 `step` 推到本批（`pnpm check:batch` 一致）。
+> 判据侧的旁证仍是「浏览器端测 · MCP」里点名的**无依赖纯逻辑档** `pnpm verify:mcp-ui`（**53 项**，
+> 跑的是纯函数、**不起浏览器、不起后端、不经 vite**）与「手工端测 · 命令行」㉓/㉔ 的**内联假上游**
+> ⇒ 它们只证明"**契约与配置接对了**"，**不等于**"阶段二出口验收通过"。两条都成立才算真的过（`docs/06` §六 第 30 条）。
+> ⚠️ **走查完请复位**：②③（以及附加①那台 embedding）起的假上游 Ctrl-C 收工；④ 建的 Provider / 模型、
+> ② 注册的 server、⑥ 建的新号、附加① 建的知识库与文档 —— 想留就留、想清就按各页的删除入口清
+> （⚠️ **删 server 会连带删掉所有人的凭据**，`ON DELETE CASCADE`）。
+> ⚠️ **顺带发现的文档缺口（本批未修）**：`pnpm serve:upstreams` 在本文档里还有 **3 处**引用
+> （「浏览器端测 · 对话」①、「浏览器端测 · 知识库」前置、「阶段一出口验收」前置 ②），而它
+> **已随 `backend/scripts/**` 删除** ⇒ 那三处现在敲下去是 `Command not found`。本节给了它的**最小替身**
+> 供本档使用；**要不要把那三处一并改掉，留给你定**（本批不动它们，免得把"阶段一收口清单"一起改了）。
+
 ### 手工端测 · 命令行（⭐ 第一个可端测里程碑：P0-1-9 起）
 
 **前置**：`pnpm infra:up && pnpm db:deploy && pnpm db:seed`（拿到 admin 的初始密码），然后
@@ -2401,3 +2531,4 @@ doubuleA/
 | 2026-09-24 | — | **P0-2-10 完成（P0-2 工具闭环 10/12）：elicitation 确认流（`confirm` 事件挂起 + `POST /:id/confirm` 应答 + 120s 超时按取消）** —— **手工跑法见「手工端测 · 命令行」㉔**（承接 ㉓ 的同一台内联假上游，不用重起；`purge` 工具**刻意不声明 `annotations`** 故按真值表判为危险。⚠️ ㉓ 里 `echo`/`boom` 那两行 `annotations: { readOnlyHint: true }` 是**本批加的**、不是装饰：**删掉它们，㉓ 整节会变成"每调一次工具先弹一次确认"**）。**改动（零新增依赖、零新增环境变量、零 `schema.prisma` 改动）**：`shared/src/sse.ts`（`CONFIRM_SOURCES = ['PLATFORM','SERVER']` + `sseConfirmPayloadSchema` 增量 **`source` / `expiresAt`** + 新增 `confirmRequestBodySchema` 与 `confirmConversationResultSchema`）、`shared/src/conversation.ts`（活跃流快照加**第四个字段** `pendingConfirmId` —— `EMPTY_ACTIVE_SNAPSHOT` / `parseActiveSnapshot` / zod schema **三处一起改**）、`backend/src/infra/redis.ts`（`chatConfirmKey` = `chat.confirm:{id}` + `CHAT_CONFIRM_TTL_SEC = 60`；**值是结构化的**而不是布尔）、`backend/src/orchestrator/sse.ts`（**核心**：`ConfirmQuestion` / `ConfirmDecision`（`CONFIRMED` 与 `REJECTED` 与 `TIMEOUT`）/ `parseConfirmAnswer` / `clearConfirmSignal` / `answerConfirm` + `SseChannel#awaitConfirm` 与 `#waitForConfirm` + `ChatProducerInput` 多一个 `awaitConfirm` 成员；`stopPollIntervalMs` 改名 `signalPollIntervalMs` 两类信号共用）、`backend/src/orchestrator/chatContext.ts`（`TOOL_CONFIRM_REJECTED_OUTPUT` / `TOOL_CONFIRM_TIMEOUT_OUTPUT` 两个常量，**刻意分开**）、`backend/src/services/mcpCall.service.ts`（`resolveMcpCallContext` / `executeMcpToolCall` 透传 `onElicit`）、`backend/src/orchestrator/chatBot.ts`（**挂起点就插在"取凭据 / 发 `RUNNING` 卡之前"** —— 即 P0-2-9 留的那处接回点；另加 `onElicit` 处理器把三个结局映射成 `accept` / `decline` / `cancel`）、`backend/src/routes/conversations.ts`（**第九条路由**，`02` §4.5 那张表至此无缺口）、`backend/src/index.ts`（`step`）。**八条最值得记的**：① **两条来源、一个原语** —— 平台强制确认（`PLATFORM`）与服务端反向 elicitation（`SERVER`）走**同一个** `confirm` 事件、同一个应答端点、同一个 `awaitConfirm`，差别只在 payload 的 `source`（决定前端选哪句文案）；② ⚠️ **应答必须带 `confirmId`**（键里存 `{confirmId, accepted}`、消费时按 id 匹配、读到即删、新一次等待开始前**再清一次**）—— 否则上一轮的迟到点击会被下一轮当成答案消费掉，症状是"**确认卡一闪而过**"且**零报错**；③ **三种结局必须分得开** ——"用户已取消"与"等待确认超时"回填**不同**文案（前者是用户的决定、后者是没人应答），合成一句话用户就读不出自己那一按到底生效了没有；④ **取消与超时都不让这一轮失败**（回填一条"未执行"的工具结果、流程继续 —— `01` §3.6 原文），**唯一的例外是中断**（`awaitConfirm` 抛 `ChatStoppedError`，交回"本轮被中断"的收尾）；⑤ **被拦下的调用不发 `RUNNING` 卡**（那张卡的含义是"已经在跑"，而它其实没跑过 ⇒ 只发最终那张 ERROR 卡，前端按 `callId` upsert）；⑥ **超时与心跳是两个独立机制** ⇒ 挂起期间 `ping` 照发、锁跟着心跳续期（**没有**第二条续期路径 —— 另起一条迟早与心跳那条打架）；⑦ **`applied:false` 是 200 不是 4xx**（用户看到卡片没消失就会再点一次，那是常态），且**不为"会话只读"单开 409**（只读会话**必定**没有活跃流 ⇒ 已被同一条判据覆盖，单开会让"流中途 Agent 被软删、用户正在看确认卡"误报）；⑧ ⚠️ **本批实际写错一次（`typecheck` 抓到）** —— `streamChatReply` 里 `acquireConversationLock` 的初始快照是**逐字段手写**的，加第四个字段时它**少一个键**，而后果是"**所有 `/confirm` 应答都变成 `applied:false`**"（静默到只有类型检查能抓）⇒ 改成 `{ ...EMPTY_ACTIVE_SNAPSHOT, startedAt }`，从根上断掉这一类。**已知边界**：`annotations` **服务端自报、不可信**（声明 `readOnlyHint: true` 即可绕过 ⇒ 平台强制名单属 **P1**）；假上游**不发** elicitation ⇒ `SERVER` 那一路在 ㉔ 里验不到（要真上游；契约与三条映射见 `docs/02` §9.10）。**取证方式**：⚠️ **本批无自动化验收档**（脚本与夹具 2026-09-24 已删；浏览器档 = **P0-2-11 之后**）；智能体侧只跑了 `pnpm -r typecheck`（三包全绿，**且首跑抓到上面第 ⑧ 条那个静默 bug**）与 `pnpm check:batch`；**未跑构建/回归/浏览器，本批不是端测里程碑**。回写：`docs/02` 新增 **§9.10** + §4.5 / §5.1 / §5.2 / §六 第 4 步 / §9.9 的落地标记同步；`docs/06` 进度 **10/12**。**下一步 = P0-2-11**（前端确认卡 + `/mcp` 页面 —— **它才是浏览器可端测里程碑**） |
 | 2026-09-24 | — | **P0-2-11 完成（P0-2 工具闭环 11/12）· 🎯 阶段二唯一的「浏览器端测」里程碑达成**：MCP 管理页 + 我的凭据页 + 确认卡接真数据源 + Agent 编辑页 MCP 多选接回 + 工具失败卡「去配置」跳转。**手工跑法见新增的本文「浏览器端测 · MCP」一节（①~⑮）** —— ⚠️ 它**前置三样**：依赖+迁移+两个进程、一台可注册的 MCP server（复用「手工端测 · 命令行」㉒/㉓ 的**内联假上游**）、**一个会主动要工具的假 LLM**（真模型不会去调一个刚注册的工具 ⇒ 少了它，"对话里触发工具"这一段走不到）。**新增 8 个文件**：`frontend/src/api/mcp.ts`（两条 query key 树 + 六条端点 hooks + `confirmConversation`；服务器列表与凭据清单**刻意都不分页**）、`frontend/src/pages/mcp/mcpModel.ts`（**零依赖纯逻辑 515 行**：server 表单 / 模板编辑器 / 凭据表单 / 列表读数 / 定位目标）、`frontend/src/features/chat/confirmModel.ts`（确认卡倒计时与文案 —— **放 `features/` 而不是 `pages/` 是为了不造出反向依赖**）、`pages/mcp/` 的四个组件页、`frontend/scripts/verify-mcp-ui.mjs`（**53 项**，A~I 九组）。**改动 9 处**：`shared/src/conversation.ts`（**本批唯一契约增量 `toolCallRecordSchema.serverId?`**）、`backend/src/orchestrator/chatBot.ts`（`base` 按**三态**带上 `serverId`）、`app/{App,nav,paths}.ts`（两条占位路由与两条 `batch` 台账一起删 —— **台账不删会变成"哪些页还没做"的错误答案**）、`features/chat/{ConfirmCard,ToolCard,messageModel,roundReducer,ChatInput}.tsx`、`stores/chatStream.ts`（新增 **`clearConfirm()`**）、`pages/chat/ChatPage.tsx`、`pages/agents/{AgentFormPage,agentModel}.ts`（MCP 多选接回）、`styles/app.css`、根/前端 `package.json`（`verify:mcp-ui`）。**零新增依赖、零新增环境变量、零 `schema.prisma` 改动、零后端路由改动**。**六条最值得记的**：① ⚠️ **`serverId` 是"工具名反推不出来"才必须加的** —— `serverName` 可重名、`toolName` 里的 slug **刻意不唯一**（同 `mcp.ts` 文件头 ③）⇒ 反推会指到别的 server，症状是"点了去配置、落在另一台 server 的分组上"；且因 `sseToolCallPayloadSchema = toolCallRecordSchema.omit({arguments:true})` 它是**派生**的，这个字段自动同时出现在落库那份与上流那份上，**别顺手做成必填**（历史行里没有它）。② ⚠️ **`StreamRound.confirm` 是"类型比事实窄"**（只声明三个键、payload 有五个）⇒ 补齐 `source`/`expiresAt`；倒计时**只读 `expiresAt`**、到点停在「已超时」+ 两键禁用、**卡不自己撤**（撤卡的判据在服务端）。③ ⚠️ **"收卡"没有服务端事件**（答复走独立于流的 `/confirm`，流里那个提问已被消费）⇒ store 上新增显式动作 `clearConfirm()`；不做则症状是**确认卡一闪而过之后又回来**。④ **模板编辑器不重写校验**：直接调 `shared#validateCredentialSchema`（四条语义规则后端已有一份），前端只把 `path[index,'key']` 还原成"哪一行哪一列"；⚠️ 写断言时踩过一次 —— 拿 `Authorization` 当"撞保留头"的夹具，而它**既不在** `MCP_RESERVED_HEADER_NAMES`、**也是**合法头名 ⇒ 什么都不报（真夹具是 `Accept` 或含空格的 `X-User Token`）。⑤ **"没改就不发"用集合语义判等**（`diffCredentialSchema`，不是 `JSON.stringify`）—— 换两行顺序或只改 `label` 都不算改动，否则会发一次无意义的 `PATCH` 并弹一条本不该有的"影响了 N 份凭据"。⑥ **坑预判 1 点名的五处，实际只有一处还需要动手**：`assertComponentRefsBindable` 的 MCP 分支**早在 P0-2-2 就翻了**；`verify:agents` / `verify:agent-package` / `verify-app.mjs` **三个脚本 2026-09-24 已随 `backend/scripts/**` 删除** ⇒ 那几处断言**无从翻转**（后者还先被 P0-2-10 作废）；真正动手的只有 `AgentFormPage` 的 MCP 多选。**取证方式**：⚠️ **浏览器那条路由人工走**（本文「浏览器端测 · MCP」①~⑮，**尚未取证**、是 P0-2-12 的前置）；智能体侧只跑了 `pnpm verify:mcp-ui`（**53/53**）与 `pnpm -r typecheck`（**三包全绿**；⚠️ 首跑抓到 4 处编译错，都是"搬文件 / 改签名之后的尾巴"：`ConfirmCard` 还从 `pages/mcp/` import 三个函数、`mcpModel` 残留未用的 `ConfirmSource`、`removeTemplateRow` 的 `readonly` 出参与可变草稿对不上）。⚠️ **未跑构建/浏览器/真后端** ⇒ 只证明**契约与接线**对，**不证明界面点得动**。**顺带订正一处 README 自身的不准确**：本节上面那句"现在敲任何一个 `verify:*` 都会 `Command not found`"只对**后端**那批成立 —— `frontend/scripts/**` 的四档（`chat-sse` / `knowledge-ui` / `admin-ui` / **`mcp-ui`**）**还在且可跑**，但按用户定案「验收一律人工端测」⇒ **存在 ≠ 要跑**。回写：`docs/03` §二（十条路由全部落地、**删掉** P0-2-10 那条"确认卡未接"告警）·§4.1·§4.2·§4.4·§4.5·§五·§六·§八；`docs/02` §5.1 的 `tool_call` 行补 `serverId?` + §9.3 新增"为什么只靠 `errorCode` 还不够" + §十四；`docs/06` 进度 **11/12** + §七 第 7 行。**下一步 = P0-2-12**（P0-2 包验收 R1/R2 —— ⚠️ **它要等你先把浏览器那条路走一遍**） ⚠️ **本行的编号于 2026-09-24 顺延**：用户当天提出"MCP server 加所属人"的新需求，它插在包验收之前 ⇒ 新需求占 `P0-2-12`、**包验收改称 `P0-2-13`**；下一行即新需求那一批 |
 | 2026-09-24 | — | **P0-2-12 完成（P0-2 工具闭环 12/13）：MCP server 所属人（改/删按行判定）+ 探测改用所属人凭据** —— 用户 2026-09-24 提案「这个 MCP 加一个所属人，测试的时候使用所属人的，其他的人不能编辑。但可以调用，调用的人使用自己的凭据」，三条判据全部落地。**手工跑法见本文「浏览器端测 · MCP」的【所属人】组（①~⑦）** 与「手工端测 · 命令行」**㉑-k**。⚠️ **这不是新功能、是一次口径收窄**（原文明确写着"这族权限**刻意**不收窄"）⇒ 严格执行"**先 `01` → 再 `02`/`06` → 最后代码**"，四份文档先改口径再动代码。**改动 13 个文件、487+/148-，零新增依赖、零新增环境变量、⚠️ **零 `schema.prisma` 迁移****（`mcp_servers.created_by` 列 **P0-2-2 就存在**，本批**只改语义 + 改注释** —— 这是"当年那个'多余的列'救了今天"的一次，反过来也提醒**列上的注释也是一种契约**）。**`shared/src/mcp.ts`**：新增 **`canEditMcpServer(server, viewer)` 唯一判据**（与 `canEditAgent` 逐字同源，但**刻意少了 `deletedAt` 那一半** —— `mcp_servers` 是**硬删**、没有"软删后还能读到一行"的中间态）+ `mcpServerItemSchema` 加 **`creatorName`**（昵称优先、回落用户名）与 **`canEdit`**（**服务端现算**的非表列字段）。**`backend/src/services/mcpServer.service.ts`**（最大一块）：`McpViewer` 加 **必填 `role: UserRole`**（少带它**编译期就过不去**——故意的）；`MCP_SERVER_SELECT` 加 `creator:{select:{username,nickname}}`（**只取这两列**，不写 `creator:true`）；`toItem(row, viewer)` 因此多一个参数、`listMcpServers` 跟着多 `viewer`；`updateMcpServer` / `removeMcpServer` 各加 **403**（**顺序 404 → 403 → 409**，403 排在 409 前是因为**那条 409 的文案本身就是信息泄露面**：无权限的人不该从"被几个智能体绑着"读出任何信息）；**`probeServer` 签名扩成 `{…,credentialSchema,createdBy}`**，内部 `decryptMyCredentialValues(id, createdBy)` ⇒ `buildCredentialInjection` ⇒ `createCredentialFetch(injection)` 交给 `McpClient`，明文经 `secrets` **只用于错误消息脱敏**（日志只记 `missingKeys` 与条数）；**缺必填凭据 ⇒ 提前 return `{ok:false,error}`、一个上游请求都不发**；`refreshServerTools`（建 server 时的 best-effort 探测）签名同步扩两个字段（漏改一处就是编译错）。**`backend/src/routes/mcpServers.ts`**：`viewerOf` 从 `{userId}` 变 `{userId, role}`；三条路由传 `viewerOf(request)`；⚠️ **`POST /:id/test` 与 `GET /:id/tools` 一行权限代码都没加 —— 它们是"使用"不是编辑**，收窄它们只会造出"**server 建完就没人能测了**"（注册者离职 ⇒ 一台能用的 server 永远显示不了工具数）。**`backend/src/mcp/errors.ts`**：`tools/list` 撞 401/403 的文案**换主语**（"本阶段做不到、去配也没用" → "**请让所属人去配**"）—— ⚠️ 当前登录的人自己配了**不影响**这条路径。**`frontend/`**：列表页新增**「所属人」列**、操作列改 `server.canEdit ? (编辑+删除) : <span>无编辑权限</span>`、顶部 Alert 改写、`api/mcp.ts` 与两个页面的文件头同步。**六条最值得记的**：① ⚠️⚠️ **`canEdit` 不许前端自己算** —— 前端若只认 `createdBy === 我`，就把"**ADMIN 也能改**"这半条在界面上抹掉了，而服务端 403 判据把他算成有权限 ⇒ 症状是"**管理员没有编辑入口**"，两边对不上且**只在管理员账号下复现**（同 `AgentItem.canEdit` / `modelAvailable`）；② ⚠️ **"用注册者凭据"能解掉 P0-2-5 当年的反对理由** —— 原文反对带凭据是因为"工具列表会依赖**谁先点过测试**"（**串用户**），那个顾虑针对的是"**发起人**凭据"；换成**注册者**后主语**唯一确定**，顾虑被结构性排除，同时解掉一个**产品级缺口**："要求鉴权的 server（真实 MCP 生态里是绝大多数）一律 401 ⇒ `tool_cache` 恒空 ⇒ 下发给模型的工具数恒 0 ⇒ **对话里永远触发不了工具**"；③ **"测试/列表看所属人，调用看自己"必须一起读** —— 只说前一句会让用户把凭据填到错的人名下；④ ⚠️ **缺必填凭据时不发请求**（与调用路径"发请求之前拦 424"同判据）—— 否则用户拿到一句 401，而那句话会把他引向"我的令牌错了"（实际是**根本没带令牌**）；`status` 仍落 `ERROR`、`tool_cache` 一字不动；⑤ ⚠️ **改凭据不清工具缓存**（失效判据仍只认 `endpoint_url` / `auth_type` / `credential_schema` 三列）—— 否则"**任意使用者**改自己那份凭据"都会触发一台**共享** server 的缓存失效，多写者互相踩；⑥ **建完第一次探测必然 `ok:false`**（所属人还没填）—— **预期行为**，不是 bug。**取证方式**：⚠️ **本批无自动化验收档、也没有跑任何 `verify`**（用户 2026-09-24 定案：新契约不自证、收尾不跑 lint/typecheck/build/verify、不做条目数交叉核对）⇒ `frontend/scripts/verify-mcp-ui.mjs`（**53 项，未随本批改动**）**没有增补也没跑**，`canEditMcpServer` 的真值表与两个新字段的取证**落在人工端测**（【所属人】组 ①~④ / ⑦）。智能体侧只跑了 **一次 `pnpm -r typecheck`** —— 这是 §七 写明的**唯一例外**（**跨文件接线批次**：契约加两个字段 + 五个函数签名变更 + `McpViewer` 加必填字段），**三包全绿、零编译错**；收尾 `pnpm check:batch` 一致。⚠️ **未跑构建/回归/浏览器/真后端** ⇒ 只证明**接线接对了**，**不证明权限真的拦得住**（403 是纯服务层逻辑，正是 `typecheck` 够不到的地方）。**README 增量**：⑳ 的文件头口径改写 + ⑳-a 的投影说明（`creatorName`/`canEdit` + 首次 `test.ok` 恒 false）、㉑ 的文件头与该节"$COOKIE 就是 admin"的澄清、**㉑-k（⭐ 403 / 404 / 200 与"B 点测试仍用 A 的凭据"）**、㉒ 与「已知边界」多处的口径订正、**新增【所属人】组 ①~⑦**（两条独立链 + 三条已知边界）。**回写**：`docs/01` 决策 22/23 + §3.6 两行；`docs/02` §三③ · §4.7① · §9.3 · §9.6① · §六；`docs/06` 本批新增节（含 13 条落地要点 + 逐条验收门槛 + 取证方式）+ §4.0 / §4.1（包验收行顺延）+ **§4.2 整节重写**（三族表 → **四族表** + 三点理由）+ §4.4 追加"更强取证"段 + 包验收节顺延为 `P0-2-13` + §四 进度 `11/13` → **`12/13`**；`backend/src/index.ts` 信封 `step`。**⚠️ P0-2 只剩最后一步**：**P0-2-13 包验收**（R1/R2）—— 它**要等你先把「浏览器端测 · MCP」①~⑮ 与【所属人】组走一遍** |
+| 2026-09-25 | — | **P0-2-13 完成（P0-2 工具闭环 13/13 —— 🎯 P0-2 整包收口）**：把阶段二的 2 条出口验收（`01` §五）收口成一份**可照抄的人工清单**（手法与 P0-1-38 同款）。⚠️ **实际形态与原计划不同、已如实改写**：`06` 原文点名的 `backend/scripts/verify-mcp-package.mjs` 属"**计划文本里的产出行**"，而 `backend/scripts/**`（含全部 `verify-*.mjs` 与假上游夹具）已于 2026-09-24 随用户定案删除 ⇒ **脚本增补计划作废**（`06` §4.1 的 ③ 端到端档同步标注作废）。⇒ 产出 = **本文新增「阶段二出口验收（人工 · P0-2-13 收尾）」整节**：前置六步 → **R1**（注册需 token 的 server → A 填凭据 → 提问触发工具 → 凭据自动注入 → 确认卡 → 结果返回）/ **R2**（B 未填凭据 → 工具标记「需配置」且不发起上游调用）→ **三条附加门槛**（跨包串一遍 / 一个新账号自己走一遍 / 写入端与读取端投影逐字一致）→ **逐行结论表**（"部分完成"单列、不混进 ✅）→ 四条边界 → 复位。同节给两段**内联假上游**（不落仓库文件）：① **「需鉴权的假 MCP」**（stdout **打印收到的 `authorization`** ⇒ R1 的"凭据自动注入"从"调用没被挡下"变成**上游侧可读读数**；⚠️ 刻意不校验 token，真 401 场景仍归【所属人】组）；② **embedding 假上游最小替身**（顶掉已删除的 `pnpm serve:upstreams`，供附加① 的跨包串）。**四条最值得记的**：① ⚠️ **模板行的 `key` 必须写 `Authorization`** —— HEADER 注入里 `key` 就是**头名**，写成 `token` 只会多一个没人看的头、而"注入成功"看起来一模一样（零症状）；`Authorization` 不在平台保留头名单里 ⇒ 可占；② ⚠️ **R2 的"需配置"是两个口径**（server 级红点 / 调用级 **424 `NEED_CREDENTIAL`** + 工具卡"去配置凭据"），**都要看、别用一个含糊的"标记了"混过去**，并各配一条"上游零请求"的旁证；③ ⚠️ **"读写投影一致"必须在真的调用过工具的那一轮上比** —— 没调过工具时 `tool_calls` 本就是空数组，"对得上"**恒真**；④ ⚠️ **顺带发现一处文档缺口（本批未修）**：`pnpm serve:upstreams` 在本文档里仍有 **3 处**引用（「浏览器端测 · 对话」① / 「知识库」前置 / 「阶段一出口验收」前置 ②），而它**已随 `backend/scripts/**` 删除** ⇒ 那三处现在敲下去是 `Command not found`；新增那一节给了最小替身，**要不要把那 3 处一并改掉留给用户定**。**取证方式**：⚠️ **由用户人工执行**（本文那一节）；智能体侧**没跑任何验收/回归/浏览器，也没跑 lint/typecheck/build**，只跑了 `pnpm check:batch`（一致）。**⚠️ 这一节只给"怎么跑、看什么"，不给"已通过"的结论**。**下一步 = P0-3**（任务闭环 · 场景 B；⚠️ 依赖两份尚未撰写的子方案 `P0-3-0a` 沙箱与引擎集成 / `P0-3-0b` 文件预览）。 |
