@@ -1,0 +1,78 @@
+/**
+ * 沙箱镜像的**版本唯一事实来源**（P0-3-1；依据 `docs/子方案/沙箱与引擎集成.md` §五）
+ *
+ * ── 为什么要有这个文件 ────────────────────────────────────────────────
+ * 三层镜像里有两层是**构建期预烘焙**的（base / toolkit，workspace 不是镜像、是每会话的卷）：
+ *   · base   = Node + **pin 版本 pi** + 桥扩展 + 非 root 用户 + 只读层里的 pi 配置
+ *   · toolkit = 验收与常见任务所需的**全部**依赖（python3/pandas/openpyxl/jq/git/rg…）
+ * 而 `子方案③` §五 2 把「运行期零安装」定成了硬约束（egress 白名单只放行模型池 ⇒ 容器内
+ * `pip install` / `npm i` **必然失败**）。⇒ 版本与标签必须有一个能被机器读到的单一来源，
+ * 否则镜像标签会散落在 Dockerfile 的 ARG 默认值、`.env` 的 `SANDBOX_IMAGE*`、脚本的 `-t`
+ * 三处，改一处漏两处的症状是「构建成功了，运行时起的还是上一版镜像」——不报错、只是行为不对。
+ *
+ * 消费方：
+ *   ① `infra/scripts/sandbox-build.mjs`（唯一构建入口，负责把这些值变成 `--build-arg` 与 `-t`）
+ *   ② `backend/src/config.ts` 的 `SANDBOX_IMAGE` / `SANDBOX_IMAGE_BASE` 由 `infra/.env` 提供
+ *      （脚本跑完会把「该写哪两行」直接打印出来，照抄即可）
+ *
+ * ⚠️ **改内容就要改版本号**（§五 2：`新增依赖 = 重建 toolkit 层 + 改版本号，不是运行时补`）。
+ *    两条版本线刻意分开：动 pi 版本只重建 base，加一个 python 库只重建 toolkit。
+ */
+
+/**
+ * base 层的 Node 基线。
+ *
+ * 为什么是 22 而不是 24：pi 的 `engines` 是 `>=22.19.0`，而本仓后端也跑在 Node 22 线
+ * ⇒ 沙箱与后端同一个大版本，排障时不必在两套 Node 语义之间切换。
+ * （上游 `containerization.md` 的示例用 `node:24-bookworm-slim`，那是它的默认，不是我们的约束。）
+ *
+ * ⚠️ 这是**「大版本线」而非「摘要级」pin** —— 想做到逐字节可复现，把这里换成
+ *    `node:22-bookworm-slim@sha256:<digest>`；当前刻意不做，因为那会让每次安全基线更新
+ *    都变成一次手改（收益与维护成本见 §五 1 的取舍）。
+ */
+export const NODE_IMAGE = 'node:22-bookworm-slim'
+
+/** pi 的 npm 包名（上游 `bin` = `pi`，`license` = MIT，见 `子方案③` §三 1） */
+export const PI_PACKAGE = '@earendil-works/pi-coding-agent'
+
+/**
+ * **pin 的 pi 版本**。这是整个 base 层里最要紧的一个数字：
+ * 上游 `RPC 协议` 是官方文档化的（`docs/rpc.md`），但**没有兼容性承诺** ⇒ 版本漂移的表现会是
+ * 「桥收到的事件名变了」这类**静默**故障（例如 `agent_settled` 缺席 ⇒ 这一轮永远不落库）。
+ */
+export const PI_VERSION = '0.87.1'
+
+/**
+ * npm registry。
+ *
+ * ⚠️ **本机实测（P0-3-1）：容器直连 `registry.npmjs.org` 不通** —— 症状很有欺骗性：
+ *   容器能通 HTTPS（`https://deb.debian.org`、`https://www.baidu.com` 都是 200），**只有 npmjs 被拦**
+ *   （`Client network socket disconnected before secure TLS connection was established`）。
+ *   而 `apt-get update` 走的是**明文 HTTP**、照样成功 ⇒ 只看"apt 能装包"会得出"网络没问题"的结论，
+ *   然后看着 `npm install` **挂十几分钟没有一行输出**（npm 默认 `fetch-timeout` 是 5 分钟/次、
+ *   还会重试），很容易误判成"容器坏了"或"pi 包很大"。
+ *
+ * ⇒ 本机构建要显式换源（二选一）：
+ *     pnpm sandbox:build -- --registry https://registry.npmmirror.com
+ *     SANDBOX_NPM_REGISTRY=https://registry.npmmirror.com pnpm sandbox:build
+ *
+ * 默认值**仍然写官方的 npmjs**（它是唯一"在任何环境都正确"的默认，CI / 海外环境直接用）；
+ * 这属于**本机网络实况**，不该被烤进镜像的默认值里。base/Dockerfile 里另配了
+ * `--fetch-timeout` / `--fetch-retries`，好让"源不通"在 1~3 分钟内**失败**而不是挂着。
+ */
+export const DEFAULT_NPM_REGISTRY = 'https://registry.npmjs.org'
+
+export const BASE_IMAGE_NAME = 'doubulea/sandbox-base'
+export const TOOLKIT_IMAGE_NAME = 'doubulea/sandbox-toolkit'
+
+/** base 层内容版本（改 Node 基线 / pi 版本 / 桥扩展 / pi 配置 时 +1） */
+export const BASE_LAYER_VERSION = '1'
+
+/** toolkit 层内容版本（加一个 python 包 / CLI 时 +1） */
+export const TOOLKIT_LAYER_VERSION = '1'
+
+/** `doubulea/sandbox-base:<ver>` —— toolkit 的 `FROM` 与 `.env` 的 `SANDBOX_IMAGE_BASE` 都用它 */
+export const baseImageRef = () => `${BASE_IMAGE_NAME}:${BASE_LAYER_VERSION}`
+
+/** `doubulea/sandbox-toolkit:<ver>` —— `.env` 的 `SANDBOX_IMAGE`，即**最终镜像**（§五 1） */
+export const toolkitImageRef = () => `${TOOLKIT_IMAGE_NAME}:${TOOLKIT_LAYER_VERSION}`

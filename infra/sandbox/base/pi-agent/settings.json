@@ -1,0 +1,5 @@
+{
+  "sessionDir": "/tmp/pi-sessions",
+  "defaultProjectTrust": "never",
+  "enableInstallTelemetry": false
+}

@@ -247,6 +247,24 @@ const intVar = (label: string, fallback: number, options: { min?: number; max?: 
   )
 }
 
+/**
+ * 正浮点数变量：未设置/空串 → 默认值。
+ * 与 `intVar` 的唯一区别是**不要求整数** —— 沙箱的 CPU 限额就是「1.5 核」这种量。
+ * （别为了用它把 `intVar` 放宽成 `number`：`CHUNK_SIZE_DEFAULT` 那类"必须是整数"的口径
+ *  正是靠 `.int()` 守着的。）
+ */
+const floatVar = (label: string, fallback: number, options: { min?: number; max?: number } = {}) => {
+  const min = options.min ?? 0.01
+  const max = options.max ?? Number.MAX_SAFE_INTEGER
+  return defaultedVar(
+    z
+      .coerce.number({ invalid_type_error: `${label} 必须是数字` })
+      .min(min, `${label} 不能小于 ${min}`)
+      .max(max, `${label} 不能大于 ${max}`),
+    fallback,
+  )
+}
+
 /** 0–1 之间的小数（相似度阈值等） */
 const ratioVar = (label: string, fallback: number) =>
   defaultedVar(
@@ -412,7 +430,62 @@ const envSchema = z
     CONTEXT_ROUNDS: intVar('CONTEXT_ROUNDS', 20),
     TOOL_LOOP_LIMIT: intVar('TOOL_LOOP_LIMIT', 10),
     ARTIFACT_URL_TTL_MIN: intVar('ARTIFACT_URL_TTL_MIN', 30),
+
+    // ── 沙箱与产物（P0-3-1 首次落地；参数总表 = `子方案/沙箱与引擎集成.md` §二）──
+    /**
+     * ⚠️ **除 `SANDBOX_IDLE_TTL_MIN` 外，本段全部是「登记但不消费」**（P0-3-1 只做镜像预构建）：
+     * 消费方分别是 P0-3-2（容器与配额）、P0-3-3（网络出口）、P0-3-7（产物扫描与保留期）。
+     * 一次登记完是刻意的 —— 每批回来改一次 zod schema 会让"缺哪一项"这类失败报告反复变形
+     * （同一手法见 MCP 段与 `SANDBOX_IMAGE`）。
+     */
+    /** 最终镜像 = **toolkit 层**（`子方案③` §五 1）；值由 `pnpm sandbox:build` 打印 */
     SANDBOX_IMAGE: optionalText,
+    /** base 层镜像（Node + pin 版 pi + 桥扩展）；toolkit 层 `FROM` 它 */
+    SANDBOX_IMAGE_BASE: optionalText,
+    /** 单容器内存上限（MB）。**主限额** —— 10 并发的真实瓶颈是内存，不是核（§二） */
+    SANDBOX_MEM_LIMIT_MB: intVar('SANDBOX_MEM_LIMIT_MB', 2048, { min: 128, max: 65_536 }),
+    /** 单容器 CPU 上限（核）。为辅：只防单容器跑飞拖垮宿主 ⇒ 可以是 1.5 这样的小数 */
+    SANDBOX_CPU_LIMIT: floatVar('SANDBOX_CPU_LIMIT', 1.5, { min: 0.1, max: 64 }),
+    /** 单容器进程数上限。防 fork 炸弹，但 pandas / node 都要开子进程 ⇒ 别给小（§二） */
+    SANDBOX_PIDS_LIMIT: intVar('SANDBOX_PIDS_LIMIT', 512, { min: 16, max: 65_536 }),
+    /**
+     * work 卷上限（MB，落成 `--storage-opt size=`）。
+     * ⚠️ 需要 overlay2 + xfs + pquota 才生效；**本机是否生效属待决事项 2**（P0-3-3 实测），
+     * 不生效时的降级方案是"定期 `du` 巡检 + 超限告警"，**不假装有配额**（§九 1）。
+     */
+    SANDBOX_WORK_VOLUME_MB: intVar('SANDBOX_WORK_VOLUME_MB', 1024, { min: 64, max: 1_048_576 }),
+    /** 容器 `/tmp`（tmpfs，`nosuid,nodev,noexec`）。只放小临时文件，大产物落 work 卷 */
+    SANDBOX_TMPFS_MB: intVar('SANDBOX_TMPFS_MB', 64, { min: 1, max: 65_536 }),
+    /**
+     * 沙箱代理 listener 的端口（**内网**，只有沙箱专用 bridge 可达；与 `BACKEND_PORT` 分开）。
+     * ⚠️ P0 的 `BACKEND_PORT` 是 13000 ⇒ 这里取 13001，不要顺手写成 13000。
+     */
+    SANDBOX_CALLBACK_PORT: intVar('SANDBOX_CALLBACK_PORT', 13001, { min: 1, max: 65_535 }),
+    /** per-container token 长度（字符）。43 = `randomBytes(32)` 的 base64url，与会话令牌同规格 */
+    SANDBOX_TOKEN_LEN: intVar('SANDBOX_TOKEN_LEN', 43, { min: 16, max: 256 }),
+    /**
+     * 容器侧调代理的超时（秒）。
+     * ⚠️ **必须 > `MCP_CONFIRM_TIMEOUT_SEC`**（否则用户在确认卡上点时容器已经放弃）——
+     * 这条跨字段约束写在下面的 `superRefine` 里，不靠注释提醒。
+     */
+    SANDBOX_PROXY_TIMEOUT_SEC: intVar('SANDBOX_PROXY_TIMEOUT_SEC', 180, { min: 1, max: 3600 }),
+    /**
+     * 沙箱出公网的 egress 代理（只放行模型池 baseURL，§四 3 出口①）。
+     * `02` §十一 把它标成"必填"，而 **P0-3-1 先登记为可选**：出口①到底落成"HTTP 代理"还是
+     * "iptables 直连白名单"是 P0-3-3 才定案的事（待决事项 5 同族）⇒ 现在收成必填会让
+     * 每一批的 `pnpm config:check` 都红，却证不出任何东西。P0-3-3 定案时再收紧。
+     */
+    SANDBOX_EGRESS_PROXY_URL: optionalUrl('SANDBOX_EGRESS_PROXY_URL', ['http', 'https']),
+    /** 产物单文件上限（MB）；超出记**告警并跳过**（不是静默丢，§十一 2） */
+    ARTIFACT_MAX_FILE_MB: intVar('ARTIFACT_MAX_FILE_MB', 50, { min: 1, max: 4096 }),
+    /** 单轮产物扫描的文件数上限；超出即截断并告警（防引擎写一万个小文件打爆上传） */
+    ARTIFACT_SCAN_MAX_FILES: intVar('ARTIFACT_SCAN_MAX_FILES', 200, { min: 1, max: 100_000 }),
+    /**
+     * 产物**文件**在对象存储的保留期（天）。
+     * ⚠️ 与 `ARTIFACT_URL_TTL_MIN`（下载**链接** 30 分钟）是**两件事**：前者是文件的寿命、
+     * 后者是链接的时效。不定这个数，产物就是一个只涨不跌的口子（§十一 4）。
+     */
+    ARTIFACT_RETENTION_DAYS: intVar('ARTIFACT_RETENTION_DAYS', 7, { min: 1, max: 3650 }),
 
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
@@ -483,6 +556,18 @@ const envSchema = z
         message: `必须小于 CHUNK_SIZE_DEFAULT（当前 ${env.CHUNK_OVERLAP_DEFAULT} >= ${env.CHUNK_SIZE_DEFAULT}），否则分块会退化`,
       })
     }
+    // 沙箱代理超时必须**罩住**确认等待（`子方案③` §二 在 `SANDBOX_PROXY_TIMEOUT_SEC` 那一行
+    // 点名的约束）。反过来的症状很难联想：用户在确认卡上点"确认"时，容器早就放弃那次 fetch 了
+    // ⇒ 后端把工具调完了，任务却已经收到超时错误 —— 表现为"点了确认也没用"。
+    if (env.SANDBOX_PROXY_TIMEOUT_SEC <= env.MCP_CONFIRM_TIMEOUT_SEC) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SANDBOX_PROXY_TIMEOUT_SEC'],
+        message:
+          `必须大于 MCP_CONFIRM_TIMEOUT_SEC（当前 ${env.SANDBOX_PROXY_TIMEOUT_SEC} <= ${env.MCP_CONFIRM_TIMEOUT_SEC}）：` +
+          '否则用户在确认卡上操作时，容器侧的 fetch 已经超时放弃了',
+      })
+    }
   })
 
 type EnvVars = z.infer<typeof envSchema>
@@ -538,7 +623,28 @@ export interface AppConfig {
   }
 
   concurrency: { chatbot: number; sandbox: number; pipeline: number }
-  sandbox: { idleTtlMin: number; image: string | undefined }
+  /**
+   * 沙箱（P0-3；参数总表 = `子方案③` §二）。
+   * ⚠️ 当前**只有 `idleTtlMin` 有人消费**（其余是 P0-3-1 的登记项，消费方 P0-3-2/3）。
+   */
+  sandbox: {
+    /** 空闲回收（分钟）。判据是**最后一次引擎事件的时间**，不是 CPU 占用 */
+    idleTtlMin: number
+    /** 最终镜像（= toolkit 层）；值来自 `pnpm sandbox:build` 的打印 */
+    image: string | undefined
+    /** base 层镜像（toolkit 的 `FROM`） */
+    imageBase: string | undefined
+    /** 沙箱代理 listener 端口（内网） */
+    callbackPort: number
+    /** per-container token 长度（字符） */
+    tokenLen: number
+    /** 容器侧调代理的超时（秒）；恒 > `mcp.confirmTimeoutSec`（schema 里守着） */
+    proxyTimeoutSec: number
+    /** 沙箱出公网的 egress 代理；未定时为 undefined（P0-3-3 定案后才会是必填） */
+    egressProxyUrl: string | undefined
+    /** 单容器限额。`cpu` 是浮点（1.5 核），其余是整数 */
+    limits: { memMb: number; cpu: number; pids: number; workVolumeMb: number; tmpfsMb: number }
+  }
   /** LLM 调用（P0-1-12；`backend/src/llm/client.ts` 是唯一消费方） */
   llm: {
     /** 「到响应头」上限（毫秒）。流式收到头即撤，非流式覆盖全程 */
@@ -567,6 +673,12 @@ export interface AppConfig {
     contextRounds: number
     toolLoopLimit: number
     artifactUrlTtlMin: number
+    /** 产物单文件上限（MB）；超出告警跳过（P0-3-7） */
+    artifactMaxFileMb: number
+    /** 单轮产物扫描文件数上限（P0-3-7） */
+    artifactScanMaxFiles: number
+    /** 产物**文件**保留期（天）；与 `artifactUrlTtlMin`（链接时效）是两件事（P0-3-7） */
+    artifactRetentionDays: number
     /** /health 单项依赖探活超时（毫秒） */
     healthProbeTimeoutMs: number
   }
@@ -767,7 +879,22 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       sandbox: vars.SANDBOX_CONCURRENCY,
       pipeline: vars.PIPELINE_CONCURRENCY,
     },
-    sandbox: { idleTtlMin: vars.SANDBOX_IDLE_TTL_MIN, image: vars.SANDBOX_IMAGE },
+    sandbox: {
+      idleTtlMin: vars.SANDBOX_IDLE_TTL_MIN,
+      image: vars.SANDBOX_IMAGE,
+      imageBase: vars.SANDBOX_IMAGE_BASE,
+      callbackPort: vars.SANDBOX_CALLBACK_PORT,
+      tokenLen: vars.SANDBOX_TOKEN_LEN,
+      proxyTimeoutSec: vars.SANDBOX_PROXY_TIMEOUT_SEC,
+      egressProxyUrl: vars.SANDBOX_EGRESS_PROXY_URL,
+      limits: {
+        memMb: vars.SANDBOX_MEM_LIMIT_MB,
+        cpu: vars.SANDBOX_CPU_LIMIT,
+        pids: vars.SANDBOX_PIDS_LIMIT,
+        workVolumeMb: vars.SANDBOX_WORK_VOLUME_MB,
+        tmpfsMb: vars.SANDBOX_TMPFS_MB,
+      },
+    },
     llm: {
       requestTimeoutMs: vars.LLM_REQUEST_TIMEOUT_MS,
       streamIdleTimeoutMs: vars.LLM_STREAM_IDLE_TIMEOUT_MS,
@@ -784,6 +911,9 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       contextRounds: vars.CONTEXT_ROUNDS,
       toolLoopLimit: vars.TOOL_LOOP_LIMIT,
       artifactUrlTtlMin: vars.ARTIFACT_URL_TTL_MIN,
+      artifactMaxFileMb: vars.ARTIFACT_MAX_FILE_MB,
+      artifactScanMaxFiles: vars.ARTIFACT_SCAN_MAX_FILES,
+      artifactRetentionDays: vars.ARTIFACT_RETENTION_DAYS,
       healthProbeTimeoutMs: vars.HEALTH_TIMEOUT_MS,
     },
     pipeline: {
@@ -838,7 +968,17 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       dim: value.embedding.dim,
     },
     concurrency: value.concurrency,
-    sandbox: { idleTtlMin: value.sandbox.idleTtlMin, image: value.sandbox.image ?? null },
+    sandbox: {
+      idleTtlMin: value.sandbox.idleTtlMin,
+      image: value.sandbox.image ?? null,
+      imageBase: value.sandbox.imageBase ?? null,
+      // egress 代理是**地址**，不脱敏（不含凭据）；未配置就如实报 null（P0-3-3 定案前它本来可以空着）
+      egressProxyUrl: value.sandbox.egressProxyUrl ?? null,
+      callbackPort: value.sandbox.callbackPort,
+      tokenLen: value.sandbox.tokenLen,
+      proxyTimeoutSec: value.sandbox.proxyTimeoutSec,
+      limits: value.sandbox.limits,
+    },
     llm: value.llm,
     mcp: value.mcp,
     limits: {
@@ -847,6 +987,9 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       contextRounds: value.limits.contextRounds,
       toolLoopLimit: value.limits.toolLoopLimit,
       artifactUrlTtlMin: value.limits.artifactUrlTtlMin,
+      artifactMaxFileMb: value.limits.artifactMaxFileMb,
+      artifactScanMaxFiles: value.limits.artifactScanMaxFiles,
+      artifactRetentionDays: value.limits.artifactRetentionDays,
       healthProbeTimeoutMs: value.limits.healthProbeTimeoutMs,
     },
     pipeline: value.pipeline,

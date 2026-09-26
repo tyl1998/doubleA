@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-0b 撰写子方案④《文件预览》（⚠️ 纯文档批次：后端代码未改动，仅本标识随批次前进 —— 新增 `docs/子方案/文件预览.md`：**两条出口**（下载 `attachment` / 预览 `inline`，刻意不合并成 `?disposition=` 参数）+ **六条安全判据**（HTML/SVG 的隔离必须落在**响应头** CSP `sandbox`、永不给 `allow-same-origin`、**SVG 归 HTML 那一路**、MD 只放行不外链图片、`Content-Type`/`nosniff` 按 `artifacts.mime` 一处判据、预览出口不设 `attachment`）+ 五格式逐条落法 + 参数总表 5 项（**不新增 env**） + 待决 5 项；对 `02` 有一处**契约修订**：产物下载形态由签名 URL 改为**后端代理**（理由：CSP 只有我方响应头加得上），并新增 `GET /api/artifacts/:id/content`）',
+    step: 'P0-3-1 三层镜像预构建（新增 `infra/sandbox/`：`versions.mjs` = 版本唯一事实来源【Node 基线 / **pin 版 pi 0.87.1** / base·toolkit 两条层版本号】+ `base/Dockerfile`【Node 22 + pi + **桥扩展空壳**（真实现归 P0-3-9b）+ 非 root `agent`(uid 10001) + 只读层里的 pi 配置**种子**（`PI_AGENT_SEED=/opt/pi/agent`）+ `entrypoint.sh` 播种到可写 agent-dir（`PI_CODING_AGENT_DIR=/tmp/pi-agent`；⚠️ 实测：pi 读 settings.json 会先在同目录加锁、只读目录上加不上锁会把整份 settings 判为 invalid 并**静默忽略**）】+ `toolkit/Dockerfile`【python3 + pandas/numpy/openpyxl + jq/git/rg，**末步跑依赖自检让 build 失败**】+ 跨平台入口 `pnpm sandbox:build`；同批把 `子方案③` §二 参数总表 15 项首次写进 `infra/.env(.example)` 与 `config.ts`（除 `SANDBOX_IDLE_TTL_MIN` 外**只登记不消费**），并加一条跨字段校验 `SANDBOX_PROXY_TIMEOUT_SEC > MCP_CONFIRM_TIMEOUT_SEC`）',
     address,
   })
   logger.info(

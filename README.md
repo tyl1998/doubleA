@@ -93,6 +93,51 @@ pnpm infra:down -- --purge
 > （生成：`node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`）。
 > 单独只跑 PG 扩展验收：`pnpm infra:verify`（12 项检查，含 `bigm_similarity` 中文相似度）。
 
+### 构建沙箱镜像（P0-3-1 起；⚠️ 只构建，现在还派不了活）
+
+TaskAgent 的沙箱是**三层结构**（`子方案③` §五）：`base`（Node + pin 版 pi + 桥扩展）、
+`toolkit`（**构建期预烘焙**的 python/pandas/openpyxl/jq/git/rg）、`workspace`（**不是镜像**，是每会话的卷）。
+版本号只有一个来源：`infra/sandbox/versions.mjs`。
+
+```bash
+pnpm sandbox:build                     # base → toolkit；末尾直接打印该写进 infra/.env 的两行
+pnpm sandbox:build -- --no-cache       # 不用 layer cache（改了 apt 源/想彻底重来时）
+pnpm sandbox:build -- --toolkit-only   # 只重建 toolkit（加了一个 python 库就用它）
+pnpm sandbox:build -- --dry-run        # 只打印将要执行的 docker 命令，不真构建
+
+# ⚠️ 本机（内网）**容器直连 registry.npmjs.org 不通** ⇒ 本机构建要换源（二选一）：
+pnpm sandbox:build -- --registry https://registry.npmmirror.com
+# 或写进 shell profile，之后照常用 pnpm sandbox:build
+#   export SANDBOX_NPM_REGISTRY=https://registry.npmmirror.com
+```
+
+> ⚠️ **这个坑的症状很有欺骗性**（P0-3-1 实测）：容器**能通 HTTPS**（`deb.debian.org`、`baidu.com`
+> 都是 200）、`apt-get update` 也过（它走**明文 HTTP**），**只有 npmjs 被拦**；而 npm 源不通时是
+> **静默挂起**（默认 5 分钟/次 × 重试）⇒ 看起来像"卡住/包很大"，不是报错。
+> base 层已配 `--fetch-timeout 90000 --fetch-retries 2`，源不通时会在 1~3 分钟内**失败**。
+
+| 项 | 值 |
+|----|----|
+| base 镜像 | `doubulea/sandbox-base:1` |
+| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:1` |
+| pin 的引擎 | `@earendil-works/pi-coding-agent@0.87.1`（Node ≥ 22.19.0，镜像内实为 22.23.3） |
+| 镜像内用户 | `agent`（uid 10001，**非 root**）；可写点只有 `/work`（卷）与 `/tmp`（P0-3-3 起是 tmpfs） |
+| pi 配置 | **只读种子**烤进 `/opt/pi/agent`（`PI_AGENT_SEED`，对 agent 只读）；入口 `entrypoint.sh` 把它 `cp -an` **播种**到可写的 `/tmp/pi-agent`（`PI_CODING_AGENT_DIR`）后再 `exec pi`。⚠️ 必须两步：pi 读 `settings.json` 会**先在同目录加锁**，只读目录上加不上锁 ⇒ 整份 settings 被判 invalid 并**静默忽略**。里面**没有 `auth.json`**（Key 走容器环境变量） |
+| 依赖自检 | 构建末步跑 `toolkit/selfcheck.sh`，缺一个依赖就让 **build 失败** |
+
+```bash
+# 在活容器里重跑依赖自检（排障时先跑它，能把"镜像问题"与"用法问题"分开）
+docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:1
+# 手 run 一个"能说话"的容器（默认 CMD 就是 --mode rpc）
+docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:1 --help
+```
+
+> ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
+> `npm i` **必然失败**，而阶段三的验收场景「分析这份 CSV 出汇总表」恰恰要 pandas（`子方案③` §五 2）。
+> 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
+> ⚠️ **本步不是可端测里程碑**：容器生命周期（P0-3-2）、两条网络出口（P0-3-3）、模型 Key 注入（P0-3-4）
+> 都还没做 ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
+
 ### 后端配置自检（P0-1-3 起）
 
 后端启动时自己读 `infra/.env`（`backend/src/config.ts`，zod 校验）：**缺必填项会直接退出并列出

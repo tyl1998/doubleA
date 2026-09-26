@@ -39,7 +39,8 @@
     "infra:build": "docker compose -f infra/docker-compose.yml --env-file infra/.env build",
     "infra:logs": "docker compose -f infra/docker-compose.yml --env-file infra/.env logs -f --tail=100",
     "infra:ps": "docker compose -f infra/docker-compose.yml --env-file infra/.env ps",
-    "infra:verify": "node infra/scripts/pg-verify.mjs"
+    "infra:verify": "node infra/scripts/pg-verify.mjs",
+    "sandbox:build": "node infra/scripts/sandbox-build.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
