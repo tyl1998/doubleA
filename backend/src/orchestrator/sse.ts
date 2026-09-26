@@ -75,6 +75,9 @@
  *     + `/active` 读得到进度"这两半。
  * ✅ `confirm` 挂起（{@link SseChannel#awaitConfirm}）与其应答端点（{@link answerConfirm} +
  *    `routes/conversations.ts` 的第九条路由）**已在 P0-2-10 落地** —— 从"刻意不做"一栏移出。
+ * ✅ **跨请求提问原语**（活跃通道注册表 + {@link askConversation}）**已在 P0-3-6b 落地** ——
+ *    它不是新功能，只是把上面那个挂起原语从"只有本层内部调得到"变成"**另一个 HTTP 请求**
+ *    也调得到"，服务的是沙箱 MCP 代理（`子方案③` §七 的那条独立请求）。见文件后半那一节。
  */
 
 import {
@@ -578,6 +581,12 @@ export interface ChatProducerInput {
    *   · **幂等前提**：同一时刻一条流只该有一个待答确认（工具是顺序执行的）。并发调用
    *     （一轮里并行问两次）会让后一个覆盖前一个的 `pendingConfirmId`，前一个只能等到超时
    *     —— 不是被允许，而是当前编排层**不会**这么调。
+   *     ⚠️ 沙箱代理**也从同一条槽**问（P0-3-9b）⇒ "同一时刻只有一个待答确认"这条前提
+   *     对它同样有效（那里用"危险调用串行化"保证，见 `子方案③` §七 6）。
+   *
+   * 📌 另一条调用路径是 {@link askConversation}（**跨请求**，P0-3-6b）—— 两条路径进的是
+   * **同一个**挂起与应答机制（`chat.confirm:{id}` 单槽 + `/confirm` 应答），这正是 P0-2-10
+   * 要的"一个共同的挂起原语"。
    */
   awaitConfirm: (question: ConfirmQuestion) => Promise<ConfirmDecision>
 }
@@ -615,6 +624,18 @@ class SseChannel {
 
   get signal(): AbortSignal {
     return this.#controller.signal
+  }
+
+  /**
+   * 这个通道是哪个会话的。
+   *
+   * 为什么要开这个口（而不是让注册表自己记一份 id）：活跃通道表是
+   * `Map<conversationId, SseChannel>`，键与"通道自己认的会话"**必须是同一个值** ——
+   * 两处各记一份，`askConversation` 就会把提问投给"另一个会话的流"
+   * （症状是确认卡出现在错误的对话里，而两边都不会报错）。
+   */
+  get conversationId(): string {
+    return this.#conversationId
   }
 
   get closed(): boolean {
@@ -985,6 +1006,114 @@ class SseChannel {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 跨请求提问原语（P0-3-6b）：活跃通道注册表 + askConversation()
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * "本进程里，这个会话的活跃通道是谁"。
+ *
+ * ── 为什么要它（问题原样，见 `02` §9.10 ⑧ / `子方案③` §八 1） ──
+ * {@link SseChannel.awaitConfirm} 是通道的**实例方法**，而通道实例是 {@link streamChatReply}
+ * 里的一个局部 `const` ⇒ 跨请求只有**"回答"**的路（`/confirm` 写应答槽
+ * `chat.confirm:{id}`），**没有"提问"**的路。而沙箱的 MCP 代理
+ * （P0-3-9b 的 `POST /api/sandbox/mcp/call`）恰恰是一条**独立的 HTTP 请求**：
+ * 容器里的引擎要动一个危险工具时，它得向"这个会话那条 SSE 流"问一句"用户同意吗"。
+ *
+ * ── 为什么是"只做取实例"的表，不兼做判据 ──
+ * "这个会话是不是有人在跑"**只有一个判据**：Redis 的活跃流锁（`chat.active:{id}`，
+ * 见文件头 ③）。本表回答的是另一个问题："**这个 id 的通道实例在不在本进程里**"。
+ * 两者**不要混成一个真相源**：混了之后"锁在、通道不在"（刚重启 / 不在同一实例）
+ * 这种状态就会被误判成"可以提问"。
+ */
+const activeChannels = new Map<string, SseChannel>()
+
+/**
+ * 一次**跨请求提问**的结局 = 确认的三种（{@link ConfirmDecision}）+ 一种"**根本没问成**"。
+ *
+ * ⚠️ 第四种**必须与 `REJECTED` 分得开**（`子方案③` §八 2 的纪律 ②）：
+ * `REJECTED` 是"用户点了取消"，`NO_CHANNEL` 是"这个会话的通道不在本进程里"
+ * （流已经结束 / 压根不在这个实例上）。两者都**通向"不执行这个工具"**，但回给模型的话
+ * 不一样 —— 把后者说成"用户已取消"是把**我们的状态问题**说成**用户的决定**。
+ */
+export type AskConfirmOutcome = ConfirmDecision | 'NO_CHANNEL'
+
+/** 通道建成后登记（{@link streamChatReply} 里紧跟 `new SseChannel(...)`） */
+function registerActiveChannel(channel: SseChannel): void {
+  activeChannels.set(channel.conversationId, channel)
+}
+
+/**
+ * 注销（{@link streamChatReply} 的 finally 里、`dispose()` **之前**）。
+ *
+ * ⚠️ **按身份撤销**，不是 `delete(conversationId)` —— 理由与
+ * {@link releaseConversationLock} 的"按归属释放"**同一条**：并发冲突的判据是 Redis 那把锁，
+ * 而锁**有 TTL**（文件头 ③）⇒ 锁一旦过期，同一个会话就可能有**第二条流**拿到锁、建出第二个
+ * 通道并覆盖本表。此时老通道的 finally 若直接 `delete(id)`，删掉的是**新通道**的登记 ——
+ * 此后该会话的 `askConversation()` 会一直答 `NO_CHANNEL`（症状是"这个会话的危险工具全都说
+ * 无法确认"），**没有任何报错**，只能靠读代码发现。
+ */
+function unregisterActiveChannel(channel: SseChannel): void {
+  if (activeChannels.get(channel.conversationId) !== channel) return
+  activeChannels.delete(channel.conversationId)
+}
+
+/**
+ * 跨请求向某个会话的活跃流提一个确认问（`02` §9.10 ⑧；调用方 = P0-3-9b 的代理端点）。
+ *
+ * 实现只有两步：**查表 → 该通道的 `awaitConfirm(question)`**（提问这件事的重心是
+ * "往哪条响应流写 `confirm` 帧"，那只能是通道实例本身）。
+ *
+ * ── 三条纪律（缺了会出静默坏事；`子方案③` §八 2） ──
+ *  ① **本表不是"谁是主人"的判据**（见 {@link activeChannels} 的注释）——
+ *     主人判据仍然只有 Redis 的活跃流锁。
+ *  ② ★ **查不到通道 ⇒ 调用方必须按"拒绝执行"处理**：回一条"无法确认 ⇒ 未执行"的结果，
+ *     **不是静默放行、也不是当成功**。安全默认拒绝 —— 查不到只可能是因为流已经结束
+ *     （那这一轮本来也该结束），或这个会话不在本进程上（见 ③）。
+ *     ⚠️ **非危险工具不依赖本表**，照常执行：本函数只被"要动危险工具"那一条路调用。
+ *  ③ **本表是进程内的** ⇒ 与 `SANDBOX_CONCURRENCY` 的作用域是**同一条扩容前提**
+ *     （`子方案③` §九 3）：横向扩容时容器与 SSE 流可能不在同一实例上。那时**不能只是把
+ *     `Map` 换成 Redis** —— "提问"要往一条具体的响应流写帧，那不可能跨进程；正确修法是
+ *     "按会话把代理调用路由到持有该流的实例"（与 §四 3 的后端地址一起改）。
+ *
+ * ── 两条实现约定（都由 {@link SseChannel#awaitConfirm} 保证，调用方不必自己处理） ──
+ *   · **超时按取消**：到点回 `'TIMEOUT'`（不抛错 —— 超时是一条**正常结论**）；
+ *   · ⚠️ **中断照旧抛出**：轮次被中断（用户停止 / 客户端断开 / 锁丢失）时抛
+ *     `ChatStoppedError`（= `signal.reason`），本函数**不接、原样透传** —— 它与"确认的结局"
+ *     是两件事（见 {@link ConfirmDecision}）。代理端点要自己接住它、把结果按"未执行"回给引擎
+ *     （属 P0-3-9b）。
+ *
+ * 📌 `question` 的形状与 `ChatProducerInput#awaitConfirm` 的入参是**同一个**
+ * （{@link ConfirmQuestion}）—— 编排层自己问、代理端点代问，走的是**同一套**挂起与应答机制。
+ */
+export async function askConversation(
+  conversationId: string,
+  question: ConfirmQuestion,
+): Promise<AskConfirmOutcome> {
+  const channel = activeChannels.get(conversationId)
+  if (channel === undefined || channel.closed) {
+    // 两个条件合成一条出口：查不到 = 这个会话没有活跃流；`closed` 是"表里还留着、流已收尾"
+    // 的兜底 —— 注销与 `dispose()` 之间没有 `await`（见 streamChatReply 的 finally），
+    // 理论上留不下窗口；留着它是因为**这里的失败方向只能是"拒绝"**，代价只是一次比较。
+    getLogger().warn(
+      {
+        conversationId,
+        source: question.source,
+        toolName: question.toolName,
+        // 区分"没登记过"与"登记了但已关闭"：排查"注销漏了"时这是唯一的线索
+        registered: channel !== undefined,
+      },
+      '本进程里没有该会话的活跃通道 ⇒ 无法提问（危险调用必须按"未执行"处理）',
+    )
+    return 'NO_CHANNEL'
+  }
+  getLogger().info(
+    { conversationId, source: question.source, toolName: question.toolName },
+    '跨请求提问：已交给该会话的活跃流，等待用户应答',
+  )
+  return channel.awaitConfirm(question)
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // 主入口：一条流的完整生命周期
 // ═════════════════════════════════════════════════════════════════════
 
@@ -1035,10 +1164,10 @@ async function writeSseErrorReply(reply: FastifyReply, payload: SseErrorPayload)
  * ③ reply.hijack() + 写头      ← 从这一刻起响应归我们管，Fastify 不再碰它
  * ④ flushHeaders             ← 必须立刻冲：占位 producer 要 20s 之后才有第一帧，
  *                              不冲头客户端的 fetch 就一直不 resolve（症状：前端以为请求没发出去）
- * ⑤ 起心跳 / 挂 close 监听
+ * ⑤ 登记活跃通道（P0-3-6b）→ 起心跳 / 挂 close 监听
  * ⑥ await producer(...)      ← 编排循环
  * ⑦ 收尾帧（done / error）
- * ⑧ finally：清定时器 → 清停止键 → 释放锁（按归属）→ end()
+ * ⑧ finally：注销活跃通道（P0-3-6b）→ 清定时器 → 清停止键 → 释放锁（按归属）→ end()
  * ```
  * ⚠️ ③ 之后**绝不能抛**：`reply` 已 hijack，抛出去的错误处理器拿不到这个响应
  * （症状是请求悬挂 + 日志里一条"处理失败"）。故 ⑤ 之后的所有路径都包在 try/catch 里，
@@ -1089,6 +1218,12 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
      * 新的那个成员就不必写 `?.` 兜底（`emit` / `updateSnapshot` 的 `?.` 是历史写法，保持不动）。
      */
     const activeChannel = channel
+    /**
+     * ★ P0-3-6b：登记进活跃通道表。**紧跟构造**（在 `start()` 之前）—— "通道活着"与
+     * "能被跨请求提问"从这一刻起同时成立；晚一步登记的后果见 ⑤ 的注释（危险工具会被
+     * 判成"无法确认"）。
+     */
+    registerActiveChannel(activeChannel)
     channel.start()
 
     // ⑤ 客户端断开 = 流结束。**这一条是"锁不会漏"的关键**：没有它，用户关掉标签页之后
@@ -1159,6 +1294,14 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
     } finally {
       reply.raw.off('close', onClientClose)
       reply.raw.off('error', onRawError)
+      /**
+       * ★ P0-3-6b：**先注销、再 `dispose()`**。
+       *
+       * 这两步都是同步调用、中间没有 `await` ⇒ 不存在"表里有、通道已死"的可观测窗口；
+       * 顺序这样写只是让"通道不再可用"与"表里查不到它"在同一步完成（连 `closed` 兜底
+       * 都成了纯保险）。⚠️ 必须**按身份撤销** —— 见 {@link unregisterActiveChannel}。
+       */
+      unregisterActiveChannel(activeChannel)
       channel.dispose()
       // ⚠️ 顺序：清停止键必须在**释放锁之前**（此刻锁还在我们手上 ⇒ 不可能有别的流在跑 ⇒
       //    这个键只可能是写给我们的）。挪到外层 finally 之后就可能和新流的 `/stop` 抢键 ——
