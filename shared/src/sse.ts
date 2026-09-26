@@ -59,7 +59,7 @@
 
 import { z } from 'zod'
 
-import { citationItemSchema, toolCallRecordSchema } from './conversation.js'
+import { artifactItemSchema, citationItemSchema, toolCallRecordSchema } from './conversation.js'
 import { ERROR_CODES } from './errors.js'
 
 // ───────────────────────────── 事件名与取值域 ─────────────────────────────
@@ -187,13 +187,15 @@ export const sseCitationsPayloadSchema = z.object({
 })
 export type SseCitationsPayload = z.infer<typeof sseCitationsPayloadSchema>
 
-/** `artifact`：TaskAgent 产出文件（P0-3 才产生；形状先定下来，前端映射表不必等） */
-export const sseArtifactPayloadSchema = z.object({
-  artifactId: z.string().min(1),
-  fileName: z.string(),
-  size: z.number().int().min(0),
-  mime: z.string(),
-})
+/**
+ * `artifact`：TaskAgent 产出文件。
+ *
+ * ⚠️ **P0-3-7 起由 `conversation.ts#artifactItemSchema` 派生**（原先是一份独立的内联
+ * schema —— P0-1 预留时还没有"落库段"这回事）。派生而不是两份的理由与 `tool_call`
+ * 完全同款：这张卡有**两个来源**（本事件、刷新后从 `messages.content.artifacts` 恢复），
+ * 各写一份会让"流里看到的卡"与"历史恢复出来的卡"悄悄分叉。
+ */
+export const sseArtifactPayloadSchema = artifactItemSchema
 export type SseArtifactPayload = z.infer<typeof sseArtifactPayloadSchema>
 
 /** `queued`：沙箱并发满时的排队位次（**1 = 下一个**，与 `conversationActiveSnapshotSchema` 同口径） */

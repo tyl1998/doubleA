@@ -27,6 +27,7 @@
 
 import {
   toolCallRecordSchema,
+  type ArtifactItem,
   type CitationItem,
   type MessageContent,
   type RetrievalHit,
@@ -470,6 +471,11 @@ export interface AssistantContentInput {
   citations: readonly CitationItem[]
   /** 本轮的**工具调用记录**（按发生顺序；P0-2-8 起定型，见 `shared#toolCallRecordSchema`） */
   toolCalls?: readonly ToolCallRecord[]
+  /**
+   * 本轮的**产出文件**（按收集顺序；P0-3-7 起定型，见 `shared#artifactItemSchema`）。
+   * ChatBot 恒不传（没有沙箱就没有产物），TaskAgent 在收集失败时也不传 —— 省键即"本轮没有"。
+   */
+  artifacts?: readonly ArtifactItem[]
 }
 
 /**
@@ -490,6 +496,9 @@ export function buildAssistantContent(input: AssistantContentInput): MessageCont
   if (input.citations.length > 0) content.citations = [...input.citations]
   if (input.toolCalls !== undefined && input.toolCalls.length > 0) {
     content.tool_calls = [...input.toolCalls]
+  }
+  if (input.artifacts !== undefined && input.artifacts.length > 0) {
+    content.artifacts = [...input.artifacts]
   }
   return content
 }

@@ -15,11 +15,11 @@
  * ⚠️ 行为**逐字未变**（P0-3-6 只搬位置 + 收窄 usage 的入参类型）—— 想核对时对照
  * `git log -p -- backend/src/orchestrator/chatBot.ts` 里删除的那一段。
  *
- * ⚠️ **产物（`artifacts`）不在本函数里**：`messageContentSchema` 目前**没有** `artifacts` 段
- * （属 P0-3-7 / P0-3-10 的契约增量），本函数照原口径只写 `text` / `thinking` / `citations` / `tool_calls`。
+ * ⚠️ **产物（`artifacts`）段在 P0-3-7 起属于本函数**（`messageContentSchema` 定型了
+ * `artifacts` 段，写入端就是这里）；ChatBot 不传该参数 ⇒ 它的落库口径与从前**逐字不变**。
  */
 
-import type { CitationItem, ToolCallRecord } from '@doubulea/shared'
+import type { ArtifactItem, CitationItem, ToolCallRecord } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
@@ -49,6 +49,11 @@ export interface PersistRoundInput {
   citations: CitationItem[]
   /** 本轮的工具调用记录（P0-2-8 起：ChatBot 是 `kind=MCP`，P0-3-6 起 TaskAgent 是 `kind=SANDBOX`） */
   toolRecords: readonly ToolCallRecord[]
+  /**
+   * 本轮的产出文件（P0-3-7 起；TaskAgent 专属）。**不传 / 空数组都表示"本轮没有产物"** ——
+   * `content.artifacts` 段只在非空时出现（`buildAssistantContent` 的省键口径）。
+   */
+  artifacts?: readonly ArtifactItem[]
   usage: RoundUsage | null
   logger: ReturnType<typeof getLogger>
 }
@@ -61,12 +66,14 @@ export interface PersistRoundInput {
  * 它自己不开事务，否则"消息落库"与"活跃时间"会变成两次写入（中间失败就出现
  * "会话里有消息、侧栏却不动"）。
  *
- * 助手消息**只在真的有内容时才写**：`text` / `thinking` / `citations` / `tool_calls` 四者全空时
- * （用户刚发出去就点了停止）不写助手行 —— 留一条空消息会在界面上画出一个空气泡。
+ * 助手消息**只在真的有内容时才写**：`text` / `thinking` / `citations` / `tool_calls` / `artifacts`
+ * 五者全空时（用户刚发出去就点了停止）不写助手行 —— 留一条空消息会在界面上画出一个空气泡。
  * 此时 `done.messageId` 为 `null`，它的语义正是"**这一轮没有产生可持久化的消息**"
  * （`shared/src/sse.ts` 文件头 ④）。
  * ⚠️ **工具记录也算内容**（P0-2-8）：一轮"只调了工具、还没等到最终回答就被停止"的生成
  * 在界面上是有东西的（工具卡），把它当成"空"会让那一轮的卡片在刷新后消失。
+ * ⚠️ **产物同理**（P0-3-7）：一轮"只产出文件、正文为空"的任务在界面上有产物卡，
+ * 刷新后要能恢复（产物卡的第二个来源就是 `messages.content.artifacts`）。
  *
  * **落库失败不外抛**：回答已经完整地流给用户看了，此时再用 `error` 帧覆盖掉
  * "回答成功"这件事，是拿一条基础设施故障去否定一个已经发生的事实。
@@ -74,9 +81,14 @@ export interface PersistRoundInput {
  * 前端据此可以说"本条未写入历史"。⚠️ 代价写在这里：这一轮在历史里查不到（刷新后会消失）。
  */
 export async function persistRoundQuietly(input: PersistRoundInput): Promise<string | null> {
-  const { conversationId, content, assistantText, thinkingText, citations, toolRecords, usage, logger } = input
+  const { conversationId, content, assistantText, thinkingText, citations, toolRecords, artifacts, usage, logger } =
+    input
   const hasAssistantContent =
-    assistantText !== '' || thinkingText !== '' || citations.length > 0 || toolRecords.length > 0
+    assistantText !== '' ||
+    thinkingText !== '' ||
+    citations.length > 0 ||
+    toolRecords.length > 0 ||
+    (artifacts?.length ?? 0) > 0
   try {
     const db = getPrisma()
     return await db.$transaction(async (tx) => {
@@ -94,6 +106,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
               thinking: thinkingText,
               citations,
               toolCalls: toolRecords,
+              artifacts,
             }),
             // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）
             tokensIn: usage?.tokensIn ?? null,

@@ -454,6 +454,46 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:13000/api/agents \
 > ⚠️ 另一条**仍未接线**的路是"**引擎主动问**"（pi 的 RPC-only events）：桥会把这类记录当**未知事件**
 > 扇给映射层、映射层只留痕不派发 ⇒ 要接通需另立批次。
 
+### 沙箱产物收集（P0-3-7 起；⚠️ 无 HTTP 面，下载/预览属 P0-3-9/10）
+
+**这一批把"引擎写了什么文件"变成"平台上看得见、下得了的产物"**：TaskAgent 每一轮
+**派活之前**拍一次 work 卷基线（`find -printf`，cmd 走数组不经 shell），`agent_settled` 之后
+对照 ⇒ 新出现或修改过的文件 → `cat` 读出 → 传 MinIO（`artifacts/{会话}/{uuid}/{名}`）→ 建
+`artifacts` 行 → 流里发 `artifact` 帧 → 落 `messages.content.artifacts` 段。保留期
+`ARTIFACT_RETENTION_DAYS`（默认 7 天）由**沙箱对账器同一轮 tick** 收口（对象删成功才删行）。
+
+判据速查（全部带日志、不静默丢）：隐藏文件（路径任一段 `.` 开头）与 `node_modules` 跳过；
+单文件 > `ARTIFACT_MAX_FILE_MB`（50MB）或单轮 > `ARTIFACT_SCAN_MAX_FILES`（200 个）跳过/截断并告警；
+**先传对象再建行**，建行失败补偿删对象；**收集失败 ≠ 这一轮失败**（编排层只 warn）。
+
+真跑一轮后的人工观察步骤（前提 = `SANDBOX_IMAGE` + `SANDBOX_EGRESS_PROXY_URL` 已就绪，
+即「沙箱派活与事件映射」那节能真派活）：
+
+```bash
+# ① 派一个"会写文件"的活（沿用上一节造好的 TASK_AGENT 会话；content 例：
+#    "用 python 把 1..10 的平方写成 CSV 存到 /work/squares.csv"）
+#    curl 走 SSE 时应看到 artifact 帧（形如：event: artifact  data: {"artifactId":"…","fileName":"squares.csv",…}）
+
+# ② MinIO 里应有对象（桶名与端口见 infra/.env 的 S3_*；键形如 artifacts/<会话id>/<uuid>/squares.csv）
+#    可用 docker exec doubulea-minio mc… 或控制台 http://127.0.0.1:19001 浏览
+
+# ③ 库里应有行（psql 连 127.0.0.1:15432，库名 doubulea）
+#    SELECT id, file_name, size, mime, created_at FROM artifacts ORDER BY created_at DESC LIMIT 5;
+#    → file_name 是相对 /work 的路径；mime 按扩展名定（csv → text/csv）
+
+# ④ 复用容器再派第二轮：写一个**别的**文件
+#    → 第二轮只报新文件；第一轮的 squares.csv 不再出现（基线 = 上一轮收尾态）
+#    → 后端日志有「本轮产物收集完成 collected: …」而无重复告警
+
+# ⑤ 保留期清理（可选，慢）：把 infra/.env 的 ARTIFACT_RETENTION_DAYS 改成 1 并重启后端，
+#    等对账轮（默认 60s 一轮）→ 对象与行一起消失（日志「产物保留期清理完成」）
+```
+
+> ⚠️ **本批无 HTTP 面**：`GET /:id/artifacts`、`GET /artifacts/:id/download`、`/content` 属 P0-3-9/10，
+> 现在只能在 MinIO / psql 里看产物。**最早可端测的点仍是 P0-3-11**。
+> ⚠️ 清理挂在沙箱对账器里 ⇒ **未配置 `SANDBOX_IMAGE` 时清理不跑**（没有镜像就没有 TaskAgent、
+> 产物不再新增；存量要清可手工删或临时配回镜像）。
+
 ### 后端配置自检（P0-1-3 起）
 
 后端启动时自己读 `infra/.env`（`backend/src/config.ts`，zod 校验）：**缺必填项会直接退出并列出

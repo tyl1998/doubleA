@@ -338,6 +338,9 @@ model Conversation {
   /// 沙箱账本（P0-3-2）。⚠️ 删会话会**级联删掉这些行**，但容器不归数据库管 ——
   /// 孤儿回收器按 label 找容器、按"会话还在不在"判死（见 `backend/src/sandbox/reaper.ts`）。
   sandboxes Sandbox[]
+  /// 本会话的产出文件（P0-3-7）。⚠️ 删会话会级联删行，但**对象与行的过期收口只由保留期
+  /// 清理器做**（`02` §三"消息与产物都不删"指的是不跟会话/Agent 的删除走）
+  artifacts Artifact[]
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -359,7 +362,8 @@ model Conversation {
 ///    全部在 `prisma/migrations/0001_init/migration.sql` 里用 SQL 完成，包括
 ///    `ensure_messages_partition(month)` 这个「建当月分区」的幂等函数。
 ///
-/// `content` 的 jsonb 结构（`02` §三）：`{ text, thinking, tool_calls, citations, attachments }`，
+/// `content` 的 jsonb 结构（`02` §三）：`{ text, thinking, tool_calls, citations, artifacts, attachments }`
+/// （`artifacts` 段 P0-3-7 定型；`attachments` 仍属 P1 未定型），
 /// 逐字段的 zod schema 属于 SSE 契约（P0-1-25），本批不定型 —— 但**结构一经写入不改语义**，
 /// 因为历史消息要能被后续版本原样渲染。
 /// `tokensIn/tokensOut` 可空：流被中断时也可能已产生 token，或 embedding/工具轮次无计量。
@@ -658,4 +662,43 @@ model Sandbox {
   /// 空闲回收的扫描键：`status = RUNNING AND last_active_at < 阈值`
   @@index([status, lastActiveAt])
   @@map("sandboxes")
+}
+
+/// artifacts —— TaskAgent 产出文件（`02` §三 / §4.8；P0-3-7 落地）
+///
+/// ⚠️ **先传对象、再建行**（`子方案③` §十一 3：顺序不能反 —— 先建行会出现
+/// "列表里有个文件、点下载才发现对象不存在"）。行是"下载/预览"的唯一入口（P0-3-9），
+/// `fileKey` 不出现在任何对外契约里（对外只有 `id`，见 `shared#artifactItemSchema`）。
+///
+/// ⚠️ **产物不跟会话走**：`02` §三 的"消息与产物都不删"—— 删会话会级联删行，但
+/// 过期收口**只由保留期清理器做**（`sandbox/artifacts.ts#reapExpiredArtifacts`，
+/// `ARTIFACT_RETENTION_DAYS` 默认 7 天），不存在"会话一删文件就没了"的路径。
+model Artifact {
+  id String @id @default(uuid(7)) @db.Uuid
+  conversationId String @map("conversation_id") @db.Uuid
+  /// S3 对象键：`artifacts/{conversationId}/{uuid}/{安全化的文件名}`（uuid 是存储层随机段，
+  /// 与 `document.service.ts` 的 `kb/...` 键同一条纪律：对象名不需要有序）
+  fileKey String @map("file_key") @db.VarChar(512)
+  /// 容器内相对 `/work` 的路径（子目录产物就是 `out/report.csv` 这种形态）
+  fileName String @map("file_name") @db.VarChar(512)
+  /// 字节数（扫描时从 `find` 读到；上传用的 buffer 长度与之不一致时以实际读到的为准并 warn）
+  size Int
+  /// ⚠️ 产物 `Content-Type` 的**唯一来源**（`子方案④` §四）：P0-3-7 扫描时按扩展名定一次，
+  /// 下载/预览端点不再看对象元数据、前端不看文件名后缀
+  mime String @db.VarChar(255)
+  /// 预览就绪标记（P0-3-10 才有消费者；P0-3-7 恒写 `false`，列先按 `02` §三 落上）
+  previewReady Boolean @default(false) @map("preview_ready")
+  /// ⚠️ 由**调用方显式传入**（`artifacts.ts` 写行时传 JS 侧 `new Date()`）：本机 PG 会话
+  /// 时区非 UTC 时 `@default(now())` 与 JS 侧边界相差一个时区偏移，而保留期清理
+  /// （`createdAt < now - N 天`）正是 JS 侧边界比较 —— 写偏了保留期就整体偏一个时区。
+  /// 默认值只是兜底（同 `Sandbox.createdAt` 的口径）。
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// P0-3-9 的产物列表（`GET /:id/artifacts`）扫描键
+  @@index([conversationId, createdAt(sort: Desc)])
+  /// 保留期清理器的扫描键（`createdAt < now - ARTIFACT_RETENTION_DAYS`）
+  @@index([createdAt])
+  @@map("artifacts")
 }

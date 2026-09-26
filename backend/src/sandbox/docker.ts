@@ -8,7 +8,8 @@
  * 本文件只做"跟 Docker 说话"，不做任何策略
  * ─────────────────────────────────────────────────────────────────────
  * 谁该活、什么时候回收、排队位次怎么算 —— 全在 `manager.ts` / `reaper.ts` / `queue.ts`。
- * 这里只有薄薄一层：连上守护进程、列对象、建对象、删对象，以及**把 Docker 的报错翻译成人话**。
+ * 这里只有薄薄一层：连上守护进程、列对象、建对象、删对象、在容器里执行一条命令
+ * （P0-3-7 的 `execInSandbox`），以及**把 Docker 的报错翻译成人话**。
  * 这样做的收益很实际：上面那些策略模块因此可以只依赖"接口形状"，不必知道 dockerode 的类型。
  *
  * ⚠️ 两处刻意的取舍：
@@ -489,6 +490,105 @@ export async function inspectImageUser(image: string): Promise<string | undefine
   } catch (error) {
     throw new Error(describeDockerFailure(error), { cause: error })
   }
+}
+
+// ───────────────────────────── 容器内执行（P0-3-7）─────────────────────────────
+
+/** 一次 `docker exec` 的结果（`exitCode` 为 `null` = 没等到退出码就断了） */
+export interface SandboxExecResult {
+  stdout: Buffer
+  stderr: Buffer
+  exitCode: number | null
+}
+
+/**
+ * 在沙箱容器里执行一条命令并**收全**它的输出（P0-3-7：产物扫描 `find` 与读文件 `cat`）。
+ *
+ * ⚠️ 三条刻意的形状约束：
+ *   · **`cmd` 是字符串数组、不经过 shell**（Docker Exec 直接 `execve`）—— 产物路径来自
+ *     `find` 的输出（引擎/模型间接控制文件名），拼进一条 `sh -c` 就是**注入**；
+ *     数组形态 + `cat --` 从结构上把这条路堵死。
+ *   · **必须 `demuxStream`**：本仓容器 `Tty:false`，输出是 8 字节头多路复用格式
+ *     （同 {@link attachSandboxStdio} 的坑 ②）。
+ *   · **必须带超时**：`docker exec` 没有内建时限，卡住的进程会把这个 await 挂成
+ *     "一轮永远收不了尾"。超时即拆流并抛错（调用方 `artifacts.ts` 按整轮失败处理）。
+ *
+ * @throws Error 超时 / 建不了 exec / 流异常（`describeDockerFailure` 已翻过人话）
+ */
+export async function execInSandbox(
+  containerId: string,
+  cmd: readonly string[],
+  options: { timeoutMs?: number } = {},
+): Promise<SandboxExecResult> {
+  const timeoutMs = options.timeoutMs ?? 60_000
+  const container = getDocker().getContainer(containerId)
+
+  // dockerode 5 的形状：`container.exec(opts)` 建（返回带 start/inspect 的 Exec 实例）——
+  // `@types/dockerode` 的过载签名与 `lib/container.js` 的实现一致（exec.create 是老版本文档的写法）
+  const exec = await container.exec({
+    Cmd: [...cmd],
+    AttachStdout: true,
+    AttachStderr: true,
+  })
+  const stream = (await exec.start({ stdin: false })) as NodeJS.ReadableStream
+
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  container.modem.demuxStream(stream, stdout, stderr)
+
+  const chunks: Buffer[] = []
+  const errChunks: Buffer[] = []
+  let stdoutDone = false
+  let stderrDone = false
+  let settled = false
+
+  return await new Promise<SandboxExecResult>((resolve, reject) => {
+    const finish = async (error?: unknown): Promise<void> => {
+      if (settled) return
+      settled = true
+      clearTimeout(deadline)
+      if (error !== undefined) {
+        // 拆流（try/catch：流可能已自断，目标状态已达成）
+        try {
+          (stream as { destroy?: () => void }).destroy?.()
+        } catch {
+          /* 已断 */
+        }
+        reject(error instanceof Error ? error : new Error(String(error)))
+        return
+      }
+      // 退出码要等流收完后再读（exec 的生命周期由容器侧的进程结束驱动）
+      try {
+        const info = await exec.inspect()
+        resolve({
+          stdout: Buffer.concat(chunks),
+          stderr: Buffer.concat(errChunks),
+          exitCode: typeof info.ExitCode === 'number' ? info.ExitCode : null,
+        })
+      } catch (inspectError) {
+        resolve({ stdout: Buffer.concat(chunks), stderr: Buffer.concat(errChunks), exitCode: null })
+      }
+    }
+
+    stdout.on('data', (chunk: Buffer) => chunks.push(chunk))
+    stderr.on('data', (chunk: Buffer) => errChunks.push(chunk))
+    stdout.on('end', () => {
+      stdoutDone = true
+      if (stderrDone) void finish()
+    })
+    stderr.on('end', () => {
+      stderrDone = true
+      if (stdoutDone) void finish()
+    })
+    stdout.on('error', finish)
+    stderr.on('error', finish)
+
+    const deadline = setTimeout(() => {
+      void finish(new Error(`docker exec 超时（${timeoutMs}ms）：${cmd.join(' ')}`))
+    }, timeoutMs)
+    // 别让定时器卡住进程退出（与 reaper 的 `unref()` 同一条纪律）
+    deadline.unref?.()
+  })
 }
 
 /** 诊断用：当前 Docker 的简述（启动日志里打一行，"沙箱到底有没有接上 Docker"一眼可判） */

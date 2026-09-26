@@ -11,7 +11,9 @@
  *  ① ensureSandbox(conversationId)   → 排队位次 ⇒ `queued` 事件 + `/active` 快照
  *  ② getSandboxRpc(...)              → 一个会话一条桥，与容器同寿命（P0-3-5）
  *  ③ onEvent(map.ts)                 → 引擎事件 ⇒ `delta` / `thinking` / `tool_call{kind:SANDBOX}`
+ *  ③.5 snapshotWorkFiles(...)        → **派活之前**拍产物基线（P0-3-7）
  *  ④ runTurn(content, {signal})      → 派活 + 等 **`agent_settled`**（不是 `agent_end`，见 `bridge.ts`）
+ *  ④.5 collectRoundArtifacts(...)    → 对照基线 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（P0-3-7）
  *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
  *  ⑥ persistRoundQuietly + done{usage}
  * ```
@@ -70,9 +72,8 @@
  * ═══════════════════════════════════════════════════════════════════════
  * ⚠️ 本批**刻意不含**的（属后续批次，不要顺手补）
  * ═══════════════════════════════════════════════════════════════════════
- *   · **产物收集**（扫描工作卷 → 对象存储 → `artifacts` 行 + `artifact` 事件）→ **P0-3-7**。
- *     于是本层发出的 `citations` 恒为空数组、也不发 `artifact`：
- *     `messageContentSchema` 目前**没有** `artifacts` 段，那是 P0-3-7 的契约增量。
+ *   · **产物下载 / 列表 / 预览端点**（`GET /:id/artifacts`、`GET /artifacts/:id/download`、
+ *     `.../content`）→ **P0-3-9 / P0-3-10**。本批只把行建出来、事件发出去，前端还没有消费面。
  *   · **MCP 工具卡与后端代理**（`kind:MCP` + `serverId` 反查）→ **P0-3-9b**；
  *     于是本层发出的工具卡 `kind` **恒为 `SANDBOX`**（`map.ts` 是它的唯一出处）。
  *   · **跨请求提问原语**（`askConversation()` / 活跃通道注册表）→ ✅ **已在 P0-3-6b 落地**
@@ -90,6 +91,7 @@
 
 import {
   AppError,
+  type ArtifactItem,
   type ConversationActiveSnapshot,
   type SseEvent,
   type ToolCallRecord,
@@ -97,13 +99,16 @@ import {
 
 import { getLogger } from '../infra/logger.js'
 import {
+  collectRoundArtifacts,
   ensureSandbox,
   getSandboxRpc,
+  snapshotWorkFiles,
   type SandboxAcquireFailure,
   type SandboxHandle,
   type SandboxRpc,
   type TurnFailureReason,
   type TurnOutcome,
+  type WorkSnapshot,
 } from '../sandbox/index.js'
 import { createEngineEventMapper, type EngineUsage } from '../sandbox/map.js'
 import { persistRoundQuietly } from './persist.js'
@@ -207,6 +212,14 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   let unsubscribe: (() => void) | null = null
   let outcome: TurnOutcome | null = null
   let failure: unknown = null
+  /**
+   * 产物基线（③.5 拍、④.5 用）。`undefined` = 没拍成（`snapshotWorkFiles` 内部已 warn）
+   * ⇒ 收集整轮跳过：**宁可不收，不重复收**（拿空基线当对照会把复用容器里上一轮的产物
+   * 全部再报一次 —— `子方案③` §十一 1 点名的症状）。
+   */
+  let baseline: WorkSnapshot | undefined
+  /** 本轮建成的产物行（发 `artifact` 帧 + 落 `content.artifacts` 段，同一份数据两个去向） */
+  const artifactItems: ArtifactItem[] = []
 
   if (acquired.ok) {
     const handle = acquired.sandbox
@@ -236,6 +249,10 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       // ③ 订阅（判据 ①：**必须早于派活**）
       // ═════════════════════════════════════════════════════════════
+      // ③.5 拍产物基线（P0-3-7；P0-3-6 详规传下来的口径 ②：**必须在派活之前**，
+      //     不许收尾之后补 —— 否则"基线"里已经混进了这一轮的产物，对照出来永远为空）
+      baseline = await snapshotWorkFiles(handle.containerId)
+
       const mapper = createEngineEventMapper()
       unsubscribe = bridge.onEvent((event) => {
         const mapped = mapper.map(event)
@@ -290,6 +307,32 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     } finally {
       // 退订必须做：桥活得比这一轮久（复用容器），不退就是每一轮多一个监听器 + 多一份泄漏的引用
       unsubscribe?.()
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ④.5 收产物（P0-3-7）
+  // ═══════════════════════════════════════════════════════════════════
+  // 排在⑤冲刷**之前** ⇒ `artifact` 帧与内容帧同一条串行队列，顺序天然正确（先过程、后产物、最后 done）。
+  // **中断/故障的轮也照收**（`子方案③` §九 5：用户点停止通常正是因为他已经拿到想要的东西了）；
+  // 引擎挂了的那轮会因容器已死而在扫描处自然失败为空集。
+  // ⚠️ 收集失败 ≠ 这一轮失败：产物是本轮的赠品，任何异常只 warn、不进 `error` 帧（见 `artifacts.ts` 文件头）。
+  if (sandbox !== null && baseline !== undefined) {
+    try {
+      const collected = await collectRoundArtifacts({
+        conversationId,
+        containerId: sandbox.containerId,
+        baseline,
+      })
+      artifactItems.push(...collected)
+      if (collected.length > 0) {
+        enqueue(collected.map((item) => ({ name: 'artifact', data: item } as const satisfies SseEvent)))
+      }
+    } catch (error) {
+      logger.warn(
+        { err: error, conversationId, agentId, containerId: sandbox.containerId },
+        '本轮产物收集失败（回答与工具过程不受影响，产物面板将缺这一轮）',
+      )
     }
   }
 
@@ -360,6 +403,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     // TaskAgent 本轮**不检索** ⇒ 恒为空（知识库绑定经 §七 代理以工具形态出现，属 P0-3-9b）
     citations: [],
     toolRecords: round.toolRecords,
+    // 本轮建成的产物行（P0-3-7）：事件里发过的那几张卡，刷新后从 `content.artifacts` 恢复
+    artifacts: artifactItems,
     usage: round.usage,
     logger,
   })
@@ -387,6 +432,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       messageId,
       toolCalls: round.toolRecords.length,
       deltaCount: round.deltaCount,
+      artifacts: artifactItems.length,
       // ⚠️ 引擎侧的两条"可解释性"实况：非空即意味着映射表要跟着引擎升级（见 `map.ts` 文件头）
       unknownEngineEvents: round.unknownEventTypes.size === 0 ? null : [...round.unknownEventTypes].sort(),
       engineAnomalies: round.anomalies,

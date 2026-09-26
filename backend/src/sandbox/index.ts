@@ -1,6 +1,6 @@
 /**
  * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥，
- * P0-3-6 补事件映射）
+ * P0-3-6 补事件映射，P0-3-7 补产物收集）
  *
  * 依据：`docs/02-后端设计.md` §七（TaskAgent 编排）+ §4.8（任务与产物）+ `docs/06-实施计划.md` §五 P0-3-2/P0-3-3
  *
@@ -12,6 +12,7 @@
  * |--------|--------|
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
  * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃）/ **`createEngineEventMapper`**（引擎事件 → 我方 SSE 事件） |
+ * | P0-3-7 的编排层 | `snapshotWorkFiles`（派活之前拍基线）/ `collectRoundArtifacts`（对照 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
  * | P0-3-8 的停止路径 | `closeSandboxRpc`（只拆连接）/ `recycleSandbox`（真杀容器） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
@@ -71,6 +72,25 @@ export {
   type EngineEventMapping,
   type EngineUsage,
 } from './map.js'
+
+// 产物收集（P0-3-7）：工作卷基线与对照扫描 → 对象存储 → `artifacts` 行
+// ｜ P0-3-6 的编排层 | `snapshotWorkFiles`（派活之前拍基线）+ `collectRoundArtifacts`（收尾对照）
+// ｜ 进程入口（reaper 的那一轮） | `reapExpiredArtifacts`（保留期清理，挂在对账器 tick 里）
+// 纯函数（`parseFindOutput` / `diffWorkFiles` / `filterChangedFiles` / `artifactMimeOf`）也导出：
+// 它们可以**不连 Docker、不连 S3** 地逐条核对（核查口径与 `map.ts` 同款）。
+export {
+  artifactMimeOf,
+  collectRoundArtifacts,
+  diffWorkFiles,
+  filterChangedFiles,
+  parseFindOutput,
+  reapExpiredArtifacts,
+  snapshotWorkFiles,
+  ARTIFACT_EXCLUDED_DIRS,
+  ARTIFACT_EXEC_TIMEOUT_MS,
+  type WorkFileStat,
+  type WorkSnapshot,
+} from './artifacts.js'
 
 // 对账（启动对账 + 周期回收 + 空闲回收 + work 卷体量巡检），由进程入口驱动
 export {

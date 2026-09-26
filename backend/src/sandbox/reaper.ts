@@ -1,5 +1,5 @@
 /**
- * 沙箱对账器（回收器）—— 启动对账 + 周期回收 + 空闲回收（P0-3-2）
+ * 沙箱对账器（回收器）—— 启动对账 + 周期回收 + 空闲回收（P0-3-2）+ 产物保留期清理（P0-3-7）
  *
  * 依据：`docs/子方案/沙箱与引擎集成.md` §九 2（★ **孤儿回收器不是优化，是必需项**）、
  *      §九 1（两个最经典的静默泄漏）、§九 4（三种"高可用"档位 —— P0 只做**进程级自愈**）、
@@ -39,6 +39,7 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import * as docker from './docker.js'
+import { reapExpiredArtifacts } from './artifacts.js'
 import { markSandboxRowsRecycled, recycleSandbox, releaseSandboxSlot } from './manager.js'
 import { clearSandboxQueue, pruneSandboxQueue } from './queue.js'
 import { keepSandboxObject, findOversizedWorkVolumes, readSandboxLabels } from './spec.js'
@@ -442,6 +443,10 @@ function runReapTick(): void {
       await reapIdleSandboxes()
       // 体量巡检排在回收之后：先让该消失的消失，读数才是"留下的那些有多大"
       await auditWorkVolumes()
+      // 产物保留期清理（P0-3-7）：它跟 Docker 无关（只看 `artifacts.created_at` 与 S3），
+      // 但挂在对账器同一轮里跑 —— "周期性的过期收口"不需要第二个定时器与第二套停启纪律。
+      // 放最后：沙箱回收与产物清理互不依赖，前者的失败不该挡住后者（各自 try/catch 在函数内）。
+      await reapExpiredArtifacts()
     } catch (error) {
       // 一轮炸了不该让对账器停摆（下一轮继续）；但必须留 error 级痕迹
       getLogger().error({ err: error }, '沙箱周期对账出错（下一轮继续）')

@@ -393,17 +393,42 @@ export const toolCallRecordSchema = z.object({
 })
 export type ToolCallRecord = z.infer<typeof toolCallRecordSchema>
 
+// ───────────────────── 产物（P0-3-7 定型）─────────────────────
+
+/**
+ * 一条**产出文件**的记录（P0-3-7 定型；`02` §三 的 `artifacts` 行 ↔ 消息 `content.artifacts` 段
+ * ↔ SSE `artifact` 事件三处共用的形状 —— 与 `toolCallRecordSchema` / `citationItemSchema` 同一条纪律：
+ * 同一张卡既由 `artifact` 事件现画、又由 `messages.content.artifacts` 在刷新后重画、
+ * 还要对得上 `artifacts` 表那行，**三处各写一份必先分叉一处**，所以只定义这一次）。
+ *
+ * · `artifactId` = `artifacts` 行的**主键**（`uuid(7)`，Prisma 侧生成）—— 下载/预览（P0-3-9）
+ *   的路由参数就是它，不是 `fileKey`（对象键是实现细节，不出现在契约里）；
+ * · `fileName` = 容器内**相对 `/work` 的路径**（产物可能在子目录里，如 `out/report.csv`
+ *   —— 那**就是**它给用户看的名字，不拆成"目录 + 文件名"两段，前端少一次拼接）；
+ * · `size` / `mime` = 扫描时（P0-3-7）由**后端**按扩展名定的那一组 —— `mime` 是产物
+ *   `Content-Type` 的**唯一来源**（`子方案④` §四：既不是 S3 对象的 `ContentType`、
+ *   也不是扩展名的运行时再判）。
+ */
+export const artifactItemSchema = z.object({
+  artifactId: z.string().min(1),
+  fileName: z.string(),
+  size: z.number().int().min(0),
+  mime: z.string(),
+})
+export type ArtifactItem = z.infer<typeof artifactItemSchema>
+
 /**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *
  * 设计口径（三条，都是"改了就会让历史读不出来"的）：
  *   · **`text` 必填**（可以是空串）：它是历史重建时唯一进入 LLM 上下文的部分
  *     （`orchestrator/chatContext.ts#selectHistoryMessages`）—— 缺了它，多轮对话就断了。
- *   · `thinking` / `citations` / `tool_calls` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
+ *   · `thinking` / `citations` / `tool_calls` / `artifacts` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
  *     与"它有但是空的"在界面上是两件事（思考折叠区 / 引用区 / 工具区该不该出现）。
  *   · `attachments` **当前仍未定型**：附件属 **P1**（`files` 表），现在写进去只会是"猜的形状"，
  *     而 `02` §三 已写明"结构一经写入**不改语义**"。`tool_calls` 已在 **P0-2-8** 定型
- *     （见 {@link toolCallRecordSchema}）—— 定型的判据是"写入端与读取端都已落地"，
+ *     （见 {@link toolCallRecordSchema}）、`artifacts` 已在 **P0-3-7** 定型（见 {@link artifactItemSchema}）
+ *     —— 定型的判据是"写入端与读取端都已落地"，
  *     不是"字段想清楚了"（P0-1-27 当时留着它，正是因为那时**没有写入端**）。
  *     ⚠️ 本 schema **不是 `passthrough` 也**不是 `.strict()` —— 未声明的键会被 Zod **静默剥掉**
  *     （不报错）。**读取端刻意不用它**（`messageItemSchema.content` 是 `z.unknown()`，原样透出，
@@ -415,6 +440,8 @@ export const messageContentSchema = z.object({
   thinking: z.string().optional(),
   citations: z.array(citationItemSchema).optional(),
   tool_calls: z.array(toolCallRecordSchema).optional(),
+  /** 本轮产出文件（P0-3-7；TaskAgent 专属 —— ChatBot 恒省略这个键） */
+  artifacts: z.array(artifactItemSchema).optional(),
 })
 export type MessageContent = z.infer<typeof messageContentSchema>
 
