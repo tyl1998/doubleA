@@ -1,5 +1,6 @@
 /**
- * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥）
+ * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥，
+ * P0-3-6 补事件映射）
  *
  * 依据：`docs/02-后端设计.md` §七（TaskAgent 编排）+ §4.8（任务与产物）+ `docs/06-实施计划.md` §五 P0-3-2/P0-3-3
  *
@@ -10,11 +11,11 @@
  * | 调用方 | 拿什么 |
  * |--------|--------|
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
- * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃） |
+ * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃）/ **`createEngineEventMapper`**（引擎事件 → 我方 SSE 事件） |
  * | P0-3-8 的停止路径 | `closeSandboxRpc`（只拆连接）/ `recycleSandbox`（真杀容器） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
- * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5） |
+ * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5）、`readEngineUsage` / `isKnownEngineEventType`（事件映射，P0-3-6） |
  */
 
 // 生命周期（拿、收、刷活跃、观测）
@@ -56,6 +57,20 @@ export {
 
 // JSONL 分帧（纯逻辑；单独导出是为了能**不连 Docker**地逐条核查"只认 LF"那几条）
 export { createJsonlDecoder, JsonlRecordTooLargeError, PI_RPC_STDIO_MAX_BYTES, type JsonlDecoder } from './jsonl.js'
+
+// 引擎事件映射（P0-3-6）：`map.ts` —— 「容器里的 pi 说了什么」→「我们往外发什么」
+// ⚠️ 它唯一的运行期依赖是 `orchestrator/chatContext.ts` 的两个**纯函数**（摘要 / 截断），
+//    不碰 DB / Redis / SSE 连接 / Docker ⇒ 可以喂一串事件、比结果地逐条核查（§六 3 的映射表）
+export {
+  createEngineEventMapper,
+  isKnownEngineEventType,
+  readEngineUsage,
+  TOOL_RESULT_NO_ERROR_DETAIL,
+  TOOL_SUMMARY_MEMO_LIMIT,
+  type EngineEventMapper,
+  type EngineEventMapping,
+  type EngineUsage,
+} from './map.js'
 
 // 对账（启动对账 + 周期回收 + 空闲回收 + work 卷体量巡检），由进程入口驱动
 export {

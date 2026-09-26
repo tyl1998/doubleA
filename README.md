@@ -379,7 +379,55 @@ docker rm -f sandbox-rpc-probe
 ```
 
 > ⚠️ **仍然不能端测**：`openSandboxRpc()` 是**模块内部路径**，本批交付的是"通道"、
-> **没有任何 HTTP / SSE 面**（谁派活、事件怎么映射成前端的卡，是 P0-3-6）⇒ **最早可端测的点仍是 P0-3-11**。
+> **没有任何 HTTP / SSE 面**（谁派活、事件怎么映射成前端的卡，**已由 P0-3-6 落地 —— 见下一节**）⇒ **最早可端测的点仍是 P0-3-11**。
+
+### 沙箱派活与事件映射（P0-3-6 起；⚠️ 仍不可端测）
+
+**这一批把"通道"接成了"链路"**：后端开始**按智能体类型分流**（`CHATBOT` 仍走 P0-1-27 那套编排，
+`TASK_AGENT` 走新的沙箱编排层），并定死了「容器里的 pi 说了什么 → 前端收到什么卡」的**逐条映射**。
+落点是 `backend/src/sandbox/map.ts`（映射，纯逻辑）+ `backend/src/orchestrator/taskAgent.ts`（编排层）
++ `backend/src/orchestrator/persist.ts`（落库，**从 `chatBot.ts` 原样抽出**、两个编排器共用一份口径）。
+
+| # | 是什么 | 判据 / 落点 |
+|---|--------|-------------|
+| ① | 分流点是 **库里的 `agent.type`** | `resolveChatProducer(agentType)`（`orchestrator/index.ts`）。`assertConversationSendable` 顺手把 `agent.type` 读出来交给路由 ⇒ **不加前端参数、也不信前端参数** |
+| ② | 引擎 tool → **`tool_call{kind:SANDBOX}`** | `tool_execution_start` ⇒ 一张 `RUNNING` 卡（`inputSummary` = 截断 200 的摘要）；`tool_execution_end` ⇒ **同一 `callId`** 的 `SUCCESS` / `ERROR` 卡（`output` = 截断后的正文） |
+| ③ | ⚠️ `tool_execution_end` **不带 `args`** | 所以"同一张卡的两帧必须共用同一份摘要"要靠一小块 `callId → 摘要` 的记忆（`map.ts` 里那块 Map；防呆上界 **200**，正常路径记一条删一条，只在**工具执行中途被打断**时兜底）。⚠️ 同一个记忆还给**落库那份**补 `arguments`：完整入参**只留档、不上线** ⇒ 落库记录与 SSE 帧**只差这一个字段** |
+| ④ | 增量 → **`delta` / `thinking`** | 认 `message_update` 里 `assistantMessageEvent.type` 的 `text_delta` / `thinking_delta`；**其余子类型一律不发** |
+| ⑤ | session stats → **`done.usage`** | 引擎顶层 `usage` 是 **latest cumulative**（原话）⇒ **覆盖**而不是相加（与 ChatBot 那边"一轮调了好几次上游 ⇒ 相加"是两件事）；字段名 `input`/`output` 只在 `readEngineUsage()` 里翻译一次；两个都取不到给 `null`（**不编一个 0**） |
+| ⑥ | ★ **四类刻意不发**（每条都有反例，别顺手补） | **`agent_end`** —— 收尾认的是 `agent_settled`（`bridge.ts` 直接消费、不到映射层）；拿它当收尾会**提前落库**（症状"回答少了一截、但历史里看着是完整的"）／**`toolcall_*` 子类型** —— 那是"模型**打算**调"，`tool_execution_*` 才是"**正在跑**"，两处都发会造出**两张同 `callId` 的卡**、前端 upsert 时状态来回跳／**`tool_execution_update`** —— 卡片只有一进一出三态，没有"中间进度"／**会话内部状态类**（`queue_update` / `thinking_level_changed` / `session_info_changed` / `entry_appended`）—— 界面上没有对应的卡 |
+| ⑦ | **可解释性有两个可核查的出口** | 每条引擎事件过一遍 `KNOWN_ENGINE_EVENT_TYPES`：**认识但不发** = `known:true`；**完全没见过**（版本漂移）= `known:false` —— 两者都**不进事件流**，区别只在编排层要不要留痕。另一条 `anomaly` = **认识、但载荷用不了**（如 `tool_execution_start` 缺 `toolCallId`）⇒ **当场 warn**。两条实况进"本轮结束"日志的 `unknownEngineEvents` / `engineAnomalies` —— **非空即意味着映射表要跟着引擎升级** |
+| ⑧ | 失败码 → 出口 | `SandboxAcquireFailure` 六种 ⇒ `sandboxAcquireError()`；`TurnFailureReason` 五种 ⇒ `engineFailureError()`。★★ **两者的出口其实是同一个：流内 `error{code}` 帧**（这点容易想错）—— `producer` 是 `streamChatReply` 在 **`reply.hijack()` 之后**才调用的 ⇒ 编排层抛的 `AppError` 一定被出口层接住、走 `error` 帧（HTTP 早已是 200 的 SSE）。**JSON 信封只属于"在 `streamChatReply` 之前就抛"的那一类**（未登录 / 参数 / 会话不是我的 / 会话只读 / 缺凭据 —— 全在 `assertConversationSendable` 里）。于是"选哪个工厂"的唯一作用 = **选 `error` 帧里的 `code`**（前端按它取文案）。⚠️ **pi 的原文只进日志、不进 SSE**（用户读到的是我们自己写的中文）；⚠️ `ABORTED` **不是失败**而是"用户在排队时点了停止" ⇒ 按**中断**收尾（落库 + `done{STOPPED}`） |
+
+**想自己验一遍**（⚠️ **同上一节，这一步也是人工取证**：映射表的价值在"喂一串真事件、比结果"，
+而**沙箱路径要 `SANDBOX_IMAGE` + `SANDBOX_EGRESS_PROXY_URL` 都就绪**才会往下走 ——
+`ensureSandbox()` 会**显式拒绝**没配好的环境，这一条本身就是本批的一个正确行为）：
+
+```bash
+# ① 起依赖 + 起后端（务必看启动日志里那两行「沙箱状态 / 沙箱启动对账完成」）
+pnpm dev:infra
+cd backend && node --import tsx src/index.ts
+
+# ② 造一个 TASK_AGENT 智能体（⚠️ 类型在库里，不在请求里）
+#    admin / doubulea-admin-A1；type 只能是 CHATBOT 或 TASK_AGENT
+curl -sS --noproxy '*' -X POST http://127.0.0.1:13000/api/agents \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"name":"沙箱探针","type":"TASK_AGENT","modelId":"<上一步建好的模型 id>","systemPrompt":"用 bash 看看 /work"}'
+#  → 然后用它建一个会话、POST /api/conversations/:id/chat 看 SSE 流
+
+# ③ 要盯的三种行（都在**后端日志**里，不在浏览器里）：
+#    · 「本轮结束」那行带 unknownEngineEvents / engineAnomalies / tokensIn / tokensOut
+#      → 前两个**必须是 0**；非 0 就是映射表落后于引擎版本（这正是 ⑦ 的用处）
+#    · 引擎的抱怨（pi 原文）**只**出现在日志里 ⇒ 用 curl 看 SSE 流时**不应该**看到英文报错
+#    · 拿不到沙箱时（没配 SANDBOX_IMAGE 等）应当看到一帧 error{code:"INTERNAL"} 且**没有落库**
+#      → 换个会话翻一遍消息历史：那一轮**不该**留下"只有问题、没有答案"的记录（⑧ 的正身）
+
+# ④ 清场：容器/卷按「沙箱容器生命周期」那一节复核；新建的 agent 用 DELETE /api/agents/:id 删
+```
+
+> ⚠️ **本批仍然不可端测**：这是第一次有了"能派活"的入口（TaskAgent 会话的 `POST /chat`），
+> 但 ① 沙箱路径要求 `SANDBOX_IMAGE` + `SANDBOX_EGRESS_PROXY_URL` 就绪、② **产物面板与预览属 P0-3-7~11**
+> ⇒ 端到端仍不成立。**最早可端测的点仍是 P0-3-11**，别把上面那段当"跑通了一条业务链路"。
 
 ### 后端配置自检（P0-1-3 起）
 

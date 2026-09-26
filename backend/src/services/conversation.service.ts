@@ -86,6 +86,7 @@ import {
   EMPTY_ACTIVE_SNAPSHOT,
   isConversationReadOnly,
   parseActiveSnapshot,
+  type AgentType,
   type ConversationActive,
   type ConversationItem,
   type ConversationListResult,
@@ -627,6 +628,16 @@ export interface ChatSendContext {
   conversationId: string
   agentId: string
   target: LlmTarget
+  /**
+   * 智能体类型（**P0-3-6 起**）—— `routes/conversations.ts` 用它决定派哪个编排循环
+   * （`orchestrator/index.ts#resolveChatProducer(agentType)`：`CHATBOT` 走后端 RAG 编排，
+   * `TASK_AGENT` 走沙箱里的 pi 引擎）。
+   *
+   * ⚠️ **判据只能来自库里的 `agents.type`**，不能来自请求体 —— 请求体里根本没有这个字段
+   * （`chatRequestBodySchema` 只有 `content` 与 `attachmentFileIds`），客户端无从指定
+   * "我要走哪条链路"。它在本函数的 `select` 里顺带取出来（同一个 `agent` 关系），零额外往返。
+   */
+  agentType: AgentType
 }
 
 /**
@@ -661,7 +672,7 @@ export async function assertConversationSendable(
 ): Promise<ChatSendContext> {
   const row = await getPrisma().conversation.findFirst({
     where: { id, userId: viewer.id },
-    select: { id: true, agentId: true, status: true, agent: { select: { modelId: true } } },
+    select: { id: true, agentId: true, status: true, agent: { select: { modelId: true, type: true } } },
   })
   if (row === null) throw AppError.notFound('会话不存在')
 
@@ -670,7 +681,7 @@ export async function assertConversationSendable(
   }
 
   const target = await resolveChatTarget(row.agent.modelId)
-  return { conversationId: row.id, agentId: row.agentId, target }
+  return { conversationId: row.id, agentId: row.agentId, target, agentType: row.agent.type }
 }
 
 // ═════════════════════════════════════════════════════════════════════

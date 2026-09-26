@@ -194,8 +194,10 @@ export function registerConversationRoutes(app: FastifyInstance): void {
    * ⚠️ **handler 里不能 `await` 完之后再 `return` 任何值**：`streamChatReply` 内部已 `hijack`，
    * 响应归它管（Fastify 的 `reply.sent` 因此恒为 true，不会再碰这个响应）。
    *
-   * ⚠️ **本批的流是"空流"**（编排循环属 P0-1-27）：只发 `ping` 心跳，不发任何内容事件、
-   * 不落库，直到 `/stop` 或客户端断开。原因与接回点见 `orchestrator/index.ts` 的文件头。
+   * ⚠️ 本段原有一句"本批的流是空流（编排循环属 P0-1-27）"—— **P0-1-27 已兑现**（真编排循环），
+   * 且 **P0-3-6 起按 `agent.type` 分流**：`CHATBOT` 走后端 RAG 编排（`chatBot.ts`），
+   * `TASK_AGENT` 走沙箱里的 pi 引擎（`taskAgent.ts`）。分流点**只在**
+   * `orchestrator/index.ts#resolveChatProducer(agentType)`，本 handler 连"有几种链路"都不需要知道。
    */
   app.post<{ Params: ConversationIdParams; Body: ChatRequestBody }>(
     '/api/conversations/:id/chat',
@@ -215,7 +217,8 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         // 检索的 query 与落库时用户消息的正文（P0-1-27 的编排循环两处都要用）
         content: request.body.content,
         target: sendable.target,
-        producer: resolveChatProducer(),
+        // ⚠️ 判据来自闸门（= 库里的 `agents.type`），**不是请求体** —— 见 `ChatSendContext#agentType`
+        producer: resolveChatProducer(sendable.agentType),
       })
     },
   )
@@ -232,8 +235,11 @@ export function registerConversationRoutes(app: FastifyInstance): void {
    * **没人消费的停止键**，它会在 60s 内让用户的下一条消息**秒停**（见 `infra/redis.ts` 的
    * `CHAT_STOP_TTL_SEC`）。
    *
-   * 刻意**不按会话类型分流**（`02` §4.5 的表里写了"停流 / 停流+回收沙箱"）：沙箱与 TaskAgent
-   * 属 **P0-3**，现在没有第二种类型可分流；先写一个只有一条分支的分流器，只会在 P0-3 变成要改的猜测。
+   * 刻意**不按会话类型分流**（`02` §4.5 的表里写了"停流 / 停流+回收沙箱"）：本端点只负责
+   * **写那一个信号键**，而被停止的那条流怎么收尾是它自己的事 —— TaskAgent 一侧由
+   * `bridge.ts#runTurn` 的 abort 监听把信号翻成引擎的 `abort` 命令（P0-3-6 起已通）。
+   * ⚠️ "停流之后要不要**杀掉容器**"是另一件事，属 **P0-3-8**（`子方案③` §九 2）——
+   * 那才是这里将来可能要分流的地方；现在多写一个分支只会是猜测。
    */
   app.post<{ Params: ConversationIdParams }>(
     '/api/conversations/:id/stop',

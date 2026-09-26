@@ -101,13 +101,12 @@ import {
   type McpElicitRequest,
 } from '../mcp/client.js'
 import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
-import { MESSAGE_CHRONO_ORDER, touchConversation } from '../services/conversation.service.js'
+import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
 import { searchKnowledgeBase } from '../services/retrieval.js'
 import {
   TOOL_CONFIRM_REJECTED_OUTPUT,
   TOOL_CONFIRM_TIMEOUT_OUTPUT,
   TOOL_LOOP_LIMIT_NOTICE,
-  buildAssistantContent,
   buildAssistantToolCallsMessage,
   buildSystemPrompt,
   buildToolResultMessages,
@@ -119,11 +118,12 @@ import {
   type HistoryRow,
   type ToolOutcome,
 } from './chatContext.js'
+import { persistRoundQuietly } from './persist.js'
 import { createSemaphore } from './semaphore.js'
 import {
   ChatStoppedError,
+  abortReasonOf,
   type ChatProducer,
-  type ChatStopReason,
   type ConfirmDecision,
 } from './sse.js'
 
@@ -134,17 +134,11 @@ import {
 const chatBotSlots = createSemaphore(config.concurrency.chatbot)
 
 /**
- * 从中断信号里读回"为什么中断"。
- *
- * `signal.reason` 是 `AbortController.abort(reason)` 塞进去的那个对象（见 `sse.ts#SseChannel.abort`），
- * 它可能是任何东西（运行时允许 `abort(undefined)`）⇒ 这里只认 {@link ChatStoppedError}，
- * 其余一律当作"不知道原因"。`user` / `client` / `lock-lost` 的区别在本文件里只用得到一处：
+ * ⚠️ `abortReasonOf(signal)` 自 **P0-3-6** 起搬到了 `sse.ts`（它有了第二个调用方 ——
+ * `taskAgent.ts` 的编排循环要同一个判据，而"同一口径只留一处"是硬要求）。
+ * 行为逐字未变；`user` / `client` / `lock-lost` 的区别在本文件里只用得到一处：
  * **`lock-lost` 不能落库**（见文件头 ①）。
  */
-function abortReasonOf(signal: AbortSignal): ChatStopReason | undefined {
-  const reason: unknown = signal.reason
-  return reason instanceof ChatStoppedError ? reason.reason : undefined
-}
 
 /**
  * ChatBot 的编排循环（`orchestrator/index.ts` 的返回值）。
@@ -706,76 +700,11 @@ export const chatBotProducer: ChatProducer = async (input) => {
   }
 }
 
-/** {@link persistRoundQuietly} 的入参 */
-interface PersistRoundInput {
-  conversationId: string
-  content: string
-  assistantText: string
-  thinkingText: string
-  citations: CitationItem[]
-  /** 本轮的工具调用记录（P0-2-8）—— 落进助手消息的 `content.tool_calls` */
-  toolRecords: readonly ToolCallRecord[]
-  usage: ChatUsage | null
-  logger: ReturnType<typeof getLogger>
-}
-
 /**
- * 把这一轮落库：**用户消息 + 助手消息 + 活跃时间，同一个事务**。
+ * ⚠️ `persistRoundQuietly()` 与它的入参类型自 **P0-3-6** 起搬到了 `persist.ts`。
  *
- * 三件事一起做的理由（`02` §4.5 ④）：`touchConversation` 的签名收
- * `Pick<PrismaClientInstance,'conversation'>` **就是为了能被这里的 `tx` 直接传入** ——
- * 它自己不开事务，否则"消息落库"与"活跃时间"会变成两次写入（中间失败就出现
- * "会话里有消息、侧栏却不动"）。
- *
- * 助手消息**只在真的有内容时才写**：`text` / `thinking` / `citations` / `tool_calls` 四者全空时
- * （用户刚发出去就点了停止）不写助手行 —— 留一条空消息会在界面上画出一个空气泡。
- * 此时 `done.messageId` 为 `null`，它的语义正是"**这一轮没有产生可持久化的消息**"
- * （`shared/src/sse.ts` 文件头 ④）。
- * ⚠️ **工具记录也算内容**（P0-2-8）：一轮"只调了工具、还没等到最终回答就被停止"的生成
- * 在界面上是有东西的（工具卡），把它当成"空"会让那一轮的卡片在刷新后消失。
- *
- * **落库失败不外抛**：回答已经完整地流给用户看了，此时再用 `error` 帧覆盖掉
- * "回答成功"这件事，是拿一条基础设施故障去否定一个已经发生的事实。
- * 处置是**如实报告**：日志记 error + `messageId: null`（"没有产生可持久化的消息"这句字面为真），
- * 前端据此可以说"本条未写入历史"。⚠️ 代价写在这里：这一轮在历史里查不到（刷新后会消失）。
+ * 理由：**两个编排器**（本文件的 ChatBot、`taskAgent.ts` 的 TaskAgent）收尾时要落同一件事，
+ * 而"助手消息什么时候该写"这类判据在两处各写一份必然有一处先腐烂（`06` §六 第 ⑰ 条）。
+ * 行为**逐字未变**（只搬位置 + 把 `usage` 的入参收窄成 `RoundUsage`）——
+ * 想核对时看 `git log -p -- backend/src/orchestrator/chatBot.ts` 里删除的那一段。
  */
-async function persistRoundQuietly(input: PersistRoundInput): Promise<string | null> {
-  const { conversationId, content, assistantText, thinkingText, citations, toolRecords, usage, logger } = input
-  const hasAssistantContent =
-    assistantText !== '' || thinkingText !== '' || citations.length > 0 || toolRecords.length > 0
-  try {
-    const db = getPrisma()
-    return await db.$transaction(async (tx) => {
-      await tx.message.create({
-        data: { conversationId, role: 'USER', content: { text: content } },
-      })
-      let assistantMessageId: string | null = null
-      if (hasAssistantContent) {
-        const created = await tx.message.create({
-          data: {
-            conversationId,
-            role: 'ASSISTANT',
-            content: buildAssistantContent({
-              text: assistantText,
-              thinking: thinkingText,
-              citations,
-              toolCalls: toolRecords,
-            }),
-            // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）
-            tokensIn: usage?.tokensIn ?? null,
-            tokensOut: usage?.tokensOut ?? null,
-          },
-        })
-        assistantMessageId = created.id
-      }
-      await touchConversation(tx, conversationId, new Date())
-      return assistantMessageId
-    })
-  } catch (error) {
-    logger.error(
-      { err: error, conversationId, hasAssistantContent, generatedChars: assistantText.length },
-      '本轮消息落库失败（回答已流给用户，但历史里不会有这一轮）',
-    )
-    return null
-  }
-}

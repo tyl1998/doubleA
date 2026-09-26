@@ -497,6 +497,25 @@ export class ChatStoppedError extends Error {
   }
 }
 
+/**
+ * 从中断信号里读回"为什么中断"。
+ *
+ * ★ **两个编排器都要它**（P0-3-6 从 `chatBot.ts` 的私有函数升到这里）：
+ * `chatBot.ts`（ChatBot）与 `taskAgent.ts`（TaskAgent）在收尾时都要做同一个判断 ——
+ * **`lock-lost` 不能落库**（那时这个会话可能已经有**另一个流**在写历史，我们再写一次就是
+ * 两边往同一份历史里插消息），而 `user` / `client` 要落库（`01` 决策 15「停止即中断，
+ * **已生成内容保留**」—— 保留的前提就是落库，否则刷新之后用户看到的是"我停了一下，问题没了"）。
+ * 判据必须**只有一处来源**（`docs/06` §六 第 ⑰ 条），故它不该在两个编排器里各写一遍。
+ *
+ * `signal.reason` 是 `abort(reason)` 塞进去的那个对象（见 {@link SseChannel.abort}），
+ * 它可能是任何东西（运行时允许 `abort(undefined)`）⇒ 这里只认 {@link ChatStoppedError}，
+ * 其余一律当作"不知道原因"。
+ */
+export function abortReasonOf(signal: AbortSignal): ChatStopReason | undefined {
+  const reason: unknown = signal.reason
+  return reason instanceof ChatStoppedError ? reason.reason : undefined
+}
+
 /** producer 完成后交给出口层的收尾信息 */
 export interface ChatProducerResult {
   /**
