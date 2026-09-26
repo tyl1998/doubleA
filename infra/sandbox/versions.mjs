@@ -65,11 +65,23 @@ export const DEFAULT_NPM_REGISTRY = 'https://registry.npmjs.org'
 export const BASE_IMAGE_NAME = 'doubulea/sandbox-base'
 export const TOOLKIT_IMAGE_NAME = 'doubulea/sandbox-toolkit'
 
-/** base 层内容版本（改 Node 基线 / pi 版本 / 桥扩展 / pi 配置 时 +1） */
-export const BASE_LAYER_VERSION = '1'
+/**
+ * base 层内容版本（改 Node 基线 / pi 版本 / 桥扩展 / pi 配置 时 +1）
+ *
+ * ⚠️ **P0-3-4 起为 `2`**：本批新增了运行期的 `models.json` 生成器（`base/gen-models.mjs`）并在
+ * `entrypoint.sh` 里加了一步调用 ⇒ 只读层内容变了。**必须改这个数**，否则宿主上会同时留着
+ * `base:1` 与 `base:2`，"上次构建的"与"这次跑的"就此分叉（而症状只是"新代码没生效"）。
+ */
+export const BASE_LAYER_VERSION = '2'
 
-/** toolkit 层内容版本（加一个 python 包 / CLI 时 +1） */
-export const TOOLKIT_LAYER_VERSION = '1'
+/**
+ * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
+ *
+ * ⚠️ **P0-3-4 起为 `2`**：toolkit 本身一行没改，但它 `FROM` 的是 base 层 ——
+ * base 内容变了就必须重建一份新的 toolkit tag，否则 `doubulea/sandbox-toolkit:1`
+ * 仍然指向**旧 base 里的那套入口**（= 没有 models.json 生成那一步）。
+ */
+export const TOOLKIT_LAYER_VERSION = '2'
 
 /** `doubulea/sandbox-base:<ver>` —— toolkit 的 `FROM` 与 `.env` 的 `SANDBOX_IMAGE_BASE` 都用它 */
 export const baseImageRef = () => `${BASE_IMAGE_NAME}:${BASE_LAYER_VERSION}`

@@ -118,25 +118,26 @@ pnpm sandbox:build -- --registry https://registry.npmmirror.com
 
 | 项 | 值 |
 |----|----|
-| base 镜像 | `doubulea/sandbox-base:1` |
-| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:1` |
+| base 镜像 | `doubulea/sandbox-base:2`（P0-3-4 起；`:1` 是上一版，缺 `gen-models.mjs` 那一步） |
+| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:2` |
 | pin 的引擎 | `@earendil-works/pi-coding-agent@0.87.1`（Node ≥ 22.19.0，镜像内实为 22.23.3） |
 | 镜像内用户 | `agent`（uid 10001，**非 root**）；可写点只有 `/work`（卷）与 `/tmp`（P0-3-3 起是 tmpfs） |
-| pi 配置 | **只读种子**烤进 `/opt/pi/agent`（`PI_AGENT_SEED`，对 agent 只读）；入口 `entrypoint.sh` 把它 `cp -an` **播种**到可写的 `/tmp/pi-agent`（`PI_CODING_AGENT_DIR`）后再 `exec pi`。⚠️ 必须两步：pi 读 `settings.json` 会**先在同目录加锁**，只读目录上加不上锁 ⇒ 整份 settings 被判 invalid 并**静默忽略**。里面**没有 `auth.json`**（Key 走容器环境变量） |
+| pi 配置 | **只读种子**烤进 `/opt/pi/agent`（`PI_AGENT_SEED`，对 agent 只读）；入口 `entrypoint.sh` 把它 `cp -an` **播种**到可写的 `/tmp/pi-agent`（`PI_CODING_AGENT_DIR`）后再 `exec pi`。⚠️ 必须两步：pi 读 `settings.json` 会**先在同目录加锁**，只读目录上加不上锁 ⇒ 整份 settings 被判 invalid 并**静默忽略**。里面**没有 `auth.json`**（Key 走容器环境变量）；**P0-3-4 起播种后多一步 `gen-models.mjs`** ⇒ 运行期生成 `models.json`，而它的 `apiKey` 只是 `${DOUBULEA_LLM_API_KEY}` **引用**（见「沙箱 LLM 注入」一节） |
 | 依赖自检 | 构建末步跑 `toolkit/selfcheck.sh`，缺一个依赖就让 **build 失败** |
 
 ```bash
 # 在活容器里重跑依赖自检（排障时先跑它，能把"镜像问题"与"用法问题"分开）
-docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:1
+docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:2
 # 手 run 一个"能说话"的容器（默认 CMD 就是 --mode rpc）
-docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:1 --help
+docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:2 --help
 ```
 
 > ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
 > `npm i` **必然失败**，而阶段三的验收场景「分析这份 CSV 出汇总表」恰恰要 pandas（`子方案③` §五 2）。
 > 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
-> ⚠️ **本步不是可端测里程碑**：容器生命周期**已落地**（P0-3-2，见下一节）、但两条网络出口（P0-3-3）、
-> 模型 Key 注入（P0-3-4）、引擎桥（P0-3-5/6）都还没做 ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
+> ⚠️ **本步不是可端测里程碑**：容器生命周期**已落地**（P0-3-2，见下一节）、两条网络出口（P0-3-3）、
+> 模型 Key 注入（P0-3-4，见后面「沙箱 LLM 注入」一节）都已落地，但**引擎桥还没接**（P0-3-5/6）
+> ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
 
 ### 沙箱容器生命周期（P0-3-2 起；⚠️ 仍然派不了活）
 
@@ -167,7 +168,7 @@ docker volume create \
   doubulea-work-00000000-0000-7000-8000-000000000001
 docker create \
   --label doubulea.role=sandbox --label doubulea.conversation=00000000-0000-7000-8000-000000000001 \
-  --network none -i doubulea/sandbox-toolkit:1
+  --network none -i doubulea/sandbox-toolkit:2
 docker ps -a --filter label=doubulea.role=sandbox        # 应看到刚造的那个（Created）
 docker volume ls --filter label=doubulea.role=sandbox    # 应看到刚造的卷
 
@@ -243,7 +244,7 @@ docker run -d --name sandbox-sec-probe \
   --mount type=volume,src=doubulea-work-00000000-0000-7000-8000-000000000002,dst=/work \
   --network doubulea-sandbox \
   -e HTTP_PROXY=http://PROXY:3128 -e HTTPS_PROXY=http://PROXY:3128 -e NO_PROXY=GW:13001 \
-  doubulea/sandbox-toolkit:1
+  doubulea/sandbox-toolkit:2
 
 # ③ 逐条取证（期望值写在行尾）
 docker exec sandbox-sec-probe node -e "require('fs').writeFileSync('/x','a')"        # EROFS（只读 rootfs）
@@ -261,6 +262,75 @@ docker rm -f sandbox-sec-probe && docker volume rm doubulea-work-00000000-0000-7
 > ⚠️ **仍然不能端测**：本批**没有任何入口能创建沙箱**（调用方 = TaskAgent `/chat`，属 P0-3-5/6），
 > listener 也**还没有端点**（`/api/sandbox/*` 属 P0-3-9b）⇒ **最早可端测的点仍是 P0-3-11**。
 > 上面那段是**手工起容器**看隔离，不是"跑通了一条业务链路"。
+
+### 沙箱 LLM 注入（P0-3-4 起；⚠️ 仍然派不了活）
+
+**这一批解决的是「容器里的引擎怎么知道该调哪个模型」** —— 答案不是把 Key 烤进镜像，而是
+**后端在起容器时算好、只用容器环境变量带进去**，并且**磁盘上任何一份 pi 配置里都不出现 Key 明文**。
+
+| # | 是什么 | 判据 / 落点 |
+|---|--------|-------------|
+| ① | `agent.model_id` → 解密 Key | **复用** `services/model.service.ts#resolveChatTarget()`（不另写一套解密/校验）；落点 `backend/src/sandbox/llm.ts`。⚠️ 它排在"动容器"**之前** ⇒ 拿不到就 `MODEL_NOT_AVAILABLE`、**容器根本不建** |
+| ② | 六个容器环境变量 | `DOUBULEA_LLM_{API_KEY,BASE_URL,API,MODEL,PROVIDER,LABEL}`（常量 `SANDBOX_LLM_ENV`）。**没有新增任何宿主 env** |
+| ③ | `models.json` 只写**引用** | `apiKey` 恒为 `${DOUBULEA_LLM_API_KEY}` —— pi 的 `apiKey`/`headers` 支持 `${ENV}` 插值，而 `baseUrl`/`api` **不支持** ⇒ 后两个只能由后端算成实值再传。生成脚本末尾有**自检**：序列化结果里出现 Key 明文就 `exit(1)`，**容器起不来** |
+| ④ | 三协议映射 | `OPENAI_COMPAT`→`openai-completions` / `OPENAI_RESPONSES`→`openai-responses` / `ANTHROPIC_MESSAGES`→`anthropic-messages`（唯一落点 `spec.ts#piApiForProtocol`；容器侧只照抄 api 名） |
+| ⑤ | `baseUrl` 归一 | 我方契约要求 baseUrl **自带 `/v1`**（`llm/client.ts` 是字符串拼接 `${baseUrl}${chatPath}`）；OpenAI SDK 同口径，而 **Anthropic SDK 自己加 `/v1`** ⇒ `piBaseUrlFor()` 对 anthropic **去掉尾部 `/v1`** |
+| ⑥ | 「模型换了但容器还活着」 | 容器标签多一个 **`doubulea.model=<id>`**：复用前比对 `llm.modelId`，不一致 ⇒ 回收后**新建**（⚠️ 标签读不出来一律按"重建"处理；它**不参与对账**） |
+
+**想自己验一遍**（⚠️ **这一步是人工取证**：`06` §六 第 30 条「验收一律人工，智能体不代跑」——
+它要证的是"真跑一轮之后 Key 没落在可写区任何文件里"，而**假上游回什么都不影响这条结论**，
+所以下面第三台服务器**故意回 500**）：
+
+```bash
+# ① 假"模型池"：只把收到的 路径 + 鉴权头 打出来，然后**故意回 500**
+#    —— 要证的是"请求打到了哪条路径、带了什么头"，不是"模型答得对"（那属 P0-3-5/6）
+node --input-type=module -e '
+const http = await import("node:http");
+const srv = http.createServer(async (req, res) => {
+  let body = ""; for await (const c of req) body += c;
+  console.log("[假模型池] " + req.method + " " + req.url);
+  console.log("           authorization=" + (req.headers["authorization"] ?? "(无)") +
+              " | x-api-key=" + (req.headers["x-api-key"] ?? "(无)") +
+              " | anthropic-version=" + (req.headers["anthropic-version"] ?? "(无)"));
+  res.writeHead(500, { "content-type": "application/json" })
+     .end(JSON.stringify({ error: { message: "probe-only" } }));
+});
+srv.listen(0, "0.0.0.0", () => console.log("LLMPORT=" + srv.address().port));
+'
+#  → LLMPORT=<port>。契约要求 baseUrl **自带 /v1** ⇒ 下面填 http://host.docker.internal:<port>/v1
+
+# ② 起一个真跑一轮 pi 的容器（⚠️ 命令跑完不退出，好让 ③ 进去取证）
+#    哨兵 Key 取一个一眼能认出来的串；`doubulea` = SANDBOX_PI_PROVIDER_ID
+docker run -d --name sandbox-llm-probe \
+  -v doubulea-sandbox-llm-probe:/work \
+  -e DOUBULEA_LLM_API_KEY=sk-probe-DO-NOT-LEAK-000000000000 \
+  -e DOUBULEA_LLM_BASE_URL=http://host.docker.internal:LLMPORT/v1 \
+  -e DOUBULEA_LLM_API=openai-completions \
+  -e DOUBULEA_LLM_MODEL=probe-model \
+  -e DOUBULEA_LLM_LABEL=探针模型 \
+  --entrypoint sh doubulea/sandbox-toolkit:2 -c \
+  '/opt/pi/entrypoint.sh -p "你好" --no-approve --provider doubulea --model probe-model; echo "--- pi exit=$? ---"; sleep 900'
+#  ⚠️ macOS/OrbStack 上 host.docker.internal 指向宿主；不通就用 `docker network inspect bridge` 的网关 IP
+#  ⚠️ 假上游屏幕上应出现一行 POST（路径 = /v1/chat/completions，或 responses/messages 看 api 取值）
+#     —— 那一行就是 ④⑤ 两条映射的**直接取证**；只换 DOUBULEA_LLM_API 重跑本步可得另两条
+
+# ③ 取证三条（期望值写在行尾）
+docker exec sandbox-llm-probe sh -c 'cat /tmp/pi-agent/models.json'
+#   → apiKey 必须是 "${DOUBULEA_LLM_API_KEY}"，**不是** sk-probe-…（这是本条最要紧的一条）
+docker exec sandbox-llm-probe sh -c 'rg -F -l sk-probe-DO-NOT-LEAK /work /tmp /home/agent || echo "OK：一个文件都没命中"'
+#   → 期望打印 "OK：…"（rg 无命中退出码 1）⇒ Key 没落进 work 卷、没落进 session 文件
+docker exec sandbox-llm-probe sh -c 'ls -l /tmp/pi-sessions/ ; du -sh /tmp/pi-sessions ; df -h /tmp | tail -n 1'
+#   → session 文件的位置与体积；`df` 一行是 tmpfs 的已用/总量（⚠️ 它**不在** work 卷上）
+
+# ④ 清场
+docker rm -f sandbox-llm-probe && docker volume rm doubulea-sandbox-llm-probe
+```
+
+> ⚠️ **为什么"三协议都支持"这件事值得单独记一句**：它把 `子方案③` §十三 **待决 1 关掉了** —— 原先
+> 担心 `ANTHROPIC_MESSAGES` 不吃，得在选模型的界面上加一条"不支持任务型 Agent"的收窄判定；实际
+> pi 有 `dist/api/anthropic-messages.js`，三条都有对应实现 ⇒ **不需要收窄**。
+> ⚠️ **仍然不能端测**：`ensureSandbox()` 仍是**模块内部路径**（入口 = TaskAgent `/chat`，属 P0-3-5/6），
+> 上面那段是**手工起容器**做一次取证，不是"跑通了一条业务链路" ⇒ **最早可端测的点仍是 P0-3-11**。
 
 ### 后端配置自检（P0-1-3 起）
 

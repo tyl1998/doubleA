@@ -25,6 +25,15 @@
 #   PI_AGENT_SEED     = 只读种子（镜像里烤好的那份，agent 不可写）
 #   PI_CODING_AGENT_DIR = pi 实际使用的 agent-dir（**必须可写**）
 #   两者相同时不做任何拷贝（允许有人故意把 agent-dir 指回种子目录，便于对照实验）。
+#
+# 【P0-3-4 加的第二步：生成 models.json】
+#   模型池地址 / 模型名 / 协议都是**每会话才知道**的（前者来自 Provider 行、后者来自 Agent 行）
+#   ⇒ 它们不可能烤在只读种子里，只能在容器启动时生成。生成用 `gen-models.mjs`：
+#     · 输入是后端注入的 `DOUBULEA_LLM_*` 环境变量；
+#     · **Key 只以 `${DOUBULEA_LLM_API_KEY}` 引用形式落盘**（pi 在请求期自己读环境变量）
+#       ⇒ 磁盘上那份 models.json 永远不含 Key（`子方案③` §五 3 硬约束 1）；
+#     · 什么都不传时**跳过**（退出码 0）—— 镜像要能直接 `docker run` 起来手工调试。
+#   顺序不许动：必须在播种**之后**（种子里的 extensions/ 要先就位）、`exec pi` 之前。
 # =====================================================================
 
 set -euo pipefail
@@ -37,6 +46,12 @@ if [ "$AGENT_DIR" != "$SEED_DIR" ]; then
   # `-a` 保留目录结构与权限、`-n` 不覆盖已存在的文件 ⇒ 幂等（可重入；容器内 agent-dir 本身就
   # 是一次性的，但重入性让"在活容器里手动再跑一次"也安全）。
   cp -an "$SEED_DIR/." "$AGENT_DIR/"
+
+  # ⚠️ 只在**可写** agent-dir 上生成：agent-dir == 种子目录时那是只读的（对照实验的形态），
+  #    写进去必然 EACCES。显式跳过并说明，而不是让 `set -e` 把它变成一次"容器起不来"。
+  node /opt/pi/gen-models.mjs
+else
+  echo "[pi-models] 跳过：PI_CODING_AGENT_DIR 指向只读种子目录（$SEED_DIR），不生成 models.json"
 fi
 
 exec pi "$@"

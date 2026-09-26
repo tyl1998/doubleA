@@ -189,6 +189,29 @@ export async function sandboxContainerExists(containerId: string): Promise<boole
 }
 
 /**
+ * 读一个容器的**标签**（P0-3-4 新增：复用前比对"里面那套 LLM 目标还是不是这一轮的"）。
+ *
+ * 三种"没有标签"的路都归成 `undefined`：容器不存在（404）、`Config.Labels` 缺失、空对象。
+ * **刻意不做区分**：调用方（`manager.ts` 的复用判定）对这三种的处理完全一样 —— 都当
+ * "读不出模型 ⇒ 不一致 ⇒ 回收重建"，而"重建"在三种情形下都是安全动作。
+ * 与 `sandboxContainerExists` 的分工：那个回答"还在不在"（`false` 是**业务答案**），
+ * 这个回答"它身上写着什么"。
+ */
+export async function inspectSandboxContainerLabels(
+  containerId: string,
+): Promise<Readonly<Record<string, string>> | undefined> {
+  try {
+    const info = await getDocker().getContainer(containerId).inspect()
+    const labels = info.Config?.Labels
+    if (labels === undefined || labels === null) return undefined
+    return Object.keys(labels).length > 0 ? labels : undefined
+  } catch (error) {
+    if (isDockerNotFound(error)) return undefined
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
+/**
  * 删容器。**`v: true` 恒开**（`子方案③` §九 1：不带它就会留下匿名卷，越堆越多，
  * 是 Docker 上"磁盘悄悄满"的头号原因）。
  *

@@ -39,6 +39,7 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import * as docker from './docker.js'
+import { resolveSandboxLlm, type SandboxLlmResult } from './llm.js'
 import {
   claimSandboxQueueHead,
   enqueueSandboxQueue,
@@ -52,6 +53,7 @@ import { ensureSandboxNetwork, type SandboxNetwork } from './network.js'
 import {
   buildSandboxContainerSpec,
   isNonRootImageUser,
+  readSandboxLabels,
   sandboxEgressEnv,
   sandboxLabels,
   workVolumeName,
@@ -91,6 +93,15 @@ export type SandboxAcquireFailure =
   | 'NOT_CONFIGURED'
   /** 会话不存在 / 已结束（只读） */
   | 'CONVERSATION_NOT_FOUND'
+  /**
+   * 这一轮用的**模型不可用**（P0-3-4）—— 模型没配 Key、模型/Provider 已停用或被删。
+   *
+   * 为什么单独一个码而不是并进 `NOT_CONFIGURED`：两者的**修法完全不同**
+   * （一个是"管理员去把 SANDBOX_IMAGE / 代理配上"，一个是"用户去模型池/智能体页改一改"），
+   * 而编排层要按码选文案。与 P0-2 的 `NEED_CREDENTIAL` 是同一族判断：
+   * "缺凭据"值得一个独立的码，因为它指向一个具体的、用户能自己完成的动作。
+   */
+  | 'MODEL_NOT_AVAILABLE'
   /** 等名额超时（= 排队项 TTL 到期） */
   | 'QUEUE_TIMEOUT'
   /** 等待期间被取消（用户点了停止 / 流断了） */
@@ -162,12 +173,22 @@ export async function ensureSandbox(
 
   // ② 校验排在删除之前：会话必须存在且 ACTIVE。⚠️ 已结束（Agent 被软删后转只读）的会话
   //    不该再起容器 —— 它连新消息都不该收。
+  //    ★ 同时把 `agent.model_id` 一起取出来（P0-3-4）：容器要用的 Key/地址/模型名全靠它解析，
+  //    而"两次查询之间模型被改掉"这个窗口没必要存在 —— 一次往返把两问都答了。
   const conversation = await getPrisma().conversation.findUnique({
     where: { id: conversationId },
-    select: { status: true },
+    select: { status: true, agent: { select: { modelId: true } } },
   })
   if (conversation === null) return fail('CONVERSATION_NOT_FOUND', '会话不存在')
   if (conversation.status !== 'ACTIVE') return fail('CONVERSATION_NOT_FOUND', '会话已结束（只读）')
+
+  // ★ P0-3-4 第二道校验：解析这一轮要注入容器的 LLM 目标。
+  //   位置是刻意的 —— 与上面两条配置校验一样**排在"动容器"之前**：
+  //   模型不可用时，容器根本不该被建出来（建了它也只能在容器里失败，而容器内的失败只会以
+  //   一条含糊的 stderr 出现，见 `子方案③` §六 3）。这里失败还**没占名额**、没有副作用。
+  //   ⚠️ 返回值含明文 Key ⇒ **只往下传给 `buildSandboxContainerSpec`**，不 log（见 `llm.ts` 文件头）。
+  const llm = await resolveSandboxLlm(conversation.agent.modelId)
+  if (!llm.ok) return fail(llm.code, llm.message)
 
   // ① 复用：账本说有 RUNNING 行 **且容器真的还在**（账本会撒谎，Docker 不会）
   const running = await getPrisma().sandbox.findFirst({
@@ -177,29 +198,45 @@ export async function ensureSandbox(
   })
   if (running !== null && running.containerId !== null) {
     if (await docker.sandboxContainerExists(running.containerId)) {
-      if (!slots.tryAdd(conversationId) && !slots.has(conversationId)) {
-        // 只可能是"别的会话把名额占满了"（单实例下正常不该发生）⇒ 以容器为准放行 + 留痕。
-        // 不在这里报错：把矛盾暴露出来，但不让一个已经存在的容器变成不可用。
-        getLogger().warn(
-          { conversationId, size: slots.size, limit: slots.limit },
-          '复用已有沙箱时名额册已满：计数与容器实际数短暂不一致（按"容器为准"继续）',
+      // ★ P0-3-4：复用之前必须确认"容器里那套 LLM 目标还是这一轮的"。
+      //   容器环境变量是**建的时候**注入的，而模型可以被改（`PATCH /api/agents/:id`）——
+      //   不比对的话，改了模型之后同一会话的下一轮**继续用旧的 Key 与旧的模型名**调，
+      //   而 Docker 与账本都不会报错（症状：账单与回答都不是你以为的那家）。
+      //   判据用标签 `doubulea.model`（只存 id，不存 Key）；**读不出来就当不一致** ——
+      //   这与对账器"标签读不出来也删"是同一条推理：读不出来时"重建"是唯一安全的动作。
+      const labels = readSandboxLabels(await docker.inspectSandboxContainerLabels(running.containerId))
+      if (labels?.modelId !== llm.modelId) {
+        getLogger().info(
+          { conversationId, containerId: running.containerId, was: labels?.modelId, now: llm.modelId },
+          '复用沙箱前发现模型已变（或容器没有模型标签）⇒ 回收重建',
         )
+        await recycleSandbox(conversationId, 'model-changed')
+      } else {
+        if (!slots.tryAdd(conversationId) && !slots.has(conversationId)) {
+          // 只可能是"别的会话把名额占满了"（单实例下正常不该发生）⇒ 以容器为准放行 + 留痕。
+          // 不在这里报错：把矛盾暴露出来，但不让一个已经存在的容器变成不可用。
+          getLogger().warn(
+            { conversationId, size: slots.size, limit: slots.limit },
+            '复用已有沙箱时名额册已满：计数与容器实际数短暂不一致（按"容器为准"继续）',
+          )
+        }
+        return {
+          ok: true,
+          sandbox: {
+            sandboxId: running.id,
+            conversationId,
+            containerId: running.containerId,
+            volumeName: workVolumeName(conversationId),
+            image: running.image,
+            createdAt: running.createdAt,
+            reused: true,
+          },
+        }
       }
-      return {
-        ok: true,
-        sandbox: {
-          sandboxId: running.id,
-          conversationId,
-          containerId: running.containerId,
-          volumeName: workVolumeName(conversationId),
-          image: running.image,
-          createdAt: running.createdAt,
-          reused: true,
-        },
-      }
+    } else {
+      // 容器没了（被手工删 / 宿主清理 / 崩过）⇒ 先把账面收干净，再走新建
+      await recycleSandbox(conversationId, 'container-missing')
     }
-    // 容器没了（被手工删 / 宿主清理 / 崩过）⇒ 先把账面收干净，再走新建
-    await recycleSandbox(conversationId, 'container-missing')
   }
 
   if (!(await tryAcquireSlotNow(conversationId))) {
@@ -210,7 +247,7 @@ export async function ensureSandbox(
   }
 
   try {
-    return { ok: true, sandbox: await createSandbox(conversationId, image, runtime) }
+    return { ok: true, sandbox: await createSandbox(conversationId, image, runtime, llm) }
   } catch (error) {
     // ★ 名额必须还回去：不还的话每失败一次漏一个槽位，且**重启才恢复**（名额是进程内的）
     slots.remove(conversationId)
@@ -299,7 +336,12 @@ interface SandboxRuntime {
   backendUrl: string
 }
 
-async function createSandbox(conversationId: string, image: string, runtime: SandboxRuntime): Promise<SandboxHandle> {
+async function createSandbox(
+  conversationId: string,
+  image: string,
+  runtime: SandboxRuntime,
+  llm: Extract<SandboxLlmResult, { ok: true }>,
+): Promise<SandboxHandle> {
   const prisma = getPrisma()
   const startedAt = new Date()
   const volumeName = workVolumeName(conversationId)
@@ -331,7 +373,7 @@ async function createSandbox(conversationId: string, image: string, runtime: San
     }
     await docker.createSandboxVolume({
       name: volumeName,
-      labels: sandboxLabels({ conversationId, startedAt }),
+      labels: sandboxLabels({ conversationId, startedAt, modelId: llm.modelId }),
     })
     containerId = await docker.createSandboxContainer(
       buildSandboxContainerSpec({
@@ -339,9 +381,18 @@ async function createSandbox(conversationId: string, image: string, runtime: San
         conversationId,
         volumeName,
         startedAt,
+        // ★ 模型 id 进标签（P0-3-4）：**复用前比对的唯一判据**（`ensureSandbox` 里那一段）。
+        //   为什么不用 `sandboxes` 表存：表里的行是"账本"，而模型变更是**容器属性**的问题 ——
+        //   要在"谁占着这个容器"这个问题上有一个跟着容器走的答案（同 label 族的其余三问）。
+        modelId: llm.modelId,
         network: runtime.network.name,
         limits: config.sandbox.limits,
-        env: sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
+        // 出口①/②（`sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，含**明文 Key**）拼成一份
+        // Env。⚠️ 后者只在**这里**被消费，别顺手把它塞进日志（见 `llm.ts` 文件头）。
+        env: {
+          ...sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
+          ...llm.env,
+        },
       }),
     )
     await docker.startSandboxContainer(containerId)

@@ -12,7 +12,9 @@
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` |
  * | P0-3-5/6 的编排层 | `ensureSandbox`（拿沙箱）/ `touchSandbox`（引擎事件刷活跃）/ `recycleSandbox` |
  * | P0-3-8 的停止路径 | `recycleSandbox` |
+ * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV`（拼 `--model <provider>/<model>`）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `sandboxQueueDepth` |
+ * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4） |
  */
 
 // 生命周期（拿、收、刷活跃、观测）
@@ -27,6 +29,9 @@ export {
   type SandboxHandle,
   type SandboxStats,
 } from './manager.js'
+
+// LLM 注入（P0-3-4）：把 `agents.model_id` 解析成"要注入容器的那组环境变量"
+export { resolveSandboxLlm, type SandboxLlmFailureCode, type SandboxLlmResult } from './llm.js'
 
 // 对账（启动对账 + 周期回收 + 空闲回收 + work 卷体量巡检），由进程入口驱动
 export {
@@ -67,6 +72,7 @@ export { sandboxQueueDepth, sandboxQueueKey, sandboxQueuePosition } from './queu
 // 名字与标签契约（纯函数；"哪些容器是我们的"**只**由它们回答）
 export {
   SANDBOX_LABEL_CONVERSATION,
+  SANDBOX_LABEL_MODEL,
   SANDBOX_LABEL_ROLE,
   SANDBOX_LABEL_STARTED_AT,
   SANDBOX_ROLE,
@@ -74,4 +80,14 @@ export {
   WORK_VOLUME_PREFIX,
   readSandboxLabels,
   workVolumeName,
+} from './spec.js'
+
+// LLM 目标的拼装（纯函数，P0-3-4）—— 容器内 `gen-models.mjs` 读的就是 `SANDBOX_LLM_ENV` 这几个名字
+export {
+  piApiForProtocol,
+  piBaseUrlFor,
+  sandboxLlmEnv,
+  SANDBOX_LLM_ENV,
+  SANDBOX_PI_PROVIDER_ID,
+  type SandboxLlmInput,
 } from './spec.js'

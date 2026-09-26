@@ -103,6 +103,55 @@ fi
 check '播种结果里有 settings.json 与桥扩展' \
   bash -c 'test -f /tmp/selfcheck-agent/settings.json && test -f /tmp/selfcheck-agent/extensions/mcp-bridge/index.ts && echo ok'
 
+# ★ P0-3-4：LLM 目标生成器（`models.json`）—— 两条硬约束，**反例 + 正例成对**
+#   ① 正例：喂一组假目标 ⇒ 生成的 models.json 逐字含 baseUrl/api/model，且 `apiKey`
+#      写的是 `${DOUBULEA_LLM_API_KEY}` **引用**；
+#   ② 反例（这条才是重点）：**文件里不得出现 Key 明文** —— 它守的是 `子方案③` §五 3 硬约束 1
+#      （"Key 不得出现在 work 卷的任何文件里"）。哨兵值取一个一眼能认出来的串。
+#      ⚠️ 用 `grep -F` 而不是正则：哨兵里可能带 `-`，正则表达式在这种串上没有意义。
+#   ③ 跳过：什么都不喂时**不生成文件**（镜像要能直接手工 run 调试）。
+#   为什么这些断言在构建期而不是运行期：运行期发现"Key 落盘了"意味着已经有一份带 Key 的
+#   文件躺在某个会话的磁盘上（取证与回收都来不及）—— 构建期红掉是最便宜的拦法。
+sentinel_key='sk-selfcheck-DO-NOT-LEAK-000000000000'
+if out="$(DOUBULEA_LLM_API_KEY="$sentinel_key" \
+          DOUBULEA_LLM_BASE_URL='https://models.example.invalid/v1' \
+          DOUBULEA_LLM_API='openai-completions' \
+          DOUBULEA_LLM_MODEL='selfcheck-model' \
+          DOUBULEA_LLM_LABEL='自检模型' \
+          PI_CODING_AGENT_DIR="$sc_agent" /opt/pi/entrypoint.sh --help 2>&1)"; then
+  ok '正例：entrypoint 在注入 LLM 目标时跑完了（退出码 0）'
+else
+  bad '正例失败：entrypoint 在注入 LLM 目标时退出码非 0'
+  printf '%s\n' "$out" | head -n 3 | indent
+fi
+models_file="$sc_agent/models.json"
+# jq 程序里含 `${...}` ⇒ 一律用**单引号**包住（双引号会被 shell 先展开，得到空串、jq 语法错）
+if jq -e '.providers.doubulea.baseUrl == "https://models.example.invalid/v1"
+          and .providers.doubulea.api == "openai-completions"
+          and .providers.doubulea.models[0].id == "selfcheck-model"
+          and .providers.doubulea.apiKey == "${DOUBULEA_LLM_API_KEY}"' \
+      "$models_file" > /dev/null 2>&1; then
+  ok 'models.json 逐字含 baseUrl / api / model id，且 apiKey 是 ${DOUBULEA_LLM_API_KEY} 引用'
+else
+  bad 'models.json 内容不符（baseUrl / api / model id / apiKey 引用之一不对）'
+  sed 's/^/         /' "$models_file" 2>/dev/null | head -n 20
+fi
+if grep -qF "$sentinel_key" "$models_file" 2>/dev/null; then
+  bad '反例不成立：models.json 里出现了 Key 明文（硬约束 1 被破坏）'
+else
+  ok '反例成立：models.json 里没有 Key 明文（只有引用）'
+fi
+sc_skip=/tmp/selfcheck-agent-skip
+rm -rf "$sc_skip"
+if out="$(PI_CODING_AGENT_DIR="$sc_skip" /opt/pi/entrypoint.sh --help 2>&1)" \
+   && [ ! -e "$sc_skip/models.json" ]; then
+  ok '未注入 LLM 目标时不生成 models.json（手工 run 的形态仍然可用）'
+else
+  bad '未注入 LLM 目标时生成了 models.json，或 entrypoint 退出码非 0'
+  printf '%s\n' "$out" | head -n 3 | indent
+fi
+rm -rf "$sc_skip"
+
 # mcp-bridge 的加载检查：**语法级**证明 —— 它能否作为一个 ESM 模块被求值、default 是不是函数。
 # 为什么复制成 .mts：agent-dir 下没有 package.json，Node 的类型擦除会按 CJS 解释 `.ts`，
 # 而扩展是 ESM 写法（`export default`）⇒ 直接 import 原路径会以一个**与扩展无关**的错失败。

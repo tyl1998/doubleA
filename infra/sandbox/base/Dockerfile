@@ -98,7 +98,9 @@ RUN set -eux; \
 #   三条刻意的决定：
 #   ① **根属主 + 0755/0644 ⇒ agent 可读不可写**：种子属于镜像、不属于会话。
 #   ② **里面没有 `auth.json`**：模型 Key 一律走容器环境变量注入（§五 3），
-#      即"Key 只在进程环境里、不在任何文件里"。
+#      即"Key 只在进程环境里、不在任何文件里"。⚠️ P0-3-4 起运行期会多出一份
+#      `models.json`（在**可写** agent-dir 里、由第 5b 节的生成器写），它**只含
+#      `${DOUBULEA_LLM_API_KEY}` 引用**，所以"配置能被 agent 读到"不再构成风险。
 #   ③ 桥扩展（`extensions/mcp-bridge/`）**本批只预烘焙空壳**，MCP 工具注册属 P0-3-9b。
 #
 #   ⚠️⚠️ **pi 不能直接跑在这个目录上**（构建期实测，见 entrypoint.sh 头部）：
@@ -118,6 +120,19 @@ RUN set -eux; \
 # （它才是最终镜像；base 层单独跑时 PI_CODING_AGENT_DIR 还没被播种过，验不出什么）。
 COPY entrypoint.sh /opt/pi/entrypoint.sh
 RUN set -eux; chmod 0755 /opt/pi/entrypoint.sh; bash -n /opt/pi/entrypoint.sh
+
+# ── 5b. models.json 的生成器（P0-3-4）─────────────────────────────────────
+#   为什么必须在**运行期**生成、不能烤进种子：模型池地址（Provider 行）与模型名（Agent 行）
+#   都是每会话才知道的。生成器读后端注入的 `DOUBULEA_LLM_*` 环境变量，写出
+#   `$PI_CODING_AGENT_DIR/models.json`，且**Key 只以 `${DOUBULEA_LLM_API_KEY}` 引用落盘**
+#   （pi 的 `apiKey` 支持环境插值，`baseUrl`/`api` 不支持 —— 见 `gen-models.mjs` 文件头）。
+#   ⚠️ 放 `/opt/pi/`（与 entrypoint 同级）而**不是** `/opt/pi/agent/`：后者是 agent-dir 的种子，
+#   往里放东西会被播种进运行期 agent-dir，让 pi 把我们的脚本当成它的配置资源。
+COPY gen-models.mjs /opt/pi/gen-models.mjs
+RUN set -eux; \
+    chmod 0755 /opt/pi/gen-models.mjs; \
+    node --check /opt/pi/gen-models.mjs; \
+    test ! -e /opt/pi/agent/gen-models.mjs
 
 # PI_AGENT_SEED = 只读种子；PI_CODING_AGENT_DIR = pi 实际使用的（**可写**）agent-dir。
 # 指到 `/tmp` 而不是 `/work` 是刻意的：`/work` 是产物扫描的范围（§十一），
@@ -139,6 +154,8 @@ WORKDIR /work
 #   ⚠️ tini **不碰 stdout/stderr**（只透传）—— 这是硬要求：RPC 通道就是 pi 的 stdout，
 #   任何给 stdout 加前缀的 init 都会把 JSONL 打坏（§六 1）。
 #   ⚠️ 这里给的默认 CMD 是"手 run 一个能说话"的形态，不是最终形态：
-#   `--model`/`--provider`/Key 注入属 P0-3-4。
+#   P0-3-4 已把 LLM 目标（地址/Key/协议/模型名）做成环境变量 + 运行期生成的 `models.json`；
+#   真正的引擎桥（`--mode rpc` + `--model <provider>/<model>`）属 **P0-3-5**，那时由
+#   `backend/src/sandbox` 覆盖 Cmd 传参。
 CMD ["--mode", "rpc"]
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/pi/entrypoint.sh"]

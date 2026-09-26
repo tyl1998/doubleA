@@ -8,9 +8,14 @@
  * 为什么单独一个文件：**这里全是纯函数**
  * ─────────────────────────────────────────────────────────────────────
  * 本文件**不 import `dockerode`、不 import `config`、不碰 Redis**（只用 `import type` 拿它的类型，
- * 编译后被抹掉）—— 于是"标签怎么拼、容器名怎么算、孤儿怎么判"这些**唯一判据**可以在不连 Docker、
- * 不连库的情况下逐条比对（同一手法见 `orchestrator/semaphore.ts` 与 `pipeline/chunk/`）。
- * 带副作用的动作（真建容器 / 真删卷）在 `docker.ts` 与 `manager.ts`。
+ * 编译后被抹掉）—— 于是"标签怎么拼、容器名怎么算、孤儿怎么判、该给容器哪些环境变量"这些
+ * **唯一判据**可以在不连 Docker、不连库的情况下逐条比对（同一手法见 `orchestrator/semaphore.ts`
+ * 与 `pipeline/chunk/`）。带副作用的动作（真建容器 / 真删卷 / 解密 Key）在 `docker.ts`、
+ * `manager.ts`、`llm.ts`。
+ *
+ * ⚠️ P0-3-4 起本文件有了**唯一一个值 import**（`@doubulea/shared` 的 `DEFAULT_UPSTREAM_PROTOCOL`，
+ * 用于 LLM 协议 → pi api 名的回落）。它仍然是纯函数文件（无 IO、不读配置），但"零 import"
+ * 这句话不再逐字成立 —— 记在这里免得下一个人以为这里忽然允许引业务模块了。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ★ label 是"这东西是不是我们的"的**唯一判据**（`子方案③` §四 1 原文）
@@ -22,12 +27,28 @@
  * 两个问题都要问，但**不能互相替代** —— 漏打一个 label 就等于清道夫看不见它（§四 1 原话）。
  */
 
+import { DEFAULT_UPSTREAM_PROTOCOL, type UpstreamProtocol } from '@doubulea/shared'
+
 import type Docker from 'dockerode'
 
 /** 角色标签的键：值恒为 {@link SANDBOX_ROLE}（`doubulea.role=sandbox`） */
 export const SANDBOX_LABEL_ROLE = 'doubulea.role'
 /** 会话标签的键：值 = `conversations.id`（UUID）。**对账器按它把容器/卷归到会话上** */
 export const SANDBOX_LABEL_CONVERSATION = 'doubulea.conversation'
+/**
+ * 模型标签的键：值 = `agents.model_id`（UUID）。
+ *
+ * ★ P0-3-4 新增，用途只有一个：**复用容器前判"里面那份 Key/端点还是不是这一轮的"**。
+ * 同一会话的多轮消息复用同一个容器（§四 1），而 Agent 的模型**可以被改**
+ * （`PATCH /api/agents/:id`）—— 模型一改，容器环境里的 Key、baseUrl、模型名就全是旧的，
+ * 而 `sandboxes` 表与 Docker 都不会报任何错（症状：改了模型，下一轮还在用旧的调，账单与
+ * 回答都不是你以为的那家）。
+ *
+ * ⚠️ 与 {@link SANDBOX_LABEL_STARTED_AT} 一样，它**不参与对账判据**（"该不该活着"仍只看
+ * {@link keepSandboxObject}）；缺这个标签的容器**不算孤儿**，但要**重建**（见 `manager.ts`）——
+ * 判据读不出来时"重建"是唯一安全的选择，与对账器"标签读不出来也删"同一条推理。
+ */
+export const SANDBOX_LABEL_MODEL = 'doubulea.model'
 /**
  * 启动时刻标签的键：值 = ISO 字符串。
  * ⚠️ 它**不是**空闲回收的判据 —— 判据是库里的 `sandboxes.last_active_at`（"最后一次**引擎事件**"，
@@ -72,15 +93,24 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export interface SandboxLabels {
   conversationId: string
   startedAt: string
+  /**
+   * 这一轮模型（`agents.model_id`）。见 {@link SANDBOX_LABEL_MODEL}。
+   * 可选：P0-3-4 之前建的容器与**所有卷**都没有这个标签（卷不带模型语义）。
+   */
+  modelId?: string
 }
 
 /** 拼出容器/卷要打的那组标签（容器与卷**用同一组**：对账器可以拿同一个谓词处理两者） */
-export function sandboxLabels(input: { conversationId: string; startedAt: Date }): Record<string, string> {
-  return {
+export function sandboxLabels(input: { conversationId: string; startedAt: Date; modelId?: string }): Record<string, string> {
+  const labels: Record<string, string> = {
     [SANDBOX_LABEL_ROLE]: SANDBOX_ROLE,
     [SANDBOX_LABEL_CONVERSATION]: input.conversationId,
     [SANDBOX_LABEL_STARTED_AT]: input.startedAt.toISOString(),
   }
+  // 空串按"没有"处理（`docker` 的标签值可以为空串，但空串读回来在语义上与缺失等价 ⇒
+  // 别在标签里制造两种"没有"）
+  if (input.modelId !== undefined && input.modelId !== '') labels[SANDBOX_LABEL_MODEL] = input.modelId
+  return labels
 }
 
 /** work 卷名：`doubulea-work-<conversationId>`（一个会话一个卷名 —— 回收后重建时复用同名卷） */
@@ -115,7 +145,13 @@ export function readSandboxLabels(labels: Readonly<Record<string, string>> | und
   if (labels[SANDBOX_LABEL_ROLE] !== SANDBOX_ROLE) return undefined
   const conversationId = labels[SANDBOX_LABEL_CONVERSATION]
   if (conversationId === undefined || !UUID_RE.test(conversationId)) return undefined
-  return { conversationId, startedAt: labels[SANDBOX_LABEL_STARTED_AT] ?? '' }
+  const modelId = labels[SANDBOX_LABEL_MODEL]
+  return {
+    conversationId,
+    startedAt: labels[SANDBOX_LABEL_STARTED_AT] ?? '',
+    // 空串归 undefined：**"缺这个标签"与"标签是空串"必须是一种情形**（见 `sandboxLabels`）
+    ...(modelId === undefined || modelId === '' ? {} : { modelId }),
+  }
 }
 
 /**
@@ -141,11 +177,16 @@ export interface SandboxContainerSpecInput {
   conversationId: string
   volumeName: string
   startedAt: Date
+  /**
+   * 这一轮模型（`agents.model_id`，P0-3-4）⇒ 写进标签 {@link SANDBOX_LABEL_MODEL}。
+   * 可选是为了让纯函数核对与"手工起容器"两种调用都不必构造一个假 UUID。
+   */
+  modelId?: string
   /** 专用 internal bridge 的**名字**（`sandbox/network.ts` 保证它存在且是我们的） */
   network: string
   /** 资源限额（值来自 `config.sandbox.limits`） */
   limits: { memMb: number; cpu: number; pids: number; tmpfsMb: number }
-  /** 容器环境变量（出口①/② 的地址与代理都从这里进去，见 `sandboxEgressEnv`） */
+  /** 容器环境变量（出口①/② 的地址、代理与 **LLM 目标** 都从这里进去，见 `sandboxEgressEnv` / `sandboxLlmEnv`） */
   env: Record<string, string>
 }
 
@@ -171,6 +212,131 @@ export function sandboxEgressEnv(input: { proxyUrl: string; backendUrl: string }
     NO_PROXY: `${backend.host},${backend.hostname}`,
     SANDBOX_BACKEND_URL: input.backendUrl,
   }
+}
+
+// ───────────────────────────── LLM 注入（P0-3-4）─────────────────────────────
+
+/**
+ * 注入给容器的 LLM 目标（**容器内 `gen-models.mjs` 读的就是这几个名字**，是一份跨边界契约）。
+ *
+ * | 变量 | 谁用 | 说明 |
+ * |------|------|------|
+ * | `DOUBULEA_LLM_API_KEY` | 只被 `models.json` 以 `${...}` **引用** | ★ 明文只在容器环境里，**绝不落盘**（见下） |
+ * | `DOUBULEA_LLM_BASE_URL` | `models.json` 的 `baseUrl` | 已按 pi 的语义归一（见 {@link piBaseUrlFor}） |
+ * | `DOUBULEA_LLM_API` | `models.json` 的 `api` | pi 的 api 名（见 {@link piApiForProtocol}） |
+ * | `DOUBULEA_LLM_MODEL` | `models.json` 的 `models[].id` | 上游 model id |
+ * | `DOUBULEA_LLM_PROVIDER` | `models.json` 的 provider 键 | P0-3-5 用它拼 `--model <provider>/<model>` |
+ * | `DOUBULEA_LLM_LABEL` | `models.json` 的 `models[].name` | 显示名（可选） |
+ *
+ * ⚠️ 名字统一加 `DOUBULEA_` 前缀是刻意的：pi 自己有一套 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+ * 之类的**按 provider 名**取的变量，用了那些名字就等于把"我们注入的 Key"悄悄变成了
+ * "pi 认为它是 OpenAI 官方凭据" —— 而我们的 baseUrl 明明是自定义模型池
+ * （多一个来源就多一条"到底哪份 Key 生效"的歧义）。
+ */
+export const SANDBOX_LLM_ENV = {
+  apiKey: 'DOUBULEA_LLM_API_KEY',
+  baseUrl: 'DOUBULEA_LLM_BASE_URL',
+  api: 'DOUBULEA_LLM_API',
+  model: 'DOUBULEA_LLM_MODEL',
+  provider: 'DOUBULEA_LLM_PROVIDER',
+  label: 'DOUBULEA_LLM_LABEL',
+} as const
+
+/**
+ * `models.json` 里的 provider 键（固定值，不随会话变）。
+ *
+ * 它同时是 **P0-3-5 拼 `--model` 时的那一半**：`--model doubulea/<上游模型名>`。
+ * 固定一个而不是"每个 Provider 一个"：一个会话只有一个模型（`conversations.agent_id` →
+ * `agents.model_id`），多注册几个 provider 只会让"这一轮到底用哪个"变成一个要读配置才知道的问题。
+ */
+export const SANDBOX_PI_PROVIDER_ID = 'doubulea'
+
+/**
+ * 我方协议枚举 → **pi 的 api 名**（`models.json` 的 `api` 字段）。
+ *
+ * ⚠️ 这是这张映射表的**唯一落点**：容器里那个生成器（`infra/sandbox/base/gen-models.mjs`）
+ * **刻意不认识我方协议枚举** —— 后端把翻译做完再传进去，于是"协议"这件事只在一处有真相，
+ * 容器侧只是拼串。加第四个协议时改这里 + pi 的 api 名（若它有）。
+ *
+ * 三个值的依据是 pi 的 `@earendil-works/pi-ai` 包内实现
+ * （`dist/api/{openai-completions,openai-responses,anthropic-messages}.js`）——
+ * **三协议都支持** ⇒ `子方案③` §十三 待决 1（"Pi 对 `OPENAI_RESPONSES` 的支持面"）就此关闭，
+ * 不需要加任何"该协议不支持任务型 Agent"的收窄判定。
+ */
+const PI_API_BY_PROTOCOL: Readonly<Record<UpstreamProtocol, string>> = {
+  OPENAI_COMPAT: 'openai-completions',
+  OPENAI_RESPONSES: 'openai-responses',
+  ANTHROPIC_MESSAGES: 'anthropic-messages',
+}
+
+/** 协议 → pi 的 api 名。未知/缺省回落到默认协议（与 `llm/protocol.ts#protocolOf` 同一口径） */
+export function piApiForProtocol(protocol: UpstreamProtocol | null | undefined): string {
+  return PI_API_BY_PROTOCOL[protocol ?? DEFAULT_UPSTREAM_PROTOCOL]
+}
+
+/**
+ * 把**我方的 baseUrl** 换成**pi 能用的 baseUrl**（纯函数）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 两个客户端对 baseUrl 的约定**差一个 `/v1`** —— 这是本批最容易静默出错的地方
+ * ─────────────────────────────────────────────────────────────────────
+ * 我方是**字符串拼接**（`llm/client.ts`：`${baseUrl}${protocol.chatPath}`），而三协议各自的
+ * `chatPath` 是 `/chat/completions` / `/responses` / `/messages` ⇒ **我方契约要求 baseUrl
+ * 自带 `/v1`**（`https://api.openai.com/v1`）。
+ *
+ * pi 走的是**官方 SDK**（源码级确认：`dist/api/*.js` 里是 `new OpenAI({ baseURL })` /
+ * `new Anthropic({ baseURL })`）：
+ *   · OpenAI SDK：`{baseURL}/chat/completions` ⇒ 与**我方一致**（同样要带 `/v1`）；
+ *   · Anthropic SDK：`{baseURL}/v1/messages` ⇒ **SDK 自己加 `/v1`**！
+ *     ⇒ 把我方那份 `https://api.anthropic.com/v1` 直接递过去会变成
+ *     `https://api.anthropic.com/v1/v1/messages`（一个 404，且报错只会说"端点不存在"）。
+ *
+ * 所以这里对 `ANTHROPIC_MESSAGES` **去掉尾部的 `/v1`**（只去这一层；`/anthropic/v1` 这种
+ * 带前缀的网关地址照样成立）。`LlmTarget.baseUrl` 已经是"去尾斜杠"的形态（见其定义），
+ * 这里仍再判一次 `/v1` 是为了让本函数**单独可读**（不看上游也说得清）。
+ *
+ * ⚠️ 这条差异**已实测**（`06` §五 P0-3-4 的实测记录）：假上游分别收到
+ * `POST /v1/chat/completions` 与 `POST /v1/messages` ⇒ 两个 SDK 的拼接口径与上面一致。
+ */
+export function piBaseUrlFor(protocol: UpstreamProtocol | null | undefined, baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/u, '')
+  if ((protocol ?? DEFAULT_UPSTREAM_PROTOCOL) !== 'ANTHROPIC_MESSAGES') return trimmed
+  return trimmed.replace(/\/v1$/u, '')
+}
+
+/** {@link sandboxLlmEnv} 的输入（结构化的最小集：刻意不收 `LlmTarget`，免得纯函数文件依赖上层类型） */
+export interface SandboxLlmInput {
+  /** 上游 model id（进 `models[].id`） */
+  modelName: string
+  /** 显示名（进 `models[].name`，可选） */
+  label?: string
+  /** 上游协议（决定 `api` 与 baseUrl 的归一，见 {@link piBaseUrlFor}） */
+  protocol?: UpstreamProtocol
+  baseUrl: string
+  /** 明文 Key —— ⚠️ 调用方**不得**把它写进任何日志（见文件尾那段） */
+  apiKey: string
+}
+
+/**
+ * LLM 目标的容器环境变量（**纯函数**，`子方案③` §五 3）。
+ *
+ * ★ 这一组 env 与 {@link sandboxEgressEnv} 合起来就是"容器凭什么能调模型"的全部答案：
+ * 出口① 让它到得了模型池（`HTTP(S)_PROXY`），这组告诉它**调谁、用哪个模型、拿什么凭据**。
+ *
+ * ⚠️ **返回值里含明文 Key** ⇒ 调用方（`manager.ts`）只许把它交给 `buildSandboxContainerSpec`，
+ * **不许打日志、不许落库、不许拼进错误消息**。这条不是洁癖：Key 一旦进日志，
+ * 就与 `02` §九 的"密钥零下发"不变式冲突，而日志的保留期通常比会话长得多。
+ */
+export function sandboxLlmEnv(input: SandboxLlmInput): Record<string, string> {
+  const env: Record<string, string> = {
+    [SANDBOX_LLM_ENV.apiKey]: input.apiKey,
+    [SANDBOX_LLM_ENV.baseUrl]: piBaseUrlFor(input.protocol, input.baseUrl),
+    [SANDBOX_LLM_ENV.api]: piApiForProtocol(input.protocol),
+    [SANDBOX_LLM_ENV.model]: input.modelName,
+    [SANDBOX_LLM_ENV.provider]: SANDBOX_PI_PROVIDER_ID,
+  }
+  if (input.label !== undefined && input.label !== '') env[SANDBOX_LLM_ENV.label] = input.label
+  return env
 }
 
 /**
@@ -226,9 +392,9 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
   const tmpfsOpts = `rw,nosuid,nodev,size=${input.limits.tmpfsMb}m`
   return {
     Image: input.image,
-    Labels: sandboxLabels({ conversationId: input.conversationId, startedAt: input.startedAt }),
+    Labels: sandboxLabels({ conversationId: input.conversationId, startedAt: input.startedAt, modelId: input.modelId }),
     WorkingDir: SANDBOX_WORK_DIR,
-    // 出口①/② 的地址与代理（见 `sandboxEgressEnv`）；Key 的注入属 P0-3-4，走同一张表
+    // 出口①/② 的地址与代理（见 `sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，P0-3-4，含明文 Key）
     Env: Object.entries(input.env).map(([key, value]) => `${key}=${value}`),
     // 引擎桥（P0-3-5）要往 stdin 写 JSONL；保持打开（见下方注释）
     OpenStdin: true,
