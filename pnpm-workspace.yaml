@@ -40,11 +40,23 @@ strictPeerDependencies: false
 # - bcrypt：install 脚本是 `node-gyp-build`（P0-1-6 的密码哈希）。它**不需要编译器** ——
 #   包内自带 `prebuilds/`（darwin-arm64 / win32-x64 / linux-x64 glibc+musl 全都有），
 #   node-gyp-build 只是把对应平台的 .node 挑出来；但脚本本身仍受本白名单管辖。
+# - ssh2 / protobufjs（P0-3-2 加 dockerode 时牵进来的）：
+#   · `ssh2` 是 `docker-modem` 的硬依赖，但只在 `DOCKER_HOST=ssh://…` 时才用得上 ——
+#     我们**只用 unix socket 连本机 daemon**（走 socket 还是 shell out，见 backend/src/sandbox/docker.ts）。
+#     它的 install 脚本在本机会真的编译一个**可选**的原生 crypto 绑定（P0-3-2 实测：`sshcrypto.node`
+#     构建成功）⇒ 登记 `false` 让没有编译器的机器也能装得上；纯 JS 回落路径完整，我们一行都不走。
+#   · `cpu-features` 是 `ssh2` 的**可选**依赖，install 脚本是 `node-gyp rebuild` ⇒ 同样 `false`。
+#     ⚠️ 别把这两个改成 true：那会让每一台没有 Xcode CLT / python 的机器在 `pnpm install` 时失败，
+#     换来的是两个我们永远用不到的原生模块。
+#   · `protobufjs` 的 postinstall 只是给它的 cli 打点，无副作用 ⇒ 放行。
 # 后续引入原生依赖（如 onnxruntime-node，P0-1-13）时在此追加。
 allowBuilds:
   esbuild: true
   prisma: true
   '@prisma/engines': true
   bcrypt: true
+  protobufjs: true
+  ssh2: false
+  cpu-features: false
 minimumReleaseAgeExclude:
   - '@modelcontextprotocol/sdk@1.30.1'

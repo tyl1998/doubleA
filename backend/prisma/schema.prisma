@@ -159,6 +159,23 @@ enum McpServerStatus {
   @@map("mcp_server_status")
 }
 
+/// 沙箱（会话容器）的生命周期状态（`02` §三 的 `status(CREATING|RUNNING|RECYCLED|FAILED)`，
+/// P0-3-2 落地）。四个取值都是**终态/在态**混合，刻意不叫 ACTIVE/STOPPED：
+/// · `CREATING` —— 行已建、容器可能还没建起来（`container_id` 此刻为 `NULL`）；
+///   它是**在飞态**，对账器会给它一个宽限期（`SANDBOX_CREATE_GRACE_SEC`）才判死；
+/// · `RUNNING` —— 容器已建并已启动（`container_id` 必有值）；
+/// · `RECYCLED` —— 容器与具名卷已回收（用户停止 / 空闲超时 / 后端重启对账）；
+/// · `FAILED` —— 创建中途失败（`error_msg` 给可读原因）。
+/// ⚠️ **行只增不删**（与"消息与产物都不删"同口径）：一个会话可以有多行（回收后再发消息会新建容器）。
+enum SandboxStatus {
+  CREATING
+  RUNNING
+  RECYCLED
+  FAILED
+
+  @@map("sandbox_status")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -318,6 +335,9 @@ model Conversation {
   agent    Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
   user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
   messages Message[]
+  /// 沙箱账本（P0-3-2）。⚠️ 删会话会**级联删掉这些行**，但容器不归数据库管 ——
+  /// 孤儿回收器按 label 找容器、按"会话还在不在"判死（见 `backend/src/sandbox/reaper.ts`）。
+  sandboxes Sandbox[]
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -583,4 +603,59 @@ model McpCredential {
   @@unique([serverId, userId])
   @@index([userId])
   @@map("mcp_credentials")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// sandboxes（P0-3-2）
+//
+// 依据：`docs/02-后端设计.md` §三 + `docs/子方案/沙箱与引擎集成.md` §四 1 / §九 1。
+// 生命周期（建 / 复用 / 空闲回收 / 上限排队 / 孤儿回收）在 `backend/src/sandbox/`。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// sandboxes —— 会话容器账本（P0-3-2）。
+///
+/// ⚠️⚠️ **这张表不是"哪些容器是我们的"的判据**（`子方案③` §四 1 原文）：
+/// 判据**只有一处** = 容器/卷上的 label `doubulea.role=sandbox`。两处都要有，但分工不同：
+///   · **label** 回答"这东西是不是我们的"（后端崩在"容器已建、行还没写"之间时，
+///     表里没有它、而 label 在 —— 这正是"判据不能是这张表"的原话）；
+///   · **本表** 回答"它**该不该活着**"（`RUNNING` / 宽限期内的 `CREATING`）+ 排障用的 `container_id`。
+/// ⇒ 对账器判孤儿用的是这两个答案的组合，**不是**"表里没有就删"或"表里有就留"。
+///
+/// 三条口径：
+/// · `containerId` **可空**：行先落（`CREATING`），容器后建 ⇒ 建行那一刻确实还没有 id
+///   （见 `SandboxStatus` 注释）。写死 NOT NULL 会让"先建行"这条顺序无法实现；
+/// · 一行 = **一次容器的生命周期**（不是"一个会话一行"）：同一会话被回收后再发消息会新建容器 ⇒ 多行
+///   ⇒ **刻意没有** `uniq(conversation_id)`；"当前那个"由 `status=RUNNING` 定位；
+/// · `lastActiveAt` **只有一个写入口** = `touchSandbox()`（引擎事件调一次，P0-3-5 接上）。
+///   空闲回收的判据就是它（`子方案③` §二：判据是**最后一次引擎事件的时间**，不是 CPU 占用）。
+///   ⚠️ 不能改用 `updatedAt`：`@updatedAt` 会被**任何**字段写入顺带推进 ⇒"回收"这个动作本身
+///   也会刷新它，判据就不再是"引擎活动"了。
+///
+/// 删除语义：`Cascade`（会话硬删 ⇒ 账本跟着删）。**容器不跟着删** —— 数据库管不到 Docker ⇒
+/// 那一刻容器成了孤儿、由回收器按 label 收掉。这是"两处都要有、判据只能有一个"的必然代价，
+/// 写在这里而不是假装它不存在。
+model Sandbox {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  conversationId String        @map("conversation_id") @db.Uuid
+  /// 容器 id（`CREATING` 期间为 `NULL`）。⚠️ 留痕/排障用，**不是**归属判据（见上方）
+  containerId    String?       @map("container_id") @db.VarChar(128)
+  status         SandboxStatus @default(CREATING)
+  /// 创建时用的镜像名（= `SANDBOX_IMAGE`）。留痕：换过镜像后仍能看出某个会话跑在哪一版上
+  image          String        @db.VarChar(255)
+  /// 失败原因（**给人看的**：按"用户能不能照着做点什么"写；连接串/堆栈只进日志）
+  errorMsg       String?       @map("error_msg") @db.Text
+  /// ⚠️ 由**调用方显式传入**（`manager.ts#createSandbox` 传同一个 `startedAt`），不要依赖这个默认值：
+  /// 本机 PG 会话时区非 UTC 时，`@default(now())` 与 JS 侧边界相差一个时区偏移，会把宽限期放大 8 小时
+  /// （见 `docs/02` 的"已知问题：timestamptz 与 Prisma 的时区偏移"）。默认值只是兜底。
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// 最后一次**引擎事件**的时刻（见上方口径）。空闲回收的唯一判据
+  lastActiveAt   DateTime      @default(now()) @map("last_active_at") @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// 「这个会话当前有没有在跑的容器」（复用判定 + 对账器的活体判定）
+  @@index([conversationId, status])
+  /// 空闲回收的扫描键：`status = RUNNING AND last_active_at < 阈值`
+  @@index([status, lastActiveAt])
+  @@map("sandboxes")
 }

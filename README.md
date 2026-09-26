@@ -135,8 +135,66 @@ docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:1 --
 > ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
 > `npm i` **必然失败**，而阶段三的验收场景「分析这份 CSV 出汇总表」恰恰要 pandas（`子方案③` §五 2）。
 > 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
-> ⚠️ **本步不是可端测里程碑**：容器生命周期（P0-3-2）、两条网络出口（P0-3-3）、模型 Key 注入（P0-3-4）
-> 都还没做 ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
+> ⚠️ **本步不是可端测里程碑**：容器生命周期**已落地**（P0-3-2，见下一节）、但两条网络出口（P0-3-3）、
+> 模型 Key 注入（P0-3-4）、引擎桥（P0-3-5/6）都还没做 ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
+
+### 沙箱容器生命周期（P0-3-2 起；⚠️ 仍然派不了活）
+
+**这一段能验的不是"能不能发任务"**（那要等 P0-3-5/6 接上引擎桥），而是
+**「会话即容器」的记账与清道夫在真 Docker 上确实在动** —— 尤其是那条最容易被当成玄学的
+**孤儿回收器**：没有它，后端崩一次就会**永久吃掉并发名额**，症状是"**明明没人用却在排队**"。
+
+代码在 `backend/src/sandbox/`（六个模块 + 一个出口 `index.ts`）：
+
+| # | 是什么 | 判据 / 落点 |
+|---|--------|-------------|
+| ① | `sandboxes` 落库（`CREATING → RUNNING → RECYCLED`/`FAILED`） | 表 `sandboxes`；`container_id` **可空**（★ **行先落、容器后建**） |
+| ② | **label 即归属** —— "这东西是不是我们的"只有这一个判据 | `doubulea.role=sandbox` + `doubulea.conversation=<id>`；`sandboxes` 表只回答"**该不该活着**" |
+| ③ | 启动对账 `reconcileOnBoot()` | 后端一起来就把**所有**带 label 的容器与卷清掉（★ 理由：引擎是**后端进程的子进程**，进程一死容器就没有对话者 ⇒ 一律重建、不复用） |
+| ④ | 周期对账 `reapOrphans()` + `reapIdleSandboxes()` | 每 `SANDBOX_REAP_INTERVAL_SEC` 秒一轮。**孤儿**判据 = 会话不再 `ACTIVE`，或账本没有活体行；**空闲**判据 = `last_active_at`（= 最后一次**引擎事件**的时间，不是 CPU） |
+| ⑤ | 并发满时的排队 | Redis **ZSET**：`ZRANK` 给位次（"1 = 下一个"）、score 给**单项 TTL**，而 **TTL 同时是等待预算** |
+
+**新增 4 个 env**（`infra/.env` 的 `[B] 沙箱与产物` 段，都有默认值）：
+`SANDBOX_QUEUE_KEY=sandbox:queue`、`SANDBOX_QUEUE_TTL_SEC=600`、`SANDBOX_REAP_INTERVAL_SEC=60`、
+`SANDBOX_CREATE_GRACE_SEC=120`（⚠️ **必须 > `SANDBOX_REAP_INTERVAL_SEC`**，否则后端启动时直接报错退出）。
+
+**想亲眼看它在动**（把两个窗口调小，看"启动对账 + 一轮周期对账"）：
+
+```bash
+# ① 造两个"我们的"对象（label 是唯一判据；本批还没有入口能建沙箱，所以手工造）
+docker volume create \
+  --label doubulea.role=sandbox --label doubulea.conversation=00000000-0000-7000-8000-000000000001 \
+  doubulea-work-00000000-0000-7000-8000-000000000001
+docker create \
+  --label doubulea.role=sandbox --label doubulea.conversation=00000000-0000-7000-8000-000000000001 \
+  --network none -i doubulea/sandbox-toolkit:1
+docker ps -a --filter label=doubulea.role=sandbox        # 应看到刚造的那个（Created）
+docker volume ls --filter label=doubulea.role=sandbox    # 应看到刚造的卷
+
+# ② 起后端（把窗口调小，方便看一轮）
+#    需先起依赖：pnpm dev:infra（或 infra 下的 compose）
+cd backend && LOG_LEVEL=info SANDBOX_REAP_INTERVAL_SEC=5 SANDBOX_IDLE_TTL_MIN=1 \
+  npx tsx src/index.ts
+# 日志里应出现两行（启动阶段）：
+#   沙箱状态（启动时：名额册必然为空）
+#   沙箱启动对账完成（Docker 29.4.0）：清理遗留容器与卷；⚠️ 本进程重启会让容器内引擎失去对话者 ⇒ 一律重建，不复用
+#     → containers: "1/1"  volumes: "1/1"  removalFailures: 0
+
+# ③ 复核：那两个对象已经没了
+docker ps -a --filter label=doubulea.role=sandbox        # 空
+docker volume ls --filter label=doubulea.role=sandbox    # 空
+```
+
+> ⚠️ **本机注意**：`docker` 不在**非交互 shell** 的 PATH 里（OrbStack 托管）⇒ 脚本里请用全路径
+> `/usr/local/bin/docker` 或补上 `~/.orbstack/bin`。后端自己**不 shell out**（走 `docker.sock`），不受影响。
+> ⚠️ **为什么 `LOG_LEVEL=info` 看不到周期对账**：一轮"什么都没干"的对账**刻意只打 `debug`**（默认 60 秒一轮，
+> 否则会把别的日志冲掉）⇒ 看不到**不代表它没跑**；想看每轮痕迹就 `LOG_LEVEL=debug`。
+> 有变化时是 `info`，一眼可辨：`孤儿回收完成` / `空闲沙箱回收完成` / `沙箱已回收` / `清理了过期的沙箱排队项`。
+> ⚠️ **写代码的人注意（P0-3-2 发现的跨批次坑）**：本机 PG 会话时区不是 UTC ⇒ `@prisma/adapter-pg`
+> 读写 `timestamptz` **各偏 8 小时且往返恒等** ⇒ **凡要参与"与 JS 侧时间比较"的时间列，必须由 JS 侧
+> 显式写入**，别依赖 `@default(now())`（`sandboxes` 两列已按此办理）。详见 `docs/02` §3.1 的"已知问题"。
+> ⚠️ **仍然不能端测**：本批**没有任何入口能创建沙箱**（调用方 = TaskAgent `/chat`，属 P0-3-5/6）
+> ⇒ **最早可端测的点仍是 P0-3-11**。
 
 ### 后端配置自检（P0-1-3 起）
 

@@ -476,6 +476,38 @@ const envSchema = z
      * 每一批的 `pnpm config:check` 都红，却证不出任何东西。P0-3-3 定案时再收紧。
      */
     SANDBOX_EGRESS_PROXY_URL: optionalUrl('SANDBOX_EGRESS_PROXY_URL', ['http', 'https']),
+    /**
+     * 沙箱**排队队列**的 Redis 键（P0-3-2）。
+     *
+     * 与 `PIPELINE_QUEUE_KEY` 同一条推理、同一个理由：`REDIS_URL` 是共享资源，
+     * 而队列是**被消费**的资源 ⇒ 两个进程用同一个键时"谁取走"是随机的，
+     * 症状不是报错而是"验收时好时坏"。可换键 = 可隔离消费方。
+     */
+    SANDBOX_QUEUE_KEY: defaultedVar(z.string().trim().min(1), 'sandbox:queue'),
+    /**
+     * 排队项的存活时长（秒，P0-3-2）。**两个语义共用一个数，是刻意的**：
+     *   ① 它是"这条排队项什么时候算孤儿"（对应它的那条 SSE 流已经断了）；
+     *   ② 它是**等待预算** —— 等这么久还拿不到名额就报超时（而不是无限挂着）。
+     * 两者合一是因为"等了 X 秒还在等"与"这条项已经没人要了"在行为上应当是同一条线；
+     * 分开设两个数只会造出"已经没人等、但它还占着位置"的中间态。
+     */
+    SANDBOX_QUEUE_TTL_SEC: intVar('SANDBOX_QUEUE_TTL_SEC', 600, { min: 10, max: 86_400 }),
+    /**
+     * 周期对账（孤儿回收 + 空闲回收）的间隔（秒，P0-3-2）。
+     * 定成配置项的理由与所有"窗口类"参数相同：**要能注入小值才验得了一条"等它回收"的断言**，
+     * 而 60 秒的默认值是"人工操作也有机会看到结果"与"不空转"之间的折中。
+     */
+    SANDBOX_REAP_INTERVAL_SEC: intVar('SANDBOX_REAP_INTERVAL_SEC', 60, { min: 5, max: 3600 }),
+    /**
+     * `CREATING` 行/容器的宽限期（秒，P0-3-2）。
+     *
+     * 为什么必须有：对账器会把"账本里没有活体行的容器"判成孤儿，而**创建过程中**的那一两秒
+     * 恰恰是这个形态（行是 `CREATING`、容器刚起来）。没有宽限期，一轮刚好踩在中间的对账
+     * 就会把一次正常创建打成孤儿 —— 症状是"偶尔有一轮任务容器起来就被删"。
+     * ⚠️ 它**必须大于对账间隔**（否则"宽限期"比"检查周期"还短，等于没有），这条跨字段约束
+     * 写在下面的 `superRefine` 里。
+     */
+    SANDBOX_CREATE_GRACE_SEC: intVar('SANDBOX_CREATE_GRACE_SEC', 120, { min: 10, max: 3600 }),
     /** 产物单文件上限（MB）；超出记**告警并跳过**（不是静默丢，§十一 2） */
     ARTIFACT_MAX_FILE_MB: intVar('ARTIFACT_MAX_FILE_MB', 50, { min: 1, max: 4096 }),
     /** 单轮产物扫描的文件数上限；超出即截断并告警（防引擎写一万个小文件打爆上传） */
@@ -568,6 +600,18 @@ const envSchema = z
           '否则用户在确认卡上操作时，容器侧的 fetch 已经超时放弃了',
       })
     }
+    // 沙箱对账的宽限期必须**罩住**一轮对账间隔（P0-3-2）：反过来的话，"正在创建"的容器
+    // 熬不过下一次检查 ⇒ 一次正常创建会被对账器判成孤儿删掉（症状是"偶尔起来就被删"，
+    // 且因为要两个配置凑巧错配才复现，最难查）。
+    if (env.SANDBOX_CREATE_GRACE_SEC <= env.SANDBOX_REAP_INTERVAL_SEC) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SANDBOX_CREATE_GRACE_SEC'],
+        message:
+          `必须大于 SANDBOX_REAP_INTERVAL_SEC（当前 ${env.SANDBOX_CREATE_GRACE_SEC} <= ${env.SANDBOX_REAP_INTERVAL_SEC}）：` +
+          '宽限期若短于检查周期，正在创建的沙箱会被对账器判成孤儿',
+      })
+    }
   })
 
 type EnvVars = z.infer<typeof envSchema>
@@ -625,7 +669,10 @@ export interface AppConfig {
   concurrency: { chatbot: number; sandbox: number; pipeline: number }
   /**
    * 沙箱（P0-3；参数总表 = `子方案③` §二）。
-   * ⚠️ 当前**只有 `idleTtlMin` 有人消费**（其余是 P0-3-1 的登记项，消费方 P0-3-2/3）。
+   * ⚠️ 消费进度：`idleTtlMin` / `limits` / `image` / `queueKey` / `queueTtlSec` / `reapIntervalSec`
+   * / `createGraceSec` 自 **P0-3-2** 起有消费方（`backend/src/sandbox/`）；
+   * `callbackPort` / `tokenLen` / `proxyTimeoutSec` / `egressProxyUrl` 仍是登记项，
+   * 消费方分别是 P0-3-9b / P0-3-4 / P0-3-3。
    */
   sandbox: {
     /** 空闲回收（分钟）。判据是**最后一次引擎事件的时间**，不是 CPU 占用 */
@@ -642,6 +689,14 @@ export interface AppConfig {
     proxyTimeoutSec: number
     /** 沙箱出公网的 egress 代理；未定时为 undefined（P0-3-3 定案后才会是必填） */
     egressProxyUrl: string | undefined
+    /** 沙箱排队队列的 Redis 键（P0-3-2） */
+    queueKey: string
+    /** 排队项存活时长（秒）= 孤儿判定窗口 = 等待预算（P0-3-2） */
+    queueTtlSec: number
+    /** 周期对账间隔（秒，P0-3-2）；恒 < `createGraceSec`（schema 里守着） */
+    reapIntervalSec: number
+    /** `CREATING` 行的宽限期（秒，P0-3-2）；恒 > `reapIntervalSec` */
+    createGraceSec: number
     /** 单容器限额。`cpu` 是浮点（1.5 核），其余是整数 */
     limits: { memMb: number; cpu: number; pids: number; workVolumeMb: number; tmpfsMb: number }
   }
@@ -887,6 +942,10 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       tokenLen: vars.SANDBOX_TOKEN_LEN,
       proxyTimeoutSec: vars.SANDBOX_PROXY_TIMEOUT_SEC,
       egressProxyUrl: vars.SANDBOX_EGRESS_PROXY_URL,
+      queueKey: vars.SANDBOX_QUEUE_KEY,
+      queueTtlSec: vars.SANDBOX_QUEUE_TTL_SEC,
+      reapIntervalSec: vars.SANDBOX_REAP_INTERVAL_SEC,
+      createGraceSec: vars.SANDBOX_CREATE_GRACE_SEC,
       limits: {
         memMb: vars.SANDBOX_MEM_LIMIT_MB,
         cpu: vars.SANDBOX_CPU_LIMIT,
@@ -977,6 +1036,11 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       callbackPort: value.sandbox.callbackPort,
       tokenLen: value.sandbox.tokenLen,
       proxyTimeoutSec: value.sandbox.proxyTimeoutSec,
+      // P0-3-2 起有消费方的四个（队列键不脱敏：它是 Redis 键名，不含凭据）
+      queueKey: value.sandbox.queueKey,
+      queueTtlSec: value.sandbox.queueTtlSec,
+      reapIntervalSec: value.sandbox.reapIntervalSec,
+      createGraceSec: value.sandbox.createGraceSec,
       limits: value.sandbox.limits,
     },
     llm: value.llm,

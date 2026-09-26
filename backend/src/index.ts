@@ -21,6 +21,7 @@ import { closePg } from './infra/pg.js'
 import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
 import { getPipelineWorkerStats, startPipelineWorker, stopPipelineWorker } from './pipeline/worker.js'
+import { getSandboxStats, reconcileOnBoot, startSandboxReaper, stopSandboxReaper } from './sandbox/index.js'
 import { ok, type Envelope } from '@doubulea/shared'
 
 /** 「优雅退出」的兜底时限：超时则强杀，避免卡在某个不肯关闭的连接上（`06` P0-1-4 落地要点） */
@@ -75,9 +76,11 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
 
   logger.info({ reason }, '开始优雅退出：停止接收新请求')
   try {
-    // ⚠️ 顺序：先停流水线 worker（它还在用 PG/Redis/S3），再收 app，最后关依赖。
-    //    反过来的话 worker 会拿着已关闭的连接继续处理任务，日志里出现一堆"数据库不可用"的假故障。
+    // ⚠️ 顺序：先停后台消费者（流水线 worker 还在用 PG/Redis/S3、沙箱对账器还在删容器），
+    //    再收 app，最后关依赖。反过来的话它们会拿着已关闭的连接继续干活，
+    //    日志里出现一堆"数据库不可用"的假故障。
     await stopPipelineWorker()
+    await stopSandboxReaper()
     await app.close()
     // ⚠️ 顺序：Prisma 先于探活池（业务查询收尾不会晚于探活）。
     //    closePrisma 对「从未创建过客户端」的进程是空操作，因此不引入退出负担。
@@ -112,7 +115,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-1 三层镜像预构建（新增 `infra/sandbox/`：`versions.mjs` = 版本唯一事实来源【Node 基线 / **pin 版 pi 0.87.1** / base·toolkit 两条层版本号】+ `base/Dockerfile`【Node 22 + pi + **桥扩展空壳**（真实现归 P0-3-9b）+ 非 root `agent`(uid 10001) + 只读层里的 pi 配置**种子**（`PI_AGENT_SEED=/opt/pi/agent`）+ `entrypoint.sh` 播种到可写 agent-dir（`PI_CODING_AGENT_DIR=/tmp/pi-agent`；⚠️ 实测：pi 读 settings.json 会先在同目录加锁、只读目录上加不上锁会把整份 settings 判为 invalid 并**静默忽略**）】+ `toolkit/Dockerfile`【python3 + pandas/numpy/openpyxl + jq/git/rg，**末步跑依赖自检让 build 失败**】+ 跨平台入口 `pnpm sandbox:build`；同批把 `子方案③` §二 参数总表 15 项首次写进 `infra/.env(.example)` 与 `config.ts`（除 `SANDBOX_IDLE_TTL_MIN` 外**只登记不消费**），并加一条跨字段校验 `SANDBOX_PROXY_TIMEOUT_SEC > MCP_CONFIRM_TIMEOUT_SEC`）',
+    step: 'P0-3-2 沙箱容器生命周期（`backend/src/sandbox/` 六个模块：`spec.ts`【label 契约 + 创建规格**纯函数**；★ label 是"这东西是不是我们的"的**唯一判据**，`sandboxes` 表只回答"该不该活着"】/ `docker.ts`【dockerode 薄封装 + 报错翻译】/ `registry.ts`【进程内名额册：★ 配额作用域 = **单实例**，且崩溃即归零 ⇒ 账面自愈】/ `queue.ts`【ZSET 排队：score = 入队时刻 ⇒ `ZRANK` 给位次、`ZREMRANGEBYSCORE` 给单项 TTL（**同时是等待预算**）】/ `manager.ts`【`ensureSandbox`（复用不占名额 / 队列非空不许插队 / 失败还名额）+ `recycleSandbox`（★ 两步回收：`rm -v` **删不掉具名卷**，须显式 `volume rm`）+ `touchSandbox`（`last_active_at` 唯一写入口）】/ `reaper.ts`【★ 启动对账**清掉全部**容器卷（引擎是本进程的子进程，进程一死容器就没有对话者 ⇒ 一律重建不复用）+ 周期孤儿回收（判据 = 会话 ACTIVE ∩ 账本有活体行）+ 空闲回收（判据 = `last_active_at`）】；同批 `sandboxes` 表上线（`SandboxStatus` CREATING|RUNNING|RECYCLED|FAILED）+ 新增 4 个 env（`SANDBOX_QUEUE_KEY/_TTL_SEC`、`SANDBOX_REAP_INTERVAL_SEC`、`SANDBOX_CREATE_GRACE_SEC`，含跨字段校验 `GRACE > INTERVAL`）；⚠️ 容器 `NetworkMode=none` 与全部安全加固留给 P0-3-3，本批**没有任何入口能创建沙箱**（TaskAgent `/chat` 属 P0-3-5/6））',
     address,
   })
   logger.info(
@@ -131,6 +134,16 @@ try {
   // 不该顺带拉起一个消费者（那会要求它连 Redis，还会莫名其妙开始吃队列里的任务）。
   logger.info(getPipelineWorkerStats(), '正在启动文档流水线 worker')
   startPipelineWorker()
+
+  // 沙箱（P0-3-2）：**先对账、再开周期任务**，两条理由都是正确性：
+  //   ① 顺序 —— 启动对账会清掉上一个进程留下的全部容器（引擎是本进程的子进程，
+  //      进程一死容器就没有对话者了）⇒ 必须发生在任何人能用沙箱之前；
+  //   ② 同 `startPipelineWorker` 的纪律：它是**进程级后台组件**，不放进 `buildApp()`
+  //      （否则所有走 `app.inject` 的契约验收都会顺带连 Docker）。
+  // ⚠️ 两者都**不会**让启动失败：未配置 `SANDBOX_IMAGE` 就直接跳过，Docker 不可达只 warn。
+  logger.info(getSandboxStats(), '沙箱状态（启动时：名额册必然为空）')
+  await reconcileOnBoot()
+  startSandboxReaper()
 } catch (error) {
   logger.fatal({ err: error, port: config.port }, '监听端口失败，进程退出')
   await shutdown('listen-failed', 1)
