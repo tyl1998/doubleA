@@ -13,7 +13,7 @@
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
  * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃）/ **`createEngineEventMapper`**（引擎事件 → 我方 SSE 事件） |
  * | P0-3-7 的编排层 | `snapshotWorkFiles`（派活之前拍基线）/ `collectRoundArtifacts`（对照 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
- * | P0-3-8 的停止路径 | `closeSandboxRpc`（只拆连接）/ `recycleSandbox`（真杀容器） |
+ * | ✅ P0-3-8 的停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（先拆连接）/ `recycleSandbox`（再杀容器与具名卷） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
  * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5）、`readEngineUsage` / `isKnownEngineEventType`（事件映射，P0-3-6） |

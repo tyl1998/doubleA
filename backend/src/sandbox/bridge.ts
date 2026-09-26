@@ -88,7 +88,8 @@ const ACTIVITY_TOUCH_INTERVAL_MS = 30_000
  *
  * pi 的 `abort` 应答**本身**就是"等到空闲之后才回"（`docs/rpc-commands.md#abort`），
  * 所以正常情况下 `agent_settled` 几乎同时到。宽限是为了兜住"引擎卡在某个工具里不响应中断"
- * —— 那时桥**如实回"被中断"**，要不要升级成回收容器由 P0-3-8 决定（桥自己不杀容器）。
+ * —— 那时桥**如实回"被中断"**，卡死的引擎由停止路径的容器回收（P0-3-8 已定案：
+ * `taskAgent.ts` 收尾时 `force` 删除 = SIGKILL；桥自己仍然不杀容器）。
  */
 const ABORT_SETTLE_GRACE_MS = 15_000
 
@@ -497,7 +498,8 @@ class SandboxRpcSession implements SandboxRpc {
         waiter.aborted = true
         if (waiter.timer !== undefined) clearTimeout(waiter.timer)
         // 中断之后**继续等 `agent_settled`**（那才是"真的停了"），但加一个宽限：
-        // 引擎卡在不响应中断的工具里时，桥如实回"被中断"，要不要升级成回收容器由 P0-3-8 决定。
+        // 引擎卡在不响应中断的工具里时，桥如实回"被中断"；卡死的引擎由停止路径的
+        // 容器回收收走（P0-3-8 定案，见文件头 `ABORT_SETTLE_GRACE_MS`）。
         waiter.timer = setTimeout(() => {
           this.#finishWaiter(waiter, { ok: false, reason: 'aborted', message: '已请求中断，但引擎未在宽限内收尾' })
         }, ABORT_SETTLE_GRACE_MS)

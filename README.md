@@ -494,6 +494,44 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:13000/api/agents \
 > ⚠️ 清理挂在沙箱对账器里 ⇒ **未配置 `SANDBOX_IMAGE` 时清理不跑**（没有镜像就没有 TaskAgent、
 > 产物不再新增；存量要清可手工删或临时配回镜像）。
 
+### 沙箱停止（P0-3-8 起；⚠️ 不可端测，只能在 Docker 侧观察）
+
+`POST /api/conversations/:id/stop` 对 TaskAgent 会话的行为：写停止信号 → 引擎中断
+（+ 15s 宽限等 `agent_settled`）→ **已生成内容照常落库** → **产物照常收集** → **容器与具名卷一并回收**。
+下一轮消息会重新建容器（"停止 → 会话恢复" = 重发即可）。已知边界：**客户端断线不回收**
+（容器留给复用，30min 空闲回收兜底）；正常完成的轮也不回收（复用是"会话即容器"的初衷）。
+
+```bash
+# 前置：沿用「沙箱产物收集」那节造好的 TASK_AGENT 会话（$CONV、$COOKIE 都在同一个 shell 里）
+
+# ① 派一个长活（够你来得及点停止），另开一个终端 curl -N 看 SSE 流
+curl --noproxy '*' -sN -X POST "http://127.0.0.1:13000/api/conversations/$CONV/chat" \
+  -H "Content-Type: application/json" -H "Cookie: $COOKIE" \
+  -d '{"content":"用 python 逐个打印 1..200 的平方，每个之间 sleep 1 秒"}'
+
+# ② 生成中途点停止
+curl --noproxy '*' -s -X POST "http://127.0.0.1:13000/api/conversations/$CONV/stop" \
+  -H "Cookie: $COOKIE" | jq .
+#   → {"data":{"id":"…","signaled":true}}；SSE 流应以 done{finishReason:"STOPPED"} 收尾
+
+# ③ 取证四条（都在停止后立刻看）
+#   a. 容器与具名卷都没了（label 是唯一判据）
+/usr/local/bin/docker ps -a --filter label=doubulea.role=sandbox --format '{{.ID}} {{.Names}}'   # → 空
+/usr/local/bin/docker volume ls --filter label=doubulea.role=sandbox --format '{{.Name}}'       # → 空
+#   b. 后端日志有「用户停止：沙箱已回收」与「TaskAgent 本轮结束」（finishReason=STOPPED）
+#   c. 半截回答落了库：翻会话消息历史，那一轮应有已生成的部分文本
+#      （01 决策 15：停止即中断、已生成内容保留）
+#   d. 账本行 = RECYCLED：psql 连 127.0.0.1:15432
+#      SELECT status, count(*) FROM sandboxes GROUP BY status;   -- RUNNING 应为 0
+
+# ④ 会话恢复 = 重发：再 POST 一次 /chat（内容随意）
+#   → 后端日志重新出现「沙箱容器已就绪」（新容器、reused:false）
+```
+
+> ⚠️ 停止后回收失败不会让"停止"失败（`done{STOPPED}` 照发）—— 残留的容器/卷留给对账器
+> （按 label 找得到）；看到 ③ 里对象还在时先看后端日志有没有「回收沙箱失败」的 warn。
+> ⚠️ `docker` 不在非交互 shell 的 PATH（OrbStack 托管）⇒ 上面用全路径，或先 `~/.orbstack/bin` 进 PATH。
+
 ### 后端配置自检（P0-1-3 起）
 
 后端启动时自己读 `infra/.env`（`backend/src/config.ts`，zod 校验）：**缺必填项会直接退出并列出

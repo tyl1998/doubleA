@@ -16,6 +16,7 @@
  *  ④.5 collectRoundArtifacts(...)    → 对照基线 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（P0-3-7）
  *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
  *  ⑥ persistRoundQuietly + done{usage}
+ *  ⑦ 用户停止 ⇒ 收沙箱              → closeSandboxRpc + recycleSandbox（容器与具名卷一并回收，P0-3-8）
  * ```
  * 它由 `orchestrator/index.ts#resolveChatProducer()` 按 `agent.type` 单点接回 ——
  * 路由与 SSE 出口层**一行都不用改**（这是 P0-1-26 定 `ChatProducer` 这个形状时就留下的接回点）。
@@ -80,8 +81,10 @@
  *     （`sse.ts`）。⚠️ 但**本层不用它**：容器内的 `bash` / `read` / `write` / `edit`
  *     **不做**逐工具确认（`子方案③` §八 5 的判据 —— **只有"跨出容器边界"的动作才需要确认卡**；
  *     容器内的破坏面已被容器边界框死）。它的调用方是 **P0-3-9b** 的沙箱 MCP 代理端点。
- *   · **停止路径的沙箱回收**（停流之后要不要杀容器）→ **P0-3-8**；本层只把 `signal` 传下去，
- *     中断由 `bridge#runTurn` 的 abort 监听转成 `abort` 命令（`bridge.ts` 自己处理宽限）。
+ *   · **停止路径的沙箱回收** → ✅ **已在 P0-3-8 落地**（见下方 ⑦）：只在**用户停止**
+ *     （`stopReason === 'user'`）时回收，且排在**收产物与落库之后**；`bridge#runTurn` 的
+ *     abort 监听把信号翻成引擎的 `abort` 命令 + 15s 宽限（P0-3-5 落的），宽限内没收尾的
+ *     卡死引擎由回收时的 `force` 删除（SIGKILL）兜底 —— 这就是"要不要升级成回收容器"的答案。
  *
  * 📌 `input.target` 在本层**刻意不用**（也不是"忘了"）：容器里的 pi 用的是**注入进容器的那一份**
  * 目标（P0-3-4，`ensureSandbox` 内部自己解析 `agents.model_id`），后端这边一次 LLM 调用都不发。
@@ -99,9 +102,11 @@ import {
 
 import { getLogger } from '../infra/logger.js'
 import {
+  closeSandboxRpc,
   collectRoundArtifacts,
   ensureSandbox,
   getSandboxRpc,
+  recycleSandbox,
   snapshotWorkFiles,
   type SandboxAcquireFailure,
   type SandboxHandle,
@@ -408,6 +413,51 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     usage: round.usage,
     logger,
   })
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ⑦ 用户停止 ⇒ 收沙箱（P0-3-8；`子方案③` §九 5 第 4 条：容器与具名卷一并回收）
+  // ═══════════════════════════════════════════════════════════════════
+  // ★ **触发表**（`ChatStopReason` 三值逐个有结论，别凭"中断了就回收"的直觉）：
+  //   · `'user'`          ⇒ **回收**。用户明确说了"停"；停止的语义就是结束这个任务 ⇒
+  //     下一轮重新建容器（`01` 阶段三验收的"停止 → 会话恢复"即"重发即重建"）。
+  //     宽限（`ABORT_SETTLE_GRACE_MS` 15s）内没收尾的卡死引擎也在这条路上被
+  //     `force` 删除（SIGKILL）兜底 —— "要不要升级成回收容器"的答案就是这一句。
+  //   · `'client'`        ⇒ **不回收**。断线 ≠ 结束任务：用户可能重连续问，容器留给复用
+  //     （30min 空闲回收兜底）。断线与停止在落库上同待遇（都保留已生成内容），
+  //     但在"要不要留容器"上必须分开 —— 这正是 `ChatStopReason` 做成三值的原因之一。
+  //   · `'lock-lost'`     ⇒ **绝不回收**（且到不了这里：上面已提前 throw）。锁丢了说明
+  //     同会话可能已有**另一条流**在跑，它名下可能已有新容器 —— 回收就是杀别人的容器。
+  //   · 正常完成 / 引擎故障 ⇒ **不回收**：前者是"会话即容器"复用的初衷；后者的容器
+  //     多半已是尸体（pi 是主进程），由复用判定的"在跑"检查（P0-3-8 收紧，
+  //     `manager.ts` ① / `docker.ts#inspectSandboxContainerState`）在**下一轮**收走。
+  //
+  // ★ **顺序即正确性**：回收必须排在 ④.5 收产物与 ⑥ 落库**之后** —— 这也是为什么
+  //   "停流 + 回收沙箱"的分流点在**编排层收尾**而不在 `/stop` 路由（`02` §4.5 那句
+  //   "按会话类型分流"的落法）：路由若直接回收，杀掉的是还没收完产物的容器。
+  //
+  // ★ **inline await、不 fire-and-forget**：`void recycleSandbox(...)` 会让紧随其后的
+  //   "直接追问"（`01` 决策 15）撞上竞态 —— 新一轮 `ensureSandbox` 的复用判定可能
+  //   在删除完成前读到"容器还在"，随后 `attach` 失败成一条莫名的 `UPSTREAM_ERROR`。
+  //   inline 的代价（`done{STOPPED}` 晚几十毫秒~秒级到达）远小于那个竞态。
+  if (stopReason === 'user') {
+    try {
+      // 先拆桥、再杀容器：桥的 `close()` 幂等且让在飞等待**立刻**失败（而不是等超时）；
+      // 容器一删 socket 也会自断，但显式关把时序钉在我们手里
+      closeSandboxRpc(conversationId, 'user-stop')
+      const recycled = await recycleSandbox(conversationId, 'user-stop')
+      logger.info(
+        { conversationId, agentId, recycled, messageId },
+        '用户停止：沙箱已回收（下一轮重新建容器 —— 会话恢复 = 重发）',
+      )
+    } catch (error) {
+      // 回收失败 ≠ 停止失败：`done{STOPPED}` 照发（用户要的"停"已经成立）；
+      // 残留的容器/卷/账本行留给对账器（它按 label 找得到，且 `recycleSandbox` 幂等）
+      logger.warn(
+        { err: error, conversationId, agentId, sandboxId: sandbox?.sandboxId ?? null },
+        '用户停止后回收沙箱失败（留给对账器兜底）',
+      )
+    }
+  }
 
   // 帧写坏了（schema 不过）是"我们自己的 bug"：内容已落库，但这一轮必须以 error 收尾
   if (frameFailure !== undefined) throw frameFailure

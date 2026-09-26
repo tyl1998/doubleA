@@ -180,15 +180,32 @@ export async function startSandboxContainer(containerId: string): Promise<void> 
   }
 }
 
-/** 容器还在不在（**唯一**判断方式：`inspect`；账本里的 `container_id` 不作数） */
-export async function sandboxContainerExists(containerId: string): Promise<boolean> {
+/** 复用判定要的容器状态（一次 `inspect` 拿全；`missing` = 404，是**业务答案**不是异常） */
+export type SandboxContainerState = 'running' | 'stopped' | 'missing'
+
+/**
+ * 一个容器此刻的状态（P0-3-8：复用判定的唯一依据）。
+ *
+ * ★ 为什么"存在"不够、必须看**在不在跑**（本批收紧的原因）：pi 是容器主进程
+ *   （镜像 `ENTRYPOINT` 是 `tini -- entrypoint.sh`、末尾 `exec pi`）⇒ **引擎退出 = 容器退出**，
+ *   而 Docker 的 `inspect` 对"退出了的容器"**照样成功返回** ⇒ 只判"存在"会把一具尸体当成
+ *   可复用的沙箱：`attach` 对已停止的容器必然失败 ⇒ 用户每重发一次就再吃一次
+ *   `UPSTREAM_ERROR`，与错误文案里那句"系统会自行重建沙箱"自相矛盾（尸体不清，
+ *   重建永远不会发生）。"停了 = 尸体 = 回收重建"也是 `子方案③` §九 4 的落法：
+ *   档位 2（会话级续跑，`docker start` 复活引擎）**刻意不做**，这里不 `start` 就是它的执行点。
+ *
+ * 与 {@link inspectSandboxContainerLabels} 的分工：这个回答"它还顶不顶得住复用"
+ * （`stopped` / `missing` 都是**业务答案**），那个回答"它身上写着什么"。
+ */
+export async function inspectSandboxContainerState(containerId: string): Promise<SandboxContainerState> {
+  let info: Docker.ContainerInspectInfo
   try {
-    await getDocker().getContainer(containerId).inspect()
-    return true
+    info = await getDocker().getContainer(containerId).inspect()
   } catch (error) {
-    if (isDockerNotFound(error)) return false
+    if (isDockerNotFound(error)) return 'missing'
     throw new Error(describeDockerFailure(error), { cause: error })
   }
+  return info.State?.Running === true ? 'running' : 'stopped'
 }
 
 /**
@@ -197,8 +214,8 @@ export async function sandboxContainerExists(containerId: string): Promise<boole
  * 三种"没有标签"的路都归成 `undefined`：容器不存在（404）、`Config.Labels` 缺失、空对象。
  * **刻意不做区分**：调用方（`manager.ts` 的复用判定）对这三种的处理完全一样 —— 都当
  * "读不出模型 ⇒ 不一致 ⇒ 回收重建"，而"重建"在三种情形下都是安全动作。
- * 与 `sandboxContainerExists` 的分工：那个回答"还在不在"（`false` 是**业务答案**），
- * 这个回答"它身上写着什么"。
+ * 与 `inspectSandboxContainerState` 的分工：那个回答"它还顶不顶得住复用"
+ * （`stopped` / `missing` 都是**业务答案**），这个回答"它身上写着什么"。
  */
 export async function inspectSandboxContainerLabels(
   containerId: string,

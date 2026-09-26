@@ -235,11 +235,12 @@ export function registerConversationRoutes(app: FastifyInstance): void {
    * **没人消费的停止键**，它会在 60s 内让用户的下一条消息**秒停**（见 `infra/redis.ts` 的
    * `CHAT_STOP_TTL_SEC`）。
    *
-   * 刻意**不按会话类型分流**（`02` §4.5 的表里写了"停流 / 停流+回收沙箱"）：本端点只负责
-   * **写那一个信号键**，而被停止的那条流怎么收尾是它自己的事 —— TaskAgent 一侧由
-   * `bridge.ts#runTurn` 的 abort 监听把信号翻成引擎的 `abort` 命令（P0-3-6 起已通）。
-   * ⚠️ "停流之后要不要**杀掉容器**"是另一件事，属 **P0-3-8**（`子方案③` §九 2）——
-   * 那才是这里将来可能要分流的地方；现在多写一个分支只会是猜测。
+   * 刻意**不按会话类型分流**（`02` §4.5 的表里写着"停流 / 停流+回收沙箱"，P0-3-8 已定案
+   * **分流点不在本路由**）：本端点只负责**写那一个信号键**，被停止的那条流怎么收尾是它
+   * 自己的事 —— TaskAgent 一侧由 `bridge.ts#runTurn` 的 abort 监听把信号翻成引擎的
+   * `abort` 命令（+ 15s 宽限等 `agent_settled`），随后在 `taskAgent.ts` 收尾里、
+   * **产物收集与落库之后**，回收容器与具名卷。若在这里直接回收，杀掉的是一个还没收完
+   * 产物的容器（顺序即正确性）—— 所以"分流"落在编排层收尾，路由对两种会话类型同形。
    */
   app.post<{ Params: ConversationIdParams }>(
     '/api/conversations/:id/stop',

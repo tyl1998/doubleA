@@ -191,14 +191,20 @@ export async function ensureSandbox(
   const llm = await resolveSandboxLlm(conversation.agent.modelId)
   if (!llm.ok) return fail(llm.code, llm.message)
 
-  // ① 复用：账本说有 RUNNING 行 **且容器真的还在**（账本会撒谎，Docker 不会）
+  // ① 复用：账本说有 RUNNING 行 **且容器还在跑**（账本会撒谎，Docker 不会）。
+  //    ★ P0-3-8 收紧：判据从"容器存在"改成"容器**在跑**"—— pi 是容器主进程 ⇒ 引擎退出 =
+  //    容器退出，而 `inspect` 对退出的容器照样成功 ⇒ 只判"存在"会把一具尸体当可复用沙箱
+  //    （`attach` 必败，用户每重发一次就再吃一次 UPSTREAM_ERROR，与"系统会自行重建"的
+  //    文案矛盾）。停了 = 回收重建；**不做** `docker start` 复活（那是 `子方案③` §九 4
+  //    刻意不做的档位 2「会话级续跑」）。
   const running = await getPrisma().sandbox.findFirst({
     where: { conversationId, status: 'RUNNING' },
     orderBy: { createdAt: 'desc' },
     select: { id: true, containerId: true, image: true, createdAt: true },
   })
   if (running !== null && running.containerId !== null) {
-    if (await docker.sandboxContainerExists(running.containerId)) {
+    const state = await docker.inspectSandboxContainerState(running.containerId)
+    if (state === 'running') {
       // ★ P0-3-4：复用之前必须确认"容器里那套 LLM 目标还是这一轮的"。
       //   容器环境变量是**建的时候**注入的，而模型可以被改（`PATCH /api/agents/:id`）——
       //   不比对的话，改了模型之后同一会话的下一轮**继续用旧的 Key 与旧的模型名**调，
@@ -235,8 +241,10 @@ export async function ensureSandbox(
         }
       }
     } else {
-      // 容器没了（被手工删 / 宿主清理 / 崩过）⇒ 先把账面收干净，再走新建
-      await recycleSandbox(conversationId, 'container-missing')
+      // 容器没了（手工删 / 宿主清理 / 崩过）或已退出（引擎死了 ⇒ pi 是主进程、容器跟着退）
+      // ⇒ 先把账面收干净，再走新建。两种 reason 只进日志（见 `recycleSandbox` 的参数注释），
+      // 但**值得分开**：`engine-exited` 指向"上一轮引擎故障"，`container-missing` 指向"外部动了 Docker"。
+      await recycleSandbox(conversationId, state === 'stopped' ? 'engine-exited' : 'container-missing')
     }
   }
 
