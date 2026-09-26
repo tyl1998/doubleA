@@ -40,6 +40,14 @@ export type SandboxLlmResult =
       ok: true
       /** `agents.model_id` —— 同时是容器标签 `doubulea.model` 的值（复用比对的判据） */
       modelId: string
+      /**
+       * **上游**模型名（`models.model_name`，≠ {@link modelId}）。
+       *
+       * P0-3-5 加的：引擎的命令行要的是**这个名字**（`pi --provider doubulea --model <它>`）。
+       * 单独留一个字段而不是让调用方去 `env[SANDBOX_LLM_ENV.model]` 里掏 —— 那是"两个模块
+       * 约定同一个字符串键"，而这里要的是"给我模型名"，直接给。
+       */
+      modelName: string
       /** 含明文 Key；**只许进容器 Env**（见文件头） */
       env: Record<string, string>
     }
@@ -66,6 +74,8 @@ export async function resolveSandboxLlm(modelId: string): Promise<SandboxLlmResu
     return {
       ok: true,
       modelId: target.modelId,
+      // 上游模型名（`pi --model` 要的就是它；P0-3-5 起由 `piRpcArgv` 消费）
+      modelName: target.modelName,
       env: sandboxLlmEnv({
         modelName: target.modelName,
         label: target.label,

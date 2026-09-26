@@ -53,6 +53,7 @@ import { ensureSandboxNetwork, type SandboxNetwork } from './network.js'
 import {
   buildSandboxContainerSpec,
   isNonRootImageUser,
+  piRpcArgv,
   readSandboxLabels,
   sandboxEgressEnv,
   sandboxLabels,
@@ -387,6 +388,13 @@ async function createSandbox(
         modelId: llm.modelId,
         network: runtime.network.name,
         limits: config.sandbox.limits,
+        /**
+         * ★ P0-3-5：覆盖镜像 CMD —— 引擎要以 **rpc 模式 + 我们这一轮的 provider/模型** 启动
+         * （`--provider doubulea --model <上游模型名>` + `--no-approve`，见 `spec.ts#piRpcArgv`）。
+         * ⚠️ 用的是 `llm.modelName`（**上游**模型名）而不是 `llm.modelId`（`agents.model_id` 的 UUID）：
+         * 前者才是 pi 认的那个 id，后者只进标签。
+         */
+        cmd: piRpcArgv(llm.modelName),
         // 出口①/②（`sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，含**明文 Key**）拼成一份
         // Env。⚠️ 后者只在**这里**被消费，别顺手把它塞进日志（见 `llm.ts` 文件头）。
         env: {

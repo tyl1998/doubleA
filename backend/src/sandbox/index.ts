@@ -1,5 +1,5 @@
 /**
- * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener）
+ * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥）
  *
  * 依据：`docs/02-后端设计.md` §七（TaskAgent 编排）+ §4.8（任务与产物）+ `docs/06-实施计划.md` §五 P0-3-2/P0-3-3
  *
@@ -9,12 +9,12 @@
  *
  * | 调用方 | 拿什么 |
  * |--------|--------|
- * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` |
- * | P0-3-5/6 的编排层 | `ensureSandbox`（拿沙箱）/ `touchSandbox`（引擎事件刷活跃）/ `recycleSandbox` |
- * | P0-3-8 的停止路径 | `recycleSandbox` |
- * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV`（拼 `--model <provider>/<model>`）、`SANDBOX_WORK_DIR` |
- * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `sandboxQueueDepth` |
- * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4） |
+ * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
+ * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃） |
+ * | P0-3-8 的停止路径 | `closeSandboxRpc`（只拆连接）/ `recycleSandbox`（真杀容器） |
+ * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
+ * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
+ * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5） |
  */
 
 // 生命周期（拿、收、刷活跃、观测）
@@ -32,6 +32,30 @@ export {
 
 // LLM 注入（P0-3-4）：把 `agents.model_id` 解析成"要注入容器的那组环境变量"
 export { resolveSandboxLlm, type SandboxLlmFailureCode, type SandboxLlmResult } from './llm.js'
+
+// 引擎桥（P0-3-5）：`pi --mode rpc` 的 JSONL 通道（建 / 取 / 关 / 观测 + 协议形状）
+export {
+  closeAllSandboxRpcs,
+  closeSandboxRpc,
+  createSandboxRpc,
+  getSandboxRpc,
+  getSandboxRpcStats,
+  openSandboxRpc,
+  SandboxRpcError,
+  type OpenSandboxRpcOptions,
+  type PiRpcCommand,
+  type PiRpcResponse,
+  type PiSessionEvent,
+  type RunTurnOptions,
+  type SandboxRpc,
+  type SandboxRpcFailureCode,
+  type SandboxRpcStats,
+  type TurnFailureReason,
+  type TurnOutcome,
+} from './bridge.js'
+
+// JSONL 分帧（纯逻辑；单独导出是为了能**不连 Docker**地逐条核查"只认 LF"那几条）
+export { createJsonlDecoder, JsonlRecordTooLargeError, PI_RPC_STDIO_MAX_BYTES, type JsonlDecoder } from './jsonl.js'
 
 // 对账（启动对账 + 周期回收 + 空闲回收 + work 卷体量巡检），由进程入口驱动
 export {
@@ -86,6 +110,7 @@ export {
 export {
   piApiForProtocol,
   piBaseUrlFor,
+  piRpcArgv,
   sandboxLlmEnv,
   SANDBOX_LLM_ENV,
   SANDBOX_PI_PROVIDER_ID,

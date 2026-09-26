@@ -21,10 +21,12 @@
  *     报错文案直接说这一句，比 `connect ENOENT` 省一轮排查。
  */
 
+import { PassThrough } from 'node:stream'
+
 import Docker from 'dockerode'
 
 import { getLogger } from '../infra/logger.js'
-import { sandboxFilter, sandboxFilterFor, type SandboxLabels } from './spec.js'
+import { SANDBOX_LLM_ENV, sandboxFilter, sandboxFilterFor, type SandboxLabels } from './spec.js'
 
 let client: Docker | undefined
 
@@ -209,6 +211,122 @@ export async function inspectSandboxContainerLabels(
     if (isDockerNotFound(error)) return undefined
     throw new Error(describeDockerFailure(error), { cause: error })
   }
+}
+
+/**
+ * 读容器**注入进去的 LLM Key**（P0-3-5）。
+ *
+ * ⚠️ **唯一用途 = 脱敏**：引擎的 stderr 会进后端日志（`子方案③` §六 3："引擎 stderr 不进 SSE，
+ * 进后端日志（脱敏）"），而上游 401 的响应体常把 `Authorization` 回显出来 —— 不抹掉就等于
+ * 借日志把 Key 漏出去（与 `llm/upstream.ts#redactSecret` 是同一个教训）。
+ *
+ * 三条刻意的收窄，别照着放宽：
+ *   ① **只读这一个键**（不是整个 `Config.Env`）：返回一个"装着所有环境变量"的对象，
+ *      下一个人迟早会把它整个打进日志；
+ *   ② 名字里带 `LlmApiKey`，让调用点一眼看出"手里这个字符串是凭据"；
+ *   ③ 读不出来（404 / 没注入）返回 `undefined` 而**不抛** —— 脱敏是收尾路径上的尽力而为，
+ *      不该因为"读不到 Key"把一次正常的关闭变成异常（同 `inspectSandboxContainerLabels`）。
+ */
+export async function readSandboxLlmApiKey(containerId: string): Promise<string | undefined> {
+  try {
+    const info = await getDocker().getContainer(containerId).inspect()
+    const env = info.Config?.Env
+    if (env === undefined || env === null) return undefined
+    const prefix = `${SANDBOX_LLM_ENV.apiKey}=`
+    const value = env.find((entry) => entry.startsWith(prefix))?.slice(prefix.length)
+    return value !== undefined && value !== '' ? value : undefined
+  } catch (error) {
+    if (isDockerNotFound(error)) return undefined
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
+/**
+ * 接上**容器主进程的 stdio**（P0-3-5）—— 引擎桥的底座。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 为什么是 `attach` 而不是 `exec`（这一条决定了桥的整个形状）
+ * ─────────────────────────────────────────────────────────────────────
+ * 镜像的 `ENTRYPOINT` 是 `tini -- entrypoint.sh`，而脚本最后 `exec pi "$@"` ⇒ **pi 就是容器主进程**
+ * （`infra/sandbox/base/Dockerfile` 的收尾注释："真正的引擎桥属 P0-3-5，那时由
+ * `backend/src/sandbox` 覆盖 Cmd 传参"）。容器创建时给的 `OpenStdin: true` / `StdinOnce: false`
+ * 就是为这条连接留的。
+ *
+ * 若改用 `exec` 再起一个 `pi --mode rpc`，容器里就会有**两个**引擎：主进程那个白等着
+ * （而它才是"容器活着的理由"），我们连的那个死了容器还活着 —— 生命周期与 `子方案③` §四 1
+ * "会话即容器"直接矛盾。`attach` 让"容器活着"与"引擎可对话"变成同一件事。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⚠️ 两处必须做对，否则症状都指不到这里
+ * ─────────────────────────────────────────────────────────────────────
+ * ① **`hijack: true`**：走 Docker 的 `Connection: Upgrade`，拿回一条**裸 socket**（可读可写）。
+ *    不带它拿到的是被包了一层的响应流，往上写命令不一定到得了容器 stdin。
+ * ② **必须 `demuxStream`**：本仓容器的 `Tty` 是 **false**（P0-3-2 实测"不设 Tty 才起得来"），
+ *    这种情况下 Docker 的 stdio 是 **8 字节头（流号 + 大端长度）+ 载荷** 的多路复用格式。
+ *    不解复用直接读，JSONL 解析器收到的是带二进制头的乱码 —— 症状是"每条记录都解析失败"，
+ *    而报错现场离真因（少了 demux）隔着两层。
+ *
+ * ⚠️ `detach()` **只拆我们的连接，不碰容器**：`StdinOnce: false` ⇒ 断开后容器 stdin 不关，
+ * pi 原地等着下一次 attach（这正是"复用容器"能成立的前提）。要结束引擎请走
+ * `manager.ts#recycleSandbox`（那才是"杀"）。
+ */
+/**
+ * `attach()` 在 `hijack: true` 下实到手的是一条 `Duplex`（可读可写、可 `destroy`），
+ * 但 `@types/dockerode` 只把它声明成 {@link NodeJS.ReadWriteStream} —— 那个接口**没有 `destroy`**。
+ * 桥的 `detach()` 必须能拆掉这条连接，所以在这一处把类型收紧：
+ * `destroy` 写成**必需**（不做 `any` 逃逸、也不退化成可选链）——
+ * 真到不了 `destroy` 就说明 dockerode 换了返回形态，宁可当场炸掉，也别静默漏掉一条连接。
+ */
+export type AttachStream = NodeJS.ReadWriteStream & { destroy: () => void }
+
+export interface SandboxStdio {
+  /** 裸 attach 连接：写入即引擎 stdin；`detach()` 关它 */
+  stream: AttachStream
+  /** **已解复用**的协议输出（引擎 stdout）——只有它能喂 JSONL 解析器 */
+  stdout: PassThrough
+  /** **已解复用**的诊断输出（引擎 stderr）——只进日志，**绝不进 SSE** */
+  stderr: PassThrough
+  /** 拆连接（不关容器、不杀引擎） */
+  detach: () => void
+}
+
+export async function attachSandboxStdio(containerId: string): Promise<SandboxStdio> {
+  const container = getDocker().getContainer(containerId)
+  let stream: AttachStream
+  try {
+    stream = (await container.attach({
+      stream: true,
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      hijack: true,
+    })) as AttachStream
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  // `modem` 在类型上是 `any`（`@types/dockerode` 就没给它类型），这里用一次即可 ——
+  // 它是 dockerode 官方推荐的解复用入口，自己手写那套 8 字节头解析没有任何好处。
+  container.modem.demuxStream(stream, stdout, stderr)
+
+  let detached = false
+  const detach = (): void => {
+    if (detached) return
+    detached = true
+    // 顺序：先断连接（它一断，解复用那侧的 'data' 就不会再来），再收两个 PassThrough。
+    // 反过来写过一次就会踩到"流已结束但 demux 还在往上写"的 ERR_STREAM_WRITE_AFTER_END。
+    try {
+      stream.destroy()
+    } catch {
+      // 已经断了 ⇒ 目标状态已达成（`detach()` 会被桥的收尾路径与进程退出路径各调一次，必须幂等）
+    }
+    stdout.end()
+    stderr.end()
+  }
+
+  return { stream, stdout, stderr, detach }
 }
 
 /**

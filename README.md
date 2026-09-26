@@ -332,6 +332,55 @@ docker rm -f sandbox-llm-probe && docker volume rm doubulea-sandbox-llm-probe
 > ⚠️ **仍然不能端测**：`ensureSandbox()` 仍是**模块内部路径**（入口 = TaskAgent `/chat`，属 P0-3-5/6），
 > 上面那段是**手工起容器**做一次取证，不是"跑通了一条业务链路" ⇒ **最早可端测的点仍是 P0-3-11**。
 
+### 沙箱引擎桥（P0-3-5 起；⚠️ 仍然派不了活）
+
+**这一批解决的是「后端怎么跟容器里的 pi 说上话」** —— 答案不是再起一个进程，而是**接上容器主进程
+本来就有的 stdin / stdout**，在上面跑 pi 的 RPC 协议（JSONL over stdio）。落点是
+`backend/src/sandbox/jsonl.ts`（分帧，纯逻辑）+ `backend/src/sandbox/bridge.ts`（协议层）。
+
+| # | 是什么 | 判据 / 落点 |
+|---|--------|-------------|
+| ① | 桥 = **容器主进程的 stdio** | `docker.ts#attachSandboxStdio()`：`container.attach({ hijack: true })`。镜像收尾是 `exec pi "$@"` ⇒ **pi 就是容器主进程**，于是"容器活着"与"引擎可对话"变成同一件事（若改用 `exec` 另起一个，容器里就有**两个**引擎） |
+| ② | 为什么必须 `demuxStream` | 本仓容器 **`Tty: false`**（P0-3-2 实测"不设 `Tty` 才起得来"）⇒ Docker 的 stdio 是 **8 字节头（流号 + 大端长度）+ 载荷** 的多路复用格式。不解复用直接读 ⇒ 症状是"**每条记录都解析失败**"，而现场离真因隔着两层 |
+| ③ | 分帧**只认 `LF`** | **不许用 `node:readline`**：它把 `U+2028` / `U+2029` 也当行边界，而这两个字符**在 JSON 字符串里合法** ⇒ 记录被静默切成两半（上游 `docs/rpc.md` 点名警告）。另设单条记录上限 **8MB**，超了抛错 —— 不让一条坏流把内存吃光 |
+| ④ | 一轮的收尾信号 = **`{"type":"agent_settled"}`** | **不是 `agent_end`** —— 后者之后还可能跟重试 / 溢出恢复 / 上下文压缩 / 跟进动作，拿它当收尾会**提前落库**（症状："回答少了一截，但历史里看着是完整的"） |
+| ⑤ | **订阅先于派活** | 先登记 `agent_settled` 的等待者，**再**发 `prompt`（上游 `docs/rpc.md`：`Subscribe before sending a prompt to avoid missing a fast completion`）。反过来写，极快的收尾必丢 |
+| ⑥ | 引擎 stderr | **进后端日志、绝不进 SSE**：`redactSecret()` 脱敏（用容器 `Env` 里那把 Key 当脱敏词）+ 保尾 8KB + 默认 `debug` 级 |
+| ⑦ | 启动参数 | `spec.ts#piRpcArgv()` → `--mode rpc --provider doubulea --model <上游模型名> --no-approve`。⚠️ **`--no-approve` 不能省**：非交互下 pi 的项目信任提示恒答"否"，省了会卡在信任那一关 |
+| ⑧ | 断开 ≠ 杀容器 | `close()` 只拆连接（`StdinOnce: false` ⇒ 容器 stdin 不关，pi 原地等下一次 attach）—— 这是"**复用容器**"能成立的前提。真要结束引擎走 `recycleSandbox`（那才是"杀"） |
+
+**想自己验一遍**（⚠️ **这一步同样是人工取证**：`06` §六 第 30 条。它要证的两件事 ——
+"真容器上的 stdio 真能收发"（② 的正身）与"完成后真的收到 `agent_settled`"（④ 的正身）——
+都属于"跑起来才知道"，用一对内存流做出来的假通道证明不了）：
+
+```bash
+# ① 起一台容器，让它以 RPC 模式等我们说话
+#    ⚠️ 必须 -i：否则容器没有 stdin，attach 上去也发不出命令
+docker run -d -i --name sandbox-rpc-probe \
+  -e DOUBULEA_LLM_API_KEY=sk-probe-DO-NOT-LEAK-000000000000 \
+  -e DOUBULEA_LLM_BASE_URL=http://host.docker.internal:9/v1 \
+  -e DOUBULEA_LLM_API=openai-completions \
+  -e DOUBULEA_LLM_MODEL=probe-model \
+  --entrypoint sh doubulea/sandbox-toolkit:2 -c \
+  '/opt/pi/entrypoint.sh --mode rpc --provider doubulea --model probe-model --no-approve; echo "--- pi exit=$? ---"; sleep 900'
+#  → baseUrl 故意指向一个**打不通的端口**：这一步验的是"协议通不通"，不是"模型答得对"
+
+# ② 先订阅、再派活 —— 用 attach（不是 exec）接主进程的 stdin/stdout，这正是后端在做的事
+( printf '%s\n' '{"id":"1","type":"prompt","message":"你好"}'; sleep 30 ) | docker attach sandbox-rpc-probe
+#  → 屏幕上应当是逐行 JSONL。要盯的是这两条：
+#      {"id":"1","type":"response","command":"prompt","success":true}   ← 命令被接受
+#      {"type":"agent_settled"}                                        ← ★ ④ 的**直接取证**
+#    ⚠️ 只有 agent_end 而始终没有 agent_settled ⇒ 收尾信号认错了（这正是坑 2）
+#  ⚠️ 模型池打不通 ⇒ 这一轮大概率以**报错收场**，那也正常：本步证的是协议与收尾信号，
+#    不是"模型答得对"。要连真上游就按上一节的假上游 / 真 Provider 换 DOUBULEA_LLM_BASE_URL
+
+# ③ 清场（⚠️ attach 断开**不会**关容器 —— 这是 ⑧ 的设计，所以必须显式删）
+docker rm -f sandbox-rpc-probe
+```
+
+> ⚠️ **仍然不能端测**：`openSandboxRpc()` 是**模块内部路径**，本批交付的是"通道"、
+> **没有任何 HTTP / SSE 面**（谁派活、事件怎么映射成前端的卡，是 P0-3-6）⇒ **最早可端测的点仍是 P0-3-11**。
+
 ### 后端配置自检（P0-1-3 起）
 
 后端启动时自己读 `infra/.env`（`backend/src/config.ts`，zod 校验）：**缺必填项会直接退出并列出

@@ -22,7 +22,9 @@ import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
 import { getPipelineWorkerStats, startPipelineWorker, stopPipelineWorker } from './pipeline/worker.js'
 import {
+  closeAllSandboxRpcs,
   getSandboxListenerStats,
+  getSandboxRpcStats,
   getSandboxStats,
   reconcileOnBoot,
   startSandboxListener,
@@ -88,6 +90,17 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
     //    再收 app，最后关依赖。反过来的话它们会拿着已关闭的连接继续干活，
     //    日志里出现一堆"数据库不可用"的假故障。
     await stopPipelineWorker()
+    // ★ P0-3-5：**先拆引擎桥**（在此之前停对账器，免得它把正在被"告别"的容器也删一遍）。
+    //   拆桥 = 关掉 attach 连接 + 把在飞的那一轮判成"桥已关闭"，**不碰容器** ——
+    //   容器留在磁盘上由**下一次启动的 `reconcileOnBoot()` 清掉**（`子方案③` §九 2：
+    //   引擎是容器主进程，后端一没就没人跟它说话，一律重建不复用）。
+    //   ⚠️ 不在这里杀容器：那会把"进程退出"变成一个可能耗时几十秒的容器清理动作，
+    //   而退出路径的兜底时限只有 10s。
+    const rpcStats = getSandboxRpcStats()
+    closeAllSandboxRpcs('shutdown')
+    if (rpcStats.open > 0) {
+      logger.info(rpcStats, '已拆掉全部引擎桥（容器留给下次启动的对账清理掉）')
+    }
     await stopSandboxReaper()
     // ⚠️ 出口② 的 listener 也是"后台组件"（它服务的是容器来的请求），排在这里：
     //    先停它再关 app —— 反过来的话容器还可能打进来，而进程已经在拆依赖了。
@@ -126,7 +139,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-4 LLM 注入（`agents.model_id` → **复用** `services/model.service.ts#resolveChatTarget()`【含解密与四道前置校验，绝不另写一份】→ 一组 `DOUBULEA_LLM_*` 容器 env【`spec.ts#sandboxLlmEnv`，与出口①② 同一张 Env 表】→ 容器内 `gen-models.mjs` 生成 pi 的 `models.json`）★ **Key 不落盘**：`apiKey` 只写 `${DOUBULEA_LLM_API_KEY}` **引用**（pi 的 apiKey/headers 支持环境插值，baseUrl/api **不支持** ⇒ 值只留在环境变量里），生成器自带自检「文件里出现 Key 明文就起不来」+ 构建期 selfcheck 的正例/反例/跳过三连。★ **三协议都支持**（`openai-completions` / `openai-responses` / `anthropic-messages`，依据 pi-ai 包内 `dist/api/*`）⇒ 待决 1 **关闭**、不需要任何收窄判定。★ **baseUrl 差一个 `/v1`**：我方是字符串拼接、契约要求 baseUrl 自带 `/v1`，pi 走官方 SDK（OpenAI SDK 与我们同口径；**Anthropic SDK 自己加 `/v1`**）⇒ `piBaseUrlFor()` 对 `ANTHROPIC_MESSAGES` 去尾部 `/v1`（否则拼成 `/v1/v1/messages`）。★ 新增容器标签 `doubulea.model`：**复用容器前比对模型**，不一致或读不出来 ⇒ 回收重建（模型改了还复用 = 静默用旧 Key 与旧模型名调，账本与 Docker 都不报错）。新失败码 `MODEL_NOT_AVAILABLE`（与 `NOT_CONFIGURED` 分开：前者用户自己能修、后者是部署问题）。镜像 base/toolkit 层版本 → **2**（entrypoint 多了"生成 models.json"一步）。**零新增 env**（`DOUBULEA_LLM_*` 是**容器内**变量、由后端从库里解析生成，不进 `infra/.env`）',
+    step: 'P0-3-5 引擎桥（**`pi --mode rpc` 的 stdio 桥**：`jsonl.ts` 按 LF 切字节流【★ 刻意不用 `readline` —— 它会把 U+2028/U+2029 当行边界，而这两个字符在 JSON 字符串里是合法内容，切开后两边都解析失败 ⇒ **正文少一截而历史看着完整**】→ `bridge.ts` 请求/应答按 `id` 配对【命令处理是异步的，不能按顺序配；配不上号的应答**丢弃并留痕**，与上游 `RpcClient` 把它当事件派发刻意不同】→ **只等 `agent_settled` 收尾**【不是 `agent_end`：后者之后还可能跟重试/压缩/跟进，拿它当"这轮结束"会**提前落库**】→ 「订阅先于派活」写进结构【`#armSettled` 在 `send` 之前就登记，否则极快的收尾会被错过】）。★ **桥 = 容器主进程**：`docker.ts#attachSandboxStdio`（`hijack` + **必须 `demux`** —— 本仓容器 `Tty:false`，Docker 的 stdio 是 8 字节头多路复用，不解复用直接读是乱码）⇒ **容器一死桥必断**（流结束即结论，不探活）；`close()` **只拆连接不杀容器**（`StdinOnce:false`）。★ **覆盖镜像 CMD**：`spec.ts#piRpcArgv` = `--mode rpc --provider doubulea --model <上游模型名> --no-approve`【pi 的 `--provider` 默认是 `google`，不给就等于去要 google 的凭据；`--no-approve` 是 headless 挡项目级扩展的显式声明】⇒ 镜像**零改动**、`versions.mjs` 不动。★ 事件驱动 `touchSandbox`（节流 30s，`last_active_at` 的唯一写入口）+ stderr **脱敏进日志、绝不进 SSE**（Key 由 `docker#readSandboxLlmApiKey` 读回专门用来抹）。⚠️ **本批不含事件映射（P0-3-6）** ⇒ 界面/命令行看不到任何新东西。**零新增 env**（4 个新常量都是代码常量）',
     address,
   })
   logger.info(

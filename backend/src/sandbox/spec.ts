@@ -188,6 +188,11 @@ export interface SandboxContainerSpecInput {
   limits: { memMb: number; cpu: number; pids: number; tmpfsMb: number }
   /** 容器环境变量（出口①/② 的地址、代理与 **LLM 目标** 都从这里进去，见 `sandboxEgressEnv` / `sandboxLlmEnv`） */
   env: Record<string, string>
+  /**
+   * 覆盖镜像的 `CMD`（P0-3-5：{@link piRpcArgv} 的产物）。
+   * 不给 = 用镜像默认的 `["--mode","rpc"]`（"手工 run 一个能说话的最小形态"，见 `piRpcArgv`）。
+   */
+  cmd?: readonly string[]
 }
 
 /**
@@ -250,6 +255,35 @@ export const SANDBOX_LLM_ENV = {
  * `agents.model_id`），多注册几个 provider 只会让"这一轮到底用哪个"变成一个要读配置才知道的问题。
  */
 export const SANDBOX_PI_PROVIDER_ID = 'doubulea'
+
+/**
+ * 容器主进程（= 引擎 pi）的命令行（**纯函数**，P0-3-5）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么要在这里拼、而不是靠镜像的 `CMD` 默认值
+ * ─────────────────────────────────────────────────────────────────────
+ * 镜像里 `CMD ["--mode","rpc"]` 是**手 run 用的最小形态**（`infra/sandbox/base/Dockerfile`
+ * 的注释写明"真正的引擎桥属 P0-3-5，那时由 `backend/src/sandbox` 覆盖 Cmd 传参"）。
+ * 少了两件事它就调不动模型：
+ *   · **`--provider` / `--model`** —— pi 的 `--provider` 默认是 `google`（上游 `docs/cli.md`
+ *     "Provider name (default: google)"）。不给这两个参数，它会去找 google 的凭据、
+ *     而不是我们注入到容器里的模型池 ⇒ 报错与"Key 没生效"长得一模一样，而真因是**它根本没被要求用那个 provider**。
+ *     `--model` 收的是"模式或 id"（支持 `provider/id` 与 `:thinking` 两种写法）——
+ *     这里刻意走**两个 flag** 而不是 `--model doubulea/<id>`：模型 id 原样传一个参数进去，
+ *     不必再赌它对 `/` 的拆分规则（`id` 里带 `/` 时两种写法的行为就不一样了）。
+ *   · **`--no-approve`** —— headless 下不弹 trust 提示（`子方案③` §六 4 坑 3）。
+ *     实测依据：`dist/cli/project-trust.js` 在**非 interactive** 模式下 `confirm()` 直接返回
+ *     `false`（即"不信任项目级文件"），所以默认行为与 `--no-approve` 一致；
+ *     但"默认恰好对"不是契约 —— 显式写出来，将来上游改了默认值也不会静默打开一条我们不想要的缝。
+ *     （`settings.json` 的 `defaultProjectTrust: 'never'` 是另一层，写在 agent-dir 里。）
+ *
+ * ⚠️ `--mode rpc` 也一起写全：与镜像 `CMD` 的默认值**刻意重复**一次。
+ *    理由：这一处的每一段都是"引擎能不能说话"的必要条件，而重复的那一份是**常量**、
+ *    不是另一个真相（改镜像 CMD 只影响"手 run"，不影响桥）。
+ */
+export function piRpcArgv(modelName: string): string[] {
+  return ['--mode', 'rpc', '--provider', SANDBOX_PI_PROVIDER_ID, '--model', modelName, '--no-approve']
+}
 
 /**
  * 我方协议枚举 → **pi 的 api 名**（`models.json` 的 `api` 字段）。
@@ -401,7 +435,12 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
     StdinOnce: false,
     AttachStdin: false,
     Tty: false,
-    // ⚠️ Cmd 刻意不设：镜像里 `CMD ["--mode","rpc"]` 就是默认值（P0-3-1 把参数留在 CMD 正是为此）
+    /**
+     * P0-3-5 起**覆盖镜像 CMD**（`piRpcArgv`）：`--mode rpc` + `--provider`/`--model`
+     * （少了后两个，pi 会去找它默认的 `google` 凭据）+ `--no-approve`。
+     * 不给 `cmd` 时 `Cmd: undefined` ⇒ Docker 用镜像的 `CMD ["--mode","rpc"]`（手工 run 的形态）。
+     */
+    Cmd: input.cmd === undefined ? undefined : [...input.cmd],
     HostConfig: {
       AutoRemove: false,
       /**
