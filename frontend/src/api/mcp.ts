@@ -1,7 +1,7 @@
 /**
  * MCP 接口封装（P0-2-11 建；servers 六条 + credentials 三条 + 确认应答一条）
  *
- * 依据：`docs/02-后端设计.md` §4.7（`/api/mcp/**` 九条端点表与权限）、`docs/06-实施计划.md`
+ * 依据：`docs/02-后端设计.md` §4.7（`/api/mcp/**` 九条端点表与权限）、`docs/归档/06-P0-2-实施步骤.md`
  *      P0-2-11（前端三处接线）、`docs/03-前端设计.md` §4.4（MCP 管理页）/§4.5（我的凭据页）、
  *      `shared/src/mcp.ts` + `shared/src/sse.ts`（**唯一一套投影**）。
  *

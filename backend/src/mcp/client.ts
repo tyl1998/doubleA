@@ -1,7 +1,7 @@
 /**
  * MCP 客户端底座（P0-2-1）
  *
- * 依据：`docs/06-实施计划.md` §四 P0-2-1（内容 / 验收门槛 1~5 / 坑预判 1~6）
+ * 依据：`docs/归档/06-P0-2-实施步骤.md` P0-2-1（内容 / 验收门槛 1~5 / 坑预判 1~6）
  *      + §4.0 全局口径 1、2（只做 Streamable HTTP；客户端侧只走
  *        `initialize` / `tools/list` / `tools/call`，另作 `elicitation/create` 的**应答方**）
  *
