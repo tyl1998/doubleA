@@ -73,7 +73,9 @@ import {
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import { ensureBucket, getS3Client } from '../infra/s3.js'
+// ⚠️ `isS3NoSuchKey` 原本是本文件的私有函数，P0-3-9 提到 `infra/s3.ts`：产物下载端点要
+// 同一个判据（"行在对象没了"），两处各写一份必然先腐烂一处
+import { ensureBucket, getS3Client, isS3NoSuchKey } from '../infra/s3.js'
 import { detectFormat } from '../pipeline/parse/index.js'
 import { enqueuePipelineJob } from '../pipeline/queue.js'
 
@@ -467,7 +469,7 @@ export async function openDocumentSource(params: {
     const stat = await s3.statObject(bucket, row.fileKey)
     size = stat.size
   } catch (error) {
-    if (isNoSuchKey(error)) {
+    if (isS3NoSuchKey(error)) {
       getLogger().warn(
         { kbId: params.kbId, docId: row.id, fileKey: row.fileKey },
         '文档行存在但 S3 对象已丢失，下载返回 404',
@@ -487,21 +489,6 @@ export async function openDocumentSource(params: {
     body,
   }
 }
-
-/**
- * 判断"对象不存在"这一类错误。
- *
- * minio SDK 抛的是 `S3Error`（带 `code`），但**不同版本/不同网关的措辞不一致**：
- * 自建 MinIO 回 `NoSuchKey`，某些 S3 兼容实现回 `NotFound`/`NoSuchBucket`。故看 code 的
- * 同时兜一层 message（`instanceof` 跨包不可靠，见 `hasPrismaCode` 同款注释）。
- */
-function isNoSuchKey(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code
-  if (code === 'NoSuchKey' || code === 'NotFound' || code === 'NoSuchBucket') return true
-  const message = error instanceof Error ? error.message : ''
-  return /NoSuchKey|not exist|does not exist/iu.test(message)
-}
-
 
 // ═══════════════════════════ 覆盖重建 / 重试 / 删除（P0-1-19）═══════════════════════════
 

@@ -22,6 +22,7 @@ import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerAgentRoutes } from './routes/agents.js'
+import { registerArtifactRoutes } from './routes/artifacts.js'
 import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerHealthRoutes } from './routes/health.js'
@@ -169,6 +170,12 @@ export function buildApp(): FastifyInstance {
   //    只能读写自己的那一份，ADMIN 也没有后门（`06` §4.2 的第四族，与 conversations 同源）。
   //    ⚠️ 它与隔壁 ⑫ **并排**注册、权限却不同族 —— 差别写在 routes/mcpCredentials.ts 文件头。
   registerMcpCredentialRoutes(app)
+  // ⑭ 产物（P0-3-9）：列表挂在 `/api/conversations/:id/artifacts`（产物属会话）、下载挂在
+  //    `/api/artifacts/:id/download`，两条**刻意同一个文件**（共用一条归属判据，理由见
+  //    routes/artifacts.ts 文件头）。权限是**仅本人**（产物 → 会话 → `conversations.user_id`），
+  //    与知识库文档下载那条"登录即可"**刻意不同** —— 照抄它就漏掉归属校验。
+  //    ⚠️ 下载是本仓**第三个**不套信封的端点（字节流 / 失败才信封），客户端按响应形状分支。
+  registerArtifactRoutes(app)
 
   return app
 }

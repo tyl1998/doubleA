@@ -417,6 +417,61 @@ export const artifactItemSchema = z.object({
 })
 export type ArtifactItem = z.infer<typeof artifactItemSchema>
 
+// ───────────────────── 产物列表与下载（P0-3-9）──────────────────────
+
+/** 产物列表一页最多几条（与其余列表的上限一致） */
+export const ARTIFACT_PAGE_LIMIT_MAX = 100
+/** 不传 `limit` 时的默认条数（与其余列表的"默认 20"对齐） */
+export const ARTIFACT_PAGE_LIMIT_DEFAULT = 20
+
+/**
+ * `GET /api/conversations/:id/artifacts` 的查询参数（`02` §四：除消息外的列表一律 offset/limit）。
+ *
+ * ⚠️ **不用游标**：产物不是"对话流"，面板要的是"这个会话产出过哪些文件"（可按时间倒序翻页），
+ * 而消息那种"向历史深处滚动"的语义在这里不存在 —— 硬套游标只会让"回到第二页"变成一次
+ * 需要额外 `count` 的操作（见 `envelope.ts#cursorPageOf` 的理由）。
+ */
+export const listArtifactsQuerySchema = z.object({
+  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, 'limit 至少为 1')
+    .max(ARTIFACT_PAGE_LIMIT_MAX, `limit 最多 ${ARTIFACT_PAGE_LIMIT_MAX}`)
+    .default(ARTIFACT_PAGE_LIMIT_DEFAULT),
+})
+export type ListArtifactsQuery = z.infer<typeof listArtifactsQuerySchema>
+
+/**
+ * 列表里的一条产物 = {@link artifactItemSchema} + `createdAt`。
+ *
+ * **刻意由 `artifactItemSchema` `.extend()` 派生**：这张卡有三个来源（流里 `artifact` 事件、
+ * 刷新后 `messages.content.artifacts`、本列表），前两个**没有** `createdAt`（事件是现发、
+ * 消息的产物段在落库时定型于 P0-3-7），只有本列表能给出"什么时候产出的"。
+ * 派生而不是各写一份 ⇒ 加字段时不会出现"列表里多一列、卡片上少一块"。
+ *
+ * **刻意不带的两列**：
+ *   · `fileKey`（S3 对象键）—— 它是存储层实现细节，**不出现在任何对外契约里**
+ *     （`02` §三；下载/预览的路由参数是 `artifactId`）；
+ *   · `previewReady` —— P0-3-7 起恒为 `false`，它的语义属 **P0-3-10**（`02` §三 明写"消费者属
+ *     P0-3-10"）。在本批把它放进契约等于**替下一批定语义**，且界面上会多出一个永远为假的开关。
+ */
+export const artifactListItemSchema = artifactItemSchema.extend({
+  /** ISO 8601（JS 侧显式写入的 `created_at`，见 `artifacts.ts` 的时区注释） */
+  createdAt: z.string(),
+})
+export type ArtifactListItem = z.infer<typeof artifactListItemSchema>
+
+/** 产物列表响应 = `{ items, total, offset, limit }`（`shared/src/envelope.ts#offsetPageOf`） */
+export const artifactListResultSchema = offsetPageOf(artifactListItemSchema)
+export type ArtifactListResult = z.infer<typeof artifactListResultSchema>
+
+/** 路径参数（`/api/artifacts/:id/...` 的 `:id` = `artifacts` 行主键，`uuid(7)`） */
+export const artifactIdParamsSchema = z.object({
+  id: z.string().uuid('产物 ID 不是合法 UUID'),
+})
+export type ArtifactIdParams = z.infer<typeof artifactIdParamsSchema>
+
 /**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *

@@ -85,6 +85,24 @@ export async function ensureBucket(bucket: string = config.s3.bucket): Promise<v
 }
 
 /**
+ * 判断"对象不存在"这一类错误（`NoSuchKey` / `NoSuchBucket`）。
+ *
+ * ⚠️ **P0-3-9 起从 `document.service.ts` 提到本模块**：产物的下载端点要**同一个判据**
+ * （`artifacts.ts` 的保留期清理删对象 ⇒ 行可能还在而对象没了），两处各写一份必然先腐烂一处
+ * —— 而这类判据错了的症状是"文件明明在列表里、点下载报 500"（`06` §六 第 ⑰ 条同款）。
+ *
+ * minio SDK 抛的是 `S3Error`（带 `code`），但**不同版本/不同网关的措辞不一致**：
+ * 自建 MinIO 回 `NoSuchKey`，某些 S3 兼容实现回 `NotFound`/`NoSuchBucket`。故看 `code` 的
+ * 同时兜一层 message（`instanceof` 跨包不可靠，见 `hasPrismaCode` 同款注释）。
+ */
+export function isS3NoSuchKey(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  if (code === 'NoSuchKey' || code === 'NotFound' || code === 'NoSuchBucket') return true
+  const message = error instanceof Error ? error.message : ''
+  return /NoSuchKey|not exist|does not exist/iu.test(message)
+}
+
+/**
  * S3 客户端**无需显式关闭**：minio 客户端按请求复用 http agent，不持有常驻连接池句柄，
  * 故本模块不提供 `close` —— 退出流程（`index.ts`）只需收 PG / Redis 两个。
  */

@@ -429,6 +429,12 @@ const envSchema = z
     SSE_PING_INTERVAL_SEC: intVar('SSE_PING_INTERVAL_SEC', 20),
     CONTEXT_ROUNDS: intVar('CONTEXT_ROUNDS', 20),
     TOOL_LOOP_LIMIT: intVar('TOOL_LOOP_LIMIT', 10),
+    /**
+     * ⚠️ **P0 不生效但保留登记**（`子方案④` §三 2 / §二）：下载形态由签名 URL 改为**后端流式代理**
+     * （决定性理由是 HTML/SVG 的 CSP 隔离头只有我方响应头加得上）⇒ "签名 URL 时效"无处可用。
+     * 保留它的唯一理由是 P1 若改回签名 URL，这一项**自动生效**（届时还需 `S3_PUBLIC_ENDPOINT`）。
+     * **不要**因为"这一项没用"就把它从 `.env` 删掉 —— 删了等于把 P1 的开关也删了。
+     */
     ARTIFACT_URL_TTL_MIN: intVar('ARTIFACT_URL_TTL_MIN', 30),
 
     // ── 沙箱与产物（P0-3-1 首次落地；参数总表 = `子方案/沙箱与引擎集成.md` §二）──

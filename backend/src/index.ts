@@ -139,7 +139,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-8 沙箱停止（stop → 引擎中断 + 等 `agent_settled` → 收产物 → 容器与**具名卷**一并回收）。★ **回收的落点在编排层收尾、不在 `/stop` 路由**（`02` §4.5 那句"按会话类型分流"的定案落法）：路由直接回收会杀掉一个还没收完产物/落完库的容器 ⇒ 顺序即正确性，`taskAgent.ts` 收尾在 `persistRoundQuietly` 之后、抛错之前调 `closeSandboxRpc` + `recycleSandbox`（**inline await、不 fire-and-forget**：否则紧随其后的"直接追问"会在删除完成前撞上复用判定的竞态）。★ **触发表按 `ChatStopReason` 三值逐个定**：`user` ⇒ 回收（含宽限内没收尾的卡死引擎 —— `force` 删除即 SIGKILL，这就是"要不要升级"的答案）；`client` ⇒ **不回收**（断线 ≠ 结束任务，容器留给复用、30min 空闲回收兜底）；`lock-lost` ⇒ **绝不回收**（同会话可能已有另一条流在跑）；正常完成/引擎故障 ⇒ 不回收。★ **同批收紧复用判定**（"存在"→"在跑"）：pi 是容器主进程 ⇒ 引擎退出 = 容器退出，而 `inspect` 对退出的容器照样成功 ⇒ 只判存在会把尸体当可复用沙箱（`attach` 必败，重发一次就再吃一次 `UPSTREAM_ERROR`，与"系统会自行重建"的文案矛盾）；`docker.ts#inspectSandboxContainerState` 三态（running/stopped/missing），停了 = 回收重建、**不做** `docker start` 复活（子方案③ §九 4 刻意不做的档位 2）。⚠️ **零新增 env、零 HTTP 面、零数据库改动**；产物收集与落库不用另写（P0-3-7 已把收集排在 runTurn 之后、收尾之前，中断轮天然带上）⇒ 不可端测，可端测里程碑仍是 **P0-3-11**',
+    step: 'P0-3-9 产物下载（列表 `GET /api/conversations/:id/artifacts` + 下载 `GET /api/artifacts/:id/download`；后端流式代理取代签名 URL ⇒ `ARTIFACT_URL_TTL_MIN` P0 不生效但保留登记；归属校验 = 产物 → 会话 → 本人（别人的一律 404，与文档下载那条"登录即可"刻意不同）；`artifacts.mime` 是 `Content-Type` 唯一来源 + `nosniff` + `private, no-store`；"行在对象没了" ⇒ 404 + 专句文案且不动数据库；不支持 Range）',
     address,
   })
   logger.info(

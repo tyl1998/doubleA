@@ -489,8 +489,9 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:13000/api/agents \
 #    等对账轮（默认 60s 一轮）→ 对象与行一起消失（日志「产物保留期清理完成」）
 ```
 
-> ⚠️ **本批无 HTTP 面**：`GET /:id/artifacts`、`GET /artifacts/:id/download`、`/content` 属 P0-3-9/10，
-> 现在只能在 MinIO / psql 里看产物。**最早可端测的点仍是 P0-3-11**。
+> ⚠️ **本批（P0-3-7）无 HTTP 面**：`GET /:id/artifacts` 与 `GET /artifacts/:id/download` 已在
+> **P0-3-9** 落地（见后面的「产物列表与下载」一节，那里有可照抄的 curl），`/content`（预览）属 **P0-3-10**
+> ⇒ 现在**浏览器里**仍然只能在 MinIO / psql 里看产物。**最早可端测的点仍是 P0-3-11**。
 > ⚠️ 清理挂在沙箱对账器里 ⇒ **未配置 `SANDBOX_IMAGE` 时清理不跑**（没有镜像就没有 TaskAgent、
 > 产物不再新增；存量要清可手工删或临时配回镜像）。
 
@@ -531,6 +532,62 @@ curl --noproxy '*' -s -X POST "http://127.0.0.1:13000/api/conversations/$CONV/st
 > ⚠️ 停止后回收失败不会让"停止"失败（`done{STOPPED}` 照发）—— 残留的容器/卷留给对账器
 > （按 label 找得到）；看到 ③ 里对象还在时先看后端日志有没有「回收沙箱失败」的 warn。
 > ⚠️ `docker` 不在非交互 shell 的 PATH（OrbStack 托管）⇒ 上面用全路径，或先 `~/.orbstack/bin` 进 PATH。
+
+### 产物列表与下载（P0-3-9 起；⚠️ 命令行可验，浏览器仍要等 P0-3-11）
+
+**这一批把"库里有一行产物"变成"用户拿得到这个文件"**（P0-3-7 只做到"行建出来、事件发出去"，
+没有 HTTP 面）。两条端点：
+
+| 端点 | 说明 |
+|------|------|
+| `GET /api/conversations/:id/artifacts` | 产物列表 `?offset=&limit=`（**仅本人**；`{items,total,offset,limit}`，按 `created_at` 倒序）。它是**"刷新后产物还在"的唯一出口** —— `artifact` 事件只发一次、历史消息里的 `content.artifacts` 只覆盖那一轮 |
+| `GET /api/artifacts/:id/download` | 下载原文件：**字节流**（`attachment` + RFC 6266/5987 双写 + `nosniff` + `private, no-store`），**不套信封**（本仓第三个，前两个是文档下载与 SSE；失败仍是标准 JSON 信封 ⇒ 客户端按响应形状分支） |
+
+四条定案：① **下载是后端流式代理，不是签名 URL**（`02` §4.8 原文的"签名 URL 30 分钟"已废 ——
+决定性理由是 **HTML/SVG 的 CSP 隔离头只有我方响应头加得上**）⇒ `ARTIFACT_URL_TTL_MIN`
+**P0 不生效但保留登记**，"时效"由"链接不可分享"兜住；② **归属 = 产物 → 会话 → 本人**
+（与知识库文档下载那条"登录即可"**刻意不同**，照抄它就漏掉归属校验），别人的一律 **404 不是 403**
+（403 等于确认这个 id 有效）；③ `Content-Type` 的**唯一来源**是 `artifacts.mime`（不是 S3 对象元数据、
+也不是扩展名的运行期再判）；④ **"行在对象没了" ⇒ 404 + 专句文案、不动数据库**
+（保留期清理删了对象、行还在时的兜底；不删行是因为它是"这个会话产出过什么"的历史）。
+
+```bash
+# 前置：起依赖 + 起后端（另一终端）
+pnpm infra:up
+cd backend && node --import tsx src/index.ts
+
+# ① 登录拿 Cookie（admin / doubulea-admin-A1；**全程同一个 shell**，-c / -b 用同一个文件）
+curl -sS --noproxy '*' -c cookies.txt -X POST http://127.0.0.1:13000/api/auth/login \
+  -H 'content-type: application/json' -d '{"username":"admin","password":"doubulea-admin-A1"}'
+
+# ② 产物列表（CONV 换成你自己的会话 id；没有产物时也是 200 → {items:[],total:0,offset:0,limit:20}）
+CONV=<你的会话 id>
+curl -sS --noproxy '*' -b cookies.txt \
+  "http://127.0.0.1:13000/api/conversations/$CONV/artifacts?limit=20" | jq .
+
+# ③ 归属（**必须用另一个账号**，判据才成立）：
+#    用 member 登录另一份 cookie 文件，再打 ② 里那条 ⇒ 404（不是 403）
+#    同理：拿 ② 里某个 artifactId，换 member 打 ④ 的下载 ⇒ 404
+
+# ④ 下载（ART 取 ② 的 .data.items[0].artifactId）
+ART=<产物 id>
+curl -sS --noproxy '*' -b cookies.txt -D /tmp/art-head.txt -o /tmp/art.bin \
+  "http://127.0.0.1:13000/api/artifacts/$ART/download"
+cat /tmp/art-head.txt
+#   → content-disposition: attachment; filename="squares.csv"; filename*=UTF-8''squares.csv
+#   → content-type 取 artifacts.mime（如 text/csv）；另有 nosniff 与 cache-control: private, no-store
+wc -c /tmp/art.bin     # → 应与列表里的 size 一致
+
+# ⑤ 不存在的 id（或"行在对象没了"）⇒ 404 的**标准信封**，不是字节流
+curl -sS --noproxy '*' -b cookies.txt \
+  "http://127.0.0.1:13000/api/artifacts/00000000-0000-0000-0000-000000000000/download" | jq .
+```
+
+> ⚠️ **浏览器里还没有入口**：产物面板 + 预览弹层属 **P0-3-11**，预览端点 `/content` 属 **P0-3-10**
+> ⇒ 上面这段是**命令行档**（能亲手跑通"列表 → 下载 → 越权 404"这条链），**最早可端测的点仍是 P0-3-11**。
+> 要真看到产物，得先跑出一轮 TaskAgent（前提 = `SANDBOX_IMAGE` + `SANDBOX_EGRESS_PROXY_URL` 就绪，
+> 见「沙箱产物收集」那一节；也可以按那一节的 ③ 直接从 psql 里取 `artifacts.id` 填进 ④）。
+> ⚠️ 下载**不支持 Range**（`子方案④` §八 2）⇒ 大文件整份下载后才显示；产物单文件 ≤ `ARTIFACT_MAX_FILE_MB`（50MB）。
 
 ### 后端配置自检（P0-1-3 起）
 
