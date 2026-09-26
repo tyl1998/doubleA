@@ -112,7 +112,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-2-13 P0-2 包验收（阶段二出口验收 R1/R2 —— ⚠️ 纯文档批次：`06` 原文点名的 `verify-mcp-package.mjs` 增补计划**作废**，`backend/scripts/**` 已于 2026-09-24 删除 ⇒ 实际产出 = `README` 新增「阶段二出口验收（人工）」整节（前置六步 / R1·R2 / 三条附加门槛 / 逐行结论表 / 四条边界 / 复位）+ 两段内联假上游：①「需鉴权的假 MCP」（打印收到的 `authorization`，R1 的"凭据自动注入"由间接证据变成上游侧可读读数）② embedding 假上游最小替身；后端代码未改动，仅本标识随批次前进）',
+    step: 'P0-3-0b 撰写子方案④《文件预览》（⚠️ 纯文档批次：后端代码未改动，仅本标识随批次前进 —— 新增 `docs/子方案/文件预览.md`：**两条出口**（下载 `attachment` / 预览 `inline`，刻意不合并成 `?disposition=` 参数）+ **六条安全判据**（HTML/SVG 的隔离必须落在**响应头** CSP `sandbox`、永不给 `allow-same-origin`、**SVG 归 HTML 那一路**、MD 只放行不外链图片、`Content-Type`/`nosniff` 按 `artifacts.mime` 一处判据、预览出口不设 `attachment`）+ 五格式逐条落法 + 参数总表 5 项（**不新增 env**） + 待决 5 项；对 `02` 有一处**契约修订**：产物下载形态由签名 URL 改为**后端代理**（理由：CSP 只有我方响应头加得上），并新增 `GET /api/artifacts/:id/content`）',
     address,
   })
   logger.info(

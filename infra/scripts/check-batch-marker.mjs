@@ -24,6 +24,11 @@
  *    倒数第二步（`git commit` 之前的最后一道），不放进 `verify:app`：后者在批次进行中
  *    会被反复执行，那时施工图还没标 `[✓]`，会变成"一直在报一件本来就还没做的事"。
  *
+ * ⚠️ **2026-09-26 起批次号允许字母后缀**（`P0-3-0a` / `0b` / `6b` / `9b`）：P0-3 的步骤表里有
+ *    四个"插在整数步之间的子步"，若沿用只认纯数字的正则，本脚本会**读不出它们** ⇒ 从 P0-3 起
+ *    会一直停在 `P0-2-13`、**每批收尾必红**，纪律随之废掉。故两处放宽：正则接受 `[0-9a-z]+`，
+ *    排序键把字母后缀折算成一个小权重（排在同一个数字键的后面、下一个数字键的前面）。
+ *
  * 用法：
  *   pnpm check:batch        # 通过 → exit 0；不一致 → 打印两边实际值 + 怎么改，exit 1
  */
@@ -37,7 +42,7 @@ const DOCS = resolve(repoRoot, 'docs')
 const ENTRY = resolve(repoRoot, 'backend/src/index.ts')
 
 /** `#### P0-1-19 入库 + …  \`[✓]\` 2026-09-22` —— 批次标题行 + 已完成标记 */
-const BATCH_HEADING = /^####\s+(P\d+-\d+-\d+)\s+/
+const BATCH_HEADING = /^####\s+(P\d+-\d+-[0-9a-z]+)\s+/
 const DONE_MARK = '`[✓]`'
 /** `step: 'P0-1-20 双路检索 + RRF 融合',` */
 const STEP_LINE = /step:\s*'([^']+)'/
@@ -63,11 +68,17 @@ function readText(path) {
   }
 }
 
-/** `P0-2-13` → 可比较的数值键（键最大者 = 最后完成的批次） */
+/**
+ * `P0-2-13` → 可比较的数值键（键最大者 = 最后完成的批次）。
+ *
+ * 字母后缀（`P0-3-0a` / `6b`）排在**同一个数字键之后、下一个数字键之前**：
+ * `P0-3-0` < `P0-3-0a` < `P0-3-0b` < `P0-3-1` < `P0-3-6b` < `P0-3-7`。
+ */
 function batchKey(id) {
-  const m = /^P(\d+)-(\d+)-(\d+)$/.exec(id)
+  const m = /^P(\d+)-(\d+)-(\d+)([a-z]*)$/.exec(id)
   if (m === null) return -1
-  return Number(m[1]) * 1e6 + Number(m[2]) * 1e3 + Number(m[3])
+  const suffix = m[4] === '' ? 0 : m[4].charCodeAt(0) - 96 // a=1, b=2 …
+  return Number(m[1]) * 1e9 + Number(m[2]) * 1e6 + Number(m[3]) * 1e3 + suffix
 }
 
 /** 扫全部施工图文件，收集标了 `[✓]` 的批次标题，取**批次号最大**的那个 */
