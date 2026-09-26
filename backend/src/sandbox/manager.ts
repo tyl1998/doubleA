@@ -48,7 +48,14 @@ import {
   sandboxQueuePosition,
 } from './queue.js'
 import { createSlotRegistry } from './registry.js'
-import { buildSandboxContainerSpec, sandboxLabels, workVolumeName } from './spec.js'
+import { ensureSandboxNetwork, type SandboxNetwork } from './network.js'
+import {
+  buildSandboxContainerSpec,
+  isNonRootImageUser,
+  sandboxEgressEnv,
+  sandboxLabels,
+  workVolumeName,
+} from './spec.js'
 
 /**
  * 排队等待的轮询间隔（**代码常量**，不进 env）。
@@ -124,6 +131,35 @@ export async function ensureSandbox(
     )
   }
 
+  // ★ 出口① 的前置（P0-3-3）：容器在**专用 internal bridge** 上，**没有公网路由** ⇒
+  //   没有 egress 代理就必然调不到模型池。**在这里拦住**，而不是让容器建起来再在容器里失败 ——
+  //   同一个判据见 P0-2-9 的"被拦下的危险调用不发 RUNNING 卡"（不为必然失败的调用付交互成本），
+  //   以及 `resolveChatTarget()` 没 Key 直接 424。
+  const proxyUrl = config.sandbox.egressProxyUrl
+  if (proxyUrl === undefined) {
+    return fail(
+      'NOT_CONFIGURED',
+      '未配置 SANDBOX_EGRESS_PROXY_URL：容器挂在专用 internal bridge 上、没有公网路由，' +
+        '没有 egress 代理就必然调不到模型池。把沙箱出公网的代理地址（只放行模型池 baseURL）配好再派活。',
+    )
+  }
+
+  // 网络的这三件事**也属于校验**（顺序即正确性，文件头顺序问题 2）：它们失败时我们还什么都没建。
+  // 网络是共享基础设施，`ensureSandboxNetwork()` 幂等（并发最多多建一次）。
+  let network: SandboxNetwork
+  try {
+    network = await ensureSandboxNetwork()
+  } catch (error) {
+    return fail('CREATE_FAILED', toUserFacingReason(error))
+  }
+  const runtime: SandboxRuntime = {
+    network,
+    proxyUrl,
+    // 「容器眼里的后端地址」**只有一个来源**：显式配置，或由 bridge 网关地址 + 回调端口算出。
+    // **不猜、不兜底**（`06` §六 27）—— 猜错的症状是容器里那次 fetch 永远超时。
+    backendUrl: config.sandbox.backendUrl ?? `http://${network.gateway}:${config.sandbox.callbackPort}`,
+  }
+
   // ② 校验排在删除之前：会话必须存在且 ACTIVE。⚠️ 已结束（Agent 被软删后转只读）的会话
   //    不该再起容器 —— 它连新消息都不该收。
   const conversation = await getPrisma().conversation.findUnique({
@@ -174,7 +210,7 @@ export async function ensureSandbox(
   }
 
   try {
-    return { ok: true, sandbox: await createSandbox(conversationId, image) }
+    return { ok: true, sandbox: await createSandbox(conversationId, image, runtime) }
   } catch (error) {
     // ★ 名额必须还回去：不还的话每失败一次漏一个槽位，且**重启才恢复**（名额是进程内的）
     slots.remove(conversationId)
@@ -249,7 +285,21 @@ async function waitForSlot(conversationId: string, options: AcquireSandboxOption
  * 补偿本身失败只 warn —— 把那半个对象留给对账器（它按 label 找得到），
  * 而不是让"清理失败"盖掉"创建失败"这个真正要说的事。
  */
-async function createSandbox(conversationId: string, image: string): Promise<SandboxHandle> {
+/**
+ * 建一个沙箱所需的**运行期参数**（P0-3-3 新增）。
+ * 三个值都在 `ensureSandbox()` 里解析完（那里是"校验排在删除之前"的落点），
+ * 传进来只是为了不让 `createSandbox` 重新读一遍配置/再问一次 Docker。
+ */
+interface SandboxRuntime {
+  /** 专用 internal bridge（见 `network.ts`） */
+  network: SandboxNetwork
+  /** 出口①：容器出公网唯一可能的路（`HTTP(S)_PROXY` 的值） */
+  proxyUrl: string
+  /** 出口②：容器眼里的后端沙箱代理地址（也写进容器 env，桥扩展 P0-3-9b 用它） */
+  backendUrl: string
+}
+
+async function createSandbox(conversationId: string, image: string, runtime: SandboxRuntime): Promise<SandboxHandle> {
   const prisma = getPrisma()
   const startedAt = new Date()
   const volumeName = workVolumeName(conversationId)
@@ -270,12 +320,29 @@ async function createSandbox(conversationId: string, image: string): Promise<San
   try {
     // 镜像缺失的文案在这里就换成"先 pnpm sandbox:build"（否则会用一句 Docker 原文糊过去）
     await docker.ensureImage(image)
+    // ★ "非 root" 是**镜像**属性（`docker create` 参数里没有这一项）⇒ 唯一能守住它的地方就是这里。
+    //   镜像被换成一个以 root 跑的镜像时**什么都不会报错**，只有这里的断言拦得住（P0-3-3）。
+    const imageUser = await docker.inspectImageUser(image)
+    if (!isNonRootImageUser(imageUser)) {
+      throw new Error(
+        `沙箱镜像 ${image} 不是以非 root 用户运行（Config.User = ${imageUser ?? '（未声明 = root）'}）。` +
+          '--cap-drop ALL 对 root 进程的意义要小得多 ⇒ 拒绝启动。请用 pnpm sandbox:build 重建镜像。',
+      )
+    }
     await docker.createSandboxVolume({
       name: volumeName,
       labels: sandboxLabels({ conversationId, startedAt }),
     })
     containerId = await docker.createSandboxContainer(
-      buildSandboxContainerSpec({ image, conversationId, volumeName, startedAt }),
+      buildSandboxContainerSpec({
+        image,
+        conversationId,
+        volumeName,
+        startedAt,
+        network: runtime.network.name,
+        limits: config.sandbox.limits,
+        env: sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
+      }),
     )
     await docker.startSandboxContainer(containerId)
     const updated = await prisma.sandbox.updateMany({

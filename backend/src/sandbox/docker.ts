@@ -242,6 +242,114 @@ export function labelsOfVolume(info: Docker.VolumeInspectInfo): Readonly<Record<
   return info.Labels
 }
 
+// ───────────────────────────── 网络（P0-3-3）─────────────────────────────
+
+/**
+ * 查一个网络（不存在返回 `undefined`，**不抛**）。
+ *
+ * ⚠️ 与 `sandboxContainerExists` 同一手法：把 404 当业务答案而不是异常 ——
+ * "还没有这张网"是**正常路径**（第一次启动），不该让调用方用 try/catch 表达。
+ */
+export async function inspectSandboxNetwork(name: string): Promise<Docker.NetworkInspectInfo | undefined> {
+  try {
+    return await getDocker().getNetwork(name).inspect()
+  } catch (error) {
+    if (isDockerNotFound(error)) return undefined
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
+/**
+ * 建**专用 internal bridge**（`子方案③` §四 3）。
+ *
+ * 三个参数都不可省：
+ *   · `Internal: true` —— 这张网**没有到公网的路由**（"其余默认拒绝"的实体）。⚠️ **建后不可改**，
+ *     所以 `network.ts` 在复用时也会拿它做一次断言；
+ *   · `Subnet` —— 网关地址（= 出口② 的默认落点）由它决定，随机会让容器眼里的后端地址每次变
+ *     （见 `network.ts` 的注释）；
+ *   · `Labels` —— 归属判据（"这网是不是我们的"），与容器/卷同一处原则。
+ *
+ * ⚠️ 刻意**不吞** "名字已存在"的错：并发建网由 `network.ts` 显式处理（退化成 inspect），
+ * 那种"退化"必须是有判断的，不能是这里的一句 catch-all。
+ */
+export async function createSandboxNetwork(input: {
+  name: string
+  subnet: string
+  labels: Record<string, string>
+}): Promise<void> {
+  try {
+    await getDocker().createNetwork({
+      Name: input.name,
+      Driver: 'bridge',
+      Internal: true,
+      Attachable: false,
+      Labels: input.labels,
+      IPAM: { Driver: 'default', Config: [{ Subnet: input.subnet }] },
+    })
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
+// ───────────────────────────── 用量读数（P0-3-3）─────────────────────────────
+
+/** `GET /system/df` 里一个卷的三项（其余字段我们不用） */
+export interface DockerVolumeUsage {
+  name: string
+  sizeBytes: number
+  labels?: Readonly<Record<string, string>>
+}
+
+/**
+ * 一次拿齐**所有**卷的体量（`GET /system/df`）。
+ *
+ * 为什么用它而不是"逐个卷 `du`"：`df` 是**一次调用**给全场（Docker 已经在算这些数了），
+ * 而我们的降级方案（work 卷没有硬配额，见 `spec.ts` 上方那段）要**周期性**跑它 ——
+ * 一次调用 vs N 个短命容器，成本差一个量级。
+ *
+ * ⚠️ 返回的是**全部**卷（包括别人的），归属过滤交给调用方（用标签，`spec.ts#findOversizedWorkVolumes`）：
+ * 本文件只跟 Docker 说话，不做策略 —— 与 `listSandboxContainers` 的取舍一致（那里是 Docker
+ * 的 filters 直接过滤，这里 `df` 没有 filters，只能在拿到之后筛）。
+ * ⚠️ `df()` 在 `@types/dockerode` 里是 `Promise<any>`（上游没给类型）⇒ 在这里收一次窄，
+ * 别把 `any` 漏给上面的策略层。
+ */
+export async function listVolumeUsage(): Promise<DockerVolumeUsage[]> {
+  let raw: unknown
+  try {
+    raw = await getDocker().df()
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+  const volumes = (raw as { Volumes?: unknown } | undefined)?.Volumes
+  if (!Array.isArray(volumes)) return []
+  const result: DockerVolumeUsage[] = []
+  for (const item of volumes as Array<{ Name?: unknown; UsageData?: { Size?: unknown } | null; Labels?: unknown }>) {
+    if (typeof item?.Name !== 'string') continue
+    const size = item.UsageData?.Size
+    result.push({
+      name: item.Name,
+      sizeBytes: typeof size === 'number' && Number.isFinite(size) ? size : 0,
+      labels: item.Labels === null || typeof item.Labels !== 'object' ? undefined : (item.Labels as Record<string, string>),
+    })
+  }
+  return result
+}
+
+/**
+ * 镜像的 `Config.User`（"非 root"是镜像属性，见 `spec.ts#isNonRootImageUser`）。
+ * 返回 `undefined` 表示镜像没声明 USER（= 以 root 跑）。
+ */
+export async function inspectImageUser(image: string): Promise<string | undefined> {
+  try {
+    const info = await getDocker().getImage(image).inspect()
+    const user = info.Config?.User
+    if (typeof user !== 'string' || user === '') return undefined
+    return user
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
 /** 诊断用：当前 Docker 的简述（启动日志里打一行，"沙箱到底有没有接上 Docker"一眼可判） */
 export async function describeDocker(): Promise<{ reachable: boolean; version?: string; error?: string }> {
   try {

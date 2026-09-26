@@ -196,6 +196,72 @@ docker volume ls --filter label=doubulea.role=sandbox    # 空
 > ⚠️ **仍然不能端测**：本批**没有任何入口能创建沙箱**（调用方 = TaskAgent `/chat`，属 P0-3-5/6）
 > ⇒ **最早可端测的点仍是 P0-3-11**。
 
+### 沙箱安全与网络（P0-3-3 起；⚠️ 仍然派不了活）
+
+**本批把"沙箱"从"能跑"变成"关得住"**：网络只剩两条白名单出口、rootfs 只读、能力清空、
+内存/CPU/进程数有上限、跑在非 root 用户上。**改点集中在一处** ——
+`backend/src/sandbox/spec.ts#buildSandboxContainerSpec` 的 `HostConfig`（上一批那句
+"`NetworkMode: 'none'` 是临时取值"到本批兑现）。
+
+| # | 关掉了什么 | 落点 / 判据 |
+|---|-----------|-------------|
+| ① | **专用 internal bridge**（不再用默认 bridge） | `network.ts`：具名 `doubulea-sandbox`（`172.31.240.0/24`），`Internal: true` ⇒ **公网无路由**；归属判据同容器/卷 = **标签**（`doubulea.role=sandbox-network`）；名字被**别人**占了 ⇒ **大声失败**，绝不挂上去 |
+| ② | **两条白名单出口** | 出口① = `HTTP(S)_PROXY` → `SANDBOX_EGRESS_PROXY_URL`（容器出公网的**唯一**可能）；出口② = 后端沙箱代理 listener（**独立 Fastify 实例**，只挂 `/api/sandbox/*`，默认只绑 bridge 网关地址）。**其余默认拒绝** |
+| ③ | 只读 rootfs + 两处 tmpfs | `ReadonlyRootfs`；`/tmp`（`noexec`）与 `$HOME`（⚠️ **必须带 `uid/gid`**，否则 agent 写不动自己的 HOME） |
+| ④ | 非 root + cap-drop | 镜像 `USER agent`（uid 10001）；建容器前**再断言一次** `Config.User` 非 root；`CapDrop: ALL` + `no-new-privileges` |
+| ⑤ | mem / cpu / pids 限额 | `Memory` + **`MemorySwap` 必须等于它**（否则 swap 让限额形同虚设）+ `NanoCpus` + `PidsLimit` |
+| ⑥ | work 卷体量 | ⚠️ **没有硬配额**（见下），降级为**周期巡检 + 超限告警 + 人工介入**：`reaper.ts#auditWorkVolumes` |
+
+**新增 2 个 env**（`infra/.env` 的 `[B] 沙箱与产物` 段，都可留空）：
+
+- `SANDBOX_BACKEND_URL` —— **容器眼里**后端沙箱代理的地址。留空 = 自动取「专用 bridge 网关地址 +
+  `SANDBOX_CALLBACK_PORT`」（= 后端与 Docker **同宿主**的形态，即生产）。
+- `SANDBOX_LISTEN_HOST` —— listener 的绑定地址。留空 = 只绑专用 bridge 的网关地址。
+
+> ⚠️ **macOS 上会撞到的一堵墙**（实测，不是推测）：Docker 跑在 OrbStack 的 **Linux VM** 里
+> ⇒ bridge 网关是那台 VM，**不是 macOS** ⇒ 跑在 macOS 上的后端**够不着**（容器侧 `ENETUNREACH`）。
+> 生产（后端与 Docker 同宿主）没这个问题；本机要把 `SANDBOX_BACKEND_URL` 显式指到一个与沙箱网络
+> **双宿的中转**，并把 `SANDBOX_LISTEN_HOST` 填成 `0.0.0.0`（细节见 `sandbox/network.ts` 文件头三条实测）。
+> 顺带一条同类实况：`--storage-opt size=` 在本机被守护进程**直接拒绝**
+> （`only for overlay over xfs with 'pquota'`）—— 所以它**没有**写进创建参数，`SANDBOX_WORK_VOLUME_MB`
+> 只是**告警阈值**，不是配额（详细三条理由见 `buildSandboxContainerSpec` 上方那段）。
+
+**想自己验一遍**（"应该失败"的五条比"应该成功"更重要 —— 白名单最常见的坏法是**看起来配了、其实全通**）：
+
+```bash
+# ① 先建一张卷（代码里是显式建的，带标签）
+docker volume create \
+  --label doubulea.role=sandbox --label doubulea.conversation=00000000-0000-7000-8000-000000000002 \
+  doubulea-work-00000000-0000-7000-8000-000000000002
+# ② 起一个"与代码同参数"的加固容器（默认 CMD = --mode rpc，它会等着 stdin）
+#    ⚠️ 变量先备好：PROXY / GW 两处替换成你的值（GW = docker network inspect doubulea-sandbox 的网关）
+docker run -d --name sandbox-sec-probe \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -m 2048m --memory-swap 2048m --cpus 1.5 --pids-limit 512 \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --tmpfs /home/agent:rw,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0755 \
+  --mount type=volume,src=doubulea-work-00000000-0000-7000-8000-000000000002,dst=/work \
+  --network doubulea-sandbox \
+  -e HTTP_PROXY=http://PROXY:3128 -e HTTPS_PROXY=http://PROXY:3128 -e NO_PROXY=GW:13001 \
+  doubulea/sandbox-toolkit:1
+
+# ③ 逐条取证（期望值写在行尾）
+docker exec sandbox-sec-probe node -e "require('fs').writeFileSync('/x','a')"        # EROFS（只读 rootfs）
+docker exec sandbox-sec-probe node -e "require('fs').writeFileSync('/work/x','a')"   # 成功（具名卷可写）
+docker exec sandbox-sec-probe node -e "console.log(process.getuid())"                # 10001（非 root）
+docker exec sandbox-sec-probe sh -c "grep CapEff /proc/self/status"                  # 0000000000000000（无能力）
+docker exec sandbox-sec-probe node -e "fetch('https://www.baidu.com/').then(r=>console.log('通了',r.status)).catch(e=>console.log('不可达',e.cause&&e.cause.code))"
+                                                                                     # 不可达 EAI_AGAIN（公网只在代理背后）
+docker exec sandbox-sec-probe sh -c "curl -s --noproxy '*' http://GW:13000/health"   # ⚠️ 本机必失败（见上面那堵墙）
+# ④ 清场
+docker rm -f sandbox-sec-probe && docker volume rm doubulea-work-00000000-0000-7000-8000-000000000002
+```
+
+> ⚠️ **`--storage-opt size=` 不要加**：本机加了它**建容器这一步就失败**（原因见上）。
+> ⚠️ **仍然不能端测**：本批**没有任何入口能创建沙箱**（调用方 = TaskAgent `/chat`，属 P0-3-5/6），
+> listener 也**还没有端点**（`/api/sandbox/*` 属 P0-3-9b）⇒ **最早可端测的点仍是 P0-3-11**。
+> 上面那段是**手工起容器**看隔离，不是"跑通了一条业务链路"。
+
 ### 后端配置自检（P0-1-3 起）
 
 后端启动时自己读 `infra/.env`（`backend/src/config.ts`，zod 校验）：**缺必填项会直接退出并列出

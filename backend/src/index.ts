@@ -21,7 +21,15 @@ import { closePg } from './infra/pg.js'
 import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
 import { getPipelineWorkerStats, startPipelineWorker, stopPipelineWorker } from './pipeline/worker.js'
-import { getSandboxStats, reconcileOnBoot, startSandboxReaper, stopSandboxReaper } from './sandbox/index.js'
+import {
+  getSandboxListenerStats,
+  getSandboxStats,
+  reconcileOnBoot,
+  startSandboxListener,
+  startSandboxReaper,
+  stopSandboxListener,
+  stopSandboxReaper,
+} from './sandbox/index.js'
 import { ok, type Envelope } from '@doubulea/shared'
 
 /** 「优雅退出」的兜底时限：超时则强杀，避免卡在某个不肯关闭的连接上（`06` P0-1-4 落地要点） */
@@ -81,6 +89,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
     //    日志里出现一堆"数据库不可用"的假故障。
     await stopPipelineWorker()
     await stopSandboxReaper()
+    // ⚠️ 出口② 的 listener 也是"后台组件"（它服务的是容器来的请求），排在这里：
+    //    先停它再关 app —— 反过来的话容器还可能打进来，而进程已经在拆依赖了。
+    await stopSandboxListener()
     await app.close()
     // ⚠️ 顺序：Prisma 先于探活池（业务查询收尾不会晚于探活）。
     //    closePrisma 对「从未创建过客户端」的进程是空操作，因此不引入退出负担。
@@ -115,7 +126,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-2 沙箱容器生命周期（`backend/src/sandbox/` 六个模块：`spec.ts`【label 契约 + 创建规格**纯函数**；★ label 是"这东西是不是我们的"的**唯一判据**，`sandboxes` 表只回答"该不该活着"】/ `docker.ts`【dockerode 薄封装 + 报错翻译】/ `registry.ts`【进程内名额册：★ 配额作用域 = **单实例**，且崩溃即归零 ⇒ 账面自愈】/ `queue.ts`【ZSET 排队：score = 入队时刻 ⇒ `ZRANK` 给位次、`ZREMRANGEBYSCORE` 给单项 TTL（**同时是等待预算**）】/ `manager.ts`【`ensureSandbox`（复用不占名额 / 队列非空不许插队 / 失败还名额）+ `recycleSandbox`（★ 两步回收：`rm -v` **删不掉具名卷**，须显式 `volume rm`）+ `touchSandbox`（`last_active_at` 唯一写入口）】/ `reaper.ts`【★ 启动对账**清掉全部**容器卷（引擎是本进程的子进程，进程一死容器就没有对话者 ⇒ 一律重建不复用）+ 周期孤儿回收（判据 = 会话 ACTIVE ∩ 账本有活体行）+ 空闲回收（判据 = `last_active_at`）】；同批 `sandboxes` 表上线（`SandboxStatus` CREATING|RUNNING|RECYCLED|FAILED）+ 新增 4 个 env（`SANDBOX_QUEUE_KEY/_TTL_SEC`、`SANDBOX_REAP_INTERVAL_SEC`、`SANDBOX_CREATE_GRACE_SEC`，含跨字段校验 `GRACE > INTERVAL`）；⚠️ 容器 `NetworkMode=none` 与全部安全加固留给 P0-3-3，本批**没有任何入口能创建沙箱**（TaskAgent `/chat` 属 P0-3-5/6））',
+    step: 'P0-3-3 沙箱安全（★ 加固的唯一落点 = `buildSandboxContainerSpec` 的同一处 `HostConfig`：只读 rootfs / 两处 tmpfs【`/tmp` 带 noexec；`$HOME` **必须带 uid·gid** —— 不带时新目录属 root:root，agent 写自己 HOME 会 EACCES，实测到的第一版形态】/ `CapDrop: ALL`【CapEff=0】+ `no-new-privileges` / `Memory`+**`MemorySwap` 必须等于它**（否则 swap 让限额形同虚设）+ `NanoCpus` + `PidsLimit` / `NetworkMode` = **专用 internal bridge** ⇒ 公网 `EAI_AGAIN`、宿主网关可达 200；⚠️ **`StorageOpt` 刻意不写**：本机守护进程直接拒绝【需 overlay2+xfs+pquota，写进去则建容器就失败】，且它管不到**具名卷** ⇒ `SANDBOX_WORK_VOLUME_MB` 改判为**告警阈值**，由 `reaper.ts#auditWorkVolumes` 巡检【降级方案：定期读数 + 超限告警 + 人工介入，不假装有配额】）；新增 `network.ts`【具名 internal bridge + 标签归属判据 + "名字已被别人占了" 大声失败】、`listener.ts`【出口② = **独立 Fastify 实例**，只挂 `/api/sandbox/*`，默认只绑 bridge 网关地址；端点本体属 P0-3-9b】、`docker.ts` 补网络/inspect/`df` 用量读数、`manager.ts` 接线【★ 未配 `SANDBOX_EGRESS_PROXY_URL` ⇒ **不建容器**（内部网络上没有它必然调不到模型池）；★ "非 root" 由镜像 `Config.User` 断言守住】；新增 2 个 env（`SANDBOX_BACKEND_URL` / `SANDBOX_LISTEN_HOST`，都为 macOS 这类"Docker 在 VM 里"的部署留的显式出口）；⚠️ 「出口② 用 pi 认不认 `HTTPS_PROXY`」待决 7 已关闭（源码级实测：pi 装的是 `undici.EnvHttpProxyAgent`，自己读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`）',
     address,
   })
   logger.info(
@@ -144,6 +155,12 @@ try {
   logger.info(getSandboxStats(), '沙箱状态（启动时：名额册必然为空）')
   await reconcileOnBoot()
   startSandboxReaper()
+
+  // 出口②（P0-3-3）：**独立 listener**，只挂 `/api/sandbox/*`（端点本体属 P0-3-9b）。
+  // 放在对账之后起：对账会清掉上一个进程留下的容器，而"能连回来的容器"此刻一个都不该存在。
+  // ⚠️ 与前面几项同款纪律：**失败只 warn**（没配镜像 / 端口被占 / Docker 不可达都不该让后端起不来）。
+  const listenerUp = await startSandboxListener()
+  logger.info(getSandboxListenerStats(), listenerUp ? '沙箱代理 listener 就绪' : '沙箱代理 listener 未就绪')
 } catch (error) {
   logger.fatal({ err: error, port: config.port }, '监听端口失败，进程退出')
   await shutdown('listen-failed', 1)

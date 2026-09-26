@@ -471,11 +471,40 @@ const envSchema = z
     SANDBOX_PROXY_TIMEOUT_SEC: intVar('SANDBOX_PROXY_TIMEOUT_SEC', 180, { min: 1, max: 3600 }),
     /**
      * 沙箱出公网的 egress 代理（只放行模型池 baseURL，§四 3 出口①）。
-     * `02` §十一 把它标成"必填"，而 **P0-3-1 先登记为可选**：出口①到底落成"HTTP 代理"还是
-     * "iptables 直连白名单"是 P0-3-3 才定案的事（待决事项 5 同族）⇒ 现在收成必填会让
-     * 每一批的 `pnpm config:check` 都红，却证不出任何东西。P0-3-3 定案时再收紧。
+     *
+     * ✅ **P0-3-3 定案：落成「HTTP 代理 + 容器环境变量」，值就是本项**（不再走 iptables 白名单方案）。
+     * 依据是一次源码级实测：pi 把 `undici.EnvHttpProxyAgent` 装成全局 dispatcher
+     * （包内 `dist/core/http-dispatcher.js`），该 agent **自己读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`**；
+     * pi 的设置项 `httpProxy` 只是"`process.env.HTTP_PROXY ??= <值>`"（即**环境变量优先**）
+     * ⇒ 我们**不必**往只读 agent-dir 里烤一个固定值（`子方案③` §十三 待决 7 就此关闭）。
+     *
+     * ⚠️ **仍然保持"可选"**：不在启动期收紧成必填（那会让每一台没配代理的机器上 `pnpm config:check`
+     * 都红，却证不出任何东西），而是在**用它的那一刻**显式失败 —— `sandbox/manager.ts#ensureSandbox`
+     * 见不到它就回 `NOT_CONFIGURED` 并说明后果（同 P0-2 的 `resolveChatTarget()` 没 Key ⇒ 424）。
      */
     SANDBOX_EGRESS_PROXY_URL: optionalUrl('SANDBOX_EGRESS_PROXY_URL', ['http', 'https']),
+    /**
+     * **容器眼里**"后端沙箱代理"的地址（`子方案③` §四 3 出口②；P0-3-3 落地）。
+     *
+     * 默认（不设）= 由专用 bridge 的**网关地址**（从 Docker 里读出来，`sandbox/network.ts`）
+     * + `SANDBOX_CALLBACK_PORT` 拼出 —— 那是"后端与 Docker 同宿主"的部署形态（= 生产）。
+     * **不做 DNS 猜测、不做兜底**（`06` §六 27）。
+     *
+     * ⚠️ 显式覆盖只为一类部署：**Docker 跑在虚拟机里**（macOS 上的 OrbStack / Docker Desktop）
+     * ⇒ 容器**到不了**跑在 macOS 上的后端（P0-3-3 实测 `ENETUNREACH`：bridge 网关是那台 VM，
+     * 不是 macOS）⇒ 那时把它指到一个与沙箱网络双宿的中转地址。生产用不到它。
+     */
+    SANDBOX_BACKEND_URL: optionalUrl('SANDBOX_BACKEND_URL', ['http']),
+    /**
+     * 沙箱代理 listener 的**绑定地址**（`02` §4.10；P0-3-3 定案 = 独立 Fastify 实例）。
+     *
+     * 默认（不设）= 专用 bridge 的网关地址 ⇒ **只有该 bridge 内的容器可达**，
+     * 于是"容器能调后端"不会扩成"容器能调到业务 API 的同一台 listener"（暴露面收敛是刻意的）。
+     *
+     * ⚠️ 覆盖成 `0.0.0.0` 是为上面 `SANDBOX_BACKEND_URL` 说的那类部署
+     * （后端不在 Docker 宿主上时，中转容器得连得上它）。
+     */
+    SANDBOX_LISTEN_HOST: optionalText,
     /**
      * 沙箱**排队队列**的 Redis 键（P0-3-2）。
      *
@@ -671,8 +700,8 @@ export interface AppConfig {
    * 沙箱（P0-3；参数总表 = `子方案③` §二）。
    * ⚠️ 消费进度：`idleTtlMin` / `limits` / `image` / `queueKey` / `queueTtlSec` / `reapIntervalSec`
    * / `createGraceSec` 自 **P0-3-2** 起有消费方（`backend/src/sandbox/`）；
-   * `callbackPort` / `tokenLen` / `proxyTimeoutSec` / `egressProxyUrl` 仍是登记项，
-   * 消费方分别是 P0-3-9b / P0-3-4 / P0-3-3。
+   * `egressProxyUrl` / `backendUrl` / `listenHost` / `limits` 的网络·限额半边自 **P0-3-3** 起有消费方；
+   * `callbackPort` / `tokenLen` / `proxyTimeoutSec` 的消费方是 P0-3-9b（listener 的端点本体）。
    */
   sandbox: {
     /** 空闲回收（分钟）。判据是**最后一次引擎事件的时间**，不是 CPU 占用 */
@@ -687,8 +716,15 @@ export interface AppConfig {
     tokenLen: number
     /** 容器侧调代理的超时（秒）；恒 > `mcp.confirmTimeoutSec`（schema 里守着） */
     proxyTimeoutSec: number
-    /** 沙箱出公网的 egress 代理；未定时为 undefined（P0-3-3 定案后才会是必填） */
+    /**
+     * 沙箱出公网的 egress 代理（§四 3 出口①）。未定时 `ensureSandbox()` 会**显式拒绝**建容器
+     * （内部网络上没有它 ⇒ 引擎必然调不到模型池）。
+     */
     egressProxyUrl: string | undefined
+    /** 容器眼里的后端沙箱代理地址；未定时由专用 bridge 的网关地址 + `callbackPort` 算出（P0-3-3） */
+    backendUrl: string | undefined
+    /** 沙箱代理 listener 的绑定地址；未定时绑专用 bridge 的网关地址（P0-3-3） */
+    listenHost: string | undefined
     /** 沙箱排队队列的 Redis 键（P0-3-2） */
     queueKey: string
     /** 排队项存活时长（秒）= 孤儿判定窗口 = 等待预算（P0-3-2） */
@@ -942,6 +978,8 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       tokenLen: vars.SANDBOX_TOKEN_LEN,
       proxyTimeoutSec: vars.SANDBOX_PROXY_TIMEOUT_SEC,
       egressProxyUrl: vars.SANDBOX_EGRESS_PROXY_URL,
+      backendUrl: vars.SANDBOX_BACKEND_URL,
+      listenHost: vars.SANDBOX_LISTEN_HOST,
       queueKey: vars.SANDBOX_QUEUE_KEY,
       queueTtlSec: vars.SANDBOX_QUEUE_TTL_SEC,
       reapIntervalSec: vars.SANDBOX_REAP_INTERVAL_SEC,
@@ -1033,6 +1071,8 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       imageBase: value.sandbox.imageBase ?? null,
       // egress 代理是**地址**，不脱敏（不含凭据）；未配置就如实报 null（P0-3-3 定案前它本来可以空着）
       egressProxyUrl: value.sandbox.egressProxyUrl ?? null,
+      backendUrl: value.sandbox.backendUrl ?? null,
+      listenHost: value.sandbox.listenHost ?? null,
       callbackPort: value.sandbox.callbackPort,
       tokenLen: value.sandbox.tokenLen,
       proxyTimeoutSec: value.sandbox.proxyTimeoutSec,

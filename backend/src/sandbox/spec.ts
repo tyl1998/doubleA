@@ -42,6 +42,26 @@ export const SANDBOX_ROLE = 'sandbox'
 /** 容器内工作目录 = work 卷的挂载点（`子方案③` §四 2：产物唯一落点） */
 export const SANDBOX_WORK_DIR = '/work'
 
+/**
+ * 非 root 用户的 HOME（镜像里 `useradd --create-home` 建的）。
+ *
+ * ⚠️ P0-3-3 为什么要给它挂一个 tmpfs：rootfs 只读（`ReadonlyRootfs: true`）⇒ `/home/agent`
+ * 变得不可写，而 python / node 工具链都会往 HOME 里写东西（缓存、`~/.config`）。镜像里
+ * `--create-home` 的注释早就写明"rootfs 只读时靠 tmpfs，见 P0-3-3"，这里就是那一步。
+ * ⚠️ **挂 tmpfs 会盖住镜像目录的属主** ⇒ 必须显式给 `uid`/`gid`，否则新目录是 `root:root`，
+ * 以 `agent` 身份跑起来的容器**写自己的 HOME 会 EACCES**（P0-3-3 实测到的第一版形态）。
+ */
+export const SANDBOX_AGENT_HOME = '/home/agent'
+
+/**
+ * 镜像内 `agent` 用户的 uid/gid。
+ *
+ * ⚠️ 这是**镜像与运行时之间的契约**（不是随手写的 magic number）：`infra/sandbox/base/Dockerfile`
+ * 用 `useradd --uid 10001` 把 uid **钉死**，理由见那里的注释（具名卷的属主靠它）。
+ * 两处必须一致 —— 改了 Dockerfile 就要改这里，否则上面那条 tmpfs 的属主会指错人。
+ */
+export const SANDBOX_AGENT_UID = 10001
+
 /** 具名卷名前缀。⚠️ 名字必须**唯一且可推导**（少一次"这卷是谁的"的考古，`子方案③` §九 1） */
 export const WORK_VOLUME_PREFIX = 'doubulea-work-'
 
@@ -121,39 +141,96 @@ export interface SandboxContainerSpecInput {
   conversationId: string
   volumeName: string
   startedAt: Date
+  /** 专用 internal bridge 的**名字**（`sandbox/network.ts` 保证它存在且是我们的） */
+  network: string
+  /** 资源限额（值来自 `config.sandbox.limits`） */
+  limits: { memMb: number; cpu: number; pids: number; tmpfsMb: number }
+  /** 容器环境变量（出口①/② 的地址与代理都从这里进去，见 `sandboxEgressEnv`） */
+  env: Record<string, string>
+}
+
+/**
+ * 容器环境变量里的出网配置（**纯函数**，`子方案③` §四 3 的两条出口）。
+ *
+ * | 键 | 值 | 干什么 |
+ * |----|----|--------|
+ * | `HTTP_PROXY` / `HTTPS_PROXY` | `SANDBOX_EGRESS_PROXY_URL` | 出口①：容器在**内部网络**上没有公网路由 ⇒ 出公网**只可能**经这个代理 |
+ * | `NO_PROXY` | 后端沙箱代理的 `host:port` 与 `hostname` | 出口②：容器 → 后端是**内网**，**绝不能**被塞进代理（否则它要先去公网绕一圈，且代理白名单里也没有它） |
+ * | `SANDBOX_BACKEND_URL` | 同上地址 | 桥扩展（P0-3-9b）用它发 `POST /api/sandbox/mcp/call` |
+ *
+ * ⚠️ **只写大写形态**：pi 侧是 `undici.EnvHttpProxyAgent`，包内文档与实现都只认
+ * `HTTP_PROXY` / `HTTPS_PROXY`（`docs/environment-variables.md`），pi 自己的 `httpProxy`
+ * 设置项也是 `??=` 到这两个大写键上。同时写一份小写只会造出"两个真相"。
+ */
+export function sandboxEgressEnv(input: { proxyUrl: string; backendUrl: string }): Record<string, string> {
+  const backend = new URL(input.backendUrl)
+  return {
+    HTTP_PROXY: input.proxyUrl,
+    HTTPS_PROXY: input.proxyUrl,
+    // 两种写法都给：一个带端口、一个不带（不同实现的匹配粒度不同，且两者都由同一个 URL 派生，不构成"两个真相"）
+    NO_PROXY: `${backend.host},${backend.hostname}`,
+    SANDBOX_BACKEND_URL: input.backendUrl,
+  }
+}
+
+/**
+ * 镜像跑的是不是**非 root 用户**（"非 root"是**镜像**属性，不在 `docker create` 的参数里）。
+ *
+ * ⚠️ 为什么要在建容器前看一眼：`--cap-drop ALL` 对 root 进程的意义要小得多，而"镜像被换成
+ * 一个以 root 跑的镜像"这件事**不会报任何错** —— 容器照样起来、照样能干活，只有
+ * `docker inspect` 里的 `Config.User` 变了。这正是本仓最怕的那类"看起来配了、其实没配"。
+ * 认 `agent` 这类用户名与 `10001` 这类数字 uid 两种写法（Dockerfile 用的是后者）。
+ */
+export function isNonRootImageUser(user: string | undefined): boolean {
+  // ⚠️ 只看 `user[:group]` 的**前半段**：`root:root` / `0:0` 都是 root，
+  //    而"只判整串等不等于 root"会让 `root:root` 判成非 root（写这条时实际踩到过）。
+  const name = (user ?? '').split(':')[0]?.trim() ?? ''
+  if (name === '') return false
+  return name !== 'root' && !/^0+$/u.test(name)
 }
 
 /**
  * 容器的创建参数（`docker create` 的等价物）。
  *
- * ⚠️⚠️ **本批刻意只做"生命周期需要的那几项"，安全加固整体留给 P0-3-3**（`docs/06` §五 的批次切分：
- * P0-3-3 = 只读 rootfs / work 卷配额 / `/tmp` tmpfs / mem·cpu·pids 限额 / 非 root + cap-drop /
- * 专用 internal bridge）。本函数里**刻意缺席**的每一项都在下面点名，留给下一批在**同一个函数**里补 ——
- * 它们散在别处就会变成"有人以为配了、其实没配"。
+ * ─────────────────────────────────────────────────────────────────────
+ * P0-3-3：本函数就是**安全加固的唯一落点**（`子方案③` §四 2 / §四 3）
+ * ─────────────────────────────────────────────────────────────────────
+ * 每一项都在下面点名，且**都经过本机实测**（真 Docker 29.4.0 / OrbStack）：
  *
- * 已在位的四项，各自的理由：
- *   · `Labels` —— 见文件头：**归属的唯一判据**；
- *   · `Mounts`（具名卷 → `/work`）—— 产物唯一落点；**具名**是为了让对账器能按 label 找回它
- *     （匿名卷只能靠 `docker rm -v` 顺带清，堆起来就是"磁盘悄悄满"，§九 1）；
- *   · `OpenStdin` + **不设 `Tty`** —— 引擎桥（P0-3-5）走 `pi --mode rpc`（JSONL over **stdio**）⇒
- *     主进程要能一直读 stdin。实测（P0-3-2）：`-i` + `--network none` 下容器稳定 `Up`
- *     （不带 `-i` 时 stdin 直接 EOF、pi 立刻退出 ⇒ 容器起来就死，账本却以为它 `RUNNING`）；
- *   · `NetworkMode: 'none'` —— ★ **本批的临时取值，P0-3-3 会换成专用 internal bridge**。
- *     理由：那时才谈得上"两条白名单出口"；在那之前把容器挂到 Docker 默认 `bridge` 上，
- *     它会**能摸到宿主所有监听端口**（13000 公网口、PG、Redis、MinIO）—— 那是比"能出公网"
- *     更严重的暴露面（§四 3）。取 `none` 是"先关死，等有白名单了再开门"，时序上不会出现
- *     "中间有一版开着门"。
+ * | 项 | 实测结论 |
+ * |----|----------|
+ * | `ReadonlyRootfs` | 容器内写 `/` 与 `/usr` 都是 `EROFS`；写 `/tmp`、`/work`、`$HOME` 正常 |
+ * | `/tmp` tmpfs | `/proc/mounts` 里是 `tmpfs rw,nosuid,nodev,noexec,size=<n>k` |
+ * | `$HOME` tmpfs | ⚠️ **必须带 `uid`/`gid`**：不带时新目录属 `root:root`，以 agent 跑起来的容器写自己 HOME 会 `EACCES` |
+ * | `CapDrop: ['ALL']` | `/proc/self/status` 的 `CapEff` = `0000000000000000` |
+ * | `SecurityOpt` | `no-new-privileges`（配合 cap-drop，setuid 类提权一并封掉） |
+ * | `Memory` + `MemorySwap` | `cgroup memory.max` = 限额；**`MemorySwap` 必须等于 `Memory`**，否则 swap 让限额形同虚设 |
+ * | `NanoCpus` | `--cpus` 的 API 形态（1.5 核 ⇒ 1_500_000_000） |
+ * | `PidsLimit` | `cgroup pids.max` = 限额 |
+ * | `NetworkMode` = 专用 internal bridge | 公网 `EAI_AGAIN`（不可达）；**到 Docker 宿主的网关地址可达**（200）⇒ 出口② 成立 |
+ * | 非 root | `getuid() = 10001`（来自镜像 `USER agent`，建容器前由 `isNonRootImageUser` 再守一道） |
  *
- * ⚠️ **`AutoRemove` 必须是 false**：true 会让容器退出时被 Docker 自己删掉，账本与对账器
- * 就失去了"这次回收发生了什么"的证据，且 `docker rm -v` 的**具名卷仍不会被删**（实测）
- * ⇒ 留下的是"行说回收了、卷还在"的假象。回收路径统一走 `manager.recycleSandbox()`。
+ * ⚠️⚠️ **`StorageOpt`（`size=`）刻意不在这里** —— 三条实测理由，缺一条都不足以否掉它：
+ *   ① 本机（OrbStack / APFS）守护进程**直接拒绝**：`--storage-opt is supported only for overlay
+ *      over xfs with 'pquota' mount option` ⇒ 一旦写进 `HostConfig`，**建容器这一步就失败**；
+ *   ② 即使换成 xfs + pquota，`size=` 管的是**容器的可写层**（overlay2 upperdir），
+ *      而 `/work` 是**具名卷**（`/var/lib/docker/volumes/<name>/_data`），**不在它的管辖范围**；
+ *   ③ 我们同时开着只读 rootfs ⇒ 可写层本来就不用。
+ *   ⇒ `SANDBOX_WORK_VOLUME_MB` **不是硬配额、而是告警阈值**，由 `reaper.ts#auditWorkVolumes`
+ *   周期性巡检并告警（`子方案③` §九 1 认可的降级方案："定期 du 巡检 + 超限告警 + 人工介入"）。
  */
 export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Docker.ContainerCreateOptions {
+  const memBytes = input.limits.memMb * 1024 * 1024
+  // `noexec` 只加在 /tmp 上：那条是设计（引擎与三方库的临时文件不该可执行）。
+  // HOME 只要求"可写"，不加 noexec —— python 有些包会把 helper 脚本写进 HOME 再执行。
+  const tmpfsOpts = `rw,nosuid,nodev,size=${input.limits.tmpfsMb}m`
   return {
     Image: input.image,
     Labels: sandboxLabels({ conversationId: input.conversationId, startedAt: input.startedAt }),
     WorkingDir: SANDBOX_WORK_DIR,
-    // 引擎桥（P0-3-5）要往 stdin 写 JSONL；保持打开（见上方注释）
+    // 出口①/② 的地址与代理（见 `sandboxEgressEnv`）；Key 的注入属 P0-3-4，走同一张表
+    Env: Object.entries(input.env).map(([key, value]) => `${key}=${value}`),
+    // 引擎桥（P0-3-5）要往 stdin 写 JSONL；保持打开（见下方注释）
     OpenStdin: true,
     StdinOnce: false,
     AttachStdin: false,
@@ -161,6 +238,40 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
     // ⚠️ Cmd 刻意不设：镜像里 `CMD ["--mode","rpc"]` 就是默认值（P0-3-1 把参数留在 CMD 正是为此）
     HostConfig: {
       AutoRemove: false,
+      /**
+       * ★ 本批从 `'none'` 换成**专用 internal bridge**（P0-3-2 的 `NetworkMode: 'none'` 是临时取值）。
+       *
+       * 为什么不是默认 `bridge`：默认 bridge 上容器能摸到宿主所有监听端口（13000 公网口、PG、
+       * Redis、MinIO），那是比"能出公网"更严重的暴露面（§四 3）。
+       * 为什么是 `internal`：`internal` 网络**没有到公网的路由** ⇒ "两条白名单出口"才是真的
+       * （公网只有经代理那一条）。⚠️ 代价写在 `network.ts` 的注释里：容器也**到不了宿主以外的
+       * 任何东西**，所以出口② 的地址必须是 Docker 宿主上的监听（实测成立）。
+       */
+      NetworkMode: input.network,
+      /** 只读 rootfs：容器**不该能改自己**（§四 2）。写 `/` 实测 `EROFS` */
+      ReadonlyRootfs: true,
+      /** 沙箱内没有任何需要特权的能力（实测 `CapEff` = 0） */
+      CapDrop: ['ALL'],
+      /** 与 cap-drop 配套：堵掉 setuid/setgid 类提权（缺了它 cap-drop 的意义减半，§四 2） */
+      SecurityOpt: ['no-new-privileges'],
+      /** 内存为主限额（10 并发的真实瓶颈是内存，§二） */
+      Memory: memBytes,
+      /** ⚠️ 必须与 `Memory` 相等：不等时容器可以用 swap 越过内存上限，限额形同虚设 */
+      MemorySwap: memBytes,
+      /** `--cpus` 的 API 形态（10^9 分之一核）；CPU 为辅：只防单容器跑飞拖垮宿主 */
+      NanoCpus: Math.round(input.limits.cpu * 1e9),
+      /** 防 fork 炸弹；pandas / node 都要开子进程 ⇒ 别给小（§二） */
+      PidsLimit: input.limits.pids,
+      /**
+       * 两个 tmpfs：`/tmp`（引擎的临时文件与 session 文件）与 `$HOME`（工具链的缓存）。
+       * ⚠️ `/tmp` 的 `noexec` 是设计（§四 2）；`$HOME` 不带 `noexec`（python 会在那里写 helper 脚本再执行）。
+       * ⚠️ `$HOME` 那条**必须给 uid/gid**：tmpfs 会盖住镜像目录的属主，不给就是 root:root
+       * ⇒ agent 写不动自己的 HOME（P0-3-3 实测到的第一版形态）。
+       */
+      Tmpfs: {
+        '/tmp': `rw,nosuid,nodev,noexec,size=${input.limits.tmpfsMb}m`,
+        [SANDBOX_AGENT_HOME]: `${tmpfsOpts},uid=${SANDBOX_AGENT_UID},gid=${SANDBOX_AGENT_UID},mode=0755`,
+      },
       // 具名卷 → `/work`。⚠️ 写在 `HostConfig.Mounts` 而不是 `Config.Binds`：
       // `--mount` 的语义更明确（不会像 `-v` 那样在宿主上"顺手"建出不存在的目录、
       // 也不会把名字里带 `/` 的东西解释成路径），且类型上就是它的家
@@ -173,9 +284,34 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
           ReadOnly: false,
         },
       ],
-      // ── P0-3-3 在这里补：ReadonlyRootfs / CapDrop+SecurityOpt / Memory+NanoCpus+PidsLimit /
-      //    Tmpfs(/tmp) / StorageOpt(work 卷配额) / NetworkMode(专用 internal bridge) ──
-      NetworkMode: 'none',
+      // ⚠️ P0-3-3 刻意**没有** StorageOpt：理由见函数头上方那段（实测三条）。work 卷的体量
+      //    改由「周期巡检 + 超限告警」看着，不假装有硬配额。
     },
   }
+}
+
+// ───────────────────────────── work 卷的体量巡检 ─────────────────────────────
+
+/** 一个卷的用量读数（`GET /system/df` 给的那几个字段里的三个） */
+export interface VolumeUsage {
+  name: string
+  sizeBytes: number
+  labels?: Readonly<Record<string, string>>
+}
+
+/**
+ * 从 `GET /system/df` 的结果里挑出**超阈值**的沙箱工作卷。
+ *
+ * 为什么是"读数 + 纯函数"而不是直接写进 `reaper.ts`：这条判据（**标签是不是我们的** ∩
+ * **体量是否越线**）要能在不连 Docker 的情况下逐条比对 —— 同一手法见本文件的标签族函数。
+ *
+ * ⚠️ 用**标签**判归属（`readSandboxLabels`），不用卷名前缀：与容器/卷的其余判据同一处
+ * （"哪些是我们的"只能有一个答案）。名字前缀只是名字的构造约定。
+ *
+ * @param limitMb 告警阈值（= `SANDBOX_WORK_VOLUME_MB`，见 `buildSandboxContainerSpec` 上方那段：
+ *        它**不是**硬配额，只是越线要出告警的那条线）
+ */
+export function findOversizedWorkVolumes(volumes: readonly VolumeUsage[], limitMb: number): VolumeUsage[] {
+  const limitBytes = limitMb * 1024 * 1024
+  return volumes.filter((volume) => readSandboxLabels(volume.labels) !== undefined && volume.sizeBytes > limitBytes)
 }

@@ -41,7 +41,7 @@ import { getPrisma } from '../infra/prisma.js'
 import * as docker from './docker.js'
 import { markSandboxRowsRecycled, recycleSandbox, releaseSandboxSlot } from './manager.js'
 import { clearSandboxQueue, pruneSandboxQueue } from './queue.js'
-import { keepSandboxObject, readSandboxLabels } from './spec.js'
+import { keepSandboxObject, findOversizedWorkVolumes, readSandboxLabels } from './spec.js'
 
 /** 一轮对账的账目（日志与验收都读它；"没干任何事"也必须能看出来，否则无法区分"对账跑过但没事"与"对账根本没跑"） */
 export interface ReapReport {
@@ -80,12 +80,33 @@ export interface ReaperStats {
   /** 上一轮开始的时刻（epoch ms）；从未跑过为 undefined */
   lastRunAt?: number
   lastReport?: ReapReport
+  /** 上一轮 work 卷巡检的读数（P0-3-3）；从未跑过为 undefined */
+  lastVolumeAudit?: WorkVolumeAudit
+}
+
+/**
+ * work 卷体量巡检的读数（P0-3-3）。
+ *
+ * ⚠️ 为什么要有这个东西：`--storage-opt size=` **在本机被守护进程直接拒绝**
+ * （`only for overlay over xfs with 'pquota'`），而且它管的是**容器可写层**、管不到具名卷
+ * ⇒ `SANDBOX_WORK_VOLUME_MB` **不是硬配额**。降级方案（`子方案③` §九 1 认可的）就是
+ * "**定期巡检 + 超限告警 + 人工介入**"，本函数就是它 —— **不假装有配额**。
+ */
+export interface WorkVolumeAudit {
+  /** 扫到的**我们的**卷数（按标签判归属，与容器/卷共用同一条判据） */
+  scanned: number
+  /** 超过告警阈值的那些（`大小 + 阈值` 都给出来，日志里能直接看到差多少） */
+  overLimit: Array<{ name: string; sizeMb: number; limitMb: number }>
+  /** 我们的卷占用的总字节数（趋势观察用） */
+  totalBytes: number
+  at: number
 }
 
 let timer: NodeJS.Timeout | undefined
 let ticking: Promise<void> | undefined
 let lastRunAt: number | undefined
 let lastReport: ReapReport | undefined
+let lastVolumeAudit: WorkVolumeAudit | undefined
 /** 「Docker 不可达」是否已告警（避开"每分钟刷一条同样的 warn"） */
 let dockerDownNotified = false
 
@@ -299,6 +320,58 @@ export async function reapIdleSandboxes(): Promise<number> {
   return reaped
 }
 
+// ───────────────────────────── work 卷体量巡检 ─────────────────────────────
+
+/**
+ * 巡检 work 卷体量，超阈值就告警（P0-3-3；**降级方案的实体**，见 `WorkVolumeAudit` 注释）。
+ *
+ * 三条"不做"是刻意的：
+ *   · **不删东西**：超过阈值**只告警**。卷里是用户跑出来的产物，"自动删掉超限的"会让用户
+ *     的东西凭空消失 —— 那是比磁盘满严重得多的事故；
+ *   · **没有活沙箱时不做**：`/system/df` 要真的去走一遍目录（Docker 算体积），空转没意义。
+ *     判据取"账本里有 `RUNNING` 行"（一行一次 DB 查询，比一次全盘扫描便宜得多）；
+ *   · **不把它算进 `ReapReport`**：那张表是"这一轮回收干了什么"，混进"读数"会让
+ *     `logReap` 的"有没有变化"判断失真。读数走 `ReaperStats.lastVolumeAudit`。
+ *
+ * @returns 巡检读数；跳过时返回 `undefined`（没有活沙箱 / 没有镜像 / Docker 不可达）
+ */
+export async function auditWorkVolumes(): Promise<WorkVolumeAudit | undefined> {
+  const limitMb = config.sandbox.limits.workVolumeMb
+  const running = await getPrisma().sandbox.count({ where: { status: 'RUNNING' } })
+  if (running === 0) {
+    lastVolumeAudit = undefined
+    return undefined
+  }
+
+  const usage = await docker.listVolumeUsage()
+  // ★ 归属判据与容器/卷同一处：**标签**。名字前缀只是名字的构造约定，不作判据。
+  const ours = usage.filter((volume) => readSandboxLabels(volume.labels) !== undefined)
+  const over = findOversizedWorkVolumes(ours, limitMb)
+  const audit: WorkVolumeAudit = {
+    scanned: ours.length,
+    overLimit: over.map((volume) => ({
+      name: volume.name,
+      sizeMb: Math.round(volume.sizeBytes / (1024 * 1024)),
+      limitMb,
+    })),
+    totalBytes: ours.reduce((sum, volume) => sum + volume.sizeBytes, 0),
+    at: Date.now(),
+  }
+  lastVolumeAudit = audit
+
+  for (const volume of audit.overLimit) {
+    getLogger().warn(
+      { volumeName: volume.name, sizeMb: volume.sizeMb, limitMb: volume.limitMb },
+      'work 卷超过告警阈值：本机没有可用的硬配额（--storage-opt 需要 overlay2+xfs+pquota，且它管不到具名卷）' +
+        '⇒ 需要人工介入（清理/缩短保留期），不会自动删',
+    )
+  }
+  if (audit.overLimit.length === 0) {
+    getLogger().debug({ ...audit }, 'work 卷体量巡检：全部在阈值内')
+  }
+  return audit
+}
+
 // ───────────────────────────── 周期任务的生命周期 ─────────────────────────────
 
 /**
@@ -352,6 +425,7 @@ export function getSandboxReaperStats(): ReaperStats {
     intervalSec: config.sandbox.reapIntervalSec,
     lastRunAt,
     lastReport,
+    lastVolumeAudit,
   }
 }
 
@@ -366,6 +440,8 @@ function runReapTick(): void {
       const orphans = await reapOrphans()
       if (orphans !== undefined) lastReport = orphans
       await reapIdleSandboxes()
+      // 体量巡检排在回收之后：先让该消失的消失，读数才是"留下的那些有多大"
+      await auditWorkVolumes()
     } catch (error) {
       // 一轮炸了不该让对账器停摆（下一轮继续）；但必须留 error 级痕迹
       getLogger().error({ err: error }, '沙箱周期对账出错（下一轮继续）')
