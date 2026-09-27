@@ -707,7 +707,8 @@ export interface AppConfig {
    * ⚠️ 消费进度：`idleTtlMin` / `limits` / `image` / `queueKey` / `queueTtlSec` / `reapIntervalSec`
    * / `createGraceSec` 自 **P0-3-2** 起有消费方（`backend/src/sandbox/`）；
    * `egressProxyUrl` / `backendUrl` / `listenHost` / `limits` 的网络·限额半边自 **P0-3-3** 起有消费方；
-   * `callbackPort` / `tokenLen` / `proxyTimeoutSec` 的消费方是 P0-3-9b（listener 的端点本体）。
+   * `callbackPort` / `tokenLen` / `proxyTimeoutSec` 自 **P0-3-9b** 起有消费方
+   * （`sandbox/proxy.ts` 的两个 MCP 代理端点 + `sandbox/token.ts` 的令牌长度）。
    */
   sandbox: {
     /** 空闲回收（分钟）。判据是**最后一次引擎事件的时间**，不是 CPU 占用 */

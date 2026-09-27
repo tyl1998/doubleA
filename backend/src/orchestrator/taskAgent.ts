@@ -75,12 +75,15 @@
  * ═══════════════════════════════════════════════════════════════════════
  *   · **产物下载 / 列表 / 预览端点**（`GET /:id/artifacts`、`GET /artifacts/:id/download`、
  *     `.../content`）→ **P0-3-9 / P0-3-10**。本批只把行建出来、事件发出去，前端还没有消费面。
- *   · **MCP 工具卡与后端代理**（`kind:MCP` + `serverId` 反查）→ **P0-3-9b**；
- *     于是本层发出的工具卡 `kind` **恒为 `SANDBOX`**（`map.ts` 是它的唯一出处）。
- *   · **跨请求提问原语**（`askConversation()` / 活跃通道注册表）→ ✅ **已在 P0-3-6b 落地**
- *     （`sse.ts`）。⚠️ 但**本层不用它**：容器内的 `bash` / `read` / `write` / `edit`
+ *   · **MCP 工具卡与后端代理**（`kind:MCP` + `serverId` 反查）→ ✅ **已在 P0-3-9b 落地**：
+ *     本层 ③.4 预热工具清单并把 `resolveMcpTool` 注进 `createEngineEventMapper`，于是
+ *     "经 §七 代理出去的 MCP 工具"确实会发成 `kind: MCP` 的卡（带 `serverId`）；
+ *     ⚠️ 清单**拿不到**时（Redis 抖动 / 没绑定）本层**不落轮**，映射器退回 `kind: SANDBOX`。
+ *   · **跨请求提问原语**（`askConversation()` / 活跃通道注册表）→ ✅ **P0-3-6b 落地**（`sse.ts`）。
+ *     ⚠️ 但**本层不用它**：容器内的 `bash` / `read` / `write` / `edit`
  *     **不做**逐工具确认（`子方案③` §八 5 的判据 —— **只有"跨出容器边界"的动作才需要确认卡**；
- *     容器内的破坏面已被容器边界框死）。它的调用方是 **P0-3-9b** 的沙箱 MCP 代理端点。
+ *     容器内的破坏面已被容器边界框死）。它的唯一调用方是 **P0-3-9b** 的沙箱 MCP 代理端点
+ *     （`sandbox/proxy.ts#runDangerousCall`）。
  *   · **停止路径的沙箱回收** → ✅ **已在 P0-3-8 落地**（见下方 ⑦）：只在**用户停止**
  *     （`stopReason === 'user'`）时回收，且排在**收产物与落库之后**；`bridge#runTurn` 的
  *     abort 监听把信号翻成引擎的 `abort` 命令 + 15s 宽限（P0-3-5 落的），宽限内没收尾的
@@ -105,17 +108,20 @@ import {
   closeSandboxRpc,
   collectRoundArtifacts,
   ensureSandbox,
+  ensureSandboxMcpCatalog,
   getSandboxRpc,
   recycleSandbox,
+  resolveSandboxMcpTool,
   snapshotWorkFiles,
   type SandboxAcquireFailure,
   type SandboxHandle,
+  type SandboxMcpCatalog,
   type SandboxRpc,
   type TurnFailureReason,
   type TurnOutcome,
   type WorkSnapshot,
 } from '../sandbox/index.js'
-import { createEngineEventMapper, type EngineUsage } from '../sandbox/map.js'
+import { createEngineEventMapper, type EngineMcpToolCard, type EngineUsage } from '../sandbox/map.js'
 import { persistRoundQuietly } from './persist.js'
 import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
 
@@ -258,7 +264,36 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       //     不许收尾之后补 —— 否则"基线"里已经混进了这一轮的产物，对照出来永远为空）
       baseline = await snapshotWorkFiles(handle.containerId)
 
-      const mapper = createEngineEventMapper()
+      // ═════════════════════════════════════════════════════════════
+      // ③.4 MCP 工具清单（P0-3-9b）—— 反查 `tool_call.serverId` 的唯一依据
+      // ═════════════════════════════════════════════════════════════
+      // 规则是「**每个容器一份快照**」（`sandbox/proxy.ts#ensureSandboxMcpCatalog`）：
+      // 已发布过就**原样读回**（容器注册的正是那一份），没发布过才算一份并发布。
+      // ⚠️ **失败不落轮**：拿不到清单只意味着 MCP 工具卡少填一个 `serverId`
+      // （`map.ts` 退回 `kind: SANDBOX`），而工具**本身照样能调** ——
+      // 容器侧的注册与实际调用都走代理端点，不依赖后端这份内存副本。
+      let mcpCatalog: SandboxMcpCatalog | null = null
+      try {
+        mcpCatalog = await ensureSandboxMcpCatalog(conversationId, agentId)
+      } catch (error) {
+        logger.warn(
+          { err: error, conversationId, agentId },
+          '沙箱 MCP 工具清单预热失败（本轮 MCP 工具卡将不带 serverId；工具本身不受影响）',
+        )
+      }
+      // ⚠️ 过一次 `const`：`let` 变量在闭包里 TS 不会保留窄化 ⇒ 直接闭合 `mcpCatalog` 会报"可能为 null"
+      const resolverCatalog: SandboxMcpCatalog | null = mcpCatalog
+      const resolveMcpTool =
+        resolverCatalog === null
+          ? undefined
+          : (engineToolName: string): EngineMcpToolCard | undefined => {
+              const ref = resolveSandboxMcpTool(resolverCatalog, engineToolName)
+              return ref === undefined
+                ? undefined
+                : { serverId: ref.serverId, serverName: ref.serverName, toolName: ref.toolName }
+            }
+
+      const mapper = createEngineEventMapper({ resolveMcpTool })
       unsubscribe = bridge.onEvent((event) => {
         const mapped = mapper.map(event)
 

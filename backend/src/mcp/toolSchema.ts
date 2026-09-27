@@ -194,8 +194,12 @@ function disambiguate(base: string, used: ReadonlySet<string>): string {
  * 反过来——模型对一个只有名字的工具几乎必然传错参数，而"空 description"是**最贵**的一种省事。
  * ⚠️ 按码点（`[...str]`）而不是 `String.prototype.slice`：后者按 UTF-16 码元切，会把代理对
  * 劈成两半、产出非法字符串，而**这一层毫无报错**（P0-1-18 的老坑）。
+ *
+ * ⚠️ **导出的理由**（P0-3-9b）：沙箱路径（`sandbox/mcpMap.ts`）也要给同一批工具造同一句说明 ——
+ * 容器里的模型看到的工具说明不该与 ChatBot 里的不是同一句。两处各写一份就是
+ * "必有一处先腐烂"（P0-1-29 的 `PASSWORD_ALPHABET`）。
  */
-function toDescription(tool: McpToolDescriptor): string {
+export function toDescription(tool: McpToolDescriptor): string {
   const raw = tool.description ?? tool.title ?? ''
   // UTF-16 长度 ≤ 码点数 ⇒ 长度没超上限时一定没超，省掉一次整串展开
   if (raw.length <= MCP_TOOL_DESCRIPTION_MAX) return raw

@@ -139,7 +139,11 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-11 任务型对话页 + 产物面板 + 预览弹层（纯前端批次）：第三列 `ArtifactPanel` 只对 `agent.type === TASK_AGENT` 加 `chat--with-panel`；面板清单 = **服务端列表**（新接 `GET /api/conversations/:id/artifacts`，`api/artifacts.ts#useConversationArtifacts`，**刷新后产物还在的唯一出口**）+ **本轮 `artifact` 事件**，两个来源在 `artifactPanelModel.ts#mergeArtifactPanelItems` **一处合流**（倒序对齐 + 按 `artifactId` 去重、保留带 `createdAt` 的服务端那一份）；产物卡两个按钮解禁 —— 「预览」判据 `previewAvailability`（`none` 与体积超限**都只给下载**，`子方案④` §九）、「下载」与弹层标题栏共用 `useArtifactDownload`；「谁在预览」住 `stores/artifactPreview.ts`（点它的地方在四个层级之下），弹层摆 `.chat` **之外**；`useChatStream` 收尾多失效一次产物列表。★ **P0-3 的可端测里程碑到了**：浏览器里能亲手跑通「派活 → 过程可见 → 预览/下载产物 → 停止 → 恢复」（步骤见 README「浏览器端测 · 任务型对话页」）',
+    // ⚠️ **支线批次的写法（P0-3-9b 起）**：`check:batch` 取的是**批次号最大**的那个（不是文件里
+    //    最后出现的），而 `P0-3-11` 的键大于 `P0-3-9b` ⇒ 插队补做的支线**不能**把 step 改成
+    //    "P0-3-9b …"（那会让自检必红）。本行因此写成「P0-3-11 + P0-3-9b」：既说明当前代码状态
+    //    是"里程碑批次之上叠了这条支线"，也仍然带着那个最大批次号。
+    step: 'P0-3-11 + P0-3-9b（插队补的支线）：上层是 P0-3 的可端测里程碑 —— 任务型对话页三栏（`chat--with-panel` 只给 `agent.type === TASK_AGENT`）+ 产物面板（清单 = 服务端列表 `GET /api/conversations/:id/artifacts` 与本轮 `artifact` 事件在 `artifactPanelModel.ts#mergeArtifactPanelItems` **一处合流**）+ 预览弹层（六个渲染器；「预览」判据 `previewAvailability`；「谁在预览」住 `stores/artifactPreview.ts`）；其上叠着 **P0-3-9b 沙箱 MCP 代理**：容器内引擎**永不直连 MCP**，所有调用走内网 `GET /api/sandbox/mcp/tools`（工具清单 + 别名映射）与 `POST /api/sandbox/mcp/call`（由后端带**会话发起者**凭据代调）—— 新增 `sandbox/token.ts`（per-container 令牌：两个方向同写同删、解析时滑动续期）+ `sandbox/mcpMap.ts`（`alias ⇄ serverId` 这张表**唯一**的存与取）+ `sandbox/proxy.ts`（越权检查 403、清单没下发 409；★ 危险判定的**第二落点**复用 `isDangerousTool` + `askConversation`，危险那一段按会话**串行**化）+ `manager.ts`（建容器前签发并注入 `SANDBOX_TOKEN`；建失败与回收都撤销）+ `map.ts`（**注入式** resolver 反查 ⇒ `kind:MCP` 的卡）+ 容器侧 `mcp-bridge` 扩展真实现（`session_start` 拉清单 + `registerTool`；★ **`throw` 才是失败**）。⚠️ 两个端点**不在公网 listener 上**；`base`/`toolkit` 镜像层版本 → 3 ⇒ 必须 `pnpm sandbox:build` 重建（本机换源）',
     address,
   })
   logger.info(
@@ -169,7 +173,8 @@ try {
   await reconcileOnBoot()
   startSandboxReaper()
 
-  // 出口②（P0-3-3）：**独立 listener**，只挂 `/api/sandbox/*`（端点本体属 P0-3-9b）。
+  // 出口②（P0-3-3）：**独立 listener**，只挂 `/api/sandbox/*`（自 P0-3-9b 起是
+  // `GET /api/sandbox/mcp/tools` 与 `POST /api/sandbox/mcp/call` 两条，见 `sandbox/proxy.ts`）。
   // 放在对账之后起：对账会清掉上一个进程留下的容器，而"能连回来的容器"此刻一个都不该存在。
   // ⚠️ 与前面几项同款纪律：**失败只 warn**（没配镜像 / 端口被占 / Docker 不可达都不该让后端起不来）。
   const listenerUp = await startSandboxListener()

@@ -48,8 +48,14 @@
  *     ⚠️ 那个原语**已落地**，但"**引擎**主动问"这条路**还没有接线**：这类 RPC-only 记录会被
  *     `bridge.ts` 一并扇到本层，而本层只把它算成 `known:false`（**只留痕、不派发** —— 见上面
  *     ⑦ 那条纪律）。要接通得另立批次（谁接住它、用什么事件名，本仓目前没有契约）。
- *   · **`kind: 'MCP'` 的工具卡** —— 容器侧看到的就是一次普通工具执行（MCP 走 §七 的后端代理），
- *     因此 alias 反查 `serverId` 是 **P0-3-9b** 的事；本层发出的 `kind` **恒为 `SANDBOX`**。
+ *   · **`kind: 'MCP'` 的工具卡只有"是不是经 §七 代理出去的"这一条判据** —— ✅ **P0-3-9b 已接线**：
+ *     容器侧报上来的名字若是**已下发的 MCP 工具名**（`mcp_<alias>_<tool>`），
+ *     {@link EngineEventMapperOptions.resolveMcpTool} 会把它解成 `{serverId, serverName, toolName}`
+ *     ⇒ 卡片填上 `serverId` / `kind: MCP` / 显示**原始**工具名与 server 名。
+ *     ⚠️ **解析器是注入的**（不是本文件去查库/查 Redis）：本层必须保持"喂一串事件、比结果"
+ *     的可核查性（文件头第一段）。映射表从哪来、`alias` 怎么解，都在调用方
+ *     （`orchestrator/taskAgent.ts` 预热 + `sandbox/mcpMap.ts` 的唯一实现）。
+ *     注入器没给 / 解不出来 ⇒ 退回 `kind: SANDBOX`（容器内的 bash / read / write / edit 走这条）。
  *   · **stderr** —— 引擎的抱怨不进 SSE（`子方案③` §六 3 末行），它由 `bridge.ts` 直接收进日志（脱敏）。
  */
 
@@ -61,13 +67,20 @@ import type { PiSessionEvent } from './bridge.js'
 // ───────────────────────────── 常量 ─────────────────────────────
 
 /**
- * 容器侧工具的 `kind` **恒为它**。
+ * 容器侧工具的 `kind` **恒为它** —— 除非它是"经 §七 代理出去的 MCP 调用"（见 {@link MCP_TOOL_KIND}）。
  *
- * `kind` 的另一个取值 `MCP` 只属于"经 §七 代理调出去的那种卡"（P0-3-9b 在代理端点里把
- * alias 反查成 `serverId` 时才发）—— 容器内的 bash/read/write/edit 与将来任何容器内工具
- * 都是 `SANDBOX`。写成常量而不是在每处写字面量：这个值同时进 SSE 帧与落库记录。
+ * 写法是常量而不是在每处写字面量：这个值同时进 SSE 帧与落库记录。
  */
 const SANDBOX_TOOL_KIND = 'SANDBOX'
+
+/**
+ * `kind` 的另一个取值（`shared#TOOL_CALL_KINDS`）：**只有"经 §七 代理调出去的"工具卡用它**。
+ *
+ * ✅ **P0-3-9b 起真的会发出去了**：判据**不是**"这个名字看起来像 MCP 工具"，而是
+ * "**注入的解析器认出了它**"（= 它确实是本次会话下发给容器的工具之一）。
+ * 于是 `mcp_` 这个前缀**不构成判据**（一个容器内的、恰好叫 `mcp_foo` 的 bash 脚本不会误判）。
+ */
+const MCP_TOOL_KIND = 'MCP'
 
 /**
  * `kind=SANDBOX` 的工具**不属于任何 MCP server** ⇒ `serverName` 是空串。
@@ -213,6 +226,36 @@ export interface EngineEventMapping {
   anomaly?: string
 }
 
+/**
+ * 一张 MCP 工具卡的"它到底是谁"（**由调用方注入的解析器产出**，P0-3-9b）。
+ *
+ * 三个字段全是**人的可读性**需要的：`serverName` 让用户知道"这个工具来自哪个系统"，
+ * `toolName` 是 MCP 侧的**原始**名（而不是我们改过的 `mcp_s1_xxx`）。
+ */
+export interface EngineMcpToolCard {
+  serverId: string
+  serverName: string
+  /** MCP 侧的原始工具名 */
+  toolName: string
+}
+
+/**
+ * {@link createEngineEventMapper} 的可选项。
+ *
+ * ⚠️ **只有一项，而它是"把库/Redis 挡在本层之外"的关键**：`alias → {serverId, serverName, toolName}`
+ * 的映射由调用方（`orchestrator/taskAgent.ts`，从 `sandbox/mcpMap.ts` 的那份清单）装好传进来。
+ * 本层因此仍然**不碰 DB / Redis / Docker / SSE**，可以"喂一串事件、比结果"地逐条核查。
+ *
+ * 返回 `undefined` 的两种情形**不区分**（都退回 `kind: SANDBOX`）：
+ *   · 这个引擎工具名根本不是 MCP 工具（容器内的 bash / read / write / edit —— 绝大多数）；
+ *   · 是 MCP 工具名，但映射里没有它（清单还没下发 / 编排层预热失败）。
+ * 两者对卡片的处置**该一样**（照 SANDBOX 发一条卡，不比别处少任何东西），
+ * 而"为什么没解出来"的线索在调用方的日志里（`taskAgent.ts` 那条 warn）。
+ */
+export interface EngineEventMapperOptions {
+  resolveMcpTool?: (engineToolName: string) => EngineMcpToolCard | undefined
+}
+
 /** 映射器（见 {@link createEngineEventMapper}：它有一小块 `callId → 摘要` 的记忆） */
 export interface EngineEventMapper {
   map(event: PiSessionEvent): EngineEventMapping
@@ -254,10 +297,22 @@ export function readEngineUsage(raw: unknown): EngineUsage | null {
  *
  * ⚠️ 记忆的键是 `callId`（引擎给的，全局唯一）⇒ 一个映射器可以安全地跨多轮复用；
  * 调用方（`taskAgent.ts`）在一轮结束时**丢弃整个映射器**，于是"跨轮的残留"在结构上不存在。
+ *
+ * @param options 见 {@link EngineEventMapperOptions} —— 唯一一项是 MCP 工具的反查解析器
  */
-export function createEngineEventMapper(): EngineEventMapper {
+export function createEngineEventMapper(options: EngineEventMapperOptions = {}): EngineEventMapper {
   /** `callId → 卡片那一行摘要 + 完整入参`（end 帧要用回它） */
   const memo = new Map<string, { inputSummary: string; args: string }>()
+
+  /**
+   * 同一张卡的**两帧必须用同一个身份**（start 与 end 各算一次 ⇒ 万一解析结果不稳定，
+   * 卡片会在运行中"换个 server"）。解析器是纯函数、映射表在一轮内不变，所以这里只是
+   * 把"两处各调一次"收成一处调用点，顺带让 `kind` / `serverName` / `serverId` 三者的来源唯一。
+   */
+  function toolIdentity(engineToolName: string): { kind: string; ref: EngineMcpToolCard | undefined } {
+    const ref = options.resolveMcpTool?.(engineToolName)
+    return { kind: ref === undefined ? SANDBOX_TOOL_KIND : MCP_TOOL_KIND, ref }
+  }
 
   function remember(callId: string, entry: { inputSummary: string; args: string }): void {
     // 先删后插：让 `Map` 的插入顺序表达"最近用过"，下面按它淘汰最旧的一条
@@ -316,19 +371,24 @@ export function createEngineEventMapper(): EngineEventMapper {
     const serialized = serializeArgs(args)
     remember(callId, { inputSummary, args: serialized })
 
+    // ★ 反查（P0-3-9b）：是"我们下发给容器的 MCP 工具"就换成 MCP 卡，否则照旧 SANDBOX
+    const { kind, ref } = toolIdentity(toolName)
     const payload: SseToolCallPayload = {
       callId,
-      toolName,
-      serverName: SANDBOX_TOOL_SERVER_NAME,
-      kind: SANDBOX_TOOL_KIND,
+      toolName: ref?.toolName ?? toolName,
+      serverName: ref?.serverName ?? SANDBOX_TOOL_SERVER_NAME,
+      // `serverId` 只在**真的是 MCP 工具**时才有这个键（"没有这个键"与"有但是空"是两件事，P0-2-11）
+      ...(ref === undefined ? {} : { serverId: ref.serverId }),
+      kind,
       status: 'RUNNING',
       inputSummary,
     }
     return {
       events: [{ name: 'tool_call', data: payload }],
       usage: null,
-      // `currentTool` 是断线重连时"现在在跑什么"的唯一来源（`02` §5.2）
-      snapshot: { currentTool: toolName },
+      // `currentTool` 是断线重连时"现在在跑什么"的唯一来源（`02` §5.2）。
+      // 用**卡片上那个名字**（MCP 卡是原始工具名）—— 与卡片不一致的 `/active` 只会让重连的人看到两个名字
+      snapshot: { currentTool: payload.toolName },
       toolRecord: { ...payload, arguments: serialized },
       known: true,
     }
@@ -355,11 +415,14 @@ export function createEngineEventMapper(): EngineEventMapper {
       resultText.trim() === '' && isError ? TOOL_RESULT_NO_ERROR_DETAIL : resultText,
     )
 
+    // 与 start 帧**同一个身份来源**（见 `toolIdentity`）；`end` 事件同样带 `toolName`
+    const { kind, ref } = toolIdentity(toolName)
     const payload: SseToolCallPayload = {
       callId,
-      toolName,
-      serverName: SANDBOX_TOOL_SERVER_NAME,
-      kind: SANDBOX_TOOL_KIND,
+      toolName: ref?.toolName ?? toolName,
+      serverName: ref?.serverName ?? SANDBOX_TOOL_SERVER_NAME,
+      ...(ref === undefined ? {} : { serverId: ref.serverId }),
+      kind,
       status: isError ? 'ERROR' : 'SUCCESS',
       // 摘要取**记忆**里的那一份：end 事件自己没有 `args`，而前端按 `callId` upsert
       // ⇒ 这里给空串会把 start 那帧已经显示出来的摘要抹掉（卡片上"参数"那一行突然空了）

@@ -1,6 +1,6 @@
 /**
  * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥，
- * P0-3-6 补事件映射，P0-3-7 补产物收集）
+ * P0-3-6 补事件映射，P0-3-7 补产物收集，P0-3-9b 补 MCP 代理）
  *
  * 依据：`docs/02-后端设计.md` §七（TaskAgent 编排）+ §4.8（任务与产物）+ `docs/06-实施计划.md` §五 P0-3-2/P0-3-3
  *
@@ -13,6 +13,8 @@
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
  * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃）/ **`createEngineEventMapper`**（引擎事件 → 我方 SSE 事件） |
  * | P0-3-7 的编排层 | `snapshotWorkFiles`（派活之前拍基线）/ `collectRoundArtifacts`（对照 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
+ * | ✅ P0-3-9b 的编排层（`taskAgent.ts`） | `ensureSandboxMcpCatalog`（预热工具清单，反查 `serverId` 的唯一依据）+ `resolveSandboxMcpTool`（引擎工具名 → 这个工具是谁）+ `type SandboxMcpCatalog` |
+ * | ✅ P0-3-9b 的 listener（`listener.ts`，**它直接 `import './proxy.js'`** —— 那条链要碰 SSE/Prisma，不该被人人都在 import 的本桶拖上） | `registerSandboxProxyRoutes` |
  * | ✅ P0-3-8 的停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（先拆连接）/ `recycleSandbox`（再杀容器与具名卷） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
@@ -117,13 +119,43 @@ export {
   type SandboxNetwork,
 } from './network.js'
 
-// 出口② 的 listener（独立 Fastify 实例；**端点本体属 P0-3-9b**）
+// 出口② 的 listener（独立 Fastify 实例；自 P0-3-9b 起它上面**真的挂着**两个 MCP 代理端点）
 export {
   getSandboxListenerStats,
   startSandboxListener,
   stopSandboxListener,
   type SandboxListenerStats,
 } from './listener.js'
+
+// MCP 走后端代理（P0-3-9b）—— 端点本体 + 「每个容器一份」的工具清单
+// ⚠️ **本组只有编排层用得到**（预热清单 + 反查）；listener 自己直接 `import './proxy.js'`
+//    （那条链一路上碰 SSE / Prisma / MCP 客户端，不该被任何 `import` 本桶的人一起拖进来）。
+// ⚠️ 端点**不在公网 listener 上**：它们由 `registerSandboxProxyRoutes` 挂到沙箱代理 listener
+//    （`02` §4.10），这里导出只为让"这个 listener 上挂了什么"有一个可读的清单。
+export {
+  buildSandboxMcpCatalog,
+  ensureSandboxMcpCatalog,
+  registerSandboxProxyRoutes,
+} from './proxy.js'
+
+// 别名映射的**纯函数与存取**（P0-3-9b）—— `alias ⇄ serverId` 这张表的唯一读法
+// ｜ 编排层（`map.ts` 的反查、`taskAgent.ts` 注入 resolver） | `resolveSandboxMcpTool`
+// ｜ 诊断 / 纯函数核对 | `registeredSandboxMcpToolName` / `sandboxMcpAliasAt` / `emptySandboxMcpCatalog`（可喂一张表、比结果）
+// ⚠️ `writeSandboxMcpCatalog` / `clearSandboxMcpMap` **不在这里导出**：写入口只有 `proxy.ts`
+//    （算清单）与回收路径（`manager.ts` 直接 `import './mcpMap.js'`）—— 放开写出口会造出
+//    "另一处也能改这张表"的可能，而它的全部价值就是**唯一性**（§七 4）。
+export {
+  emptySandboxMcpCatalog,
+  readSandboxMcpCatalog,
+  registeredSandboxMcpToolName,
+  resolveSandboxMcpTool,
+  sandboxMcpAliasAt,
+  SANDBOX_MCP_ALIAS_PREFIX,
+  SANDBOX_MCP_DESCRIPTION_MAX,
+  type SandboxMcpCatalog,
+  type SandboxMcpServerRef,
+  type SandboxMcpToolRef,
+} from './mcpMap.js'
 
 // 排队（位次可观测；编排层把位次变成 `queued` 事件）
 export { sandboxQueueDepth, sandboxQueueKey, sandboxQueuePosition } from './queue.js'

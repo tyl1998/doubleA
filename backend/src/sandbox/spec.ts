@@ -219,6 +219,51 @@ export function sandboxEgressEnv(input: { proxyUrl: string; backendUrl: string }
   }
 }
 
+// ───────────────────────────── MCP 代理（P0-3-9b）─────────────────────────────
+
+/**
+ * per-container 代理令牌的容器环境变量名。
+ *
+ * ⚠️ 这是一份**跨边界契约**（与 `SANDBOX_LLM_ENV` 那六个名字同族）：容器里的桥扩展
+ * （`infra/sandbox/base/pi-agent/extensions/mcp-bridge/index.ts`）**逐字**读这个名字。
+ * 改这里就必须同步改扩展 —— 而两处对不上的症状是"扩展说没有令牌、于是不注册任何工具"
+ * （后端侧一切正常，日志里连一条 warn 都没有）。
+ */
+export const SANDBOX_TOKEN_ENV = 'SANDBOX_TOKEN'
+
+/** 代理请求超时（毫秒）的容器环境变量名；值由 `SANDBOX_PROXY_TIMEOUT_SEC` 换算 */
+export const SANDBOX_PROXY_TIMEOUT_ENV = 'SANDBOX_PROXY_TIMEOUT_MS'
+
+/**
+ * 代理令牌的 **HTTP 头名**（跨边界契约的另一半，与 {@link SANDBOX_TOKEN_ENV} 同族）。
+ *
+ * 用自定义头而不是 `Authorization: Bearer`：这一侧的客户端只有我们的扩展，
+ * 而 `Authorization` 会让抓包/日志工具把它当"标准凭据"顺手记下来（值里就是会话身份）。
+ * 头名一律按**小写**写（HTTP 头名不区分大小写，Node 侧 `request.headers` 拿到的也是小写）。
+ */
+export const SANDBOX_TOKEN_HEADER = 'x-sandbox-token'
+
+/**
+ * MCP 代理要用的容器环境变量（**纯函数**，§七 3 ②/③）。
+ *
+ * ★ 这组 env 与 {@link sandboxEgressEnv} 合起来才是"容器凭什么能调后端"的完整答案：
+ * 出口② 那条给的是**地址**（`SANDBOX_BACKEND_URL`），这里给的是**身份**（令牌）与**耐心**（超时）。
+ *
+ * ⚠️ 返回值里含**令牌明文**（它是"允许冒充这个会话"的凭据）⇒ 调用方（`manager.ts`）
+ * 只许把它交给 `buildSandboxContainerSpec`，**不许打日志、不许落库、不许拼进错误消息**
+ * —— 与 `sandboxLlmEnv` 的明文 Key 同一条纪律（`02` §九 的"密钥零下发"）。
+ *
+ * ⚠️ 超时值**从配置来、不写死**：它必须 > `MCP_CONFIRM_TIMEOUT_SEC`（120s，确认卡要能等到人
+ * 应答），而这条恒等关系由 `config.ts#superRefine` 守着。在扩展里再写一份常量就会造出
+ * "两处各写一份、必有一处先腐烂"，而腐烂的方向正是那个最难查的"确认卡还没点完就被超时掐断"。
+ */
+export function sandboxProxyEnv(input: { token: string; proxyTimeoutSec: number }): Record<string, string> {
+  return {
+    [SANDBOX_TOKEN_ENV]: input.token,
+    [SANDBOX_PROXY_TIMEOUT_ENV]: String(Math.round(input.proxyTimeoutSec * 1000)),
+  }
+}
+
 // ───────────────────────────── LLM 注入（P0-3-4）─────────────────────────────
 
 /**

@@ -57,8 +57,11 @@ import {
   readSandboxLabels,
   sandboxEgressEnv,
   sandboxLabels,
+  sandboxProxyEnv,
   workVolumeName,
 } from './spec.js'
+import { bindSandboxToken, revokeSandboxToken } from './token.js'
+import { clearSandboxMcpMap } from './mcpMap.js'
 
 /**
  * 排队等待的轮询间隔（**代码常量**，不进 env）。
@@ -178,7 +181,11 @@ export async function ensureSandbox(
   //    而"两次查询之间模型被改掉"这个窗口没必要存在 —— 一次往返把两问都答了。
   const conversation = await getPrisma().conversation.findUnique({
     where: { id: conversationId },
-    select: { status: true, agent: { select: { modelId: true } } },
+    // ★ P0-3-9b 起多取两列（`userId` / `agentId`）：per-container 代理令牌的**身份**就是它们
+    //   （`{conversationId, userId, agentId}` ⇒ `sandbox/token.ts`）。为什么在这一条查询里一起取：
+    //   令牌要在**建容器之前**写好（容器一起来扩展就会拿它拉工具清单），而现在这里已经是
+    //   "建容器之前唯一一次读会话"的位置 —— 再加一条查询只会多一个"两次读之间会话/Agent 变了"的窗口。
+    select: { status: true, userId: true, agentId: true, agent: { select: { modelId: true } } },
   })
   if (conversation === null) return fail('CONVERSATION_NOT_FOUND', '会话不存在')
   if (conversation.status !== 'ACTIVE') return fail('CONVERSATION_NOT_FOUND', '会话已结束（只读）')
@@ -256,7 +263,13 @@ export async function ensureSandbox(
   }
 
   try {
-    return { ok: true, sandbox: await createSandbox(conversationId, image, runtime, llm) }
+    return {
+      ok: true,
+      sandbox: await createSandbox(conversationId, image, runtime, llm, {
+        userId: conversation.userId,
+        agentId: conversation.agentId,
+      }),
+    }
   } catch (error) {
     // ★ 名额必须还回去：不还的话每失败一次漏一个槽位，且**重启才恢复**（名额是进程内的）
     slots.remove(conversationId)
@@ -350,6 +363,7 @@ async function createSandbox(
   image: string,
   runtime: SandboxRuntime,
   llm: Extract<SandboxLlmResult, { ok: true }>,
+  owner: { userId: string; agentId: string },
 ): Promise<SandboxHandle> {
   const prisma = getPrisma()
   const startedAt = new Date()
@@ -384,6 +398,16 @@ async function createSandbox(
       name: volumeName,
       labels: sandboxLabels({ conversationId, startedAt, modelId: llm.modelId }),
     })
+    /**
+     * ★ P0-3-9b：签发 per-container 代理令牌。
+     *
+     * **位置是正确性的一部分** —— 必须在建/启容器**之前**：
+     * 容器一起来，pi 就加载桥扩展、扩展立刻拿 `SANDBOX_TOKEN` 去拉工具清单
+     * （`GET /api/sandbox/mcp/tools`）⇒ 令牌晚一步写好，容器第一次拉清单就是 401，
+     * 而扩展那边看起来像"后端不可达"（§六 27 的"服务间地址不做兜底"同族）。
+     * 反过来放早了也不好：这里已经过了全部校验（镜像 / 模型 / 卷），失败概率最低。
+     */
+    const token = await bindSandboxToken({ conversationId, userId: owner.userId, agentId: owner.agentId })
     containerId = await docker.createSandboxContainer(
       buildSandboxContainerSpec({
         image,
@@ -403,11 +427,13 @@ async function createSandbox(
          * 前者才是 pi 认的那个 id，后者只进标签。
          */
         cmd: piRpcArgv(llm.modelName),
-        // 出口①/②（`sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，含**明文 Key**）拼成一份
-        // Env。⚠️ 后者只在**这里**被消费，别顺手把它塞进日志（见 `llm.ts` 文件头）。
+        // 出口①/②（`sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，含**明文 Key**）
+        // + MCP 代理令牌与超时（`sandboxProxyEnv`，含**令牌明文**，P0-3-9b）拼成一份 Env。
+        // ⚠️ 后两者只在**这里**被消费，别顺手把它们塞进日志（见各自函数的注释）。
         env: {
           ...sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
           ...llm.env,
+          ...sandboxProxyEnv({ token, proxyTimeoutSec: config.sandbox.proxyTimeoutSec }),
         },
       }),
     )
@@ -435,6 +461,9 @@ async function createSandbox(
     await docker.removeSandboxVolume(volumeName).catch((cleanupError: unknown) => {
       getLogger().warn({ err: cleanupError, volumeName }, '创建失败后删卷失败（留给对账器）')
     })
+    // ★ P0-3-9b：容器没建成 ⇒ 令牌一起撤掉（否则 Redis 里留着一条"能冒充这个会话去调后端"
+    //   的凭据，而它对应的容器从来没存在过）。幂等、失败只 warn：没绑过就是一次空 `del`。
+    await revokeSandboxToken(conversationId)
     await prisma.sandbox
       .updateMany({ where: { id: row.id, status: 'CREATING' }, data: { status: 'FAILED', errorMsg: reason } })
       .catch((markError: unknown) => {
@@ -482,6 +511,15 @@ export async function recycleSandbox(conversationId: string, reason: string): Pr
     })
     changed = changed || updated.count > 0
   }
+
+  // ★ P0-3-9b：容器收了 ⇒ 它那只**代理令牌**与**别名映射**必须一起消失。
+  //   令牌留着 = 一条"能冒充这个会话去调后端、并用该会话发起者 MCP 凭据"的凭据，
+  //   而它对应的容器已经不存在了 —— 这类残留不该靠 TTL 兜底（TTL 有 12 小时）。
+  //   ⚠️ **无条件调用**（不看 `changed`）：回收路径本身是幂等的，"没有可回收的对象"
+  //   恰恰是"令牌可能悬空"的那种状态（容器被人手工删掉、账本行已被清）。
+  //   ⚠️ 两者都幂等、失败只 warn（各自模块内部处理），不会把"回收"变成"抛出"。
+  await revokeSandboxToken(conversationId)
+  await clearSandboxMcpMap(conversationId)
 
   if (slots.remove(conversationId)) changed = true
   if (changed) {

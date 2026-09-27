@@ -12,8 +12,9 @@
  *     （Docker 跑在 VM 里），等于把"容器摸不到业务 API"这条关键判据押在一个我这边看不见的层上；
  *   · 第二个实例的成本其实只有"多一个 Fastify 对象"：不挂会话、不挂 CORS、不挂业务路由，
  *     `buildApp()` 那一整套（错误处理 + 首登闸门 + 会话 + 全部路由）**一行都不进这里**。
- * ⇒ **容器能调到的那个 listener 上只有 `/api/sandbox/*`**（本批为空集，端点属 P0-3-9b），
- * 登录、会话、管理端点全都不在它上面。
+ * ⇒ **容器能调到的那个 listener 上只有 `/api/sandbox/*`** —— 自 **P0-3-9b** 起它上面真的挂着
+ * 两个端点（`GET /api/sandbox/mcp/tools` 与 `POST /api/sandbox/mcp/call`，见 `proxy.ts`），
+ * 登录、会话、管理端点**一个都不在它上面**。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ★ 绑定地址：默认**只绑专用 bridge 的网关地址**
@@ -25,10 +26,9 @@
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 三处刻意的"不做"
  * ─────────────────────────────────────────────────────────────────────
- * ① **不在这里注册任何业务路由，也不注册 `/api/sandbox/*` 的端点**：端点属 **P0-3-9b**
- *    （`proxy.ts`）。本批交付的是**通道**（网络 + listener + 地址契约），不是端点。
- *    所有未注册路径统一 404 + 统一信封 —— 于是"容器把路径写错了"与"容器根本连不上"是两种
- *    可区分的现象（前者 404、后者连不上）。
+ * ① **不在这里注册任何业务路由**：容器能调到的只有 `/api/sandbox/mcp/*` 两条
+ *    （`registerSandboxProxyRoutes`，P0-3-9b 起）。所有**未注册**路径统一 404 + 统一信封 ——
+ *    于是"容器把路径写错了"与"容器根本连不上"是两种可区分的现象（前者 404、后者连不上）。
  * ② **不让它的失败影响后端启动**：Docker 不可达 / 端口被占 / 网关读不到 ⇒ **warn + 记在
  *    `getSandboxListenerStats().error` 上**，后端照常服务其余功能（同 `00` 的纪律：探活端点
  *    自身恒 200，依赖状态进 body/日志）。理由很实际：本机没起 Docker 时不该连登录都用不了。
@@ -44,6 +44,7 @@ import { fail } from '@doubulea/shared'
 import { config } from '../config.js'
 import { logger as pinoLogger } from '../infra/logger.js'
 import { describeSandboxNetwork, ensureSandboxNetwork } from './network.js'
+import { registerSandboxProxyRoutes } from './proxy.js'
 
 /** 沙箱代理 listener 的运行态（日志 / 排障 / 将来的 `/api/tasks` 用） */
 export interface SandboxListenerStats {
@@ -67,7 +68,7 @@ let boundHost: string | undefined
 export async function startSandboxListener(): Promise<boolean> {
   if (instance !== undefined) return true
   if (config.sandbox.image === undefined) {
-    pinoLogger.info('未配置 SANDBOX_IMAGE ⇒ 不启动沙箱代理 listener（出口②，P0-3-9b 才需要它）')
+    pinoLogger.info('未配置 SANDBOX_IMAGE ⇒ 不启动沙箱代理 listener（出口②，只服务于 MCP 代理）')
     return false
   }
 
@@ -83,12 +84,16 @@ export async function startSandboxListener(): Promise<boolean> {
       //    开了它只会让 `X-Forwarded-For` 变成可以随便伪造的东西（日志里出现假来源）。
       trustProxy: false,
     })
-    // 统一信封的 404：路径写错（P0-3-9b 还没上的端点）应当是**看得懂的一句话**，
+    // ★ P0-3-9b：把沙箱 MCP 代理的两个端点挂上（`proxy.ts`）。
+    //   ⚠️ 只挂在这一个实例上 —— 公网 listener（`app.ts`）上没有它们，
+    //   于是"容器能摸到业务 API"在结构上不成立，而不是靠 iptables（本机根本验不了 iptables）。
+    registerSandboxProxyRoutes(app)
+    // 统一信封的 404：路径写错（不是 `/api/sandbox/mcp/*` 里的那两条）应当是**看得懂的一句话**，
     // 而不是 Fastify 默认的 "Route GET:/api/sandbox/mcp/call not found"。
     app.setNotFoundHandler((request, reply) => {
       void reply
         .code(404)
-        .send(fail('NOT_FOUND', `沙箱代理端点上没有 ${request.method} ${request.url}（端点属 P0-3-9b）`))
+        .send(fail('NOT_FOUND', `沙箱代理端点上没有 ${request.method} ${request.url}`))
     })
     await app.listen({ port, host })
     instance = app

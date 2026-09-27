@@ -1080,7 +1080,7 @@ function unregisterActiveChannel(channel: SseChannel): void {
  *   · ⚠️ **中断照旧抛出**：轮次被中断（用户停止 / 客户端断开 / 锁丢失）时抛
  *     `ChatStoppedError`（= `signal.reason`），本函数**不接、原样透传** —— 它与"确认的结局"
  *     是两件事（见 {@link ConfirmDecision}）。代理端点要自己接住它、把结果按"未执行"回给引擎
- *     （属 P0-3-9b）。
+ *     （`sandbox/proxy.ts#runDangerousCall` 已接住，P0-3-9b）。
  *
  * 📌 `question` 的形状与 `ChatProducerInput#awaitConfirm` 的入参是**同一个**
  * （{@link ConfirmQuestion}）—— 编排层自己问、代理端点代问，走的是**同一套**挂起与应答机制。

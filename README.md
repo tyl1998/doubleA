@@ -118,18 +118,19 @@ pnpm sandbox:build -- --registry https://registry.npmmirror.com
 
 | 项 | 值 |
 |----|----|
-| base 镜像 | `doubulea/sandbox-base:2`（P0-3-4 起；`:1` 是上一版，缺 `gen-models.mjs` 那一步） |
-| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:2` |
+| base 镜像 | `doubulea/sandbox-base:3`（P0-3-9b 起；`:2` 里是**空壳**桥扩展，`:1` 还缺 `gen-models.mjs` 那一步） |
+| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:3` |
 | pin 的引擎 | `@earendil-works/pi-coding-agent@0.87.1`（Node ≥ 22.19.0，镜像内实为 22.23.3） |
 | 镜像内用户 | `agent`（uid 10001，**非 root**）；可写点只有 `/work`（卷）与 `/tmp`（P0-3-3 起是 tmpfs） |
 | pi 配置 | **只读种子**烤进 `/opt/pi/agent`（`PI_AGENT_SEED`，对 agent 只读）；入口 `entrypoint.sh` 把它 `cp -an` **播种**到可写的 `/tmp/pi-agent`（`PI_CODING_AGENT_DIR`）后再 `exec pi`。⚠️ 必须两步：pi 读 `settings.json` 会**先在同目录加锁**，只读目录上加不上锁 ⇒ 整份 settings 被判 invalid 并**静默忽略**。里面**没有 `auth.json`**（Key 走容器环境变量）；**P0-3-4 起播种后多一步 `gen-models.mjs`** ⇒ 运行期生成 `models.json`，而它的 `apiKey` 只是 `${DOUBULEA_LLM_API_KEY}` **引用**（见「沙箱 LLM 注入」一节） |
 | 依赖自检 | 构建末步跑 `toolkit/selfcheck.sh`，缺一个依赖就让 **build 失败** |
+| 桥扩展 | `/opt/pi/agent/extensions/mcp-bridge/index.ts` —— **P0-3-9b 起是真实现**（`session_start` 拉 `GET /api/sandbox/mcp/tools` 并逐个 `pi.registerTool`；每次调用转成 `POST /api/sandbox/mcp/call`）。它**不含任何凭据**，只读容器 env 的 `SANDBOX_BACKEND_URL` / `SANDBOX_TOKEN` / `SANDBOX_PROXY_TIMEOUT_MS`（`sandbox/spec.ts` 是这三个名字的源头） |
 
 ```bash
 # 在活容器里重跑依赖自检（排障时先跑它，能把"镜像问题"与"用法问题"分开）
-docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:2
+docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:3
 # 手 run 一个"能说话"的容器（默认 CMD 就是 --mode rpc）
-docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:2 --help
+docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:3 --help
 ```
 
 > ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
@@ -137,7 +138,8 @@ docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:2 --
 > 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
 > ⚠️ **本步不是可端测里程碑**：容器生命周期**已落地**（P0-3-2，见下一节）、两条网络出口（P0-3-3）、
 > 模型 Key 注入（P0-3-4，见后面「沙箱 LLM 注入」一节）都已落地，但**引擎桥还没接**（P0-3-5/6）
-> ⇒ **现在还不能派活**；最早可端测的点仍是 **P0-3-11**。
+> ⇒ **当时还不能派活**。⚠️ 那条路已经走完：**P0-3-11 是端测里程碑（已落地）**，批次的镜像版本
+> **已到 `:3`**（P0-3-9b 的桥扩展实现）—— 下面的 `:3` 才是当前该用的 tag。
 
 ### 沙箱容器生命周期（P0-3-2 起；⚠️ 仍然派不了活）
 
@@ -647,6 +649,90 @@ pnpm verify:artifact-preview
 > MD 产物里的**外链图片不发起请求**（DevTools Network 里没有那个地址 —— 这是**预期行为**，不是 bug）、
 > 以及 **PDF 加 / 不加 CSP sandbox 各渲染一次**（`子方案④` §十 待决 2，仍未实测）。
 
+### 沙箱 MCP 代理（P0-3-9b 起；⚠️ 命令行档 —— 浏览器档见下一节）
+
+**这一批让 TaskAgent 真的能用 MCP 工具，而容器里的引擎一个字都碰不到 MCP 凭据。** 定案（`子方案③` §七）：
+**容器 → 后端**。容器侧只有一个瘦扩展（`mcp-bridge`，烤在 base 层），它把每次工具调用转成对后端的一次内网 HTTP 请求：
+
+```
+pi（容器内）的 mcp_* 工具（桥扩展在 session_start 里注册的）
+  → POST {SANDBOX_BACKEND_URL}/api/sandbox/mcp/call      头: x-sandbox-token
+  → 后端（**沙箱代理 listener**，端口 SANDBOX_CALLBACK_PORT；⚠️ 不在公网 listener 上）
+       ① 令牌 ⇒ {conversationId, userId, agentId}     ← 三个身份都**不在请求体里**，只从令牌解析
+       ② serverAlias ⇒ serverId                       ← 只能调"这个 agent 绑定的" server（否则 403）
+       ③ 危险判定（口径：只有 readOnlyHint===true 且**未**声明 destructiveHint===true 才算安全）
+             → 危险 ⇒ 复用 P0-3-6b 的跨请求提问 ⇒ 对话区弹确认卡 ⇒ 用户确认 / 取消 / 超时
+       ④ 调 MCP（用**会话发起者**的凭据）→ 回 {isError, text}
+```
+
+⇒ 一句话：**凭据不进容器**（MCP 凭据留在后端）、公网出口仍然只有模型池（模型 Key 是刻意的例外，见「沙箱 LLM 注入」）、
+危险调用拦得住。★ 判据：**只有"跨出容器边界"的动作才需要确认卡** —— 容器内的 `bash`/`read`/`write`/`edit` **不做**逐工具确认。
+
+**前置**（四样，缺一样就走不到后面）：
+
+1. 依赖服务 + 后端（13000）起着；
+2. ⭐ **镜像必须重建到 `:3`** —— 桥扩展在 P0-3-1 只是个**空壳**（当时只证明"扩展能被 pi 加载"），
+   真实现是这一批落的：`pnpm sandbox:build -- --registry https://registry.npmmirror.com`，
+   再把 `infra/.env` 的 `SANDBOX_IMAGE` 改成打印出来的 `doubulea/sandbox-toolkit:3`；
+   ⚠️ 不重建的症状最隐蔽：后端日志**一条错都没有**，只是"模型从来不调 MCP 工具"（空壳没注册任何工具）；
+3. ⭐ **一个绑了 MCP server 的 `TASK_AGENT`** —— 绑定入口见「浏览器端测 · MCP」那一节（管理页）或
+   `POST /api/agents/:id/components`；⚠️ **那台 server 必须有工具缓存**（在 `/mcp` 点一次「测试」拉
+   `tools/list`），否则清单是空的（后端日志有一行 warn 会指出这一点）；
+4. 一个**会去调工具**的模型 —— 真厂商模型，或一句明确到不能再明确的提示（"用你手上的 MCP 工具把 X 查一下"）。
+
+```bash
+# ① 重建镜像（base 层内容变了 ⇒ base 与 toolkit 的层版本号都 +1 到 3）
+pnpm sandbox:build -- --registry https://registry.npmmirror.com
+#   → 末尾打印该写进 infra/.env 的两行（SANDBOX_IMAGE_BASE / SANDBOX_IMAGE），照抄
+
+# ② 派活之后，**在容器里**直接打一次代理端点。
+#    ⚠️ 镜像刻意**没有 curl / wget**（toolkit Dockerfile 第 ② 条），但 Node 在 —— 用全局 fetch 当探针。
+#    容器 env 里本来就有后端地址与令牌（SANDBOX_BACKEND_URL / SANDBOX_TOKEN）。
+docker ps --filter 'label=doubulea.role=sandbox' --format '{{.ID}}  {{.Names}}'
+CID=<上面那台的 ID>
+docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/mcp/tools",{headers:{"x-sandbox-token":process.env.SANDBOX_TOKEN}}).then(async r=>console.log(r.status,(await r.text()).slice(0,300)))'
+#   → 200 {"servers":[{"alias":"s1","id":"…","name":"…"}],"tools":[{"name":"mcp_s1_…","serverAlias":"s1","toolName":"…",…}]}
+#   ⚠️ tools 是**空数组** ⇒ 那台 server 没有工具缓存（回前置 3）；servers 空数组 ⇒ Agent 没绑 MCP
+
+# ③ 两个负例：令牌不认 ⇒ 401（**不套信封**，这一侧的契约见 sandbox/proxy.ts）；
+#    路径写错 ⇒ 404 但它**套统一信封**（由 listener 的 setNotFoundHandler 给）
+docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/mcp/tools",{headers:{"x-sandbox-token":"nope"}}).then(async r=>console.log(r.status,(await r.text()).slice(0,200)))'
+#   → 401 {"error":{"code":"UNAUTHORIZED","message":"沙箱代理令牌无效或已过期。"}}
+docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/nope").then(async r=>console.log(r.status,(await r.text()).slice(0,200)))'
+#   → 404 {"code":"NOT_FOUND","msg":"沙箱代理端点上没有 GET /api/sandbox/nope",…}   ← 统一信封
+#   （顺带证一件事：**容器能摸到的只有这两个端点** —— 登录 / 会话 / 管理路由一条都不在这台 listener 上）
+
+# ④ 在对话页发一句会用到那个 MCP 工具的任务，然后盯**后端日志**这三行：
+#    · 已为沙箱签发代理令牌（容器建起来之前就写好了 ⇒ 扩展一起来就能拉清单）
+#    · 容器已拉取 MCP 工具清单（沙箱代理端点）            ← 扩展真的连上来了（这一步不通 ⇒ 先查镜像版本）
+#    · 沙箱代理收到一次 MCP 调用（凭据主语 = 会话发起者）   ← 调用真的走到了后端
+#    并且那张工具卡显示的是 **server 名 + 原始工具名**（带 serverId 的 `kind: MCP` 卡，不是沙箱卡）
+
+# ⑤ 危险调用 ⇒ 弹确认卡（口径：只有 readOnlyHint===true 且未声明 destructiveHint===true 才算安全）
+#    挑一个"会改东西"的工具（annotations 里 destructiveHint 为真，或压根没声明 readOnlyHint）
+#    → 对话区出现确认卡；点「取消」⇒ 模型读到"用户取消了这次工具调用，未执行。"（**不是**报错卡）
+#    → 点「确认」⇒ 工具真跑、卡片转成功；**不理它** ⇒ 超时后回"等待用户确认超时，未执行。"
+```
+
+**已知边界（别当 bug）**：
+
+- ⚠️ **改了 Agent 的 MCP 绑定，在同一个容器活着期间不生效** —— 清单是"每个容器一份"的快照
+  （`proxy.ts#ensureSandboxMcpCatalog`），新派活（或容器被回收后重建）才换新清单；
+- ⚠️ **非危险调用中途不可中断**：那一趟 HTTP 没有挂"用户停止"的信号（危险那一路由确认流覆盖）。
+  用户停止时，危险调用会被后端写成"这一轮已被中断，该工具未执行。"回给模型；
+- ⚠️ **工具名是后端改过的**：`mcp_<别名>_<原工具名>`，别名 = `s1`/`s2`…（**本次会话**的编号）
+  ⇒ 别把 `s1` 当成稳定的 server 标识（`slug` 刻意不唯一，所以别名才由后端按会话分配）；
+- ⚠️ **`mcp_` 这个前缀不构成"这是 MCP 工具"的判据**：卡片是不是 `kind: MCP`，取决于**后端那份清单里
+  有没有这个工具**（容器里一个恰好叫 `mcp_foo` 的脚本仍然是**沙箱**工具卡）；
+- ⚠️ **工具缓存是清单的来源**：`tools/list` 是"点「测试」/`?refresh=1`"时才拉的，清单端点**只读缓存、
+  绝不联网**（与 ChatBot 路径同一条取舍 —— 派活的第一帧不该等一次几秒的网络请求）。
+
+> **⚠️ 这一档证明什么、不证明什么**：后端侧只有**跨文件接线批次的那一次 `pnpm -r typecheck`** + `pnpm check:batch`；
+> 扩展跑在**容器里**、由 pi 用 jiti 加载（无构建步骤），**智能体不代跑浏览器、也不代跑容器**（用户 2026-09-23 定案）
+> ⇒ 上面每一条都要你自己动手。⚠️ 其中"**扩展到底加载上没有、注册成功没有**"只有**重建镜像到 `:3` 之后**才验得到；
+> 另外 pi 的扩展 API 形状（`session_start` / `registerTool` / **`throw` 才算失败**）来自上游文档，
+> 本仓没有类型可查（`infra/` 不在任何 tsconfig 的 include 里）。
+
 ### 浏览器端测 · 任务型对话页（⭐ **阶段三唯一的浏览器端测点**：P0-3-11 起）
 
 **这一档终于有界面了。** P0-3-1~10 全部落在后端与纯逻辑层（镜像 / 生命周期 / 加固 / Key 注入 /
@@ -663,8 +749,9 @@ stdio 桥 / 事件映射 / 产物收集 / 停止回收 / 列表与下载 / 五�
    提示词（例如"请把 1 到 100 的平方写成沙箱工作目录下的 `squares.csv`，然后用一句话告诉我行数"）；
 4. **一个 `TASK_AGENT` 类型的智能体** —— 产物面板**只有**它那一页会出现（判据是类型，不是"有没有产物"）。
 
-⚠️ 本档**不需要真厂商模型**（假 LLM 即可）；也**验不了**"任务里调危险 MCP 工具 ⇒ 弹确认卡"
-（那一条要等 **P0-3-9b** 沙箱 MCP 代理）。
+⚠️ 本档**不需要真厂商模型**（假 LLM 即可）。⭐ **"任务里调危险 MCP 工具 ⇒ 弹确认卡"自 P0-3-9b 起可验了**，
+但它**不在本表**里：它要求"Agent 绑了 MCP server + 真模型会去调它 + 镜像重建到 `:3`"，步骤单列在上一节
+「**沙箱 MCP 代理**」（本表 ③ 里的工具卡就是那条链的第一段）。
 
 | # | 该测的路径 | 预期 |
 |---|-----------|------|
@@ -691,7 +778,8 @@ stdio 桥 / 事件映射 / 产物收集 / 停止回收 / 列表与下载 / 五�
 **已知边界（别当 bug）**：
 - ⚠️ **"这份 CSV 从哪来"本身还没有入口**（`01` §五 的留注）：P0 的做法是**让模型自己在沙箱里造**
   （前置 3 的提示词）或走知识库文档。所以本档验的是"**产物这条链**"，不是"用户上传一份文件让它分析"；
-- ⚠️ **"任务里调危险 MCP 工具 ⇒ 弹确认卡"本档验不到** —— 要等 **P0-3-9b**（沙箱 MCP 代理）；
+- ⭐ **"任务里调危险 MCP 工具 ⇒ 弹确认卡"自 P0-3-9b 起可验**（那条链的步骤在上一节「沙箱 MCP 代理」）：
+  它需要 **Agent 绑 MCP server + 镜像重建到 `:3` + 一个真会调工具的模型**，与本表的前置不同；
 - ⚠️ **沙箱是"会话即容器"**：空闲 30 分钟会被回收（面板底部那句说明就是它）。回收后**产物照旧在**（对象存储），
   但"再发一句"会**重建容器**（新容器的工作目录是空的 ⇒ 上一轮的中间文件不在那儿了）；
 - ⚠️ **1280px 以下第三列不显示**（原型定下）；**能力没消失**（消息流里的产物卡照样带两个按钮）；

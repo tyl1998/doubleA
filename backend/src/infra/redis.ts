@@ -454,6 +454,62 @@ export async function invalidateUserSnapshot(userId: string): Promise<void> {
   }
 }
 
+// ═══════════════════════════ 沙箱 MCP 代理（P0-3-9b）═══════════════════════════
+//
+// 一个容器 **两个键**，它们是"容器凭什么能调后端"的全部答案：
+//
+//   sandbox.token:{token}            → `{conversationId, userId, agentId}`（**解析方向**）
+//   sandbox.convToken:{conversationId} → `token`（**撤销方向**）
+//
+// ⚠️ **为什么是两个键而不是一个**：审计上这两问的**方向**不同 ——
+//   ① 容器带着一个不透明字符串找上来，我们要回答"**你是谁**"（token → 身份）；
+//   ② 回收时要回答"**这个会话的令牌是哪个**"（会话 → token）。Redis 没有"按值查键"
+//      这个操作（`SCAN` 一遍全场不是可接受的实现），所以只能把两个方向都写下来。
+//   两处**必须同写同删**（`sandbox/token.ts` 把它们收在一对函数里，不给第二个写入点）。
+//
+// ⚠️ 令牌一旦泄露 = 别人能冒充会话去调**该会话发起者的 MCP 凭据**（`子方案③` §七 3 ② 原话）。
+//    所以：值里**不放任何凭据**、TTL 跟着容器寿命走、回收时显式删。
+
+/** `sandbox.token:{token}` 键名（`token` 是 43 字符的 base64url 随机串，见 `sandbox/token.ts`） */
+export function sandboxTokenKey(token: string): string {
+  return `sandbox.token:${token}`
+}
+
+/** `sandbox.convToken:{conversationId}` 键名（撤销方向，见本节头注释） */
+export function sandboxConversationTokenKey(conversationId: string): string {
+  return `sandbox.convToken:${conversationId}`
+}
+
+/**
+ * `sandbox.mcp:{conversationId}` 键名 —— **工具清单的别名映射**（`子方案③` §七 4）。
+ *
+ * 值是 `{ servers: [{alias, serverId, serverName}], tools: { "<注册名>": {alias, serverId, serverName, toolName, annotations} } }`：
+ * 后端按会话分配 `s1` / `s2` …，容器侧只有**已重命名**的工具名（`mcp_<alias>_<tool>`）⇒
+ * 卡片要填 `serverId` 时**唯一**能反查的就是这张表（**不能靠工具名 slug 反推** —— slug 刻意不唯一，
+ * 反推会指错 server，而症状只是"卡片上的 server 名不对"，不报错）。
+ */
+export function sandboxMcpMapKey(conversationId: string): string {
+  return `sandbox.mcp:${conversationId}`
+}
+
+/**
+ * 令牌与别名映射的 TTL（秒）—— **它是"容器寿命"的兜底，不是主机制**。
+ *
+ * 与 `chat.stop` / `chat.confirm` 同款的两道防线：
+ *   · **主机制**：回收（`recycleSandbox`）时**显式删**；
+ *   · **兜底**：TTL —— 回收失败 / 进程被杀 / 容器被手工删掉时，凭证不该永久留在 Redis 里。
+ *
+ * ⚠️ 取 12 小时而不是"跟空闲回收一个数"（30 分钟）：一个**一直在输出事件**的容器不会被空闲回收
+ *   （`reapIdleSandboxes` 的判据是 `last_active_at`），活过 30 分钟是常态。取小了会造出
+ *   "长任务的 MCP 调用跑到一半开始 401"这一种极难联想的现象。
+ *   实际寿命由 `resolveSandboxToken()` **每次命中都续期**决定（同 `readSessionUserId` 的滑动续期口径）
+ *   ⇒ 这里的数字只在"这个容器彻底静默了 12 小时"时才生效。
+ */
+export const SANDBOX_TOKEN_TTL_SEC = 12 * 3600
+
+/** `sandbox.mcp:{id}` 的 TTL（秒）。与令牌**同一条推理**，同取 12 小时 */
+export const SANDBOX_MCP_MAP_TTL_SEC = 12 * 3600
+
 // ═══════════════════════════ 登录限速（P0-1-7）═══════════════════════════
 //
 // `02` §十：**同账号连续 5 次密码错误 → 锁 10 分钟**（Redis 计数）。
