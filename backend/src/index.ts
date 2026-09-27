@@ -139,7 +139,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-9 产物下载（列表 `GET /api/conversations/:id/artifacts` + 下载 `GET /api/artifacts/:id/download`；后端流式代理取代签名 URL ⇒ `ARTIFACT_URL_TTL_MIN` P0 不生效但保留登记；归属校验 = 产物 → 会话 → 本人（别人的一律 404，与文档下载那条"登录即可"刻意不同）；`artifacts.mime` 是 `Content-Type` 唯一来源 + `nosniff` + `private, no-store`；"行在对象没了" ⇒ 404 + 专句文案且不动数据库；不支持 Range）',
+    step: 'P0-3-10 五种格式预览（新增 `GET /api/artifacts/:id/content`：**复用** P0-3-9 的 `openArtifactSource` ⇒ 下载与预览只差响应头那一组；响应头按 `shared#previewKindOf` 一处分派 —— HTML/SVG 带 CSP `sandbox` + `inline`、PDF 刻意不加 CSP、text 一律压成 `text/plain`、`none` 当作下载，每路 `nosniff` + `private, no-store`；前端 `components/ArtifactPreview/` 六个渲染器 + `artifactPreview.ts` 纯逻辑【CSV 自写 RFC 4180 解析、三处截断读数报原数、两个 URL 只在一处拼】+ `pnpm verify:artifact-preview` 26 项）。⚠️ 浏览器仍不可端测（产物面板与「预览」按钮的接入点属 P0-3-11），但**命令行可验**（README「产物预览」）',
     address,
   })
   logger.info(

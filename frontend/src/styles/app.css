@@ -1200,6 +1200,37 @@
 .artifact__meta { font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--muted); }
 .artifact__ops { margin-left: auto; display: flex; gap: var(--sp-3); }
 
+/* ── 产物预览（P0-3-10；`子方案④` §七）─────────────────────────────────────
+   只放 AntD 表达不了的三件：iframe 容器（要撑满抽屉剩余高度）、`<pre>` 的等宽容器、
+   以及"外链图片改成链接"那一行的小字。表格 / 提示条 / 抽屉本身都交给 AntD。 */
+.preview { display: flex; flex-direction: column; gap: var(--sp-3); }
+/* HTML / PDF 的 iframe：`.preview--text` 走的是滚动容器，两者不共用高度口径 */
+.preview__frame {
+  width: 100%;
+  height: calc(100vh - 220px);
+  min-height: 420px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+}
+.preview--image img { max-width: 100%; max-height: calc(100vh - 240px); object-fit: contain; }
+.preview__pre {
+  margin: 0;
+  padding: var(--sp-4);
+  overflow: auto;
+  max-height: calc(100vh - 240px);
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* MD 里被拦下的外链图片：链接 + 一句说明（**不自动加载**是预期行为，别当 bug） */
+.preview__extimg { display: inline-flex; align-items: baseline; gap: var(--sp-2); flex-wrap: wrap; }
+
 /* 确认卡：阻塞输入区（`03` §4.1） */
 .confirm-card {
   border: 1px solid var(--danger);

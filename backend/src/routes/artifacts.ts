@@ -1,10 +1,11 @@
 /**
- * 产物路由（P0-3-9）：**列表 + 下载**
+ * 产物路由（P0-3-9 列表 + 下载；**P0-3-10 增 `/content` 预览**）
  *
- * 依据：`docs/02-后端设计.md` §4.8（`/api/conversations/:id/artifacts` 与
- *      `/api/artifacts/:id/download`）+ §四（信封 / offset-limit 分页）+ §4.9（不套信封的端点）
- *      + `docs/子方案/文件预览.md` §三/§四（两条出口、后端代理、归属校验、响应头分派）
- *      + `docs/06-实施计划.md` §五 P0-3-9 行
+ * 依据：`docs/02-后端设计.md` §4.8（`/api/conversations/:id/artifacts`、
+ *      `/api/artifacts/:id/download`、`/api/artifacts/:id/content`）+ §四（信封 / offset-limit 分页）
+ *      + §4.9（不套信封的端点）+ `docs/子方案/文件预览.md` §三/§四（两条出口、后端代理、
+ *      归属校验、响应头分派）+ §五/§六（五种格式与六条安全判据）
+ *      + `docs/06-实施计划.md` §五 P0-3-9 / P0-3-10 行
  *
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 本文件里两条端点的**路径前缀不同**，但仍放在同一个文件
@@ -22,12 +23,20 @@
  * 别人的资源一律 **404**（不是 403）。路由层只挂 `requireAuth`，判据在服务层的 `where` 里。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ⚠️ 下载是**第三个**不套信封的端点（`02` §4.9 的"恰好两个"自此读作"三个"）
+ * ⚠️ **两条**都是不套信封的端点（`02` §4.9 的"恰好两个"自 P0-3-10 起读作"三个"：
  * ─────────────────────────────────────────────────────────────────────
+ * 文档下载、产物下载、产物预览）
  * 成功 = **字节流**；失败（404 / 500）= **标准 JSON 信封** ⇒ 客户端按**响应形状**
  * （`content-type` 是不是 `application/json`）分支，不按状态码（P0-1-35 已定案，前端
- * `api/client.ts#requestBlob` 就是这个）。三个不套信封的端点：文档下载、产物下载、
- * 以及 P0-3-10 的产物预览（`/content`）。
+ * `api/client.ts#requestBlob` 就是这个）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 下载与预览是**两条出口**，不是一个端点加一个参数（`子方案④` §三 1）
+ * ─────────────────────────────────────────────────────────────────────
+ * `attachment`（下载）= "别解释它、存下来"；`inline`（预览）= "当文档渲染它、并且必须带上隔离头"。
+ * 两者绑定的**隔离强度不同**，把它们合成 `?disposition=` 会把安全策略变成调用方可选的参数
+ * ⇒ 由 **URL** 决定的策略才是可审计的策略。两条共用同一个取流函数（`openArtifactSource`）
+ * 与同一条归属判据，差的只有 {@link previewHeadersFor} 那一组响应头。
  *
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
@@ -37,9 +46,11 @@ import {
   conversationIdParamsSchema,
   listArtifactsQuerySchema,
   ok,
+  previewKindOf,
   type ArtifactIdParams,
   type ConversationIdParams,
   type ListArtifactsQuery,
+  type PreviewKind,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
@@ -70,6 +81,73 @@ function userIdOf(request: FastifyRequest): string {
  */
 function downloadContentType(mime: string): string {
   return mime.trim() === '' ? 'application/octet-stream' : mime.trim()
+}
+
+/**
+ * ★ HTML / SVG 的隔离头：`子方案④` §六 判据 ① 的**第一道**（iframe 属性只是第二道）。
+ *
+ * 为什么必须是**响应头**：iframe 的 `sandbox=""` 只在"被嵌进 iframe 时"生效 —— 用户在预览弹层里
+ * 右键"在新标签页打开"、或直接把 `/content` 贴进地址栏，那份文档就**不在 iframe 里**了，
+ * 此时唯一还在生效的就是这一行。CSP `sandbox` 对 standalone document 同样生效，
+ * 而且它**不支持 `<meta>`**（MDN 明文）⇒ 只可能来自响应头 —— 这也是产物预览走**后端代理**
+ * 而不是签名 URL 的那条决定性理由（签名 URL 的响应由对象存储直发，我们一个头都加不上）。
+ *
+ * `default-src 'none'` + `img-src data:` + `style-src 'unsafe-inline'`：
+ * 不给脚本、不给网络（连同源的 `/api/...` 都不给，`default-src 'none'` 已经封死），
+ * 只留内嵌图片与内联样式（HTML 产物里最常见、且无害的两种）。
+ */
+const HTML_PREVIEW_CSP = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+
+/** 预览响应的 `Content-Disposition` 形态（`子方案④` §四 2 的最后一列） */
+type PreviewDisposition = 'inline' | 'attachment'
+
+/** 预览响应头里"随形态变化"的那三样（其余头两条端点完全一样） */
+interface PreviewHeaders {
+  contentType: string
+  disposition: PreviewDisposition
+  /** 只有 HTML/SVG 那一路有值（PDF **刻意不加**，见 {@link HTML_PREVIEW_CSP} 的对照说明） */
+  csp: string | null
+}
+
+/** 取 `mime` 的主类型（`text/html; charset=utf-8` → `text/html`）—— 拼 `; charset=utf-8` 之前要先剥参数 */
+function baseMimeOf(mime: string): string {
+  const raw = mime.trim().toLowerCase()
+  const semicolon = raw.indexOf(';')
+  return (semicolon === -1 ? raw : raw.slice(0, semicolon)).trim()
+}
+
+/**
+ * 预览响应的**响应头分派**：按 `artifacts.mime` 一处判据上不同的头（`子方案④` §四 2 的表）。
+ *
+ * 三条要点（都是"不写就会静默出错"的）：
+ *
+ *   ① ★ **`text` 一律回 `text/plain`**，不回它声明的类型：这样"有人把 `/content` URL 直接贴进
+ *      地址栏"看到的是**源码**，而不是被浏览器当 `text/html` 渲染（前端取文本用 `fetch().text()`，
+ *      与响应头无关，所以这个收窄对预览**没有代价**）；
+ *   ② **PDF 刻意不加 CSP `sandbox`**：MDN 明确说 sandbox "prevents the execution of plugins"，
+ *      而 PDF 的浏览器内置 viewer 属这一类 ⇒ 加了会**渲染不出来**（症状是空框或直接触发下载，
+ *      看起来像"我们的 PDF 坏了"）。这一路的安全边界另写在 `子方案④` §五 6 —— 它是全方案
+ *      **唯一一处把安全交给浏览器**的地方，写在此处而不是藏在代码注释里；
+ *   ③ **`none`（zip / docx / 未知类型）当作下载处理**（`attachment` + `octet-stream`）：
+ *      这个端点理论上不会被前端调用（前端不显示「预览」按钮），但 URL 是可以手敲的
+ *      ⇒ 给它一份"不会被浏览器解释"的响应，而不是一份带 `inline` 的未知类型。
+ */
+function previewHeadersFor(mime: string): PreviewHeaders {
+  const kind: PreviewKind = previewKindOf(mime)
+  switch (kind) {
+    case 'html':
+      // SVG 归这一路（`previewKindOf` 已定案）：它是能带 `<script>` 的文档
+      return { contentType: `${baseMimeOf(mime)}; charset=utf-8`, disposition: 'inline', csp: HTML_PREVIEW_CSP }
+    case 'image':
+      // `<img>` 上下文不执行脚本 ⇒ 不需要 CSP；但 `nosniff` 照样要（调用方统一加）
+      return { contentType: baseMimeOf(mime), disposition: 'inline', csp: null }
+    case 'pdf':
+      return { contentType: 'application/pdf', disposition: 'inline', csp: null }
+    case 'text':
+      return { contentType: 'text/plain; charset=utf-8', disposition: 'inline', csp: null }
+    default:
+      return { contentType: 'application/octet-stream', disposition: 'attachment', csp: null }
+  }
 }
 
 export function registerArtifactRoutes(app: FastifyInstance): void {
@@ -122,6 +200,48 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
         .header('x-content-type-options', 'nosniff')
         .header('cache-control', 'private, no-store')
         .send(source.body)
+    },
+  )
+
+  /**
+   * 预览产物（`02` §4.8 + `子方案④` §三/§四；**P0-3-10**）：`inline` + **字节流**，同样是后端代理。
+   *
+   * ★ **与 `/download` 的关系**：同一个取流函数、同一条归属判据、同样不套信封，
+   * 差别**只**在 {@link previewHeadersFor} 那一组头（形态 + 隔离头 + `Content-Type` 的收窄）。
+   * ⇒ 别在这里另写一个"取对象"的实现（`06` P0-3-9 详规传下来的口径）。
+   *
+   * 五个头各自承担什么：
+   *   · `Content-Type`：**按形态分派**（`text` 一律压成 `text/plain`、HTML/SVG 补 `charset`、
+   *     `none` 回 `octet-stream`）—— 它的**唯一来源仍是 `artifacts.mime`**，只是按判据收窄；
+   *   · `Content-Security-Policy: sandbox …`：**只有 HTML/SVG 那一路有**；
+   *   · `Content-Disposition: inline`：⭐ **这一条是"预览"这个出口的定义** —— 套用 `01` §四
+   *     "下载强制 `attachment`"会把预览整条废掉（`<iframe>`/`<img>` 取到的是一份"另存为"的响应）；
+   *     两句话说的是**两个出口**（`子方案④` §六 判据 ⑥）；
+   *   · `X-Content-Type-Options: nosniff`：**每一路都要有**；
+   *   · `Cache-Control: private, no-store`：与下载同款理由（代理 URL 不带时效，靠"登录 + 归属"守住）。
+   *
+   * ⚠️ 前端**只在体积闸门通过时**才会打这个端点（闸门常量在 `shared`，前后端同源），
+   * 但 URL 可以手敲 ⇒ 本端点不做体积判断（"大文件请求预览"只是慢，不是错）。
+   * ⚠️ 不支持 Range（同 `/download`）⇒ 大 PDF 整份下载后才显示。
+   */
+  app.get<{ Params: ArtifactIdParams }>(
+    '/api/artifacts/:id/content',
+    { preHandler: app.requireAuth, schema: { params: artifactIdParamsSchema } },
+    async (request, reply) => {
+      const source = await openArtifactSource({
+        artifactId: request.params.id,
+        userId: userIdOf(request),
+      })
+      const headers = previewHeadersFor(source.mime)
+      reply
+        .header('content-type', headers.contentType)
+        .header('content-length', String(source.contentLength))
+        .header('content-disposition', buildContentDisposition(source.fileName, { disposition: headers.disposition }))
+        .header('x-content-type-options', 'nosniff')
+        .header('cache-control', 'private, no-store')
+      // ⚠️ CSP **只**给 HTML/SVG 那一路（PDF 加了会渲染不出来 —— 见 previewHeadersFor 的要点 ②）
+      if (headers.csp !== null) reply.header('content-security-policy', headers.csp)
+      return reply.send(source.body)
     },
   )
 }

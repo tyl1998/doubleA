@@ -472,6 +472,73 @@ export const artifactIdParamsSchema = z.object({
 })
 export type ArtifactIdParams = z.infer<typeof artifactIdParamsSchema>
 
+// ───────────────────── 产物预览（P0-3-10）─────────────────────
+
+/**
+ * 预览的**五种形态**（`子方案④` §四 2 / §五）。
+ *
+ * `none` 不是一个错误态，而是"这个格式没有在线预览"这个**事实**（zip / docx / 未知类型）⇒
+ * 界面上表现为**没有「预览」按钮**、只给下载，而不是"按钮置灰"（`03` §4.5 同款口径：
+ * 能力有无是事实，不是"暂不可用"）。
+ */
+export const PREVIEW_KINDS = ['html', 'image', 'pdf', 'text', 'none'] as const
+export type PreviewKind = (typeof PREVIEW_KINDS)[number]
+
+/**
+ * 图片 / PDF **直连渲染**（`<img>` / `<iframe>`）的体积闸门（10 MiB）。
+ *
+ * ⚠️ 放 `shared` 而不是 env：前端要**在发起请求之前**就知道"这个不值得内联"，
+ * 否则要么白拉 50MB、要么前端自己抄一个数（`子方案④` §二）。
+ */
+export const ARTIFACT_PREVIEW_MAX_INLINE_BYTES = 10 * 1024 * 1024
+
+/** MD / CSV / 文本类**取回文本**的体积闸门（2 MiB）—— 文本要进 JS 字符串并参与解析，比内联更紧 */
+export const ARTIFACT_PREVIEW_MAX_TEXT_BYTES = 2 * 1024 * 1024
+
+/**
+ * 预览形态的**唯一判据**：`previewKindOf(mime)`。
+ *
+ * 两个消费者、一个函数（`子方案④` §五 1）：
+ *   · **前端**用它决定"用哪个渲染器 / 有没有预览入口"；
+ *   · **后端**用它决定 `GET /api/artifacts/:id/content` 上哪一组响应头（隔离头尤其）。
+ * ⇒ 不可能出现"前端当图片渲染、后端却按 HTML 加隔离"的分叉 —— 那种分叉**没有任何一层会报错**。
+ *
+ * 三条实现口径：
+ *   ① **只认 `artifacts.mime`，不看 `file_name` 的扩展名**（引擎可以把 `evil.html` 命名成 `x.png`，
+ *      而 `mime` 是后端扫描时定的那一个）；
+ *   ② ★ **`image/svg+xml` 归 `html` 那一族**：SVG 是**能带 `<script>` 的文档** —— `<img>` 上下文里
+ *      脚本不执行（安全），但"在新标签页打开"就会以**我们站点的源**执行 ⇒ 它与 HTML 同级，走
+ *      iframe + 双隔离，代价只是"SVG 不在 `<img>` 里直出"，观感完全一样；
+ *   ③ **名单刻意保守**（与 `artifactMimeOf` 同款）：只认 `子方案④` §四 2 表里列出来的那些，
+ *      其余（含 `text/x-python` / `text/javascript` / `text/yaml` 这类"其实也能当文本看"的类型）
+ *      一律 `none` ⇒ 只给下载。**要扩就在这一处扩**，扩了前后端同时生效。
+ *
+ * `mime` 可能带参数（如 `text/html; charset=utf-8`）⇒ 先取 `;` 之前那一段再比；
+ * 非字符串（`null` / `undefined`）与空串一律 `none`（**不抛错**：它只是决定"有没有预览入口"）。
+ */
+export function previewKindOf(mime: string | null | undefined): PreviewKind {
+  if (typeof mime !== 'string') return 'none'
+  const raw = mime.trim().toLowerCase()
+  const semicolon = raw.indexOf(';')
+  const base = (semicolon === -1 ? raw : raw.slice(0, semicolon)).trim()
+  if (base === '') return 'none'
+
+  // ⚠️ `svg` 必须排在 `image/*` 之前（它是 `image/*` 的子集，却归 html 那一族）
+  if (base === 'text/html' || base === 'application/xhtml+xml' || base === 'image/svg+xml') return 'html'
+  if (base === 'application/pdf') return 'pdf'
+  if (
+    base === 'text/markdown' ||
+    base === 'text/csv' ||
+    base === 'text/tab-separated-values' ||
+    base === 'text/plain' ||
+    base === 'application/json'
+  ) {
+    return 'text'
+  }
+  if (base.startsWith('image/')) return 'image'
+  return 'none'
+}
+
 /**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *

@@ -13,6 +13,7 @@
     "verify:knowledge-ui": "node --import tsx scripts/verify-knowledge-ui.mjs",
     "verify:admin-ui": "node --import tsx scripts/verify-admin-ui.mjs",
     "verify:mcp-ui": "node --import tsx scripts/verify-mcp-ui.mjs",
+    "verify:artifact-preview": "node --import tsx scripts/verify-artifact-preview.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

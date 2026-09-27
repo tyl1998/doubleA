@@ -33,19 +33,33 @@
  *         不影响任何契约、服务端或数据。所以"暂缓"是可逆的 —— 这也是能安心定案的前提。
  */
 
-import Markdown from 'react-markdown'
+import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 export interface AssistantMarkdownProps {
   text: string
+  /**
+   * 渲染器覆盖（**P0-3-10 新增，默认不给**）。
+   *
+   * 唯一的消费者是**产物预览里的 MD**（`components/ArtifactPreview/MarkdownPreview`）：
+   * 那里要多传一个 `components.img` —— `react-markdown@10.1.0` 会把外链图片**原样保留**
+   * （实测），渲染出来浏览器就真的去请求那个外网地址（追踪像素 / 泄露访问者 IP），
+   * 这是 MD 一路**唯一**的残留风险 ⇒ 产物预览必须把它换成"可点击的链接"。
+   *
+   * ⚠️ **对话正文刻意不传**：助手正文里没有这个覆盖也不会有 XSS（raw HTML 被转义），
+   * 而给整站加 `img-src` 会把一个预览的需求扩散成整个应用的约束（`子方案④` §五 2）。
+   */
+  components?: Components
 }
 
-export function AssistantMarkdown({ text }: AssistantMarkdownProps) {
+export function AssistantMarkdown({ text, components }: AssistantMarkdownProps) {
   return (
     // `.md` 的样式在 `styles/base.css`（P0-1-30 从 `design/styles/base.css` 搬入），
     // 含 `pre` / `code` / `table` / `blockquote` 的完整口径 —— 这里不重复写任何样式
     <div className="md">
-      <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
+      <Markdown remarkPlugins={[remarkGfm]} {...(components === undefined ? {} : { components })}>
+        {text}
+      </Markdown>
     </div>
   )
 }

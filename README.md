@@ -490,8 +490,9 @@ curl -sS --noproxy '*' -X POST http://127.0.0.1:13000/api/agents \
 ```
 
 > ⚠️ **本批（P0-3-7）无 HTTP 面**：`GET /:id/artifacts` 与 `GET /artifacts/:id/download` 已在
-> **P0-3-9** 落地（见后面的「产物列表与下载」一节，那里有可照抄的 curl），`/content`（预览）属 **P0-3-10**
-> ⇒ 现在**浏览器里**仍然只能在 MinIO / psql 里看产物。**最早可端测的点仍是 P0-3-11**。
+> **P0-3-9** 落地（见后面的「产物列表与下载」一节，那里有可照抄的 curl），`/content`（预览）已在
+> **P0-3-10** 落地（见再后面的「产物预览」一节）⇒ 现在**浏览器里**仍然只能在 MinIO / psql 里看产物
+> （界面入口属 P0-3-11）。**最早可端测的点仍是 P0-3-11**。
 > ⚠️ 清理挂在沙箱对账器里 ⇒ **未配置 `SANDBOX_IMAGE` 时清理不跑**（没有镜像就没有 TaskAgent、
 > 产物不再新增；存量要清可手工删或临时配回镜像）。
 
@@ -583,11 +584,68 @@ curl -sS --noproxy '*' -b cookies.txt \
   "http://127.0.0.1:13000/api/artifacts/00000000-0000-0000-0000-000000000000/download" | jq .
 ```
 
-> ⚠️ **浏览器里还没有入口**：产物面板 + 预览弹层属 **P0-3-11**，预览端点 `/content` 属 **P0-3-10**
-> ⇒ 上面这段是**命令行档**（能亲手跑通"列表 → 下载 → 越权 404"这条链），**最早可端测的点仍是 P0-3-11**。
+> ⚠️ **浏览器里还没有入口**：产物面板 + 预览弹层属 **P0-3-11**（预览端点 `/content` 已于 **P0-3-10**
+> 落地，见下一节）⇒ 上面这段是**命令行档**（能亲手跑通"列表 → 下载 → 越权 404"这条链），
+> **最早可端测的点仍是 P0-3-11**。
 > 要真看到产物，得先跑出一轮 TaskAgent（前提 = `SANDBOX_IMAGE` + `SANDBOX_EGRESS_PROXY_URL` 就绪，
 > 见「沙箱产物收集」那一节；也可以按那一节的 ③ 直接从 psql 里取 `artifacts.id` 填进 ④）。
 > ⚠️ 下载**不支持 Range**（`子方案④` §八 2）⇒ 大文件整份下载后才显示；产物单文件 ≤ `ARTIFACT_MAX_FILE_MB`（50MB）。
+
+### 产物预览（P0-3-10 起；⚠️ 命令行可验，浏览器仍要等 P0-3-11）
+
+**这一批给产物加了第二条出口**：`GET /api/artifacts/:id/content`（`inline`）与上一节的 `/download`
+（`attachment`）**共用同一个取流函数与同一条归属判据**，差的**只有响应头** —— 而那组头正是"预览"
+这件事的全部（`子方案④` §三 1：两条出口刻意不合成"一个端点 + 一个 `?disposition=` 参数"，
+那会把安全策略变成调用方可选的参数）。
+
+响应头按 `artifacts.mime` **一处**分派，判据是 `shared#previewKindOf(mime)`（前端选渲染器用的
+是**同一个函数** ⇒ 不可能分叉）：
+
+| `previewKindOf(mime)` | 触发（举例） | `Content-Type` | 隔离头 | `Content-Disposition` |
+|---|---|---|---|---|
+| `html` | `text/html`、**`image/svg+xml`** | 原 mime + `; charset=utf-8` | **CSP `sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`** | `inline` |
+| `image` | `image/png`、`image/webp` | 原 mime | 无（`<img>` 上下文不执行脚本） | `inline` |
+| `pdf` | `application/pdf` | `application/pdf` | **刻意不加 CSP**（加了 PDF 渲染不出来） | `inline` |
+| `text` | `text/markdown`、`text/csv`、`text/plain`、`application/json` | **一律 `text/plain; charset=utf-8`** | 无 | `inline` |
+| `none` | zip / docx / 未知类型 | `application/octet-stream` | 无 | **`attachment`**（当作下载） |
+
+**每一路都带** `X-Content-Type-Options: nosniff` 与 `Cache-Control: private, no-store`。
+★ 两条最值得亲手看的：`image/svg+xml` 必须带 CSP（它是能带 `<script>` 的文档，`<img>` 里安全、
+"在新标签页打开"就会以我们站点的源执行）；`text/csv` 必须回 `text/plain`（把 URL 贴进地址栏
+看到的是源码，而不是被浏览器当表格或 HTML 解释）。
+
+```bash
+# 前置：沿用「产物列表与下载」那一节的 cookies.txt 与 $ART（**全程同一个 shell**）
+
+# ① 只看响应头（-D - 打到 stdout，-o /dev/null 丢掉正文）
+curl -sS --noproxy '*' -b cookies.txt -D - -o /dev/null \
+  "http://127.0.0.1:13000/api/artifacts/$ART/content"
+#   → content-disposition: inline; filename="squares.csv"; filename*=UTF-8''squares.csv
+#   → content-type: text/plain; charset=utf-8      ← text 那一路被压平了（下载那条才是 text/csv）
+#   → x-content-type-options: nosniff / cache-control: private, no-store
+
+# ② 换一个 HTML 或 SVG 的产物 id 再打一次（ART2=它的 id）⇒ 多一行 CSP
+ART2=<一个 html 或 svg 产物 id>
+curl -sS --noproxy '*' -b cookies.txt -D - -o /dev/null \
+  "http://127.0.0.1:13000/api/artifacts/$ART2/content" | grep -i 'content-security-policy'
+#   → content-security-policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'
+#   ⚠️ 直接把这个 URL 贴进浏览器地址栏（**不经 iframe**）脚本也不该执行 —— 那时唯一生效的就是这一行
+
+# ③ 越权（**必须用另一个账号**）：member 登录后打 ① ⇒ 404 标准信封（不是 403）
+# ④ 不存在的 id ⇒ 404；"行在对象没了" ⇒ 404 + 专句文案（与下载那条同款）
+curl -sS --noproxy '*' -b cookies.txt \
+  "http://127.0.0.1:13000/api/artifacts/00000000-0000-0000-0000-000000000000/content" | jq .
+
+# ⑤ 前端纯逻辑档（不起后端、不连依赖）：26 项 / 七组
+pnpm verify:artifact-preview
+```
+
+> ⚠️ **浏览器里仍然没有入口**：产物面板与「预览」按钮属 **P0-3-11**（本批交付的是"预览能力"本身：
+> 端点 + 分派判据 + 弹层与六个渲染器）。⇒ 上面这段是**命令行档**，最早可端测的点仍是 **P0-3-11**；
+> 到那时请在浏览器里顺手验掉这几条（它们**只有**浏览器能验）：HTML/SVG 产物在 iframe 里**不执行脚本**、
+> 直接把 `/content` 贴进地址栏**也不执行**、`image/svg+xml` 走的是 **iframe 而不是 `<img>`**、
+> MD 产物里的**外链图片不发起请求**（DevTools Network 里没有那个地址 —— 这是**预期行为**，不是 bug）、
+> 以及 **PDF 加 / 不加 CSP sandbox 各渲染一次**（`子方案④` §十 待决 2，本批仍未实测）。
 
 ### 后端配置自检（P0-1-3 起）
 

@@ -398,8 +398,15 @@ const RFC5987_EXTRA = /['()*]/gu
  * 回落名里的非 ASCII 一律换成 `_`（不做音译）：宁可显示 `___.pdf`，也不要在一个格式严格受限的
  * 头部里塞进需要解码的东西 —— 真名已经在 `filename*` 里了。
  *
+ * ★ **P0-3-10 起多一个 `disposition` 选项**（`attachment` / `inline`）：产物有**两条出口**
+ * （`子方案④` §三 1）—— 下载 = `attachment`、预览 = `inline`，两者绑定的**隔离强度不同**
+ * （`inline` 那一路还要带 CSP 与 `nosniff`）。⚠️ 它刻意**不是**"一个端点 + 一个
+ * `?disposition=` 参数"：那样会把安全策略变成调用方可选的参数，而由 URL 决定的策略才是可审计的。
+ * 两条出口共用**这一处**文件名清洗（CR/LF 剔除、RFC 5987 编码）—— 复制一份就会有一份先腐烂。
+ *
  * @param fileName 原始文件名（可含路径、可为空）
- * @param fallbackExtension 名字退化到无法给出扩展名时用的后缀（如 `bin`）
+ * @param options.disposition `attachment`（默认，下载）/ `inline`（预览）
+ * @param options.fallbackExtension 名字退化到无法给出扩展名时用的后缀（如 `bin`）
  */
 /** 可打印字符判定（用于剔除控制字符）—— 写成函数而不是 `/[\u0000-\u001f]/` 正则：
  *  eslint 的 `no-control-regex` 会拦下后者，而这里的"含控制字符"是**故意的**（安全过滤） */
@@ -408,7 +415,11 @@ function isPrintable(char: string): boolean {
   return code > 0x1f && code !== 0x7f
 }
 
-export function buildContentDisposition(fileName: string, fallbackExtension = 'bin'): string {
+export function buildContentDisposition(
+  fileName: string,
+  options: { disposition?: 'attachment' | 'inline'; fallbackExtension?: string } = {},
+): string {
+  const { disposition = 'attachment', fallbackExtension = 'bin' } = options
   // ① 控制字符（含 CR/LF）与引号/反斜杠/路径分隔符一律剔除
   const cleaned = [...fileName].filter(isPrintable).join('').replace(/["\\/]/gu, '_').trim()
   const base = cleaned === '' ? `document.${fallbackExtension}` : cleaned
@@ -419,7 +430,7 @@ export function buildContentDisposition(fileName: string, fallbackExtension = 'b
     RFC5987_EXTRA,
     (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
   )
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`
 }
 
 export interface DocumentSource {
