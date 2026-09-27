@@ -141,9 +141,10 @@ try {
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
     // ⚠️ **支线批次的写法（P0-3-9b 起）**：`check:batch` 取的是**批次号最大**的那个（不是文件里
     //    最后出现的），而 `P0-3-11` 的键大于 `P0-3-9b` ⇒ 插队补做的支线**不能**把 step 改成
-    //    "P0-3-9b …"（那会让自检必红）。本行因此写成「P0-3-11 + P0-3-9b」：既说明当前代码状态
-    //    是"里程碑批次之上叠了这条支线"，也仍然带着那个最大批次号。
-    step: 'P0-3-11 + P0-3-9b（插队补的支线）：上层是 P0-3 的可端测里程碑 —— 任务型对话页三栏（`chat--with-panel` 只给 `agent.type === TASK_AGENT`）+ 产物面板（清单 = 服务端列表 `GET /api/conversations/:id/artifacts` 与本轮 `artifact` 事件在 `artifactPanelModel.ts#mergeArtifactPanelItems` **一处合流**）+ 预览弹层（六个渲染器；「预览」判据 `previewAvailability`；「谁在预览」住 `stores/artifactPreview.ts`）；其上叠着 **P0-3-9b 沙箱 MCP 代理**：容器内引擎**永不直连 MCP**，所有调用走内网 `GET /api/sandbox/mcp/tools`（工具清单 + 别名映射）与 `POST /api/sandbox/mcp/call`（由后端带**会话发起者**凭据代调）—— 新增 `sandbox/token.ts`（per-container 令牌：两个方向同写同删、解析时滑动续期）+ `sandbox/mcpMap.ts`（`alias ⇄ serverId` 这张表**唯一**的存与取）+ `sandbox/proxy.ts`（越权检查 403、清单没下发 409；★ 危险判定的**第二落点**复用 `isDangerousTool` + `askConversation`，危险那一段按会话**串行**化）+ `manager.ts`（建容器前签发并注入 `SANDBOX_TOKEN`；建失败与回收都撤销）+ `map.ts`（**注入式** resolver 反查 ⇒ `kind:MCP` 的卡）+ 容器侧 `mcp-bridge` 扩展真实现（`session_start` 拉清单 + `registerTool`；★ **`throw` 才是失败**）。⚠️ 两个端点**不在公网 listener 上**；`base`/`toolkit` 镜像层版本 → 3 ⇒ 必须 `pnpm sandbox:build` 重建（本机换源）',
+    //    "P0-3-9b …"（那会让自检必红）。支线当时的写法是「P0-3-11 + P0-3-9b」：既说明代码状态是
+    //    "里程碑批次之上叠了这条支线"，又仍带着那个最大批次号。⚠️ **P0-3-12 起该写法退役** ——
+    //    P0-3-12 > P0-3-11 > P0-3-9b ⇒ 本行直接写"P0-3-12 …"即可（规则只在"补做的批次号更小"时才需绕）。
+    step: 'P0-3-12 TaskAgent 计量（`usage_records` 上线 + 用量口径订正）：一行 = **一轮派活**的用量，写在与消息落库**同一个 `$transaction`** 里、且**只在 `engineStarted` 时写**（纯排队失败 / 没真派活 ⇒ 不记）；新增 **按月的分区表** `usage_records`（手写 DDL + `ensure_usage_records_partition()` 动态窗口 + `pnpm db:partitions` 续期，**套路照 `messages`**；`user_id`/`agent_id` 两条 FK 都 `RESTRICT`、**刻意无 `conversation_id`**）+ `PersistRoundInput.usageRecord`（`UsageRecordInput` 刻意**不含** `userId`/`agentId` —— 由会话行反查，避免调用方传错人）；★ **订正 P0-3-6 留下的用量口径错**：引擎 `usage` 是**每个 assistant turn** 的累积值、而**一个 turn = 一次模型请求** ⇒ **同一 turn 内覆盖、跨 turn 相加**（`map.ts#engineTurnBoundaryOf` 划 `turn_start`/`turn_end` 边界 + `sumUsages`），全 0 的 usage 视作"**没上报**" ⇒ `NULL`（不编 0）；`rounds`（引擎 `turn_start` 条数）与 `duration_ms`（本轮墙钟）是"引擎没上报 token"时的**兜底两列**。⚠️ **ChatBot 仍不写这张表**（只透传 `done.usage`）。顺带修掉 P0-3-9b 遗留的 `map.ts#toolIdentity` `TS2322`（`string` 未收窄到 `ToolCallKind`）。上一层是 **P0-3-11 里程碑**（任务型对话页 + 产物面板 + 预览弹层）与 **P0-3-9b 支线**（沙箱 MCP 代理）',
     address,
   })
   logger.info(

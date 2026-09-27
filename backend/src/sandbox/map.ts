@@ -59,7 +59,13 @@
  *   · **stderr** —— 引擎的抱怨不进 SSE（`子方案③` §六 3 末行），它由 `bridge.ts` 直接收进日志（脱敏）。
  */
 
-import type { ConversationActiveSnapshot, SseEvent, SseToolCallPayload, ToolCallRecord } from '@doubulea/shared'
+import type {
+  ConversationActiveSnapshot,
+  SseEvent,
+  SseToolCallPayload,
+  ToolCallKind,
+  ToolCallRecord,
+} from '@doubulea/shared'
 
 import { summarizeToolInput, truncateToolResult } from '../orchestrator/chatContext.js'
 import type { PiSessionEvent } from './bridge.js'
@@ -186,6 +192,13 @@ const ENGINE_MESSAGE_UPDATE = 'message_update'
 const ENGINE_TOOL_EXECUTION_START = 'tool_execution_start'
 const ENGINE_TOOL_EXECUTION_END = 'tool_execution_end'
 
+/**
+ * turn 边界（P0-3-12）：**一个 turn = 一次模型请求**（pi `how-pi-works.md`）。
+ * 用量按它归集（同一 turn 覆盖、跨 turn 相加），见 {@link engineTurnBoundaryOf}。
+ */
+const ENGINE_TURN_START = 'turn_start'
+const ENGINE_TURN_END = 'turn_end'
+
 /** `message_update.assistantMessageEvent` 里我们真的要用的两个子类型 */
 const ASSISTANT_TEXT_DELTA = 'text_delta'
 const ASSISTANT_THINKING_DELTA = 'thinking_delta'
@@ -208,7 +221,12 @@ export interface EngineUsage {
 export interface EngineEventMapping {
   /** 要发出去的我方事件（按顺序；0 条 = 这条引擎事件不上线） */
   events: SseEvent[]
-  /** 这条事件携带的**累积**用量；`null` = 没带（只有 `message_update` 会带，见 `readEngineUsage`） */
+  /**
+   * 这条事件携带的用量 —— ⚠️ **它是「这一个 assistant turn」的累积值**，不是整轮的：
+   * 只有 `message_update` 会带（见 `readEngineUsage`）；同一个 turn 里逐帧递增 ⇒
+   * 调用方**覆盖**；**跨 turn 要相加**（`orchestrator/taskAgent.ts` 的归集器）。
+   * `null` = 这一条没带（或带了个"没信息量"的全 0，见 `readEngineUsage`）。
+   */
   usage: EngineUsage | null
   /** 这一条对 `/active` 快照的影响（只含该改的键）—— 断线重连的人靠它知道"现在在跑什么" */
   snapshot?: Partial<ConversationActiveSnapshot>
@@ -271,13 +289,22 @@ export function isKnownEngineEventType(type: string): boolean {
 /**
  * 引擎的 usage 对象 → 我们要的那两项（**不认识就返回 `null`，不编一个 0**）。
  *
- * 口径三条：
- *   · 引擎的 `usage` 是 **latest cumulative**（pi `docs/json.md`："The top-level `usage` is the
- *     latest cumulative provider-reported usage"）⇒ 调用方**覆盖**而不是相加（与 ChatBot 那边
- *     `sumUsages` 的"多轮相加"是两件事：那边一轮里调了好几次上游）。
+ * 口径四条：
+ *   · 引擎的 `usage` 是**「这一个 assistant turn」的累积值**（pi `docs/json.md`："The top-level
+ *     `usage` is the latest cumulative provider-reported usage for **the assistant response**"）
+ *     ⇒ ① **同一 turn 内**逐帧递增 ⇒ 调用方**覆盖**；② **跨 turn 必须相加**
+ *     （一个 turn = 一次模型请求，pi `how-pi-works.md`）。两条合起来才是对的，
+ *     只做 ① 会在多轮工具循环里**只记最后一轮**的用量，只做 ② 会把同一 turn 的递增重复计。
+ *     落点在调用方（`orchestrator/taskAgent.ts`，见那里的"本轮用量"那一段）。
  *   · 字段名是 `input` / `output`（不是 `tokensIn` / `tokensOut`）—— 翻译**只在这一处**。
- *   · 两个数都取不到 ⇒ `null`（`done.usage` 的 `null` 语义是"没有上游调用或上游不给"，
- *     与"给了一个 0"是两件事，见 `shared/src/sse.ts` 文件头 ④）。
+ *   · ⚠️ **全 0 视为"没上报"**（P0-3-12）：pi 明写 "It can remain zero until completion when a
+ *     provider does not report usage while streaming" ⇒ 自建/内网那些不上报 usage 的
+ *     OpenAI 兼容端点，一个 turn 跑完仍是 `{input:0,output:0}`。那不是"用了 0 个 token"，
+ *     而是"不知道" —— 契约里 `null` 才是"不知道"（`shared/src/sse.ts` 文件头 ④：
+ *     `null` = 没有上游调用或上游不给），把它记成 0 会让**计量报表说谎**
+ *     （`usage_records` 里出现 `tokens_in=0` 的行）。真正的 0/0 响应在现实中不存在：
+ *     任何一次真实调用，输入侧至少有一个 token。
+ *   · 两个数都取不到 ⇒ `null`（同一条语义的另一半）。
  */
 export function readEngineUsage(raw: unknown): EngineUsage | null {
   const record = asRecord(raw)
@@ -285,7 +312,29 @@ export function readEngineUsage(raw: unknown): EngineUsage | null {
   const tokensIn = nonNegativeIntOf(record.input)
   const tokensOut = nonNegativeIntOf(record.output)
   if (tokensIn === null && tokensOut === null) return null
+  // 全 0 = provider 没上报（见上方第三条），不是"用了 0 个 token"
+  if (tokensIn === 0 && tokensOut === 0) return null
   return { tokensIn, tokensOut }
+}
+
+/**
+ * 这条引擎事件在不在**一个 assistant turn 的边界**上（P0-3-12 新增）。
+ *
+ * 用途只有一个：把"引擎的用量"按 turn 归集 —— **同一 turn 内覆盖、跨 turn 相加**
+ * （见 {@link readEngineUsage} 的口径 ① ②）。所以这张小表就是那个归集器的判据来源，
+ * 别在调用方再抄一遍事件名字符串（`docs/06` §六 第 ⑰ 条）。
+ *
+ * 语义以 pi `how-pi-works.md` / `docs/json.md` 为准：
+ *   · `turn_start` —— "One assistant turn started."（**一个 turn = 一次模型请求**）
+ *   · `turn_end`   —— "One assistant response and its resulting tool calls finished."
+ *     ⇒ 那一刻这一个 turn 的 usage **已定稿**（可以安全地并进总数）
+ *
+ * @returns `'start'` / `'end'` / `null`（不是边界事件）
+ */
+export function engineTurnBoundaryOf(event: PiSessionEvent): 'start' | 'end' | null {
+  if (event.type === ENGINE_TURN_START) return 'start'
+  if (event.type === ENGINE_TURN_END) return 'end'
+  return null
 }
 
 /**
@@ -308,8 +357,15 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
    * 同一张卡的**两帧必须用同一个身份**（start 与 end 各算一次 ⇒ 万一解析结果不稳定，
    * 卡片会在运行中"换个 server"）。解析器是纯函数、映射表在一轮内不变，所以这里只是
    * 把"两处各调一次"收成一处调用点，顺带让 `kind` / `serverName` / `serverId` 三者的来源唯一。
+   *
+   * ⚠️ 返回类型**必须**是 `ToolCallKind`（`'MCP' | 'SANDBOX'`）而不是 `string`：
+   * 写宽成 `string` 后赋值给 `SseToolCallPayload` 会 `TS2322`（P0-3-9b 留下的编译错误，
+   * P0-3-12 收尾时修掉 —— 运行期一直是对的，红的是类型）—— 而那正是"这张卡只能是这两种之一"
+   * 这条契约在类型层的表达，宽成 `string` 等于把它丢了。
    */
-  function toolIdentity(engineToolName: string): { kind: string; ref: EngineMcpToolCard | undefined } {
+  function toolIdentity(
+    engineToolName: string,
+  ): { kind: ToolCallKind; ref: EngineMcpToolCard | undefined } {
     const ref = options.resolveMcpTool?.(engineToolName)
     return { kind: ref === undefined ? SANDBOX_TOOL_KIND : MCP_TOOL_KIND, ref }
   }

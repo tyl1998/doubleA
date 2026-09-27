@@ -201,6 +201,7 @@ model User {
   conversations  Conversation[]
   mcpServers     McpServer[]
   mcpCredentials McpCredential[]
+  usageRecords   UsageRecord[]
 
   @@map("users")
 }
@@ -285,6 +286,7 @@ model Agent {
   creator       User              @relation(fields: [createdBy], references: [id], onDelete: Restrict)
   components    AgentComponent[]
   conversations Conversation[]
+  usageRecords  UsageRecord[]
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
@@ -701,4 +703,84 @@ model Artifact {
   /// 保留期清理器的扫描键（`createdAt < now - ARTIFACT_RETENTION_DAYS`）
   @@index([createdAt])
   @@map("artifacts")
+}
+
+/// usage_records —— 计量（`02` §三 / §七 的「计量」那一行；`01` 决策 20。**P0-3-12 落地**）
+///
+/// **一行 = 一轮 TaskAgent 派活的用量**（不是"一次上游调用一行"，也不是"一个会话一行"）。
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// ★ 这张表为什么在 P0-3-12 就上线（原计划属 P1）
+/// ─────────────────────────────────────────────────────────────────────
+/// `02` §6.2 ⑦ 的"本版本不写 `usage_records`"是 **ChatBot 侧**（P0-1-27）的口径；
+/// 而 `子方案③` §十 要求 **TaskAgent** 写它 —— 「引擎有 usage 则填满；无则 token 字段为空、
+/// 按时长 + 轮次记条目」（`01` 决策 20）。这处张力在 P0-3-12 收口，于是**该表随本批上线**。
+/// ⚠️ **ChatBot 仍不写**（它的接回点已就位：`persist.ts#PersistRoundInput.usageRecord`，
+/// P1 只需在 `chatBot.ts` 传一次）—— 别把"表上线了"顺手理解成"两边都开始写"。
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// ★ 两列不由 `02` §三 的原始清单给出，而是本批按 `01` 决策 20 补的
+/// ─────────────────────────────────────────────────────────────────────
+/// `02` §三 的列清单是 `id, user_id, agent_id, model, tokens_in, tokens_out, created_at`。
+/// 决策 20 允许"token 字段为空"，但要求那时**按时长 + 轮次**记 —— 没有这两列，
+/// 兜底路径留下的就是一个"零信息量的行"（只有 id 与时间）。故补：
+///   · `duration_ms` —— 本轮派活的墙钟耗时（我们**自己量的**，与引擎上报无关）
+///   · `rounds`      —— 引擎这一轮跑了几轮（`turn_start` 条数）
+/// ⚠️ `rounds` 的量纲是**引擎的 turn**，不是我们的"消息轮"：pi `how-pi-works.md` 的
+/// "…That completes one turn. If tool results … require another model request, Pi starts
+/// another turn." ⇒ **一个 turn = 一次模型请求**（= ChatBot 侧 `sumUsages` 相加的那一轮）。
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// ★ 分区表的四条约束（与 `messages` 同款，改本模型前务必先读）
+/// ─────────────────────────────────────────────────────────────────────
+/// 1. **主键必须含分区键** ⇒ `@@id([id, createdAt])`，`findUnique` 要写复合键
+///    `where: { id_createdAt: { id, createdAt } }`。本表的读取形态是"按时间窗口 + 用户/Agent
+///    聚合"，天然带 `createdAt`，所以不亏（同 `Message` 的说明）。
+/// 2. **分区不在这里声明**：父表/子表与 `ensure_usage_records_partition(month)` 全在
+///    `prisma/migrations/<ts>_add_usage_records/migration.sql` 里用 SQL 完成。
+/// 3. **`tokens_*` 可空且刻意不用 0 代替**："引擎没上报"与"这一轮真的用了 0 个 token"
+///    是两件事（`shared/src/sse.ts` 文件头 ④ 的同一条口径）—— 不知道就留 `NULL`。
+/// 4. **时间为 JS 侧写入**（同 `Artifact.createdAt` 的理由）：本机 PG 会话时区非 UTC 时
+///    `@default(now())` 与 JS 侧边界差一个时区偏移；本表的"按月看用量"正是 JS 侧窗口比较。
+///    默认值只是兜底。
+///
+/// **删除语义 `Restrict`**（与 `conversations.user_id` / `conversations.agent_id` 同款）：
+/// 计量是**账**，不该被谁连带删掉。本系统不删用户（见 `UserStatus` 注释），Agent 是软删
+/// ⇒ 这两条外键在 P0 永远不会挡下一次合法操作，但它把"以后谁想硬删"这件事变成一次显式决定。
+///
+/// ⚠️ **刻意没有 `conversation_id`**：`01` 决策 20 的用途是"**按用户/Agent 的 token 累计**"，
+/// 会话维度不在其中；加了它反而会诱导"删会话时要不要级联删账"这种本不该存在的问题
+/// （`messages` 是 CASCADE，那是"历史属于会话"；账不是）。
+model UsageRecord {
+  id         String   @default(uuid(7)) @db.Uuid
+  /// ⚠️ 由**调用方显式传入**（`orchestrator/persist.ts` 传 JS 侧 `new Date()`），见上方口径 4
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  userId     String   @map("user_id") @db.Uuid
+  agentId    String   @map("agent_id") @db.Uuid
+  /// 上游真实型号名（`LlmTarget.modelName`，如 `gpt-4o-mini`）。**刻意不是 `models.id`**：
+  /// 报表要的是"哪个型号花了多少"（型号名才是跨 provider 的可比口径），而模型行可以被停用/改绑；
+  /// 长度 255 与 `models.model_name`(128) 刻意不同 —— 这里存的是**上游报文里的那个名字**
+  /// （`responseModel` 可能比登记的名字长），不跟着 `models` 的约束走。
+  model      String   @db.VarChar(255)
+  /// 引擎上报的输入/输出 token（跨 turn **相加**后的值）。`NULL` = 引擎没上报（不编 0）
+  tokensIn   Int?     @map("tokens_in")
+  tokensOut  Int?     @map("tokens_out")
+  /// 本轮派活的墙钟耗时（`startedAt` → 落库前），**我们自己量的**
+  durationMs Int      @map("duration_ms")
+  /// 引擎这一轮跑了几轮（`turn_start` 条数 = 模型请求次数）；`0` = 引擎一次都没开轮
+  rounds     Int
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Restrict)
+
+  /// ⚠️ 复合主键是分区的**前置条件**，不是设计偏好（见上方口径 1）
+  @@id([id, createdAt])
+  /// 「某个用户的用量」（`02` §三 的用途：按用户累计）—— 时间窗口 + 人是必然的查询形状
+  @@index([userId, createdAt(sort: Desc)])
+  /// 「某个 Agent 的用量」—— TaskAgent 的用量尤其要能按 Agent 归集
+  @@index([agentId, createdAt(sort: Desc)])
+  /// ⚠️ **刻意没有 `@@index([createdAt])`**：分区表上的索引是**分区本地**的，
+  /// "某段时间的全局用量"由分区裁剪（partition pruning）完成，再挂一个时间索引只增写放大。
+  /// ⚠️ 也**刻意没有 `@@index([model])`**：按型号聚合是 P1 报表的事，届时按实际查询形状再加。
+  @@map("usage_records")
 }

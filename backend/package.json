@@ -18,7 +18,7 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:status": "prisma migrate status",
-    "db:partitions": "prisma db execute --file prisma/sql/ensure_messages_partitions.sql",
+    "db:partitions": "prisma db execute --file prisma/sql/ensure_messages_partitions.sql && prisma db execute --file prisma/sql/ensure_usage_records_partitions.sql",
     "db:seed": "pnpm run db:generate && tsx prisma/seed.ts",
     "db:studio": "prisma studio"
   },

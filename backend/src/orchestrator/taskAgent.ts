@@ -15,7 +15,7 @@
  *  ④ runTurn(content, {signal})      → 派活 + 等 **`agent_settled`**（不是 `agent_end`，见 `bridge.ts`）
  *  ④.5 collectRoundArtifacts(...)    → 对照基线 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（P0-3-7）
  *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
- *  ⑥ persistRoundQuietly + done{usage}
+ *  ⑥ persistRoundQuietly + 计量（`usage_records`）+ done{usage}
  *  ⑦ 用户停止 ⇒ 收沙箱              → closeSandboxRpc + recycleSandbox（容器与具名卷一并回收，P0-3-8）
  * ```
  * 它由 `orchestrator/index.ts#resolveChatProducer()` 按 `agent.type` 单点接回 ——
@@ -66,9 +66,19 @@
  *    而 `emit` 是异步的（过 schema + 背压等 `drain`）⇒ 分两半做：
  *    「记下来」（`assistantText` / `toolRecords` / `usage`）**在回调里同步完成**，
  *    「发出去」进一条串行队列（`enqueue`）。`void emit(...)` 会同时丢掉**帧顺序**与**错误**。
- * ③ **usage 是「覆盖」不是「相加」**：引擎给的 `message_update.usage` 是
- *    **latest cumulative**（pi `docs/json.md` 原话）⇒ 后一帧直接盖掉前一帧。
- *    这与 `chatBot.ts` 的 `sumUsages` 是两件不同的事（那边一轮里调了好几次上游）。
+ * ③ **usage 要按引擎的 turn 归集：同一 turn 内「覆盖」、跨 turn「相加」**（P0-3-12 订正）：
+ *    引擎给的 `message_update.usage` 是「**这一个 assistant turn** 的累积值」（pi `docs/json.md`：
+ *    "latest cumulative provider-reported usage for **the assistant response**"），
+ *    而 **一个 turn = 一次模型请求**（pi `how-pi-works.md`："…That completes one turn. If tool
+ *    results … require another model request, Pi starts another turn."）⇒ 两条一起才是对的：
+ *      · **同一 turn 内**逐帧递增 ⇒ 后一帧**盖掉**前一帧（不要累加，会重复计）；
+ *      · **turn 结束时**把这个 turn 的值**并进总数**，下一 turn 从零开始 ⇒ 多轮工具循环
+ *        的总量 = 各 turn 相加（与 ChatBot 的 `sumUsages` 同一条口径，`子方案③` §十 的原文要求）。
+ *    ⚠️ **P0-3-6 时只做了前半句**（"覆盖不是相加"），于是多轮工具循环里**只留了最后一轮**的
+ *    用量 —— 客户端看到的 token 数偏小，而**没有任何断言会红**（它是个"看起来合理"的数）。
+ *    P0-3-12 做的是计量，这条偏小直接进 `usage_records`，所以必须在这一批订正。
+ *    ⚠️ 另一处同族修正：**全 0 的 usage 视为"没上报"**（不上报 usage 的 provider 全程给 0，
+ *    见 `map.ts#readEngineUsage`）—— 那不是"用了 0 个 token"。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ⚠️ 本批**刻意不含**的（属后续批次，不要顺手补）
@@ -104,6 +114,7 @@ import {
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
+import { sumUsages, type ChatUsage } from '../llm/protocol.js'
 import {
   closeSandboxRpc,
   collectRoundArtifacts,
@@ -121,8 +132,13 @@ import {
   type TurnOutcome,
   type WorkSnapshot,
 } from '../sandbox/index.js'
-import { createEngineEventMapper, type EngineMcpToolCard, type EngineUsage } from '../sandbox/map.js'
-import { persistRoundQuietly } from './persist.js'
+import {
+  createEngineEventMapper,
+  engineTurnBoundaryOf,
+  type EngineMcpToolCard,
+  type EngineUsage,
+} from '../sandbox/map.js'
+import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
 import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
 
 /**
@@ -159,10 +175,19 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     /** 工具调用记录（落库那份**带 `arguments`** —— 见 `map.ts#EngineEventMapping.toolRecord`） */
     toolRecords: [] as ToolCallRecord[],
     /**
-     * 本轮用量。⚠️ 引擎给的是**累积值** ⇒ 每次直接覆盖（判据 ③）；
-     * `null` = 至今没有哪一帧带过它（`readEngineUsage` 两个数都取不到时返回 `null`，不编 0）。
+     * 本轮**总量**（跨 turn 相加后的结果；落 `messages.tokens_*`、`usage_records` 与 `done.usage`）。
+     * ⚠️ 类型用 `ChatUsage`（含 `tokensTotal`）只为**复用 `sumUsages`** —— 那个函数是
+     * "多轮用量相加"这条口径的**唯一实现**（ChatBot 的工具循环也是它，`子方案③` §十 明确
+     * 要求两边同口径）。对外只投影 `tokensIn` / `tokensOut`（见 `toEngineUsage`）。
      */
-    usage: null as EngineUsage | null,
+    usageTotal: null as ChatUsage | null,
+    /**
+     * **当前 turn** 的最新值（引擎在同一 turn 内逐帧递增 ⇒ 直接覆盖）。`null` = 这个 turn
+     * 至今没有哪一帧带过它。turn 结束时并进 {@link round.usageTotal} 再清空。
+     */
+    currentTurnUsage: null as EngineUsage | null,
+    /** 引擎这一轮跑了几轮（`turn_start` 条数 = 模型请求次数）。`usage_records.rounds` 用它 */
+    turns: 0,
     /** 收到的正文增量条数（日志用；也是 TTFT 的判据） */
     deltaCount: 0,
     // ── 引擎事件的"可解释性"计数器（`map.ts` 文件头的 known / anomaly）──
@@ -170,6 +195,23 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     unknownEventTypes: new Set<string>(),
     /** 认识、但载荷用不了（缺必填字段）的次数 —— 每一条都当场 warn，见下面的处理 */
     anomalies: 0,
+  }
+
+  /**
+   * 把"当前 turn"的用量并进总数（判据 ③ 的后半句）。
+   *
+   * 三个调用点各有理由，缺一个都会漏计或重复计：
+   *   · `turn_end` —— 这一个 turn 的 usage 已定稿（**正常路径**，pi `docs/json.md`）；
+   *   · `turn_start` —— **防呆**：万一 `turn_end` 没收到（引擎异常/中断在两条事件之间），
+   *     下一个 turn 开始时先把上一个 turn 的值归位，而不是让它被覆盖掉；
+   *   · **收尾**（`runTurn` 之后）—— 最后一个 turn 可能还没 `turn_end`（被中断、或引擎
+   *     直接退出）⇒ 那之前产生的 token 是**真实的**，照算。
+   */
+  const flushTurnUsage = (): void => {
+    const current = round.currentTurnUsage
+    if (current === null) return
+    round.usageTotal = sumUsages(round.usageTotal, { ...current, tokensTotal: null })
+    round.currentTurnUsage = null
   }
 
   /**
@@ -223,6 +265,13 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   let unsubscribe: (() => void) | null = null
   let outcome: TurnOutcome | null = null
   let failure: unknown = null
+  /**
+   * 这一轮**有没有真的把 prompt 发出去**（= 走到了 `bridge.runTurn`）。
+   *
+   * 它是"要不要记一条计量"的判据（见收尾处），**不能**用 `outcome !== null` 代替：
+   * `runTurn` 抛异常时 `outcome` 仍是 `null`，可那时 prompt 已经发出去了 —— 用量真实发生。
+   */
+  let engineStarted = false
   /**
    * 产物基线（③.5 拍、④.5 用）。`undefined` = 没拍成（`snapshotWorkFiles` 内部已 warn）
    * ⇒ 收集整轮跳过：**宁可不收，不重复收**（拿空基线当对照会把复用容器里上一轮的产物
@@ -319,8 +368,19 @@ export const taskAgentProducer: ChatProducer = async (input) => {
             round.thinkingText += frame.data.text
           }
         }
-        // 覆盖而不是相加（判据 ③）；`null` 表示这一帧没带 usage，**不该盖掉**已有的值
-        if (mapped.usage !== null) round.usage = mapped.usage
+        // ── 用量：按引擎的 turn 归集（判据 ③）──
+        // 顺序不能反：**先处理边界、再收本帧的 usage** —— `turn_end` 与它那个 turn 的最后
+        // 一帧 `message_update` 谁先到由引擎决定，先收后并可以两种顺序都不漏；
+        // 反过来（先并后收）会把"边界那一帧自己带的 usage"算进**下一个** turn 里。
+        const boundary = engineTurnBoundaryOf(event)
+        if (boundary === 'start') {
+          flushTurnUsage() // 防呆：上一个 turn 的 `turn_end` 没收到时在这里归位
+          round.turns += 1
+        } else if (boundary === 'end') {
+          flushTurnUsage()
+        }
+        // 同一 turn 内覆盖（`null` 表示这一帧没带，**不该盖掉**已有值）；跨 turn 靠上面那次归位
+        if (mapped.usage !== null) round.currentTurnUsage = mapped.usage
         if (mapped.toolRecord !== undefined) round.toolRecords.push(mapped.toolRecord)
 
         // ── 可解释性：未知事件只留痕；"认识但载荷坏了"当场 warn ──
@@ -340,6 +400,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       // ④ 派活（`runTurn` 内部：先挂 `agent_settled` 等待者，再 `send(prompt)`）
       // ═════════════════════════════════════════════════════════════
+      engineStarted = true // 计量判据（见收尾处）：从这一行起，token 就已经可能花出去了
       outcome = await bridge.runTurn(content, { signal })
     } catch (error) {
       // 中断与故障在这里**都只是"记下来"**，统一的收尾在下面（顺序即优先级，与 chatBot 同款）
@@ -349,6 +410,16 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       unsubscribe?.()
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ④.6 用量收口：把最后一个 turn 的值并进总数（判据 ③）
+  // ═══════════════════════════════════════════════════════════════════
+  // 必须排在这里（退订之后、读取之前）而不是等到落库那一行：后面有三处读它
+  // （`persistRoundQuietly` 的 `tokens_*`、`usage_records` 的 `tokens_*`、结束日志与 `done.usage`），
+  // 漏了这一步的症状是"最后一个 turn 的 token 不见了"（中断的轮尤其明显：它根本没有 `turn_end`）。
+  flushTurnUsage()
+  /** 本轮用量（跨 turn 相加后的**对外形状**）：落库、计量、`done.usage` 三处共用这一份 */
+  const roundUsage: EngineUsage | null = toEngineUsage(round.usageTotal)
 
   // ═══════════════════════════════════════════════════════════════════
   // ④.5 收产物（P0-3-7）
@@ -435,6 +506,40 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   const interrupted =
     stopReason !== undefined || (outcome !== null && !outcome.ok && outcome.reason === 'aborted')
 
+  /**
+   * 本轮的墙钟耗时（`startedAt` → 现在）。取**一次**、三处共用（计量行、结束日志、`usage_records`）
+   * —— 分三处各算一次的话，同一轮在报表与日志里会得到三个不同的数（而它们都"看起来对"）。
+   */
+  const durationMs = Date.now() - requestedAtMs
+
+  /**
+   * 本轮要不要记一条计量（`usage_records`，P0-3-12；`01` 决策 20）。
+   *
+   * ★ 判据 = **"这一轮引擎真的跑过"**（{@link engineStarted}），而不是"落库判据"。
+   *   两者的差别**只有一种情形**：**用户排队时点了停止** —— 落库要写（他确实发起了、
+   *   又主动停了），计量不记（那一轮连 `prompt` 都没发出去，没有用量可言）。
+   *   ⚠️ 反过来"引擎跑了但没产出内容"（被中断 / 引擎故障）**照记**：token 是真的花掉了，
+   *   `01` 决策 15 的"停止即中断"也不该让账目消失。
+   *   ⚠️ 与落库同一条例外：**`lock-lost` 到不了这里**（上面已提前 throw）—— 那时可能已有
+   *   另一个流在写同一份历史，我们连消息都不写，更不该往账里加一条。
+   *
+   * ★ 两条取值口径（`01` 决策 20 的"允许 token 字段为空"）：
+   *   · `tokensIn/Out` 取**跨 turn 相加**后的值；引擎没上报（或全 0，见 `map.ts#readEngineUsage`）
+   *     ⇒ `null`，**不编 0** —— 报表里 `NULL` 是"不知道"，`0` 是"真的没用"，两件事。
+   *   · 取不到 token 时这两列之外的字段照填：**时长是我们自己量的、轮次是引擎自己报的**，
+   *     它们与"有没有 usage 上报"无关 ⇒ 一条"零信息量"的行不会出现。
+   */
+  const usageRecord: UsageRecordInput | undefined = engineStarted
+    ? {
+        model: input.target.modelName,
+        tokensIn: roundUsage?.tokensIn ?? null,
+        tokensOut: roundUsage?.tokensOut ?? null,
+        durationMs,
+        rounds: round.turns,
+        createdAt: new Date(),
+      }
+    : undefined
+
   const messageId = await persistRoundQuietly({
     conversationId,
     content,
@@ -445,7 +550,10 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     toolRecords: round.toolRecords,
     // 本轮建成的产物行（P0-3-7）：事件里发过的那几张卡，刷新后从 `content.artifacts` 恢复
     artifacts: artifactItems,
-    usage: round.usage,
+    usage: roundUsage,
+    // 计量行与消息**同一个事务**（P0-3-12）：要么都写、要么都不写 ⇒ 不会出现
+    // "有消息没计量"或"有计量没消息"两种半截状态
+    usageRecord,
     logger,
   })
 
@@ -521,15 +629,30 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ⚠️ 引擎侧的两条"可解释性"实况：非空即意味着映射表要跟着引擎升级（见 `map.ts` 文件头）
       unknownEngineEvents: round.unknownEventTypes.size === 0 ? null : [...round.unknownEventTypes].sort(),
       engineAnomalies: round.anomalies,
-      // 引擎给的**累积**用量（`message_update.usage`），某一路取不到就是 `null`（不知道就不编 0）
-      tokensIn: round.usage?.tokensIn ?? null,
-      tokensOut: round.usage?.tokensOut ?? null,
-      durationMs: Date.now() - requestedAtMs,
+      // 本轮用量的三个数（P0-3-12 起口径见判据 ③）：跨 turn **相加**后的 token（某一路
+      // 没上报就是 `null`，不知道就不编 0）+ 我们自己量的时长 + **引擎自己报的轮次**
+      tokensIn: roundUsage?.tokensIn ?? null,
+      tokensOut: roundUsage?.tokensOut ?? null,
+      durationMs,
+      // ⚠️ `0` 是**真实可能的**（引擎一次 turn 都没开：派活刚发出去就被中断）——
+      // 它与"取不到 token"（`null`）是两件事，别把两者混成一个"没有"
+      rounds: round.turns,
     },
     'TaskAgent 本轮结束',
   )
 
-  return { messageId, finishReason, usage: round.usage }
+  return { messageId, finishReason, usage: roundUsage }
+}
+
+/**
+ * 跨 turn 累加后的用量 → **对外形状**（`done.usage` 的 `tokensIn` / `tokensOut` 两项）。
+ *
+ * 内部用 `ChatUsage` 只是为复用 `sumUsages`；`tokensTotal` 在契约里没有位置
+ * （`shared#sseDonePayloadSchema` 的 `usage` 刻意只投影两项，见 `map.ts#EngineUsage`），
+ * 所以出口处**显式**把它丢掉，而不是让它顺着类型漏出去。
+ */
+function toEngineUsage(total: ChatUsage | null): EngineUsage | null {
+  return total === null ? null : { tokensIn: total.tokensIn, tokensOut: total.tokensOut }
 }
 
 // ═════════════════════════════════════════════════════════════════════

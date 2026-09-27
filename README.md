@@ -733,6 +733,57 @@ docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/
 > 另外 pi 的扩展 API 形状（`session_start` / `registerTool` / **`throw` 才算失败**）来自上游文档，
 > 本仓没有类型可查（`infra/` 不在任何 tsconfig 的 include 里）。
 
+### TaskAgent 计量（P0-3-12 起；⚠️ 命令行档 —— 无界面增量）
+
+**一句话**：TaskAgent 每**真派活**一轮，收尾时在**落库的同一个事务**里写一条 `usage_records`（账）。
+本批同时把**一张按月的分区表**（`usage_records`）上线（手写 DDL + `ensure_usage_records_partition()` +
+续期脚本，**分区套路照 `messages`**），并**订正了 P0-3-6 留下的用量口径错**（见下表最后一行）。
+
+**是什么 / 判据 · 落点**：
+
+| 是什么 | 判据 · 落点 |
+|--------|-------------|
+| **一行 = 一轮派活** | 不是"一次上游调用一行"、也不是"一个会话一行"；落点 `orchestrator/persist.ts#persistRoundQuietly`（与消息落库同一个 `$transaction`） |
+| **只 TaskAgent 写** | `engineStarted` 为真才写（**纯排队失败 / 没真派活 ⇒ 不记**）；ChatBot 路径**仍不写**（`02` §6.2 ⑦） |
+| **token 可空、不编 0** | 引擎没上报（`usage` **全 0** 或取不到）⇒ `NULL` —— "**不知道**"与"**真的用了 0**"是两件事 |
+| **`duration_ms` / `rounds` 兜底** | 两个**我方量**：本派活墙钟（ms）+ 引擎 `turn_start` 条数 ⇒ 即便没有 token，账上也留得下信息（`01` 决策 20 的"按时长 + 轮次记条目"） |
+| ★ **用量口径 = 同 turn 覆盖、跨 turn 相加** | 引擎的 `usage` 是「**这一个 assistant turn**」的累积值，而**一个 turn = 一次模型请求** ⇒ 同一 turn 内**覆盖**、跨 turn 走 `sumUsages` **相加**（`turn_start`/`turn_end` 划边界）。⚠️ P0-3-6 只做了"覆盖"这半句 ⇒ 多轮工具循环**只记了最后一轮**的 token（数字偏小、看着合理、不报错） |
+| **`created_at` 由 JS 侧写** | 本机 PG 会话时区非 UTC ⇒ 凡参与 JS 侧比较的时间列都由 JS 侧显式写入（`02` §3.1 已知问题） |
+| **按月分区** | `PARTITION BY RANGE (created_at)` + 复合主键 `(id, created_at)`；`ensure_usage_records_partition()` 动态建窗口、`pnpm db:partitions` 幂等续期 |
+
+**人工观察步骤**（前置 = 同「沙箱派活与事件映射」：能**真派活** —— `SANDBOX_IMAGE` +
+`SANDBOX_EGRESS_PROXY_URL` 就绪 + 一个 `TASK_AGENT` + 一个会干活的模型）：
+
+```bash
+# ① 派一轮活（沿用上一节造好的 TASK_AGENT 会话），等 SSE 收口
+#    curl 走 SSE 时 done 帧里应有 usage（形如：event: done  data: {"finishReason":"COMPLETE","usage":{"tokensIn":…,"tokensOut":…}}）
+
+# ② 库里应有行（psql 连 127.0.0.1:15432，库名 doubulea）
+#    SELECT created_at, model, tokens_in, tokens_out, duration_ms, rounds
+#      FROM usage_records ORDER BY created_at DESC LIMIT 5;
+#    → tokens_in/out 可能为 NULL —— 那是"模型在流式阶段没报"（= 不知道），**不是 0**
+#    → rounds ≥ 1（引擎发了几个 turn_start）；duration_ms = 这一轮派活的墙钟毫秒
+#    → 多轮工具循环时 rounds > 1，且 token 是**各 turn 相加**（不是只留最后一轮）—— 这正是本批订正的点
+
+# ③ 一行都没写？先看后端"本轮结束"那行日志有没有 usage 字段；
+#    纯排队失败 / 没真派活而**没有这一行是刻意的**（判据 = "这一轮真的发生过"）
+```
+
+**已知边界（别当 bug）**：
+
+- ⚠️ **ChatBot 不写这张表**：ChatBot 的收尾只做"计量**透传**"（`done.usage` + 日志）；账要挂
+  `user_id + agent_id`，而 ChatBot 的生产路径没有这两者 ⇒ 它的接回点（`PersistRoundInput.usageRecord`）
+  留成了真接口，接线是**另一批**的事；
+- ⚠️ **`tokens_*` 为 `NULL` 是正常的**：多数 provider 在**流式阶段**不报 usage，只有收口才给；
+  引擎侧这句原文是"it can remain zero until completion"；
+- ⚠️ **`rounds = 0` 是可能真实的**（引擎一个 `turn_start` 都没发就结束）；
+- ⚠️ **没有查询端点**：`02` §四 的 `GET /api/usage/summary` **报表仍属 P1** —— 本批只落账，看账靠 psql。
+
+> **⚠️ 这一档证明什么、不证明什么**：契约侧只有**跨文件接线的那一次 `pnpm -r typecheck`** + `pnpm check:batch`；
+> 表已 `pnpm db:deploy` 应用、DDL 形状过了 `prisma migrate diff --exit-code`（无差异）与 psql 的 `relkind = 'p'`。
+> ⚠️ **本批零新增 env、零 HTTP 面、零前端改动**（就一个迁移 + 一个新表 + 编排层收口），
+> 所以"账记得对不对"（token 有没有真的相加、`NULL` 与 `0` 有没有分对）只能**你自己派一轮活、再 psql 里看**。
+
 ### 浏览器端测 · 任务型对话页（⭐ **阶段三唯一的浏览器端测点**：P0-3-11 起）
 
 **这一档终于有界面了。** P0-3-1~10 全部落在后端与纯逻辑层（镜像 / 生命周期 / 加固 / Key 注入 /

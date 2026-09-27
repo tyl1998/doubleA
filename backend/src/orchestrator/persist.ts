@@ -40,6 +40,32 @@ export interface RoundUsage {
   tokensOut: number | null
 }
 
+/**
+ * 一条计量行（`usage_records`，**P0-3-12**；`02` §三 / §七、`01` 决策 20）。
+ *
+ * ⚠️ **刻意不收 `userId` / `agentId`**（虽然表里有这两列）：它们的唯一权威是**会话行**，
+ * 而本函数与消息落库在**同一个事务**里 —— 让那一列在事务内读出来，行与消息才真正同生共死。
+ * 由编排层"顺手带下来"的 id 会制造第二种来源（今天它们恰好相等，明天换个调用方就不一定）。
+ *
+ * ⚠️ **`tokensIn/Out` 允许为 `null`**（引擎没上报 / 不上报 usage 的 provider ⇒ 全程 0，
+ * 见 `sandbox/map.ts#readEngineUsage`）：`NULL` = 不知道，`0` = 真的没用 ——
+ * `01` 决策 20 明确允许前者，所以**不要**为了"字段不留空"编一个 0。
+ * 取不到 token 时这条记录仍然有意义：`durationMs`（我们自己量的）与 `rounds`
+ * （引擎自己报的 turn 数）与"有没有上报"无关。
+ */
+export interface UsageRecordInput {
+  /** 上游真实型号名（`LlmTarget.modelName`）。见 `schema.prisma#UsageRecord.model` 的说明 */
+  model: string
+  tokensIn: number | null
+  tokensOut: number | null
+  /** 本轮派活的墙钟耗时（**调用方量**；本函数不自己看表 —— 它要的是"这一轮"，不是"这一次落库"） */
+  durationMs: number
+  /** 引擎这一轮跑了几轮（`turn_start` 条数 = 模型请求次数） */
+  rounds: number
+  /** ⚠️ 由调用方显式传入（本机 PG 会话时区非 UTC 时 `@default(now())` 会偏一个时区，见 `02` 的已知问题） */
+  createdAt: Date
+}
+
 /** {@link persistRoundQuietly} 的入参 */
 export interface PersistRoundInput {
   conversationId: string
@@ -55,6 +81,20 @@ export interface PersistRoundInput {
    */
   artifacts?: readonly ArtifactItem[]
   usage: RoundUsage | null
+  /**
+   * 本轮的计量行（**P0-3-12**；TaskAgent 专属）。
+   *
+   * **不传 = 这一轮不计量**（口径与 `artifacts` 同款）：
+   *   · `chatBot.ts` 至今不传 ⇒ 它的落库口径与从前**逐字不变**（"本版本不写 `usage_records`"
+   *     是 **ChatBot 侧**的 P0-1-27 口径；它的接回点就是**这个参数**，P1 传一次即可）；
+   *   · TaskAgent 在"**这一轮引擎真的跑过**"时才传（判据在 `taskAgent.ts`：用户排队时点停止
+   *     ⇒ 引擎没跑 ⇒ 不计量）。
+   *
+   * 为什么由本函数写、而不是编排层再开一次写：**与消息同一个事务**。
+   * 分开写的后果是两种半截状态 —— "有消息没计量"与"有计量没消息"（后者更糟：账上多了一条
+   * 用户翻遍历史也找不到对应对话的用量）。
+   */
+  usageRecord?: UsageRecordInput
   logger: ReturnType<typeof getLogger>
 }
 
@@ -81,8 +121,18 @@ export interface PersistRoundInput {
  * 前端据此可以说"本条未写入历史"。⚠️ 代价写在这里：这一轮在历史里查不到（刷新后会消失）。
  */
 export async function persistRoundQuietly(input: PersistRoundInput): Promise<string | null> {
-  const { conversationId, content, assistantText, thinkingText, citations, toolRecords, artifacts, usage, logger } =
-    input
+  const {
+    conversationId,
+    content,
+    assistantText,
+    thinkingText,
+    citations,
+    toolRecords,
+    artifacts,
+    usage,
+    usageRecord,
+    logger,
+  } = input
   const hasAssistantContent =
     assistantText !== '' ||
     thinkingText !== '' ||
@@ -116,6 +166,31 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
         assistantMessageId = created.id
       }
       await touchConversation(tx, conversationId, new Date())
+      // ── 计量行（P0-3-12）：与上面两条消息、会话活跃时间同一个事务 ──
+      // `user_id` / `agent_id` 从**会话行**读（它们是这两个身份的唯一权威，见 `UsageRecordInput`）。
+      // ⚠️ 走到这里会话行**必然存在**：上面两条 `message.create` 带着 `conversations` 外键，
+      // 同一个事务里它们已经成功过。真为 `null` 只能是"外键被绕过"这种不可能状态 ⇒
+      // **直接抛**（整轮回滚 + 外层那条 error 日志），而不是静默跳过这一行 ——
+      // 静默跳过正是这条口径要避免的半截状态（"有消息、没账"）。
+      if (usageRecord !== undefined) {
+        const conversation = await tx.conversation.findUnique({
+          where: { id: conversationId },
+          select: { userId: true, agentId: true },
+        })
+        if (conversation === null) throw new Error(`计量落库时会话行不见了：${conversationId}`)
+        await tx.usageRecord.create({
+          data: {
+            userId: conversation.userId,
+            agentId: conversation.agentId,
+            model: usageRecord.model,
+            tokensIn: usageRecord.tokensIn,
+            tokensOut: usageRecord.tokensOut,
+            durationMs: usageRecord.durationMs,
+            rounds: usageRecord.rounds,
+            createdAt: usageRecord.createdAt,
+          },
+        })
+      }
       return assistantMessageId
     })
   } catch (error) {

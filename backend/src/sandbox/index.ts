@@ -1,6 +1,6 @@
 /**
  * 沙箱模块出口（P0-3-2 建，P0-3-3 补网络与 listener，P0-3-4 补 LLM 注入，P0-3-5 补引擎桥，
- * P0-3-6 补事件映射，P0-3-7 补产物收集，P0-3-9b 补 MCP 代理）
+ * P0-3-6 补事件映射，P0-3-7 补产物收集，P0-3-9b 补 MCP 代理，P0-3-12 补用量归集的 turn 边界）
  *
  * 依据：`docs/02-后端设计.md` §七（TaskAgent 编排）+ §4.8（任务与产物）+ `docs/06-实施计划.md` §五 P0-3-2/P0-3-3
  *
@@ -18,7 +18,7 @@
  * | ✅ P0-3-8 的停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（先拆连接）/ `recycleSandbox`（再杀容器与具名卷） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
- * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5）、`readEngineUsage` / `isKnownEngineEventType`（事件映射，P0-3-6） |
+ * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5）、`readEngineUsage` / `isKnownEngineEventType` / **`engineTurnBoundaryOf`**（事件映射与用量归集，P0-3-6 / P0-3-12） |
  */
 
 // 生命周期（拿、收、刷活跃、观测）
@@ -66,6 +66,7 @@ export { createJsonlDecoder, JsonlRecordTooLargeError, PI_RPC_STDIO_MAX_BYTES, t
 //    不碰 DB / Redis / SSE 连接 / Docker ⇒ 可以喂一串事件、比结果地逐条核查（§六 3 的映射表）
 export {
   createEngineEventMapper,
+  engineTurnBoundaryOf,
   isKnownEngineEventType,
   readEngineUsage,
   TOOL_RESULT_NO_ERROR_DETAIL,
