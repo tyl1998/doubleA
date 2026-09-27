@@ -1,23 +1,56 @@
 /**
- * 产物卡（P0-1-32；`docs/03` §4.1 消息流渲染规则表第 6 行："文件名 + 大小 + [预览] [下载]"）
+ * 产物卡（P0-1-32；`docs/03` §4.1 消息流渲染规则表第 6 行："文件名 + 大小 + [预览] [下载]"；
+ * **P0-3-11 把两个按钮接上了**）
  *
- * ⚠️ **P0 阶段流里不会出现 `artifact`**：产物的产生方是 TaskAgent 的沙箱执行，属 **P0-3**；
- * 文件预览（`03` §4.6 的六种格式）属 **子方案④**，下载端点也还没落地。
- * 事件形状已经定义（`sseArtifactPayloadSchema`），故卡片先就位、**没有数据源**。
+ * ─────────────────────────────────────────────────────────────────────
+ * P0-1-32 → P0-3-11：两个按钮从 disabled 变成能点，这一步**只做了一件事**
+ * ─────────────────────────────────────────────────────────────────────
+ * P0-1-32 把按钮写成 `disabled` 是刻意的（`03` §六 的同一条纪律："不提供点不通的入口" ——
+ * 那时下载端点是 P0-3-9、预览弹层是 P0-3-10，两个都还没落地）。P0-3-11 它们齐了，
+ * 于是卡片不必再自己解释"属哪个批次"：
+ *   · 「预览」把产物放进 `stores/artifactPreview.ts`（弹层住在 `ChatPage`，见那个文件的说明）；
+ *   · 「下载」走 `useArtifactDownload`（**与弹层标题栏那个按钮同一份实现**）。
  *
- * ⚠️ **预览与下载按钮刻意是 disabled**：这是 P0-1-31 定下的同一条纪律 ——
- * 「**不提供点不通的入口**」（那一批是"UI 上不提供 MCP 勾选"，因为后端明确拒绝）。
- * 摆一个能点但只会 404 或弹一句"暂不可用"的按钮，比没有按钮更糟：
- * 用户会以为是自己用错了。按钮保留是为了让**卡片的形态**（`03` §4.1 的那一行）
- * 现在就能被看到与验收，`title` 里如实写明"属哪个批次"。
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 「预览」按钮**不是所有产物都有** —— 判据是 `previewAvailability`
+ * ─────────────────────────────────────────────────────────────────────
+ * `子方案④` §九 两条验收点写在同一件事上：
+ *   · `none` 类型（zip / docx / 未知）⇒ **没有**「预览」按钮；
+ *   · 超大产物（> 10 MiB 图片 / > 2 MiB 文本）⇒ **无预览入口**、只有下载。
+ * 两句话是同一条规则的两种情形 ⇒ 用的是**同一个**函数（`previewAvailability`，
+ * 它内部调 `shared#previewKindOf`）。于是"哪些产物能预览"只有一处判据 ——
+ * 弹层那边也用同一个函数（它是最后一道兜底，见 `ArtifactPreviewDrawer` 的文件头）。
+ *
+ * ⚠️ 刻意**不做成"置灰的预览按钮"**：能力有无是事实，不是"暂不可用"
+ * （`03` §4.5 同款口径）。给 zip 一个永远点不开的「预览」，用户会以为是自己用错了。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * `timeText`：产物面板用它，消息流不用
+ * ─────────────────────────────────────────────────────────────────────
+ * 产物面板（`design/chat.html` 的 `.artifact__meta`）写的是 `8.4 KB · 刚生成`，而消息流里的
+ * 产物卡（`03` §4.1 那一行）只有 `8.4 KB`。两种读数**不是同一个来源**：面板那份来自服务端列表
+ * 的 `createdAt`，而流式产物**根本没有 `createdAt`**（`artifact` 事件是现发的）。
+ * 故时间读数做成**可选入参**：面板传，消息流不传 —— 而不是在卡片里判"我现在在哪一列"
+ * （那会让这张卡知道自己的父亲是谁）。
+ *
+ * 它同时解释了为什么卡片**不 import `artifactPanelModel.ts`**：那个纯逻辑档是面板的，
+ * 卡片只接受一个已经算好的字符串。
  */
 
 import { Button } from 'antd'
 
+import { useArtifactDownload } from '../../components/ArtifactPreview/useArtifactDownload.js'
+import { previewAvailability } from '../../components/ArtifactPreview/artifactPreview.js'
+import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
 import type { ArtifactView } from './messageModel.js'
 
 export interface ArtifactCardProps {
   artifact: ArtifactView
+  /**
+   * 人类可读的"什么时候产出的"（`8.4 KB · 刚生成` 的后半句）。
+   * `null` / `undefined` = 这一处不显示时间（消息流：流式产物没有落库时刻）。
+   */
+  timeText?: string | null
 }
 
 /** 文件大小（`artifact.size` 是字节数）—— 人类可读，1 位小数 */
@@ -34,7 +67,16 @@ function kindOf(fileName: string): string {
   return fileName.slice(dot + 1).toUpperCase().slice(0, 4)
 }
 
-export function ArtifactCard({ artifact }: ArtifactCardProps) {
+export function ArtifactCard({ artifact, timeText = null }: ArtifactCardProps) {
+  const openPreview = useArtifactPreviewStore((state) => state.openPreview)
+  const { downloading, download } = useArtifactDownload()
+
+  // 「这个产物能不能预览」—— 唯一的判据（见文件头）。不可预览时不渲染按钮，
+  // 而不是渲染一个置灰的：`none` 与"超大"是两件不同的事，但结论相同（只有下载）。
+  const canPreview = previewAvailability(artifact).available
+
+  const meta = timeText === null ? formatSize(artifact.size) : `${formatSize(artifact.size)} · ${timeText}`
+
   return (
     <div className="artifact" data-testid="artifact-card">
       <span className="artifact__kind" aria-hidden="true">
@@ -42,13 +84,28 @@ export function ArtifactCard({ artifact }: ArtifactCardProps) {
       </span>
       <div>
         <p className="artifact__name">{artifact.fileName}</p>
-        <p className="artifact__meta num">{formatSize(artifact.size)}</p>
+        <p className="artifact__meta num">{meta}</p>
       </div>
       <div className="artifact__ops">
-        <Button size="small" disabled title="产物预览属 P0-3（与沙箱执行一起交付）">
-          预览
-        </Button>
-        <Button size="small" disabled title="产物下载属 P0-3（下载端点尚未落地）">
+        {canPreview ? (
+          <Button
+            size="small"
+            onClick={() => {
+              // 只传四个字段之外的原对象：`ArtifactPanelItem` 多带的 `createdAt` / `live`
+              // 与弹层无关，但也没必要在这里剥（弹层只读它要的那四个，见 store 的注释）
+              openPreview(artifact)
+            }}
+          >
+            预览
+          </Button>
+        ) : null}
+        <Button
+          size="small"
+          loading={downloading}
+          onClick={() => {
+            download({ artifactId: artifact.artifactId, fileName: artifact.fileName })
+          }}
+        >
           下载
         </Button>
       </div>

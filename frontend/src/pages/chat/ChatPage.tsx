@@ -19,8 +19,10 @@
  * ✅ P0-1-34：**会话侧栏**（新建 / 切换 / 行内重命名 / 分级删除，`ConversationSidebar.tsx`）
  *    —— 侧栏的判据全在 `conversationList.ts`（零依赖纯逻辑，有断言）；
  *    **全屏布局**在 `AppLayout`（`docs/03` §三：保留 Logo 与头像菜单，其余导航收进「工作台」下拉）。
- * ⏳ P0-3：TaskAgent 的**产物面板**（`artifact` 事件驱动）—— `design/chat.html` 是三栏，
- *    本批落到两栏（侧栏 + 消息流）；产物面板要等产物收集（P0-3-7/9）。
+ * ✅ P0-3-11：**第三列 = 产物面板**（`ArtifactPanel.tsx`，只对 TaskAgent 加 `chat--with-panel`）
+ *    + **预览弹层**（`ArtifactPreviewDrawer`，谁在预览住在 `stores/artifactPreview.ts`）。
+ *    清单由 `mergeArtifactPanelItems` 一处合流：服务端列表（刷新后还在）+ 本轮 `artifact` 事件
+ *    （此刻就在手上）—— 见 `artifactPanelModel.ts` 的文件头（顺序与去重口径都写在那里）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 侧栏带来的那一件事：**切会话时不动 store**
@@ -58,6 +60,7 @@ import { HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
 import type { RemoveConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
+import { useConversationArtifacts } from '../../api/artifacts.js'
 import {
   flattenMessagePages,
   useConversationMessages,
@@ -66,7 +69,10 @@ import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { useFeedback } from '../../app/feedback.js'
 import { HOME_PATH, agentEditPath, chatPath } from '../../app/paths.js'
+import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
 import { TableSkeleton } from '../../components/ListStates.js'
+import { ArtifactPanel } from '../../features/chat/ArtifactPanel.js'
+import { mergeArtifactPanelItems, showArtifactPanel } from '../../features/chat/artifactPanelModel.js'
 import { ChatInput } from '../../features/chat/ChatInput.js'
 import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/confirmModel.js'
 import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
@@ -76,6 +82,7 @@ import { messagesToViews, openingView } from '../../features/chat/messageModel.j
 import { roundToViews } from '../../features/chat/roundReducer.js'
 import { chatErrorTitle, shouldToastChatError } from '../../features/chat/streamErrors.js'
 import { useChatStream } from '../../features/chat/useChatStream.js'
+import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
 import { useChatStreamStore } from '../../stores/chatStream.js'
 
 /** 消息流的外框（三态共用，避免切换时布局跳动） */
@@ -172,6 +179,40 @@ export function ChatPage() {
     const opening = openingView(agent?.openingRemarks)
     return opening === null ? [] : [opening]
   }, [history, streamViews, agent?.openingRemarks])
+
+  // ── 产物面板（P0-3-11）──────────────────────────────────────────────────────
+  //
+  // ⚠️ **只有 TaskAgent 有这一列**（`03` §4.1 的"TaskAgent 差异"）。判据是 `agent.type`
+  //    而不是"有没有产物"—— 理由在 `artifactPanelModel.ts` 的文件头（类型在创建时定死、
+  //    "有没有产物"不是 ⇒ 后者会让面板在第一次派活之前不存在、之后凭空出现）。
+  //    `agent` 还没到时按"不显示"处理：三栏的 `grid-template-columns` 变一次会让中栏跳一下。
+  const showPanel = showArtifactPanel(agent?.type)
+
+  /**
+   * 产物列表：**"刷新后产物还在"的唯一出口**（`artifact` 事件只发一次、
+   * 历史消息里的 `content.artifacts` 只覆盖那一轮）。
+   *
+   * `enabled: showPanel` ⇒ ChatBot 与"新会话态"都不发这个请求。那一轮的产出**仍然是可见的**
+   * （消息流里的产物卡由 `roundReducer` 的 `artifact` 分支承载），面板只是不让它多一次请求。
+   */
+  const artifactsQuery = useConversationArtifacts(conversationId, showPanel)
+
+  /**
+   * 面板清单 = **服务端列表**（最新在前，刷新后还在）+ **本轮事件**（产出顺序，此刻就在手上）
+   * 在一处的合流（`mergeArtifactPanelItems`：倒序对齐 + 按 `artifactId` 去重、保留服务端那一份）。
+   * ⚠️ 顺序不许在这里再排一次：**顺序只能来自服务端**（与 `conversationList.ts` 同款纪律）。
+   *
+   * ⚠️ 用 `round`（= 属于**当前会话**的那一轮）而不是 store 里任意一轮：切到别的会话时
+   * 面板显示的是那个会话的产物，不允许把上一个会话的产出混进来。
+   */
+  const artifactItems = useMemo(
+    () => mergeArtifactPanelItems(artifactsQuery.data?.items ?? [], round?.assistant.artifacts ?? []),
+    [artifactsQuery.data, round],
+  )
+
+  // 预览弹层（P0-3-11）：谁在预览住在 store 里（点「预览」的地方在四个层级之下，见那个文件）
+  const previewedArtifact = useArtifactPreviewStore((state) => state.preview)
+  const closePreview = useArtifactPreviewStore((state) => state.closePreview)
 
   /**
    * 流式版本让位（见文件头）。判据只有一条：**历史里已经有那条消息了**。
@@ -385,130 +426,168 @@ export function ChatPage() {
   }
 
   return (
-    // `.chat` 的完整形态在 `03` §4.1 是「会话侧栏 + 消息流 +（TaskAgent 的产物面板）」三栏
-    // （`design/chat.html` 的 `.chat--with-panel`）。本批落**左栏 + 中栏**（侧栏 = P0-1-34）；
-    // 产物面板要等产物收集（P0-3-7/9）⇒ 暂不加第三列：多一个永远空的占位会让
-    // "消息流到底占多宽"变成一个看不出来的问题。列的宽度是 `styles/app.css` 的 `.chat`
-    <div className="chat">
-      <ConversationSidebar
-        agentId={agentId}
-        conversationId={conversationId}
-        streamingId={streamingId}
-        onSelect={handleSelectConversation}
-        onNew={handleNewConversation}
-        onDeleted={handleConversationDeleted}
-      />
-      <main className="chat__main" aria-label="当前会话">
-        <div className="chat__head">
-          <div>
-            <h1 className="chat__title">{agentName}</h1>
-            <p className="ratio">
-              {agent === undefined ? '正在读取智能体…' : `${agent.type} · ${agent.modelLabel}`}
-            </p>
-          </div>
-          <div className="chat__head-right">
-            {agent?.modelAvailable === false ? (
-              // 绑定模型被停用 ⇒ 发消息会被后端 409 拦下（`shared/src/agent.ts` 的 `modelAvailable`
-              // 是服务端投影，前端**照抄**，不自己判角色/不自己看模型池）。提前说，省一次失败。
-              <Tag className="tag--danger" title="绑定的模型或其 Provider 已停用，发送会被拒绝">
-                绑定模型不可用
-              </Tag>
-            ) : null}
-            {agent === undefined ? null : (
-              <Link to={agentEditPath(agent.id)}>
-                <Button size="small">编辑智能体</Button>
-              </Link>
-            )}
-          </div>
-        </div>
-
-        {/* 顶部黄条：断线 / 停止没收到服务端确认（`03` §4.1："点击黄条 = 立即拉取历史对齐"）。
-            它由 store 持有（不是轮次的一部分）—— 因为"对齐"本身会把轮次丢掉，
-            见 `stores/chatStream.ts` 的 `DisconnectState` */}
-        {disconnect === null ? null : (
-          <DisconnectBanner extra={disconnect.extra} aligning={aligning} onAlign={handleAlign} />
-        )}
-
-        {/* 排队提示（`queued` 事件）：沙箱并发满时的位次。**P0 阶段恒不出现**
-            （产生方是沙箱并发闸，属 P0-3）。 */}
-        {round?.queuedPosition === null || round?.queuedPosition === undefined ? null : (
-          <div className="queued" style={{ margin: 'var(--sp-2) var(--sp-5)' }}>
-            <span className="led led--warn" aria-hidden="true" />
-            排队第 {round.queuedPosition} 位
-          </div>
-        )}
-
-        {/* ── 消息流：三态 + 流式 ── */}
-        {conversationId !== undefined && messagesQuery.isPending ? (
-          <StreamFrame>
-            <TableSkeleton rows={3} />
-          </StreamFrame>
-        ) : conversationId !== undefined && messagesQuery.isError ? (
-          <StreamFrame>
-            <div className="card card--pad">
-              <p className="empty__title">历史没有读出来</p>
-              <p className="empty__lead">
-                这次没拿到消息历史，界面上的内容可能不完整。点下面重试，或刷新页面。
+    // `.chat` 的完整形态（`03` §4.1 / `design/chat.html` 的 `.chat--with-panel`）是**三栏**：
+    // 会话侧栏 + 消息流 +（TaskAgent 的）产物面板。前两栏在 P0-1-34 就位，
+    // 第三栏是 **P0-3-11**（产物收集/列表/预览齐了才可能出现真内容）。
+    // ⚠️ 第三列**不是常驻的空占位**：只对 TaskAgent 加 `chat--with-panel`，
+    // 否则"消息流到底占多宽"会变成一个看不出来的问题（ChatBot 会永远少 312px）。
+    <>
+      <div className={showPanel ? 'chat chat--with-panel' : 'chat'}>
+        <ConversationSidebar
+          agentId={agentId}
+          conversationId={conversationId}
+          streamingId={streamingId}
+          onSelect={handleSelectConversation}
+          onNew={handleNewConversation}
+          onDeleted={handleConversationDeleted}
+        />
+        <main className="chat__main" aria-label="当前会话">
+          <div className="chat__head">
+            <div>
+              <h1 className="chat__title">{agentName}</h1>
+              <p className="ratio">
+                {agent === undefined ? '正在读取智能体…' : `${agent.type} · ${agent.modelLabel}`}
               </p>
-              <Button
-                onClick={() => {
-                  void messagesQuery.refetch()
-                }}
-                loading={messagesQuery.isFetching}
-              >
-                重试
-              </Button>
             </div>
-          </StreamFrame>
-        ) : messages.length === 0 ? (
-          <StreamFrame>
-            <div className="empty">
-              <div className="empty__frame" aria-hidden="true" />
-              <p className="empty__title">这个智能体还没有开场白</p>
-              <p className="empty__lead">直接在下面输入第一条消息，会话会在这时创建。</p>
+            <div className="chat__head-right">
+              {agent?.modelAvailable === false ? (
+                // 绑定模型被停用 ⇒ 发消息会被后端 409 拦下（`shared/src/agent.ts` 的 `modelAvailable`
+                // 是服务端投影，前端**照抄**，不自己判角色/不自己看模型池）。提前说，省一次失败。
+                <Tag className="tag--danger" title="绑定的模型或其 Provider 已停用，发送会被拒绝">
+                  绑定模型不可用
+                </Tag>
+              ) : null}
+              {agent === undefined ? null : (
+                <Link to={agentEditPath(agent.id)}>
+                  <Button size="small">编辑智能体</Button>
+                </Link>
+              )}
             </div>
-          </StreamFrame>
-        ) : (
-          <StreamFrame scrollRef={frameRef} onNearBottomChange={handleNearBottom}>
-            {/* 向历史深处翻页。契约：`items` 正序、`nextCursor` 指向**更早**一页
-                （`shared/src/conversation.ts#messagePageResultSchema`）—— 展平顺序由
-                `flattenMessagePages` 负责，别在这里自己拼页。 */}
-            {messagesQuery.hasNextPage ? (
-              <div style={{ textAlign: 'center' }}>
+          </div>
+
+          {/* 顶部黄条：断线 / 停止没收到服务端确认（`03` §4.1："点击黄条 = 立即拉取历史对齐"）。
+              它由 store 持有（不是轮次的一部分）—— 因为"对齐"本身会把轮次丢掉，
+              见 `stores/chatStream.ts` 的 `DisconnectState` */}
+          {disconnect === null ? null : (
+            <DisconnectBanner extra={disconnect.extra} aligning={aligning} onAlign={handleAlign} />
+          )}
+
+          {/* 排队提示（`queued` 事件）：沙箱并发满时的位次。**P0 阶段恒不出现**
+              （产生方是沙箱并发闸，属 P0-3）。 */}
+          {round?.queuedPosition === null || round?.queuedPosition === undefined ? null : (
+            <div className="queued" style={{ margin: 'var(--sp-2) var(--sp-5)' }}>
+              <span className="led led--warn" aria-hidden="true" />
+              排队第 {round.queuedPosition} 位
+            </div>
+          )}
+
+          {/* ── 消息流：三态 + 流式 ── */}
+          {conversationId !== undefined && messagesQuery.isPending ? (
+            <StreamFrame>
+              <TableSkeleton rows={3} />
+            </StreamFrame>
+          ) : conversationId !== undefined && messagesQuery.isError ? (
+            <StreamFrame>
+              <div className="card card--pad">
+                <p className="empty__title">历史没有读出来</p>
+                <p className="empty__lead">
+                  这次没拿到消息历史，界面上的内容可能不完整。点下面重试，或刷新页面。
+                </p>
                 <Button
-                  size="small"
-                  loading={messagesQuery.isFetchingNextPage}
                   onClick={() => {
-                    void messagesQuery.fetchNextPage()
+                    void messagesQuery.refetch()
                   }}
+                  loading={messagesQuery.isFetching}
                 >
-                  加载更早的消息
+                  重试
                 </Button>
               </div>
-            ) : null}
-            <MessageList messages={messages} agentName={agentName} />
-          </StreamFrame>
-        )}
+            </StreamFrame>
+          ) : messages.length === 0 ? (
+            <StreamFrame>
+              <div className="empty">
+                <div className="empty__frame" aria-hidden="true" />
+                <p className="empty__title">这个智能体还没有开场白</p>
+                <p className="empty__lead">直接在下面输入第一条消息，会话会在这时创建。</p>
+              </div>
+            </StreamFrame>
+          ) : (
+            <StreamFrame scrollRef={frameRef} onNearBottomChange={handleNearBottom}>
+              {/* 向历史深处翻页。契约：`items` 正序、`nextCursor` 指向**更早**一页
+                  （`shared/src/conversation.ts#messagePageResultSchema`）—— 展平顺序由
+                  `flattenMessagePages` 负责，别在这里自己拼页。 */}
+              {messagesQuery.hasNextPage ? (
+                <div style={{ textAlign: 'center' }}>
+                  <Button
+                    size="small"
+                    loading={messagesQuery.isFetchingNextPage}
+                    onClick={() => {
+                      void messagesQuery.fetchNextPage()
+                    }}
+                  >
+                    加载更早的消息
+                  </Button>
+                </div>
+              ) : null}
+              <MessageList messages={messages} agentName={agentName} />
+            </StreamFrame>
+          )}
 
-        {/* ── 输入区：状态机 / 停止 / 确认卡全在 `ChatInput` 里（本页只提供数据与回调） ── */}
-        <ChatInput
-          round={round}
-          sending={sending}
-          stopping={stopping}
-          // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
-          // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
-          // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
-          elsewhere={streamingId !== null && streamingId !== conversationId}
-          draft={draft}
-          onDraftChange={setDraft}
-          onSubmit={() => {
-            void submit()
-          }}
-          onStop={handleStop}
-          onConfirmAnswer={handleConfirmAnswer}
-          confirmPending={confirmPending}
-        />
-      </main>
-    </div>
+          {/* ── 输入区：状态机 / 停止 / 确认卡全在 `ChatInput` 里（本页只提供数据与回调） ── */}
+          <ChatInput
+            round={round}
+            sending={sending}
+            stopping={stopping}
+            // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
+            // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
+            // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
+            elsewhere={streamingId !== null && streamingId !== conversationId}
+            draft={draft}
+            onDraftChange={setDraft}
+            onSubmit={() => {
+              void submit()
+            }}
+            onStop={handleStop}
+            onConfirmAnswer={handleConfirmAnswer}
+            confirmPending={confirmPending}
+          />
+        </main>
+
+        {/* ── 第三列：产物面板（P0-3-11，**只有 TaskAgent 有**）─────────────────────
+            `items` 已经是合流后的清单（服务端列表 + 本轮事件，见上面的 `artifactItems`）；
+            本组件不认识那两个来源、也不判"我该不该存在"（由上面的 `showPanel` 决定）。
+
+            ⚠️ `total` 取服务端给的数、**不拿 `items.length` 冒充**：列表一页最多 100 条，
+            超过时面板底部那句"仅显示最近 100 个（共 N 个）"只有真 `total` 才说得出来
+            （`artifactPanelModel.ts#artifactPanelOverflowNote`）。
+
+            ⚠️ `streaming` 用 `round?.status === 'streaming'`（**当前会话**的那一轮）：
+            别的会话在跑时本列不该亮灯 —— 它列出的是**这个**会话的产物。 */}
+        {showPanel ? (
+          <ArtifactPanel
+            items={artifactItems}
+            total={artifactsQuery.data?.total}
+            listFailed={artifactsQuery.isError}
+            onRetry={() => {
+              void artifactsQuery.refetch()
+            }}
+            streaming={round?.status === 'streaming'}
+          />
+        ) : null}
+      </div>
+
+      {/* 预览弹层（P0-3-11）。⚠️ 放在 `.chat` **之外**：`.chat` 是 grid，
+          多一个直接子节点会被自动放进隐式的那一列/行（AntD Drawer 默认 portal 到 body，
+          但把布局容器当作"顺便的挂载点"是在赌它的默认值不变 —— 摆在外面就不必赌）。
+
+          ⚠️ 它不认识"哪个会话"：产物由 `artifactId` 唯一确定，切会话不关它是**刻意的**
+          （用户点开的东西不该被后台悄悄关掉；若那个产物随会话被删了，取内容会 404
+          并如实显示"没能取到文件内容"，而不是渲染一片空白）。 */}
+      <ArtifactPreviewDrawer
+        artifact={previewedArtifact}
+        open={previewedArtifact !== null}
+        onClose={closePreview}
+      />
+    </>
   )
 }

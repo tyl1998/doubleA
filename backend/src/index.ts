@@ -139,7 +139,7 @@ try {
     //    启动日志一直报「P0-1-6」导致冒烟时无法从日志判断跑的是哪一版；**P0-1-19 又漏了一次**
     //    ⇒ 已配机器自检 `pnpm check:batch`，它比对本行与 `docs/06` 里最后一个 `[✓]` 的批次号）。
     //    批次清单见 `docs/06-实施计划.md` §三；收尾清单见本仓批次工作流技能。
-    step: 'P0-3-10 五种格式预览（新增 `GET /api/artifacts/:id/content`：**复用** P0-3-9 的 `openArtifactSource` ⇒ 下载与预览只差响应头那一组；响应头按 `shared#previewKindOf` 一处分派 —— HTML/SVG 带 CSP `sandbox` + `inline`、PDF 刻意不加 CSP、text 一律压成 `text/plain`、`none` 当作下载，每路 `nosniff` + `private, no-store`；前端 `components/ArtifactPreview/` 六个渲染器 + `artifactPreview.ts` 纯逻辑【CSV 自写 RFC 4180 解析、三处截断读数报原数、两个 URL 只在一处拼】+ `pnpm verify:artifact-preview` 26 项）。⚠️ 浏览器仍不可端测（产物面板与「预览」按钮的接入点属 P0-3-11），但**命令行可验**（README「产物预览」）',
+    step: 'P0-3-11 任务型对话页 + 产物面板 + 预览弹层（纯前端批次）：第三列 `ArtifactPanel` 只对 `agent.type === TASK_AGENT` 加 `chat--with-panel`；面板清单 = **服务端列表**（新接 `GET /api/conversations/:id/artifacts`，`api/artifacts.ts#useConversationArtifacts`，**刷新后产物还在的唯一出口**）+ **本轮 `artifact` 事件**，两个来源在 `artifactPanelModel.ts#mergeArtifactPanelItems` **一处合流**（倒序对齐 + 按 `artifactId` 去重、保留带 `createdAt` 的服务端那一份）；产物卡两个按钮解禁 —— 「预览」判据 `previewAvailability`（`none` 与体积超限**都只给下载**，`子方案④` §九）、「下载」与弹层标题栏共用 `useArtifactDownload`；「谁在预览」住 `stores/artifactPreview.ts`（点它的地方在四个层级之下），弹层摆 `.chat` **之外**；`useChatStream` 收尾多失效一次产物列表。★ **P0-3 的可端测里程碑到了**：浏览器里能亲手跑通「派活 → 过程可见 → 预览/下载产物 → 停止 → 恢复」（步骤见 README「浏览器端测 · 任务型对话页」）',
     address,
   })
   logger.info(

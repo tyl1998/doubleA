@@ -797,11 +797,13 @@
   .page__head-actions { margin-left: 0; }
 }
 
-/* =========================== 对话页（P0-1-32；P0-1-34 加侧栏） ================= */
+/* =========================== 对话页（P0-1-32；P0-1-34 加侧栏；P0-3-11 第三列） = */
 /* 原型（`design/chat.html`）是「会话侧栏 + 消息流 + 产物面板」三栏（`03` §4.1）。
-   本批落**左栏 + 中栏**：侧栏好了（P0-1-34），产物面板属 P0-3（TaskAgent）。
-   刻意**不**先摆一个空的第三列 —— 那会让"消息流该占多宽"变成一个看不出来的问题，
-   而 P0-3 到时只需在这里把 `grid-template-columns` 补成原型那句。 */
+   P0-1-34 落了左栏、P0-1-32 落了中栏，第三列在 **P0-3-11** 才出现（产物收集 / 列表 /
+   预览三条链齐了才可能有真内容）。
+   ⚠️ 第三列**不是常驻占位**：只有 TaskAgent 的那一页会拿到 `chat--with-panel`
+   （判据在 `features/chat/artifactPanelModel.ts`，不在 CSS 里）。摆一个永远空的第三列会
+   让 ChatBot 平白少 312px 的消息流宽度，而这"看起来只是窄了一点"、不报任何错。 */
 .chat {
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
@@ -809,6 +811,41 @@
      —— 底部那条滚动条会一直露着，输入区永远压不到屏幕底边。
      ⚠️ `.page` 的 padding 在 1024px 断点里变了（`sp-6` → `sp-5`），那里的覆盖见文件末的断点块。 */
   height: calc(100vh - var(--topbar-h) - var(--sp-6) - var(--sp-8));
+}
+
+/* TaskAgent 的三栏（`design/styles/components.css` 的 `.chat--with-panel` 逐字一致） */
+.chat--with-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w); }
+
+/* ── 产物面板（P0-3-11；原型 `design/styles/components.css` 的 `.panel*`）────────
+   与 `.sidebar` 同构（头 + 可滚动的体），只是贴在右边。 */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--rule-strong);
+}
+.panel__head { padding: var(--sp-4); border-bottom: 1px solid var(--rule); }
+.panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+/* ⚠️ 这条断点**必须住在这里**（base 规则之后），不能搬去文件前面那个「响应式」块：
+   CSS 里同特异度的两条规则**由源码顺序**决定谁赢，而那个块在对话页段**之前** ⇒
+   搬过去就会被上面的 `.chat--with-panel` 覆盖掉（静默、不报错、只在窄屏看得出）。
+   —— 这个文件里已经有一处同样的坑（`@media (max-width:1024px)` 块里那两条 `.chat`，
+   它们的 `height` 与 `grid-template-columns` 如今被后面 base 规则盖住了），此处不重复它。
+   ≥1280px 才配第三列（原型 `design/styles/components.css` 同款）：窄屏上产物面板会把消息流
+   挤到 700px 以下。⚠️ 「能预览产物」这条能力**没有消失** —— 消息流里的产物卡仍然带
+   [预览][下载]（它们就在这一页上），面板只是那一列不显示。 */
+@media (max-width: 1280px) {
+  .chat--with-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+  .chat--with-panel .panel { display: none; }
 }
 
 /* ── 会话侧栏（P0-1-34）───────────────────────────────────────────────────── */

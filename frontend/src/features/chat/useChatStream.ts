@@ -64,6 +64,7 @@ import {
   streamChat,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
+import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
 import { useChatStreamStore, type DisconnectState } from '../../stores/chatStream.js'
 import { decideAlign, type AlignOutcome } from './alignHistory.js'
 import { createSendGate } from './composerState.js'
@@ -309,6 +310,13 @@ export function useChatStream(
           // 放在 `finally` 而不是 `done` 那一支：中断/断线的一轮**也可能落库**，
           // 而"没落库"时多拉一次列表的代价只是一次几十行的查询（`03` §五 的 `done` 行是下限，不是上限）。
           void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+          // 产物面板（P0-3-11）也是"这一轮真的发生过 ⇒ 库里可能多了几行"。它**没有**
+          // `last_message_at` 那种排序副作用，但面板上那一条要从"刚生成"变成真正的时刻读数
+          // （`artifactPanelModel#artifactTimeText` 的 `live` 那一档），靠的就是这份列表重取回来。
+          // ⚠️ 非 TaskAgent 时这个查询**根本没建**（`enabled: false`）⇒ 这一行是空转、
+          // 不多打请求；写在这里而不是在 TaskAgent 分支里，是为了让"一轮结束要失效什么"
+          // 只出现在一个地方（漏一处就是这个面板停在旧数据上的那种静默错）。
+          void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(targetId) })
         }
       } finally {
         sendGate.leave()

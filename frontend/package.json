@@ -14,6 +14,7 @@
     "verify:admin-ui": "node --import tsx scripts/verify-admin-ui.mjs",
     "verify:mcp-ui": "node --import tsx scripts/verify-mcp-ui.mjs",
     "verify:artifact-preview": "node --import tsx scripts/verify-artifact-preview.mjs",
+    "verify:artifact-panel": "node --import tsx scripts/verify-artifact-panel.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

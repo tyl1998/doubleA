@@ -44,6 +44,8 @@ import { useFeedback } from '../../app/feedback.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteConversationModal } from './DeleteConversationModal.js'
 import { groupConversationViews, newConversationAction, normalizeTopicDraft } from './conversationList.js'
+// P0-3-11：节拍器提为公共 hook（产物面板要用同一份间隔），见 `useMinuteTick.ts` 文件头
+import { useMinuteTick } from './useMinuteTick.js'
 
 export interface ConversationSidebarProps {
   agentId: string
@@ -60,26 +62,6 @@ export interface ConversationSidebarProps {
    * （否则页面会停在一个已经不存在的会话上，历史查询立刻 404）。
    */
   onDeleted: (removed: RemoveConversationResult) => void
-}
-
-/**
- * "现在"的节拍器（60s 一跳）。
- *
- * 相对时间读数（"3 分钟前"）**不会自己更新** —— 没有这个 tick，用户把页面开着一小时后
- * 看到的还是"3 分钟前"。60s 与读数的最小粒度一致（分档里最小的变化就是"刚刚 → N 分钟前"）；
- * 比它更细只会白白重渲染，比它更粗就会出现"明明过了两分钟还写着刚刚"。
- */
-function useMinuteTick(): Date {
-  const [now, setNow] = useState(() => new Date())
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setNow(new Date())
-    }, 60_000)
-    return () => {
-      window.clearInterval(timer)
-    }
-  }, [])
-  return now
 }
 
 export function ConversationSidebar({

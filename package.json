@@ -28,6 +28,7 @@
     "verify:admin-ui": "pnpm --filter @doubulea/frontend verify:admin-ui",
     "verify:mcp-ui": "pnpm --filter @doubulea/frontend verify:mcp-ui",
     "verify:artifact-preview": "pnpm --filter @doubulea/frontend verify:artifact-preview",
+    "verify:artifact-panel": "pnpm --filter @doubulea/frontend verify:artifact-panel",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",
     "db:deploy": "pnpm --filter @doubulea/backend db:deploy",
