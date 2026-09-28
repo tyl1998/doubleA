@@ -17,6 +17,7 @@
 |------|------|
 | **一键起整套**（`pnpm dev` / `pnpm dev:stop`） | 本文 **§一**（脚本 `infra/scripts/dev-run.sh` / `dev-stop.sh`；日志 `.dev-logs/`、pid `.pids/`） |
 | 环境准备 / 起依赖 / 起后端 / 起前端 / 常用命令 | 本文 **§一** |
+| **沙箱 egress 代理**（`egress-up.sh` / `egress-down.sh` / `egress-proxy.mjs` / `egress-probe.mjs`，均在 `infra/scripts/`） | 本文 **§一**（一键起整套）+「阶段三出口验收」前置 ③ |
 | **浏览器端测 · MCP**（阶段二唯一浏览器端测点，**待人工取证**） | 本文 **§一** |
 | **阶段一出口验收（人工）** / **阶段二出口验收（人工）** / **阶段三出口验收（人工 · P0-3-13 收尾）** | 本文 **§一**（**未验，待人工执行**；⚠️ 阶段三那条自带环境前置，见该节开头） |
 | P0-1 的五个浏览器端测小节（登录 / 智能体 / 对话 / 知识库 / 管理页） | → `归档/README-浏览器端测-P0-1.md` |
@@ -73,8 +74,23 @@ pnpm dev:stop     # 收掉后端 + 前端（依赖服务留着）；--infra 连�
 > 步骤是**幂等**的（依赖服务已在跑就跳过；迁移/种子本来就幂等）⇒ 反复跑这条命令是安全的。
 > 常用开关：`--no-infra`（依赖已在跑）/ `--no-db`（不想每次跑迁移种子）/ `--force`（已在跑就重启）/
 > `--timeout N`；完整清单 `bash infra/scripts/dev-run.sh --help`。
-> ⚠️ 它**不含沙箱镜像** —— 要往沙箱派活仍需先 `pnpm sandbox:build`（见下「构建沙箱镜像」与「阶段三出口验收」前置 ②③）。
+> ⚠️ 它**不含沙箱镜像、也不含 egress 代理** —— 要往沙箱派活还得另做三件事（见「阶段三出口验收」前置 ②③）：
+> ① `pnpm sandbox:build`（把镜像推到版本线对应的 tag，并写回 `infra/.env`）；② `bash infra/scripts/egress-up.sh --write-env`
+> （沙箱出公网的代理，**必须在后端起来之后**再跑）；③ 一个**有额度**的模型池。三者缺一，界面上的症状各不相同。
 > 想分步做、或想在前台看热更新输出，就往下看各小节，用 `pnpm infra:up` / `pnpm dev:backend` / `pnpm dev:frontend`。
+
+### 沙箱出公网的代理（只有跑沙箱 / 阶段三出口验收才需要）
+
+```bash
+bash infra/scripts/egress-up.sh --write-env   # 起代理（两条腿）+ 把地址写进 infra/.env
+bash infra/scripts/egress-down.sh             # 收工（只删代理容器，不动沙箱网络）
+```
+
+> 沙箱容器挂在 `doubulea-sandbox`（`Internal: true`）上**没有公网路由** ⇒ 出公网**只可能**经这个代理；
+> `SANDBOX_EGRESS_PROXY_URL` 留空时 `ensureSandbox()` 会**直接拒绝**派活（不是"卡住不动"）。
+> ⚠️ **顺序**：那张网由**后端启动时**的 listener 建出来 ⇒ 先 `pnpm dev`（看到「沙箱状态」那行），再跑本脚本。
+> 白名单默认自动取库里 `enabled` 的 `model_providers` 主机名（**空白名单 = 拒启**，不是全放行）。
+> 完整形态要求（两条腿 / 无鉴权）、验证三条、macOS 两堵墙，见「阶段三出口验收」前置 ③。
 
 ### 起依赖服务（postgres / redis / minio）
 
@@ -1333,27 +1349,46 @@ srv.listen(0, "127.0.0.1", () => console.log("AUTHMCPURL=http://127.0.0.1:" + sr
 |---|--------|--------|
 | ① | `pnpm infra:up && pnpm db:deploy && pnpm db:seed && pnpm db:partitions` | 依赖 + 表 + 两个种子账号（**记下 admin 的初始密码**）；⭐ `db:partitions` 是为 `usage_records`（R3 要查它） |
 | ② | ⭐ `pnpm sandbox:build -- --registry https://registry.npmmirror.com`，把末尾打印的两行写回 `infra/.env`（`SANDBOX_IMAGE` / `SANDBOX_IMAGE_BASE`） | **当前 `infra/.env` 里仍是 `:2`**，而带"MCP 桥扩展**真实现**"的是 **`:3`**（P0-3-9b）⇒ 不重建的症状最隐蔽：**后端日志一条错都没有**，只是"模型从来不调 MCP 工具" |
-| ③ | ⭐ 准备一个 **egress 正向代理**，把地址填进 `SANDBOX_EGRESS_PROXY_URL` | 它是容器出公网的**唯一**出口（出口①）。⚠️ **仓库不提供代理**（`子方案③` §四 3 写明"代理本身不属 P0 加固范围"）；留空 ⇒ `ensureSandbox()` **显式拒绝**、一发消息就是错误卡（不是"卡住不动"）。形态要求见下面「③ 的代理要什么」 |
+| ③ | ⭐ 准备一个 **egress 正向代理**，把地址填进 `SANDBOX_EGRESS_PROXY_URL` | 它是容器出公网的**唯一**出口（出口①）。⚠️ **仓库不提供生产级代理**（`子方案③` §四 3 写明"代理本身不属 P0 加固范围"），但**自 2026-09-28 起有一个开发用最小实现**（`egress-up.sh`，见下面「③ 的代理」）；留空 ⇒ `ensureSandbox()` **显式拒绝**、一发消息就是错误卡（不是"卡住不动"） |
 | ④ | 让模型池**可达**：真 Provider，或一台**假 LLM**（它同样要经 ③ 被容器摸到） | 真模型**不会主动写文件**、也不会主动去调刚注册的工具 ⇒ 要么用假 LLM，要么给一句**明确到不能再明确**的提示词（同「浏览器端测 · 任务型对话页」前置 3） |
 | ⑤ | 一个 `TASK_AGENT` 智能体（「智能体」页建，或 curl `POST /api/agents`） | 沙箱路径**只**由库里的 `agent.type` 分流（`resolveChatProducer`），**不加前端参数、也不信前端参数**；⚠️ 类型在库里，不在请求里 |
 | ⑥ | 起后端（**13000**）与前端（**5174**） | R1~R6 大部分在浏览器里看；⚠️ 端口的唯一真相来源是 `infra/.env` |
 
 ```bash
-# ③ 的代理要什么：形状上只有两条要求（本仓不提供实现，怎么起由你定）
+# ③ 的代理：形状上只有两条要求
 #   · **两条腿** —— 一条挂在 `doubulea-sandbox`（`Internal: true`，容器够得着它），
 #     另一条挂在**能上网**的网络（默认 bridge 即可）。只有一条腿的代理，在 internal 网络上等于没有；
 #   · **无鉴权**（或把凭据一并写进 SANDBOX_EGRESS_PROXY_URL）—— 注入进容器 env 的是 `HTTP_PROXY`/`HTTPS_PROXY` 的裸 URL。
-# ⇒ 一个最小形态：随便起一台 HTTP 正向代理容器（squid 之类），再把它连进沙箱网络：
-docker network connect doubulea-sandbox <你的代理容器名>
-#   然后 SANDBOX_EGRESS_PROXY_URL=http://<它在沙箱网里的地址>:<port>
+#
+# ✅ 本仓自带一个**开发用**最小实现（零依赖、离线可跑）：
+bash infra/scripts/egress-up.sh --write-env   # 起代理 + 写进 infra/.env；白名单自动取库里 enabled 的 model_providers
+bash infra/scripts/egress-down.sh             # 收工（只删代理容器，不动沙箱网络）
+#   · 两条腿、**白名单**（`host` / `host:port` / `*.host`）—— 因为出口① 的定义是"只放行模型池 baseURL"，
+#     而现成的 squid/tinyproxy 默认全放行，等于把 internal bridge 的设计意图作废；
+#   · **空白名单 = 拒启**（不是全放行）；要加目标 `--allow api.example.com`，临时排查 `--allow-all`；
+#   · ⚠️ **顺序**：`doubulea-sandbox` 由**后端启动时**的 listener 建出来 ⇒ **先 `dev-run.sh`，再 `egress-up.sh`**
+#     （网不在时会直接告诉你，别手工 `docker network create` —— 后端会校验标签与 `Internal` 标志）。
+#
+# 手工起也行（形状一样）：随便一台 HTTP 正向代理容器，再 `docker network connect doubulea-sandbox <名字>`，
+#   然后 SANDBOX_EGRESS_PROXY_URL=http://<它在沙箱网里的名字>:<port>
 #
 # ⚠️ macOS / OrbStack 上还有**两堵墙**（都是 P0-3-3 实测，不是推测）：
 #   a. 容器**到不了 macOS 宿主**（ENETUNREACH —— bridge 网关在 OrbStack 的 Linux VM 里）
 #      ⇒ 假 LLM 若跑在宿主上，得让**代理那台容器**去摸（它另一条腿在默认 bridge 上，通常
-#      `host.docker.internal` 通；不通就用 `docker network inspect bridge` 的网关地址）。
+#      `host.docker.internal` 通）。⚠️ 因此那条 provider 的 base_url 要写
+#      `http://host.docker.internal:<port>/v1` 而**不是** `127.0.0.1:<port>` ——
+#      后者在代理容器里指的是它自己的回环（`egress-up.sh` 会跳过并告警这类 provider）。
 #   b. 出口②（容器 → 后端 listener）同理够不着宿主 ⇒ 想在本机跑**附加①**，必须显式给一个中转：
 #      把 `SANDBOX_BACKEND_URL` 指到那个中转、`SANDBOX_LISTEN_HOST=0.0.0.0`（详见「沙箱安全与网络」）。
 #      ⚠️ 只是跑 R1~R6（不涉 MCP）的话，**不需要**这一条。
+
+# 验证代理（三条，反例比正例重要 —— 白名单的坏法是"看起来配了、其实全通"）。
+# ⚠️ 必须用本仓的 egress-probe.mjs 而不是 `fetch`：Node 的**全局 fetch 不读代理环境变量**
+#    （undici 默认 dispatcher 是裸 Agent）⇒ 直接 fetch 会把"代理不工作"误报成结论。
+#    沙箱里能通是因为 pi 装了 `undici.EnvHttpProxyAgent`。三条的期望值：
+#      ① 放行 → OK（guji 那个 401/402 = 网络通、只是没额度/没带 key）
+#      ② 白名单外的域名 → BLOCKED 403
+#      ③ 不挂代理 → FAIL（证明 internal 网真的没路由 ⇒ ① 的通不是"本来就通"）
 ```
 
 **R1~R6 怎么跑 / 看什么**

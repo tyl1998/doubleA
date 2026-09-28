@@ -19,6 +19,8 @@
     "shared": "pnpm --filter @doubulea/shared",
     "dev": "bash infra/scripts/dev-run.sh",
     "dev:stop": "bash infra/scripts/dev-stop.sh",
+    "egress:up": "bash infra/scripts/egress-up.sh",
+    "egress:down": "bash infra/scripts/egress-down.sh",
     "dev:backend": "pnpm --filter @doubulea/backend dev",
     "start:backend": "pnpm --filter @doubulea/backend start",
     "dev:frontend": "pnpm --filter @doubulea/frontend dev",
