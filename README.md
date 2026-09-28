@@ -15,6 +15,7 @@
 
 | 内容 | 位置 |
 |------|------|
+| **一键起整套**（`pnpm dev` / `pnpm dev:stop`） | 本文 **§一**（脚本 `infra/scripts/dev-run.sh` / `dev-stop.sh`；日志 `.dev-logs/`、pid `.pids/`） |
 | 环境准备 / 起依赖 / 起后端 / 起前端 / 常用命令 | 本文 **§一** |
 | **浏览器端测 · MCP**（阶段二唯一浏览器端测点，**待人工取证**） | 本文 **§一** |
 | **阶段一出口验收（人工）** / **阶段二出口验收（人工）** / **阶段三出口验收（人工 · P0-3-13 收尾）** | 本文 **§一**（**未验，待人工执行**；⚠️ 阶段三那条自带环境前置，见该节开头） |
@@ -60,6 +61,20 @@ pnpm --filter @doubulea/frontend build     # → frontend/dist（纯静态）
 ```
 
 > 后端/前端 dev 命令见各包 `scripts`（本机脚本一律走 Node / 平台原生脚本，不依赖 Git Bash 工具链）。
+
+### 一键起整套（推荐）
+
+```bash
+pnpm dev          # 依赖服务 → 建表/种子 → 后端(13000) → 前端(5174)：一条命令到浏览器能打开
+pnpm dev:stop     # 收掉后端 + 前端（依赖服务留着）；--infra 连依赖一起停
+```
+
+> 后端 / 前端在**后台**跑：日志 `.dev-logs/{backend,frontend,db,seed}.log`，pid `.pids/`（两目录都在 `.gitignore` 里）。
+> 步骤是**幂等**的（依赖服务已在跑就跳过；迁移/种子本来就幂等）⇒ 反复跑这条命令是安全的。
+> 常用开关：`--no-infra`（依赖已在跑）/ `--no-db`（不想每次跑迁移种子）/ `--force`（已在跑就重启）/
+> `--timeout N`；完整清单 `bash infra/scripts/dev-run.sh --help`。
+> ⚠️ 它**不含沙箱镜像** —— 要往沙箱派活仍需先 `pnpm sandbox:build`（见下「构建沙箱镜像」与「阶段三出口验收」前置 ②③）。
+> 想分步做、或想在前台看热更新输出，就往下看各小节，用 `pnpm infra:up` / `pnpm dev:backend` / `pnpm dev:frontend`。
 
 ### 起依赖服务（postgres / redis / minio）
 
@@ -175,7 +190,7 @@ docker ps -a --filter label=doubulea.role=sandbox        # 应看到刚造的那
 docker volume ls --filter label=doubulea.role=sandbox    # 应看到刚造的卷
 
 # ② 起后端（把窗口调小，方便看一轮）
-#    需先起依赖：pnpm dev:infra（或 infra 下的 compose）
+#    需先起依赖：pnpm infra:up（或 infra 下的 compose）
 cd backend && LOG_LEVEL=info SANDBOX_REAP_INTERVAL_SEC=5 SANDBOX_IDLE_TTL_MIN=1 \
   npx tsx src/index.ts
 # 日志里应出现两行（启动阶段）：
@@ -407,7 +422,7 @@ docker rm -f sandbox-rpc-probe
 
 ```bash
 # ① 起依赖 + 起后端（务必看启动日志里那两行「沙箱状态 / 沙箱启动对账完成」）
-pnpm dev:infra
+pnpm infra:up
 cd backend && node --import tsx src/index.ts
 
 # ② 造一个 TASK_AGENT 智能体（⚠️ 类型在库里，不在请求里）
