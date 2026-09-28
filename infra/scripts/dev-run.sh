@@ -247,7 +247,10 @@ fi
 step "③ 后端（tsx watch）→ http://127.0.0.1:${BACKEND_PORT}"
 
 : >"$LOG_DIR/backend.log"
-nohup pnpm dev:backend >>"$LOG_DIR/backend.log" 2>&1 &
+# ⚠️ 顺手接走 stdin（</dev/null）：vite 把 stdin 的 EOF 当作 Ctrl+D，stdin 一关它就退出
+#    （症状 = 日志 "VITE ready" 之后紧跟 [ELIFECYCLE] Command failed）。backend 是 tsx watch、
+#    不理会 stdin，一并接走以保持一致。
+nohup pnpm dev:backend >>"$LOG_DIR/backend.log" 2>&1 </dev/null &
 BACKEND_PID=$!
 echo "$BACKEND_PID" >"$PID_DIR/backend.pid"
 info "已后台启动（pid ${BACKEND_PID}，日志 ${LOG_DIR}/backend.log）"
@@ -267,7 +270,7 @@ step "④ 前端（vite）→ http://localhost:${FRONTEND_PORT}"
 
 : >"$LOG_DIR/frontend.log"
 VITE_DEV_PROXY_TARGET="http://127.0.0.1:${BACKEND_PORT}" \
-  nohup pnpm dev:frontend >>"$LOG_DIR/frontend.log" 2>&1 &
+  nohup pnpm dev:frontend >>"$LOG_DIR/frontend.log" 2>&1 </dev/null &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" >"$PID_DIR/frontend.pid"
 info "已后台启动（pid ${FRONTEND_PID}，日志 ${LOG_DIR}/frontend.log）"
