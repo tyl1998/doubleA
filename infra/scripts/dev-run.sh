@@ -222,6 +222,8 @@ if [ "$DO_DB" -eq 1 ]; then
   info 'db:seed（幂等：已存在的账号只跳过、绝不改密码）'
   pnpm db:seed >"$LOG_DIR/seed.log" 2>&1 || {
     tail -20 "$LOG_DIR/seed.log" >&2
+    warn '本仓高频原因：backend/generated/prisma 是"半生成"态（上次 prisma generate 被中断过）'
+    warn '  修法：rm -rf backend/generated/prisma && pnpm db:generate，再重跑本脚本'
     fail "pnpm db:seed 失败，完整日志 $LOG_DIR/seed.log"
   }
   ok '种子完成'
@@ -277,6 +279,8 @@ else
   printf '\n%s--- frontend.log 末尾 ---%s\n' "$C_D" "$C_X"
   tail -25 "$LOG_DIR/frontend.log"
   printf '\n'
+  warn "后端这时候已经起来了、还在后台跑（pid $(cat "$PID_DIR/backend.pid" 2>/dev/null)）"
+  warn "整体收掉：bash infra/scripts/dev-stop.sh"
   fail "前端 ${TIMEOUT_SEC}s 内没起来（5174 被占 / 依赖没装？见上面的日志）"
 fi
 
