@@ -121,6 +121,17 @@ fi
 command -v pnpm >/dev/null 2>&1 || fail '找不到 pnpm（先装：corepack enable / npm i -g pnpm）'
 ok "pnpm $(pnpm --version)"
 
+# Node 版本闸门（本仓 engines: node >=22）。Prisma 7 的 @prisma/dev 依赖 ESM-only 的
+# zeptomatch，Node 20 的 require() 会以 ERR_REQUIRE_ESM 崩在 ② 的 `pnpm db:deploy`，
+# 而错误被埋在 .dev-logs/db.log 里、表层只看到"启动失败"。在这里显式拦一道，给可执行的修法。
+NODE_MAJOR="$(node -v 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')"
+[ -n "$NODE_MAJOR" ] || fail '找不到 node（本仓要求 Node ≥22）。用 nvm：nvm install 22 && nvm use 22'
+if [ "$NODE_MAJOR" -lt 22 ]; then
+  fail "Node 版本过低：当前 $(node -v)，本仓要求 ≥22。Prisma 7 会在 db:deploy 以 ERR_REQUIRE_ESM 崩溃。\
+切到 22 再来：nvm install 22 && nvm use 22（永久：nvm alias default 22）"
+fi
+ok "Node $(node -v)"
+
 if [ "$DO_INFRA" -eq 1 ]; then
   [ -n "$DOCKER_BIN" ] || fail '找不到 docker（OrbStack / Docker Desktop 装了吗）'
   "$DOCKER_BIN" version --format '{{.Server.Version}}' >/dev/null 2>&1 \
