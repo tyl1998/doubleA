@@ -193,6 +193,24 @@ const agentModelIdSchema = z
   .string({ required_error: '请选择模型' })
   .uuid('模型 ID 不是合法 UUID')
 
+/** 模型池上限（防误操作；池是"对话时可选的模型集合"，几十个足够，不是存储约束） */
+export const AGENT_MODEL_POOL_MAX = 50
+
+/**
+ * 智能体的**模型池**（`modelIds`）——对话时可在其中选具体模型。
+ *
+ * · **非空**：一个没有任何可选模型的智能体发不出消息；
+ * · **必须包含默认模型**（`modelId`）：默认模型是"对话不指定模型时走的那一个"，
+ *   它天然是池成员。这条跨字段约束在**同一请求同时给了两者**时由 schema 拦
+ *   （见 {@link createAgentBodySchema} / {@link updateAgentBodySchema} 的 superRefine）；
+ *   只给其一时由服务层结合库里现状补齐（服务层会把新默认模型自动并入池）。
+ * · **不在 schema 层去重**：服务层用 Set 去重即可，重复项最多是前端多选了一次。
+ */
+const agentModelPoolSchema = z
+  .array(agentModelIdSchema)
+  .min(1, '请至少选择一个模型')
+  .max(AGENT_MODEL_POOL_MAX, `模型池最多 ${AGENT_MODEL_POOL_MAX} 个模型`)
+
 // ───────────────────────────── 补默认值（读取端唯一入口） ─────────────────────────────
 
 /**
@@ -240,6 +258,24 @@ export const agentComponentRefSchema = z.object({
 export type AgentComponentRef = z.infer<typeof agentComponentRefSchema>
 
 /**
+ * 模型池里的**一个可选模型**（对话页的模型选择器逐项渲染）。
+ *
+ * `available` = 模型与其 Provider 都启用（与 `GET /api/models/available` 同口径）。
+ * 停用的模型仍留在池投影里（`available:false`），前端把它置灰而不是让它凭空消失
+ * —— 与 `modelAvailable` 对默认模型的处理同款：让用户看得见"它被停用了"，而不是"少了一个"。
+ */
+export const agentModelOptionSchema = z.object({
+  modelId: z.string(),
+  /** 上游型号名（会原样放进请求体的 `model` 字段） */
+  modelName: z.string(),
+  /** 模型别名（界面上给业务同学看的名字） */
+  modelLabel: z.string(),
+  /** 现在能否直接用于对话（`models.enabled && model_providers.enabled`） */
+  available: z.boolean(),
+})
+export type AgentModelOption = z.infer<typeof agentModelOptionSchema>
+
+/**
  * 智能体（**列表 / 详情 / 建 / 改共用的唯一投影**，见文件头 ②）。
  *
  * 几个字段的存在理由：
@@ -260,13 +296,28 @@ export const agentItemSchema = z.object({
   systemPrompt: z.string().nullable(),
   openingRemarks: z.string().nullable(),
   guideQuestions: z.array(z.string()),
-  modelId: z.string(),
-  /** 上游型号名（会原样放进请求体的 `model` 字段） */
-  modelName: z.string(),
-  /** 模型别名（界面上给业务同学看的名字） */
-  modelLabel: z.string(),
-  /** 绑定模型当前**可直接用于对话**吗（`models.enabled && model_providers.enabled`，与可选列表同口径） */
+  /**
+   * 绑定的模型 id。**可空**：删模型商/删模型会把引用它的智能体自动解绑（`schema.prisma`
+   * 的 `agents.model_id` = `onDelete: SetNull`），此时为 `null` ⇒ 「未绑定模型」，
+   * 需重新绑定后才能对话。创建时必填（{@link createAgentBodySchema}），只有"被动解绑"会变空。
+   */
+  modelId: z.string().nullable(),
+  /** 上游型号名（会原样放进请求体的 `model` 字段）；未绑定模型时为 `null` */
+  modelName: z.string().nullable(),
+  /** 模型别名（界面上给业务同学看的名字）；未绑定模型时为 `null` */
+  modelLabel: z.string().nullable(),
+  /**
+   * 绑定模型当前**可直接用于对话**吗（`models.enabled && model_providers.enabled`，与可选列表同口径）。
+   * **未绑定模型**（`modelId === null`）时恒为 `false` —— 前端据此提示"去编辑页重新绑定模型"。
+   */
   modelAvailable: z.boolean(),
+  /**
+   * **模型池**：对话时可选的模型集合（`agent_models` 关联）。
+   *
+   * 默认模型（`modelId`）恒为池成员（服务层保证）。发消息时前端可在此选一个具体模型
+   * （`POST /:id/chat` 的 `modelId`）；不选则走默认模型。未绑定模型的旧智能体此处可能为空数组。
+   */
+  models: z.array(agentModelOptionSchema),
   createdBy: z.string(),
   /** 创建者显示名（昵称优先、回落用户名） */
   creatorName: z.string(),
@@ -371,25 +422,41 @@ export type AgentListResult = z.infer<typeof agentListResultSchema>
  * `type` **必填且无默认值**：ChatBot 与 TaskAgent 的运行方式完全不同（RAG 直连 vs 沙箱 ACP），
  * 给一个默认值等于让"忘了传"的调用方建出一个他没想要的东西，而且**建完改不了**（见下）。
  *
- * `modelId` 必填：`agents.model_id` 是 `NOT NULL` + `ON DELETE RESTRICT`
- * —— 一个没有模型的智能体发不出消息，等于一条废记录。
+ * `modelId` 必填：一个没有模型的智能体发不出消息，创建时不允许留空。
+ * （列本身 `onDelete: SetNull` 可空，但那只用于"删模型商/删模型时被动解绑"，
+ * 不是创建入口能表达的状态。）
  * 服务层会校验它"存在 + 启用 + 所属 Provider 也启用 + `type=CHAT`"（`01` §3.2 验收要点）。
  *
  * 三个可省字段（`description` / `icon` / `systemPrompt` / `openingRemarks`）省略与 `null` 同义。
  * `guideQuestions` 省略时取库里的 `[]` 默认值。
  */
-export const createAgentBodySchema = z.object({
-  name: agentNameSchema,
-  description: agentDescriptionSchema.nullish(),
-  icon: agentIconSchema.nullish(),
-  type: z.enum(AGENT_TYPES, {
-    errorMap: () => ({ message: `type 只能是 ${AGENT_TYPES.join('/')}` }),
-  }),
-  systemPrompt: agentSystemPromptSchema.nullish(),
-  openingRemarks: agentOpeningRemarksSchema.nullish(),
-  guideQuestions: guideQuestionsSchema.optional(),
-  modelId: agentModelIdSchema,
-})
+export const createAgentBodySchema = z
+  .object({
+    name: agentNameSchema,
+    description: agentDescriptionSchema.nullish(),
+    icon: agentIconSchema.nullish(),
+    type: z.enum(AGENT_TYPES, {
+      errorMap: () => ({ message: `type 只能是 ${AGENT_TYPES.join('/')}` }),
+    }),
+    systemPrompt: agentSystemPromptSchema.nullish(),
+    openingRemarks: agentOpeningRemarksSchema.nullish(),
+    guideQuestions: guideQuestionsSchema.optional(),
+    modelId: agentModelIdSchema,
+    /**
+     * 模型池（对话时可选）。**可省**：省略时服务层按 `[modelId]` 建池（向后兼容单模型）。
+     * 给了就必须包含 `modelId`（默认模型），见下面的 superRefine。
+     */
+    modelIds: agentModelPoolSchema.optional(),
+  })
+  .superRefine((body, ctx) => {
+    if (body.modelIds !== undefined && !body.modelIds.includes(body.modelId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['modelId'],
+        message: '默认模型必须在模型池中',
+      })
+    }
+  })
 export type CreateAgentBody = z.infer<typeof createAgentBodySchema>
 
 // ───────────────────────────── 改 ─────────────────────────────
@@ -413,7 +480,8 @@ export type CreateAgentBody = z.infer<typeof createAgentBodySchema>
  *   （`03` §4.2 已写明"类型创建后不可改"，而"不可改"必须能**被用户感知到**）。
  *   传同值放行（幂等：前端整表单提交时"没改"不该失败）。
  *
- * · `modelId` **可以改**（换绑模型是正常操作），改的时候走与创建**同一段**可用性校验。
+ * · `modelId` **可以改**（换绑默认模型是正常操作），改的时候走与创建**同一段**可用性校验。
+ * · `modelIds` **可以改**（整体替换模型池）：非空，服务层保证默认模型并入池、逐个校验可用性。
  */
 export const updateAgentBodySchema = z
   .object({
@@ -430,6 +498,8 @@ export const updateAgentBodySchema = z
     /** `[]` = 清空（不是三态，见上） */
     guideQuestions: guideQuestionsSchema.optional(),
     modelId: agentModelIdSchema.optional(),
+    /** 整体替换模型池（非空）；与 `modelId` 的一致性见下方 superRefine 与服务层 */
+    modelIds: agentModelPoolSchema.optional(),
   })
   .refine(
     (body) =>
@@ -441,9 +511,20 @@ export const updateAgentBodySchema = z
       body.systemPrompt !== undefined ||
       body.openingRemarks !== undefined ||
       body.guideQuestions !== undefined ||
-      body.modelId !== undefined,
+      body.modelId !== undefined ||
+      body.modelIds !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
+  .superRefine((body, ctx) => {
+    // 同一请求同时给了默认模型与模型池 ⇒ 默认模型必须在池里（只给其一时由服务层结合库里现状补齐）
+    if (body.modelId !== undefined && body.modelIds !== undefined && !body.modelIds.includes(body.modelId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['modelId'],
+        message: '默认模型必须在模型池中',
+      })
+    }
+  })
 export type UpdateAgentBody = z.infer<typeof updateAgentBodySchema>
 
 // ───────────────────────────── 路径参数与删除结果 ─────────────────────────────

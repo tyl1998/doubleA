@@ -336,6 +336,55 @@ export const modelProviderIdParamsSchema = z.object({
 })
 export type ModelProviderIdParams = z.infer<typeof modelProviderIdParamsSchema>
 
+// ─────────────── 删除前的"被绑定模型"清单 + 删除结果（删模型商自动解绑） ───────────────
+
+/**
+ * `GET /api/model-providers/:id/bound-models` 的一项：该 Provider 下**正被智能体绑定**的一个模型。
+ *
+ * 用于删除弹窗如实列出"删了会解绑哪些"。`agentCount` **只算未软删的在线智能体**
+ * （软删的智能体本就该被视作已解绑，不该再吓唬管理员）。
+ */
+export const providerBoundModelSchema = z.object({
+  modelId: z.string(),
+  /** 模型别名（界面名） */
+  label: z.string(),
+  /** 上游型号名 */
+  modelName: z.string(),
+  /** 绑定这个模型的**在线**智能体数（>0 才会出现在列表里） */
+  agentCount: z.number().int().min(1),
+})
+export type ProviderBoundModel = z.infer<typeof providerBoundModelSchema>
+
+/**
+ * `GET /api/model-providers/:id/bound-models` 的响应。
+ *
+ * `models` 是该 Provider 下**被在线智能体绑定**的模型清单（没有绑定的模型不列）；
+ * `agentTotal` 是受影响的（去重）智能体数 —— 删除后它们会被自动解绑、变为"未绑定模型"。
+ */
+export const providerBoundModelsResultSchema = z.object({
+  providerId: z.string(),
+  models: z.array(providerBoundModelSchema),
+  /** 受影响的在线智能体总数（去重） */
+  agentTotal: z.number().int().min(0),
+})
+export type ProviderBoundModelsResult = z.infer<typeof providerBoundModelsResultSchema>
+
+/**
+ * `DELETE /api/model-providers/:id` 的响应。
+ *
+ * 删 Provider 会级联删其下模型；引用这些模型的在线智能体被**自动解绑**（`model_id` 置空）。
+ * `unboundAgents` 报出被解绑的智能体数，供界面给出有信息量的确认提示。
+ */
+export const removeModelProviderResultSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** 连带删除的模型数 */
+  deletedModels: z.number().int().min(0),
+  /** 被自动解绑（`model_id` 置空）的在线智能体数 */
+  unboundAgents: z.number().int().min(0),
+})
+export type RemoveModelProviderResult = z.infer<typeof removeModelProviderResultSchema>
+
 // ───────────────────── 拉取上游模型列表（P0-1-12） ─────────────────────
 
 /**
@@ -353,6 +402,12 @@ export const remoteModelItemSchema = z.object({
   ownedBy: z.string().nullable(),
   /** 上游给的 Unix 秒级创建时间，缺失为 `null` */
   created: z.number().int().nullable(),
+  /**
+   * 上游给的上下文长度（token）。**只有部分实现返回**（OpenRouter 的 `context_length`、
+   * vLLM 的 `max_model_len` 等）；标准 OpenAI `/models` 不含此字段，缺失为 `null`。
+   * 用于"新建模型时默认填充上下文长度"（读不到就留空，管理员手填）。
+   */
+  contextLength: z.number().int().nullable(),
 })
 export type RemoteModelItem = z.infer<typeof remoteModelItemSchema>
 

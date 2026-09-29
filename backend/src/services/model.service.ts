@@ -58,7 +58,9 @@ import {
   type ModelOption,
   type ModelProviderItem,
   type OffsetPage,
+  type ProviderBoundModelsResult,
   type RemoteModelListResult,
+  type RemoveModelProviderResult,
   type UpdateModelBody,
   type UpdateModelProviderBody,
   type UpstreamProtocol,
@@ -314,47 +316,75 @@ export async function updateModelProvider(
 }
 
 /**
- * 删 Provider（`02` §4.3）。`models.provider_id` 是 `ON DELETE CASCADE`，但
- * `agents.model_id` 是 `ON DELETE RESTRICT`（`02` §三 的删除语义）—— 也就是说
- * **只要 Provider 下有一个模型被 Agent 引用着，级联删除就会撞上外键约束抛 `P2003`**。
+ * 删 Provider 前列出"其下**被在线智能体绑定**的模型"（`GET /api/model-providers/:id/bound-models`）。
  *
- * 所以在删之前先数一遍"被 Agent 引用的模型"，命中就 409 并给数字。
- * 顺带说明：Agent 是**软删**（`agents.deleted_at`），软删的 Agent 仍然占着外键 ——
- * 计数刻意不按 `deletedAt` 过滤，否则会出现"提示说能删、删下去却 500"。
+ * 供删除弹窗如实展示"删了会解绑哪些模型、影响多少智能体"（需求 3）。
+ * 只算 `deletedAt: null` 的在线智能体（软删的本就已解绑，不该再计入吓唬管理员）。
  *
- * @throws {AppError} `NOT_FOUND`(404) 目标不存在 / `CONFLICT`(409) 有模型正被 Agent 使用
+ * @throws {AppError} `NOT_FOUND`(404) Provider 不存在
  */
-export async function removeModelProvider(id: string): Promise<{ id: string; name: string }> {
+export async function getProviderBoundModels(id: string): Promise<ProviderBoundModelsResult> {
+  const db = getPrisma()
+  const provider = await db.modelProvider.findUnique({ where: { id }, select: { id: true } })
+  if (provider === null) throw AppError.notFound('Provider 不存在')
+
+  const models = await db.model.findMany({
+    where: { providerId: id },
+    select: {
+      id: true,
+      label: true,
+      modelName: true,
+      _count: { select: { agents: { where: { deletedAt: null } } } },
+    },
+    orderBy: [{ label: 'asc' }],
+  })
+
+  const bound = models
+    .filter((m) => m._count.agents > 0)
+    .map((m) => ({ modelId: m.id, label: m.label, modelName: m.modelName, agentCount: m._count.agents }))
+  // 每个在线智能体只绑一个模型 ⇒ 各模型的计数之和即受影响智能体总数（无重复计数）
+  const agentTotal = bound.reduce((sum, m) => sum + m.agentCount, 0)
+
+  return { providerId: id, models: bound, agentTotal }
+}
+
+/**
+ * 删 Provider（`02` §4.3；需求 3：自动解绑）。`models.provider_id` 是 `ON DELETE CASCADE`，
+ * `agents.model_id` 是 `ON DELETE SET NULL` —— 于是删 Provider 会连带删掉其下**全部模型**，
+ * 引用这些模型的**在线**智能体被 DB 自动解绑（`model_id` 置空）、变为"未绑定模型"。
+ *
+ * 不再像旧版那样因"有模型被引用"而 409 拦截：现在删除照常进行，只是把受影响的模型数与
+ * 被解绑的在线智能体数如实回报给界面（弹窗已提前用 {@link getProviderBoundModels} 列出清单）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 目标不存在
+ */
+export async function removeModelProvider(id: string): Promise<RemoveModelProviderResult> {
   const db = getPrisma()
   const target = await db.modelProvider.findUnique({
     where: { id },
-    select: { id: true, name: true },
+    select: { id: true, name: true, _count: { select: { models: true } } },
   })
   if (target === null) throw AppError.notFound('Provider 不存在')
 
-  const referencedModels = await db.model.count({
-    where: { providerId: id, agents: { some: {} } },
+  // 删除前数一遍"会被自动解绑的在线智能体"（删除后 SetNull 已生效，就数不到了）
+  const unboundAgents = await db.agent.count({
+    where: { deletedAt: null, model: { providerId: id } },
   })
-  if (referencedModels > 0) {
-    throw AppError.conflict(
-      `该 Provider 下有 ${referencedModels} 个模型正被 Agent 使用，无法删除。请先删除或改绑这些 Agent`,
-    )
-  }
+  const deletedModels = target._count.models
 
   try {
-    // 无论有没有模型都走同一句：schema 的级联会连带删掉它下面的 models（此时已确认无人引用）
+    // 级联：其下 models 随 Provider 删除，引用这些模型的 agent 由 ON DELETE SET NULL 自动解绑
     await db.modelProvider.delete({ where: { id } })
   } catch (error) {
     if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('Provider 不存在')
-    // `P2003` = 外键约束失败：理论上已被上面的检查拦住，留作并发兜底（换成可读文案而不是 500）
-    if (hasPrismaCode(error, 'P2003')) {
-      throw AppError.conflict('该 Provider 下的模型正被其他数据引用，无法删除')
-    }
     throw error
   }
 
-  getLogger().info({ providerId: id, name: target.name }, '已删除模型 Provider（其下模型级联删除）')
-  return { id: target.id, name: target.name }
+  getLogger().info(
+    { providerId: id, name: target.name, deletedModels, unboundAgents },
+    '已删除模型 Provider（其下模型级联删除，引用它们的在线智能体已自动解绑）',
+  )
+  return { id: target.id, name: target.name, deletedModels, unboundAgents }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -376,11 +406,15 @@ const MODEL_MANAGE_SELECT = {
   type: true,
   maxContext: true,
   supportsVision: true,
+  supportsReasoning: true,
   enabled: true,
   createdAt: true,
   updatedAt: true,
   provider: { select: { name: true, enabled: true } },
-  _count: { select: { agents: true } },
+  // 只算**在线**智能体（未软删）：软删的智能体删除时已把 model_id 置空、不再占用模型；
+  // 但为兼容历史软删行（迁移前置空逻辑上线前留下的），这里显式过滤 deletedAt: null，
+  // 保证"删了智能体、模型就不再显示被绑定"（删智能体自动解绑）。
+  _count: { select: { agents: { where: { deletedAt: null } } } },
 } as const
 
 /** {@link MODEL_MANAGE_SELECT} 的产物形态 */
@@ -392,6 +426,7 @@ interface ModelRow {
   type: ModelItem['type']
   maxContext: number | null
   supportsVision: boolean
+  supportsReasoning: boolean
   enabled: boolean
   createdAt: Date
   updatedAt: Date
@@ -408,6 +443,7 @@ const MODEL_OPTION_SELECT = {
   type: true,
   maxContext: true,
   supportsVision: true,
+  supportsReasoning: true,
   provider: { select: { name: true } },
 } as const
 
@@ -420,6 +456,7 @@ interface ModelOptionRow {
   type: ModelOption['type']
   maxContext: number | null
   supportsVision: boolean
+  supportsReasoning: boolean
   provider: { name: string }
 }
 
@@ -434,6 +471,7 @@ function toModelItem(row: ModelRow): ModelItem {
     type: row.type,
     maxContext: row.maxContext,
     supportsVision: row.supportsVision,
+    supportsReasoning: row.supportsReasoning,
     enabled: row.enabled,
     agentCount: row._count.agents,
     createdAt: row.createdAt.toISOString(),
@@ -451,6 +489,7 @@ function toModelOption(row: ModelOptionRow): ModelOption {
     type: row.type,
     maxContext: row.maxContext,
     supportsVision: row.supportsVision,
+    supportsReasoning: row.supportsReasoning,
   }
 }
 
@@ -548,6 +587,7 @@ export async function createModel(input: CreateModelBody): Promise<ModelItem> {
         // 显式写出两个默认值：DB 默认也是 false/true，但"新模型默认启用、默认不支持图片"
         // 属于契约，不该藏在迁移里（与 createModelProvider 同款理由）
         supportsVision: input.supportsVision ?? false,
+        supportsReasoning: input.supportsReasoning ?? false,
         enabled: input.enabled ?? true,
       },
       select: MODEL_MANAGE_SELECT,
@@ -640,6 +680,7 @@ export async function updateModel(id: string, input: UpdateModelBody): Promise<M
         // 三态落点：undefined = 不带这一列（不动）；null = 显式清空；number = 设置
         ...(input.maxContext === undefined ? {} : { maxContext: input.maxContext }),
         ...(input.supportsVision === undefined ? {} : { supportsVision: input.supportsVision }),
+        ...(input.supportsReasoning === undefined ? {} : { supportsReasoning: input.supportsReasoning }),
         ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
       },
       select: MODEL_MANAGE_SELECT,
@@ -662,12 +703,15 @@ export async function updateModel(id: string, input: UpdateModelBody): Promise<M
 /**
  * 删模型（`DELETE /api/models/:id`，仅 ADMIN）。
  *
- * `agents.model_id` 是 `ON DELETE RESTRICT`，所以在删之前先数一遍引用并给 409 + 数字
- * （而不是撞外键抛 500）。计数口径与 `ModelItem.agentCount` 一致：**含软删的 Agent** ——
- * `agents.deleted_at` 非空的记录照样占着外键，按 `deletedAt` 过滤会出现
- * "界面上显示 0 个引用、删下去却 500"。
+ * `agents.model_id` 现在是 `ON DELETE SET NULL`：即便有智能体引用，删模型也会把它们自动解绑
+ * （不会撞外键）。但对**在线**智能体来说，"悄悄把模型删了、它下次发消息才发现没模型"体验很差，
+ * 所以仍在删之前数一遍**在线**引用并给 409 + 数字（软删的智能体不算 —— 它们本就已解绑/将被 SetNull）。
  *
- * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `CONFLICT`(409) 正被 Agent 使用
+ * ⚠️ 引用口径含**两处**：作为智能体的**默认模型**（`agents.model_id`），或作为其**模型池成员**
+ * （`agent_models`）。后者删除时是 `ON DELETE CASCADE`（会静默把它移出池），所以更要在删之前
+ * 拦一道 —— 否则"删个模型，好几个智能体的可选列表悄悄少了一项"而没人知道。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `CONFLICT`(409) 正被在线 Agent 使用
  */
 export async function removeModel(id: string): Promise<{ id: string; modelName: string }> {
   const db = getPrisma()
@@ -677,10 +721,13 @@ export async function removeModel(id: string): Promise<{ id: string; modelName: 
   })
   if (target === null) throw AppError.notFound('模型不存在')
 
-  const referencedAgents = await db.agent.count({ where: { modelId: id } })
+  // 默认模型引用 或 模型池成员引用，任一命中即算"在被在线智能体使用"
+  const referencedAgents = await db.agent.count({
+    where: { deletedAt: null, OR: [{ modelId: id }, { pool: { some: { modelId: id } } }] },
+  })
   if (referencedAgents > 0) {
     throw AppError.conflict(
-      `该模型正被 ${referencedAgents} 个 Agent 使用，无法删除。请先删除或改绑这些 Agent`,
+      `该模型正被 ${referencedAgents} 个智能体使用（默认模型或模型池），无法删除。请先删除或改绑这些智能体`,
     )
   }
 
@@ -744,6 +791,9 @@ async function readProviderCredential(
  * 解析「一个模型 → 可调用的上游目标」（P0-1-12 的对外接口，F 包的编排层用它）。
  *
  * 四道前置校验，全部按"先查再说人话"排（`06` P0-1-6 起的纪律：不许把 500 抛给用户）：
+ *   ⓪ **`modelId` 非空** → 否则 409。列 `agents.model_id` 现在可空（删模型商/删模型会
+ *      把引用它的智能体自动解绑成 `null`）；一个未绑定模型的智能体不能对话，
+ *      给一句"去重新绑定"的可读 409，而不是让 `findUnique(null)` 抛类型错/500；
  *   ① 模型存在 → 否则 404；
  *   ② `type = CHAT` → 否则 409。向量模型与对话模型不可互换（`02` §4.3 同款结论），
  *      把 EMBEDDING 模型塞给对话编排只会在上游得到一个 404/400；
@@ -755,9 +805,14 @@ async function readProviderCredential(
  *      要求 Key：自建/内网 OpenAI 兼容实现常常不校验凭据，那种情况由部署方自己决定 ——
  *      见 {@link listProviderRemoteModels} 的宽松口径。
  *
- * @throws {AppError} 见上（404 / 409 / 424 / 500）
+ * @throws {AppError} 见上（409 未绑定 / 404 / 409 / 424 / 500）
  */
-export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
+export async function resolveChatTarget(modelId: string | null): Promise<LlmTarget> {
+  if (modelId === null) {
+    throw AppError.conflict(
+      '该智能体未绑定模型（可能因所属模型商/模型被删除而自动解绑）。请在智能体编辑页重新绑定一个模型后再对话',
+    )
+  }
   const db = getPrisma()
   const row = await db.model.findUnique({
     where: { id: modelId },
@@ -769,6 +824,7 @@ export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
       enabled: true,
       maxContext: true,
       supportsVision: true,
+      supportsReasoning: true,
       providerId: true,
       provider: { select: { name: true, baseUrl: true, enabled: true, protocol: true } },
     },
@@ -800,6 +856,7 @@ export async function resolveChatTarget(modelId: string): Promise<LlmTarget> {
     label: row.label,
     maxContext: row.maxContext,
     supportsVision: row.supportsVision,
+    supportsReasoning: row.supportsReasoning,
     providerId: row.providerId,
     providerName: row.provider.name,
     // 上游协议来自 **Provider**（不是模型）：同一 Provider 下所有模型走同一种协议

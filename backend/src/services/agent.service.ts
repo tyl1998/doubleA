@@ -121,6 +121,15 @@ const AGENT_SELECT = {
   updatedAt: true,
   deletedAt: true,
   model: { select: { modelName: true, label: true, enabled: true, provider: { select: { enabled: true } } } },
+  // 模型池（对话时可选）：一次 join 出来，与 `model`（默认模型）同源。稳定顺序（modelId asc）
+  // 让前端多选框/选择器不闪。
+  pool: {
+    orderBy: { modelId: 'asc' },
+    select: {
+      modelId: true,
+      model: { select: { modelName: true, label: true, enabled: true, provider: { select: { enabled: true } } } },
+    },
+  },
   creator: { select: { username: true, nickname: true } },
 } as const
 
@@ -134,12 +143,16 @@ interface AgentRow {
   systemPrompt: string | null
   openingRemarks: string | null
   guideQuestions: unknown
-  modelId: string
+  modelId: string | null
   createdBy: string
   createdAt: Date
   updatedAt: Date
   deletedAt: Date | null
-  model: { modelName: string; label: string; enabled: boolean; provider: { enabled: boolean } }
+  model: { modelName: string; label: string; enabled: boolean; provider: { enabled: boolean } } | null
+  pool: {
+    modelId: string
+    model: { modelName: string; label: string; enabled: boolean; provider: { enabled: boolean } }
+  }[]
   creator: { username: string; nickname: string | null }
 }
 
@@ -173,11 +186,19 @@ function toItem(row: AgentRow, components: AgentComponentRef[], viewer: AgentVie
     // 读取端一律过唯一入口（jsonb 可能是任何形状，见 shared 的 normalizeGuideQuestions）
     guideQuestions: normalizeGuideQuestions(row.guideQuestions),
     modelId: row.modelId,
-    modelName: row.model.modelName,
-    modelLabel: row.model.label,
+    modelName: row.model?.modelName ?? null,
+    modelLabel: row.model?.label ?? null,
     // 与 `GET /api/models/available` 的过滤同口径（不含 type：绑定时已锁死为 CHAT、且 modelId
-    // 改绑也走同一段校验，所以库里不可能出现"绑着 EMBEDDING 模型"的智能体）
-    modelAvailable: row.model.enabled && row.model.provider.enabled,
+    // 改绑也走同一段校验，所以库里不可能出现"绑着 EMBEDDING 模型"的智能体）。
+    // **未绑定模型**（被删模型商/删模型解绑后 model 为 null）恒为 false —— 前端据此提示重新绑定。
+    modelAvailable: row.model !== null && row.model.enabled && row.model.provider.enabled,
+    // 模型池投影：与默认模型同口径算 available（停用的留在池里、置灰，不凭空消失）
+    models: row.pool.map((entry) => ({
+      modelId: entry.modelId,
+      modelName: entry.model.modelName,
+      modelLabel: entry.model.label,
+      available: entry.model.enabled && entry.model.provider.enabled,
+    })),
     createdBy: row.createdBy,
     creatorName: row.creator.nickname ?? row.creator.username,
     canEdit: canEditAgent(row, viewer),
@@ -277,45 +298,61 @@ export async function getAgent(id: string, viewer: AgentViewer): Promise<AgentIt
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 校验「这个模型现在能不能被智能体绑定」。三条与 `GET /api/models/available?type=CHAT` **同口径**。
+ * 校验「这些模型现在能不能被智能体绑定」。三条与 `GET /api/models/available?type=CHAT` **同口径**。
  *
- * 三种失败各给**可执行的**文案（而不是甩一个"参数不合法"）：
+ * 一次 `findMany` 查全部（不是逐个 `await`），再逐个给**可执行的**文案：
  *   · 不存在 → 404：多半是模型被删了而前端还拿着旧的下拉数据；
  *   · 类型不符 → 409：把向量模型绑给对话智能体是"选错了"，说清楚两者不可互换；
  *   · 停用（模型或它所属 Provider）→ 409：说清楚"去哪儿能修"，因为用户的出路不同
  *     （前者在模型池里启用这个模型；后者要启用 Provider）。
  *
+ * 用于建/改智能体时校验**默认模型 + 模型池**里"新引入"的每一个模型（未变的不重校，见文件头 ④）。
+ *
  * @throws {AppError} `NOT_FOUND`(404) / `CONFLICT`(409)
  */
-async function assertChatModelBindable(modelId: string): Promise<void> {
-  const db = getPrisma()
-  const row = await db.model.findUnique({
-    where: { id: modelId },
+async function assertChatModelsBindable(modelIds: string[]): Promise<void> {
+  const unique = [...new Set(modelIds)]
+  if (unique.length === 0) return
+
+  const rows = await getPrisma().model.findMany({
+    where: { id: { in: unique } },
     select: {
+      id: true,
       modelName: true,
       type: true,
       enabled: true,
       provider: { select: { name: true, enabled: true } },
     },
   })
-  if (row === null) throw AppError.notFound('模型不存在')
+  const byId = new Map(rows.map((row) => [row.id, row]))
 
-  if (row.type !== 'CHAT') {
-    throw AppError.conflict(
-      `该模型是向量模型（EMBEDDING），不能绑定到智能体：${row.modelName}。请选择对话模型`,
-    )
+  for (const id of unique) {
+    const row = byId.get(id)
+    if (row === undefined) throw AppError.notFound(`模型不存在：${id}`)
+    if (row.type !== 'CHAT') {
+      throw AppError.conflict(
+        `该模型是向量模型（EMBEDDING），不能绑定到智能体：${row.modelName}。请选择对话模型`,
+      )
+    }
+    if (!row.enabled) {
+      throw AppError.conflict(
+        `模型已停用，不能绑定：${row.modelName}。请在模型池管理页启用它，或改用其他模型`,
+      )
+    }
+    if (!row.provider.enabled) {
+      throw AppError.conflict(
+        `该模型所属的 Provider「${row.provider.name}」已停用，不能绑定。` +
+          '请启用该 Provider，或改用其他模型',
+      )
+    }
   }
-  if (!row.enabled) {
-    throw AppError.conflict(
-      `模型已停用，不能绑定：${row.modelName}。请在模型池管理页启用它，或改用其他模型`,
-    )
-  }
-  if (!row.provider.enabled) {
-    throw AppError.conflict(
-      `该模型所属的 Provider「${row.provider.name}」已停用，不能绑定。` +
-        '请启用该 Provider，或改用其他模型',
-    )
-  }
+}
+
+/** 两个字符串集合是否相等（与顺序无关）—— 判"模型池有没有变" */
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  const set = new Set(a)
+  return b.every((item) => set.has(item))
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -342,7 +379,11 @@ export async function createAgent(
   viewer: AgentViewer,
 ): Promise<AgentItem> {
   const db = getPrisma()
-  await assertChatModelBindable(input.modelId)
+  // 模型池：省略 `modelIds` 时按 `[modelId]` 建池（向后兼容单模型）。默认模型恒为池成员
+  // （schema 已在"同时给了两者"时校验；只给 modelId 时这里补进去）。
+  const pool = [...new Set(input.modelIds ?? [input.modelId])]
+  if (!pool.includes(input.modelId)) pool.push(input.modelId)
+  await assertChatModelsBindable(pool)
 
   const created = await db.agent.create({
     data: {
@@ -357,12 +398,14 @@ export async function createAgent(
       guideQuestions: input.guideQuestions ?? [],
       modelId: input.modelId,
       createdBy: viewer.id,
+      // 模型池一并落库（嵌套 create，agentId 由关系自动填）
+      pool: { create: pool.map((modelId) => ({ modelId })) },
     },
     select: AGENT_SELECT,
   })
 
   getLogger().info(
-    { agentId: created.id, name: created.name, type: created.type, modelId: created.modelId },
+    { agentId: created.id, name: created.name, type: created.type, modelId: created.modelId, poolSize: pool.length },
     '已创建智能体',
   )
   // 刚建的必然没有组件绑定，不必再查库
@@ -411,26 +454,56 @@ export async function updateAgent(
     throw AppError.conflict('智能体类型创建后不可修改。请新建一个智能体')
   }
 
-  if (input.modelId !== undefined && input.modelId !== target.modelId) {
-    await assertChatModelBindable(input.modelId)
+  // ── 模型池 / 默认模型的换绑（文件头 ④：只校验"新引入"的模型；未变的不重校）──
+  const currentPool = target.pool.map((entry) => entry.modelId)
+  const newPoolInput = input.modelIds === undefined ? undefined : [...new Set(input.modelIds)]
+  const defaultChanged = input.modelId !== undefined && input.modelId !== target.modelId
+  const effectiveDefault = input.modelId ?? target.modelId
+
+  // 计算生效的池：给了 modelIds 用它，否则沿用现有池；并保证默认模型是池成员
+  // （只改默认模型、没给池时，把新默认模型并入池 —— 选了新默认就意味着它该可用）。
+  let effectivePool = newPoolInput ?? currentPool
+  if (effectiveDefault !== null && !effectivePool.includes(effectiveDefault)) {
+    effectivePool = [...effectivePool, effectiveDefault]
   }
 
-  const updated = await db.agent.update({
-    where: { id },
-    data: {
-      ...(input.name === undefined ? {} : { name: input.name }),
-      // `null` 是"清空"，`undefined` 是"不动" —— 必须用 `!== undefined` 判，不能真值判断
-      ...(input.description === undefined ? {} : { description: input.description }),
-      ...(input.icon === undefined ? {} : { icon: input.icon }),
-      ...(input.systemPrompt === undefined ? {} : { systemPrompt: input.systemPrompt }),
-      ...(input.openingRemarks === undefined ? {} : { openingRemarks: input.openingRemarks }),
-      ...(input.guideQuestions === undefined ? {} : { guideQuestions: input.guideQuestions }),
-      ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
-    },
-    select: AGENT_SELECT,
+  // 只校验"新引入"的模型：新池里的全部（整体替换）+ 换绑的新默认模型
+  const toValidate = new Set<string>()
+  if (newPoolInput !== undefined) newPoolInput.forEach((id) => toValidate.add(id))
+  if (defaultChanged && input.modelId !== undefined) toValidate.add(input.modelId)
+  await assertChatModelsBindable([...toValidate])
+
+  const poolChanged = !sameStringSet(currentPool, effectivePool)
+
+  const updated = await db.$transaction(async (tx) => {
+    await tx.agent.update({
+      where: { id },
+      data: {
+        ...(input.name === undefined ? {} : { name: input.name }),
+        // `null` 是"清空"，`undefined` 是"不动" —— 必须用 `!== undefined` 判，不能真值判断
+        ...(input.description === undefined ? {} : { description: input.description }),
+        ...(input.icon === undefined ? {} : { icon: input.icon }),
+        ...(input.systemPrompt === undefined ? {} : { systemPrompt: input.systemPrompt }),
+        ...(input.openingRemarks === undefined ? {} : { openingRemarks: input.openingRemarks }),
+        ...(input.guideQuestions === undefined ? {} : { guideQuestions: input.guideQuestions }),
+        ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
+      },
+    })
+    // 池有变化才重写（整体替换：删旧行 + 建新行）—— 没变则一行都不动，避免无谓刷新 created_at
+    if (poolChanged) {
+      await tx.agentModel.deleteMany({ where: { agentId: id } })
+      await tx.agentModel.createMany({
+        data: effectivePool.map((modelId) => ({ agentId: id, modelId })),
+        skipDuplicates: true,
+      })
+    }
+    return tx.agent.findUniqueOrThrow({ where: { id }, select: AGENT_SELECT })
   })
 
-  getLogger().info({ agentId: id, changed: Object.keys(input) }, '已更新智能体')
+  getLogger().info(
+    { agentId: id, changed: Object.keys(input), poolChanged, poolSize: effectivePool.length },
+    '已更新智能体',
+  )
   return toItem(updated, await componentsOf(id), viewer)
 }
 
@@ -451,9 +524,11 @@ export async function updateAgent(
  * 如果一律用 `_count.conversations`，一个已经有 10 个 FINISHED 会话的智能体会回报
  * "影响 10 个会话"，而这次删除其实一个都没改 —— 界面上的级联提示（`03` §七）会吓到用户。
  *
- * ⚠️ 刻意**不删**会话与消息（`02` §4.4 的"只读保留"），也**不删** `agents.model_id` 的引用
- * —— 后者是 `ON DELETE RESTRICT`，软删的 Agent 照样占着那个模型（P0-1-11 的
- * `ModelItem.agentCount` 与删除守卫都是按这个口径数的，刻意不按 `deletedAt` 过滤）。
+ * ⚠️ 刻意**不删**会话与消息（`02` §4.4 的"只读保留"）。但**会把 `agents.model_id` 置空**
+ * （P0 优化）：软删后这个智能体不该再被算作"占用着某个模型"，否则模型/Provider 会一直显示
+ * "被绑定、删不掉"。置空后模型的引用计数与删除守卫自然只剩在线智能体（见
+ * `model.service.ts` 的 `countBindingAgents`）。列 `model_id` 现在可空（`onDelete: SetNull`），
+ * 所以这一步是合法的。
  *
  * @throws {AppError} `NOT_FOUND`(404) 不存在或**已经**软删 / `FORBIDDEN`(403) 权限不足
  */
@@ -475,7 +550,8 @@ export async function removeAgent(
   const { removedComponents, finishedConversations } = await db.$transaction(async (tx) => {
     const softDeleted = await tx.agent.updateMany({
       where: { id, deletedAt: null },
-      data: { deletedAt: new Date() },
+      // 打软删标记的同时解绑模型（model_id 置空）：软删的智能体不该再占用模型（见文件头/上方注释）
+      data: { deletedAt: new Date(), modelId: null },
     })
     // 并发窗口：查到了但打标记前被另一个请求删掉了
     if (softDeleted.count === 0) throw AppError.notFound('智能体不存在')
@@ -483,6 +559,9 @@ export async function removeAgent(
     // ⚠️ 这两步不能省：组件绑定是**多态外键、没有 FK 兜底**（`02` §3.1），
     //    留着它会让被绑的知识库永远删不掉（见文件头 ②）
     const removed = await tx.agentComponent.deleteMany({ where: { agentId: id } })
+    // 模型池同理清空：软删的智能体不该再"占用"任何模型（默认模型已由上面的 modelId=null 解绑，
+    // 池成员行也要一并删掉，否则删模型的守卫会把一个已"没了"的智能体算进引用计数）。
+    await tx.agentModel.deleteMany({ where: { agentId: id } })
     const finished = await tx.conversation.updateMany({
       where: { agentId: id, status: 'ACTIVE' },
       data: { status: 'FINISHED' },

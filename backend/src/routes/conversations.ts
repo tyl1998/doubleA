@@ -208,7 +208,12 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     async (request, reply) => {
       // 前置闸门（404 / 只读 409 / 424）在加锁与 hijack **之前**跑完，它们走 JSON 信封；
       // 会话互斥的 CONFLICT 由 `streamChatReply` 内部以 `error` 事件收尾（见上面的分界说明）
-      const sendable = await assertConversationSendable(request.params.id, viewerOf(request))
+      // 本轮指定模型（模型池特性）由请求体透传：省略则走该会话智能体的默认模型
+      const sendable = await assertConversationSendable(
+        request.params.id,
+        viewerOf(request),
+        request.body.modelId,
+      )
       await streamChatReply({
         reply,
         conversationId: sendable.conversationId,

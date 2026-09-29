@@ -68,6 +68,8 @@ export const modelItemSchema = z.object({
   /** 上下文长度（token）；未填为 `null` */
   maxContext: z.number().int().nullable(),
   supportsVision: z.boolean(),
+  /** 是否支持"深度思考"（reasoning / thinking）。见 `createModelBodySchema` 的字段注释 */
+  supportsReasoning: z.boolean(),
   enabled: z.boolean(),
   /**
    * 有多少个 Agent 绑了这个模型。
@@ -100,6 +102,8 @@ export const modelOptionSchema = z.object({
   maxContext: z.number().int().nullable(),
   /** `03` §4.2：下拉要显示是否支持图片 */
   supportsVision: z.boolean(),
+  /** 是否支持"深度思考"（reasoning / thinking）：选模型时也要看得见这个能力 */
+  supportsReasoning: z.boolean(),
 })
 export type ModelOption = z.infer<typeof modelOptionSchema>
 
@@ -205,6 +209,15 @@ export const createModelBodySchema = z.object({
   /** 可缺省：`null` 与缺省同义（未填写） */
   maxContext: maxContextSchema.nullish(),
   supportsVision: z.boolean().optional(),
+  /**
+   * 是否支持"深度思考"（reasoning / thinking）。可缺省（缺省 = `false`）。
+   *
+   * 它**不只是读数**：对话链路会据此决定是否向上游请求思考 —— 各协议的落点不同
+   * （OpenAI 兼容 `reasoning_effort`、Responses `reasoning.effort`、Anthropic `thinking`），
+   * 见 `backend/src/llm/protocol.ts` 各 `buildBody`。关掉它 = 不向上游发任何思考参数
+   * （回到默认行为：上游若自发思考，`reasoning_content` 仍会被解析显示）。
+   */
+  supportsReasoning: z.boolean().optional(),
   enabled: z.boolean().optional(),
 })
 export type CreateModelBody = z.infer<typeof createModelBodySchema>
@@ -237,6 +250,7 @@ export const updateModelBodySchema = z
     /** ⚠️ 必须是 `.nullable().optional()`（**不要**加 `.default()`）：要区分"不动"与"清空" */
     maxContext: maxContextSchema.nullable().optional(),
     supportsVision: z.boolean().optional(),
+    supportsReasoning: z.boolean().optional(),
     enabled: z.boolean().optional(),
   })
   .refine(
@@ -248,6 +262,7 @@ export const updateModelBodySchema = z
       // `maxContext: null`（清空）也算"给了字段"：`null !== undefined`，正是想要的效果
       body.maxContext !== undefined ||
       body.supportsVision !== undefined ||
+      body.supportsReasoning !== undefined ||
       body.enabled !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )

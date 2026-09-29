@@ -655,6 +655,9 @@ export interface ChatSendContext {
  *      它被设计出来的场景 —— 两边各自实现一遍必然漂移。
  *      ⚠️ 这些错误原样透出（含 `NOT_FOUND`）：与智能体换绑模型时同一套口径（那里也是 404），
  *      不在这里另立一套。
+ *   ③′ **本轮指定模型**（模型池特性）：请求体给了 `modelId` 且不等于默认模型时，必须是该智能体
+ *      **模型池的成员**（`agent_models`）→ 否则 **409**（防止绕过智能体的模型白名单）。
+ *      成员校验通过后，用它替代默认模型解析上游目标；未指定则走默认模型（`agents.model_id`）。
  *   ④ **会话互斥**（活跃流锁）**不在这里**：它是 Redis 上的一个原子操作，属 SSE 出口层
  *      （`orchestrator/sse.ts#acquireConversationLock`），失败了走 **409 `CONFLICT`**。
  *      ⚠️ 那一处**不查库**：加锁必须是一次 `SET NX`，而"用户的"判据已经由 ①② 保证了。
@@ -663,14 +666,19 @@ export interface ChatSendContext {
  * 属 P0-1-27 的编排层 —— 放在这条路由上会让"打开一个流"与"占用一个编排名额"变成两件事
  * （本批的流不消耗编排资源，占名额反而会把名额表变成假的）。
  *
- * @throws {AppError} `NOT_FOUND`(404) 会话/模型不存在（或不是我的）/ `CONFLICT`(409) 会话只读或模型不可用
+ * @param requestedModelId 本轮请求指定的模型（`chatRequestBodySchema.modelId`）。省略/undefined
+ *   ⇒ 走该智能体的默认模型；给了则必须是模型池成员（见 ③′）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 会话/模型不存在（或不是我的）/ `CONFLICT`(409) 会话只读/模型不可用/所选模型不在池中
  *                    / `NEED_CREDENTIAL`(424) Provider 未配 Key
  */
 export async function assertConversationSendable(
   id: string,
   viewer: ConversationViewer,
+  requestedModelId?: string,
 ): Promise<ChatSendContext> {
-  const row = await getPrisma().conversation.findFirst({
+  const db = getPrisma()
+  const row = await db.conversation.findFirst({
     where: { id, userId: viewer.id },
     select: { id: true, agentId: true, status: true, agent: { select: { modelId: true, type: true } } },
   })
@@ -680,7 +688,20 @@ export async function assertConversationSendable(
     throw AppError.conflict('该会话已结束，不能再发送消息')
   }
 
-  const target = await resolveChatTarget(row.agent.modelId)
+  // ③′ 解析"这一轮到底用哪个模型"：默认走 agent.model_id；请求指定了别的就必须是池成员。
+  let chosenModelId = row.agent.modelId
+  if (requestedModelId !== undefined && requestedModelId !== row.agent.modelId) {
+    const member = await db.agentModel.findUnique({
+      where: { agentId_modelId: { agentId: row.agentId, modelId: requestedModelId } },
+      select: { modelId: true },
+    })
+    if (member === null) {
+      throw AppError.conflict('所选模型不在该智能体的模型池中，请重新选择模型')
+    }
+    chosenModelId = requestedModelId
+  }
+
+  const target = await resolveChatTarget(chosenModelId)
   return { conversationId: row.id, agentId: row.agentId, target, agentType: row.agent.type }
 }
 

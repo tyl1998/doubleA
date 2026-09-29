@@ -28,6 +28,7 @@ import type { FastifyInstance } from 'fastify'
 
 import {
   createModelProvider,
+  getProviderBoundModels,
   listModelProviders,
   listProviderRemoteModels,
   removeModelProvider,
@@ -81,8 +82,19 @@ export function registerModelProviderRoutes(app: FastifyInstance): void {
   )
 
   /**
-   * 删除（`02` §4.3）：其下 `models` 级联删除；但只要有一个模型被 Agent 引用，
-   * 就会在服务层被 409 拦下（`agents.model_id` 是 RESTRICT，见 `02` §三 删除语义）。
+   * 删除前列出"其下被在线智能体绑定的模型"（需求 3）：删除弹窗据此如实展示影响范围。
+   * 只读、不落库。
+   */
+  app.get<{ Params: ModelProviderIdParams }>(
+    '/api/model-providers/:id/bound-models',
+    { preHandler: app.requireAdmin, schema: { params: modelProviderIdParamsSchema } },
+    async (request) => ok(await getProviderBoundModels(request.params.id)),
+  )
+
+  /**
+   * 删除（`02` §4.3；需求 3）：其下 `models` 级联删除；引用这些模型的**在线**智能体由
+   * `agents.model_id` 的 `ON DELETE SET NULL` **自动解绑**（变为"未绑定模型"，需重新绑定）。
+   * 响应回报连带删除的模型数与被解绑的智能体数。
    */
   app.delete<{ Params: ModelProviderIdParams }>(
     '/api/model-providers/:id',

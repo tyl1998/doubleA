@@ -120,6 +120,11 @@ export interface LlmTarget {
   label: string
   maxContext: number | null
   supportsVision: boolean
+  /**
+   * 是否向上游请求"深度思考"（reasoning / thinking）。来自模型的 `supportsReasoning`。
+   * `true` 时各协议在 `buildBody` 里落各自的思考参数；`false` 时不发任何思考参数（默认行为）。
+   */
+  supportsReasoning: boolean
   providerId: string
   providerName: string
   /**
@@ -221,6 +226,11 @@ export interface RemoteModel {
   id: string
   ownedBy: string | null
   created: number | null
+  /**
+   * 上下文长度（token），**仅部分实现返回**（OpenRouter `context_length`、vLLM `max_model_len` 等）；
+   * 标准 OpenAI `/models` 不含，缺失为 `null`。用于新建模型时默认填充上下文长度。
+   */
+  contextLength: number | null
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -295,6 +305,7 @@ export async function chat(
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     tools: options.tools,
+    requestReasoning: target.supportsReasoning,
     extraBody: options.extraBody,
   })
 
@@ -376,6 +387,7 @@ export async function chatStream(
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     tools: options.tools,
+    requestReasoning: target.supportsReasoning,
     extraBody: options.extraBody,
   })
   // ⚠️ 刻意不写 `stream_options`（见文件头 ②）：它是 400 的常见来源，而 usage 只是锦上添花
@@ -709,6 +721,7 @@ export function normalizeRemoteModels(payload: unknown): RemoteModel[] {
     let id: string | null = null
     let ownedBy: string | null = null
     let created: number | null = null
+    let contextLength: number | null = null
     if (typeof entry === 'string') {
       id = entry
     } else if (typeof entry === 'object' && entry !== null) {
@@ -724,10 +737,21 @@ export function normalizeRemoteModels(payload: unknown): RemoteModel[] {
       if (typeof owner === 'string' && owner !== '') ownedBy = owner
       const createdAt = row.created ?? row.created_at
       if (typeof createdAt === 'number' && Number.isFinite(createdAt)) created = createdAt
+      // 上下文长度：各家字段名不一。**刻意不认 `max_tokens`**（那常指最大**输出**，不是上下文）。
+      // OpenRouter=context_length；vLLM=max_model_len；另有 context_window / max_context(_length)。
+      const rawContext =
+        row.context_length ??
+        row.context_window ??
+        row.max_context_length ??
+        row.max_context ??
+        row.max_model_len
+      if (typeof rawContext === 'number' && Number.isInteger(rawContext) && rawContext > 0) {
+        contextLength = rawContext
+      }
     }
     if (id === null || seen.has(id)) continue // 去重：有的网关把同一模型列两次（不同 owner）
     seen.add(id)
-    items.push({ id, ownedBy, created })
+    items.push({ id, ownedBy, created, contextLength })
   }
   // 排序是刻意的：上游顺序不稳定时，前端列表会在两次刷新之间自己抖动（与 P0-1-11 的排序口径同因）
   return items.sort((a, b) => a.id.localeCompare(b.id))

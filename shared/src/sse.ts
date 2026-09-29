@@ -302,11 +302,18 @@ export const chatRequestBodySchema = z.object({
   content: z
     .string({
       required_error: '请输入消息内容',
-      invalid_type_error: '消息内容必须是字符串',
+      invalid_type_error: '消息内容必须是文本',
     })
     .trim()
     .min(1, '消息内容不能为空')
     .max(MAX_CHAT_CONTENT_CHARS, `单条消息最多 ${MAX_CHAT_CONTENT_CHARS} 个字符`),
+  /**
+   * 本轮**指定使用的模型**（模型池特性）。**可省**：省略时走该会话所属智能体的默认模型
+   * （`agents.model_id`）。给了就必须是该智能体**模型池的成员**且当前可用 ——
+   * 服务层（`assertConversationSendable`）负责校验归属与可用性，非成员/已停用一律 409，
+   * 不存在 404。这样"对话时选具体模型"不必新建会话，也不会绕过智能体的模型白名单。
+   */
+  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
   attachmentFileIds: z
     .array(z.string().uuid('附件 ID 不是合法 UUID'))
     .max(0, '附件上传属 P1（files 表尚未落地）；本版本请只发送文本')

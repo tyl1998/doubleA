@@ -246,12 +246,16 @@ model Model {
   type           ModelType
   maxContext     Int?      @map("max_context")
   supportsVision Boolean   @default(false) @map("supports_vision")
+  // 是否支持"深度思考"（reasoning / thinking）。默认 false —— 与 supportsVision 同款：
+  // 既是选模型侧的读数，也在对话链路上决定"是否向上游请求思考"（见 llm/protocol.ts 各协议 buildBody）。
+  supportsReasoning Boolean @default(false) @map("supports_reasoning")
   enabled        Boolean   @default(true)
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
   agents   Agent[]
+  agentPool AgentModel[]
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -262,11 +266,14 @@ model Model {
 ///
 /// · `guideQuestions` 是 `string[]` 的 jsonb（引导问题，`01` §3.3）。默认 `[]` 而非 null，
 ///   前端可以无脑 `.map()`；写入端（P0-1-22）负责校验元素都是字符串。
-/// · `modelId` 用 `onDelete: Restrict`：删模型前必须先处理绑定它的 Agent，不能让
-///   「Agent 指向一个不存在的模型」在库里出现（运行期拿不到模型 = 对话直接炸）。
-/// · `createdBy` 同理 Restrict：本系统不删用户（见 UserStatus 注释）。
-/// · `deletedAt` 支撑 §4.4 的**软删**（会话转只读保留、组件绑定解除），列表查询一律带
-///   `deletedAt: null`；因此加 `@@index([deletedAt, updatedAt])` 服务列表排序。
+/// · `modelId` **可空** + `onDelete: SetNull`（P0 优化：删智能体/删模型商自动解绑）：
+///   删掉一个模型（含删 Provider 时其下模型级联删）时，DB 自动把引用它的 Agent 的
+///   `model_id` 置空 —— Agent 保留但变成「未绑定模型」，需重新绑定后才能对话。
+///   软删智能体时由服务层显式把 `model_id` 置空（SetNull 只在删模型那侧触发）。
+///   运行期拿到 `model_id = null` 的 Agent，`resolveChatTarget` / 绑定校验会给可读 409，
+///   而不是让「指向不存在模型」在库里出现。
+///   ⚠️ `modelId` 的语义自"模型池"上线后收窄为**默认模型**（对话时不指定模型走它）；
+///   可选的模型集合是 `pool`（{@link AgentModel}），默认模型**必须**是池成员（服务层保证）。
 model Agent {
   id             String    @id @default(uuid(7)) @db.Uuid
   name           String    @db.VarChar(128)
@@ -276,21 +283,46 @@ model Agent {
   systemPrompt   String?   @map("system_prompt") @db.Text
   openingRemarks String?   @map("opening_remarks") @db.Text
   guideQuestions Json      @default("[]") @map("guide_questions") @db.JsonB
-  modelId        String    @map("model_id") @db.Uuid
+  modelId        String?   @map("model_id") @db.Uuid
   createdBy      String    @map("created_by") @db.Uuid
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
 
-  model         Model             @relation(fields: [modelId], references: [id], onDelete: Restrict)
+  model         Model?            @relation(fields: [modelId], references: [id], onDelete: SetNull)
   creator       User              @relation(fields: [createdBy], references: [id], onDelete: Restrict)
   components    AgentComponent[]
+  pool          AgentModel[]
   conversations Conversation[]
   usageRecords  UsageRecord[]
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
   @@map("agents")
+}
+
+/// agent_models —— Agent 的**可选模型池**（对话时可在其中选具体模型）
+///
+/// 背景：原设计"Agent 绑定单一模型、运行时不可切换"（旧决策 9）在实际使用中很不方便。
+/// 现在 Agent 绑定一个模型集合（池），发消息时可在池内选一个具体模型；请求不指定时
+/// 走 `agents.model_id`（默认模型，服务层保证它是池成员）。
+///
+/// · `@@unique([agentId, modelId])` 防重复入池；
+/// · `onDelete: Cascade` 两侧都成立：删 Agent（硬删/软删由服务层显式删行）、删模型
+///   （含删 Provider 级联删模型）时，对应的池成员行随之消失。
+///   ⚠️ 删模型只会移除"池成员"这一行，不会删 Agent 本身；若被删的恰好是默认模型，
+///   `agents.model_id` 由既有的 `SetNull` 外键置空（Agent 变「未绑定模型」）。
+model AgentModel {
+  agentId   String   @map("agent_id") @db.Uuid
+  modelId   String   @map("model_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@id([agentId, modelId])
+  @@index([modelId])
+  @@map("agent_models")
 }
 
 /// agent_components —— Agent 的组件绑定（`02` §三 / §4.4）

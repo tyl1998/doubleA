@@ -56,14 +56,16 @@ export type SandboxLlmResult =
 /**
  * 把"某个模型"解析成"要注入容器的那组环境变量"。
  *
- * @param modelId `agents.model_id`（由调用方从会话行里取出来，见 `manager.ts` 的那一次查询）
+ * @param modelId `agents.model_id`（由调用方从会话行里取出来，见 `manager.ts` 的那一次查询）。
+ *   **可空**：智能体可能因所属模型商/模型被删除而被自动解绑（`model_id = null`）——
+ *   这种情况由 `resolveChatTarget` 抛可读 409，在这里同样映射成 `MODEL_NOT_AVAILABLE`。
  *
  * 失败一律映射成 {@link SandboxLlmFailureCode} 而不是把 `AppError` 抛出去：调用方
  * （`ensureSandbox`）要按 `code` 决定回什么事件，而 `resolveChatTarget` 的四种 AppError
  * （404 / 409 / 424 / 500）在**这个上下文里是同一件事** —— "这一轮的模型用不了"，
  * 用户能做的动作也一样（去模型池/智能体页改一改）。文案原样透传（它本来就是给人看的）。
  */
-export async function resolveSandboxLlm(modelId: string): Promise<SandboxLlmResult> {
+export async function resolveSandboxLlm(modelId: string | null): Promise<SandboxLlmResult> {
   try {
     const target = await resolveChatTarget(modelId)
     // `resolveChatTarget` 已经保证了非 null（缺 Key 会抛 `needCredential`）——

@@ -189,6 +189,12 @@ export interface ProtocolChatRequest {
   temperature?: number
   /** 下发给模型的工具（OpenAI 形态；形状投影由各协议自己做，见文件头 ③）。缺省 = 不带 `tools` */
   tools?: readonly ProtocolToolDefinition[]
+  /**
+   * 是否请求"深度思考"（reasoning / thinking）。来自模型的 `supportsReasoning`。
+   * `true` 时各协议在 `buildBody` 里落各自的思考参数（兼容：`reasoning_effort`；
+   * Responses：`reasoning.effort`；Anthropic：`thinking`）。缺省/`false` = 不发任何思考参数。
+   */
+  requestReasoning?: boolean
   /** 原样并入请求体的逃生口（`top_p` 之类），协议特有字段最后仍可覆盖 */
   extraBody?: Record<string, unknown>
 }
@@ -539,6 +545,9 @@ const openAiCompat: ChatProtocol = {
     if (request.temperature !== undefined) body.temperature = request.temperature
     // 本协议的 `tools` 就是 OpenAI 形态 ⇒ 原样（另两家的投影在各自己的分支里）
     if (request.tools !== undefined) body.tools = request.tools
+    // 深度思考：OpenAI（及多数兼容网关）用 `reasoning_effort`。管理员在模型上显式勾了
+    // supportsReasoning 才发 —— 若上游不认这个字段会 400，届时把开关关掉即可（配置期可回退）。
+    if (request.requestReasoning === true) body.reasoning_effort = REASONING_EFFORT_DEFAULT
     Object.assign(body, request.extraBody ?? {})
     // 刻意不写 `stream_options`（见 `02` §6.1 差异收敛清单 1）：它是 400 的常见来源
     return body
@@ -704,6 +713,8 @@ const openAiResponses: ChatProtocol = {
     if (request.maxTokens !== undefined) body.max_output_tokens = request.maxTokens
     if (request.temperature !== undefined) body.temperature = request.temperature
     if (request.tools !== undefined) body.tools = toResponsesTools(request.tools)
+    // 深度思考：Responses 用 `reasoning.effort`（推理模型才认；勾了 supportsReasoning 才发）
+    if (request.requestReasoning === true) body.reasoning = { effort: REASONING_EFFORT_DEFAULT }
     Object.assign(body, request.extraBody ?? {})
     return body
   },
@@ -863,6 +874,23 @@ export const ANTHROPIC_API_VERSION = '2023-06-01'
  */
 export const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
 
+/**
+ * 深度思考的默认力度（三协议共用的默认口径，模型池优化）。
+ *
+ * `supportsReasoning` 只是一个"是否请求思考"的布尔开关，本平台不暴露"力度"这一维度，
+ * 所以统一取 `medium`（各家的中庸档）。需要其它力度时走 `extraBody`（它在 buildBody 末尾
+ * 覆盖，见各协议实现）。
+ */
+export const REASONING_EFFORT_DEFAULT = 'medium'
+
+/**
+ * Anthropic 扩展思考的预算 token（`thinking.budget_tokens`）。
+ *
+ * ⚠️ 两条硬约束（Anthropic API）：`max_tokens` 必须 **大于** `budget_tokens`；开启思考时
+ * **不能带 `temperature`**（只允许 1 或不带）。两者都在 Anthropic 的 `buildBody` 里兜。
+ */
+export const ANTHROPIC_THINKING_BUDGET_TOKENS = 2048
+
 /** Anthropic 的 `stop_reason` → OpenAI 词表（见文件头口径 ①）；未知取值原样透出 */
 const ANTHROPIC_FINISH_REASONS: Readonly<Record<string, string>> = {
   end_turn: 'stop',
@@ -998,15 +1026,24 @@ const anthropicMessages: ChatProtocol = {
       .join('\n\n')
     const messages = toAnthropicMessages(request.messages)
 
+    // 深度思考（扩展思考）：勾了 supportsReasoning 才开。两条硬约束在这里兜（见常量注释）：
+    //  · `max_tokens` 必须 > `budget_tokens` ⇒ 思考开时给 max_tokens 兜一个下限；
+    //  · 开思考时不能带 `temperature`（只允许 1 或不带）⇒ 思考开时不透传 temperature。
+    const thinking = request.requestReasoning === true
+    const maxTokens = request.maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS
+
     const body: Record<string, unknown> = {
       model: request.model,
       messages,
-      max_tokens: request.maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS,
+      max_tokens: thinking
+        ? Math.max(maxTokens, ANTHROPIC_THINKING_BUDGET_TOKENS + ANTHROPIC_DEFAULT_MAX_TOKENS)
+        : maxTokens,
       stream: request.stream,
     }
     if (system !== '') body.system = system
-    if (request.temperature !== undefined) body.temperature = request.temperature
+    if (!thinking && request.temperature !== undefined) body.temperature = request.temperature
     if (request.tools !== undefined) body.tools = toAnthropicTools(request.tools)
+    if (thinking) body.thinking = { type: 'enabled', budget_tokens: ANTHROPIC_THINKING_BUDGET_TOKENS }
     Object.assign(body, request.extraBody ?? {})
     return body
   },
