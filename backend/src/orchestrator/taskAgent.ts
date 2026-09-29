@@ -299,12 +299,17 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     )
     // 名额到手 ⇒ `queuedPosition` 归零。不清的话断线重连的人会一直看到"排队中"
     enqueue([], { queuedPosition: null })
+    // 中间态（P0-3-13）：接下来是无输出的引擎启动期，先让前端知道"在干什么"。
+    // 这些事件不落库、不进 `/active` 快照（`shared#sseStatusPayloadSchema` 文件头写明）。
+    enqueue([{ name: 'status', data: { text: '沙箱已就绪，正在启动引擎…' } }])
 
     try {
       // ═════════════════════════════════════════════════════════════
       // ② 引擎桥（一个会话一条、与容器同寿命；容器换了它会自己重attach）
       // ═════════════════════════════════════════════════════════════
       bridge = await getSandboxRpc(conversationId, handle.containerId)
+      // 桥建立返回 = 引擎已就绪（`openSandboxRpc` 内部那条预热命令已经确认它能对话）
+      enqueue([{ name: 'status', data: { text: '引擎已就绪，正在准备…' } }])
 
       // ═════════════════════════════════════════════════════════════
       // ③ 订阅（判据 ①：**必须早于派活**）
@@ -401,6 +406,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ④ 派活（`runTurn` 内部：先挂 `agent_settled` 等待者，再 `send(prompt)`）
       // ═════════════════════════════════════════════════════════════
       engineStarted = true // 计量判据（见收尾处）：从这一行起，token 就已经可能花出去了
+      enqueue([{ name: 'status', data: { text: '任务运行中…' } }])
       outcome = await bridge.runTurn(content, { signal })
     } catch (error) {
       // 中断与故障在这里**都只是"记下来"**，统一的收尾在下面（顺序即优先级，与 chatBot 同款）

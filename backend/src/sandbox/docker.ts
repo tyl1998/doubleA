@@ -555,8 +555,6 @@ export async function execInSandbox(
 
   const chunks: Buffer[] = []
   const errChunks: Buffer[] = []
-  let stdoutDone = false
-  let stderrDone = false
   let settled = false
 
   return await new Promise<SandboxExecResult>((resolve, reject) => {
@@ -574,37 +572,50 @@ export async function execInSandbox(
         reject(error instanceof Error ? error : new Error(String(error)))
         return
       }
-      // 退出码要等流收完后再读（exec 的生命周期由容器侧的进程结束驱动）
+      // 退出码要等流收完后再读（exec 的生命周期由容器侧的进程结束驱动）。
+      // ⚠️ 个别环境（OrbStack 实测）流先关、ExitCode 稍后才可读 ⇒ 轮询一小段再取，
+      //     拿不到就当 `null`（调用方按"非 0 退出"处理，安全侧）。
+      let info: { Running?: boolean; ExitCode?: number | null } | null = null
       try {
-        const info = await exec.inspect()
-        resolve({
-          stdout: Buffer.concat(chunks),
-          stderr: Buffer.concat(errChunks),
-          exitCode: typeof info.ExitCode === 'number' ? info.ExitCode : null,
-        })
-      } catch (inspectError) {
-        resolve({ stdout: Buffer.concat(chunks), stderr: Buffer.concat(errChunks), exitCode: null })
+        for (let i = 0; i < 20; i += 1) {
+          info = await exec.inspect()
+          if (info.Running !== true) break
+          await sleep(50)
+        }
+      } catch {
+        info = null
       }
+      resolve({
+        stdout: Buffer.concat(chunks),
+        stderr: Buffer.concat(errChunks),
+        exitCode: info !== null && typeof info.ExitCode === 'number' ? info.ExitCode : null,
+      })
     }
 
     stdout.on('data', (chunk: Buffer) => chunks.push(chunk))
     stderr.on('data', (chunk: Buffer) => errChunks.push(chunk))
-    stdout.on('end', () => {
-      stdoutDone = true
-      if (stderrDone) void finish()
-    })
-    stderr.on('end', () => {
-      stderrDone = true
-      if (stdoutDone) void finish()
-    })
     stdout.on('error', finish)
     stderr.on('error', finish)
+    // ⚠️ **完成信号必须看原始流，而不是 demux 出来的两个 PassThrough**：
+    // docker-modem 的 `demuxStream` 只把 'data' 转发给输出，**不会**把源流的 'end'
+    // 传给它们 ⇒ 等 stdout/stderr 的 'end' 会让每一条 exec 都挂满整个超时
+    // （60s，实测症状是产物基线扫描"每次都恰好卡一分钟"）。
+    stream.on('end', () => void finish())
+    stream.on('close', () => void finish())
+    stream.on('error', finish)
 
     const deadline = setTimeout(() => {
       void finish(new Error(`docker exec 超时（${timeoutMs}ms）：${cmd.join(' ')}`))
     }, timeoutMs)
     // 别让定时器卡住进程退出（与 reaper 的 `unref()` 同一条纪律）
     deadline.unref?.()
+  })
+}
+
+/** 短眠（退出码轮询用；与 `manager.ts` 的 `sleep` 同款，不引依赖） */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
   })
 }
 

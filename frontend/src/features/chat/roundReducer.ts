@@ -128,6 +128,12 @@ export interface StreamRound {
    * 走的是流内 `error{BUSY}`，不是 `queued` —— 那是两个不同的机制，别混）。
    */
   queuedPosition: number | null
+  /**
+   * 本轮生命周期的**中间态**（`status` 事件，TaskAgent 专属；`shared#sseStatusPayloadSchema`）。
+   * `null` = 还没有 / 已被真实内容替代。它是"还没内容时"的进度指示：
+   * `delta` / `thinking` / `tool_call` 一到达就清掉（真实进度已经可见）。
+   */
+  statusText: string | null
 }
 
 /** 开一轮（用户按下发送、且流已经成功建立时调用） */
@@ -145,6 +151,7 @@ export function beginRound(userText: string, startedAt: string): StreamRound {
     assistantMessageId: null,
     confirm: null,
     queuedPosition: null,
+    statusText: null,
   }
 }
 
@@ -175,12 +182,14 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
     case 'delta':
       return {
         ...round,
+        statusText: null,
         assistant: { ...round.assistant, text: round.assistant.text + event.data.text },
       }
 
     case 'thinking':
       return {
         ...round,
+        statusText: null,
         assistant: { ...round.assistant, thinking: round.assistant.thinking + event.data.text },
       }
 
@@ -189,7 +198,11 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
       const next = toolViewFromEvent(event.data)
       const index = round.assistant.tools.findIndex((tool) => tool.callId === next.callId)
       if (index === -1) {
-        return { ...round, assistant: { ...round.assistant, tools: [...round.assistant.tools, next] } }
+        return {
+          ...round,
+          statusText: null,
+          assistant: { ...round.assistant, tools: [...round.assistant.tools, next] },
+        }
       }
       const tools = [...round.assistant.tools]
       // `output` 可省：`RUNNING` 那一帧没有它 ⇒ **保留旧值**，别把它抹成 undefined
@@ -198,7 +211,7 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
         next.output === undefined && previous?.output !== undefined
           ? { ...next, output: previous.output }
           : next
-      return { ...round, assistant: { ...round.assistant, tools } }
+      return { ...round, statusText: null, assistant: { ...round.assistant, tools } }
     }
 
     case 'citations':
@@ -227,6 +240,9 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
 
     case 'queued':
       return { ...round, queuedPosition: event.data.position }
+
+    case 'status':
+      return { ...round, statusText: event.data.text }
 
     case 'done':
       return {
@@ -290,6 +306,7 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       artifacts: round.assistant.artifacts,
       createdAt: null,
       status: round.status,
+      ...(round.statusText === null ? {} : { statusText: round.statusText }),
       ...(round.finishReason === null ? {} : { finishReason: round.finishReason }),
       ...(round.usage === null ? {} : { usage: round.usage }),
       ...(round.error === null ? {} : { error: round.error }),

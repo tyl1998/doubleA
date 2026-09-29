@@ -177,6 +177,13 @@ export interface SandboxRpc {
   send(command: PiRpcCommand, options?: { timeoutMs?: number }): Promise<PiRpcResponse>
   /** 订阅引擎事件（P0-3-6 的映射层消费）。返回退订函数 */
   onEvent(listener: (event: PiSessionEvent) => void): () => void
+  /**
+   * 订阅**引擎协议错误**：pi 收到一条它解析不了的行时回 `{command:'parse', success:false}`
+   * （**无 id**，配不到在飞命令）。已知触发面 = docker hijack attach 对 stdin 的**首条**
+   * 写入会被传坏（实测复现，见 `primeEngineConnection`）—— 订阅者把它当成"连接已打通"。
+   * 返回退订函数。
+   */
+  onProtocolError(listener: () => void): () => void
   /** 派活并等**这一轮真的收尾**（= 发 prompt + 等 `agent_settled`，见文件头坑 2） */
   runTurn(message: string, options?: RunTurnOptions): Promise<TurnOutcome>
   /** 中断当前运行（P0-3-8 的停止路径）。⚠️ 只发中断，**不杀容器** */
@@ -227,6 +234,7 @@ class SandboxRpcSession implements SandboxRpc {
   /** 这一轮收尾的等待者（正常只会有一个：同一个容器不接受并发 prompt） */
   readonly #settleWaiters = new Set<SettledWaiter>()
   readonly #eventListeners = new Set<(event: PiSessionEvent) => void>()
+  readonly #protocolErrorListeners = new Set<() => void>()
 
   #commandSeq = 0
   #alive = true
@@ -354,6 +362,13 @@ class SandboxRpcSession implements SandboxRpc {
     }
   }
 
+  onProtocolError(listener: () => void): () => void {
+    this.#protocolErrorListeners.add(listener)
+    return () => {
+      this.#protocolErrorListeners.delete(listener)
+    }
+  }
+
   async runTurn(message: string, options: RunTurnOptions = {}): Promise<TurnOutcome> {
     if (!this.#alive) return { ok: false, reason: 'closed', message: '引擎桥已关闭' }
     if (options.signal?.aborted === true) return { ok: false, reason: 'aborted', message: '派活之前就已被取消' }
@@ -451,6 +466,22 @@ class SandboxRpcSession implements SandboxRpc {
         { conversationId: this.conversationId, id: id ?? null, command: response.command ?? null },
         '收到配不上号的引擎应答（已丢弃）',
       )
+      // ⚠️ **引擎协议错误**：pi 解析不了一行时回 `{command:'parse', success:false}`、**无 id**。
+      //    已知触发面 = docker hijack attach 对 stdin 的**首条**写入被传坏（实测复现：
+      //    引擎收到"合法 JSON + 尾部垃圾"）。这正是 `primeEngineConnection` 等在等的信号 ——
+      //    它意味着"这次坏写入被吃掉了，下一条命令能干净到达"。
+      if (response.success === false && response.command === 'parse') {
+        for (const listener of [...this.#protocolErrorListeners]) {
+          try {
+            listener()
+          } catch (error) {
+            getLogger().debug(
+              { err: error, conversationId: this.conversationId },
+              '引擎协议错误订阅者抛错（忽略该订阅者本次回调）',
+            )
+          }
+        }
+      }
       return
     }
     this.#pending.delete(id)
@@ -661,7 +692,7 @@ export async function openSandboxRpc(options: OpenSandboxRpcOptions): Promise<Sa
     getLogger().debug({ err: error, containerId: options.containerId }, '读容器 LLM Key 失败（跳过 stderr 脱敏）')
   }
 
-  return createSandboxRpc({
+  const bridge = createSandboxRpc({
     conversationId: options.conversationId,
     containerId: options.containerId,
     stdio,
@@ -669,6 +700,51 @@ export async function openSandboxRpc(options: OpenSandboxRpcOptions): Promise<Sa
     maxRecordBytes: options.maxRecordBytes,
     secret,
   })
+  // ★ 预热（在第一条真实命令之前）：docker 的 hijack attach 会把**首条**写入容器 stdin
+  //   的命令传坏（pi 回 parse-error，配不上号 ⇒ 桥只会干等超时）。用一条无害的
+  //   `get_state` 把这次坏写入吃掉，并顺带确认引擎已就绪 —— 见 `primeEngineConnection`。
+  await primeEngineConnection(bridge)
+  return bridge
+}
+
+/**
+ * 预热引擎连接（吃掉 docker attach 首条写坏的 stdin，顺带确认引擎已就绪）。
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * ★ 为什么需要（2026-09-29 实测复现的故障链路）
+ * ═══════════════════════════════════════════════════════════════════════
+ * docker 的 hijack attach 在同一容器出现**第二条 stdin 连接**（或个别情况下首条）时，
+ * 写入的第一条命令会被传坏：引擎收到的是「合法 JSON + 尾部垃圾」，
+ * 于是回 `{"type":"response","command":"parse","success":false,"error":"Failed to
+ * parse command: Unexpected non-whitespace character after JSON at position …"}`
+ * —— 它**没有 id**，`send()` 配不到应答 ⇒ 那条命令只能等满超时（30s）才失败，
+ * 而整轮编排就挂在那 30s 上（界面表现为"一直卡住"）。
+ *
+ * 预热用一条**无害的只读命令** `get_state` 做**第一条**写入：
+ *   · 它被传坏 ⇒ 引擎立刻回 parse-error ⇒ 触发 {@link SandboxRpc.onProtocolError} ⇒
+ *     本函数立刻返回（连接已打通，之后的 prompt 是第二条、能干净到达）；
+ *   · 它正常应答 ⇒ 引擎已就绪（这同时是"引擎启动检测"的唯一判据：RPC 模式里
+ *     stdin 的 JSONL reader 是引擎启动流程的最后一步）；
+ *   · 引擎还没就绪（启动慢）⇒ 写入会缓冲在容器 stdin，等引擎就绪后处理 ⇒
+ *     `get_state` 在超时内应答。
+ *
+ * ⚠️ **尽力而为**：`send` 失败（超时 / 桥断）一律照常返回 —— 预热不改变"这一轮
+ * 该不该跑"的任何判据，只是把已知的坏写入从 prompt 身上挪开。
+ */
+export async function primeEngineConnection(bridge: SandboxRpc): Promise<void> {
+  let unsubscribe: (() => void) | undefined
+  // parse-error（无 id）只会走 `onProtocolError`，配不到 `send` 的应答 ⇒ 必须两条路竞争
+  const protocolError = new Promise<void>((resolve) => {
+    unsubscribe = bridge.onProtocolError(() => resolve())
+  })
+  const sent = bridge
+    .send({ type: 'get_state' }, { timeoutMs: 5_000 })
+    .then(
+      () => undefined,
+      () => undefined,
+    )
+  await Promise.race([protocolError, sent])
+  unsubscribe?.()
 }
 
 /**

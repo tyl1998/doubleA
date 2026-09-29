@@ -299,6 +299,7 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
   citations: { items: [{ docName: '手册.pdf', snippet: '片段原文', score: 0.87 }] },
   artifact: { artifactId: 'art-1', fileName: '报告.md', size: 2048, mime: 'text/markdown' },
   queued: { position: 2 },
+  status: { text: '沙箱已就绪，正在启动引擎…' },
   ping: { ts: '2026-09-23T00:00:00.000Z' },
   done: { messageId: 'msg-1', finishReason: 'COMPLETE', usage: { tokensIn: 10, tokensOut: 20 } },
   error: { code: 'CONFLICT', message: '该会话正在生成中' },

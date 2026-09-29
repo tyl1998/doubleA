@@ -159,6 +159,11 @@ export interface ChatMessageView {
   /** 流内错误卡的内容（`status === 'error'` 时才有） */
   error?: { code: string; message: string }
   /**
+   * 本轮生命周期的**中间态**（`status` 事件，TaskAgent 专属）。
+   * 只有流式助手消息有；一旦真实内容（正文/思考/工具卡）到达就被清掉。
+   */
+  statusText?: string
+  /**
    * `false` = 这一轮**没有产生可持久化的消息**（`done.messageId === null`，
    * 见 `shared/src/sse.ts` 文件头 ④）⇒ 刷新后它不会出现在历史里，界面要如实标注。
    * `null` / `undefined` = 还没收尾（或历史消息，它当然已持久化）。

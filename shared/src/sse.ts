@@ -9,7 +9,7 @@
  * ① 归一化的意义：两条链路 → 同一套事件
  * ─────────────────────────────────────────────────────────────────────
  * ChatBot 走"后端 RAG 编排 + MCP 工具"，TaskAgent 走"沙箱 ACP 引擎 + bash/read/write 工具"
- * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 10 个事件 ——
+ * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 **11 个**事件 ——
  * 于是前端只有一套渲染路径，将来接新引擎也不必动前端。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -85,6 +85,8 @@ export const SSE_EVENT_NAMES = [
   'artifact',
   /** 沙箱并发满，排队中 */
   'queued',
+  /** 本轮生命周期中间态（沙箱就绪 / 引擎启动 / 引擎就绪…；TaskAgent 专属） */
+  'status',
   /** 心跳（空闲期保活；前端静默忽略） */
   'ping',
   /** 流结束 */
@@ -111,7 +113,7 @@ export type ChatFinishReason = (typeof CHAT_FINISH_REASONS)[number]
 /** SSE 响应的 Content-Type（含 charset —— 中文增量必须明确编码，否则有的客户端按 latin-1 解） */
 export const SSE_CONTENT_TYPE = 'text/event-stream; charset=utf-8'
 
-// ───────────────────────────── 10 个事件的 payload ─────────────────────────────
+// ───────────────────────────── 11 个事件的 payload ─────────────────────────────
 
 /** `delta`：助手回答文本增量 */
 export const sseDeltaPayloadSchema = z.object({ text: z.string() })
@@ -203,6 +205,22 @@ export const sseQueuedPayloadSchema = z.object({ position: z.number().int().min(
 export type SseQueuedPayload = z.infer<typeof sseQueuedPayloadSchema>
 
 /**
+ * `status`：本轮生命周期的**中间态**（P0-3-13；TaskAgent 专属 —— ChatBot 恒不发）。
+ *
+ * 解决的问题：TaskAgent 一轮的"无输出期"很长（建沙箱 → 起引擎 → 跑任务，首字可能几十秒），
+ * 没有它用户只能看到"正在等待上游响应…"的占位，分不清到底在干什么、是不是卡了。
+ * 编排层在**每个阶段切换点**发一条，前端把它显示成助手消息里的一行小字；
+ * 一旦真实内容（`delta` / `thinking` / `tool_call`）到达，归约层就会清掉它 ——
+ * 状态行只是"还没内容时"的进度指示，不追求跟真实内容同时存在。
+ *
+ * ⚠️ 它是**进度语**不是数据：不落库（`done` 时整条落库只含正文/工具/引用/产物）、
+ * 不参与断线重连（`/active` 快照有自己的 `queuedPosition` / `currentTool`），
+ * 断了重连靠历史补齐，历史里没有这条中间态是**刻意的**。
+ */
+export const sseStatusPayloadSchema = z.object({ text: z.string() })
+export type SseStatusPayload = z.infer<typeof sseStatusPayloadSchema>
+
+/**
  * `ping`：心跳。
  *
  * `ts` 用 **ISO 8601 字符串**（与本仓其余时间字段同口径）：`02` §5.1 只写了 `{ts}`，
@@ -258,6 +276,7 @@ export const SSE_PAYLOAD_SCHEMAS = {
   citations: sseCitationsPayloadSchema,
   artifact: sseArtifactPayloadSchema,
   queued: sseQueuedPayloadSchema,
+  status: sseStatusPayloadSchema,
   ping: ssePingPayloadSchema,
   done: sseDonePayloadSchema,
   error: sseErrorPayloadSchema,
