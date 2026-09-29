@@ -84,7 +84,6 @@ export function orderSections(sections: Iterable<AgentSectionKey>): AgentSection
 export interface AgentFormValues {
   name: string
   description: string
-  icon: string
   type: AgentType
   /** 默认模型（对话不指定模型时走它）；空串 = 未选择 */
   modelId: string
@@ -105,7 +104,6 @@ export interface AgentFormValues {
 export const EMPTY_AGENT_FORM_VALUES: AgentFormValues = {
   name: '',
   description: '',
-  icon: '',
   type: 'CHATBOT',
   modelId: '',
   modelIds: [],
@@ -119,7 +117,6 @@ export function valuesFromAgent(item: AgentItem): AgentFormValues {
   return {
     name: item.name,
     description: item.description ?? '',
-    icon: item.icon ?? '',
     type: item.type,
     // item.modelId 可空（智能体可能因删模型商/删模型被自动解绑）；表单态用空串表达"未选择"，
     // 保存时校验必须选一个（`shared` 的 modelId 在创建/更新校验里是 uuid）
@@ -135,10 +132,10 @@ export function valuesFromAgent(item: AgentItem): AgentFormValues {
 
 // ───────────────────────────── 文本字段的归一化（三态的唯一判据） ─────────────────────────────
 
-export type TextField = 'description' | 'icon' | 'systemPrompt' | 'openingRemarks'
+export type TextField = 'description' | 'systemPrompt' | 'openingRemarks'
 
-/** 基本信息区的两个文本字段 */
-const BASIC_TEXT_FIELDS = ['description', 'icon'] as const satisfies readonly TextField[]
+/** 基本信息区的文本字段 */
+const BASIC_TEXT_FIELDS = ['description'] as const satisfies readonly TextField[]
 /** 提示词区的两个文本字段 */
 const PROMPT_TEXT_FIELDS = ['systemPrompt', 'openingRemarks'] as const satisfies readonly TextField[]
 
@@ -146,7 +143,7 @@ const PROMPT_TEXT_FIELDS = ['systemPrompt', 'openingRemarks'] as const satisfies
  * 可空文本字段的**归一化方式**。
  *
  * ⚠️ 与 `shared` 的 schema 逐条对应、**不能统一成一种**：
- *   · `description` / `icon` 在 schema 里是 `.trim()` 过的 ⇒ 归一化也 trim（否则
+ *   · `description` 在 schema 里是 `.trim()` 过的 ⇒ 归一化也 trim（否则
  *     "把描述末尾多打一个空格"会被判成改动，白白发一次 PATCH）；
  *   · `systemPrompt` / `openingRemarks` **刻意不 trim**（缩进与前导换行是提示词排版的一部分，
  *     `shared/src/agent.ts` 的注释）⇒ 归一化必须**原样保留**，否则"用户没动过"与
@@ -154,7 +151,6 @@ const PROMPT_TEXT_FIELDS = ['systemPrompt', 'openingRemarks'] as const satisfies
  */
 const TEXT_FIELD_MODE: Readonly<Record<TextField, 'trim' | 'verbatim'>> = {
   description: 'trim',
-  icon: 'trim',
   systemPrompt: 'verbatim',
   openingRemarks: 'verbatim',
 }
@@ -354,7 +350,6 @@ export function buildCreateBody(values: AgentFormValues): CreateAgentBody {
   return {
     name: values.name.trim(),
     description: nullableTextField('description', values.description),
-    icon: nullableTextField('icon', values.icon),
     type: values.type,
     systemPrompt: nullableTextField('systemPrompt', values.systemPrompt),
     openingRemarks: nullableTextField('openingRemarks', values.openingRemarks),

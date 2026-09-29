@@ -42,6 +42,7 @@ import {
   type CitationItem,
   type ErrorCode,
   type MessageItem,
+  type MessageModelSegment,
 } from '@doubulea/shared'
 import type {
   ChatFinishReason,
@@ -164,6 +165,11 @@ export interface ChatMessageView {
    */
   persisted?: boolean | null
   /**
+   * 这一轮**实际使用**的模型（产品优化 2026-09-29；见 `shared#messageModelSegmentSchema`）。
+   * 只有历史助手消息有（流式轮次在收尾前不知道它）；重进会话时头部模型选择器据此回显。
+   */
+  model?: MessageModelSegment
+  /**
    * `true` = **纯文本**渲染（不解析 Markdown）。
    *
    * `03` §4.1 对**开场白**单独写了一条："Agent 开场白纯文本气泡（不解析 markdown）"
@@ -266,6 +272,21 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
 }
 
 /**
+ * 模型段：从 jsonb 里安全取值（与 `pickCitations` 同族 —— 逐字段收窄，坏形状 → `undefined`）。
+ * 只认 `messageModelSegmentSchema` 的三个字段全是字符串的情况，其余一律"没有这一段"：
+ * 历史是跨版本读的，P0-2 之前的消息没有这个段是正常态，不该渲染出半截模型选择。
+ */
+function pickModel(source: Record<string, unknown>): MessageModelSegment | undefined {
+  const value = source['model']
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const { modelId, modelName, modelLabel } = value as Record<string, unknown>
+  if (typeof modelId !== 'string' || typeof modelName !== 'string' || typeof modelLabel !== 'string') {
+    return undefined
+  }
+  return { modelId, modelName, modelLabel }
+}
+
+/**
  * 错误码 → **默认中文文案**（`shared/src/errors.ts` 的 `DEFAULT_MESSAGE_BY_ERROR_CODE`）。
  *
  * ⚠️ 存在的理由是"**别再写第四张映射表**"：本仓已经有三处涉及错误码 → 文案 ——
@@ -307,6 +328,8 @@ export function messageToView(item: MessageItem): ChatMessageView {
     // 产物卡仍恒空：它的写入端（沙箱产物，P0-3）还没有，见文件头。
     tools: pickToolCalls(content),
     artifacts: [],
+    // 本轮实际使用的模型（产品优化 2026-09-29；旧消息没有这个段 ⇒ undefined）
+    model: pickModel(content),
     createdAt: item.createdAt,
     status: 'complete',
   }

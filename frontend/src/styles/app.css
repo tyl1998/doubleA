@@ -1311,6 +1311,34 @@
 }
 
 /* 输入区 */
+/* 引导问题（产品优化 2026-09-29）：新会话态、输入区上方的可点击列表（点击填入输入框）。
+   与编辑页 `.guide-row` 是一套东西的两处形态，但**不共用类**：那是表单里的输入行，
+   这里是一排按钮 —— 共用只会让其中一处继承到另一处的布局。 */
+.guide-questions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 auto;
+  width: min(760px, 100%);
+  font-family: var(--font-body);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.guide-questions__label { white-space: nowrap; }
+.guide-chip {
+  border: 1px solid var(--rule-control);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--fs-2xs);
+  line-height: 1.5;
+  cursor: pointer;
+}
+.guide-chip:hover { border-color: var(--accent-rule); color: var(--accent); }
+
 .composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }.composer__inner { width: min(760px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
 .composer__box {
   display: flex;

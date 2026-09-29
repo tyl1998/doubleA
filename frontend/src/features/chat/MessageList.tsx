@@ -17,6 +17,9 @@
  * （`03` §4.1 第一行："Agent 开场白纯文本气泡"）。
  */
 
+import { useState } from 'react'
+
+import { useFeedback } from '../../app/feedback.js'
 import { AssistantMessage } from './AssistantMessage.js'
 import type { ChatMessageView } from './messageModel.js'
 
@@ -24,6 +27,15 @@ export interface MessageListProps {
   messages: readonly ChatMessageView[]
   /** 助手消息头部显示的名字（= Agent 名） */
   agentName: string
+  /**
+   * 可撤回的"最新一轮"用户消息（产品优化 2026-09-29）。`null` = 不显示撤回/修改重发。
+   * `hadTools` 是页面从该轮助手消息判出来的（工具效果无法复原的警告要用）。
+   */
+  recallable?: { key: string; hadTools: boolean } | null
+  /** 撤回最新一轮（正文 + 该轮是否调过工具） */
+  onRecall?: (text: string, hadTools: boolean) => void
+  /** 修改重发最新一轮（撤回后把正文放回输入框） */
+  onResend?: (text: string, hadTools: boolean) => void
 }
 
 /** 用户消息头部的时刻：`09-22 17:41`（流式消息没有 `createdAt`，那一行就不显示时刻） */
@@ -35,12 +47,59 @@ function formatStamp(iso: string | null): string | null {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function UserMessage({ view }: { view: ChatMessageView }) {
+function UserMessage({
+  view,
+  recallable,
+  onRecall,
+  onResend,
+}: {
+  view: ChatMessageView
+  recallable: { key: string; hadTools: boolean } | null | undefined
+  onRecall?: (text: string, hadTools: boolean) => void
+  onResend?: (text: string, hadTools: boolean) => void
+}) {
+  const feedback = useFeedback()
+  const [copying, setCopying] = useState(false)
   const stamp = formatStamp(view.createdAt)
+  // `recallable?.key` 一次覆盖 `null` / `undefined` / key 不匹配三种"不提供撤回"的情况
+  const isRecallable = recallable?.key === view.key
+  const hadTools = recallable === null || recallable === undefined ? false : recallable.hadTools
+
+  const copy = async (): Promise<void> => {
+    if (view.text === '') return
+    setCopying(true)
+    try {
+      await navigator.clipboard.writeText(view.text)
+      feedback.ok('已复制')
+    } catch (error) {
+      // 复制失败不静默：用户要的是那段文字，不是"点了按钮"（与助手消息的复制同一口径）
+      feedback.fail(error, '复制失败')
+    } finally {
+      setCopying(false)
+    }
+  }
+
   return (
     <article className="msg msg--user" data-testid="user-message">
       <p className="msg__head">{stamp === null ? '刚刚' : <span className="num">{stamp}</span>}</p>
       <div className="bubble bubble--user">{view.text}</div>
+      <div className="msg__tools">
+        {/* 快捷复制（产品优化 2026-09-29）：用户消息也要能快速复制 —— 之前只有助手消息有 */}
+        <button type="button" onClick={() => void copy()} disabled={copying || view.text === ''}>
+          复制
+        </button>
+        {/* 撤回 / 修改重发（产品优化 2026-09-29）：只挂在"最新一轮"的用户消息上 */}
+        {isRecallable && onRecall !== undefined && onResend !== undefined && (
+          <>
+            <button type="button" onClick={() => onRecall(view.text, hadTools)}>
+              撤回
+            </button>
+            <button type="button" onClick={() => onResend(view.text, hadTools)}>
+              修改重发
+            </button>
+          </>
+        )}
+      </div>
     </article>
   )
 }
@@ -58,7 +117,7 @@ function OpeningMessage({ view, agentName }: { view: ChatMessageView; agentName:
   )
 }
 
-export function MessageList({ messages, agentName }: MessageListProps) {
+export function MessageList({ messages, agentName, recallable, onRecall, onResend }: MessageListProps) {
   // ⚠️ **不在这里包 `.stream` / `.stream__inner`**：滚动容器与居中列由页面的 `StreamFrame`
   // （`ChatPage.tsx`）持有，三态（骨架 / 错误 / 空态）与消息流共用同一个外框。
   // 之前在这里再包一层，实测会得到**两层 `.stream`** —— padding 被叠加、还多出一个嵌套滚动容器
@@ -67,7 +126,17 @@ export function MessageList({ messages, agentName }: MessageListProps) {
     <>
       {messages.map((view) => {
         if (view.key === 'opening') return <OpeningMessage key={view.key} view={view} agentName={agentName} />
-        if (view.role === 'USER') return <UserMessage key={view.key} view={view} />
+        if (view.role === 'USER') {
+          return (
+            <UserMessage
+              key={view.key}
+              view={view}
+              recallable={recallable}
+              onRecall={onRecall}
+              onResend={onResend}
+            />
+          )
+        }
         if (view.plain === true) return <OpeningMessage key={view.key} view={view} agentName={agentName} />
         return <AssistantMessage key={view.key} view={view} agentName={agentName} />
       })}

@@ -63,6 +63,7 @@ import {
   getConversationActive,
   listConversationsForAgent,
   listMessages,
+  recallLastRound,
   removeConversation,
   renameConversation,
   type ConversationViewer,
@@ -135,6 +136,19 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     '/api/conversations/:id',
     { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
     async (request) => ok(await removeConversation(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * 撤回最新一轮（产品优化 2026-09-29）。**只允许最新一轮**（产品口径，见服务层函数注释）。
+   *
+   * ⚠️ **不按 `status` 拦**（与服务层同族）：只读会话照样能撤回自己的历史。
+   * 响应带 `deletedMessages` / `deletedArtifacts`（同一个事务里数出来）——
+   * 界面的成功提示要说"删掉了什么"（TaskAgent 那一轮的产物也一并删）。
+   */
+  app.post<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/recall',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => ok(await recallLastRound(request.params.id, viewerOf(request))),
   )
 
   /**

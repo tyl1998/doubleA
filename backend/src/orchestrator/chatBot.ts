@@ -709,6 +709,13 @@ export const chatBotProducer: ChatProducer = async (input) => {
       thinkingText,
       citations,
       toolRecords,
+      // 产品优化 2026-09-29：把"本轮实际用的模型"记进助手消息的 content.model 段，
+      // 重进会话时头部模型选择器据此回显（`input.target` 就是闸门解析出来的那个目标）。
+      model: {
+        modelId: input.target.modelId,
+        modelName: input.target.modelName,
+        modelLabel: input.target.label,
+      },
       usage: totalUsage,
       logger,
     })

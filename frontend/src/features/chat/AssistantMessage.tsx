@@ -108,8 +108,10 @@ export function AssistantMessage({ view, agentName }: AssistantMessageProps) {
       {empty ? (
         <p className="ratio" data-testid="assistant-placeholder">
           {view.status === 'streaming' ? (
+            // 流式但**一个字都还没到** = 正等上游首字（TTFT）。用"等待上游响应"而不是
+            // "正在生成"：首字可能几十秒（慢网关），把它说成"正在生成"会像"卡住了"
             <>
-              正在生成<span className="caret" aria-hidden="true" />
+              正在等待上游响应…<span className="caret" aria-hidden="true" />
             </>
           ) : view.status === 'stopped' ? (
             '已停止：本轮没有产生内容'

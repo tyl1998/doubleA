@@ -287,7 +287,15 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
     status: 'RUNNING',
     inputSummary: '/etc/hosts',
   },
-  confirm: { confirmId: 'confirm-1', toolName: 'run_shell', inputSummary: 'rm -rf build' },
+  // ⚠️ P0-2-11 起 `confirm` 载荷多了 `source` / `expiresAt`（倒计时只读服务端绝对时刻）——
+  //    样本必须与 `shared#sseConfirmPayloadSchema` 同步，否则 B1（事件全集能解析）会红。
+  confirm: {
+    confirmId: 'confirm-1',
+    source: 'PLATFORM',
+    toolName: 'run_shell',
+    inputSummary: 'rm -rf build',
+    expiresAt: '2026-09-23T00:02:00.000Z',
+  },
   citations: { items: [{ docName: '手册.pdf', snippet: '片段原文', score: 0.87 }] },
   artifact: { artifactId: 'art-1', fileName: '报告.md', size: 2048, mime: 'text/markdown' },
   queued: { position: 2 },

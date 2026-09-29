@@ -42,6 +42,7 @@ import type {
   ConversationListResult,
   MessageItem,
   MessagePageResult,
+  RecallConversationResult,
   RemoveConversationResult,
   SseEvent,
   StopConversationResult,
@@ -158,6 +159,26 @@ export function useRemoveConversation(agentId: string) {
   return useMutation({
     mutationFn: (id: string) =>
       request<RemoveConversationResult>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+    },
+  })
+}
+
+/**
+ * 撤回最新一轮（`POST /api/conversations/:id/recall`，产品优化 2026-09-29）。
+ *
+ * 失效 `agentConversationsQueryKey`（列表 + 总数）：撤回会改 `lastMessageAt` / `topic`，
+ * 侧栏的标题与排序都要跟着变。**消息历史与产物面板的失效交给页面**（它才知道
+ * `conversationId` 的当前值，也还要处理流式版本 —— 与 `useRemoveConversation` 同款分工）。
+ */
+export function useRecallLastRound(agentId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      request<RecallConversationResult>(`/api/conversations/${encodeURIComponent(id)}/recall`, {
+        method: 'POST',
+      }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
     },

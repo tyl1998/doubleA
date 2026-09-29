@@ -30,6 +30,7 @@ import {
   type ArtifactItem,
   type CitationItem,
   type MessageContent,
+  type MessageModelSegment,
   type RetrievalHit,
   type ToolCallRecord,
 } from '@doubulea/shared'
@@ -476,6 +477,11 @@ export interface AssistantContentInput {
    * ChatBot 恒不传（没有沙箱就没有产物），TaskAgent 在收集失败时也不传 —— 省键即"本轮没有"。
    */
   artifacts?: readonly ArtifactItem[]
+  /**
+   * 本轮**实际使用**的模型（产品优化 2026-09-29；见 `shared#messageModelSegmentSchema`）。
+   * ChatBot 写入；TaskAgent 不传 ⇒ 省键即"没记录"，前端回落到默认模型。
+   */
+  model?: MessageModelSegment
 }
 
 /**
@@ -500,5 +506,6 @@ export function buildAssistantContent(input: AssistantContentInput): MessageCont
   if (input.artifacts !== undefined && input.artifacts.length > 0) {
     content.artifacts = [...input.artifacts]
   }
+  if (input.model !== undefined) content.model = { ...input.model }
   return content
 }

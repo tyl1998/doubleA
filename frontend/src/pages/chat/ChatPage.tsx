@@ -53,15 +53,17 @@
  */
 
 import { Button, Select, Tag } from 'antd'
+import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import type { ReactNode, RefObject } from 'react'
 import { HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
-import type { RemoveConversationResult } from '@doubulea/shared'
+import type { RecallConversationResult, RemoveConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
-import { useConversationArtifacts } from '../../api/artifacts.js'
+import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
 import {
+  conversationMessagesQueryKey,
   flattenMessagePages,
   useConversationMessages,
 } from '../../api/conversations.js'
@@ -78,7 +80,8 @@ import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/con
 import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MessageList } from '../../features/chat/MessageList.js'
-import { messagesToViews, openingView } from '../../features/chat/messageModel.js'
+import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
+import { messagesToViews, openingView, type ChatMessageView } from '../../features/chat/messageModel.js'
 import { roundToViews } from '../../features/chat/roundReducer.js'
 import { chatErrorTitle, shouldToastChatError } from '../../features/chat/streamErrors.js'
 import { useChatStream } from '../../features/chat/useChatStream.js'
@@ -121,6 +124,7 @@ export function ChatPage() {
   const conversationId = params.conversationId
   const navigate = useNavigate()
   const feedback = useFeedback()
+  const queryClient = useQueryClient()
 
   // `agentId` 为空串时不查（`useAgent` 的 `enabled` 判据是"不是 undefined"，空串会打出一个 400）
   const agentQuery = useAgent(agentId === '' ? undefined : agentId)
@@ -131,12 +135,21 @@ export function ChatPage() {
    * （`03` §4.1）。首帧 `agent` 还没到时是 `undefined`（按 ChatBot 处理）—— 这没关系：
    * hook 里存的是 ref，真正读它的时刻是"用户点了对齐/停止了"，那时 agent 早就到了。
    */
+  /**
+   * 首次发送新建会话时，`conversationId` 会从 `undefined` 变成新会话 id —— 这次变化**不是**
+   * "切换会话"，用户的模型选择必须保留（否则"选了 flash 发送后，选择器立刻回到默认"）。
+   * 其余变化（侧栏切换 / 「+ 新会话」）照旧重置。由 `onConversationCreated` 置位、reset effect 消费。
+   */
+  const preserveSelectionRef = useRef(false)
+
   const { round, sending, stopping, disconnect, streamingId, send, stop, align } = useChatStream(
     agentId,
     conversationId,
     {
       // 首条消息建出会话之后把 id 写进 URL（`replace`：不往历史里塞一步"空跳转"）
       onConversationCreated: (created) => {
+        // 这是"新建会话"而不是"切换会话"：别让 reset effect 把用户此刻选的模型清掉
+        preserveSelectionRef.current = true
         navigate(chatPath(agentId, created.id), { replace: true })
       },
       ...(agentQuery.data === undefined ? {} : { agentType: agentQuery.data.type }),
@@ -148,11 +161,18 @@ export function ChatPage() {
   /**
    * 本会话**这一轮选用的模型**（模型池特性）。`undefined` = 走智能体默认模型（`agent.modelId`）。
    * 切换会话时重置（下面的 effect）：一个会话选的模型不该带到另一个会话。
+   * ⚠️ 但"新建会话的第一条消息"**不算切换**（`onConversationCreated` 会先置
+   * `preserveSelectionRef`）—— 那时重置会把用户刚选的模型丢掉，而历史还没加载、回显也补不上。
    */
   const [selectedModelId, setSelectedModelId] = useState<string | undefined>(undefined)
   useEffect(() => {
+    if (preserveSelectionRef.current) {
+      preserveSelectionRef.current = false
+      return
+    }
     setSelectedModelId(undefined)
   }, [conversationId])
+
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
   const [confirmPending, setConfirmPending] = useState(false)
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
@@ -174,10 +194,51 @@ export function ChatPage() {
 
   const agent = agentQuery.data
   const agentName = agent?.name ?? '智能体'
+  /**
+   * 头部副标题里显示的模型名：**跟随本会话当前选中/正在用的模型**，而不是永远显示默认模型
+   * （产品反馈 2026-09-29：选了 flash 后副标题还停在 pro）。`selectedModelId` 为
+   * `undefined`（未选 / 回落到默认）时显示默认模型；选中的模型已不在池里（被删/停用）
+   * 时 `find` 落空 ⇒ 照样回落默认标签。
+   */
+  const activeModelLabel =
+    agent?.models.find((m) => m.modelId === (selectedModelId ?? agent.modelId))?.modelLabel ??
+    agent?.modelLabel ??
+    null
 
   // 历史（正序）→ 视图；流式轮次 → 视图；两者**同一形状**（单一渲染路径）
   const history = useMemo(() => messagesToViews(flattenMessagePages(messagesQuery.data)), [messagesQuery.data])
   const streamViews = useMemo(() => (round === null ? [] : roundToViews(round)), [round])
+
+  /**
+   * 本会话**最后使用的模型**（产品优化 2026-09-29）—— 从已落库历史的最后一条带 `model`
+   * 段的助手消息取（越靠后越新）。重进会话时头部选择器要回显它，而不是每次都回落到默认。
+   */
+  const lastUsedModel = useMemo(() => {
+    for (let index = history.length - 1; index >= 0; index--) {
+      const view = history[index]
+      if (view === undefined) continue
+      const model = view.model
+      if (model !== undefined) return model
+    }
+    return undefined
+  }, [history])
+
+  /**
+   * 重进会话回显"上次用的模型"（产品优化 2026-09-29）。
+   *
+   * 三个前置缺一不可：**用户还没手动选过**（`undefined` = 这一会话还没碰过选择器）、
+   * 历史里有记录、那个模型**现在仍可用**（池成员且未停用）。
+   * 模型被删 / 停用 ⇒ 这里不动 ⇒ 头部选择器回落到默认模型（`selectedModelId ?? agent.modelId`）
+   * —— 这正是产品口径"当模型被删除后使用默认模型"。手动画过选择器后也**不再覆盖**
+   * （否则会出现"我选了 B、却被回显成 A"的打架）。
+   */
+  useEffect(() => {
+    if (selectedModelId !== undefined) return
+    if (lastUsedModel === undefined) return
+    const member = agent?.models.find((m) => m.modelId === lastUsedModel.modelId)
+    if (member === undefined || !member.available) return
+    setSelectedModelId(lastUsedModel.modelId)
+  }, [selectedModelId, lastUsedModel, agent])
 
   const messages = useMemo(() => {
     const all = [...history, ...streamViews]
@@ -187,6 +248,37 @@ export function ChatPage() {
     const opening = openingView(agent?.openingRemarks)
     return opening === null ? [] : [opening]
   }, [history, streamViews, agent?.openingRemarks])
+
+  /**
+   * 可撤回的"最新一轮"（产品优化 2026-09-29；产品口径：只能对最新的一轮撤回/修改重发）。
+   *
+   * 判据四条：有会话 + 没在生成 + 历史里最后一条 `USER` 消息 + 它在整条历史里是最后一条。
+   * `hadTools` 看紧随其后的助手消息有没有工具卡 —— "调用过工具、效果无法复原"的警告
+   * 是**事前**说的，判据来自已落库的历史（不是服务端另算）。
+   *
+   * ⚠️ 只在**已落库的历史**（`history`）上算，不含流式轮次：流式中不提供撤回
+   * （那会撤掉正在生成的一轮，而"最新一轮"此刻还在变）。
+   */
+  const recallable = useMemo(() => {
+    if (conversationId === undefined) return null
+    if (round !== null) return null
+    let lastUser: ChatMessageView | undefined
+    let lastUserIndex = -1
+    for (let index = history.length - 1; index >= 0; index--) {
+      const view = history[index]
+      if (view !== undefined && view.role === 'USER') {
+        lastUser = view
+        lastUserIndex = index
+        break
+      }
+    }
+    if (lastUser === undefined) return null
+    const assistant = history[lastUserIndex + 1]
+    return {
+      key: lastUser.key,
+      hadTools: assistant !== undefined && assistant.role === 'ASSISTANT' && assistant.tools.length > 0,
+    }
+  }, [conversationId, history, round])
 
   // ── 产物面板（P0-3-11）──────────────────────────────────────────────────────
   //
@@ -415,6 +507,36 @@ export function ChatPage() {
     [agentId, conversationId, navigate, streamingId],
   )
 
+  // ── 撤回 / 修改重发最新一轮（产品优化 2026-09-29）──────────────────────────────
+
+  /** 撤回确认弹窗的目标；`null` = 关闭 */
+  const [recallTarget, setRecallTarget] = useState<RecallTarget | null>(null)
+
+  /** 点「撤回」/「修改重发」：两个动作共用同一个确认弹窗，`resend` 只决定成功后的收尾 */
+  const openRecall = useCallback(
+    (text: string, hadTools: boolean, resend: boolean): void => {
+      setRecallTarget({ text, hadTools, resend })
+    },
+    [],
+  )
+
+  /**
+   * 撤回成功的收尾（弹窗已弹过成功提示，这里做数据与 UI 的收尾）：
+   *   · 失效消息历史与产物面板（侧栏列表已由 mutation 失效）—— 不失效的话，撤回的这一轮
+   *     还躺在界面上，而用户看到的正是"我刚撤了它"；
+   *   · 修改重发 ⇒ 把原文放回输入框（`resend` 为真）。
+   */
+  const handleRecalled = useCallback(
+    (_result: RecallConversationResult, target: RecallTarget): void => {
+      setRecallTarget(null)
+      if (conversationId === undefined) return
+      void queryClient.invalidateQueries({ queryKey: conversationMessagesQueryKey(conversationId) })
+      void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(conversationId) })
+      if (target.resend) setDraft(target.text)
+    },
+    [conversationId, queryClient],
+  )
+
   // ── 智能体本身取不到（不存在 / 已软删 / 链接里的 id 不对）：给一条能回去的路
   if (agentQuery.isError) {
     return (
@@ -456,7 +578,7 @@ export function ChatPage() {
               <p className="ratio">
                 {agent === undefined
                   ? '正在读取智能体…'
-                  : `${agent.type} · ${agent.modelLabel ?? '未绑定模型'}`}
+                  : `${agent.type} · ${activeModelLabel ?? '未绑定模型'}`}
               </p>
             </div>
             <div className="chat__head-right">
@@ -562,9 +684,35 @@ export function ChatPage() {
                   </Button>
                 </div>
               ) : null}
-              <MessageList messages={messages} agentName={agentName} />
+              <MessageList
+                messages={messages}
+                agentName={agentName}
+                recallable={recallable}
+                onRecall={(text, hadTools) => openRecall(text, hadTools, false)}
+                onResend={(text, hadTools) => openRecall(text, hadTools, true)}
+              />
             </StreamFrame>
           )}
+
+          {/* ── 引导问题（产品优化 2026-09-29）：新会话态、开场白下方 ──
+              点击**只填入输入框**（可编辑后再发送），不直接发送 —— 与编辑页的提示逐字一致。
+              ⚠️ 只在"还没有会话"（`conversationId === undefined`）时出现：首条消息一发出去
+              会话就建出来了，那时引导问题作为"开场"的使命已经完成。 */}
+          {conversationId === undefined && (agent?.guideQuestions ?? []).length > 0 ? (
+            <div className="guide-questions" data-testid="guide-questions">
+              <span className="guide-questions__label">试试这样问：</span>
+              {(agent?.guideQuestions ?? []).map((question) => (
+                <button
+                  key={question}
+                  type="button"
+                  className="guide-chip"
+                  onClick={() => setDraft(question)}
+                >
+                  {question}
+                </button>
+              ))}
+            </div>
+          ) : null}
 
           {/* ── 输入区：状态机 / 停止 / 确认卡全在 `ChatInput` 里（本页只提供数据与回调） ── */}
           <ChatInput
@@ -620,6 +768,16 @@ export function ChatPage() {
         artifact={previewedArtifact}
         open={previewedArtifact !== null}
         onClose={closePreview}
+      />
+
+      {/* 撤回 / 修改重发最新一轮（产品优化 2026-09-29）。`conversationId ?? ''` 是类型兜底：
+          弹窗只在 `recallTarget` 非空时发请求，而那时 `conversationId` 必然存在（见 `recallable` 的判据） */}
+      <RecallConversationModal
+        agentId={agentId}
+        conversationId={conversationId ?? ''}
+        target={recallTarget}
+        onClose={() => setRecallTarget(null)}
+        onRecalled={handleRecalled}
       />
     </>
   )

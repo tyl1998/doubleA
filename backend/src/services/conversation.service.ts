@@ -95,6 +95,7 @@ import {
   type ListMessagesQuery,
   type MessageItem,
   type MessagePageResult,
+  type RecallConversationResult,
   type RemoveConversationResult,
   type RenameConversationBody,
 } from '@doubulea/shared'
@@ -423,6 +424,125 @@ async function removeConversationObjects(objectKeys: string[]): Promise<number> 
     )
     return 0
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 撤回最新一轮（产品优化 2026-09-29）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 从助手消息的 `content.artifacts` 段里安全地取出产物 id（`content` 是 jsonb、形状由写入版本决定） */
+function artifactIdsOfContent(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return []
+  const artifacts = (raw as Record<string, unknown>)['artifacts']
+  if (!Array.isArray(artifacts)) return []
+  const ids: string[] = []
+  for (const entry of artifacts) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const id = (entry as { artifactId?: unknown }).artifactId
+    if (typeof id === 'string' && id !== '') ids.push(id)
+  }
+  return ids
+}
+
+/**
+ * 撤回**最新一轮**（`POST /api/conversations/:id/recall`）。
+ *
+ * 只允许"最新一轮"（而不是任意一轮）：多轮对话里模型看到的上下文依赖前面的消息，
+ * 改中间任何一轮都会让后面的回答建立在被改写的历史上 —— 产品口径是"只能对最新的一轮
+ * 撤回 / 修改重发"（产品反馈 2026-09-29）。
+ *
+ * 一轮 = 最后一条 `USER` 消息 + 它之后落库的全部消息（本仓一轮是 USER + ASSISTANT 两条、
+ * 在**同一个事务**里写入；"之后"在正常路径上就是那一条 ASSISTANT）。
+ *
+ * 三处刻意：
+ *   · **不按 `status` 拦**（与删除同族，文件头 ⑤）：用户要能撤回自己的历史，
+ *     与 Agent 是否被软删无关；
+ *   · **TaskAgent 那一轮的产物一并删**（行 + S3 对象）：产物面板与消息历史是同一条时间线，
+ *     撤了轮却让产物留在面板上，会造出"这一轮不存在了、文件却还在"的半截状态。
+ *     对象删除失败只告警（行已删，残留对象属可人工清理的泄漏，与 `removeConversation` 同款）；
+ *   · **撤回后整轮删干净**（没有消息了）⇒ 把 `topic` / `lastMessageAt` 重置回 `null`：
+ *     "标题由首条消息推导"（{@link deriveConversationTopic}）的前提是"有首条消息"，
+ *     空会话回到"新会话"态。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 会话不存在或不是我的
+ */
+export async function recallLastRound(
+  id: string,
+  viewer: ConversationViewer,
+): Promise<RecallConversationResult> {
+  const target = await findMyConversation(id, viewer)
+  const db = getPrisma()
+
+  // 事务外要用的 S3 对象键：`$transaction` 的回闭里写入、事务提交后再删对象
+  let objectKeys: string[] = []
+
+  const result = await db.$transaction(async (tx) => {
+    // ① 最新一轮的起点 = 最后一条 USER 消息（`MESSAGE_CHRONO_ORDER` 是"新 → 旧"）
+    const lastUser = await tx.message.findFirst({
+      where: { conversationId: id, role: 'USER' },
+      orderBy: [...MESSAGE_CHRONO_ORDER],
+    })
+    if (lastUser === null) {
+      // 一个消息都没有的会话：撤回无可撤回（界面上也不该出现这个按钮，这里是兜底）
+      return { id, agentId: target.agentId, deletedMessages: 0, deletedArtifacts: 0 }
+    }
+
+    // ② 该轮的全部消息 = 那条 USER + 它之后的一切（二元组字典序，与 `listMessages` 同款比较）
+    const doomed = await tx.message.findMany({
+      where: {
+        conversationId: id,
+        OR: [
+          { id: lastUser.id },
+          { createdAt: { gt: lastUser.createdAt } },
+          { createdAt: lastUser.createdAt, id: { gt: lastUser.id } },
+        ],
+      },
+      select: { id: true, role: true, content: true },
+      orderBy: [...MESSAGE_CHRONO_ORDER],
+    })
+
+    // ③ 数 + 删消息（同一个事务：先数后删，跨语句数会出现"数了 2 条、删了 3 条"）
+    const deletedMessages = await tx.message.deleteMany({
+      where: { id: { in: doomed.map((row) => row.id) } },
+    })
+
+    // ④ TaskAgent 那一轮的产物：行与消息同一个事务删，S3 对象在事务外尽力删
+    const artifactIds = doomed
+      .filter((row) => row.role === 'ASSISTANT')
+      .flatMap((row) => artifactIdsOfContent(row.content))
+    let deletedArtifacts = 0
+    if (artifactIds.length > 0) {
+      const rows = await tx.artifact.findMany({
+        where: { id: { in: artifactIds } },
+        select: { id: true, fileKey: true },
+      })
+      objectKeys.push(...rows.map((row) => row.fileKey))
+      if (rows.length > 0) {
+        deletedArtifacts = (await tx.artifact.deleteMany({ where: { id: { in: rows.map((row) => row.id) } } })).count
+      }
+    }
+
+    // ⑤ 重算活跃时间与标题：还有消息 ⇒ `lastMessageAt` 指到最后一条；没有 ⇒ 回到"新会话"态
+    const remaining = await tx.message.findFirst({
+      where: { conversationId: id },
+      orderBy: [...MESSAGE_CHRONO_ORDER],
+      select: { createdAt: true },
+    })
+    await tx.conversation.update({
+      where: { id },
+      data: {
+        lastMessageAt: remaining === null ? null : remaining.createdAt,
+        ...(remaining === null ? { topic: null } : {}),
+      },
+    })
+
+    return { id, agentId: target.agentId, deletedMessages: deletedMessages.count, deletedArtifacts }
+  })
+
+  // S3 对象清理放在事务外（失败只告警，不把"删消息"这件事拖垮）
+  if (objectKeys.length > 0) await removeConversationObjects(objectKeys)
+  getLogger().info({ conversationId: id, ...result }, '已撤回最新一轮')
+  return result
 }
 
 // ═════════════════════════════════════════════════════════════════════

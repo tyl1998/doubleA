@@ -93,7 +93,9 @@ export function isConversationReadOnly(status: ConversationStatus): boolean {
  * 放 `shared` 的理由与 `DOCUMENT_PARSING_HINT`（P0-1-21）相同：这是**界面判据**，
  * 前端多个出口（侧栏、对话页头部、删除确认框）都要一致 —— 各处各写一份，
  * 改口径时就得全仓搜。
- * ⚠️ P0-1 阶段**没有自动命名**（`01`/`02`/`03` 都没要求），`topic` 只可能由"重命名"产生。
+ * ⚠️ 产品优化（2026-09-29）后 `topic` 会在**首条用户消息落库时**被自动命名
+ * （{@link deriveConversationTopic}），所以这个回落文案只剩两种处境：
+ * "刚建好、还没发消息"的会话，以及"自动命名前的极短窗口"。
  */
 export const CONVERSATION_UNTITLED_HINT = '新会话'
 
@@ -106,6 +108,23 @@ export const CONVERSATION_UNTITLED_HINT = '新会话'
  * 落地形态与 `PASSWORD_*` / `MESSAGE_PAGE_LIMIT_*` 同款：常量放 `shared`，schema 与界面都引它。
  */
 export const CONVERSATION_TOPIC_MAX_CHARS = 255
+
+/**
+ * 从**首条用户消息**推导会话标题（产品优化 2026-09-29：发起会话后标题不该停在「新会话」）。
+ *
+ * 三条口径：
+ *   · `trim()` + 把连续空白（含换行）压成单个空格 —— 标题是**单行显示名**，多行正文直接
+ *     放进侧栏会把布局撑破，而"标题里保留换行"没有任何展示价值；
+ *   · 按**码点**截断到 {@link CONVERSATION_TOPIC_MAX_CHARS} —— 与 `renameConversationBodySchema`
+ *     的 `.max()` 同口径（zod 的 `.max()` 也是按码点，`String.prototype.slice` 会劈代理对）；
+ *   · 返回空串 = 首条消息"没内容可当标题"（理论上不会发生：`POST /:id/chat` 的正文已被
+ *     schema `trim().min(1)` 拦过）。调用方把空串当"不命名"处理（写入口用 CAS 也天然安全）。
+ */
+export function deriveConversationTopic(firstUserText: string): string {
+  const collapsed = firstUserText.trim().replace(/\s+/g, ' ')
+  const chars = [...collapsed]
+  return chars.length > CONVERSATION_TOPIC_MAX_CHARS ? chars.slice(0, CONVERSATION_TOPIC_MAX_CHARS).join('') : collapsed
+}
 
 // ───────────────────────────── 列表 / 详情投影 ─────────────────────────────
 
@@ -214,6 +233,22 @@ export const removeConversationResultSchema = z.object({
   deletedMessages: z.number().int().min(0),
 })
 export type RemoveConversationResult = z.infer<typeof removeConversationResultSchema>
+
+/**
+ * `POST /api/conversations/:id/recall` 的响应（产品优化 2026-09-29：撤回最新一轮）。
+ *
+ * 带上三个数（与删除同族）：界面要能说出"删掉了什么"。`deletedMessages` / `deletedArtifacts`
+ * 都是**同一个事务里数出来**的（`messages` 由外键 CASCADE 时数不出来，必须先数后删）。
+ */
+export const recallConversationResultSchema = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  /** 删掉的消息数（撤回的那一轮；本仓一轮 = USER + ASSISTANT 两条，同事务写入） */
+  deletedMessages: z.number().int().min(0),
+  /** 连带删掉的产物行数（TaskAgent 那一轮的产出文件；ChatBot 恒为 0） */
+  deletedArtifacts: z.number().int().min(0),
+})
+export type RecallConversationResult = z.infer<typeof recallConversationResultSchema>
 
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 
@@ -393,6 +428,26 @@ export const toolCallRecordSchema = z.object({
 })
 export type ToolCallRecord = z.infer<typeof toolCallRecordSchema>
 
+/**
+ * 一轮回答使用的模型（产品优化 2026-09-29：重新进入会话时，头部模型选择器要回显"上次用的模型"）。
+ *
+ * 三个字段与 `agentModelOptionSchema` 同一份语义（`modelId` = 池成员 id，也是对话页模型选择器的
+ * value；`modelName` / `modelLabel` 是展示名）。记录进 `messages.content.model` 段：
+ * 历史还原时前端拿 `modelId` 去当前模型池里找 —— 模型被删除/停用时池里没有它 ⇒ 界面回落到
+ * 默认模型（判据在前端 `ChatPage`，本 schema 只负责"写进去的形状"）。
+ *
+ * ⚠️ 它记的是"这一轮**实际用了**哪个模型"，不是"默认模型是哪个"：用户在对话页选了池里的
+ * 非默认模型后，重进会话要靠它回显，而不是又落回默认。
+ */
+export const messageModelSegmentSchema = z.object({
+  modelId: z.string(),
+  /** 上游型号名（`gpt-4o-mini`…，不是界面别名） */
+  modelName: z.string(),
+  /** 模型别名（界面上给业务同学看的名字） */
+  modelLabel: z.string(),
+})
+export type MessageModelSegment = z.infer<typeof messageModelSegmentSchema>
+
 // ───────────────────── 产物（P0-3-7 定型）─────────────────────
 
 /**
@@ -564,6 +619,8 @@ export const messageContentSchema = z.object({
   tool_calls: z.array(toolCallRecordSchema).optional(),
   /** 本轮产出文件（P0-3-7；TaskAgent 专属 —— ChatBot 恒省略这个键） */
   artifacts: z.array(artifactItemSchema).optional(),
+  /** 本轮实际使用的模型（产品优化 2026-09-29；ChatBot 写入，见 {@link messageModelSegmentSchema}） */
+  model: messageModelSegmentSchema.optional(),
 })
 export type MessageContent = z.infer<typeof messageContentSchema>
 

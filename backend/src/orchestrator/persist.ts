@@ -19,7 +19,8 @@
  * `artifacts` 段，写入端就是这里）；ChatBot 不传该参数 ⇒ 它的落库口径与从前**逐字不变**。
  */
 
-import type { ArtifactItem, CitationItem, ToolCallRecord } from '@doubulea/shared'
+import type { ArtifactItem, CitationItem, MessageModelSegment, ToolCallRecord } from '@doubulea/shared'
+import { deriveConversationTopic } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
@@ -80,6 +81,12 @@ export interface PersistRoundInput {
    * `content.artifacts` 段只在非空时出现（`buildAssistantContent` 的省键口径）。
    */
   artifacts?: readonly ArtifactItem[]
+  /**
+   * 本轮**实际使用**的模型（产品优化 2026-09-29；ChatBot 传、TaskAgent 不传）。
+   * 落进助手消息的 `content.model` 段，供"重进会话回显上次用的模型"（见
+   * `shared#messageModelSegmentSchema`）。
+   */
+  model?: MessageModelSegment
   usage: RoundUsage | null
   /**
    * 本轮的计量行（**P0-3-12**；TaskAgent 专属）。
@@ -129,6 +136,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
     citations,
     toolRecords,
     artifacts,
+    model,
     usage,
     usageRecord,
     logger,
@@ -157,6 +165,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
               citations,
               toolCalls: toolRecords,
               artifacts,
+              ...(model === undefined ? {} : { model }),
             }),
             // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）
             tokensIn: usage?.tokensIn ?? null,
@@ -166,6 +175,17 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
         assistantMessageId = created.id
       }
       await touchConversation(tx, conversationId, new Date())
+      // ── 自动命名（产品优化 2026-09-29）：首条用户消息落库时给会话一个标题 ──
+      // 判据是"`topic` 还是 `null`"（CAS 更新，不是先读再写）：
+      //   · 流式中用户手动改名 ⇒ `topic` 已非 null ⇒ 这里不会覆盖（后写覆盖先写是错的）；
+      //   · 之后每一轮都一样 —— 标题只由"第一条消息"或"手动重命名"产生，二选一。
+      const derivedTopic = deriveConversationTopic(content)
+      if (derivedTopic !== '') {
+        await tx.conversation.updateMany({
+          where: { id: conversationId, topic: null },
+          data: { topic: derivedTopic },
+        })
+      }
       // ── 计量行（P0-3-12）：与上面两条消息、会话活跃时间同一个事务 ──
       // `user_id` / `agent_id` 从**会话行**读（它们是这两个身份的唯一权威，见 `UsageRecordInput`）。
       // ⚠️ 走到这里会话行**必然存在**：上面两条 `message.create` 带着 `conversations` 外键，

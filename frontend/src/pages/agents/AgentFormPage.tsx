@@ -58,7 +58,6 @@
 import { Alert, Button, Checkbox, Form, Input, Radio, Select, Tag } from 'antd'
 import {
   AGENT_DESCRIPTION_MAX_CHARS,
-  AGENT_ICON_MAX_CHARS,
   AGENT_OPENING_REMARKS_MAX_CHARS,
   AGENT_SYSTEM_PROMPT_MAX_CHARS,
   AGENT_TYPES,
@@ -520,13 +519,6 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                   extra={`留空即清空该字段；最多 ${AGENT_DESCRIPTION_MAX_CHARS} 个字符。`}
                 >
                   <Input placeholder="一句话说清它做什么、边界在哪" />
-                </Form.Item>
-                <Form.Item
-                  name="icon"
-                  label="图标"
-                  extra={`填一个 emoji 或图片 URL（最多 ${AGENT_ICON_MAX_CHARS} 个字符）。`}
-                >
-                  <Input placeholder="🛠️" />
                 </Form.Item>
                 {typeLocked ? (
                   <div>
