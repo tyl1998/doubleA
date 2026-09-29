@@ -331,6 +331,17 @@ export const chatBotProducer: ChatProducer = async (input) => {
       return { userId: viewerUserId }
     }
 
+    /**
+     * 本轮（这一条用户消息）里**已被用户取消 / 等待超时**过的危险工具名。
+     *
+     * 🔧 修复"反复弹卡"：`TOOL_CONFIRM_REJECTED_OUTPUT` 已经明说"请不要重试"，但模型并不总是
+     * 听话 —— 它把同一个工具再报一次，就会**又弹一张确认卡**，一轮一轮直到工具轮数上限。
+     * 用户的观感是"取消了却一直在弹同一张卡 / 卡住"。这里按**工具名**记住"本轮已经拒过它"，
+     * 之后模型再请求同名工具时**不再弹卡**，直接按取消回填 —— 用户对同一个工具只需拒一次。
+     * 作用域是"这一轮用户消息"（放在 `for(;;)` 之外），下一条消息重新开始。
+     */
+    const blockedToolNames = new Set<string>()
+
     try {
       for (;;) {
         const limit = config.limits.toolLoopLimit
@@ -455,16 +466,41 @@ export const chatBotProducer: ChatProducer = async (input) => {
            *     回填一条"未执行"的结果给模型，让它自己决定怎么说 —— 与 P0-2-8 门槛 2 同一条形态
            *     （`01` §3.6 的"取消后流程可继续"）。
            */
-          const blocked =
-            route !== undefined && parsed.ok && route.dangerous
-              ? await input.awaitConfirm({ source: 'PLATFORM', toolName: call.name, inputSummary })
-              : null
+          /**
+           * 🔧 反复弹卡修复：只有"本轮还没拒过这个工具"时才真的弹卡。
+           *   · 已经拒过（或超时过）⇒ 直接按 `REJECTED` 处理，**不再弹第二张卡**；
+           *   · 第一次遇到 ⇒ 弹卡等应答；应答是"取消 / 超时"则把工具名记进 `blockedToolNames`，
+           *     使模型的后续同名请求走上面那条"不弹卡"分支。
+           */
+          let blocked: ConfirmDecision | null = null
+          if (route !== undefined && parsed.ok && route.dangerous) {
+            if (blockedToolNames.has(call.name)) {
+              blocked = 'REJECTED'
+              logger.info(
+                { conversationId, agentId, toolName: call.name },
+                '该工具本轮已被用户取消/超时，模型再次请求 ⇒ 不再弹确认卡，直接按取消处理',
+              )
+            } else {
+              blocked = await input.awaitConfirm({ source: 'PLATFORM', toolName: call.name, inputSummary })
+              // 取消与超时都意味着"这一轮不该再为它弹卡"（见 `blockedToolNames` 的注释）
+              if (blocked === 'REJECTED' || blocked === 'TIMEOUT') blockedToolNames.add(call.name)
+            }
+          }
           const blockedOutput =
             blocked === null || blocked === 'CONFIRMED'
               ? null
               : blocked === 'TIMEOUT'
                 ? TOOL_CONFIRM_TIMEOUT_OUTPUT
                 : TOOL_CONFIRM_REJECTED_OUTPUT
+
+          /**
+           * 同一次调用的"二次确认去重"（`docs/08-…` §8）：本次调用已经过 PLATFORM 卡且用户确认了
+           * （`route.dangerous` 为真且 `blocked === 'CONFIRMED'`）⇒ 同一调用途中的服务端
+           * elicitation / `input_required` **自动 accept、不再弹第二张卡** —— 用户已经为
+           * "执行这个危险工具"确认过一次。非危险工具（没弹过 PLATFORM 卡）不受影响，服务端卡照弹。
+           */
+          const platformConfirmed =
+            route !== undefined && parsed.ok && route.dangerous && blocked === 'CONFIRMED'
 
           /**
            * 被用户拦下的调用**不发 `RUNNING` 卡**：那张卡的含义是"已经在跑"，而它其实没跑过。
@@ -505,8 +541,12 @@ export const chatBotProducer: ChatProducer = async (input) => {
                * 差别只在 payload 的 `source`（决定前端那句话怎么写）。
                *
                * 三条映射口径（MCP 的 `ElicitResult.action` 只有这三个值）：
-               *   · 用户确认 ⇒ `accept`，**不带 `content`** —— P0 只有确认/取消二元语义
-               *     （`02` §六 第 4 步明写"不做自由输入表单"）⇒ 没有表单值可回；
+               *   · 用户确认 ⇒ `accept` —— P0 只有确认/取消二元语义（`02` §六 第 4 步明写
+               *     "不做自由输入表单"）。⚠️ **v2 起（2026-07-28 的 `input_required`）：
+               *     服务端的确认表单要求 accept 带表单值**（apitest 的 `mrtrGate` 读
+               *     `acceptedContent(...,'confirm').confirm === true`），裸 accept 会被它
+               *     当成 decline/cancel ⇒ 删除在服务端直接失败。P0 不做自由输入，只填
+               *     "布尔 confirm"这一种表单（见 `confirmFormContent`）；对不上就仍不带 content；
                *   · 用户取消 ⇒ `decline`（MCP 的语义是"用户明确拒绝"）；
                *   · **超时 ⇒ `cancel`**（语义是"用户没给出答复就结束了"）——
                *     与 `decline` 分开，是因为服务端可能对这两种的处理不同。
@@ -519,6 +559,23 @@ export const chatBotProducer: ChatProducer = async (input) => {
                * 上游调用会以 `LlmAbortError` 结束，`chatBot` 据此按 `STOPPED` 收尾。
                */
               const onElicit = async (request: McpElicitRequest): Promise<McpElicitReply> => {
+                // 同一次调用已过 PLATFORM 确认卡 ⇒ 服务端再问的那一次自动 accept（不弹第二张卡）。
+                // 用户已经为"执行这个危险工具"确认过一次；服务端的 elicitation 只是它自己的确认回合
+                // （`docs/08-…` §8 的去重）。应答形状与手动确认后的 accept 完全一致（含布尔 confirm 表单值）。
+                if (platformConfirmed) {
+                  logger.info(
+                    {
+                      conversationId,
+                      agentId,
+                      toolName: call.name,
+                      serverName,
+                      message: request.message,
+                    },
+                    '同一次调用已过 PLATFORM 确认卡 ⇒ 服务端 elicitation 自动 accept（不弹第二张卡）',
+                  )
+                  const content = confirmFormContent(request.requestedSchema)
+                  return content === null ? { action: 'accept' } : { action: 'accept', content }
+                }
                 let decision: ConfirmDecision
                 try {
                   decision = await input.awaitConfirm({
@@ -531,7 +588,10 @@ export const chatBotProducer: ChatProducer = async (input) => {
                   if (error instanceof ChatStoppedError) return { action: 'cancel' }
                   throw error
                 }
-                if (decision === 'CONFIRMED') return { action: 'accept' }
+                if (decision === 'CONFIRMED') {
+                  const content = confirmFormContent(request.requestedSchema)
+                  return content === null ? { action: 'accept' } : { action: 'accept', content }
+                }
                 return decision === 'TIMEOUT' ? { action: 'cancel' } : { action: 'decline' }
               }
 
@@ -712,3 +772,24 @@ export const chatBotProducer: ChatProducer = async (input) => {
  * 行为**逐字未变**（只搬位置 + 把 `usage` 的入参收窄成 `RoundUsage`）——
  * 想核对时看 `git log -p -- backend/src/orchestrator/chatBot.ts` 里删除的那一段。
  */
+
+/**
+ * 二进制确认表单 → accept 时要回填的 `content`。
+ *
+ * 现代协议（2026-07-28 的 `input_required`）下，服务端（如 apitest 的 MRTR）用**表单式**
+ * elicitation 请求确认，`requestedSchema` 是 `{type:'object', properties:{confirm:{type:'boolean'}},
+ * required:['confirm']}`，其 `mrtrGate` 读的是 `acceptedContent(...,'confirm').confirm === true`。
+ * P0 不做自由输入，只认这一种"布尔 confirm"表单；schema 形状对不上就返回 `null`
+ * （保持裸 accept，legacy 反向通道的旧行为不变）。
+ */
+function confirmFormContent(schema: unknown): Record<string, boolean> | null {
+  const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+  if (!isPlainObject(schema)) return null
+  if (schema.type !== 'object') return null
+  const properties = schema.properties
+  if (!isPlainObject(properties)) return null
+  const confirm = properties.confirm
+  if (!isPlainObject(confirm) || confirm.type !== 'boolean') return null
+  return { confirm: true }
+}

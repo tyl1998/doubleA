@@ -18,20 +18,21 @@
  * ⇒ 只复用真正与协议无关的文本工具（`redactSecret` / `UPSTREAM_BODY_SNIPPET`）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 三条**实测**得来的判据（SDK 1.30.1；详见 `issue_fix/问题记录-P0-2-1-*.md`）
+ * 三条**实测**得来的判据（v2 `@modelcontextprotocol/client`；1.x 判据已按 v2 重写）
  * ─────────────────────────────────────────────────────────────────────
- * 1. ⚠️ **`AbortSignal` 中断会被 SDK 包成 `McpError(RequestTimeout)`**。
- *    `shared/protocol.js#cancel()` 的原文是
- *    `reason instanceof McpError ? reason : new McpError(ErrorCode.RequestTimeout, String(reason))`
+ * 1. ⚠️ **`AbortSignal` 中断仍会被包成超时类错误**（v2：`SdkError(code:'REQUEST_TIMEOUT')`）
  *    ⇒ **不能靠错误码区分「用户停止」与「真超时」**。调用点必须把 `signal.aborted`
- *    显式传进来（{@link McpFailureContext.aborted}），这也是本函数**先看 aborted、
- *    再看错误码**的原因 —— 顺序即正确性。
- * 2. `StreamableHTTPError` **不设 `name`**（实例的 `name === 'Error'`），只有一个
- *    `code: number`；且它**不是** `McpError` 的子类 ⇒ 只能按形状认
- *    （`code` 是数字且 `name === 'McpError'` 不成立）。
- * 3. `fetch` 连不通时抛的是 `TypeError: fetch failed`，**真正的原因在 `.cause` 链上**
+ *    显式传进来（{@link McpFailureContext.aborted}），本函数**先看 aborted、再看错误码** ——
+ *    顺序即正确性。
+ * 2. ⚠️ **v2 把错误分成两族**（core 的 `SdkError` / `ProtocolError`）：
+ *    · **本地 SDK 错误** `SdkError`：`code` 是**字符串**（`SdkErrorCode`，如 `REQUEST_TIMEOUT`），
+ *      HTTP 非 2xx 用子类 `SdkHttpError`（带 `status: number` / `data.status`）；
+ *    · **JSON-RPC 协议错误** `ProtocolError`：`code` 是**数字**（-32601 等，跨线的错误帧）。
+ *    本模块**按形状认**（不 import SDK 运行时枚举，理由见下方版本集注释）：
+ *    数字 `code` ⇒ 协议层；字符串 `code` + `status` 数字 ⇒ HTTP 层；`code:'REQUEST_TIMEOUT'` ⇒ 超时。
+ * 3. `fetch` 连不通时抛的仍是 `TypeError: fetch failed`，**真正的原因在 `.cause` 链上**
  *    （`ENOTFOUND` / `ECONNREFUSED` …）⇒ 不走 {@link describeCauseChain} 就只有一个
- *    毫无信息量的 "fetch failed"。验收门槛 4（三种连不通都要给出可读原因）靠它。
+ *    毫无信息量的 "fetch failed"。三种连不通都要给出可读原因靠它。
  */
 
 import { AppError, isAppError } from '@doubulea/shared'
@@ -112,40 +113,48 @@ export class McpAbortError extends Error {
   }
 }
 
-/** 判定 SDK 的 JSON-RPC 层错误（`McpError` 显式设了 `name`，可靠） */
-function isMcpError(error: unknown): error is { name: string; code: number; message: string; data?: unknown } {
+/** 判定 v2 的 JSON-RPC 协议层错误（`ProtocolError`：`code` 是**数字**，跨线的错误帧） */
+function isProtocolError(error: unknown): error is { code: number; message: string; data?: unknown } {
   return (
     typeof error === 'object' &&
     error !== null &&
-    (error as { name?: unknown }).name === 'McpError' &&
     typeof (error as { code?: unknown }).code === 'number'
   )
 }
 
 /**
- * 判定 SDK 的 HTTP 传输层错误（`StreamableHTTPError`）。
+ * 判定 v2 的 HTTP 传输层错误（`SdkHttpError`）。
  *
- * ⚠️ 该类的实现**没有** `this.name = 'StreamableHTTPError'`（所以 `name` 是 `'Error'`），
- * 只有 `code: number` 与 `'Streamable HTTP error: '` 的消息前缀。判据写在这里一处，
- * 别在别处再猜一次。
+ * ⚠️ v2 的 `SdkError.code` 是**字符串**（`SdkErrorCode`），HTTP 子类额外带
+ * `status: number`（并镜像在 `data.status`）。判据写在这里一处，别在别处再猜一次。
  */
-function isStreamableHttpError(error: unknown): error is { code: number; message: string } {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { name?: unknown }).name !== 'McpError' &&
-    typeof (error as { code?: unknown }).code === 'number' &&
-    typeof (error as { message?: unknown }).message === 'string' &&
-    (error as { message: string }).message.startsWith('Streamable HTTP error:')
-  )
+function isSdkHttpError(error: unknown): error is { status: number; message: string } {
+  if (typeof error !== 'object' || error === null) return false
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number') return true
+  const dataStatus = (error as { data?: { status?: unknown } }).data?.status
+  return typeof dataStatus === 'number'
 }
 
-/**
- * `ErrorCode.RequestTimeout` 的字面量。
- * ⚠️ 刻意写死而不是 `import { ErrorCode }`：本模块的定位是"把 SDK 的东西翻译成人话"，
- * 让它反过来依赖 SDK 的运行时枚举就等于把两边的生命周期绑在一起（理由同下方版本集注释）。
- */
-const MCP_ERROR_CODE_REQUEST_TIMEOUT = -32001
+/** 取 HTTP 状态码（优先 `status` getter，回落 `data.status`） */
+function httpStatusOf(error: unknown): number {
+  const status = (error as { status?: unknown }).status
+  if (typeof status === 'number') return status
+  const dataStatus = (error as { data?: { status?: unknown } }).data?.status
+  return typeof dataStatus === 'number' ? dataStatus : -1
+}
+
+/** v2 本地超时错误码（`SdkErrorCode.RequestTimeout` 的字面量） */
+const MCP_SDK_CODE_REQUEST_TIMEOUT = 'REQUEST_TIMEOUT'
+/** v2「服务端回了不认识的内容类型」错误码（多半根本不是 MCP 端点，回了 HTML） */
+const MCP_SDK_CODE_UNEXPECTED_CONTENT = 'CLIENT_HTTP_UNEXPECTED_CONTENT'
+
+/** 是不是 v2 的本地 SDK 错误（`SdkError`：`code` 是字符串） */
+function sdkErrorCodeOf(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null) return null
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : null
+}
 
 /** JSON-RPC 错误码 → 中文修复提示（缺省时不加提示，只报原码与原消息） */
 const MCP_ERROR_HINTS: Readonly<Record<string, string>> = {
@@ -156,6 +165,7 @@ const MCP_ERROR_HINTS: Readonly<Record<string, string>> = {
   '-32603': 'MCP 服务端内部错误',
   '-32000': '连接已关闭（服务端主动断开，或会话已失效）',
   '-32001': '请求超时',
+  '-32022': '协议版本不被服务端支持（现代协议协商阶段；请确认双方协议版本有交集）',
 }
 
 /**
@@ -279,19 +289,41 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
   const rawMessage = error instanceof Error ? error.message : String(error)
   const detail = mcpSnippet(rawMessage, secrets)
 
-  // ③ SDK 的 JSON-RPC 层错误（服务端**答了**，但答的是错误帧）
-  if (isMcpError(error)) {
+  // ③ v2 本地超时（`SdkError(code:'REQUEST_TIMEOUT')`；真超时与被中断都可能走这里，
+  //    但②已先把「用户中断」摘走了 ⇒ 到这里的是真超时）
+  const sdkCode = sdkErrorCodeOf(error)
+  if (sdkCode === MCP_SDK_CODE_REQUEST_TIMEOUT) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 调用超时')
+    throw AppError.upstreamTimeout(
+      `调用 MCP server 超时（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
+        `原始消息：${detail}`,
+    )
+  }
+
+  // ③' v2「服务端回了本 SDK 不认识的内容类型」（多半根本不是 MCP 端点，回了 HTML）
+  //    —— 复用 describeHttpFailure 的 -1 分支文案
+  if (sdkCode === MCP_SDK_CODE_UNEXPECTED_CONTENT) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 端点返回了不认识的内容类型')
+    throw AppError.upstreamError(describeHttpFailure(-1, rawMessage, endpoint, stage))
+  }
+
+  // ④ v2 HTTP 传输层错误（`SdkHttpError`，带 HTTP `status`）
+  if (isSdkHttpError(error)) {
+    const status = httpStatusOf(error)
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage, upstreamStatus: status }, 'MCP 上游返回非 2xx')
+    throw AppError.upstreamError(`${describeHttpFailure(status, rawMessage, endpoint, stage)}`, {
+      upstreamStatus: status,
+    })
+  }
+
+  // ⑤ v2 JSON-RPC 协议层错误（`ProtocolError`：`code` 是数字，服务端**答了**但答的是错误帧）
+  if (isProtocolError(error)) {
     const hint = MCP_ERROR_HINTS[String(error.code)] ?? ''
     getLogger().warn(
       { ...describeMcpEndpoint(endpoint), stage, rpcCode: error.code },
       'MCP 服务端返回 JSON-RPC 错误',
     )
-    if (error.code === MCP_ERROR_CODE_REQUEST_TIMEOUT) {
-      throw AppError.upstreamTimeout(
-        `调用 MCP server 超时（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
-          `原始消息：${detail}`,
-      )
-    }
+    // -32022 = 协议版本不被支持（现代协议 negotiation 阶段的错误帧）
     throw AppError.upstreamError(
       `MCP 服务端返回错误 ${error.code}（${stage}）：${endpoint.serverName}` +
         `${hint === '' ? '' : `。${hint}`}。原始消息：${detail}`,
@@ -299,20 +331,18 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
     )
   }
 
-  // ④ SDK 的 HTTP 传输层错误（没答 JSON-RPC，答的是 HTTP 状态 / 不认识的 content-type）
-  if (isStreamableHttpError(error)) {
-    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage, upstreamStatus: error.code }, 'MCP 上游返回非 2xx')
-    throw AppError.upstreamError(`${describeHttpFailure(error.code, error.message, endpoint, stage)}`, {
-      upstreamStatus: error.code,
-    })
-  }
-
-  // ⑤ 协议版本不被支持（SDK 抛的是**裸 Error**，只能按消息认）
-  if (rawMessage.includes('protocol version is not supported')) {
-    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 服务端协议版本不在 SDK 支持集内')
+  // ⑤* 协议版本不被支持 / 协商失败（v2 有时抛裸 Error 或 SdkError，按消息兜底认）
+  if (
+    rawMessage.includes('protocol version is not supported') ||
+    rawMessage.includes('Version negotiation failed') ||
+    sdkCode === 'ERA_NEGOTIATION_FAILED' ||
+    sdkCode === 'UNSUPPORTED_PROTOCOL_VERSION'
+  ) {
+    getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 协议版本协商失败')
     throw AppError.upstreamError(
-      `MCP 服务端回了本 SDK 不支持的协议版本（${stage}）：${endpoint.serverName}。` +
-        `SDK 支持集：${SUPPORTED_PROTOCOL_VERSIONS.join(' / ')}。原始消息：${detail}`,
+      `MCP 服务端的协议版本无法与本客户端协商（${stage}）：${endpoint.serverName}。` +
+        `本客户端 legacy 支持集：${SUPPORTED_PROTOCOL_VERSIONS.join(' / ')}（另支持现代协议 2026-07-28）。` +
+        `原始消息：${detail}`,
     )
   }
 

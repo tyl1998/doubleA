@@ -1,61 +1,76 @@
 /**
- * MCP 客户端底座（P0-2-1）
+ * MCP 客户端底座（v2 迁移：`@modelcontextprotocol/client@2.x`）
  *
- * 依据：`docs/归档/06-P0-2-实施步骤.md` P0-2-1（内容 / 验收门槛 1~5 / 坑预判 1~6）
- *      + §4.0 全局口径 1、2（只做 Streamable HTTP；客户端侧只走
+ * 依据：`docs/08-MCP客户端迁移-v2-input_required.md`（现代协议 2026-07-28 + 无状态 input_required）
+ *      + `docs/归档/06-P0-2-实施步骤.md` P0-2-1（内容 / 验收门槛 / 坑预判，历史）
+ *      + §4.0 全局口径（只做 Streamable HTTP；客户端侧只走
  *        `initialize` / `tools/list` / `tools/call`，另作 `elicitation/create` 的**应答方**）
  *
- * 这一层是**官方 SDK 的壳**，职责只有四件：
- *   ① 连接与握手（并把**协商后的协议版本**记下来留痕）；
+ * 这一层是**官方 v2 client 的壳**，职责只有四件：
+ *   ① 连接与握手（**开启版本协商**，把**协商后的协议版本**记下来留痕）；
  *   ② `tools/list` → 本仓的 {@link McpToolDescriptor} 投影；
- *   ③ `tools/call` → 本仓的 {@link McpToolResult} 投影；
+ *   ③ `tools/call` → 本仓的 {@link McpToolResult} 投影（现代协议下 `input_required`
+ *      由 v2 client **在这一次调用内部**自动多轮补全，见判据 5）；
  *   ④ 优雅关闭（**先 `DELETE` 终止会话，再关传输**）。
  *
- * ⚠️ 它**不认识数据库、不认识用户**（`06` P0-2-1 原文）。凭据通过 `headers` 注入
+ * ⚠️ 它**不认识数据库、不认识用户**（`06` P0-2-1 原文）。凭据通过 `fetch` 注入
  * （P0-2-7 负责解密与组装），本层只透传 + 在错误消息里脱敏。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 五条实测判据（SDK 1.30.1；逐条对应 `06` 的坑预判，详见 issue_fix/问题记录-P0-2-1-*.md）
+ * v1.30.1 → v2 迁移：包族拆分 + 版本协商 + 无状态 input_required
  * ─────────────────────────────────────────────────────────────────────
- * 1. ⚠️ **请求的协议版本由 SDK 写死，不可配**。`client/index.js#connect()` 里是
- *    `params.protocolVersion = LATEST_PROTOCOL_VERSION`，而 1.30.1 的常量是
- *    **`2025-11-25`**（≠ `06` §4.0 写的设计目标 `2025-06-18`）。**没有** setter。
- *    ⇒ 本层的处置：**请求最新、接受降级、把协商结果留痕**。
- *      服务端回 `2025-06-18` 时 SDK 会 `transport.setProtocolVersion(它)`，
- *      此后每个请求都带 `mcp-protocol-version: 2025-06-18` —— 与设计目标一致。
- *      服务端回一个**不在 SDK 支持集内**的版本时 SDK 直接抛（裸 `Error`），
- *      由 `errors.ts` 翻成 502 并给出支持集。
- * 2. ⚠️ **`mcp-protocol-version` 只在 `_protocolVersion` 有值时才发**（`_commonHeaders()`）
- *    ⇒ 首包 `initialize` **不带**该头，这是**正确**行为（那时还没协商）。
- *      头名是**全小写** `mcp-protocol-version`（不是 `MCP-Protocol-Version`）。
- * 3. ⚠️ **我们的头合并顺序在最后**：`_commonHeaders()` 是
- *    `new Headers({...auth, ...sessionId, ...protocolVersion, ...extraHeaders})`，
- *    而**注入中间件（判据 6）是在它之上 `set`** ⇒ 我们设的头**会覆盖** SDK 自己那三个头。
- *    因此**绝不能**把 `mcp-session-id` / `mcp-protocol-version` / `Authorization`
- *    放进去（那会悄悄改掉会话与版本）。这条约束落成 `shared` 的 `MCP_RESERVED_HEADER_NAMES`
+ * 旧单体 `@modelcontextprotocol/sdk` 拆成 scoped 包族，**客户端侧用
+ * `@modelcontextprotocol/client`**。`Client` / `StreamableHTTPClientTransport` 的
+ * 构造与方法签名与 1.x **基本同形**（connect / callTool / listTools / close /
+ * terminateSession / setProtocolVersion / sessionId / protocolVersion getter 均在），
+ * 差异集中在下面六条判据里。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 六条实测判据（v2；逐条对应 `06` 的历史坑预判，全部已对 v2 重验）
+ * ─────────────────────────────────────────────────────────────────────
+ * 1. ⚠️ **协议版本由 v2 的“版本协商”决定，不再是写死的常量**。1.x 里
+ *    `params.protocolVersion = LATEST_PROTOCOL_VERSION` 写死到 `2025-11-25`；v2 改为
+ *    `ClientOptions.versionNegotiation`：默认 `'legacy'`（与 1.x 逐字等价），本仓**开
+ *    `{ mode: 'auto' }`** —— connect 时先用 `server/discover` 探针，探到现代能力就落到
+ *    **2026-07-28**，否则**自动降级**回 legacy `initialize`（对仍是 1.x/2025 的 server 逐字等价）。
+ *    ⇒ 本层的处置：**开 auto、接受协商结果、把它留痕**。协商结果读
+ *    `inner.getNegotiatedProtocolVersion()`（权威值），不再从写死常量推断。
+ * 2. ⚠️ **`mcp-protocol-version` 头仍只在协商后才发**：legacy 腿首包 `initialize` 不带；
+ *    现代腿改用每请求 `_meta` envelope 携带版本/能力/客户端信息（v2 自动附加）。
+ *    对我们的注入无影响：头名依旧是保留头（判据 3）。
+ * 3. ⚠️ **注入中间件在 SDK 头之上 `set`**：transport 的 `requestInit.headers` 与
+ *    transport 自管头（`Authorization`/`mcp-session-id`/`mcp-protocol-version`）中，
+ *    **transport 自管头优先**；而我们的 `fetch` 中间件是在 `init.headers` 之上 `set`
+ *    ⇒ 我们设的头**会覆盖** SDK 自己那几个头。因此**绝不能**把
+ *    `mcp-session-id` / `mcp-protocol-version` / `Authorization` 放进去（那会悄悄改掉
+ *    会话与版本）。这条约束落成 `shared` 的 `MCP_RESERVED_HEADER_NAMES`
  *    —— 模板层拦一次、`mcp/inject.ts` 再拦一次（库里可能有历史数据）。
- * 4. ⚠️ **`Client.close()` 不会终止会话**（它只 `transport.close()`）。
- *    不显式 `terminateSession()` 的后果是**服务端累积僵尸会话**，我们自己看不到任何症状
- *    ⇒ 关闭顺序固定为「先 DELETE、后 close」，见 {@link McpClient.close}。
- * 5. ⚠️ **`registerCapabilities()` 在 connect 之后调用会抛**
- *    （`Cannot register capabilities after connecting to transport`）
- *    ⇒ 能力声明只能在构造函数里做。且**只在真的有 elicitation 应答方时才声明**：
- *    声明了却答不出来，服务端会照发请求、我们静默失败（比不声明更难查）。
- * 6. ⚠️ **transport 的 `fetch` 选项是所有网络请求的唯一出口**（P0-2-7 的 H4 探针定案）：
- *    `send()` / `terminateSession()` / `_startOrAuthSse()` 三处都是
- *    `await (this._fetch ?? fetch)(this._url, init)` —— **URL 是每次现传给 fetch 的**
- *    （不是构造 transport 时冻住的，`_url` 本身整个会话不变），而 `init` 里已经装好了
- *    SDK 自己拼好的 `Headers`。⇒ 它**同时**能改 URL / 请求头 / 报文体
- *    ⇒ 凭据注入的三个位置（HEADER / QUERY / BODY）**一个口子全包**。
- *    ⚠️ 也正因如此，{@link McpClientOptions} **没有** `headers` 选项（P0-2-1 曾有一个，
- *    注释写着"凭据注入口"）：留着它就是**第二条注入路径**，而两条路径在这一个点上打架的症状
- *    是"某个凭据时而生效、时而被顶掉"—— 那是最难查的一类。要加静态头就写一个 `fetch` 包装。
+ * 4. ⚠️ **`Client.close()` 不会终止会话**（它只关传输）。不显式 `terminateSession()`
+ *    的后果是**服务端累积僵尸会话**，我们自己看不到任何症状 ⇒ 关闭顺序固定为
+ *    「先 DELETE、后 close」，见 {@link McpClient.close}。
+ * 5. ⚠️ **`registerCapabilities()` 只能在 connect 前调用；`setRequestHandler` 改为字符串
+ *    方法名**（v2：`setRequestHandler('elicitation/create', handler)`，不再传 zod schema）。
+ *    且**只在真有 elicitation 应答方时才声明**能力：声明了却答不出来，服务端会照发请求、
+ *    我们静默失败（比不声明更难查）。
+ *    **关键利好**：v2 的无状态 `input_required`（现代腿）与 legacy 的
+ *    `elicitation/create` 反向请求（旧腿）**共用同一个 handler** —— 打开
+ *    `inputRequired.autoFulfill`（默认开）后，现代协议下工具回 `input_required`，
+ *    v2 client 会**用同一个 `elicitation/create` handler 自动补全**并带
+ *    `inputResponses` 重调（`callTool` 仍返回普通结果，交互在这一次调用内部完成）。
+ *    两条腿都汇到我们的 {@link McpClientOptions.onElicit}，上层零改动。
+ * 6. ⚠️ **transport 的 `fetch` 选项是所有网络请求的唯一出口**（P0-2-7 的 H4 探针定案，v2 仍成立）：
+ *    `StreamableHTTPClientTransportOptions.fetch` 是 `FetchLike`
+ *    （`(url, init) => Promise<Response>`，与本仓 {@link McpFetch} 逐字同形），传输的
+ *    每一次 POST/GET/DELETE（含 `server/discover` 探针）都经它出网 —— 它**同时**能改
+ *    URL / 请求头 / 报文体 ⇒ 凭据注入的三个位置（HEADER / QUERY / BODY）**一个口子全包**。
+ *    ⚠️ 也正因如此，{@link McpClientOptions} **没有** `headers` 选项：留着它就是**第二条注入
+ *    路径**，两条路径在这一个点上打架的症状是"某个凭据时而生效、时而被顶掉"—— 最难查的一类。
+ *    要加静态头就写一个 `fetch` 包装。（也**不要**用 transport 的 `requestInit.headers`
+ *    去管 HEADER 注入 —— 同理由。）
  */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { ElicitRequestSchema, LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js'
-import type { ElicitRequestParams } from '@modelcontextprotocol/sdk/types.js'
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
+import type { ElicitRequestParams, ElicitResult } from '@modelcontextprotocol/client'
 
 import { AppError, type McpToolDescriptor } from '@doubulea/shared'
 
@@ -77,11 +92,17 @@ import {
 export const MCP_CLIENT_NAME = 'doubulea-backend'
 
 /**
- * 设计目标协议版本（`06` §4.0 全局口径 1）。
+ * 现代协议目标版本（v2 迁移目标；见 `docs/08-…`）。
  *
- * ⚠️ 它**不用于发请求**（请求版本由 SDK 写死，见文件头判据 1），只用于**留痕**：
- * 服务端协商后的版本是否落回到我们的设计目标上。P0 的硬要求就是这一条 ——
- * 「落到 `2025-06-18` 时行为与设计一致」。
+ * ⚠️ 它**不用于发请求**（现代腿的版本由 `versionNegotiation` 探针协商，见文件头判据 1），
+ * 只用于**留痕**：协商后的版本是否落到了现代目标上。开 `mode:'auto'` 后，对支持
+ * 2026-07-28 的 server（如 `apitest`）会落到这里；对仍是 2025 的 server 则自动降级。
+ */
+export const MCP_MODERN_PROTOCOL_VERSION = '2026-07-28'
+
+/**
+ * 历史设计目标协议版本（`06` §4.0 全局口径 1，legacy 腿）。保留导出以兼容既有引用；
+ * 现代腿的留痕比较改用 {@link MCP_MODERN_PROTOCOL_VERSION}。
  */
 export const MCP_DESIGN_TARGET_PROTOCOL_VERSION = '2025-06-18'
 
@@ -301,18 +322,30 @@ export class McpClient {
       )
     }
 
-    this.inner = new Client({ name: MCP_CLIENT_NAME, version: SERVICE_VERSION }, { capabilities: {} })
+    // v2：开启版本协商（判据 1）。`mode:'auto'` = connect 时探针 `server/discover`，
+    // 探到现代能力落 2026-07-28、否则自动降级回 legacy initialize（对 2025 server 逐字等价）。
+    // `inputRequired` 用默认（autoFulfill:true, maxRounds:10）—— 现代腿的 input_required
+    // 会经下面注册的 `elicitation/create` handler 自动补全并重调（判据 5）。
+    this.inner = new Client(
+      { name: MCP_CLIENT_NAME, version: SERVICE_VERSION },
+      { capabilities: {}, versionNegotiation: { mode: 'auto' } },
+    )
 
-    // ⚠️ 必须**在 connect 之前**（判据 5），且**只在真有应答方时**才声明（判据 5 的后半）
+    // ⚠️ 必须**在 connect 之前**（判据 5），且**只在真有应答方时**才声明（判据 5 的后半）。
+    // v2：`setRequestHandler` 用**字符串方法名**（不再传 zod schema）。同一个 handler
+    // 同时服务 legacy 反向 `elicitation/create` 与现代 `input_required` 的自动补全。
     if (options.onElicit !== undefined) {
       this.inner.registerCapabilities({ elicitation: {} })
-      this.inner.setRequestHandler(ElicitRequestSchema, async (request) => {
+      this.inner.setRequestHandler('elicitation/create', async (request): Promise<ElicitResult> => {
         // 走到这里说明服务端在等我们说话，把这行记下来 —— 它是"这次调用为什么停住了"的唯一线索
         getLogger().info(
           { ...describeMcpEndpoint(this.endpoint), method: 'elicitation/create' },
-          'MCP 服务端发起了 elicitation 请求',
+          'MCP 服务端发起了 elicitation 请求（或现代协议的 input_required 补全）',
         )
-        return options.onElicit?.(normalizeElicitRequest(request.params)) ?? { action: 'cancel' }
+        const reply = (await options.onElicit?.(normalizeElicitRequest(request.params))) ?? {
+          action: 'cancel',
+        }
+        return reply satisfies McpElicitReply as ElicitResult
       })
     }
 
@@ -343,13 +376,14 @@ export class McpClient {
   }
 
   /**
-   * 实际会发给服务端的 `mcp-protocol-version` 值；没有则为 `null`（那时请求不带这个头）。
+   * 实际协商到的协议版本；没有则为 `null`。
    *
-   * 语义分两种情况：**首次握手后 = 协商结果**；**恢复会话时 = 调用方传入的版本**（没传就是 null）。
-   * ⚠️ 只用于留痕 / 缓存，**不做分支逻辑**（`06` P0-2-1 坑预判 3：P0 只有一个目标版本）。
+   * 语义分两种情况：**首次握手后 = v2 协商结果**（`getNegotiatedProtocolVersion()`，
+   * 现代腿可能是 `2026-07-28`、legacy 腿是 `2025-*`）；**恢复会话时 = 调用方传入的版本**
+   * （transport 上补的那个）。⚠️ 只用于留痕 / 缓存，**不做分支逻辑**。
    */
   get protocolVersion(): string | null {
-    return this.transport.protocolVersion ?? null
+    return this.inner.getNegotiatedProtocolVersion() ?? this.transport.protocolVersion ?? null
   }
 
   /** 服务端自报的 `serverInfo`；未连接时为 `null` */
@@ -360,24 +394,23 @@ export class McpClient {
   }
 
   /**
-   * 握手（`initialize` + `notifications/initialized`）。
+   * 握手（`initialize` + `notifications/initialized`，现代腿则先跑 `server/discover` 探针）。
    *
-   * 成功后会留下**一条 info 级留痕**：我们请求的版本（SDK 写死的那个）、
-   * 服务端协商出来的版本、以及**它是否落回设计目标**。
-   * 这条日志是"协议版本这件事到底怎么样了"的唯一答案（验收门槛 1 的取证点之一）。
+   * 成功后会留下**一条 info 级留痕**：协商模式、协商出来的版本、以及**它是否落到现代目标**。
+   * 这条日志是"协议版本这件事到底怎么样了"的唯一答案（验收取证点之一）。
    */
   async connect(): Promise<void> {
     const stage = 'initialize（握手）'
     try {
       await this.inner.connect(this.transport, { timeout: this.timeoutMs })
     } catch (error) {
-      // SDK 自己在 connect 失败时已经 `void this.close()`（不等），这里再关一次是幂等的
+      // v2 在 connect 失败时也会尝试收尾，这里再关一次是幂等的
       await this.close().catch(() => undefined)
       toMcpFailure(error, { endpoint: this.endpoint, stage, aborted: false })
     }
 
     this.connected = true
-    // 恢复会话（传了 sessionId）时 SDK 会跳过 initialize ⇒ 没有"协商结果"可言，
+    // 恢复会话（传了 sessionId）时 v2 会跳过 initialize ⇒ 没有"协商结果"可言，
     // 这时 `protocolVersion` 就是调用方补进来的那个（没补则 null）。
     const resumed = this.options.sessionId !== undefined
     const version = this.protocolVersion
@@ -386,9 +419,10 @@ export class McpClient {
       {
         ...describeMcpEndpoint(this.endpoint),
         resumed,
-        requestedProtocolVersion: resumed ? null : LATEST_PROTOCOL_VERSION,
+        versionNegotiation: resumed ? null : 'auto',
         negotiatedProtocolVersion: version,
-        matchesDesignTarget: version === MCP_DESIGN_TARGET_PROTOCOL_VERSION,
+        protocolEra: resumed ? null : (this.inner.getProtocolEra() ?? null),
+        matchesModernTarget: version === MCP_MODERN_PROTOCOL_VERSION,
         hasSession: this.transport.sessionId !== undefined,
         serverInfo: this.serverInfo,
       },
@@ -419,6 +453,9 @@ export class McpClient {
    * `tools/call`。
    *
    * ⚠️ 返回 `isError: true` **不是**抛错（见 {@link McpToolResult} 的表格）。
+   * ⚠️ 现代协议下服务端可能回 `input_required`（二次确认）：v2 client 会**在这一次调用内部**
+   * 用注册的 `elicitation/create` handler 自动补全并带 `inputResponses` 重调（判据 5），
+   * 因此这里拿到的仍是补全后的**普通结果**，上层无需感知多轮往返。
    */
   async callTool(
     name: string,
@@ -428,7 +465,7 @@ export class McpClient {
     const stage = `tools/call（调用工具 ${name}）`
     this.assertUsable(stage)
     try {
-      const result = await this.inner.callTool({ name, arguments: args }, undefined, this.requestOptions(options))
+      const result = await this.inner.callTool({ name, arguments: args }, this.requestOptions(options))
       const { blocks, text } = toContentBlocks(result.content)
       return {
         isError: result.isError === true,
