@@ -82,32 +82,24 @@ export function NoticePage({ serial, title, lead, tag, bullets, actions }: Notic
 export interface BatchPlaceholderPageProps {
   serial: string
   title: string
-  /** 属哪个批次（`docs/06` 的批次号）。**必须写清**，否则读起来就是"这页坏了" */
-  batch: string
-  /** 前置依赖一句话（为什么要等） */
-  blockedBy?: string
   bullets?: readonly string[]
 }
 
 /**
  * 未开工页面的占位。
  *
- * 为什么导航里保留这些入口、而不是先隐藏：`03` §二 的路由表是产品结构的一部分，
- * 隐藏它会让"导航项在 ADMIN 与非 ADMIN 之间的差异"这类验收无从验起，
- * 也会让用户在 P0-1-31 之后发现"入口是突然冒出来的"。给占位页并写明批次，
+ * 为什么导航里保留这些入口、而不是先隐藏：路由表是产品结构的一部分，
+ * 隐藏它会让用户觉得入口"突然冒出来"。给占位页并说明"尚未开工"，
  * 比"点不动"和"什么都没有"都诚实。
  */
-export function BatchPlaceholderPage({ serial, title, batch, blockedBy, bullets }: BatchPlaceholderPageProps) {
+export function BatchPlaceholderPage({ serial, title, bullets }: BatchPlaceholderPageProps) {
   return (
     <NoticePage
       serial={serial}
       title={title}
-      tag={{ text: batch, tone: 'warn' }}
       lead={
         <>
-          本页尚未开工，属 <span className="num">{batch}</span>
-          {blockedBy === undefined ? '。' : `，前置：${blockedBy}。`}
-          {' 当前可用的功能是登录 / 首登强制改密 / 修改密码 —— '}
+          {'本页尚未开工，后续版本会开放。当前可用的功能是登录 / 首登强制改密 / 修改密码 —— '}
           <Link to={HOME_PATH}>回到首页</Link>。
         </>
       }

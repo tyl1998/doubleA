@@ -60,8 +60,6 @@ import {
   protocolAllowedForType,
 } from '@doubulea/shared'
 
-import { isTypedConfirmMatch } from '../../app/confirm.js'
-
 // ═══════════════════════════════ 词表 ═══════════════════════════════
 
 /** 角色词表（`01` §3.1 只有两种角色，无自注册）。刻意与 `USER_ROLES` 同键，漏一个编译期就红 */
@@ -428,6 +426,8 @@ export interface ModelFormValues {
   /** `null` = 未填写（界面上显示"未知"）。⚠️ 与"清空"共用 `null`，靠**与已存值比较**区分 */
   maxContext: number | null
   supportsVision: boolean
+  /** 是否支持"深度思考"（reasoning / thinking）。对话链路会据此决定是否向上游请求思考 */
+  supportsReasoning: boolean
   enabled: boolean
 }
 
@@ -438,6 +438,7 @@ export const EMPTY_MODEL_FORM_VALUES: ModelFormValues = {
   type: 'CHAT',
   maxContext: null,
   supportsVision: false,
+  supportsReasoning: false,
   enabled: true,
 }
 
@@ -449,6 +450,7 @@ export function modelEditValuesOf(model: ModelItem): ModelFormValues {
     type: model.type,
     maxContext: model.maxContext,
     supportsVision: model.supportsVision,
+    supportsReasoning: model.supportsReasoning,
     enabled: model.enabled,
   }
 }
@@ -479,6 +481,7 @@ export function buildCreateModelBody(values: ModelFormValues): CreateModelBody {
     // ⚠️ 留空 ⇒ **不带这个键**（`null` 与缺省在 create 侧同义，但"不带"更明确）
     ...(values.maxContext === null ? {} : { maxContext: values.maxContext }),
     supportsVision: values.supportsVision,
+    supportsReasoning: values.supportsReasoning,
     enabled: values.enabled,
   }
 }
@@ -511,6 +514,7 @@ export function buildModelUpdateBody(model: ModelItem, values: ModelFormValues):
   if (values.maxContext !== model.maxContext) body.maxContext = values.maxContext
 
   if (values.supportsVision !== model.supportsVision) body.supportsVision = values.supportsVision
+  if (values.supportsReasoning !== model.supportsReasoning) body.supportsReasoning = values.supportsReasoning
   if (values.enabled !== model.enabled) body.enabled = values.enabled
 
   if (Object.keys(body).length === 0) return null
@@ -532,13 +536,13 @@ export const MODEL_TYPE_LOCKED_REASON =
 /**
  * 删模型前的"点下去会怎样"。`null` = 可以直接删（走 Popconfirm）。
  *
- * ⚠️ `agentCount` **含软删的智能体**（`02` §4.3：软删的 Agent 照样占着 `agents.model_id`
- * 外键，计数刻意不按 `deletedAt` 过滤）—— 所以这里报的数字与后端的守卫**同口径**，
- * 不会出现"显示 0 个却删不掉"。
+ * ⚠️ `agentCount` **只算在线（未软删）的智能体**（`02` §4.3 起口径调整：删智能体会把
+ * `model_id` 置空自动解绑，软删的智能体不再占用模型）—— 与后端删除守卫**同口径**，
+ * 不会出现"显示 N 个、其实那些都是已删除的智能体"。
  */
 export function modelDeleteBlockedNotice(model: Pick<ModelItem, 'agentCount'>): string | null {
   if (model.agentCount === 0) return null
-  return `该模型正被 ${model.agentCount} 个智能体绑定，后端会拒绝这次删除（409）。请先到智能体列表把它们改绑到别的模型（含已删除的智能体：软删仍占着这条引用）。`
+  return `该模型正被 ${model.agentCount} 个在线智能体绑定，后端会拒绝这次删除（409）。请先到智能体列表把它们改绑到别的模型。`
 }
 
 // ═══════════════════════════════ 按 Provider 分组（顺序不许重排） ═══════════════════════════════
@@ -602,31 +606,28 @@ export function summarizeModels(models: readonly ModelItem[]): {
  * 为什么它是级联而删模型不是：`models.provider_id` 是 `ON DELETE CASCADE`（`02` §4.3）
  * —— 删一个 Provider 会连带删掉它下面的**全部**模型。删模型只删它自己。
  *
- * 本仓对级联那一档的落地口径是**再叠一层逐字确认**（删智能体输入 Agent 名称、删知识库
- * 输入库名、删会话输入固定的「删除」）。判据委托 {@link isTypedConfirmMatch} ——
- * **只有这一份实现**（`app/confirm.ts`），刻意不 `trim`、不忽略大小写。
+ * ⚠️ 需求优化：删除**不再**要求逐字输入确认（去掉重复输入），也**不再**因"有模型被引用"
+ * 而 409 拦截；引用这些模型的在线智能体会被**自动解绑**（`agents.model_id` 置空）。
+ * 弹窗改为提前列出"会解绑哪些模型"（见 `DeleteProviderModal.tsx` + `useProviderBoundModels`）。
  */
-export function isProviderDeleteConfirmed(typed: string, providerName: string): boolean {
-  return isTypedConfirmMatch(typed, providerName)
-}
-
 export const PROVIDER_DELETE_IMPACT_HINT =
-  '删除 Provider 会连带删除它下面的**全部模型**（数据库外键是 ON DELETE CASCADE）。若其中有模型正被智能体绑定，后端会拒绝整次删除（409），那时先到智能体列表改绑。密文里的 API Key 也会一起消失，重建后需要重新填写。'
+  '删除 Provider 会连带删除它下面的**全部模型**（数据库外键是 ON DELETE CASCADE）。正在绑定这些模型的在线智能体会被自动解绑，变为"未绑定模型"，需到智能体编辑页重新绑定后才能对话。密文里的 API Key 也会一起消失，重建后需要重新填写。'
 
 // ═══════════════════════════════ 拉取上游模型 ═══════════════════════════════
 
-/** 上游列表的一行读数（`created` 是 Unix 秒，缺失为 `null` —— 不编一个时间） */
+/** 上游列表的一行读数（`contextLength` 缺失为 `null` —— 标准 /models 多半不返回） */
 export interface RemoteModelRow {
   id: string
   ownedBy: string | null
-  createdText: string | null
+  /** 上游给的上下文长度（token），缺失为 `null`（新建模型时用它默认填充上下文长度） */
+  contextLength: number | null
 }
 
 export function remoteModelRows(result: RemoteModelListResult): RemoteModelRow[] {
   return result.items.map((item) => ({
     id: item.id,
     ownedBy: item.ownedBy,
-    createdText: item.created === null ? null : new Date(item.created * 1000).toISOString().slice(0, 10),
+    contextLength: item.contextLength,
   }))
 }
 

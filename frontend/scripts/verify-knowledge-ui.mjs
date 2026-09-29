@@ -178,7 +178,6 @@ const {
   retrievalValuesOf,
   editValuesOf,
   validateChunking,
-  isKnowledgeDeleteConfirmed,
   summarizeDocuments,
   EMPTY_KNOWLEDGE_FORM_VALUES,
 } = await import('../src/pages/knowledge/knowledgeModel.ts')
@@ -553,12 +552,13 @@ await it('G4 本页统计：三态各计各的，总数等于条目数', () => {
   )
 })
 
-await it('G5 删除确认逐字一致：**不做 trim**', () => {
-  assertEqual(isKnowledgeDeleteConfirmed('运维手册', '运维手册'), true, '完全一致')
-  assertEqual(isKnowledgeDeleteConfirmed(' 运维手册', '运维手册'), false, '多一个空格就不算（逐字确认的意义）')
-  assertEqual(isKnowledgeDeleteConfirmed('', '运维手册'), false, '空输入')
-  // 反向：名字本身带空格时也要能确认（判据是"逐字"，不是"规范化后"）
-  assertEqual(isKnowledgeDeleteConfirmed('a b', 'a b'), true, '名字里有空格照样能确认')
+await it('G5 删除弹窗已去掉逐字输入确认（需求优化），但保留"被绑定时禁用删除"的 409 守卫', () => {
+  const modal = stripComments(
+    readFileSync(fileURLToPath(new URL('../src/pages/knowledge/DeleteKnowledgeBaseModal.tsx', import.meta.url)), 'utf8'),
+  )
+  assertExcludes(modal, 'isKnowledgeDeleteConfirmed', '不再逐字确认')
+  assertExcludes(modal, 'app/confirm.js', '不再 import 已删除的 confirm 模块')
+  assertIncludes(modal, 'disabled: bound', '被智能体绑定时仍禁用删除（409 出路）')
 })
 
 await it('G6 覆盖重建"内容未变化"的提示只有一处写法（shared 常量）', () => {

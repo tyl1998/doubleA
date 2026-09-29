@@ -274,6 +274,13 @@ export function ModelsPage() {
       render: (_, model) => <span className="num">{model.supportsVision ? '✓' : '—'}</span>,
     },
     {
+      title: '思考',
+      dataIndex: 'supportsReasoning',
+      width: 70,
+      align: 'center',
+      render: (_, model) => <span className="num">{model.supportsReasoning ? '✓' : '—'}</span>,
+    },
+    {
       title: '状态',
       dataIndex: 'enabled',
       width: 150,
@@ -497,8 +504,7 @@ export function ModelsPage() {
           description={
             <>
               「可用模型」下拉（建/改智能体时用）只含<strong>已启用</strong>的模型，且要求它的 Provider
-              也处于启用状态。所以这里停用一个模型之后，那个下拉里立刻就没有它了 —— 这正是
-              「无效模型创建智能体时不可选」这条验收要点的落地。
+              也处于启用状态。所以这里停用一个模型之后，那个下拉里立刻就没有它了。
             </>
           }
         />
@@ -558,7 +564,7 @@ export function ModelsPage() {
               dataSource={filteredModels}
               loading={false}
               pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
-              scroll={{ x: 1150 }}
+              scroll={{ x: 1220 }}
             />
           </div>
         )}

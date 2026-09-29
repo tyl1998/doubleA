@@ -1,26 +1,23 @@
 /**
- * 知识库级联删除确认（P0-1-35）
+ * 知识库级联删除确认（P0-1-35；需求优化：去掉逐字输入确认）
  *
  * 依据：`docs/03` §七「删除分级确认」——**级联删除 = Modal + 红色危险按钮 + 明示影响范围**；
- *      `design/agents.html` 的 `#cascade-modal`（输入名称逐字确认）是本仓"级联"那一档的落地形态
- *      （`pages/agents/DeleteAgentModal.tsx` 已按它做过一次）；`docs/02` §4.6（删库连带
- *      `documents` / `chunks` / S3 原文件，且**被智能体绑定时 409**）。
+ *      `docs/02` §4.6（删库连带 `documents` / `chunks` / S3 原文件，且**被智能体绑定时 409**）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 两条与"数字"有关的如实说明
  * ─────────────────────────────────────────────────────────────────────
- * ① **文档数拿得到**（`KnowledgeBaseItem.documentCount`），所以这里能写"将同时删除 N 篇文档"
- *    —— 这与删会话时"给不出消息条数"（游标分页没有 `total`）是**两种不同的处境**，
- *    别把那条结论套过来（`docs/06` §六：界面上有数字 ≠ 能拿到这个数字，反之亦然）。
- * ② **片段数拿不到**：没有任何端点回答"这个库里一共有多少 chunk"（文档列表只有每篇的
- *    `chunkCount`）。所以文案只说文档数，不写"213 个片段"（原型上那个数字在这里**取不到**）。
+ * ① **文档数拿得到**（`KnowledgeBaseItem.documentCount`），所以这里能写"将同时删除 N 篇文档"。
+ * ② **片段数拿不到**：没有任何端点回答"这个库里一共有多少 chunk"，文案只说文档数。
  *
- * 409（`agentCount > 0`）是这条链路上最需要界面上有出路的一种失败：后端不会因为"你说了确认"
- * 就放行。处置是**不关弹窗、把服务端那句话显示出来，并给出"去智能体列表解绑"的链接**
- * —— 提示指向一个可操作的地方，而不是让用户对着一个红条猜。
+ * 409（`agentCount > 0`）是这条链路上最需要界面上有出路的一种失败：后端不会因为"你点了确认"
+ * 就放行。处置是**禁用删除按钮、把原因显示出来，并给出"去智能体列表解绑"的链接**。
+ *
+ * ⚠️ 需求优化：删除**不再**要求逐字输入库名（去掉重复输入这层确认）；仍保留级联危险标记、
+ * 明示影响范围、红色危险按钮，以及"被智能体绑定时禁用删除（409）"的守卫。
  */
 
-import { Alert, Input, Modal, Tag } from 'antd'
+import { Alert, Modal, Tag } from 'antd'
 import type { KnowledgeBaseItem, RemoveKnowledgeBaseResult } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -29,7 +26,6 @@ import { describeError } from '../../api/client.js'
 import { useRemoveKnowledgeBase } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
 import { HOME_PATH } from '../../app/paths.js'
-import { isKnowledgeDeleteConfirmed } from './knowledgeModel.js'
 
 export interface DeleteKnowledgeBaseModalProps {
   /** 要删的库；`null` = 弹窗关闭 */
@@ -42,18 +38,15 @@ export interface DeleteKnowledgeBaseModalProps {
 export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: DeleteKnowledgeBaseModalProps) {
   const feedback = useFeedback()
   const remove = useRemoveKnowledgeBase()
-  const [typed, setTyped] = useState('')
   const [errorText, setErrorText] = useState<string | null>(null)
 
-  // 每次打开都清空 —— 否则"确认删除"按钮会带着上一个库的名字亮着
+  // 每次打开都清空上一次的错误
   useEffect(() => {
-    setTyped('')
     setErrorText(null)
   }, [open, kb])
 
   if (kb === null) return null
 
-  const confirmed = isKnowledgeDeleteConfirmed(typed, kb.name)
   const removing = remove.isPending
   const bound = kb.agentCount > 0
 
@@ -85,7 +78,7 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
         </span>
       }
       okText="确认删除"
-      okButtonProps={{ danger: true, disabled: !confirmed || bound, loading: removing }}
+      okButtonProps={{ danger: true, disabled: bound, loading: removing }}
       cancelText="取消"
       onOk={confirm}
       onCancel={onClose}
@@ -125,24 +118,6 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
         )}
 
         {errorText !== null && <Alert type="error" showIcon message="删除失败" description={errorText} />}
-
-        <div>
-          <p>请输入知识库名称以确认：</p>
-          <Input
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-            placeholder={kb.name}
-            aria-label="输入知识库名称以确认删除"
-            onPressEnter={() => {
-              if (confirmed && !removing && !bound) confirm()
-            }}
-          />
-          {/* 与删智能体同款：`isKnowledgeDeleteConfirmed` **不做 trim**（多一个空格就不算），
-              逐字确认的全部意义就是逼用户慢下来 */}
-          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            名称需逐字一致（含大小写与空格）
-          </p>
-        </div>
       </div>
     </Modal>
   )

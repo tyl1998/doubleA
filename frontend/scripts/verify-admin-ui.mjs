@@ -34,7 +34,7 @@
  *   E 改类型与迁移的守卫（Provider 的 type / 模型的 type / 模型的 providerId）
  *   F `maxContext` 三态与界面校验
  *   G 分组呈现（rowSpan）+ "顺序只来自服务端"
- *   H 删除分级（Provider 走级联 + 逐字确认；用户没有删除接口）
+ *   H 删除分级（Provider 走级联，去逐字确认 + 自动解绑；用户没有删除接口）
  *   I 拉取上游模型的读数（截断、未配 Key、0 条）
  *   J 源码级守门（几条"没有别的观测面"的正确性）
  *     ⚠️ J13 原属"没有别的观测面"那一类，直到它在浏览器里真出过一次：
@@ -141,8 +141,6 @@ function stripComments(source) {
 
 const { USER_ROLES, USER_STATUSES } = await import('@doubulea/shared')
 
-const { isTypedConfirmMatch } = await import('../src/app/confirm.ts')
-
 const {
   USER_ROLE_LABELS,
   USER_STATUS_LABELS,
@@ -178,7 +176,6 @@ const {
   providerGroupSpans,
   countProviders,
   summarizeModels,
-  isProviderDeleteConfirmed,
   remoteModelRows,
   remoteModelNotice,
 } = await import('../src/pages/admin/adminModel.ts')
@@ -228,6 +225,7 @@ function makeModel(overrides = {}) {
     type: 'CHAT',
     maxContext: 128_000,
     supportsVision: true,
+    supportsReasoning: false,
     enabled: true,
     agentCount: 0,
     createdAt: '2026-09-23T10:00:00.000Z',
@@ -249,6 +247,7 @@ function makeModelForm(overrides = {}) {
     type: 'CHAT',
     maxContext: 128_000,
     supportsVision: true,
+    supportsReasoning: false,
     enabled: true,
     ...overrides,
   }
@@ -537,7 +536,7 @@ await it('F7 只清空 `maxContext` ⇒ 请求体**恰好只有一个键**（没
 })
 
 await it('F8 模型表单的编辑初值与契约逐字段对齐（含布尔开关）', () => {
-  const values = modelEditValuesOf(makeModel({ supportsVision: false, enabled: false, maxContext: null }))
+  const values = modelEditValuesOf(makeModel({ supportsVision: false, supportsReasoning: true, enabled: false, maxContext: null }))
   assertDeepEqual(
     values,
     {
@@ -547,6 +546,7 @@ await it('F8 模型表单的编辑初值与契约逐字段对齐（含布尔开�
       type: 'CHAT',
       maxContext: null,
       supportsVision: false,
+      supportsReasoning: true,
       enabled: false,
     },
     '编辑初值',
@@ -620,39 +620,31 @@ await it('G7 源码级：模型表**不给 Provider 列开 `sorter`**（排序�
 
 // ───────────────────────────── H 删除分级 ─────────────────────────────
 
-groupStart('H', '删除分级：Provider 走级联档、用户没有删除接口', '判据：`isProviderDeleteConfirmed` / `modelDeleteBlockedNotice` + 源码级')
-
-await it('H1 删 Provider 的逐字确认：不 trim、不忽略大小写', () => {
-  assertEqual(isProviderDeleteConfirmed('OpenAI 生产', 'OpenAI 生产'), true, '逐字相同')
-  assertEqual(isProviderDeleteConfirmed('OpenAI 生产 ', 'OpenAI 生产'), false, '多一个空格不算')
-  assertEqual(isProviderDeleteConfirmed('openai 生产', 'OpenAI 生产'), false, '大小写不算')
-})
-
-await it('H2 与智能体 / 会话 / 知识库那三档**共用同一份实现**（`isTypedConfirmMatch`）', () => {
-  assertEqual(isTypedConfirmMatch('a', 'a'), true, '一份实现')
-  assertEqual(isTypedConfirmMatch('a ', 'a'), false, '四档行为必须逐字相同')
-})
+groupStart('H', '删除分级：Provider 走级联档、用户没有删除接口', '判据：`modelDeleteBlockedNotice` + 源码级')
 
 await it('H3 删模型：没被引用 ⇒ 没有阻力（走 Popconfirm 那一档）', () => {
   assertEqual(modelDeleteBlockedNotice(makeModel({ agentCount: 0 })), null, '可以删')
 })
 
-await it('H4 删模型：被引用 ⇒ 文案带数字 + 409 + 明说"含软删的智能体"', () => {
+await it('H4 删模型：被在线智能体引用 ⇒ 文案带数字 + 409（只算在线，不含软删）', () => {
   const notice = modelDeleteBlockedNotice(makeModel({ agentCount: 3 }))
   assert(notice !== null, '要有提示')
   assertIncludes(notice, '3', '要说清几个')
   assertIncludes(notice, '409', '要说清后端会拒')
-  assertIncludes(notice, '软删', '`agentCount` 含软删的 Agent —— 不写会出现"显示 0 个却删不掉"')
+  assertIncludes(notice, '在线', '`agentCount` 只算在线智能体（删智能体已自动解绑）')
 })
 
-await it('H5 源码级：Provider 删除弹窗是**级联那一档**（危险标签 + 逐字确认 + 危险按钮）', () => {
+await it('H5 源码级：Provider 删除弹窗是**级联那一档**（危险标签 + 危险按钮 + 明示影响 + 无逐字确认）', () => {
   const modal = stripComments(
     readFileSync(fileURLToPath(new URL('../src/pages/admin/DeleteProviderModal.tsx', import.meta.url)), 'utf8'),
   )
   assertIncludes(modal, 'tag--danger', '`03` §七：级联删除要有危险标记')
-  assertIncludes(modal, 'isProviderDeleteConfirmed(', '逐字确认判据来自纯函数')
   assertIncludes(modal, 'danger: true', '确认按钮是红色的')
   assertIncludes(modal, 'modelCount', '要明示影响范围（连带删掉几个模型）')
+  // 需求优化：删除不再逐字输入确认，改为列出被自动解绑的模型清单
+  assertIncludes(modal, 'useProviderBoundModels', '删除弹窗应列出会被自动解绑的模型（需求 3）')
+  assertExcludes(modal, 'isProviderDeleteConfirmed', '已去掉逐字输入确认')
+  assertExcludes(modal, 'aria-label="输入 Provider 名称以确认删除"', '已去掉"输入名称"确认输入框')
 })
 
 await it('H6 源码级：**用户没有删除接口 ⇒ 界面也没有删除入口**（不画一个灰掉的删除键）', () => {
@@ -678,22 +670,22 @@ function makeRemoteResult(overrides = {}) {
     total: 2,
     truncated: false,
     items: [
-      { id: 'gpt-4o-mini', ownedBy: 'openai', created: 1_700_000_000 },
-      { id: 'bge-m3', ownedBy: null, created: null },
+      { id: 'gpt-4o-mini', ownedBy: 'openai', created: 1_700_000_000, contextLength: 128_000 },
+      { id: 'bge-m3', ownedBy: null, created: null, contextLength: null },
     ],
     ...overrides,
   }
 }
 
-await it('I1 Unix 秒 → 日期；`ownedBy` 缺失保持 `null`', () => {
+await it('I1 上游给了上下文长度 ⇒ 带出；`ownedBy` 缺失保持 `null`', () => {
   const rows = remoteModelRows(makeRemoteResult())
   assertEqual(rows.length, 2, '两条')
-  assertEqual(rows[0]?.createdText, '2023-11-14', '秒 × 1000 再取 ISO 日期')
+  assertEqual(rows[0]?.contextLength, 128_000, '上游给的上下文长度原样带出（新建模型时默认填充）')
   assertEqual(rows[1]?.ownedBy, null, '上游没给就保持 null')
 })
 
-await it('I2 `created` 为 `null` ⇒ `createdText` 也是 `null`（不编一个时间）', () => {
-  assertEqual(remoteModelRows(makeRemoteResult())[1]?.createdText, null, '不猜')
+await it('I2 `contextLength` 为 `null` ⇒ 保持 `null`（标准 /models 多半不返回，读不到就留空）', () => {
+  assertEqual(remoteModelRows(makeRemoteResult())[1]?.contextLength, null, '读不到不猜')
 })
 
 await it('I3 一条都没探到 ⇒ 提示核对 baseUrl + "可能不提供模型列表，请手工录入"', () => {
@@ -880,24 +872,24 @@ function sourceFiles() {
   return names.map((name) => ({ name, source: stripComments(readFileSync(`${base}${name}`, 'utf8')) }))
 }
 
-await it('J1 「逐字确认」的判据在全仓**恰好一处实现**（`app/confirm.ts`）', () => {
+await it('J1 「逐字确认」判据已随需求移除：全仓不再有 `isTypedConfirmMatch` 实现', () => {
   const definitions = sourceFiles().filter(({ source }) => /function\s+isTypedConfirmMatch\s*\(/.test(source))
-  assertEqual(definitions.length, 1, `定义应恰好一处，实际：${definitions.map((f) => f.name).join(', ')}`)
-  assertEqual(definitions[0]?.name, 'app/confirm.ts', '唯一实现住在 app/confirm.ts')
+  assertEqual(definitions.length, 0, `已去掉逐字确认，不应再有实现，实际：${definitions.map((f) => f.name).join(', ')}`)
 })
 
-await it('J2 四个消费方（会话 / 智能体 / 知识库 / Provider）都**委托**那一份实现', () => {
+await it('J2 四个删除弹窗都**不再**引用逐字确认（去掉重复输入）', () => {
   const expected = [
-    'features/chat/conversationList.ts',
+    'features/chat/DeleteConversationModal.tsx',
     'pages/agents/DeleteAgentModal.tsx',
-    'pages/knowledge/knowledgeModel.ts',
-    'pages/admin/adminModel.ts',
+    'pages/knowledge/DeleteKnowledgeBaseModal.tsx',
+    'pages/admin/DeleteProviderModal.tsx',
   ]
   const files = sourceFiles()
   for (const name of expected) {
     const file = files.find((item) => item.name === name)
     assert(file !== undefined, `找不到 ${name}`)
-    assertIncludes(file.source, 'isTypedConfirmMatch(', `${name} 必须委托唯一实现`)
+    assertExcludes(file.source, 'isTypedConfirmMatch(', `${name} 不应再有逐字确认`)
+    assertExcludes(file.source, 'app/confirm.js', `${name} 不应再 import 已删除的 confirm 模块`)
   }
 })
 
@@ -906,7 +898,6 @@ await it('J3 `adminModel.ts` **零依赖**（不 import react / antd）—— �
   assert(model !== undefined, '找不到 adminModel.ts')
   assertExcludes(model.source, "'react'", '不 import react')
   assertExcludes(model.source, "'antd'", '不 import antd')
-  assertIncludes(model.source, "from '../../app/confirm.js'", '唯一的运行时依赖是那一份判据')
 })
 
 await it('J4 ⚠️ 表单初值**绝不**来自 `apiKeyPreview`（Key 有进无出在界面侧的落点）', () => {

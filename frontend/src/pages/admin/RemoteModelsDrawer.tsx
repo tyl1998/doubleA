@@ -27,10 +27,19 @@ import { Alert, Button, Drawer, Input, Table, Tooltip, type TableColumnsType } f
 import type { ModelProviderItem } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
-import { useProbeRemoteModels } from '../../api/modelPool.js'
+import { describeError } from '../../api/client.js'
+import { useCreateModel, useProbeRemoteModels } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
 import { ErrorState } from '../../components/ListStates.js'
-import { describeProviderKey, remoteModelNotice, remoteModelRows, type RemoteModelRow } from './adminModel.js'
+import {
+  buildCreateModelBody,
+  describeProviderKey,
+  maxContextText,
+  remoteModelNotice,
+  remoteModelRows,
+  type ModelFormValues,
+  type RemoteModelRow,
+} from './adminModel.js'
 
 export interface RemoteModelsDrawerProps {
   /** 要探的 Provider；`null` = 抽屉关闭 */
@@ -41,7 +50,11 @@ export interface RemoteModelsDrawerProps {
 export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProps) {
   const feedback = useFeedback()
   const probe = useProbeRemoteModels()
+  const create = useCreateModel()
   const [keyword, setKeyword] = useState('')
+  // 多选：勾选的上游型号名，用于批量创建到本 Provider 下
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [creating, setCreating] = useState(false)
 
   const providerId = provider?.id ?? null
 
@@ -54,10 +67,12 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       // 关闭即清掉上一次的结果：留着会让下次打开先闪一眼旧 Provider 的模型列表
       probe.reset()
       setKeyword('')
+      setSelectedIds([])
       return
     }
     probe.mutate(providerId)
     setKeyword('')
+    setSelectedIds([])
   }, [providerId])
 
   const result = probe.data
@@ -70,6 +85,47 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       .writeText(id)
       .then(() => feedback.ok(`已复制型号名「${id}」`))
       .catch(() => feedback.fail(new Error('浏览器拒绝了剪贴板访问，请手工选中后复制'), '复制失败'))
+  }
+
+  /**
+   * 批量创建：把勾选的上游型号名逐个建成本 Provider 下的模型。
+   *
+   * · 别名默认取型号名、类型取 Provider 类型、上下文长度取上游给的值（`null` 则不带）；
+   *   支持图片/深度思考默认关（这些要管理员按模型确认，随后到「编辑」里改）。
+   * · 逐个建、逐个兜错：已存在（409）等失败不阻断其余项，最后汇总成功/失败条数。
+   */
+  const createSelected = async (): Promise<void> => {
+    if (provider === null || selectedIds.length === 0) return
+    setCreating(true)
+    const targets = rows.filter((row) => selectedIds.includes(row.id))
+    let ok = 0
+    const failures: string[] = []
+    for (const row of targets) {
+      const values: ModelFormValues = {
+        providerId: provider.id,
+        modelName: row.id,
+        label: row.id,
+        type: provider.type,
+        maxContext: row.contextLength,
+        supportsVision: false,
+        supportsReasoning: false,
+        enabled: true,
+      }
+      try {
+        await create.mutateAsync(buildCreateModelBody(values))
+        ok += 1
+      } catch (error) {
+        failures.push(`${row.id}（${describeError(error).message}）`)
+      }
+    }
+    setCreating(false)
+    setSelectedIds([])
+    if (ok > 0) {
+      feedback.ok(`已创建 ${ok} 个模型${failures.length > 0 ? `，${failures.length} 个失败` : ''}`)
+    }
+    if (failures.length > 0) {
+      feedback.fail(new Error(failures.join('；')), ok > 0 ? '部分模型创建失败' : '模型创建失败')
+    }
   }
 
   const columns: TableColumnsType<RemoteModelRow> = [
@@ -91,10 +147,11 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       render: (_, row) => <span className="num">{row.ownedBy ?? '—'}</span>,
     },
     {
-      title: '上游创建日',
-      dataIndex: 'createdText',
+      title: '上下文',
+      dataIndex: 'contextLength',
       width: 120,
-      render: (_, row) => <span className="num">{row.createdText ?? '—'}</span>,
+      align: 'right',
+      render: (_, row) => <span className="num">{maxContextText(row.contextLength)}</span>,
     },
   ]
 
@@ -117,8 +174,8 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
           <Alert
             type="info"
             showIcon
-            message="只读探测，不改动任何数据"
-            description="这里探的是上游 /models 的真实返回。关掉抽屉什么都不会发生 —— 要真的加进来，请点型号名复制，再到「新建模型」里粘贴。探到了也不代表调用一定成功（上游可能仍需鉴权或该型号不可用）。"
+            message="只读探测，勾选后可批量创建"
+            description="这里探的是上游 /models 的真实返回。勾选想要的型号，点「创建选中的模型」即可批量建到本 Provider 下（别名默认取型号名、类型取 Provider 类型、上下文长度取上游值，可稍后编辑）。探到了也不代表调用一定成功（上游可能仍需鉴权或该型号不可用）。"
           />
 
           {probe.isPending && <p className="ratio">正在向上游发起一次请求…（可能较慢，内网地址会一直等到超时）</p>}
@@ -151,6 +208,14 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                   style={{ width: 240 }}
                   aria-label="过滤上游型号名"
                 />
+                <Button
+                  type="primary"
+                  disabled={selectedIds.length === 0 || creating}
+                  loading={creating}
+                  onClick={() => void createSelected()}
+                >
+                  创建选中的模型（{selectedIds.length}）
+                </Button>
                 <span className="ratio u-right">
                   上游共 <span className="num">{result.total}</span> 个
                   {result.truncated && <>（本次列出前 {result.items.length} 个）</>}
@@ -168,13 +233,17 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                   columns={columns}
                   dataSource={filtered}
                   loading={false}
+                  rowSelection={{
+                    selectedRowKeys: selectedIds,
+                    onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
+                  }}
                   pagination={filtered.length > 20 ? { pageSize: 20, showSizeChanger: false } : false}
                 />
               )}
 
               <p className="ratio">
-                提示：点型号名即可复制。上游清单里常有 embedding / 图像 / 老版本模型，不一定都能拿来做对话
-                —— 加进来之前先确认它的类型。
+                提示：勾选型号后可批量创建；也可点型号名复制到「新建模型」里手动录入。上游清单里常有
+                embedding / 图像 / 老版本模型，不一定都能拿来做对话 —— 加进来之前先确认它的类型。
               </p>
             </>
           )}

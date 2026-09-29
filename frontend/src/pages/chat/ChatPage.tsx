@@ -52,7 +52,7 @@
  *   · 没有终帧（断线 / 停止超时）⇒ 按条数让位（那一条，是对齐动作的一部分）。
  */
 
-import { Button, Tag } from 'antd'
+import { Button, Select, Tag } from 'antd'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import type { ReactNode, RefObject } from 'react'
@@ -145,6 +145,14 @@ export function ChatPage() {
 
   const [draft, setDraft] = useState('')
   const [aligning, setAligning] = useState(false)
+  /**
+   * 本会话**这一轮选用的模型**（模型池特性）。`undefined` = 走智能体默认模型（`agent.modelId`）。
+   * 切换会话时重置（下面的 effect）：一个会话选的模型不该带到另一个会话。
+   */
+  const [selectedModelId, setSelectedModelId] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    setSelectedModelId(undefined)
+  }, [conversationId])
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
   const [confirmPending, setConfirmPending] = useState(false)
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
@@ -279,14 +287,14 @@ export function ChatPage() {
     // ⚠️ "能不能发"由输入区状态机（`composerState.ts#canSend`）判，这里**不再判一次**：
     // 两处判据必然漂移（最典型：这里放行了、按钮却是灰的，用户看到"没反应"）
     setDraft('')
-    const outcome = await send(text)
+    const outcome = await send(text, selectedModelId)
     if (!outcome.ok) {
       // 前置失败（401/400/404/409 只读/424 缺凭据）与**同标签页重复发送**（`BUSY`）：
       // 这一轮一个字都没落库 ⇒ 界面上不该留下它，正文还给输入框，用户不必重打
       setDraft(text)
       feedback.fail(outcome.error, '发送失败')
     }
-  }, [draft, feedback, send])
+  }, [draft, feedback, send, selectedModelId])
 
   /**
    * 点「停止」（`03` §4.1 的时序在 `useChatStream` → `stopController`，这里只报告结果）。
@@ -446,11 +454,36 @@ export function ChatPage() {
             <div>
               <h1 className="chat__title">{agentName}</h1>
               <p className="ratio">
-                {agent === undefined ? '正在读取智能体…' : `${agent.type} · ${agent.modelLabel}`}
+                {agent === undefined
+                  ? '正在读取智能体…'
+                  : `${agent.type} · ${agent.modelLabel ?? '未绑定模型'}`}
               </p>
             </div>
             <div className="chat__head-right">
-              {agent?.modelAvailable === false ? (
+              {/* 模型选择器（模型池特性）：池里有 2 个及以上模型时才给选择器；否则只有默认模型、
+                  没有可选项，用上面的文字标签展示即可。选了非默认模型时随发送透传给后端
+                  （`POST /:id/chat` 的 modelId），后端校验它是该智能体模型池成员。 */}
+              {agent !== undefined && agent.modelId !== null && agent.models.length >= 2 ? (
+                <Select
+                  size="small"
+                  value={selectedModelId ?? agent.modelId}
+                  style={{ minWidth: 160 }}
+                  onChange={(next: string) => setSelectedModelId(next)}
+                  options={agent.models.map((m) => ({
+                    value: m.modelId,
+                    label: m.available ? m.modelLabel : `${m.modelLabel}（已停用）`,
+                    disabled: !m.available,
+                  }))}
+                  title="选择本会话使用的模型（来自该智能体的模型池）"
+                />
+              ) : null}
+              {agent?.modelId === null ? (
+                // 未绑定模型（多因所属模型商被删除而自动解绑）⇒ 发消息会被后端 409 拦下。
+                // 提前说清并指向出路（编辑页重新绑定）。
+                <Tag className="tag--danger" title="该智能体未绑定模型，请到编辑页重新绑定后再对话">
+                  未绑定模型
+                </Tag>
+              ) : agent?.modelAvailable === false ? (
                 // 绑定模型被停用 ⇒ 发消息会被后端 409 拦下（`shared/src/agent.ts` 的 `modelAvailable`
                 // 是服务端投影，前端**照抄**，不自己判角色/不自己看模型池）。提前说，省一次失败。
                 <Tag className="tag--danger" title="绑定的模型或其 Provider 已停用，发送会被拒绝">

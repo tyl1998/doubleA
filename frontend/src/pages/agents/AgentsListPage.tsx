@@ -84,20 +84,29 @@ export function AgentsListPage() {
       title: '模型',
       dataIndex: 'modelName',
       width: 200,
-      render: (_, agent) => (
-        <div className="agent-cell">
-          <span className="num">
-            {agent.modelName}
-            {!agent.modelAvailable && (
-              <>
-                {' '}
-                <Tag className="tag--danger">已停用</Tag>
-              </>
-            )}
-          </span>
-          <span className="agent-cell__sub">{agent.modelAvailable ? agent.modelLabel : '该模型或所属 Provider 已停用，发消息会被拒'}</span>
-        </div>
-      ),
+      render: (_, agent) =>
+        agent.modelId === null ? (
+          // 未绑定模型（多因所属模型商/模型被删除而自动解绑）：如实标注、指向"去编辑页重新绑定"
+          <div className="agent-cell">
+            <span className="num">
+              <Tag className="tag--danger">未绑定模型</Tag>
+            </span>
+            <span className="agent-cell__sub">所属模型商/模型已删除，编辑智能体重新绑定后才能对话</span>
+          </div>
+        ) : (
+          <div className="agent-cell">
+            <span className="num">
+              {agent.modelName}
+              {!agent.modelAvailable && (
+                <>
+                  {' '}
+                  <Tag className="tag--danger">已停用</Tag>
+                </>
+              )}
+            </span>
+            <span className="agent-cell__sub">{agent.modelAvailable ? agent.modelLabel : '该模型或所属 Provider 已停用，发消息会被拒'}</span>
+          </div>
+        ),
     },
     {
       title: '组件绑定',
@@ -239,7 +248,7 @@ export function AgentsListPage() {
         <div className="card">
           <EmptyState
             title="还没有智能体"
-            lead="创建一个智能体：选一个对话模型、写清它的角色与边界。需要私有知识就挂知识库，需要动手就挂 MCP 工具（MCP 属 P0-2）。"
+            lead="创建一个智能体：选一个对话模型、写清它的角色与边界。需要私有知识就挂知识库，需要动手就挂 MCP 工具。"
             action={
               <Button type="primary" onClick={() => navigate(AGENTS_NEW_PATH)}>
                 创建智能体

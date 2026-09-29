@@ -36,7 +36,7 @@ export const AGENT_TYPE_LABEL: Readonly<Record<AgentType, string>> = {
 /** 类型选择器的副标题（`design/agent-edit.html` 的 `.check__meta`） */
 export const AGENT_TYPE_HINT: Readonly<Record<AgentType, string>> = {
   CHATBOT: '即时问答，一轮一轮对话',
-  TASK_AGENT: '带沙箱与产物面板（沙箱执行属 P0-3）；类型创建后不可改',
+  TASK_AGENT: '带沙箱与产物面板；类型创建后不可改',
 }
 
 // 类型选项**不在这里再定义一份**：`shared` 的 `AGENT_TYPES` 就是取值域，编辑页直接迭代它。
@@ -86,7 +86,10 @@ export interface AgentFormValues {
   description: string
   icon: string
   type: AgentType
+  /** 默认模型（对话不指定模型时走它）；空串 = 未选择 */
   modelId: string
+  /** 模型池（对话时可选的模型集合）。默认模型 `modelId` 应当在其中（保存时保证） */
+  modelIds: string[]
   systemPrompt: string
   openingRemarks: string
   guideQuestions: string[]
@@ -105,6 +108,7 @@ export const EMPTY_AGENT_FORM_VALUES: AgentFormValues = {
   icon: '',
   type: 'CHATBOT',
   modelId: '',
+  modelIds: [],
   systemPrompt: '',
   openingRemarks: '',
   guideQuestions: [],
@@ -117,7 +121,11 @@ export function valuesFromAgent(item: AgentItem): AgentFormValues {
     description: item.description ?? '',
     icon: item.icon ?? '',
     type: item.type,
-    modelId: item.modelId,
+    // item.modelId 可空（智能体可能因删模型商/删模型被自动解绑）；表单态用空串表达"未选择"，
+    // 保存时校验必须选一个（`shared` 的 modelId 在创建/更新校验里是 uuid）
+    modelId: item.modelId ?? '',
+    // 模型池：投影里的每个可选模型；旧智能体可能为空数组
+    modelIds: item.models.map((m) => m.modelId),
     systemPrompt: item.systemPrompt ?? '',
     openingRemarks: item.openingRemarks ?? '',
     // 拷贝一份：表单会原地改这个数组（Form.List 的增删），不能与 query 缓存共享引用
@@ -265,6 +273,29 @@ function sameStrings(a: readonly string[], b: readonly string[]): boolean {
   return a.every((item, index) => item === b[index])
 }
 
+/** 字符串集合判等（**顺序无关**）—— 用于模型池"有没有变" */
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  const set = new Set(a)
+  return b.every((item) => set.has(item))
+}
+
+/** 模型区是否有变化（默认模型换了 或 模型池集合变了） */
+function modelChanged(baseline: AgentFormValues, values: AgentFormValues): boolean {
+  return values.modelId !== baseline.modelId || !sameStringSet(values.modelIds, baseline.modelIds)
+}
+
+/**
+ * 把默认模型并入模型池（去重）——**提交口径**：默认模型恒为池成员（后端也会补，
+ * 但前端先补一遍能让 `POST`/`PATCH` 的请求体自洽，也让 superRefine 不会因"默认不在池里"报错）。
+ * 默认模型为空串（未选）时不并入。
+ */
+function poolForSubmit(values: AgentFormValues): string[] {
+  const pool = [...new Set(values.modelIds)]
+  if (values.modelId !== '' && !pool.includes(values.modelId)) pool.push(values.modelId)
+  return pool
+}
+
 function textChanged(fields: readonly TextField[], baseline: AgentFormValues, values: AgentFormValues): boolean {
   return fields.some(
     (field) => normalizeTextField(field, values[field]) !== normalizeTextField(field, baseline[field]),
@@ -288,7 +319,7 @@ function guidesChanged(baseline: AgentFormValues, values: AgentFormValues): bool
 export function changedSections(baseline: AgentFormValues, values: AgentFormValues): AgentSectionKey[] {
   const changed = new Set<AgentSectionKey>()
   if (values.name !== baseline.name || textChanged(BASIC_TEXT_FIELDS, baseline, values)) changed.add('basic')
-  if (values.modelId !== baseline.modelId) changed.add('model')
+  if (modelChanged(baseline, values)) changed.add('model')
   if (textChanged(PROMPT_TEXT_FIELDS, baseline, values) || guidesChanged(baseline, values)) changed.add('prompt')
   return AGENT_SECTIONS.filter((section) => changed.has(section))
 }
@@ -307,7 +338,12 @@ export function buildUpdateBody(baseline: AgentFormValues, values: AgentFormValu
       body[field] = nullableTextField(field, values[field])
     }
   }
+  // 默认模型或模型池任一变了都要提交：默认模型进 `modelId`，池进 `modelIds`（默认模型并入池）。
+  // 只在真的变了时才带上对应字段（三态/整体替换的最小提交），避免无谓写库。
   if (values.modelId !== baseline.modelId) body.modelId = values.modelId
+  if (!sameStringSet(values.modelIds, baseline.modelIds) || values.modelId !== baseline.modelId) {
+    body.modelIds = poolForSubmit(values)
+  }
   if (guidesChanged(baseline, values)) body.guideQuestions = normalizeGuideQuestionsForSubmit(values.guideQuestions)
 
   return Object.keys(body).length === 0 ? null : body
@@ -324,6 +360,8 @@ export function buildCreateBody(values: AgentFormValues): CreateAgentBody {
     openingRemarks: nullableTextField('openingRemarks', values.openingRemarks),
     guideQuestions: normalizeGuideQuestionsForSubmit(values.guideQuestions),
     modelId: values.modelId,
+    // 模型池：默认模型并入去重；池为空（旧表单）时退化成 `[modelId]`（与后端"省略即 [modelId]"一致）
+    modelIds: poolForSubmit(values),
   }
 }
 
@@ -335,7 +373,7 @@ export function buildCreateBody(values: AgentFormValues): CreateAgentBody {
 export function sectionsOfUpdateBody(body: UpdateAgentBody): AgentSectionKey[] {
   const sections = new Set<AgentSectionKey>()
   if (body.name !== undefined || BASIC_TEXT_FIELDS.some((field) => body[field] !== undefined)) sections.add('basic')
-  if (body.modelId !== undefined) sections.add('model')
+  if (body.modelId !== undefined || body.modelIds !== undefined) sections.add('model')
   if (PROMPT_TEXT_FIELDS.some((field) => body[field] !== undefined) || body.guideQuestions !== undefined) {
     sections.add('prompt')
   }

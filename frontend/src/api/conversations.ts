@@ -296,9 +296,11 @@ export async function streamChat(
   content: string,
   handlers: StreamChatHandlers,
   signal?: AbortSignal,
+  modelId?: string,
 ): Promise<Awaited<ReturnType<typeof readChatEventStream>>> {
   const response = await openEventStream(`/api/conversations/${encodeURIComponent(conversationId)}/chat`, {
-    body: { content },
+    // `modelId` 省略 ⇒ 走该会话智能体的默认模型；给了则必须是其模型池成员（后端校验）
+    body: { content, ...(modelId === undefined ? {} : { modelId }) },
     ...(signal === undefined ? {} : { signal }),
   })
   return readChatEventStream(response, handlers)

@@ -404,21 +404,27 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
   // ───────────────────────── 渲染 ─────────────────────────
 
-  const staleModelOption =
-    item !== undefined && !modelOptions.some((option) => option.id === values.modelId)
-      ? // 绑定的模型已停用时，把它作为**唯一能看到的旧值**留在下拉里：否则 Select 只显示一个裸 uuid，
-        // 用户看不出这个智能体绑的是什么，也无从判断该换成哪个。
-        [{ value: values.modelId, label: `${item.modelName}（已停用，请换一个）` }]
-      : []
-  const modelSelectOptions = [
-    ...modelOptions.map((option) => ({
-      value: option.id,
-      label: `${option.label} · 上下文 ${option.maxContext === null ? '未配置' : option.maxContext} · ${
-        option.supportsVision ? '支持图片' : '不支持图片'
-      }`,
-    })),
-    ...staleModelOption,
-  ]
+  // ── 模型池 / 默认模型的下拉选项 ──
+  // 可用（已启用）CHAT 模型的选项（模型池多选框的主数据源）
+  const availableModelOptions = modelOptions.map((option) => ({
+    value: option.id,
+    label: `${option.label} · 上下文 ${option.maxContext === null ? '未配置' : option.maxContext} · ${
+      option.supportsVision ? '支持图片' : '不支持图片'
+    }`,
+  }))
+  // 编辑时：池里"已停用/已删"的成员（不在可用列表里）也要能显示与保留，否则 Select 只剩裸 uuid，
+  // 用户看不出绑的是什么。停用成员的名字来自投影 `item.models`。
+  const stalePoolOptions =
+    item === undefined
+      ? []
+      : item.models
+          .filter((m) => !modelOptions.some((option) => option.id === m.modelId))
+          .map((m) => ({ value: m.modelId, label: `${m.modelLabel}（已停用，可移出池）` }))
+  const modelPoolSelectOptions = [...availableModelOptions, ...stalePoolOptions]
+  // 默认模型只能在**当前池**内选（保证默认模型恒为池成员，与后端一致）
+  const defaultModelSelectOptions = modelPoolSelectOptions.filter((option) =>
+    values.modelIds.includes(option.value),
+  )
 
   const toggleKb = (kbId: string, checked: boolean) => {
     setSelectedKbIds((current) =>
@@ -518,7 +524,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 <Form.Item
                   name="icon"
                   label="图标"
-                  extra={`填一个 emoji 或图片 URL（最多 ${AGENT_ICON_MAX_CHARS} 个字符）；文件上传属 P1。`}
+                  extra={`填一个 emoji 或图片 URL（最多 ${AGENT_ICON_MAX_CHARS} 个字符）。`}
                 >
                   <Input placeholder="🛠️" />
                 </Form.Item>
@@ -553,21 +559,46 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
             {/* ② 模型 */}
             <FormSection section="model" dirty={dirtySections.includes('model')} failed={failedSections.has('model')}>
-              <Form.Item
-                name="modelId"
-                label="对话模型"
-                rules={[{ required: true, message: '请选择模型' }]}
-                extra="仅列出「已启用」的 CHAT 模型（与模型池的可用列表逐条一致）—— 停用的模型不会出现在这里，管理员自己建智能体时也一样。"
-              >
-                <Select
-                  showSearch
-                  optionFilterProp="label"
-                  loading={modelQuery.isPending}
-                  options={modelSelectOptions}
-                  placeholder={modelQuery.isPending ? '正在读取可用模型…' : '选择一个对话模型'}
-                  notFoundContent="没有可用的对话模型：需要管理员在模型池里启用一个 CHAT 模型（且它的 Provider 也启用）"
-                />
-              </Form.Item>
+              <div className="stack stack--tight">
+                <Form.Item
+                  name="modelIds"
+                  label="模型池"
+                  rules={[{ required: true, message: '请至少选择一个模型', type: 'array', min: 1 }]}
+                  extra="对话时可在这里选择的模型集合。仅列出「已启用」的 CHAT 模型（停用的模型不会出现在这里）；用户在对话页可从池中切换具体模型。"
+                >
+                  <Select
+                    mode="multiple"
+                    showSearch
+                    optionFilterProp="label"
+                    loading={modelQuery.isPending}
+                    options={modelPoolSelectOptions}
+                    placeholder={modelQuery.isPending ? '正在读取可用模型…' : '选择一个或多个对话模型'}
+                    notFoundContent="没有可用的对话模型：需要管理员在模型池里启用一个 CHAT 模型（且它的 Provider 也启用）"
+                    onChange={(next: string[]) => {
+                      // 池里移除了当前默认模型 ⇒ 清空默认模型选择，逼用户重选（避免默认模型不在池里）
+                      const currentDefault = form.getFieldValue('modelId') as string
+                      if (currentDefault !== '' && !next.includes(currentDefault)) {
+                        form.setFieldValue('modelId', '')
+                        setValues((prev) => ({ ...prev, modelId: '', modelIds: next }))
+                      }
+                    }}
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="modelId"
+                  label="默认模型"
+                  rules={[{ required: true, message: '请选择默认模型' }]}
+                  extra="对话时不指定模型时使用的默认模型。只能从上面的模型池中选择。"
+                >
+                  <Select
+                    showSearch
+                    optionFilterProp="label"
+                    options={defaultModelSelectOptions}
+                    placeholder={values.modelIds.length === 0 ? '请先在上面选择模型池' : '从模型池中选一个默认模型'}
+                    notFoundContent="模型池为空：请先在上面选择至少一个模型"
+                  />
+                </Form.Item>
+              </div>
             </FormSection>
 
             {/* ③ 提示词 */}
@@ -655,12 +686,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                       }
                     />
                   ) : kbItems.length === 0 ? (
-                    <Alert
-                      type="info"
-                      showIcon
-                      message="还没有任何知识库"
-                      description="知识库的创建与上传界面属 P0-1-35；现在可以用命令行建一个（README 手工端测 ⑧ 的 POST /api/knowledge-bases），再回到本页绑定。"
-                    />
+                    <Alert type="info" showIcon message="还没有任何知识库" />
                   ) : (
                     <div className="stack stack--tight">
                       {/* ⚠️ `.pick` 落在 **AntD Checkbox 自己那个 `<label>` 根节点**上，
@@ -681,7 +707,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                         </Checkbox>
                       ))}
                       <span className="ratio">
-                        一次列出 {kbItems.length} 个（limit 上限 100）；知识库的创建与上传界面属 P0-1-35。
+                        一次列出 {kbItems.length} 个（limit 上限 100）。
                       </span>
                     </div>
                   )}
@@ -879,7 +905,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               <p className="kicker">危险区</p>
               <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
                 删除会解除 {item.components.length} 处组件绑定，并把它的全部会话转为只读保留（会话与消息不会被删除）。
-                P0-1 没有恢复入口。
+                没有恢复入口。
               </p>
               <Button danger style={{ marginTop: 'var(--sp-4)' }} onClick={() => setDeleteOpen(true)}>
                 删除该智能体

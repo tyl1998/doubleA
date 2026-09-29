@@ -43,9 +43,6 @@ import {
   type ConversationItem,
 } from '@doubulea/shared'
 
-// 逐字确认的唯一判据（P0-1-36 起四处级联删除共用这一份，见下方 `isDeleteConfirmed`）
-import { isTypedConfirmMatch } from '../../app/confirm.js'
-
 /** 侧栏一行的视图（组件只把它画出来，不再做任何判断） */
 export interface ConversationListItemView {
   id: string
@@ -221,28 +218,4 @@ export function normalizeTopicDraft(raw: string, original: string | null): Topic
  */
 export function newConversationAction(conversationId: string | undefined): 'navigate' | 'already-new' {
   return conversationId === undefined ? 'already-new' : 'navigate'
-}
-
-/**
- * 删除会话的**逐字确认词**（`design/chat.html` 的 `#conv-delete-confirm`：占位符就是它）。
- *
- * 与 Agent 的级联删除（`DeleteAgentModal` 输入名称）同一设计：级联删除的确认成本**高于**
- * 普通删除（`03` §七 分了这两档）—— 一个固定的词在这里更合适，因为会话的默认名（"新会话"）
- * 可以是重复的，而"输入会议名"在一个没命名的会话上无从输入。
- */
-export const CONVERSATION_DELETE_CONFIRM_WORD = '删除'
-
-/**
- * 确认词是否逐字对上了。
- *
- * ⚠️ **不做 `trim()`、不忽略大小写、不接受全角**（"删除 " 与 "删除" 不是一回事）：
- * 这一类"确认成本"的全部意义就在于**逼用户慢下来**，而"顺手把空白去掉"会让"粘了个带空格的
- * 词进来"也算通过 —— 它挡不住任何一次误触，却让"逐字确认"这句话变成一句空话。
- *
- * ⚠️ **P0-1-36 起实现改为委托** `app/confirm.ts#isTypedConfirmMatch`：到本批为止，
- * "逐字确认"这句判据已经有四个消费方（会话 / 智能体 / 知识库 / Provider）—— 四份实现
- * 必然先腐烂一份，且**不报任何错**。对外导出与行为逐字未变。
- */
-export function isDeleteConfirmed(typed: string): boolean {
-  return isTypedConfirmMatch(typed, CONVERSATION_DELETE_CONFIRM_WORD)
 }

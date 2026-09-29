@@ -260,7 +260,6 @@ const {
   conversationItemView,
   describeConversationTime,
   groupConversationViews,
-  isDeleteConfirmed,
   newConversationAction,
   normalizeTopicDraft,
 } = await import('../src/features/chat/conversationList.ts')
@@ -1838,13 +1837,13 @@ await it('K4 行内重命名的三条判据（空 / 超长 / 没改动）；长�
   )
 })
 
-await it('K5 删除确认词**逐字**（不 trim、不忽略大小写）', () => {
-  assertEqual(isDeleteConfirmed('删除'), true, '逐字对上')
-  assertEqual(isDeleteConfirmed('删除 '), false, '尾随空格不算')
-  assertEqual(isDeleteConfirmed(' 删除'), false, '前导空格不算')
-  assertEqual(isDeleteConfirmed('删 除'), false, '中间插空格不算')
-  assertEqual(isDeleteConfirmed('DELETE'), false, '换一种写法不算')
-  assertEqual(isDeleteConfirmed(''), false, '空串不算（弹窗刚打开时的默认态）')
+await it('K5 会话删除弹窗已去掉逐字输入确认（需求优化）', () => {
+  const modal = stripComments(
+    readFileSync(new URL('../src/features/chat/DeleteConversationModal.tsx', import.meta.url), 'utf8'),
+  )
+  assert(!modal.includes('isDeleteConfirmed'), '不再逐字确认')
+  assert(!modal.includes('app/confirm.js'), '不再 import 已删除的 confirm 模块')
+  assert(modal.includes('danger: true'), '仍是红色危险按钮（级联删除档）')
 })
 
 await it('K6 「+ 新会话」的判据：已经在新会话态 ⇒ 什么都不做', () => {
@@ -1950,7 +1949,7 @@ console.log(`  ${c.g}③${c.x} 断线黄条点击后历史与后端一致 ......
 console.log(`  ${c.g}坑${c.x} 停止的 5s 收口窗口不能省 .............. I2（abort 必须排在等待之后）+ I3（窗口可注入）`)
 
 console.log(`\n${c.b}── P0-1-34 验收原文两条对应的证据 ──${c.x}`)
-console.log(`  ${c.g}①${c.x} 新建 → 切换 → 重命名 → 删除全流程顺 ...... K4（改名三条判据）+ K5（删除逐字确认）+ K6（新建）`)
+console.log(`  ${c.g}①${c.x} 新建 → 切换 → 重命名 → 删除全流程顺 ...... K4（改名三条判据）+ K5（删除弹窗去逐字确认）+ K6（新建）`)
 console.log(`     ${c.g}+${c.x} 列表形态（分组 / 顺序 / 读数 / 状态灯）......... K1 + K2 + K3`)
 console.log(`     ${c.y}⚠️${c.x} "顺不顺"是交互与网络的事（导航、` + '`PATCH`/`DELETE` 真打出去）⇒ 归浏览器端测（`' + `README` + '` ㉜~㊱）')
 console.log(`  ${c.g}②${c.x} 对话中途仍能进知识库/凭据页（导航不孤岛）... K10 的同族守门（源码级）`)

@@ -83,7 +83,6 @@ export function App() {
               <BatchPlaceholderPage
                 serial="S-09 · 任务中心"
                 title="任务中心"
-                batch="P1"
                 bullets={['TaskAgent 的会话视图：任务 / Agent / 状态 / 最近活动', '继续对话与停止']}
               />
             }
@@ -100,7 +99,6 @@ export function App() {
                 <BatchPlaceholderPage
                   serial="S-07c · 用量"
                   title="用量统计"
-                  batch="P1"
                   bullets={['按用户 / 模型 / 时间维度的 token 与费用统计']}
                 />
               }

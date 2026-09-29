@@ -20,12 +20,12 @@
  *    写成 `.optional().default(null)` 会让"改个别名"顺手把上下文长度抹掉。
  */
 
-import { Alert, Input, InputNumber, Modal, Select, Switch } from 'antd'
+import { Alert, AutoComplete, Input, InputNumber, Modal, Select, Switch } from 'antd'
 import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem, type ModelType } from '@doubulea/shared'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
-import { useCreateModel, useUpdateModel } from '../../api/modelPool.js'
+import { useCreateModel, useProbeRemoteModels, useUpdateModel } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   EMPTY_MODEL_FORM_VALUES,
@@ -36,6 +36,7 @@ import {
   buildModelUpdateBody,
   modelEditValuesOf,
   modelTypeChangeBlocked,
+  remoteModelRows,
   validateMaxContext,
 } from './adminModel.js'
 
@@ -63,11 +64,41 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   const [type, setType] = useState<ModelType>(EMPTY_MODEL_FORM_VALUES.type)
   const [maxContext, setMaxContext] = useState<number | null>(null)
   const [supportsVision, setSupportsVision] = useState(false)
+  const [supportsReasoning, setSupportsReasoning] = useState(false)
   const [enabled, setEnabled] = useState(true)
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const editing = model !== null
   const typeLocked = model !== null && modelTypeChangeBlocked(model)
+
+  // 拉取上游模型：型号名下拉的来源（获取失败/为空时 AutoComplete 仍可手动输入，见下方渲染）。
+  // ⚠️ 只在**新建**态、且已选 Provider 时探一次；编辑态不自动打上游（避免打开编辑弹窗就发探测请求）。
+  const probe = useProbeRemoteModels()
+  useEffect(() => {
+    if (!open || editing) return
+    if (providerId === '') {
+      probe.reset()
+      return
+    }
+    probe.mutate(providerId)
+    // 依赖只放 open/providerId：把 probe 放进依赖会让每次 mutate 状态变化都再探一次
+  }, [open, editing, providerId])
+
+  /** 上游型号名 → 上下文长度 的查表（选中某个型号时用它默认填充上下文长度） */
+  const remoteRows = useMemo(() => (probe.data === undefined ? [] : remoteModelRows(probe.data)), [probe.data])
+  const remoteOptions = useMemo(
+    () =>
+      remoteRows.map((row) => ({
+        value: row.id,
+        label: row.contextLength === null ? row.id : `${row.id} · 上下文 ${row.contextLength.toLocaleString('en-US')}`,
+      })),
+    [remoteRows],
+  )
+  const filteredOptions = useMemo(() => {
+    const keyword = modelName.trim().toLowerCase()
+    if (keyword === '') return remoteOptions
+    return remoteOptions.filter((option) => option.value.toLowerCase().includes(keyword))
+  }, [remoteOptions, modelName])
 
   useEffect(() => {
     if (!open) return
@@ -78,6 +109,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       setType(EMPTY_MODEL_FORM_VALUES.type)
       setMaxContext(null)
       setSupportsVision(false)
+      setSupportsReasoning(false)
       setEnabled(true)
     } else {
       const values = modelEditValuesOf(model)
@@ -87,6 +119,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       setType(values.type)
       setMaxContext(values.maxContext)
       setSupportsVision(values.supportsVision)
+      setSupportsReasoning(values.supportsReasoning)
       setEnabled(values.enabled)
     }
     setErrorText(null)
@@ -107,7 +140,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       return
     }
 
-    const values = { providerId, modelName, label, type, maxContext, supportsVision, enabled }
+    const values = { providerId, modelName, label, type, maxContext, supportsVision, supportsReasoning, enabled }
 
     if (model === null) {
       create.mutate(buildCreateModelBody(values), {
@@ -189,19 +222,44 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
         <div>
           <p className="block-label">型号名</p>
-          <Input
+          <AutoComplete
             value={modelName}
-            maxLength={128}
+            options={filteredOptions}
+            filterOption={false}
+            style={{ width: '100%' }}
             aria-label="型号名"
-            placeholder="上游的 model id，例如 gpt-4o-mini"
-            onChange={(event) => setModelName(event.target.value)}
-            onPressEnter={() => {
-              if (canSubmit) submit()
+            placeholder="上游的 model id，例如 gpt-4o-mini（可下拉选择或手动输入）"
+            onChange={(value) => setModelName(value)}
+            onSelect={(value: string) => {
+              setModelName(value)
+              // 选中某个上游型号 ⇒ 若上游给了上下文长度、且用户还没填，就默认填上（Req 4）
+              const row = remoteRows.find((item) => item.id === value)
+              if (row !== undefined && row.contextLength !== null && maxContext === null) {
+                setMaxContext(row.contextLength)
+              }
             }}
-          />
+          >
+            <Input
+              maxLength={128}
+              onPressEnter={() => {
+                if (canSubmit) submit()
+              }}
+            />
+          </AutoComplete>
+          {!editing && providerId !== '' && (
+            <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+              {probe.isPending
+                ? '正在向上游拉取可选型号…（内网地址可能较慢）'
+                : probe.isError
+                  ? '拉取上游型号失败，可直接手动输入型号名（不影响创建）。'
+                  : remoteOptions.length > 0
+                    ? `下拉列出上游 ${remoteOptions.length} 个型号，选中会自动带入上下文长度（若上游提供）；也可手动输入。`
+                    : '上游没有返回可选型号，请手动输入型号名。'}
+            </p>
+          )}
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
             会<strong>原样</strong>放进调用上游的请求里，所以不能含空格（含空格只会在第一次发消息时
-            变成 404，很难排查）。不确定的话用 Provider 行上的「拉取上游模型」探一次再照抄。
+            变成 404，很难排查）。
           </p>
         </div>
 
@@ -259,14 +317,26 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
         <div>
           <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>支持深度思考</span>
+            <Switch checked={supportsReasoning} aria-label="支持深度思考" onChange={setSupportsReasoning} />
+          </div>
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            开启后对话会向上游请求"深度思考"（reasoning / thinking）：OpenAI 兼容走
+            <code>reasoning_effort</code>、Responses 走 <code>reasoning</code>、Anthropic 走
+            <code>thinking</code>。只对<strong>真正支持思考的模型</strong>勾选 —— 上游若不认这个参数会报错，
+            那时关掉它即可。
+          </p>
+        </div>
+
+        <div>
+          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
             <p className="block-label" style={{ marginBottom: 0 }}>
               启用
             </p>
             <Switch checked={enabled} aria-label="启用该模型" onChange={setEnabled} />
           </div>
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            停用后它不会出现在「可用模型」下拉里（含管理员自己建智能体时，
-            <code>01</code> §3.2 的验收要点）；已绑定它的智能体发消息会失败。
+            停用后它不会出现在「可用模型」下拉里；已绑定它的智能体发消息会失败。
           </p>
         </div>
 

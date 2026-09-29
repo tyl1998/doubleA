@@ -50,7 +50,9 @@ import type {
   ModelListResult,
   ModelProviderItem,
   ModelProviderListResult,
+  ProviderBoundModelsResult,
   RemoteModelListResult,
+  RemoveModelProviderResult,
   UpdateModelBody,
   UpdateModelProviderBody,
 } from '@doubulea/shared'
@@ -139,17 +141,41 @@ export function useUpdateModelProvider() {
 }
 
 /**
- * 删 Provider（**级联**删它下面的全部模型；其中有模型被智能体引用时整体 409）。
+ * 删 Provider（**级联**删它下面的全部模型；引用这些模型的**在线**智能体被自动解绑）。
  *
- * 界面走"级联删除"那一档（Modal + 危险按钮 + 明示影响范围 + 逐字确认），见
- * `pages/admin/DeleteProviderModal.tsx`。
+ * 界面走"级联删除"那一档（Modal + 危险按钮 + 明示影响范围），见
+ * `pages/admin/DeleteProviderModal.tsx`。删除不再因"有模型被引用"而 409：引用它们的在线
+ * 智能体会被自动解绑（`agents.model_id` 置空），响应回报删掉的模型数与被解绑的智能体数。
  */
 export function useRemoveModelProvider() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) =>
-      request<{ id: string; name: string }>(`/api/model-providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-    onSuccess: () => invalidateModelPoolViews(queryClient),
+      request<RemoveModelProviderResult>(`/api/model-providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    // 删 Provider 会连带解绑智能体 ⇒ 智能体列表/详情也要失效（modelAvailable/modelName 变了）
+    onSuccess: () => {
+      invalidateModelPoolViews(queryClient)
+      void queryClient.invalidateQueries({ queryKey: ['agents'] })
+    },
+  })
+}
+
+/** Provider 被绑定模型清单的查询键（删除弹窗打开时拉取，见需求 3） */
+export const PROVIDER_BOUND_MODELS_QUERY_KEY = ['admin', 'model-providers', 'bound-models'] as const
+
+/**
+ * 删 Provider 前拉取"其下被在线智能体绑定的模型清单"（需求 3：弹窗如实列出影响范围）。
+ *
+ * 只在传入 `providerId` 时才发（删除弹窗打开才需要）；只读、不失效任何东西。
+ */
+export function useProviderBoundModels(providerId: string | null) {
+  return useQuery({
+    queryKey: [...PROVIDER_BOUND_MODELS_QUERY_KEY, providerId] as const,
+    queryFn: () =>
+      request<ProviderBoundModelsResult>(
+        `/api/model-providers/${encodeURIComponent(providerId as string)}/bound-models`,
+      ),
+    enabled: providerId !== null,
   })
 }
 

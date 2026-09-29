@@ -110,8 +110,8 @@ export interface UseChatStreamResult {
    * 那段时间界面**确实**还在等服务端收口，亮着是对的）。
    */
   streamingId: string | null
-  /** 发一条消息；返回 `ok:false` 时正文应当还给输入框 */
-  send: (text: string) => Promise<SendOutcome>
+  /** 发一条消息；返回 `ok:false` 时正文应当还给输入框。`modelId` 省略走智能体默认模型 */
+  send: (text: string, modelId?: string) => Promise<SendOutcome>
   /** 点「停止」（时序见 `stopController.ts`）；返回值供页面决定说什么 */
   stop: () => Promise<StopOutcome>
   /**
@@ -200,7 +200,7 @@ export function useChatStream(
   alignRef.current = align
 
   const send = useCallback(
-    async (text: string): Promise<SendOutcome> => {
+    async (text: string, modelId?: string): Promise<SendOutcome> => {
       const content = text.trim()
       // 空正文：与后端 `.min(1)` 同口径，不发请求（把"必填"的失败留给界面自己判，见 `ChatPage`）
       if (content === '') return { ok: true }
@@ -273,6 +273,7 @@ export function useChatStream(
               onIssue: reportSseIssue,
             },
             controller.signal,
+            modelId,
           )
 
           if (!result.terminated && !controller.signal.aborted) {
