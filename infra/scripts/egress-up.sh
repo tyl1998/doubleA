@@ -28,7 +28,18 @@
 #   bash infra/scripts/egress-up.sh --allow api.foo.com  # 追加白名单（可重复）
 #   bash infra/scripts/egress-up.sh --allow-all          # 关白名单（只建议临时排查）
 #   bash infra/scripts/egress-up.sh --no-auto            # 不自动取库，只用 --allow
+#   bash infra/scripts/egress-up.sh --watch              # ★ 起完代理后保持前台，每 30s 从库刷新白名单
+#   bash infra/scripts/egress-up.sh --daemon             # ★★ 同 --watch，但**常驻后台**（pid → .pids/egress-watch.pid，
+#                                                        #     日志 → .dev-logs/egress.log；egress-down.sh 一并收掉）
 #   bash infra/scripts/egress-up.sh --port 3128 --name doubulea-egress --image node:22-bookworm-slim
+#
+# 【白名单自动同步】代理挂载一个**白名单文件**（`${TMPDIR:-/tmp}/doubulea-egress-allow/allow`），
+#   代理进程每 5s 轮询该文件、内容变了就热更新 —— 库里新增/停用 provider **不需要重启代理**。
+#   谁在写这个文件：
+#   · 本脚本**每次运行**时写一次（临时文件 + `mv`，原子写）；
+#   · `--watch` 模式起一个前台循环，每 30s 重新查库，变了就重写文件（代理 ≤5s 后热更新）。
+#   Ctrl+C 只停同步循环，代理容器照常跑（白名单停在最后一次一致状态）。
+#   ⚠️ 不跑 `--watch` 的话仍是"启动时抓一次"的旧语义 —— 想完全自动化就用 `--watch`。
 #
 # 停止：bash infra/scripts/egress-down.sh
 # =====================================================================
@@ -47,9 +58,23 @@ NET=doubulea-sandbox
 IMAGE=node:22-bookworm-slim
 PG_CONTAINER=doubulea-postgres
 
+# 白名单文件（挂进代理容器，代理每 5s 轮询热更新 —— 加 provider 不用重启代理）
+ALLOW_DIR_HOST="${TMPDIR:-/tmp}/doubulea-egress-allow"
+ALLOW_FILE_HOST="$ALLOW_DIR_HOST/allow"
+ALLOW_FILE_CONTAINER=/egress-allow/allow
+
+# 常驻（--daemon）的 pid / 日志（与 dev-run.sh 同一套目录，gitignore 里已放行）
+LOG_DIR="$REPO_ROOT/.dev-logs"
+PID_DIR="$REPO_ROOT/.pids"
+WATCH_LOG="$LOG_DIR/egress.log"
+WATCH_PID_FILE="$PID_DIR/egress-watch.pid"
+
 ALLOW_ALL=0
 WRITE_ENV=0
 NO_AUTO=0
+WATCH=0
+DAEMON=0
+WATCH_INTERVAL_SEC=30
 EXTRA_ALLOW=()
 
 while [ $# -gt 0 ]; do
@@ -62,6 +87,9 @@ while [ $# -gt 0 ]; do
     --allow-all) ALLOW_ALL=1 ;;
     --no-auto)   NO_AUTO=1 ;;
     --write-env) WRITE_ENV=1 ;;
+    --watch)     WATCH=1 ;;
+    --daemon)    DAEMON=1; WATCH=1 ;;
+    --watch-interval) shift; WATCH_INTERVAL_SEC="${1:-30}" ;;
     --)          : ;;   # `pnpm egress:up -- --write-env` 会把孤立 -- 传进来
     -h|--help)   sed -n '2,37p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
@@ -127,45 +155,84 @@ add_allow() {
 
 SKIPPED_LOOPBACK=()
 
-if [ "$NO_AUTO" -eq 0 ]; then
+# 从库里取 enabled 的 model_providers 主机名（不自动取库时只留 --allow 的）
+db_allow_hosts() {
+  [ "$NO_AUTO" -eq 1 ] && return 0
+  local PG_USER PG_DB urls h
   PG_USER="$(env_value POSTGRES_USER)"; [ -n "$PG_USER" ] || PG_USER=doubulea
   PG_DB="$(env_value POSTGRES_DB)";     [ -n "$PG_DB" ]   || PG_DB=doubulea
 
   urls="$("$DOCKER_BIN" exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A \
             -c "SELECT base_url FROM model_providers WHERE enabled = true;" 2>/dev/null)"
   if [ -z "$urls" ]; then
-    warn "从库里没取到 enabled 的 model_providers（容器 ${PG_CONTAINER} 在跑吗？库是 ${PG_DB} 吗？）"
-  else
-    while IFS= read -r u; do
-      [ -n "$u" ] || continue
-      h="$(printf '%s' "$u" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/:]+).*#\1#')"
-      case "$h" in
-        127.0.0.1|localhost|::1|0.0.0.0)
-          SKIPPED_LOOPBACK+=("$u")
-          ;;
-        *)
-          add_allow "$h"
-          ;;
-      esac
-    done <<< "$urls"
+    return 1
   fi
-  info "库里的模型池主机：${ALLOW[*]:-（无）}"
-fi
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    h="$(printf '%s' "$u" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/:]+).*#\1#')"
+    case "$h" in
+      127.0.0.1|localhost|::1|0.0.0.0)
+        SKIPPED_LOOPBACK+=("$u")
+        ;;
+      *)
+        add_allow "$h"
+        ;;
+    esac
+  done <<< "$urls"
+  return 0
+}
 
-for extra in ${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}; do
-  add_allow "$extra"
-done
+# 重算白名单 → 填 ALLOW / ALLOW_CSV。
+# 参数 `quiet`：非空 = 只填值、不打"库里的模型池主机 / 放行 N 个"这些启动期日志
+#               （watch 每 30s 调一次，不能每轮都刷屏）。
+# 返回 0 = ALLOW_CSV 可用（含 '*'）；1 = 白名单为空（调用方决定是拒启还是保留旧值）。
+compute_allow_csv() {
+  local quiet="${1:-}"
+  ALLOW=()
+  SKIPPED_LOOPBACK=()
+  if db_allow_hosts; then
+    if [ -z "$quiet" ]; then
+      info "库里的模型池主机：${ALLOW[*]:-（无）}"
+    fi
+  elif [ -z "$quiet" ]; then
+    warn "从库里没取到 enabled 的 model_providers（容器 ${PG_CONTAINER} 在跑吗？）"
+  fi
 
-if [ "$ALLOW_ALL" -eq 1 ]; then
-  ALLOW_CSV='*'
-  warn "白名单已关闭（--allow-all）：任何目标都放行，只建议临时排查用"
-elif [ "${#ALLOW[@]}" -eq 0 ]; then
+  local extra
+  for extra in ${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}; do
+    add_allow "$extra"
+  done
+
+  if [ "$ALLOW_ALL" -eq 1 ]; then
+    ALLOW_CSV='*'
+    if [ -z "$quiet" ]; then
+      warn "白名单已关闭（--allow-all）：任何目标都放行，只建议临时排查用"
+    fi
+  elif [ "${#ALLOW[@]}" -eq 0 ]; then
+    ALLOW_CSV=''
+    return 1
+  else
+    ALLOW_CSV="$(printf '%s,' ${ALLOW[@]+"${ALLOW[@]}"})"
+    ALLOW_CSV="${ALLOW_CSV%,}"
+  fi
+  return 0
+}
+
+# 原子写白名单文件（临时文件 + mv：代理轮询读的是路径，mv 后立即可见新内容）
+write_allow_file() {
+  mkdir -p "$ALLOW_DIR_HOST"
+  local tmp="$ALLOW_FILE_HOST.tmp"
+  printf '%s\n' "$ALLOW_CSV" > "$tmp"
+  mv "$tmp" "$ALLOW_FILE_HOST"
+}
+
+if compute_allow_csv; then
+  if [ "$ALLOW_ALL" -ne 1 ] && [ "${#ALLOW[@]}" -gt 0 ]; then
+    ok "放行 ${#ALLOW[@]} 个主机：$ALLOW_CSV"
+  fi
+else
   fail "白名单是空的 —— 拒启（空白名单不是「全放行」，那样等于把 internal bridge 的设计意图作废）。
        加目标：--allow api.example.com    或显式关掉白名单：--allow-all"
-else
-  ALLOW_CSV="$(printf '%s,' ${ALLOW[@]+"${ALLOW[@]}"})"
-  ALLOW_CSV="${ALLOW_CSV%,}"
-  ok "放行 ${#ALLOW[@]} 个主机：$ALLOW_CSV"
 fi
 
 for skipped in ${SKIPPED_LOOPBACK[@]+"${SKIPPED_LOOPBACK[@]}"}; do
@@ -174,6 +241,10 @@ for skipped in ${SKIPPED_LOOPBACK[@]+"${SKIPPED_LOOPBACK[@]}"}; do
        要用宿主上的假 LLM：把该 provider 的 base_url 改成 http://host.docker.internal:<port>/v1，
        再重跑本脚本（代理那台容器在默认 bridge 上够得着宿主）。"
 done
+
+# 白名单落盘（挂进容器；代理轮询它做热更新）
+write_allow_file
+info "白名单已写入 $ALLOW_FILE_HOST（代理挂载 + 热更新）"
 
 # -- 2. 起容器（公网腿）------------------------------------------------
 
@@ -188,7 +259,9 @@ fi
   --network bridge --restart unless-stopped \
   -e "EGRESS_PORT=${PORT}" \
   -e "EGRESS_ALLOW=${ALLOW_CSV}" \
+  -e "EGRESS_ALLOW_FILE=${ALLOW_FILE_CONTAINER}" \
   -v "$PROXY_SRC:/app/egress-proxy.mjs:ro" \
+  -v "$ALLOW_DIR_HOST:/egress-allow:ro" \
   "$IMAGE" node /app/egress-proxy.mjs >/dev/null || fail "容器起不来（$DOCKER_BIN logs $NAME 看原因）"
 ok "已启动（公网腿 = 默认 bridge）"
 
@@ -265,4 +338,49 @@ cat <<EOF
 
   日志：$DOCKER_BIN logs -f $NAME
   停止：bash infra/scripts/egress-down.sh
+  白名单热更新：代理每 5s 轮询 $ALLOW_FILE_HOST，库变了会在 ≤5s 内生效（不用重启代理）
 EOF
+
+# -- 5. 白名单自动同步（--watch / --daemon）----------------------------
+
+# 常驻循环本体（函数 → 前台直调或后台子 shell 都能复用）
+watch_loop() {
+  last_saved="$(cat "$ALLOW_FILE_HOST" 2>/dev/null || true)"
+  while true; do
+    sleep "$WATCH_INTERVAL_SEC"
+    if compute_allow_csv quiet; then
+      if [ "$ALLOW_CSV" != "$last_saved" ]; then
+        write_allow_file
+        last_saved="$ALLOW_CSV"
+        ok "白名单已同步（${ALLOW_CSV:-*}）→ 代理 ≤5s 内热更新"
+      fi
+    else
+      warn "本次查库失败/白名单为空 —— 保留上一份（$last_saved），下轮再试"
+    fi
+  done
+}
+
+if [ "$WATCH" -eq 1 ]; then
+  step "白名单自动同步（每 ${WATCH_INTERVAL_SEC}s 从库刷新）"
+
+  if [ "$NO_AUTO" -eq 1 ]; then
+    warn "--watch/--daemon 与 --no-auto 同时出现：库里没有可刷的来源，只会在 --allow 变化时更新（但 --allow 是启动参数，运行中不变 ⇒ 实际上不会更新）"
+  fi
+
+  if [ "$DAEMON" -eq 1 ]; then
+    if [ -f "$WATCH_PID_FILE" ] && kill -0 "$(cat "$WATCH_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+      info "同步已在常驻（pid $(cat "$WATCH_PID_FILE")），不重复起"
+    else
+      mkdir -p "$LOG_DIR" "$PID_DIR"
+      : >"$WATCH_LOG"
+      watch_loop </dev/null >>"$WATCH_LOG" 2>&1 &
+      WATCH_PID=$!
+      echo "$WATCH_PID" >"$WATCH_PID_FILE"
+      ok "白名单同步已常驻（pid ${WATCH_PID}，日志 ${WATCH_LOG}）"
+      info "停止：bash infra/scripts/egress-down.sh（容器 + 同步一起收）"
+    fi
+  else
+    info "代理保持运行；Ctrl+C 只停同步循环（白名单停在最后一次一致状态）"
+    watch_loop
+  fi
+fi

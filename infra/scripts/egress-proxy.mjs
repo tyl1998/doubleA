@@ -21,6 +21,12 @@
  *   EGRESS_PORT               监听端口（默认 3128）
  *   EGRESS_LISTEN_HOST        绑定地址（默认 0.0.0.0；容器里必须非回环，否则沙箱够不着）
  *   EGRESS_ALLOW              逗号分隔白名单：`host` / `host:port` / `*.host`；`*` = 全放行
+ *                             **启动兜底**用（`egress-up.sh` 每次都带）
+ *   EGRESS_ALLOW_FILE         已挂载的白名单文件路径（可省）。设置后：
+ *                             ① 启动时**优先**读它（`egress-up.sh` 已把它写好）；
+ *                             ② 之后每 `EGRESS_ALLOW_REFRESH_MS` 轮询一次，内容变了
+ *                                **热更新**规则 —— 库里加了新 provider 不用重启代理。
+ *   EGRESS_ALLOW_REFRESH_MS   白名单文件轮询间隔（默认 5000）
  *   EGRESS_CONNECT_TIMEOUT_MS 建连超时（默认 30000）
  *   EGRESS_LOG_BODIES         非空 = 记一行每请求日志（默认只记放行/拒绝与错误）
  *
@@ -30,16 +36,49 @@
 import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
+import fs from 'node:fs'
 
 const PORT = Number(process.env.EGRESS_PORT ?? 3128)
 const LISTEN_HOST = process.env.EGRESS_LISTEN_HOST ?? '0.0.0.0'
 const CONNECT_TIMEOUT_MS = Number(process.env.EGRESS_CONNECT_TIMEOUT_MS ?? 30_000)
 const LOG_BODIES = (process.env.EGRESS_LOG_BODIES ?? '') !== ''
-const RULES = (process.env.EGRESS_ALLOW ?? '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
-const ALLOW_ALL = RULES.includes('*')
+const ALLOW_ENV = process.env.EGRESS_ALLOW ?? ''
+const ALLOW_FILE = process.env.EGRESS_ALLOW_FILE ?? ''
+const ALLOW_REFRESH_MS = Number(process.env.EGRESS_ALLOW_REFRESH_MS ?? 5_000)
+
+let RULES = []
+let ALLOW_ALL = false
+
+/** 把一串规则（可含空段）装进运行态；返回装好的规则数组 */
+function applyRules(entries) {
+  RULES = entries.filter((s) => s !== '')
+  ALLOW_ALL = RULES.includes('*')
+  return RULES
+}
+
+function rulesFromEnv() {
+  return ALLOW_ENV.split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+function rulesFromFile(file) {
+  const content = fs.readFileSync(file, 'utf8').trim()
+  return content.split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+// 初始规则：优先已挂载的白名单文件（`egress-up.sh` 起容器前已写好）；读不到退回 env
+let initialSource = 'env'
+if (ALLOW_FILE !== '') {
+  try {
+    const fromFile = rulesFromFile(ALLOW_FILE)
+    if (fromFile.length > 0) {
+      applyRules(fromFile)
+      initialSource = 'file'
+    }
+  } catch {
+    /* 文件还没就绪 → 用 env */
+  }
+}
+if (RULES.length === 0) applyRules(rulesFromEnv())
 
 if (RULES.length === 0) {
   console.error(
@@ -52,6 +91,34 @@ if (RULES.length === 0) {
 
 if (ALLOW_ALL) {
   console.warn('[egress] ⚠️  EGRESS_ALLOW=* —— 白名单关闭，任何目标都放行（只建议临时排查用）')
+}
+
+// 白名单热更新：轮询已挂载的文件，内容变了就换规则（库里加 provider 不用重启代理）。
+// ⚠️ 空内容 = 一次坏写入，**保留旧规则**并告警 —— 别让写一半把出口整个关掉。
+if (ALLOW_FILE !== '') {
+  let last = ''
+  try {
+    last = fs.readFileSync(ALLOW_FILE, 'utf8').trim()
+  } catch {
+    last = ''
+  }
+  setInterval(() => {
+    let content = ''
+    try {
+      content = fs.readFileSync(ALLOW_FILE, 'utf8').trim()
+    } catch {
+      return
+    }
+    if (content === last) return
+    last = content
+    const next = content.split(',').map((s) => s.trim()).filter(Boolean)
+    if (next.length === 0) {
+      log(`警告：白名单文件变成空，已忽略（保留上一份规则）`)
+      return
+    }
+    applyRules(next)
+    log(`白名单已热更新（${RULES.length} 条）：${RULES.join(', ')}`)
+  }, ALLOW_REFRESH_MS)
 }
 
 /** 规则 → 是否命中。规则形态：`host`、`host:port`、`*.host`、`*` */
