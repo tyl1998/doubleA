@@ -30,22 +30,67 @@ import { AppError } from '@doubulea/shared'
 
 import { config } from '../../config.js'
 import { fetchUpstreamJson, snippet, type UpstreamEndpoint } from '../upstream.js'
-import type { EmbeddingProvider } from './index.js'
+import type { EmbeddingImage, EmbeddingInput, EmbeddingProvider } from './index.js'
+
+/** 该输入是否带图片 */
+function hasImage(input: EmbeddingInput): boolean {
+  return typeof input !== 'string' && (input.images?.length ?? 0) > 0
+}
+
+/** 图片 → `data:<mime>;base64,<...>`（多模态端点的 `image_url.url` 就吃这个形式） */
+function imageDataUrl(image: EmbeddingImage): string {
+  return `data:${image.mime};base64,${image.data.toString('base64')}`
+}
+
+/**
+ * 一条输入 → 多模态端点的 content part 数组：
+ * `[{type:'text',text}, {type:'image_url',image_url:{url}}...]`。
+ */
+function contentPartsOf(input: EmbeddingInput): Array<Record<string, unknown>> {
+  const text = typeof input === 'string' ? input : input.text
+  const parts: Array<Record<string, unknown>> = [{ type: 'text', text }]
+  if (typeof input !== 'string') {
+    for (const image of input.images ?? []) {
+      parts.push({ type: 'image_url', image_url: { url: imageDataUrl(image) } })
+    }
+  }
+  return parts
+}
 
 export interface ApiEmbeddingOptions {
-  /** 已归一化（去尾斜杠）的 baseUrl；服务端会自己接 `/embeddings` */
+  /** 已归一化（去尾斜杠）的 baseUrl；服务端会自己接 `/embeddings`（除非 `customUrl=true`） */
   apiUrl: string
   apiKey: string | null
   apiModel: string
-  /** 期望维度（= `EMBEDDING_DIM` = `chunks.embedding` 的 `vector(N)`） */
-  dim: number
+  /**
+   * 期望维度。**本批起可为 `null`**：模型池里的模型不记录维度，
+   * 建库时先用 `null` 探测一次（第一次 `embed()` 的返回长度即真实维度），之后即可传入已知维度做逐条校验。
+   */
+  dim: number | null
   batchSize: number
+  /** 上游名字（进日志与错误消息）。缺省 `EMBEDDING_API`；模型池来的给 Provider 名更有用 */
+  providerName?: string
+  /** 自定义 URL：为 true 时 `apiUrl` 就是完整端点，不拼 `/embeddings`（见 `upstream.ts#resolveUpstreamUrl`） */
+  customUrl?: boolean
+  /**
+   * 多模态 embedding 端点（如火山 `doubao-embedding-vision`）：打 `POST /embeddings/multimodal`，
+   * `input` 为 `[{type:"text",text}]`。默认 `false` = 标准 OpenAI `POST /embeddings` + `input:[string]`。
+   */
+  multimodal?: boolean
   /** 覆盖"到响应头 + 读 body"的上限（测试/一次性任务用） */
   timeoutMs?: number
 }
 
-/** api 模式的上游名字（进日志与错误消息；Provider 名对这个模式没有意义） */
-const UPSTREAM_NAME = 'EMBEDDING_API'
+/** api 模式的默认上游名字（进日志与错误消息；未指定 providerName 时用） */
+const DEFAULT_UPSTREAM_NAME = 'EMBEDDING_API'
+
+/**
+ * embedding 的落库标识（= `EmbeddingProvider.name()`）：`api:<model id>`。
+ * 集中一处，供 `kb.service` 的漂移探测复用 —— 两处各拼一遍迟早会漂移。
+ */
+export function apiEmbeddingName(modelName: string): string {
+  return `api:${modelName}`
+}
 
 /**
  * OpenAI 兼容接口的 embedding provider。
@@ -55,59 +100,91 @@ const UPSTREAM_NAME = 'EMBEDDING_API'
  */
 export class ApiEmbeddingProvider implements EmbeddingProvider {
   readonly #options: ApiEmbeddingOptions
+  /** 已知/已推断出的维度；`null` = 尚未确定（下次 embed 后从返回长度补上） */
+  #dim: number | null
 
   constructor(options: ApiEmbeddingOptions) {
     if (options.apiUrl.endsWith('/')) {
       throw AppError.internal(`ApiEmbeddingProvider 的 apiUrl 必须是归一化后的地址（去掉尾斜杠）：${options.apiUrl}`)
     }
     this.#options = options
+    this.#dim = options.dim
   }
 
   /**
    * 落库标记（`子方案①` §八：`chunks.meta.embeddingName`，用于换模型检测）。
    *
    * 形状 `api:<model>`：**同一 model id 在不同 endpoint 上视为同一个模型**（OpenAI 命名惯例里
-   * model id 就是身份）。换维度的情况由 `dim()` 与 `EMBEDDING_DIM` 的一致性单独守住（§十一）。
+   * model id 就是身份）。
    */
   name(): string {
-    return `api:${this.#options.apiModel}`
+    return apiEmbeddingName(this.#options.apiModel)
   }
 
-  /** 期望维度。真实维度由上游决定，取回时会逐条校验（不一致立刻报错，不写脏数据） */
+  /** 已知维度；尚未探测到时抛错（调用方应先 `embed()` 探测，或在构造时给已知维度） */
   dim(): number {
-    return this.#options.dim
+    if (this.#dim === null) {
+      throw AppError.internal(`embedding 维度尚未确定（model=${this.#options.apiModel}）：请先完成一次 embedding 调用`)
+    }
+    return this.#dim
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(inputs: readonly EmbeddingInput[]): Promise<number[][]> {
     // 空输入**不发请求**（有的实现会对 `input: []` 回 400，而"没有文本"不是错误）
-    if (texts.length === 0) return []
+    if (inputs.length === 0) return []
 
-    const { batchSize } = this.#options
+    // 图片只能走多模态端点：模型没标多模态却收到图片 ⇒ 当场拒绝，不要把图片当文本吞掉
+    // （静默降级会让"图片内容没进向量空间"变成一个事后无法解释的检索缺失）
+    const multimodal = this.#options.multimodal === true
+    if (!multimodal && inputs.some(hasImage)) {
+      throw AppError.internal(
+        `所选 embedding 模型不支持多模态，无法向量化图片（model=${this.#options.apiModel}）`,
+      )
+    }
+
+    // 多模态端点（如火山 doubao-embedding-vision）一次请求只回**一个**融合向量 ⇒
+    // 只能一条一条发（每次请求 1 条输入、取回 1 个向量），否则条数对不上。
+    const batchSize = multimodal ? 1 : this.#options.batchSize
     const vectors: number[][] = []
-    for (let start = 0; start < texts.length; start += batchSize) {
-      const batch = texts.slice(start, start + batchSize)
-      vectors.push(...(await this.#embedBatch(batch)))
+    for (let start = 0; start < inputs.length; start += batchSize) {
+      const batch = inputs.slice(start, start + batchSize)
+      const result = await this.#embedBatch(batch, this.#dim)
+      // 首次探测：拿返回的向量长度当维度（此后逐批按它校验，不再接受不同维度）
+      if (this.#dim === null && result[0] !== undefined) this.#dim = result[0].length
+      vectors.push(...result)
     }
     return vectors
   }
 
-  async #embedBatch(texts: string[]): Promise<number[][]> {
+  async #embedBatch(inputs: readonly EmbeddingInput[], expectedDim: number | null): Promise<number[][]> {
     const endpoint: UpstreamEndpoint = {
-      providerName: UPSTREAM_NAME,
+      providerName: this.#options.providerName ?? DEFAULT_UPSTREAM_NAME,
       subject: this.#options.apiModel,
       baseUrl: this.#options.apiUrl,
+      customUrl: this.#options.customUrl,
       apiKey: this.#options.apiKey,
     }
 
+    // 多模态端点：路径不同 + input 是 content 分片
+    //   · 无图片：仍是 `[{type:'text',text}]`（与历史逐字一致）
+    //   · 有图片：`[{type:'text',text},{type:'image_url',image_url:{url:data:...}}]`
+    // 标准端点：`input` 是纯文本数组（图片输入在 embed() 已拦下）
+    const multimodal = this.#options.multimodal === true
+    const bodyInput = multimodal
+      ? contentPartsOf(inputs[0] ?? '')
+      : inputs.map((input) => (typeof input === 'string' ? input : input.text))
     const payload = await fetchUpstreamJson(endpoint, {
-      path: '/embeddings',
-      body: { model: this.#options.apiModel, input: texts },
+      path: multimodal ? '/embeddings/multimodal' : '/embeddings',
+      body: {
+        model: this.#options.apiModel,
+        input: bodyInput,
+      },
       // 超时沿用 `LLM_REQUEST_TIMEOUT_MS`（同一个"到响应头 + 读 body"上限，没必要再开一个变量）
       timeoutMs: this.#options.timeoutMs ?? config.llm.requestTimeoutMs,
       stage: 'embeddings',
     })
 
-    return readEmbeddingPayload(payload, endpoint, texts.length, this.#options.dim)
+    return readEmbeddingPayload(payload, endpoint, inputs.length, expectedDim)
   }
 }
 
@@ -127,7 +204,7 @@ export function readEmbeddingPayload(
   payload: unknown,
   endpoint: UpstreamEndpoint,
   expectedCount: number,
-  expectedDim: number,
+  expectedDim: number | null,
 ): number[][] {
   if (typeof payload !== 'object' || payload === null) {
     throw AppError.upstreamError(
@@ -177,11 +254,11 @@ export function readEmbeddingPayload(
 
   return ordered.map((row) => {
     const vector = row.vector
-    if (vector.length !== expectedDim) {
+    // `expectedDim === null` = 首次探测（建库时）⇒ 不校验，把真实维度作为结果返回
+    if (expectedDim !== null && vector.length !== expectedDim) {
       throw AppError.upstreamError(
-        `上游返回 ${vector.length} 维向量，与配置的 ${expectedDim} 维（EMBEDDING_DIM）不一致：${endpoint.providerName} / ${endpoint.subject}。` +
-          `本项目 chunks.embedding 是 vector(${expectedDim})（子方案① §4-4），维度不符会写坏数据 —— ` +
-          '请改用同维度的模型，或按 §八 的"新表切换"路径换维度',
+        `上游返回 ${vector.length} 维向量，与期望的 ${expectedDim} 维不一致：${endpoint.providerName} / ${endpoint.subject}。` +
+          '同一知识库内的向量维度必须一致 —— 请核对所选 embedding 模型是否被改动。',
       )
     }
     return vector
@@ -208,6 +285,23 @@ function collectRows(record: Record<string, unknown>): Array<{ vector: number[];
     if (vector === null) continue
     const index = typeof row.index === 'number' && Number.isInteger(row.index) ? row.index : null
     rows.push({ vector, index })
+  }
+
+  // 多模态端点（火山 doubao-embedding-vision）返回的是**单个对象**而非数组：
+  //   { "created": …, "data": { "embedding": [ … ] } }
+  // 顶层直接给 `embedding` 的实现也一并兜住。
+  if (rows.length === 0) {
+    const single = record.data
+    if (
+      typeof single === 'object' &&
+      single !== null &&
+      !Array.isArray(single) &&
+      Array.isArray((single as Record<string, unknown>).embedding)
+    ) {
+      rows.push({ vector: toVector((single as Record<string, unknown>).embedding as unknown[]), index: null })
+    } else if (Array.isArray(record.embedding)) {
+      rows.push({ vector: toVector(record.embedding), index: null })
+    }
   }
   return rows
 }

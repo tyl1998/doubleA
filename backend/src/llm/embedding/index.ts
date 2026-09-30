@@ -20,11 +20,31 @@ import { config } from '../../config.js'
 import { ApiEmbeddingProvider } from './api.js'
 import { LocalEmbeddingProvider, localEmbeddingProblems } from './local.js'
 
-export { ApiEmbeddingProvider, readEmbeddingPayload } from './api.js'
+export { ApiEmbeddingProvider, apiEmbeddingName, readEmbeddingPayload } from './api.js'
 export { LocalEmbeddingProvider, localEmbeddingProblems } from './local.js'
 
 /** `EMBEDDING_MODE` 的两个取值（与 `config.ts#EMBEDDING_MODES` 同源） */
 export type EmbeddingMode = 'local' | 'api'
+
+/**
+ * 送入 embedding 的一张图片（原始字节 + MIME；api 层负责转成 data URL content part）。
+ * 只在 `MULTIMODAL` 图片模式使用。
+ */
+export interface EmbeddingImage {
+  mime: string
+  data: Buffer
+}
+
+/**
+ * 一条 embedding 输入：纯文本（历史形态）或"文本 + 若干图片"。
+ * 多模态端点会把文本与图片作为同一 content 的多个 part，融合成一个向量。
+ */
+export interface EmbeddingContent {
+  text: string
+  images?: readonly EmbeddingImage[]
+}
+
+export type EmbeddingInput = string | EmbeddingContent
 
 /**
  * `02` §八 的三个方法（**只有这三个**：`embed` / `dim` / `name`）。
@@ -32,9 +52,12 @@ export type EmbeddingMode = 'local' | 'api'
  * `dim()` 返回的是**本项目期望的维度**（= `EMBEDDING_DIM` = `chunks.embedding` 的 `vector(N)`）：
  * 它是 D 包写 DDL/meta 的依据；上游/运行时实际返回的维度会在每次调用时逐条校验，
  * 不符立刻报错（而不是把维度不对的向量写进库 —— 那种数据事后没法分辨）。
+ *
+ * `embed` 接受 {@link EmbeddingInput}：纯文本调用（检索 query、普通分块）传 `string` 即可；
+ * 多模态图片分块传 `{ text, images }`。**条数与顺序必须与输入逐条对应**。
  */
 export interface EmbeddingProvider {
-  embed(texts: string[]): Promise<number[][]>
+  embed(inputs: readonly EmbeddingInput[]): Promise<number[][]>
   dim(): number
   /** 落库标记（`chunks.meta.embeddingName`），换模型检测靠它 */
   name(): string
@@ -154,4 +177,82 @@ function buildProvider(mode: EmbeddingMode): EmbeddingProvider {
     dim,
     batchSize,
   })
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 模型池来源的 provider（本批：知识库 embedding 改用建库时选定的模型）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 模型池里一个 EMBEDDING 模型解析出的上游目标（由 `services/model.service.ts#resolveEmbeddingTarget` 组装） */
+export interface PoolEmbeddingTarget {
+  /** 日志/错误消息里的上游名字（用 Provider 名，比 `EMBEDDING_API` 更好排查） */
+  providerName: string
+  /** 已归一化（去尾斜杠）的 baseUrl */
+  baseUrl: string
+  /** 自定义 URL：为 true 时 baseUrl 就是完整端点，不拼 `/embeddings` */
+  customUrl?: boolean
+  /** 多模态 embedding 端点（`/embeddings/multimodal` + content 分片 input） */
+  multimodal?: boolean
+  /** 未配置为 `null`（内网免鉴权实现） */
+  apiKey: string | null
+  /** 上游 model id */
+  apiModel: string
+}
+
+/**
+ * 用模型池的 EMBEDDING 模型构造 provider（OpenAI 兼容 `/embeddings`；`multimodal` 时走多模态端点）。
+ *
+ * `dim` 允许为 `null`：建库时用它**探测**一次真实维度（第一次 `embed()` 的返回长度）。
+ */
+export function buildPoolEmbeddingProvider(
+  target: PoolEmbeddingTarget,
+  dim: number | null,
+  batchSize: number,
+): ApiEmbeddingProvider {
+  return new ApiEmbeddingProvider({
+    apiUrl: target.baseUrl,
+    apiKey: target.apiKey,
+    apiModel: target.apiModel,
+    dim,
+    batchSize,
+    providerName: target.providerName,
+    customUrl: target.customUrl,
+    multimodal: target.multimodal,
+  })
+}
+
+/** 探测维度用的占位文本（内容无所谓，只关心返回向量的长度） */
+const DIM_PROBE_TEXT = 'dimension probe'
+
+/**
+ * 向该模型发一次极小 embedding 请求，返回其**真实维度**（建库时快照用）。
+ *
+ * 不齐/不可达时抛 `AppError`（消息可直接展示），让建库**快速失败**而不是等到第一篇文档入库才发现。
+ */
+export async function probeEmbeddingDim(
+  target: PoolEmbeddingTarget,
+  batchSize: number,
+  timeoutMs?: number,
+): Promise<number> {
+  const provider = new ApiEmbeddingProvider({
+    apiUrl: target.baseUrl,
+    apiKey: target.apiKey,
+    apiModel: target.apiModel,
+    dim: null,
+    batchSize,
+    providerName: target.providerName,
+    customUrl: target.customUrl,
+    multimodal: target.multimodal,
+    timeoutMs,
+  })
+  const [vector] = await provider.embed([DIM_PROBE_TEXT])
+  if (vector === undefined) {
+    throw AppError.internal(
+      `无法确定 embedding 维度：模型「${target.apiModel}」没有返回向量（请核对该 Provider 的 /embeddings 端点）`,
+    )
+  }
+  if (vector.length < 1 || !Number.isInteger(vector.length)) {
+    throw AppError.internal(`embedding 返回了非法维度（${vector.length}），无法用于知识库`)
+  }
+  return vector.length
 }

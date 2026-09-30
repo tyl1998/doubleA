@@ -19,6 +19,9 @@
  *   pnpm sandbox:build -- --toolkit-only  只重建 toolkit（加了一个 python 库时）
  *   pnpm sandbox:build -- --registry https://registry.npmmirror.com
  *   pnpm sandbox:build -- --dry-run    只打印将要执行的 docker 命令
+ *   pnpm sandbox:build -- --prune      构建后清掉**旧的** sandbox 镜像 tag / 悬空镜像 /
+ *                                       已停的 sandbox 容器与无主卷，并回收 24h 前的构建缓存
+ *                                       （保护：本次构建的两个 tag + `infra/.env` 正在用的 tag）
  *
  * ── 两个本机实况（都不是猜的）─────────────────────────────────────────
  *  ① **`docker` 可能不在非交互 shell 的 PATH 里**（本机是 OrbStack 托管）⇒ 本脚本自己找
@@ -31,16 +34,18 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
+  BASE_IMAGE_NAME,
   DEFAULT_NPM_REGISTRY,
   NODE_IMAGE,
   PI_PACKAGE,
   PI_VERSION,
+  TOOLKIT_IMAGE_NAME,
   baseImageRef,
   toolkitImageRef,
 } from '../sandbox/versions.mjs'
@@ -60,10 +65,21 @@ const registryIndex = argv.indexOf('--registry')
 const npmRegistry =
   registryIndex >= 0 ? argv[registryIndex + 1] : (process.env.SANDBOX_NPM_REGISTRY ?? DEFAULT_NPM_REGISTRY)
 
+const aptMirrorIndex = argv.indexOf('--apt-mirror')
+// Debian 源主机名优先级：`--apt-mirror` > `SANDBOX_APT_MIRROR` > 自动（换了 npmmirror 就用清华源）> ''。
+// ⚠️ 本机实测：`deb.debian.org` 只 ~0.4MB/s，`mirrors.tuna.tsinghua.edu.cn` ~6MB/s（十几倍）
+//    —— 两个 Dockerfile 的 apt 步骤占了沙箱构建的大头，这条是本机提速最有效的一处。
+// ⚠️ 默认值仍**不写死**国内源（CI / 海外环境用官方是对的）；"本机内网"这个事实由调用方给。
+// ⚠️ 显式传空串（`--apt-mirror ''` 或 `SANDBOX_APT_MIRROR=`）**就是**用官方源（`??` 不会把空串当缺省）。
+const explicitAptMirror = aptMirrorIndex >= 0 ? argv[aptMirrorIndex + 1] : process.env.SANDBOX_APT_MIRROR
+const aptMirror =
+  explicitAptMirror ?? (npmRegistry.includes('npmmirror') ? 'mirrors.tuna.tsinghua.edu.cn' : '')
+
 if (flags.has('--help') || flags.has('-h')) {
   console.log(
-    '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--registry <url>|--dry-run]\n' +
-      '环境变量: SANDBOX_NPM_REGISTRY=<url>   （等价于 --registry；本机需要换源，见 README）',
+    '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--registry <url>|--apt-mirror <host>|--dry-run|--prune]\n' +
+      '环境变量: SANDBOX_NPM_REGISTRY=<url>   （等价于 --registry；本机需要换源，见 README）\n' +
+      '          SANDBOX_APT_MIRROR=<host>    （等价于 --apt-mirror；只换 Debian 源主机名，留空 = 官方）',
   )
   process.exit(0)
 }
@@ -71,11 +87,16 @@ if (registryIndex >= 0 && (npmRegistry === undefined || npmRegistry.startsWith('
   console.error('--registry 后面要跟一个 URL')
   process.exit(2)
 }
+if (aptMirrorIndex >= 0 && (explicitAptMirror === undefined || explicitAptMirror.startsWith('--'))) {
+  console.error('--apt-mirror 后面要跟一个主机名（如 mirrors.tuna.tsinghua.edu.cn），或用空串走官方源')
+  process.exit(2)
+}
 
 const noCache = flags.has('--no-cache')
 const dryRun = flags.has('--dry-run')
 const baseOnly = flags.has('--base-only')
 const toolkitOnly = flags.has('--toolkit-only')
+const doPrune = flags.has('--prune')
 if (baseOnly && toolkitOnly) {
   console.error('--base-only 与 --toolkit-only 不能同时给（那就是"都构建"，去掉参数即可）')
   process.exit(2)
@@ -144,6 +165,26 @@ function run(args, label) {
   return 0
 }
 
+/** 跑一条 docker 命令并**收回 stdout**（用于"列出要删的东西"）；失败回 `[]`，不抛 */
+function capture(args) {
+  const result = spawnSync(dockerBin, args, { encoding: 'utf8', env: childEnv })
+  if (result.error || result.status !== 0) return []
+  return result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
+/** 跑一条 docker 命令但**忽略失败**（回收路径：删不掉只该 warn，不该让整批失败） */
+function runBestEffort(args, label) {
+  console.log(`  ${C.dim}$ ${dockerBin} ${args.join(' ')}${C.x}`)
+  if (dryRun) return
+  const result = spawnSync(dockerBin, args, { stdio: 'inherit', env: childEnv })
+  if (result.error || result.status !== 0) {
+    console.log(`  ${C.yellow}[warn]${C.x} ${label}（不影响构建）`)
+  }
+}
+
 // ── 0. 前置检查 ──────────────────────────────────────────────────────────
 step('Preflight')
 const serverVersion = spawnSync(dockerBin, ['version', '--format', '{{.Server.Version}}'], {
@@ -161,6 +202,10 @@ info(`Node 基线：${NODE_IMAGE} ｜ pi：${PI_PACKAGE}@${PI_VERSION}`)
 info(`npm 源：${npmRegistry}`)
 if (npmRegistry !== DEFAULT_NPM_REGISTRY) {
   info('（已换源：本机容器直连 registry.npmjs.org 不通，见 versions.mjs 的注释）')
+}
+info(`Debian 源：${aptMirror === '' ? '官方 deb.debian.org' : aptMirror}`)
+if (aptMirror !== '') {
+  info('（换源：本机实测官方源只 ~0.4MB/s，清华源 ~6MB/s —— 两个 Dockerfile 的 apt 步骤是大头）')
 }
 info(`base 标签：${baseImageRef()} ｜ toolkit 标签：${toolkitImageRef()}`)
 
@@ -181,6 +226,8 @@ if (!toolkitOnly) {
     `PI_VERSION=${PI_VERSION}`,
     '--build-arg',
     `NPM_REGISTRY=${npmRegistry}`,
+    '--build-arg',
+    `APT_MIRROR=${aptMirror}`,
   ]
   if (noCache) args.push('--no-cache')
   args.push(join(SANDBOX_DIR, 'base'))
@@ -202,6 +249,8 @@ if (!baseOnly) {
     toolkitImageRef(),
     '--build-arg',
     `BASE_IMAGE=${baseImageRef()}`,
+    '--build-arg',
+    `APT_MIRROR=${aptMirror}`,
   ]
   if (noCache) args.push('--no-cache')
   args.push(join(SANDBOX_DIR, 'toolkit'))
@@ -210,6 +259,58 @@ if (!baseOnly) {
 } else {
   step('构建 toolkit 层')
   info('已跳过（--base-only）')
+}
+
+// ── 2.5 回收（--prune）────────────────────────────────────────────────────
+// Docker **从不自动清理**：新 tag 建好后，旧 tag 的镜像、悬空镜像、已停容器、无主卷、以及
+// **构建缓存**（本机曾累积到 ~30GB）都只会越来越多。这里把"旧 sandbox 版本"收一遍。
+//
+// ★ 三条安全约束（都不许省）：
+//   ① **保护正在用的 tag** —— 本次构建的两个 + `infra/.env` 里 `SANDBOX_IMAGE*` 指向的；
+//      ⚠️ 若 `.env` 还停在上一版（用户还没改），那一版**不会**被删。
+//   ② **只碰 `doubulea/sandbox-*` 与带我们 label 的东西** —— 本机通常还跑着别的项目，
+//      `docker image prune -a` / 无过滤的 `container prune` 会误伤它们（本机实测有别的仓库镜像）。
+//   ③ 回收路径**一律 best-effort**（`runBestEffort`）：正在被运行容器占用的 tag 删不掉是正常的，
+//      不该让整批构建失败。
+if (doPrune && !dryRun) {
+  step('回收（--prune）：旧 sandbox 镜像 tag / 悬空镜像 / 已停容器 / 旧构建缓存')
+
+  const keep = new Set()
+  if (!toolkitOnly) keep.add(baseImageRef())
+  if (!baseOnly) keep.add(toolkitImageRef())
+  const envFile = join(INFRA_DIR, '.env')
+  if (existsSync(envFile)) {
+    for (const line of readFileSync(envFile, 'utf8').split('\n')) {
+      const m = /^\s*(SANDBOX_IMAGE|SANDBOX_IMAGE_BASE)\s*=\s*(.+?)\s*$/.exec(line)
+      if (m) keep.add(m[2])
+    }
+  }
+  info(`保护中的 tag：${[...keep].join('、') || '（无）'}`)
+
+  // ① 删掉 `doubulea/sandbox-base:*` / `doubulea/sandbox-toolkit:*` 里**不在保护名单**的 tag
+  for (const repo of [BASE_IMAGE_NAME, TOOLKIT_IMAGE_NAME]) {
+    for (const ref of capture(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repo])) {
+      if (keep.has(ref)) {
+        info(`保留 ${ref}（正在用 / 本次构建）`)
+        continue
+      }
+      runBestEffort(['image', 'rm', ref], `删除旧 tag ${ref}`)
+    }
+  }
+
+  // ② 悬空镜像（被顶掉、没有 tag 的层）
+  runBestEffort(['image', 'prune', '-f'], '清悬空镜像')
+
+  // ③ 已停的 **sandbox** 容器（按 label 过滤 —— 绝不碰别的项目）
+  const stopped = capture(['ps', '-a', '--filter', 'label=doubulea.role=sandbox', '--filter', 'status=exited', '-q'])
+  if (stopped.length > 0) runBestEffort(['rm', ...stopped], '清已停 sandbox 容器')
+  else info('没有已停的 sandbox 容器')
+
+  // ④ 无主的 **sandbox** 工作卷（同样按 label 过滤；活会话的卷是"在用"，不会被动）
+  runBestEffort(['volume', 'prune', '-f', '--filter', 'label=doubulea.role=sandbox'], '清无主 sandbox 卷')
+
+  // ⑤ 构建缓存：只回收 **24h 之前**的（刚构建出来的层留着，下次改一行仍能命中缓存）
+  runBestEffort(['builder', 'prune', '-f', '--filter', 'until=24h'], '回收 24h 前的构建缓存')
 }
 
 // ── 3. 汇总：把"该写进 infra/.env 的两行"直接给出来 ────────────────────

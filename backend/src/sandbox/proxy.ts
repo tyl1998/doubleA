@@ -62,8 +62,15 @@ import { McpAbortError } from '../mcp/errors.js'
 import { isDangerousTool } from '../mcp/risk.js'
 import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
-import { summarizeToolInput } from '../orchestrator/chatContext.js'
+import { knowledgeListTool, knowledgeSearchTool, summarizeToolInput } from '../orchestrator/chatContext.js'
+import {
+  boundKnowledgeBaseIds,
+  executeKnowledgeTool,
+  isKnowledgeToolName,
+} from '../orchestrator/knowledgeTools.js'
 import { askConversation, ChatStoppedError, type ConfirmQuestion } from '../orchestrator/sse.js'
+import { artifactDownloadContentType, openArtifactSourceForConversation } from '../services/artifact.service.js'
+import { buildContentDisposition } from '../services/document.service.js'
 import { executeMcpToolCall } from '../services/mcpCall.service.js'
 import {
   emptySandboxMcpCatalog,
@@ -71,6 +78,7 @@ import {
   registeredSandboxMcpToolName,
   sandboxMcpAliasAt,
   writeSandboxMcpCatalog,
+  type SandboxBuiltinToolRef,
   type SandboxMcpCatalog,
   type SandboxMcpToolRef,
 } from './mcpMap.js'
@@ -98,17 +106,27 @@ export async function buildSandboxMcpCatalog(
   const logger = getLogger()
 
   const components = await db.agentComponent.findMany({
-    where: { agentId, componentType: 'MCP' },
-    select: { refId: true },
-    orderBy: { refId: 'asc' },
+    where: { agentId },
+    select: { componentType: true, refId: true },
+    orderBy: [{ componentType: 'asc' }, { refId: 'asc' }],
   })
-  const serverIds = [...new Set(components.map((row) => row.refId))]
-  if (serverIds.length === 0) return emptySandboxMcpCatalog()
+  const serverIds = [
+    ...new Set(components.filter((row) => row.componentType === 'MCP').map((row) => row.refId)),
+  ]
+  const knowledgeIds = [
+    ...new Set(components.filter((row) => row.componentType === 'KNOWLEDGE').map((row) => row.refId)),
+  ]
 
-  const rows = await db.mcpServer.findMany({
-    where: { id: { in: serverIds } },
-    select: { id: true, name: true, slug: true, toolCache: true },
-  })
+  const catalog: SandboxMcpCatalog = emptySandboxMcpCatalog()
+
+  // ── MCP server（有绑才查、才算）──
+  const rows =
+    serverIds.length === 0
+      ? []
+      : await db.mcpServer.findMany({
+          where: { id: { in: serverIds } },
+          select: { id: true, name: true, slug: true, toolCache: true },
+        })
   // 绑定里有查不到的 server（`DELETE` 那一侧有 409 拦着）⇒ 走到这里说明数据异常
   if (rows.length !== serverIds.length) {
     const found = new Set(rows.map((row) => row.id))
@@ -122,7 +140,6 @@ export async function buildSandboxMcpCatalog(
     a.name === b.name ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name),
   )
 
-  const catalog: SandboxMcpCatalog = emptySandboxMcpCatalog()
   /** 已占用的**注册名**（跨 server 累积 —— 见 `mcpMap.ts#registeredSandboxMcpToolName`） */
   const taken = new Set<string>()
 
@@ -165,6 +182,12 @@ export async function buildSandboxMcpCatalog(
     }
   })
 
+  // ── 平台内置工具（知识库检索 / 目录）—— 绑了库才下发 ──
+  // 与 ChatBot 同源（`knowledgeTools.ts`）；容器侧注册的商品名下不带 `mcp_` 前缀，
+  // 执行时经 `/api/sandbox/builtin/call` 由后端代跑（凭据/库都不进容器）。见 `子方案③` §七。
+  if (knowledgeIds.length > 0) catalog.builtins = knowledgeBuiltinTools()
+  else catalog.builtins = []
+
   await writeSandboxMcpCatalog(conversationId, catalog)
   logger.info(
     {
@@ -172,10 +195,25 @@ export async function buildSandboxMcpCatalog(
       agentId,
       serverCount: catalog.servers.length,
       toolCount: Object.keys(catalog.tools).length,
+      builtinToolCount: catalog.builtins.length,
     },
-    '已为沙箱下发 MCP 工具清单（别名 s1…sN；清单内容与别名映射都已发布）',
+    '已为沙箱下发工具清单（MCP 别名 s1…sN + 知识库内置工具；清单内容与别名映射都已发布）',
   )
   return catalog
+}
+
+/**
+ * 绑了知识库时下发给容器的**内置工具**（`knowledge_search` / `list_knowledge`）。
+ *
+ * 形状直接取自 ChatBot 那两个工具的**同一份**定义（`chatContext.ts`），只是转成容器清单要的
+ * `{name, description, inputSchema}` —— 两处各写一份就会漂移（`06` §六 第 ⑰ 条）。
+ */
+export function knowledgeBuiltinTools(): SandboxBuiltinToolRef[] {
+  return [knowledgeListTool(), knowledgeSearchTool()].map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description ?? '',
+    inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
+  }))
 }
 
 /**
@@ -213,6 +251,11 @@ interface SandboxMcpToolsResponse {
     /** 原样的 JSON Schema（容器侧据此给模型声明参数） */
     inputSchema: unknown
   }[]
+  /**
+   * 平台内置工具（知识库一族）。**没有就是空数组** —— 容器侧据此注册 `knowledge_search` /
+   * `list_knowledge`，执行时走 {@link BUILTIN_CALL_PATH}（不是 `/mcp/call`）。
+   */
+  builtinTools: { name: string; description: string; inputSchema: unknown }[]
 }
 
 /** `POST /api/sandbox/mcp/call` 的响应（200 那一类，见文件头"分界线"） */
@@ -233,6 +276,18 @@ interface SandboxMcpCallResponse {
 const sandboxMcpCallBodySchema = z.object({
   serverAlias: z.string().trim().min(1).max(32),
   toolName: z.string().min(1).max(256),
+  arguments: z.record(z.unknown()).default({}),
+})
+
+/**
+ * 内置工具调用的容器环境变量或路径（跨边界契约，与扩展侧 `BUILTIN_CALL_PATH` 逐字对应）。
+ * 名字里没有 `conversationId` / `agentId`：身份从令牌解析（同 `/mcp/call`）。
+ */
+export const BUILTIN_CALL_PATH = '/api/sandbox/builtin/call'
+
+/** `/api/sandbox/builtin/call` 的请求体（内部协议） */
+const sandboxBuiltinCallBodySchema = z.object({
+  name: z.string().trim().min(1).max(64),
   arguments: z.record(z.unknown()).default({}),
 })
 
@@ -261,14 +316,20 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
         description: ref.description,
         inputSchema: ref.inputSchema,
       })),
+      builtinTools: catalog.builtins.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+      })),
     }
     getLogger().info(
       {
         conversationId: auth.record.conversationId,
         serverCount: payload.servers.length,
         toolCount: payload.tools.length,
+        builtinToolCount: payload.builtinTools.length,
       },
-      '容器已拉取 MCP 工具清单（沙箱代理端点）',
+      '容器已拉取工具清单（沙箱代理端点）',
     )
     return reply.send(payload)
   })
@@ -338,6 +399,115 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     })
     return reply.send(result)
   })
+
+  /**
+   * 平台**内置工具**调用（当前只有知识库：`knowledge_search` / `list_knowledge`）。
+   *
+   * 与 `/mcp/call` 分开一条路径的原因：内置工具**没有 MCP server / 凭据 / 危险确认**，
+   * 执行体是 `orchestrator/knowledgeTools.ts` 的**同一个函数**（ChatBot 也用它）。
+   * 塞进 `/mcp/call` 会让那条"别名 → server → 越权检查"的链路描述不了它。
+   *
+   * 三条判据与 `/mcp/call` 同族：认证（令牌 ⇒ 会话身份）→ **清单里真的下发过这个工具** →
+   * 执行（库/文档全部在后端查，容器侧只有一个工具名与参数）。
+   */
+  app.post('/api/sandbox/builtin/call', async (request, reply) => {
+    const auth = await authenticate(tokenFromHeader(request.headers))
+    if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+
+    const parsed = sandboxBuiltinCallBodySchema.safeParse(request.body)
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'VALIDATION',
+        `请求体不合法：${parsed.error.issues.map((issue) => `${issue.path.join('.')} ${issue.message}`).join('；')}`,
+      )
+    }
+    const body = parsed.data
+
+    // 只认内置知识库工具（其他名字不是这条端点的职责）
+    if (!isKnowledgeToolName(body.name)) {
+      return sendError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
+    }
+
+    const catalog = await readSandboxMcpCatalog(auth.record.conversationId)
+    if (catalog === null) {
+      return sendError(
+        reply,
+        409,
+        'CONFLICT',
+        '沙箱工具清单不存在或已过期（容器可能已被回收）。请重新派活。',
+      )
+    }
+    // 清单必须**确实下发过**这个内置工具（与 MCP 的 findOfferedTool 同一条判据）
+    if (!catalog.builtins.some((tool) => tool.name === body.name)) {
+      return sendError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器（绑定里没有知识库）。`)
+    }
+
+    // ★ 库**现查**（不从清单快照取）：绑定可以在容器活着期间被改掉；没有绑定就如实回"没有库"。
+    const kbIds = await boundKnowledgeBaseIds(auth.record.agentId)
+    if (kbIds.length === 0) {
+      return reply.send({ isError: true, text: '（当前没有绑定任何知识库）' })
+    }
+
+    const outcome = await executeKnowledgeTool({
+      kbIds,
+      name: body.name,
+      // 执行体收的是模型给的**原文**（JSON 串）；容器给的是对象 ⇒ 这里归一
+      arguments: JSON.stringify(body.arguments),
+      log: { conversationId: auth.record.conversationId, agentId: auth.record.agentId },
+    })
+    return reply.send({ isError: outcome.isError, text: outcome.output })
+  })
+
+  /**
+   * 沙箱**按需下载产物**（`GET /api/sandbox/artifacts/:artifactId`，**TaskAgent 记忆与产物 块 2**）。
+   *
+   * 解决的是问题 1 的"缺容器侧下载通道"：容器重建后 `/work` 是空的，记忆文档里写着
+   * "这个会话产出过哪些文件、ID 是什么"，agent 需要时用这条端点把它们**自己拉回 `/work`**
+   * （命令见 `orchestrator/memoryDoc.ts#NODE_FETCH_DOWNLOAD_COMMAND`）。
+   *
+   * ★ 认证与归属：令牌 ⇒ 会话身份（与 `/mcp/call` 同一条），产物行的 `conversation_id` 必须等于
+   *   令牌里的 `conversationId`（`openArtifactSourceForConversation` 的 `where` 一次判完）
+   *   —— 容器**只能取回自己这个会话**产出的文件，取不到别人的、也取不到别的会话的。
+   *
+   * ⚠️ 响应头与公网 `/api/artifacts/:id/download` **逐字同款**（同一组头、同一个
+   *   `buildContentDisposition`）—— 它走的也是"字节流 + 失败信封"的形态，容器侧 `fetch`
+   *   按 `r.ok` 分支即可，不需要另一套解析。
+   */
+  app.get<{ Params: { artifactId: string } }>(
+    '/api/sandbox/artifacts/:artifactId',
+    async (request, reply) => {
+      const auth = await authenticate(tokenFromHeader(request.headers))
+      if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+
+      const parsedId = z.string().uuid().safeParse(request.params.artifactId)
+      if (!parsedId.success) return sendError(reply, 400, 'VALIDATION', '产物 ID 不是合法 UUID')
+
+      try {
+        const source = await openArtifactSourceForConversation({
+          artifactId: parsedId.data,
+          conversationId: auth.record.conversationId,
+        })
+        getLogger().info(
+          { conversationId: auth.record.conversationId, artifactId: parsedId.data },
+          '沙箱按需下载产物（容器经代理令牌自证身份）',
+        )
+        return reply
+          .header('content-type', artifactDownloadContentType(source.mime))
+          .header('content-length', String(source.contentLength))
+          .header('content-disposition', buildContentDisposition(source.fileName))
+          .header('x-content-type-options', 'nosniff')
+          .header('cache-control', 'private, no-store')
+          .send(source.body)
+      } catch (error) {
+        // 产物不存在 / 不属于这个会话 ⇒ 404（与 `/mcp/call` 的"4xx = 协议层拒绝"同族）。
+        // 其余（S3 不可用等）照常向上抛，由 listener 的默认错误处理收口。
+        if (error instanceof AppError) return sendError(reply, error.status, error.code, error.message)
+        throw error
+      }
+    },
+  )
 }
 
 /** {@link callToolViaProxy} 的入参（把"验过的身份 + 解析出来的工具"合成一个对象） */

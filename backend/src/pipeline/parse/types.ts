@@ -18,8 +18,59 @@
  */
 
 /** 支持的格式（= `UPLOAD_EXTENSIONS`，但本层不依赖 upload 侧的写法，保持独立） */
-export const PARSE_FORMATS = ['pdf', 'docx', 'md', 'txt'] as const
+export const PARSE_FORMATS = [
+  'pdf',
+  'docx',
+  'md',
+  'txt',
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'gif',
+  'bmp',
+] as const
 export type ParseFormat = (typeof PARSE_FORMATS)[number]
+
+/** 解析选项（由流水线按文档的 `imageMode` 传下来；默认不抽图，见 {@link DEFAULT_PARSE_OPTIONS}） */
+export interface ParseOptions {
+  /** 是否抽取文档内图片（`imageMode != NONE` 时为 true） */
+  extractImages: boolean
+  /** 单张图片上限（字节）；超过则跳过该图并告警，不因一张大图拖垮整篇 */
+  maxImageBytes: number
+}
+
+/** 默认解析选项：不抽图（与历史行为一致） */
+export const DEFAULT_PARSE_OPTIONS: ParseOptions = Object.freeze({
+  extractImages: false,
+  maxImageBytes: 10 * 1024 * 1024,
+})
+
+/**
+ * 抽取出的图片（文档内嵌图 / 扫描页 / 独立图片文件 / MD 外链图统一此形状）。
+ *
+ * ⚠️ `data` 是**内存里的原始字节**（不落 S3）—— 图片只在一次流水线内经手：
+ * `MULTIMODAL` 时转 base64 直接向量化，`OCR` 时先转文字后再不需要原图。
+ * 重建时重新从原文件抽取即可，故**不持久化图片**（省一份存储与一套生命周期）。
+ */
+export interface ParsedImage {
+  data: Buffer
+  /** 图片 MIME（用于 base64 data URL 前缀；也用于 OCR 输入） */
+  mime: string
+  /** 所属页码（PDF 才有；其余为 `null`） */
+  page: number | null
+  /** 所属标题路径（docx/md 能定位到；PDF 为 `[]`） */
+  headingPath: string[]
+  /**
+   * 在 `blocks` 中的**插入位置**：插在 `blocks[anchor]` **之前**（= 图片前已产出的块数）。
+   *
+   * ⚠️ 这是"图注文字不能跑到文末"的关键：图片天然嵌在正文中间，若不记位置，
+   * OCR 文本只能追加到 `blocks` 末尾 —— 于是"订单入口"那张图的文字跑到全文最后，
+   * 与它所属的章节彻底脱节（实测 chunk 偏差很大）。
+   * `null`/缺省 = 位置未知，调用方按"追加到末尾"处理。
+   */
+  anchor?: number | null
+}
 
 /** 段落级结构块 */
 export interface ParsedBlock {
@@ -55,6 +106,8 @@ export interface ParseMeta {
 
 export interface ParseResult {
   blocks: ParsedBlock[]
+  /** 抽取出的图片（不抽图时为空数组；`子方案` 文档图片解析） */
+  images: ParsedImage[]
   /** `blocks` 以空行连接（见文件头说明） */
   text: string
   meta: ParseMeta
@@ -70,22 +123,41 @@ export function countChars(text: string): number {
 }
 
 /**
+ * 标题路径清洗：剔除非字符串与空串。
+ *
+ * ⚠️ 必须有它：docx/md 用"层级栈"维护标题路径，遇到**等级跳变**（第一个标题就是 2 级、
+ * 或 `#` 后直接 `###`）时低层槽位是**空洞**，`[...stack]` 会带出 `undefined`。
+ * 而 `chunks.meta` 是 jsonb，Prisma 写入时对数组里的 `undefined` 会直接抛
+ * `Can not use undefined value within array`（实测），整篇文档 FAILED。
+ * 所以标题路径在**出解析层之前**就保证"只含非空字符串"。
+ */
+export function normalizeHeadingPath(path: readonly unknown[]): string[] {
+  return path.filter((item): item is string => typeof item === 'string' && item !== '')
+}
+
+/**
  * 由 `blocks` 收口出 `text` / `meta` 的公共逻辑（四个解析器都走它，保证形状一致）。
  */
 export function buildParseResult(
   format: ParseFormat,
   blocks: ParsedBlock[],
-  extra: { pageCount?: number | null; encoding?: string } = {},
+  extra: { pageCount?: number | null; encoding?: string; images?: ParsedImage[] } = {},
 ): ParseResult {
-  const text = blocks.map((block) => block.text).join('\n\n')
+  // 收口处再清洗一道标题路径：任何解析器（含将来新增的）漏了空洞都在这里被兜住
+  const cleanBlocks = blocks.map((block) => ({
+    ...block,
+    headingPath: normalizeHeadingPath(block.headingPath),
+  }))
+  const text = cleanBlocks.map((block) => block.text).join('\n\n')
   return {
-    blocks,
+    blocks: cleanBlocks,
+    images: extra.images ?? [],
     text,
     meta: {
       format,
       pageCount: extra.pageCount ?? null,
       charCount: countChars(text),
-      hasHeadings: blocks.some((block) => block.headingPath.length > 0),
+      hasHeadings: cleanBlocks.some((block) => block.headingPath.length > 0),
       encoding: extra.encoding ?? 'utf-8',
     },
   }

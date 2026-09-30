@@ -3,12 +3,13 @@
  *
  * 依据：`docs/02-后端设计.md` §4.6（知识库文档端点表）+ `子方案/知识库流水线.md` §4-1/§七
  *
- * 本文件现有六条端点（**全部只需登录**，与知识库同口径）：
+ * 本文件现有七条端点（**全部只需登录**，与知识库同口径）：
  *   `POST   /api/knowledge-bases/:id/documents`                    上传（multipart，字段名 `file`）
  *   `GET    /api/knowledge-bases/:id/documents`                    列表（分页；流水线进度的可视出口）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/reupload`    覆盖重建（multipart，同上）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/retry`       失败重试（无请求体）
  *   `GET    /api/knowledge-bases/:id/documents/:docId/download`    下载原始文件（**返回字节流**）
+ *   `GET    /api/knowledge-bases/:id/documents/:docId/chunks`      片段预览（分页；按 `seq` 升序）
  *   `DELETE /api/knowledge-bases/:id/documents/:docId`             删除（清 chunk + 原文件）
  * 至此 `02` §4.6 的文档端点表全部落地（`search` 属 P0-1-20，已挂）。
  *
@@ -33,17 +34,24 @@
 
 import {
   AppError,
+  DEFAULT_IMAGE_MODE,
   documentParamsSchema,
+  IMAGE_MODES,
   knowledgeBaseIdParamsSchema,
+  listDocumentChunksQuerySchema,
   listDocumentsQuerySchema,
   ok,
+  UPLOAD_IMAGE_MODE_FIELD,
   type DocumentParams,
+  type ImageMode,
   type KnowledgeBaseIdParams,
+  type ListDocumentChunksQuery,
   type ListDocumentsQuery,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { config } from '../config.js'
+import { listDocumentChunks } from '../services/chunk.service.js'
 import {
   buildContentDisposition,
   deleteDocument,
@@ -63,32 +71,56 @@ function fileTooLarge(fileName: string | undefined): Error {
   return error
 }
 
-/** 从 multipart 请求里取出唯一那个文件（上传与覆盖重建共用，见文件头） */
+/** 解析 multipart 里的图片处理方式字段（缺省 = `NONE`；非法值 400） */
+function parseImageMode(raw: string | undefined): ImageMode {
+  const value = (raw ?? '').trim().toUpperCase()
+  if (value === '') return DEFAULT_IMAGE_MODE
+  if ((IMAGE_MODES as readonly string[]).includes(value)) return value as ImageMode
+  throw AppError.validation(`imageMode 只能是 ${IMAGE_MODES.join(' / ')}，收到「${raw}」`)
+}
+
+/**
+ * 从 multipart 请求里取出唯一那个文件 + 图片处理方式字段（上传与覆盖重建共用，见文件头）。
+ *
+ * 用 `request.parts()` 逐项消费而不是 `request.file()`：图片处理方式字段与文件字段的**顺序**
+ * 由客户端决定（前端先选解析方式、后放文件，curl 则相反），`request.file()` 只能拿到它之前
+ * 出现的字段。逐项消费与顺序无关。
+ */
 async function readUploadedFile(request: FastifyRequest): Promise<{
   fileName: string
   declaredMime: string | undefined
   bytes: Buffer
+  imageMode: ImageMode
 }> {
-  const file = await request.file()
+  let file: { fileName: string; declaredMime: string | undefined; bytes: Buffer } | undefined
+  let imageModeRaw: string | undefined
+
+  for await (const part of request.parts()) {
+    if (part.type === 'file') {
+      const bytes = await part.toBuffer()
+      // 正常路径下 @fastify/multipart 已经抛了 413；这条是"若将来关掉 throwFileSizeLimit"的兜底
+      // ⚠️ `truncated` 在**流**上（`part.file`）而不是 `MultipartFile` 本身 —— 类型里只有流有这个字段
+      if (part.file.truncated) throw fileTooLarge(part.filename)
+      if (file !== undefined) {
+        throw AppError.validation('一次只能上传一个文件：请只保留一个待上传文件，字段名为 file')
+      }
+      file = { fileName: part.filename, declaredMime: part.mimetype, bytes }
+      continue
+    }
+    if (part.fieldname === UPLOAD_IMAGE_MODE_FIELD) imageModeRaw = String(part.value)
+  }
+
   if (file === undefined) {
     throw AppError.validation('没有收到文件：请用 multipart/form-data 上传，文件字段名为 file')
   }
-  if (file.file.truncated) {
-    // 正常路径下 @fastify/multipart 已经抛了 413；这条是"若将来关掉 throwFileSizeLimit"的兜底
-    // ⚠️ `truncated` 在**流**上（`file.file`）而不是 `MultipartFile` 本身 —— 类型里只有流有这个字段
-    throw fileTooLarge(file.filename)
-  }
-
-  const bytes = await file.toBuffer()
-  if (bytes.length === 0) {
-    throw AppError.validation(`上传的文件是空的（0 字节）：${file.filename || '未命名文件'}`)
+  if (file.bytes.length === 0) {
+    throw AppError.validation(`上传的文件是空的（0 字节）：${file.fileName || '未命名文件'}`)
   }
   return {
-    // `filename` 可能含路径（老式浏览器会把客户端全路径塞进来），服务层只按扩展名判定，
+    // `fileName` 可能含路径（老式浏览器会把客户端全路径塞进来），服务层只按扩展名判定，
     // 原样存库供展示 —— 路径拼接交给前端（显示时只取 basename）
-    fileName: file.filename,
-    declaredMime: file.mimetype,
-    bytes,
+    ...file,
+    imageMode: parseImageMode(imageModeRaw),
   }
 }
 
@@ -182,6 +214,28 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema, querystring: listDocumentsQuerySchema } },
     async (request) =>
       ok(await listDocuments({ kbId: request.params.id, ...request.query })),
+  )
+
+  /**
+   * 片段预览（登录即可）：按 `seq` 升序分页列出该文档的块原文（`03` §4.3 的「查看片段」）。
+   *
+   * 只读、不返回 `embedding`（理由见 `chunk.service.ts` 文件头）。`docId` 不属于该知识库时
+   * 与其余 `:docId` 端点一致地 404 —— 避免"知道 id 就能看任何库的正文"。
+   */
+  app.get<{ Params: DocumentParams; Querystring: ListDocumentChunksQuery }>(
+    '/api/knowledge-bases/:id/documents/:docId/chunks',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: documentParamsSchema, querystring: listDocumentChunksQuerySchema },
+    },
+    async (request) =>
+      ok(
+        await listDocumentChunks({
+          kbId: request.params.id,
+          docId: request.params.docId,
+          ...request.query,
+        }),
+      ),
   )
 
   /**

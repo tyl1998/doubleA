@@ -39,10 +39,35 @@ export interface UpstreamEndpoint {
   subject?: string
   /** 已归一化（去尾斜杠），拼路径不会出现 `//` */
   baseUrl: string
+  /**
+   * 自定义 URL：为 `true` 时 {@link baseUrl} 就是完整端点，{@link resolveUpstreamUrl}
+   * 原样返回、不拼 `path`。缺省等价于 `false`（既有拼接行为）——
+   * embedding 的 api 模式不设它 ⇒ 照旧拼 `/embeddings`。
+   */
+  customUrl?: boolean
   /** 未配置时为 `null` —— 有的自建/内网 OpenAI 兼容实现不校验凭据 */
   apiKey: string | null
   /** 额外的日志字段（如对话的 modelId/providerId）；**不参与**消息文案 */
   logFields?: Record<string, unknown>
+}
+
+/**
+ * 拼上游 URL（**纯函数**，两个 fetch 调用点共用一份）。
+ *
+ * · 常规（`customUrl` 缺省/false）：`${baseUrl}${path}` —— baseUrl 已去尾斜杠、
+ *   path 以 `/` 开头 ⇒ 不会出现 `//`。这是 P0-1-12 起的既有拼接口径。
+ * · 自定义 URL（`customUrl === true`）：baseUrl **就是完整端点**，原样返回、**忽略** `path`。
+ *   用于不按"`{host}/v1` + 固定后缀"规范给地址的第三方（端点已含完整路径，甚至带 query）。
+ *
+ * ⚠️ 自定义 URL 下 `/models` / `/embeddings` 这类"另一条路径"无法从固定后缀派生 ——
+ *   它们同样只会打到这一个端点。`/models` 探测因此对自定义 URL 基本无意义（型号名手工录入），
+ *   这是刻意的：一个"完整端点"本就只对应一条路径。
+ */
+export function resolveUpstreamUrl(
+  endpoint: Pick<UpstreamEndpoint, 'baseUrl' | 'customUrl'>,
+  path: string,
+): string {
+  return endpoint.customUrl === true ? endpoint.baseUrl : `${endpoint.baseUrl}${path}`
 }
 
 /** 只打名字与 `hasKey` 的日志形态 —— **唯一**允许用来记录 {@link UpstreamEndpoint} 的方式 */
@@ -245,12 +270,19 @@ export async function throwUpstreamStatus(
     response.status === 401 || response.status === 403
       ? '（上游拒绝了凭据，请检查该 Provider 的 API Key）'
       : response.status === 404
-        ? '（上游没有这个路径，请检查 Provider 的 baseUrl 是否包含正确的版本段，如 /v1）'
+        ? '（404：可能是路径不对（检查 baseUrl 的版本段，如 /v1、/api/v3），也可能是**该模型/接入点不存在或无权限**（火山需用接入点 id，如 ep-…，或账号未开通该模型））'
         : response.status === 429
           ? '（上游限流）'
           : ''
   getLogger().warn(
-    { ...describeEndpoint(endpoint), stage, upstreamStatus: response.status, upstreamBody: body },
+    {
+      ...describeEndpoint(endpoint),
+      stage,
+      // 实际请求的完整 URL（不含凭据——Key 在请求头里）：排查"路径对不对"最直接的证据
+      url: response.url,
+      upstreamStatus: response.status,
+      upstreamBody: body,
+    },
     '上游返回非 2xx',
   )
   throw AppError.upstreamError(
@@ -302,7 +334,7 @@ export async function fetchUpstreamJson(
   let rawBody: string
   try {
     deadline.arm(request.timeoutMs, '首次响应（到响应头）')
-    response = await fetch(`${endpoint.baseUrl}${request.path}`, {
+    response = await fetch(resolveUpstreamUrl(endpoint, request.path), {
       method: request.method ?? 'POST',
       headers:
         request.headers ??

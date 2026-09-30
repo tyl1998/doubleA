@@ -20,22 +20,22 @@
  *    写成 `.optional().default(null)` 会让"改个别名"顺手把上下文长度抹掉。
  */
 
-import { Alert, AutoComplete, Input, InputNumber, Modal, Select, Switch } from 'antd'
+import { Alert, AutoComplete, Button, Input, InputNumber, Modal, Select, Switch } from 'antd'
 import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem, type ModelType } from '@doubulea/shared'
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
-import { useCreateModel, useProbeRemoteModels, useUpdateModel } from '../../api/modelPool.js'
+import { useCreateModel, useProbeEmbeddingModel, useProbeRemoteModels, useUpdateModel } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   EMPTY_MODEL_FORM_VALUES,
   MAX_CONTEXT_MAX,
   MAX_CONTEXT_MIN,
-  MODEL_TYPE_LOCKED_REASON,
+  MODEL_TYPE_FOLLOWS_PROVIDER_REASON,
   buildCreateModelBody,
   buildModelUpdateBody,
   modelEditValuesOf,
-  modelTypeChangeBlocked,
+  modelTypeForProvider,
   remoteModelRows,
   validateMaxContext,
 } from './adminModel.js'
@@ -57,19 +57,30 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   const feedback = useFeedback()
   const create = useCreateModel()
   const update = useUpdateModel()
+  const probeEmbedding = useProbeEmbeddingModel()
 
   const [providerId, setProviderId] = useState('')
   const [modelName, setModelName] = useState('')
   const [label, setLabel] = useState('')
   const [type, setType] = useState<ModelType>(EMPTY_MODEL_FORM_VALUES.type)
   const [maxContext, setMaxContext] = useState<number | null>(null)
+  const [embeddingDim, setEmbeddingDim] = useState<number | null>(null)
+  const [embeddingMultimodal, setEmbeddingMultimodal] = useState(false)
   const [supportsVision, setSupportsVision] = useState(false)
   const [supportsReasoning, setSupportsReasoning] = useState(false)
   const [enabled, setEnabled] = useState(true)
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const editing = model !== null
-  const typeLocked = model !== null && modelTypeChangeBlocked(model)
+  /**
+   * 方案A：模型的 `type` **跟随所属 Provider**，因此选择器**始终只读** ——
+   * 创建时由所选 Provider 决定（见下方 Provider 的 `onChange`），编辑时 Provider 不可迁移、
+   * 类型也就不变。这样用户没有机会造出"Provider 是向量、模型却是对话"的不一致配置。
+   */
+  const typeLocked = true
+  const typeLockedReason = editing ? '类型跟随所属 Provider，不可修改。' : MODEL_TYPE_FOLLOWS_PROVIDER_REASON
+  /** 向量模型：界面只显示"维度"，隐藏上下文/图片/思考等对话侧字段（类型跟随 Provider，故此刻已知） */
+  const isEmbedding = type === 'EMBEDDING'
 
   // 拉取上游模型：型号名下拉的来源（获取失败/为空时 AutoComplete 仍可手动输入，见下方渲染）。
   // ⚠️ 只在**新建**态、且已选 Provider 时探一次；编辑态不自动打上游（避免打开编辑弹窗就发探测请求）。
@@ -103,11 +114,15 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   useEffect(() => {
     if (!open) return
     if (model === null) {
-      setProviderId(defaultProviderId ?? providers[0]?.id ?? '')
+      const initialProviderId = defaultProviderId ?? providers[0]?.id ?? ''
+      setProviderId(initialProviderId)
       setModelName('')
       setLabel('')
-      setType(EMPTY_MODEL_FORM_VALUES.type)
+      // 方案A：类型跟随 Provider（还没选到 Provider 时占位为 CHAT，选了会跟着变）
+      setType(modelTypeForProvider(providers, initialProviderId))
       setMaxContext(null)
+      setEmbeddingDim(null)
+      setEmbeddingMultimodal(false)
       setSupportsVision(false)
       setSupportsReasoning(false)
       setEnabled(true)
@@ -118,6 +133,8 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       setLabel(values.label)
       setType(values.type)
       setMaxContext(values.maxContext)
+      setEmbeddingDim(values.embeddingDim)
+      setEmbeddingMultimodal(values.embeddingMultimodal)
       setSupportsVision(values.supportsVision)
       setSupportsReasoning(values.supportsReasoning)
       setEnabled(values.enabled)
@@ -133,6 +150,24 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   const canSubmit =
     modelName.trim() !== '' && label.trim() !== '' && (editing || providerId !== '') && contextError === null && !submitting
 
+  const probing = probeEmbedding.isPending
+  const canProbe = providerId !== '' && modelName.trim() !== '' && !probing && !submitting
+
+  /** 探测向量模型维度（不落库）：成功即回填维度并提示；失败把上游原文显示在表单里 */
+  const runProbe = (): void => {
+    setErrorText(null)
+    probeEmbedding.mutate(
+      { providerId, modelName: modelName.trim(), embeddingMultimodal },
+      {
+        onSuccess: (result) => {
+          setEmbeddingDim(result.dim)
+          feedback.ok(`探测成功：维度 ${result.dim}。请求 ${result.url}`)
+        },
+        onError: (error) => setErrorText(describeError(error).message),
+      },
+    )
+  }
+
   const submit = (): void => {
     setErrorText(null)
     if (contextError !== null) {
@@ -140,7 +175,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       return
     }
 
-    const values = { providerId, modelName, label, type, maxContext, supportsVision, supportsReasoning, enabled }
+    const values = { providerId, modelName, label, type, maxContext, embeddingDim, embeddingMultimodal, supportsVision, supportsReasoning, enabled }
 
     if (model === null) {
       create.mutate(buildCreateModelBody(values), {
@@ -215,7 +250,11 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
               placeholder="选择 Provider"
               style={{ width: '100%' }}
               aria-label="所属 Provider"
-              onChange={setProviderId}
+              onChange={(next) => {
+                setProviderId(next)
+                // 方案A：换了 Provider，模型类型跟着它走（后端也会校验一致）
+                setType(modelTypeForProvider(providers, next))
+              }}
             />
           )}
         </div>
@@ -233,8 +272,9 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
             onSelect={(value: string) => {
               setModelName(value)
               // 选中某个上游型号 ⇒ 若上游给了上下文长度、且用户还没填，就默认填上（Req 4）
+              // 向量模型不需要上下文长度，跳过自动填充
               const row = remoteRows.find((item) => item.id === value)
-              if (row !== undefined && row.contextLength !== null && maxContext === null) {
+              if (!isEmbedding && row !== undefined && row.contextLength !== null && maxContext === null) {
                 setMaxContext(row.contextLength)
               }
             }}
@@ -288,45 +328,89 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
             onChange={setType}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {typeLocked
-              ? MODEL_TYPE_LOCKED_REASON
-              : '刻意不要求"与 Provider 的类型一致"：同一型号名既提供对话又提供向量（如 bge 兼容端点）是合法的配置。'}
+            {typeLockedReason}
           </p>
         </div>
 
-        <div>
-          <p className="block-label">上下文长度（token）</p>
-          <InputNumber
-            value={maxContext}
-            min={MAX_CONTEXT_MIN}
-            max={MAX_CONTEXT_MAX}
-            style={{ width: '100%' }}
-            aria-label="上下文长度"
-            placeholder="留空表示未知"
-            onChange={(value) => setMaxContext(value === null ? null : Number(value))}
-          />
-          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            只是给选模型的人看的读数（不参与任何计算）。留空会显示成「未知」——比填一个猜的数字好。
-          </p>
-        </div>
+        {isEmbedding ? (
+          <>
+            <div>
+              <p className="block-label">向量维度</p>
+              <div className="row" style={{ gap: 'var(--sp-2)', alignItems: 'flex-start' }}>
+                <InputNumber
+                  value={embeddingDim}
+                  min={1}
+                  max={1_000_000}
+                  style={{ flex: 1 }}
+                  aria-label="向量维度"
+                  placeholder="留空则在保存时尽力向上游探测"
+                  onChange={(value) => setEmbeddingDim(value === null ? null : Number(value))}
+                />
+                <Button onClick={runProbe} loading={probing} disabled={!canProbe}>
+                  探测
+                </Button>
+              </div>
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                点「探测」会<strong>当场</strong>向该模型发一次极小 embedding（不保存）：成功即回填维度；失败会把上游原文
+                显示在下方。留空直接保存时后端也会尽力探测一次，探测不到<strong>不影响保存</strong>，
+                但请在此<strong>手动填写维度</strong> —— 否则建知识库时会提示补填。
+              </p>
+            </div>
 
-        <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-          <span>支持图片输入</span>
-          <Switch checked={supportsVision} aria-label="支持图片输入" onChange={setSupportsVision} />
-        </div>
+            <div>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>多模态 embedding 端点</span>
+                <Switch
+                  checked={embeddingMultimodal}
+                  aria-label="多模态 embedding 端点"
+                  onChange={setEmbeddingMultimodal}
+                />
+              </div>
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                某些向量模型（如火山 <code>doubao-embedding-vision</code>）只提供
+                <code>POST /embeddings/multimodal</code>，且 <code>input</code> 是 content 数组。开启后本平台按
+                <code>{'[{type:"text",text}]'}</code> 形状请求该端点（本平台的知识库是纯文本，只发文本分片）。
+                标准 OpenAI 兼容端点<strong>不要</strong>开。
+              </p>
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              <p className="block-label">上下文长度（token）</p>
+              <InputNumber
+                value={maxContext}
+                min={MAX_CONTEXT_MIN}
+                max={MAX_CONTEXT_MAX}
+                style={{ width: '100%' }}
+                aria-label="上下文长度"
+                placeholder="留空表示未知"
+                onChange={(value) => setMaxContext(value === null ? null : Number(value))}
+              />
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                只是给选模型的人看的读数（不参与任何计算）。留空会显示成「未知」——比填一个猜的数字好。
+              </p>
+            </div>
 
-        <div>
-          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>支持深度思考</span>
-            <Switch checked={supportsReasoning} aria-label="支持深度思考" onChange={setSupportsReasoning} />
-          </div>
-          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            开启后对话会向上游请求"深度思考"（reasoning / thinking）：OpenAI 兼容走
-            <code>reasoning_effort</code>、Responses 走 <code>reasoning</code>、Anthropic 走
-            <code>thinking</code>。只对<strong>真正支持思考的模型</strong>勾选 —— 上游若不认这个参数会报错，
-            那时关掉它即可。
-          </p>
-        </div>
+            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>支持图片输入</span>
+              <Switch checked={supportsVision} aria-label="支持图片输入" onChange={setSupportsVision} />
+            </div>
+
+            <div>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>支持深度思考</span>
+                <Switch checked={supportsReasoning} aria-label="支持深度思考" onChange={setSupportsReasoning} />
+              </div>
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                开启后对话会向上游请求"深度思考"（reasoning / thinking）：OpenAI 兼容走
+                <code>reasoning_effort</code>、Responses 走 <code>reasoning</code>、Anthropic 走
+                <code>thinking</code>。只对<strong>真正支持思考的模型</strong>勾选 —— 上游若不认这个参数会报错，
+                那时关掉它即可。
+              </p>
+            </div>
+          </>
+        )}
 
         <div>
           <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>

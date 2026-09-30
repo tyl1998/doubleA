@@ -76,8 +76,17 @@ export const TOOLKIT_IMAGE_NAME = 'doubulea/sandbox-toolkit'
  * 真的会去拉清单并 `registerTool`）⇒ 只读层内容又变了。不 +1 的症状最隐蔽：
  * 宿主上还留着 `toolkit:2`（里面是老的空壳扩展），于是"任务里 MCP 工具一个都不出现"，
  * 而后端日志里一条错都没有（扩展只是没注册任何工具）。
+ *
+ * ⚠️ **P0-3-14 起为 `4`**：桥扩展又要多注册一族**内置工具**（`knowledge_search` /
+ * `list_knowledge`，经 `/api/sandbox/builtin/call`）⇒ 只读层内容再次变了。同一条纪律：
+ * 不 +1 ⇒ 宿主上的 toolkit 里还是"只注册 MCP 工具"的旧扩展，于是"绑了知识库但模型不会去检索"，
+ * 而后端日志里一条错都没有。
+ *
+ * ⚠️ **P0-3-14 后续为 `5`**：同批给 base/toolkit 的 `apt` / `npm` 步骤加了 **BuildKit 缓存挂载**
+ * （`--mount=type=cache`，见两个 Dockerfile 的注释）。它改的是**构建**行为、也轻微改了只读层内容
+ * （apt 的 lists 不再落镜像）⇒ 按"改内容就 +1"的纪律升到 `5`，免得宿主上留着同 tag 的旧层。
  */
-export const BASE_LAYER_VERSION = '3'
+export const BASE_LAYER_VERSION = '5'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -88,8 +97,13 @@ export const BASE_LAYER_VERSION = '3'
  *
  * ⚠️ **P0-3-9b 起为 `3`**：同一条理由 —— 真正被 `.env` 的 `SANDBOX_IMAGE` 引用的是
  * **toolkit 层**，base 换了而它不换 ⇒ 沙箱跑的仍是旧 base（扩展还是空壳）。
+ *
+ * ⚠️ **P0-3-14 起为 `4`**：同一条理由 —— base 层换了（扩展多了内置工具注册），
+ * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向旧 base。
+ *
+ * ⚠️ **P0-3-14 后续为 `5`**：同一条理由 —— 本层自己与 base 的 Dockerfile 都加了缓存挂载。
  */
-export const TOOLKIT_LAYER_VERSION = '3'
+export const TOOLKIT_LAYER_VERSION = '5'
 
 /** `doubulea/sandbox-base:<ver>` —— toolkit 的 `FROM` 与 `.env` 的 `SANDBOX_IMAGE_BASE` 都用它 */
 export const baseImageRef = () => `${BASE_IMAGE_NAME}:${BASE_LAYER_VERSION}`

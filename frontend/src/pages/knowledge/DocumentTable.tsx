@@ -27,7 +27,7 @@
  */
 
 import { Button, Popconfirm, Table, Tooltip, type TableColumnsType } from 'antd'
-import { isDocumentSearchable, type DocumentItem } from '@doubulea/shared'
+import { IMAGE_MODE_LABELS, isDocumentSearchable, type DocumentItem } from '@doubulea/shared'
 
 import { saveDocumentFile, useRemoveDocument, useRetryDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -44,9 +44,11 @@ export interface DocumentTableProps {
   documents: readonly DocumentItem[]
   /** 打开「覆盖重传」弹窗（弹窗由页面持有，表格只发意图） */
   onReupload: (doc: DocumentItem) => void
+  /** 打开「片段预览」抽屉（同上，抽屉由页面持有） */
+  onPreviewChunks: (doc: DocumentItem) => void
 }
 
-export function DocumentTable({ kbId, documents, onReupload }: DocumentTableProps) {
+export function DocumentTable({ kbId, documents, onReupload, onPreviewChunks }: DocumentTableProps) {
   const feedback = useFeedback()
   const retry = useRetryDocument(kbId)
   const remove = useRemoveDocument(kbId)
@@ -88,7 +90,11 @@ export function DocumentTable({ kbId, documents, onReupload }: DocumentTableProp
       render: (_, doc) => (
         <div className="kb-cell">
           <span className="kb-cell__name">{doc.fileName}</span>
-          <span className="kb-cell__sub num">{documentExtensionLabel(doc.fileName)}</span>
+          <span className="kb-cell__sub num">
+            {documentExtensionLabel(doc.fileName)}
+            {/* 选了图片解析方式时补一个标记（默认 `NONE` 不显示，避免满屏噪音） */}
+            {doc.imageMode !== 'NONE' && ` · ${IMAGE_MODE_LABELS[doc.imageMode]}`}
+          </span>
         </div>
       ),
     },
@@ -137,6 +143,11 @@ export function DocumentTable({ kbId, documents, onReupload }: DocumentTableProp
         const actions = documentActions(doc.status)
         return (
           <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
+            {actions.canPreviewChunks && (
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => onPreviewChunks(doc)}>
+                查看片段
+              </Button>
+            )}
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => download(doc)}>
               下载
             </Button>

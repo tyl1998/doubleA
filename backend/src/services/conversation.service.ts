@@ -38,6 +38,9 @@
  *    但 `03` §七 要求会话删除走「Modal + 红色危险按钮 + **明示影响范围**」步，
  *    所以必须把消息数**在同一个事务里数出来**再删（跨语句数会出现"数了 5 条、实际删了 6 条"，
  *    与 P0-1-19 的 `deletedChunks` 同款；用事务是为了消掉这个 TOCTOU）。
+ *    ⚠️ **产物行不跟着删**（`TaskAgent记忆与产物` 块 3 起）：`artifacts.conversation_id` 是
+ *    可空 + `ON DELETE SET NULL`，删会话只把它置空、产物归入"历史产物"。这不是漏了 ——
+ *    `02` §三 的"消息与产物都不删"现在在删除路径上字面成立。
  *
  * **⑤ 「只读」= 不能再产生消息；改名与删除**刻意不按 status 拦**。**
  *    {@link isConversationReadOnly} 的消费方是 P0-1-26 的 `POST /:id/chat` 闸门（见
@@ -46,14 +49,13 @@
  *    `status === 'ACTIVE'` 才放行，就把"删除一个已结束会话"变成做不到的事
  *    （P0-1-11 的教训：自己发明约束会把合法操作挡在门外）。
  *
- * **⑥ 没有"会话级的 S3 对象"（P0-1 阶段的诚实边界）。**
- *    `06` P0-1-25 的内容里写了"删除（异步清理 S3）"。但这一阶段**确实没有**属于会话的对象：
- *    产物在 `artifacts` 表（P0-3 的 TaskAgent 才用）、附件在 `files` 表（P1），
- *    两者**都还不存在**。故 {@link collectConversationObjectKeys} 现在返回空数组，
- *    {@link removeConversationObjects} 拿到空数组时**连桶都不探**（与 `kb.service.ts` 的
- *    "没有文档就不碰 S3"同款 —— 验收脚本因此不需要 MinIO 也能跑）。
- *    接回方式写在那两个函数上：P0-3 建了 `artifacts` 之后，只需在**收集**那一处加一句查询，
- *    删除路径本身不用改。⚠️ 现在写一段"先假定键在哪里"的代码，只会在 P0-3 变成需要重写的猜测。
+ * **⑥ 会话删除**不再收集/删除产物对象（`TaskAgent记忆与产物` 块 3）。**
+ *   产物行随删除被置空 `conversation_id`、保留为"历史产物"，S3 对象**必须跟着保留**
+ *   （行是下载的唯一入口，对象删了行就成了 404 —— 那正是"误删历史产物"）。
+ *   所以 `removeConversation` **不再碰 S3**（也不再需要 `collectConversationObjectKeys`）。
+ *   ⚠️ 唯一例外是"**撤回最新一轮**"（{@link recallLastRound}）：撤回 = 撤销那一轮，
+ *   产物行与 S3 对象一起删 —— 它是与"删除会话"**刻意不同**的另一种操作。
+ *   ⇒ 本文件里 `removeConversationObjects` 仍保留，但它**只被撤回路径使用**。
  *
  * **⑦ 消息历史（P0-1-28）的游标是"行 id"，不是时间戳；且排序必须与上下文窗口同源。**
  *    `messages.created_at` 是毫秒精度，而**同一轮问答的两条消息在同一个事务里写入**
@@ -360,39 +362,21 @@ export async function removeConversation(
     getLogger().warn({ err: error, conversationId: id }, '活跃流锁清理失败（会话已删除，键会自行过期）')
   }
 
-  // ③ S3：P0-1 阶段必然为空数组（文件头 ⑥）
-  const objectKeys = await collectConversationObjectKeys(id)
-  const deletedObjects = await removeConversationObjects(objectKeys)
-
+  // ⚠️ ③ 产物**不删**（文件头 ⑥）：`conversation_id` 由外键自动置空、产物归"历史产物"，
+  //    S3 对象跟着保留。这里**刻意不碰 S3** —— 唯一删产物对象的口子是撤回最新一轮。
   getLogger().info(
-    { conversationId: id, agentId: target.agentId, deletedMessages, deletedObjects },
-    '已删除会话',
+    { conversationId: id, agentId: target.agentId, deletedMessages },
+    '已删除会话（产物行保留为历史产物，conversation_id 由外键置空）',
   )
   return { id, agentId: target.agentId, topic: target.topic, deletedMessages }
 }
 
 /**
- * 这个会话名下的对象存储键。**P0-1 阶段恒为空数组**（文件头 ⑥）。
- *
- * 为什么保留这个函数而不是把 S3 那一段整个删掉：`06` P0-1-25 的需求原文里有"删除（异步清理 S3）"，
- * 而今天**没有**任何属于会话的对象 —— 产物（`artifacts`，P0-3）与附件（`files`，P1）两张表
- * 都还不存在。把"该收哪些键"这件事收在**一个**函数里，P0-3 就只需在这里加一句：
- *
- * ```ts
- * const rows = await db.artifact.findMany({ where: { conversationId }, select: { fileKey: true } })
- * return rows.map((row) => row.fileKey)
- * ```
- *
- * 删除路径（{@link removeConversation}）**不用改**。⚠️ 现在写一段"先假定键长什么样"的代码，
- * 只会在 P0-3 变成需要重写的猜测（P0-1-14 的坑预判被证伪，就是这种"先假设"的代价）。
- */
-async function collectConversationObjectKeys(conversationId: string): Promise<string[]> {
-  void conversationId
-  return []
-}
-
-/**
  * 清掉这些键。**失败只告警、不抛**（与 `kb.service.ts` 的 `removeDocumentObjects` 同款）。
+ *
+ * ⚠️ **自"删除会话保留产物"（`TaskAgent记忆与产物` 块 3）起只被撤回路径使用**：
+ * `recallLastRound` 撤掉一整轮时会连产物行 + S3 对象一起删（撤回 = 撤销那一轮，
+ * 与"删除会话"是两种操作）；而 `removeConversation` **不再调用本函数**。
  *
  * ⚠️ **空数组直接返回、连桶都不探**：`infra/s3.ts` 的探活注释说明了桶是"首次上传时按需创建"的，
  * 一个从没上传过任何东西的部署里桶根本不存在；探一次桶会白跑一个请求，而

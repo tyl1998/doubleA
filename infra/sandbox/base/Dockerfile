@@ -29,6 +29,9 @@ FROM ${NODE_IMAGE}
 ARG PI_PACKAGE
 ARG PI_VERSION
 ARG NPM_REGISTRY
+# Debian 源的**主机名**（可空 = 用官方 deb.debian.org）。见 sandbox-build.mjs 的 `--apt-mirror`：
+# 本机（内网）实测 `deb.debian.org` 只 ~0.4MB/s，而 `mirrors.tuna.tsinghua.edu.cn` ~6MB/s。
+ARG APT_MIRROR
 
 # ── 1. 系统依赖 ──────────────────────────────────────────────────────────
 #   bash             → pi 的 `bash` 工具要用它（slim 镜像只有 sh）
@@ -37,13 +40,28 @@ ARG NPM_REGISTRY
 #                      会把人引到 iptables 上去查。本文件末尾有断言把它钉死。
 #   tini             → PID 1 的僵尸回收（pi 会反复起 bash 子进程）。也可以在 docker run 时
 #                      加 `--init`，但那把"必需项"交给启动方记着；镜像里带更不容易漏。
-RUN set -eux; \
+# ⚠️ BuildKit **缓存挂载**（`--mount=type=cache`）：apt 的包体（`/var/cache/apt`）与索引
+#    （`/var/lib/apt/lists`）留在**构建缓存**里、不进镜像层 ⇒ 这一层因上游变化而重跑时
+#    不必再把同样的 deb 从网上下一遍（这是"改一个扩展文件却像全量重建"里最贵的网络段）。
+#    `sharing=locked` 防并发构建互相踩。
+#    ⚠️ **刻意不写 `# syntax=docker/dockerfile:1`**（见文件头）：缓存挂载**不需要**那条指令 ——
+#    它是 BuildKit 内置 frontend 的能力（本机 Docker 29.4 实测可用）。代价：daemon 必须开
+#    BuildKit（现代 Docker 默认开；`DOCKER_BUILDKIT=0` 会直接报错而不是静默降级）。
+#    因为 `/var/lib/apt/lists` 现在挂在缓存上（不落镜像），**不再需要** `rm -rf /var/lib/apt/lists/*`
+#    —— 再写那句会把缓存清掉，等于白挂。
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    if [ -n "${APT_MIRROR:-}" ]; then \
+      echo "把 Debian 源换成 ${APT_MIRROR}（本机实测快十几倍）"; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
-        tini; \
-    rm -rf /var/lib/apt/lists/*
+        tini
 
 # ── 2. Node 版本门槛（pi 的 engines 要求 >=22.19.0）─────────────────────
 #   上游 `node:22-bookworm-slim` 当前远超这个下限，但**镜像标签是浮动的** ⇒ 用一条断言把
@@ -68,14 +86,16 @@ RUN set -eux; \
 #   ⚠️ `--fetch-timeout` / `--fetch-retries` 是**为失败而不是为成功**配的：
 #   源不通时 npm 默认会**静默挂着**（5 分钟/次 × 重试），看起来像"卡住了"。
 #   P0-3-1 实测本机容器直连 registry.npmjs.org 不通，详见 `versions.mjs` 的注释。
-RUN set -eux; \
+# ⚠️ 同上的缓存挂载：npm 的 tarball 缓存在 `/root/.npm`（挂在构建缓存、不落镜像）⇒ 这一层
+#    重跑时不再重下 pi 的 tarball。因此**去掉** `npm cache clean --force`（它会把缓存清掉）。
+RUN --mount=type=cache,target=/root/.npm \
+    set -eux; \
     test -n "$PI_PACKAGE" || { echo 'FATAL: 缺少 --build-arg PI_PACKAGE（详见 Dockerfile 头部「怎么构建」）'; exit 1; }; \
     test -n "$PI_VERSION"  || { echo 'FATAL: 缺少 --build-arg PI_VERSION（详见 Dockerfile 头部「怎么构建」）'; exit 1; }; \
     npm install -g --ignore-scripts \
       --fetch-timeout 90000 --fetch-retries 2 \
       --registry "${NPM_REGISTRY:-https://registry.npmjs.org}" \
       "${PI_PACKAGE}@${PI_VERSION}"; \
-    npm cache clean --force; \
     pi --version | grep -qF "$PI_VERSION"; \
     pi --help > /dev/null; \
     echo "pi ${PI_VERSION} installed OK"

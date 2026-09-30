@@ -50,6 +50,8 @@ import type {
   ModelListResult,
   ModelProviderItem,
   ModelProviderListResult,
+  ProbeEmbeddingBody,
+  ProbeEmbeddingResult,
   ProviderBoundModelsResult,
   RemoteModelListResult,
   RemoveModelProviderResult,
@@ -244,5 +246,16 @@ export function useRemoveModel() {
     mutationFn: (id: string) =>
       request<{ id: string; modelName: string }>(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     onSuccess: () => invalidateModelPoolViews(queryClient),
+  })
+}
+
+/**
+ * 探测向量模型维度（仅 ADMIN，**不落库**）：按当前表单值试发一次 embedding，
+ * 成功即拿到维度；失败则抛出上游原文（含请求 URL），供界面直接展示。
+ */
+export function useProbeEmbeddingModel() {
+  return useMutation({
+    mutationFn: (body: ProbeEmbeddingBody) =>
+      request<ProbeEmbeddingResult>('/api/models/probe-embedding', { method: 'POST', body }),
   })
 }

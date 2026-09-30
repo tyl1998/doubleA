@@ -229,6 +229,11 @@ export function initialPasswordCopyText(username: string, initialPassword: strin
 export interface ProviderFormValues {
   name: string
   baseUrl: string
+  /**
+   * 自定义 URL：为 `true` 时 `baseUrl` 就是完整端点，后端原样发请求、不拼后缀
+   * （见 `shared` 的 `customUrl` / `backend#resolveUpstreamUrl`）。
+   */
+  customUrl: boolean
   type: ModelType
   /** 上游协议（P0-1-37）。`EMBEDDING` 下被类型锁成默认协议，见 {@link protocolAfterTypeChange} */
   protocol: UpstreamProtocol
@@ -240,6 +245,7 @@ export interface ProviderFormValues {
 export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
   name: '',
   baseUrl: '',
+  customUrl: false,
   type: 'CHAT',
   protocol: DEFAULT_UPSTREAM_PROTOCOL,
   enabled: true,
@@ -260,6 +266,7 @@ export function providerEditValuesOf(provider: ModelProviderItem): ProviderFormV
   return {
     name: provider.name,
     baseUrl: provider.baseUrl,
+    customUrl: provider.customUrl,
     type: provider.type,
     protocol: provider.protocol,
     enabled: provider.enabled,
@@ -339,6 +346,8 @@ export function buildCreateProviderBody(values: ProviderFormValues): CreateModel
   return {
     name: values.name.trim(),
     baseUrl: values.baseUrl.trim(),
+    // 总是带上 customUrl（同 protocol 的理由：用户在开关上明确设过，不靠服务端默认值）
+    customUrl: values.customUrl,
     type: values.type,
     // ⚠️ 总是带上 protocol（哪怕它就是默认值）：用户在下拉里**明确选过**，
     //    而依赖服务端默认值会让"界面显示 OpenAI 兼容、实际存了别的"无法从请求体看出来
@@ -376,6 +385,9 @@ export function buildProviderUpdateBody(
 
   const baseUrl = values.baseUrl.trim()
   if (baseUrl !== provider.baseUrl) body.baseUrl = baseUrl
+
+  // 布尔开关：逐字比较后只在真变了才带（同 `enabled` 的处置）
+  if (values.customUrl !== provider.customUrl) body.customUrl = values.customUrl
 
   if (values.type !== provider.type && !providerTypeChangeBlocked(provider)) body.type = values.type
 
@@ -425,6 +437,10 @@ export interface ModelFormValues {
   type: ModelType
   /** `null` = 未填写（界面上显示"未知"）。⚠️ 与"清空"共用 `null`，靠**与已存值比较**区分 */
   maxContext: number | null
+  /** **向量模型专属**：输出维度（可手动填写；留空则保存时后端尽力探测） */
+  embeddingDim: number | null
+  /** **向量模型专属**：是否走多模态 embedding 端点（`/embeddings/multimodal` + content 分片 input） */
+  embeddingMultimodal: boolean
   supportsVision: boolean
   /** 是否支持"深度思考"（reasoning / thinking）。对话链路会据此决定是否向上游请求思考 */
   supportsReasoning: boolean
@@ -437,6 +453,8 @@ export const EMPTY_MODEL_FORM_VALUES: ModelFormValues = {
   label: '',
   type: 'CHAT',
   maxContext: null,
+  embeddingDim: null,
+  embeddingMultimodal: false,
   supportsVision: false,
   supportsReasoning: false,
   enabled: true,
@@ -449,6 +467,8 @@ export function modelEditValuesOf(model: ModelItem): ModelFormValues {
     label: model.label,
     type: model.type,
     maxContext: model.maxContext,
+    embeddingDim: model.embeddingDim,
+    embeddingMultimodal: model.embeddingMultimodal,
     supportsVision: model.supportsVision,
     supportsReasoning: model.supportsReasoning,
     enabled: model.enabled,
@@ -473,15 +493,25 @@ export function maxContextText(value: number | null): string {
 }
 
 export function buildCreateModelBody(values: ModelFormValues): CreateModelBody {
+  // 向量模型没有"上下文/图片/思考"这些对话侧概念 ⇒ 不发送这些字段（后端也会忽略）
+  const isEmbedding = values.type === 'EMBEDDING'
   return {
     providerId: values.providerId,
     modelName: values.modelName.trim(),
     label: values.label.trim(),
     type: values.type,
-    // ⚠️ 留空 ⇒ **不带这个键**（`null` 与缺省在 create 侧同义，但"不带"更明确）
-    ...(values.maxContext === null ? {} : { maxContext: values.maxContext }),
-    supportsVision: values.supportsVision,
-    supportsReasoning: values.supportsReasoning,
+    ...(isEmbedding
+      ? {
+          // 向量模型：可手动给维度；留空则后端保存时尽力探测
+          ...(values.embeddingDim === null ? {} : { embeddingDim: values.embeddingDim }),
+          embeddingMultimodal: values.embeddingMultimodal,
+        }
+      : {
+          // ⚠️ 留空 ⇒ **不带这个键**（`null` 与缺省在 create 侧同义，但"不带"更明确）
+          ...(values.maxContext === null ? {} : { maxContext: values.maxContext }),
+          supportsVision: values.supportsVision,
+          supportsReasoning: values.supportsReasoning,
+        }),
     enabled: values.enabled,
   }
 }
@@ -511,10 +541,23 @@ export function buildModelUpdateBody(model: ModelItem, values: ModelFormValues):
 
   if (values.type !== model.type && !modelTypeChangeBlocked(model)) body.type = values.type
 
-  if (values.maxContext !== model.maxContext) body.maxContext = values.maxContext
+  // 向量模型不带"上下文/图片/思考"（对话侧字段）—— 用**生效类型**（类型改不动时以库里的为准）
+  const typeChanging = values.type !== model.type && !modelTypeChangeBlocked(model)
+  const isEmbedding = (typeChanging ? values.type : model.type) === 'EMBEDDING'
+  if (isEmbedding) {
+    // 维度：只在给了新值且与原值不同时才带（不支持"清空维度"—— null 无法表达，且无意义）
+    if (values.embeddingDim !== null && values.embeddingDim !== model.embeddingDim) {
+      body.embeddingDim = values.embeddingDim
+    }
+    if (values.embeddingMultimodal !== model.embeddingMultimodal) {
+      body.embeddingMultimodal = values.embeddingMultimodal
+    }
+  } else {
+    if (values.maxContext !== model.maxContext) body.maxContext = values.maxContext
+    if (values.supportsVision !== model.supportsVision) body.supportsVision = values.supportsVision
+    if (values.supportsReasoning !== model.supportsReasoning) body.supportsReasoning = values.supportsReasoning
+  }
 
-  if (values.supportsVision !== model.supportsVision) body.supportsVision = values.supportsVision
-  if (values.supportsReasoning !== model.supportsReasoning) body.supportsReasoning = values.supportsReasoning
   if (values.enabled !== model.enabled) body.enabled = values.enabled
 
   if (Object.keys(body).length === 0) return null
@@ -532,6 +575,23 @@ export function modelTypeChangeBlocked(model: Pick<ModelItem, 'agentCount'>): bo
 
 export const MODEL_TYPE_LOCKED_REASON =
   '该模型已被智能体绑定，后端不允许改类型（409）：对话模型与向量模型不可互换，改了等于让已上线的智能体悄悄换一类模型。请先到智能体列表改绑。'
+
+/**
+ * 方案A：模型的 `type` **跟随所属 Provider 的 type**（Provider 决定其下模型的用途）。
+ *
+ * 找不到该 Provider（还没选）时回落到 `CHAT` 只作展示占位 —— 提交时后端仍会强校验一致。
+ * 判据的"权威"在后端（`model.service.ts#createModel`），这里只是把界面下拉 derive 出来，
+ * 让用户没有"选错"的机会。
+ */
+export function modelTypeForProvider(
+  providers: readonly Pick<ModelProviderItem, 'id' | 'type'>[],
+  providerId: string,
+): ModelType {
+  return providers.find((provider) => provider.id === providerId)?.type ?? 'CHAT'
+}
+
+export const MODEL_TYPE_FOLLOWS_PROVIDER_REASON =
+  '类型跟随所属 Provider：Provider 是「对话」就建对话模型、是「向量」就建向量模型，不再单独选择（后端也会校验一致）。'
 
 /**
  * 删模型前的"点下去会怎样"。`null` = 可以直接删（走 Popconfirm）。

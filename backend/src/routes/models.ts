@@ -35,11 +35,13 @@ import {
   listModelsQuerySchema,
   modelIdParamsSchema,
   ok,
+  probeEmbeddingBodySchema,
   updateModelBodySchema,
   type CreateModelBody,
   type ListAvailableModelsQuery,
   type ListModelsQuery,
   type ModelIdParams,
+  type ProbeEmbeddingBody,
   type UpdateModelBody,
 } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
@@ -48,6 +50,7 @@ import {
   createModel,
   listAvailableModels,
   listModels,
+  probeModelEmbedding,
   removeModel,
   updateModel,
 } from '../services/model.service.js'
@@ -78,6 +81,18 @@ export function registerModelRoutes(app: FastifyInstance): void {
     '/api/models',
     { preHandler: app.requireAdmin, schema: { body: createModelBodySchema } },
     async (request) => ok(await createModel(request.body)),
+  )
+
+  /**
+   * 探测向量模型维度（仅 ADMIN）：按表单值试发一次 embedding，**不落库**。
+   *
+   * 静态段 `/probe-embedding` 与 `POST /api/models`、`PATCH|DELETE /api/models/:id` 路径不同，
+   * 不存在被参数路由抢先匹配的问题（见文件头）。
+   */
+  app.post<{ Body: ProbeEmbeddingBody }>(
+    '/api/models/probe-embedding',
+    { preHandler: app.requireAdmin, schema: { body: probeEmbeddingBodySchema } },
+    async (request) => ok(await probeModelEmbedding(request.body)),
   )
 
   /** 部分更新（仅 ADMIN）。三条守卫（迁移 Provider / 改 type 有引用 / 唯一冲突）在服务层 */

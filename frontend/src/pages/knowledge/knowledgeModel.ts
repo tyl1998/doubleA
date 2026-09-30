@@ -19,12 +19,16 @@
 
 import {
   DOCUMENT_PARSING_HINT,
+  IMAGE_MODES,
   LEGACY_DOC_EXTENSION,
   LEGACY_DOC_HINT,
   UPLOAD_EXTENSIONS,
   isDocumentSearchable,
+  isImageUploadExtension,
+  type ChunkItem,
   type DocumentItem,
   type DocumentStatus,
+  type ImageMode,
   type KnowledgeBaseItem,
   type RetrievalConfig,
   type RetrievalHit,
@@ -124,7 +128,7 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
     return {
       kind: 'reject',
       code: 'LEGACY_DOC',
-      message: `「${file.name}」不在白名单内：本平台只解析 ${UPLOAD_EXTENSIONS.join(' / ')} 四类格式，旧版 .doc 需先转换。`,
+      message: `「${file.name}」不在白名单内：本平台只解析 ${UPLOAD_EXTENSIONS.join(' / ')} 这些格式，旧版 .doc 需先转换。`,
       hint: LEGACY_DOC_HINT,
     }
   }
@@ -149,6 +153,29 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
 /** 扩展名（用于表格里那个等宽小标）—— 识别不出时给 `—`，**不编**一个格式出来 */
 export function documentExtensionLabel(fileName: string): string {
   return extensionOf(fileName) ?? '—'
+}
+
+/** 这个文件是不是独立图片文件（`png`/`jpg`/…）—— 上传时它必须选一个图片解析方式 */
+export function isImageFile(fileName: string): boolean {
+  const extension = extensionOf(fileName)
+  return extension !== null && isImageUploadExtension(extension)
+}
+
+/**
+ * 图片解析方式是否**可选**。
+ *
+ * `MULTIMODAL` 依赖 `/embeddings/multimodal`，只有知识库所选向量模型标了 `embeddingMultimodal`
+ * 才允许（后端也会再拦一道）。其余方式恒可选。
+ */
+export function isImageModeAllowed(mode: ImageMode, multimodalSupported: boolean): boolean {
+  return mode !== 'MULTIMODAL' || multimodalSupported
+}
+
+/** 图片解析方式的可选项（`MULTIMODAL` 在模型不支持时标记 disabled） */
+export function imageModeOptions(
+  multimodalSupported: boolean,
+): Array<{ value: ImageMode; disabled: boolean }> {
+  return IMAGE_MODES.map((mode) => ({ value: mode, disabled: !isImageModeAllowed(mode, multimodalSupported) }))
 }
 
 // ───────────────────────────── 文档状态展示 ─────────────────────────────
@@ -199,6 +226,8 @@ export interface DocumentActions {
   canDownload: boolean
   canReupload: boolean
   canRetry: boolean
+  /** 「查看片段」—— 只有 `READY` 才有块可看（见下方矩阵） */
+  canPreviewChunks: boolean
   canDelete: boolean
   /** 「重试」按钮的说明（两种状态下的含义不同，见下） */
   retryHint: string
@@ -207,11 +236,11 @@ export interface DocumentActions {
 /**
  * 按状态决定行内操作（**这是本页最容易"多做一步"的地方**）。
  *
- * | 状态 | 下载 | 覆盖重传 | 重试 | 删除 |
- * |------|------|---------|------|------|
- * | `PARSING` | ✅ | ❌ | ✅ | ✅ |
- * | `READY` | ✅ | ✅ | ❌ | ✅ |
- * | `FAILED` | ✅ | ✅ | ✅ | ✅ |
+ * | 状态 | 下载 | 覆盖重传 | 重试 | 查看片段 | 删除 |
+ * |------|------|---------|------|---------|------|
+ * | `PARSING` | ✅ | ❌ | ✅ | ❌ | ✅ |
+ * | `READY` | ✅ | ✅ | ❌ | ✅ | ✅ |
+ * | `FAILED` | ✅ | ✅ | ✅ | ❌ | ✅ |
  *
  * 三处判据的理由（**都不是"看着更整齐"**）：
  *   · **下载 / 删除任何状态都可用**：原始文件在上传成功那一刻就在 S3 里了（`PARSING` 是"内容
@@ -225,12 +254,17 @@ export interface DocumentActions {
  *   · **`PARSING` 不给「覆盖重传」**：后端虽然允许（`PARSING → PARSING` 是合法迁移），但那是
  *     "排队里已有一个 job 时再插一个" —— 语义是"换内容"，而用户此刻看到的是"正在解析"，
  *     提供它只会制造两次流水线抢同一行。要换内容，先等它落定或先删掉重传（两者都在行内）。
+ *   · **「查看片段」只在 `READY` 给**：`PARSING` / `FAILED` 时 `chunk_count` 恒为 0
+ *     （覆盖重建是"先删后建"、失败也可能已在删除阶段清过块）⇒ 打开只会是空抽屉。
+ *     判据用 `isDocumentSearchable`（与「片段数」列**同源**，不写字面量比较）——
+ *     两处若各写一份 `status === 'READY'`，将来语义再变时会先腐烂一处。
  */
 export function documentActions(status: DocumentStatus): DocumentActions {
   return {
     canDownload: true,
     canReupload: status !== 'PARSING',
     canRetry: status !== 'READY',
+    canPreviewChunks: isDocumentSearchable(status),
     canDelete: true,
     retryHint:
       status === 'PARSING' ? '长时间停在「解析中」时可重新入队' : '重新入队解析（失败原因多来自扫描件或格式问题）',
@@ -392,6 +426,31 @@ export function hitSourceText(hit: Pick<RetrievalHit, 'docName' | 'page' | 'seq'
   return hit.page === null ? `${hit.docName} · 块 #${hit.seq}` : `${hit.docName} · 第 ${hit.page} 页`
 }
 
+// ───────────────────────────── 片段预览（P0-1-35 增量）─────────────────────────────
+
+/**
+ * 片段预览里一行的位置说明：块号（必有）+ 页码（PDF 才有）+ 标题层级（可空）。
+ *
+ * 三段各自**按数据有无**决定是否出现，而不是拼一个固定模板：非 PDF 没有页码、定长切分没有
+ * 标题层级 —— 给它们补一个 `第 — 页` / `（无标题）` 只是噪音（与 `hitSourceText` 同款取舍）。
+ * `headingPath` 用 ` / ` 连接，对应流水线写入的层级数组（`子方案①` §4-4）。
+ */
+export function chunkLocationText(chunk: Pick<ChunkItem, 'seq' | 'page' | 'headingPath'>): string {
+  const parts = [`块 #${chunk.seq}`]
+  if (chunk.page !== null) parts.push(`第 ${chunk.page} 页`)
+  if (chunk.headingPath.length > 0) parts.push(chunk.headingPath.join(' / '))
+  return parts.join(' · ')
+}
+
+/**
+ * 片段字数（预览里用等宽小字标出）—— 让人一眼看出"这块是不是被切得太碎/太长"。
+ * 用 `[...text].length` 码点数而不是 `text.length`：与后端分块/窗口的**码点口径**一致
+ * （`retrieval.ts#buildSnippet` 同款），否则含 emoji 的块会数出偏移的字数。
+ */
+export function chunkLengthText(content: string): string {
+  return `${[...content].length} 字`
+}
+
 export interface SearchNotice {
   tone: 'info' | 'warn'
   text: string
@@ -447,6 +506,8 @@ export function searchNotice(result: {
 export interface KnowledgeCreateFormValues {
   name: string
   description: string
+  /** 建库时**选定**的 embedding 模型 id（模型池 `type=EMBEDDING`）；必填 */
+  embeddingModelId: string
   chunkSize: number | null
   chunkOverlap: number | null
 }
@@ -454,6 +515,7 @@ export interface KnowledgeCreateFormValues {
 export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
   name: '',
   description: '',
+  embeddingModelId: '',
   chunkSize: null,
   chunkOverlap: null,
 }
@@ -468,16 +530,18 @@ export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
  */
 export function buildCreateBody(values: KnowledgeCreateFormValues): {
   name: string
+  embeddingModelId: string
   description?: string
   chunkSize?: number
   chunkOverlap?: number
 } {
   const body: {
     name: string
+    embeddingModelId: string
     description?: string
     chunkSize?: number
     chunkOverlap?: number
-  } = { name: values.name.trim() }
+  } = { name: values.name.trim(), embeddingModelId: values.embeddingModelId }
 
   const description = values.description.trim()
   if (description !== '') body.description = description

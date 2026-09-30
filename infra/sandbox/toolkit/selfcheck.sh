@@ -155,8 +155,21 @@ rm -rf "$sc_skip"
 # mcp-bridge 的加载检查：**语法级**证明 —— 它能否作为一个 ESM 模块被求值、default 是不是函数。
 # 为什么复制成 .mts：agent-dir 下没有 package.json，Node 的类型擦除会按 CJS 解释 `.ts`，
 # 而扩展是 ESM 写法（`export default`）⇒ 直接 import 原路径会以一个**与扩展无关**的错失败。
+# ⚠️ 扩展 `import 'typebox'`（pi 自己的依赖，P0-3-9b 的真扩展起才有这条）。裸包名按**目录向上**
+#    解析 node_modules，而 `/opt/pi/agent/extensions/...` 下没有 ⇒ 复制到 /tmp 后照样解析不到。
+#    ⇒ 临时目录旁边**软链 pi 自带的 node_modules**：pi 运行期用它自己的模块解析加载扩展，
+#      解析面与这里等价（这不是"为过检查而检查"）。找不到 pi 的 node_modules 时如实 FAIL。
 # ⚠️ 它**不证明** pi 侧的 jiti 也认得它 —— 那要等 P0-3-5 的真容器冒烟（本批只保证"文件进了镜像"）。
-bridge_copy=/tmp/selfcheck-bridge.mts
+bridge_dir=/tmp/selfcheck-bridge
+bridge_copy="$bridge_dir/index.mts"
+rm -rf "$bridge_dir"
+mkdir -p "$bridge_dir"
+pi_modules="$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent/node_modules"
+if [ -d "$pi_modules" ]; then
+  ln -s "$pi_modules" "$bridge_dir/node_modules"
+else
+  bad "找不到 pi 的 node_modules（$pi_modules）⇒ 无法解析扩展的 'typebox' 依赖"
+fi
 cp "$sc_agent/extensions/mcp-bridge/index.ts" "$bridge_copy"
 if out="$(node --no-warnings -e "
 import('$bridge_copy').then((m) => {
@@ -169,7 +182,7 @@ else
   bad 'mcp-bridge 扩展可作 ESM 求值（default 是函数）'
 fi
 [ -n "$out" ] && printf '%s\n' "$out" | indent
-rm -f "$bridge_copy"
+rm -rf "$bridge_dir"
 rm -rf "$sc_agent"
 
 # ── 4. toolkit 依赖（本层存在的全部意义）───────────────────────────────

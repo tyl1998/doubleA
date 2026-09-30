@@ -31,12 +31,28 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# Debian 源主机名（可空 = 官方）。由 sandbox-build.mjs 的 `--apt-mirror` 注入，理由同 base。
+ARG APT_MIRROR
+
 # base 层结尾是 `USER agent` ⇒ 装包前必须切回 root（apt 不能以非 root 跑）。装完再切回去，
 # 这样 toolkit 的**镜像默认用户**与 base 一致 —— 别忘了这一句，否则容器默认以 root 跑（§四 2 的
 # "非 root"要求会静默失效，而 `--cap-drop ALL` 的意义也随之减半）。
 USER root
 
-RUN set -eux; \
+# ⚠️ BuildKit **缓存挂载**（与 base 同款，见 `infra/sandbox/base/Dockerfile` 那一段的完整理由）：
+#    这一层是本仓最慢的网络段（`python3-pandas` / `numpy` / `openpyxl` 加起来上百 MB），而它**每次
+#    base 变了都要重跑**（`FROM ${BASE_IMAGE}` 的父层 ID 一变，这条 `RUN` 的缓存就失效）⇒ 把 apt
+#    的包体与索引挂在构建缓存里，重跑时**不再重新下载**，只做解包与配置（这是本批提速的主要来源）。
+#    ⚠️ 同理**不再** `rm -rf /var/lib/apt/lists/*`（它现在挂在缓存上，删了等于白挂）。
+#    ⚠️ 同样**刻意不写** `# syntax=docker/dockerfile:1`（见文件头）：缓存挂载不需要它。
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    if [ -n "${APT_MIRROR:-}" ]; then \
+      echo "把 Debian 源换成 ${APT_MIRROR}（本机实测快十几倍）"; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         python3 \
@@ -45,8 +61,7 @@ RUN set -eux; \
         python3-openpyxl \
         jq \
         git \
-        ripgrep; \
-    rm -rf /var/lib/apt/lists/*
+        ripgrep
 
 # 自检脚本 COPY 进镜像（而不只是 inline RUN）：出问题时能在**活着的容器里**重跑同一份脚本，
 # 不必回头去翻构建日志（P0-3-3/4 排障会用到）。

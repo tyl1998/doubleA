@@ -89,6 +89,14 @@ const SANDBOX_TOOL_KIND = 'SANDBOX'
 const MCP_TOOL_KIND = 'MCP'
 
 /**
+ * `kind` 的第三个取值（`shared#TOOL_CALL_KINDS`）：**平台内置工具**（当前只有知识库一族）。
+ *
+ * 判据与 MCP 同款 —— "**注入的解析器认出了它**"（它确实是本次会话下发的内置工具之一）。
+ * 与 ChatBot 路径**同一个 kind**（`chatBot.ts` 给 `knowledge_search` / `list_knowledge` 发的就是它）。
+ */
+const BUILTIN_TOOL_KIND = 'BUILTIN'
+
+/**
  * `kind=SANDBOX` 的工具**不属于任何 MCP server** ⇒ `serverName` 是空串。
  *
  * ⚠️ 空串而不是省略：`shared#toolCallRecordSchema.serverName` 是 `z.string()`（必填），
@@ -258,10 +266,22 @@ export interface EngineMcpToolCard {
 }
 
 /**
+ * 一张**内置工具卡**的"它到底是谁"（同样由调用方注入的解析器产出）。
+ *
+ * 内置工具**没有 `serverId`**（不是 MCP server）⇒ 只有展示用的一项 `serverName`（"知识库"）。
+ */
+export interface EngineBuiltinToolCard {
+  serverName: string
+  /** 内置工具的**注册名**（`knowledge_search` / `list_knowledge`，无前缀可还原） */
+  toolName: string
+}
+
+/**
  * {@link createEngineEventMapper} 的可选项。
  *
- * ⚠️ **只有一项，而它是"把库/Redis 挡在本层之外"的关键**：`alias → {serverId, serverName, toolName}`
- * 的映射由调用方（`orchestrator/taskAgent.ts`，从 `sandbox/mcpMap.ts` 的那份清单）装好传进来。
+ * ⚠️ **两项都是"把库/Redis 挡在本层之外"的关键**：`alias → {serverId, serverName, toolName}`
+ * （MCP）与"这个名字是不是内置工具"都由调用方（`orchestrator/taskAgent.ts`，从
+ * `sandbox/mcpMap.ts` 的那份清单）装好传进来。
  * 本层因此仍然**不碰 DB / Redis / Docker / SSE**，可以"喂一串事件、比结果"地逐条核查。
  *
  * 返回 `undefined` 的两种情形**不区分**（都退回 `kind: SANDBOX`）：
@@ -272,6 +292,12 @@ export interface EngineMcpToolCard {
  */
 export interface EngineEventMapperOptions {
   resolveMcpTool?: (engineToolName: string) => EngineMcpToolCard | undefined
+  /**
+   * 反查"这是不是一个**平台内置工具**"（当前只有 `knowledge_search` / `list_knowledge`）。
+   * 认出来 ⇒ `kind: BUILTIN` + 展示名（"知识库"）；认不出 ⇒ 照旧 `kind: SANDBOX`。
+   * ⚠️ 在本层之外仍然**不碰 DB / Redis**：认哪几个名字由调用方注入（`taskAgent.ts`）。
+   */
+  resolveBuiltinTool?: (engineToolName: string) => EngineBuiltinToolCard | undefined
 }
 
 /** 映射器（见 {@link createEngineEventMapper}：它有一小块 `callId → 摘要` 的记忆） */
@@ -358,16 +384,36 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
    * 卡片会在运行中"换个 server"）。解析器是纯函数、映射表在一轮内不变，所以这里只是
    * 把"两处各调一次"收成一处调用点，顺带让 `kind` / `serverName` / `serverId` 三者的来源唯一。
    *
-   * ⚠️ 返回类型**必须**是 `ToolCallKind`（`'MCP' | 'SANDBOX'`）而不是 `string`：
+   * ⚠️ 返回类型**必须**是 `ToolCallKind`（`'MCP' | 'SANDBOX' | 'BUILTIN'`）而不是 `string`：
    * 写宽成 `string` 后赋值给 `SseToolCallPayload` 会 `TS2322`（P0-3-9b 留下的编译错误，
-   * P0-3-12 收尾时修掉 —— 运行期一直是对的，红的是类型）—— 而那正是"这张卡只能是这两种之一"
+   * P0-3-12 收尾时修掉；P0-3-14 起又多了 `BUILTIN`）—— 而那正是"这张卡只能是这三种之一"
    * 这条契约在类型层的表达，宽成 `string` 等于把它丢了。
    */
-  function toolIdentity(
-    engineToolName: string,
-  ): { kind: ToolCallKind; ref: EngineMcpToolCard | undefined } {
+  function toolIdentity(engineToolName: string): {
+    kind: ToolCallKind
+    ref: EngineMcpToolCard | undefined
+    builtin: EngineBuiltinToolCard | undefined
+  } {
     const ref = options.resolveMcpTool?.(engineToolName)
-    return { kind: ref === undefined ? SANDBOX_TOOL_KIND : MCP_TOOL_KIND, ref }
+    if (ref !== undefined) return { kind: MCP_TOOL_KIND, ref, builtin: undefined }
+    const builtin = options.resolveBuiltinTool?.(engineToolName)
+    if (builtin !== undefined) return { kind: BUILTIN_TOOL_KIND, ref: undefined, builtin }
+    return { kind: SANDBOX_TOOL_KIND, ref: undefined, builtin: undefined }
+  }
+
+  /** 卡片上"这个工具叫什么、来自哪"的唯一取值点（MCP 卡 / 内置卡 / 沙箱卡三选一） */
+  function toolFace(identity: ReturnType<typeof toolIdentity>, engineToolName: string): {
+    toolName: string
+    serverName: string
+    serverId?: string
+  } {
+    if (identity.ref !== undefined) {
+      return { toolName: identity.ref.toolName, serverName: identity.ref.serverName, serverId: identity.ref.serverId }
+    }
+    if (identity.builtin !== undefined) {
+      return { toolName: identity.builtin.toolName, serverName: identity.builtin.serverName }
+    }
+    return { toolName: engineToolName, serverName: SANDBOX_TOOL_SERVER_NAME }
   }
 
   function remember(callId: string, entry: { inputSummary: string; args: string }): void {
@@ -427,15 +473,16 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
     const serialized = serializeArgs(args)
     remember(callId, { inputSummary, args: serialized })
 
-    // ★ 反查（P0-3-9b）：是"我们下发给容器的 MCP 工具"就换成 MCP 卡，否则照旧 SANDBOX
-    const { kind, ref } = toolIdentity(toolName)
+    // ★ 反查（P0-3-9b）：是"我们下发给容器的 MCP / 内置工具"就换成对应卡，否则照旧 SANDBOX
+    const identity = toolIdentity(toolName)
+    const face = toolFace(identity, toolName)
     const payload: SseToolCallPayload = {
       callId,
-      toolName: ref?.toolName ?? toolName,
-      serverName: ref?.serverName ?? SANDBOX_TOOL_SERVER_NAME,
+      toolName: face.toolName,
+      serverName: face.serverName,
       // `serverId` 只在**真的是 MCP 工具**时才有这个键（"没有这个键"与"有但是空"是两件事，P0-2-11）
-      ...(ref === undefined ? {} : { serverId: ref.serverId }),
-      kind,
+      ...(face.serverId === undefined ? {} : { serverId: face.serverId }),
+      kind: identity.kind,
       status: 'RUNNING',
       inputSummary,
     }
@@ -472,13 +519,14 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
     )
 
     // 与 start 帧**同一个身份来源**（见 `toolIdentity`）；`end` 事件同样带 `toolName`
-    const { kind, ref } = toolIdentity(toolName)
+    const identity = toolIdentity(toolName)
+    const face = toolFace(identity, toolName)
     const payload: SseToolCallPayload = {
       callId,
-      toolName: ref?.toolName ?? toolName,
-      serverName: ref?.serverName ?? SANDBOX_TOOL_SERVER_NAME,
-      ...(ref === undefined ? {} : { serverId: ref.serverId }),
-      kind,
+      toolName: face.toolName,
+      serverName: face.serverName,
+      ...(face.serverId === undefined ? {} : { serverId: face.serverId }),
+      kind: identity.kind,
       status: isError ? 'ERROR' : 'SUCCESS',
       // 摘要取**记忆**里的那一份：end 事件自己没有 `args`，而前端按 `callId` upsert
       // ⇒ 这里给空串会把 start 那帧已经显示出来的摘要抹掉（卡片上"参数"那一行突然空了）

@@ -65,8 +65,12 @@ export const modelItemSchema = z.object({
   /** 别名：界面上给业务同学看的名字 */
   label: z.string(),
   type: z.enum(MODEL_TYPES),
-  /** 上下文长度（token）；未填为 `null` */
+  /** 上下文长度（token）；未填为 `null`。**对话模型专属**（向量模型为 `null`） */
   maxContext: z.number().int().nullable(),
+  /** **向量模型专属**：embedding 输出维度；对话模型为 `null` */
+  embeddingDim: z.number().int().nullable(),
+  /** **向量模型专属**：是否走多模态 embedding 端点；对话模型恒 `false` */
+  embeddingMultimodal: z.boolean(),
   supportsVision: z.boolean(),
   /** 是否支持"深度思考"（reasoning / thinking）。见 `createModelBodySchema` 的字段注释 */
   supportsReasoning: z.boolean(),
@@ -100,6 +104,8 @@ export const modelOptionSchema = z.object({
   type: z.enum(MODEL_TYPES),
   /** `03` §4.2：下拉要显示上下文长度 */
   maxContext: z.number().int().nullable(),
+  /** 向量模型专属：输出维度（对话模型为 `null`） */
+  embeddingDim: z.number().int().nullable(),
   /** `03` §4.2：下拉要显示是否支持图片 */
   supportsVision: z.boolean(),
   /** 是否支持"深度思考"（reasoning / thinking）：选模型时也要看得见这个能力 */
@@ -208,6 +214,24 @@ export const createModelBodySchema = z.object({
   type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
   /** 可缺省：`null` 与缺省同义（未填写） */
   maxContext: maxContextSchema.nullish(),
+  /**
+   * **向量模型专属**：embedding 输出维度。
+   *
+   * 可缺省 —— 后端会**尽力**向上游探测一次；探测不到（多模态/特殊实现、或端点暂时不可用）
+   * 就留空，**不会因此拒绝创建**，由管理员在编辑里手动填写维度。
+   * 对话模型忽略该字段。
+   */
+  embeddingDim: z
+    .number({ invalid_type_error: 'embeddingDim 必须是数字' })
+    .int('embeddingDim 必须是整数')
+    .min(1, 'embeddingDim 至少为 1')
+    .max(1_000_000, 'embeddingDim 过大')
+    .optional(),
+  /**
+   * **向量模型专属**：是否走**多模态 embedding 端点**（`POST {baseUrl}/embeddings/multimodal`，
+   * `input` 为 `[{type:"text",text}]`）。默认 `false` = 标准 OpenAI 形状。对话模型忽略。
+   */
+  embeddingMultimodal: z.boolean().optional(),
   supportsVision: z.boolean().optional(),
   /**
    * 是否支持"深度思考"（reasoning / thinking）。可缺省（缺省 = `false`）。
@@ -249,6 +273,15 @@ export const updateModelBodySchema = z
       .optional(),
     /** ⚠️ 必须是 `.nullable().optional()`（**不要**加 `.default()`）：要区分"不动"与"清空" */
     maxContext: maxContextSchema.nullable().optional(),
+    /** **向量模型专属**：手动指定/覆盖输出维度（缺省时后端尽力探测；对话模型忽略） */
+    embeddingDim: z
+      .number({ invalid_type_error: 'embeddingDim 必须是数字' })
+      .int('embeddingDim 必须是整数')
+      .min(1, 'embeddingDim 至少为 1')
+      .max(1_000_000, 'embeddingDim 过大')
+      .optional(),
+    /** **向量模型专属**：是否走多模态 embedding 端点（见 `createModelBodySchema` 同名字段） */
+    embeddingMultimodal: z.boolean().optional(),
     supportsVision: z.boolean().optional(),
     supportsReasoning: z.boolean().optional(),
     enabled: z.boolean().optional(),
@@ -261,6 +294,8 @@ export const updateModelBodySchema = z
       body.type !== undefined ||
       // `maxContext: null`（清空）也算"给了字段"：`null !== undefined`，正是想要的效果
       body.maxContext !== undefined ||
+      body.embeddingDim !== undefined ||
+      body.embeddingMultimodal !== undefined ||
       body.supportsVision !== undefined ||
       body.supportsReasoning !== undefined ||
       body.enabled !== undefined,
@@ -273,3 +308,29 @@ export const modelIdParamsSchema = z.object({
   id: z.string().uuid('模型 ID 不是合法 UUID'),
 })
 export type ModelIdParams = z.infer<typeof modelIdParamsSchema>
+
+// ───────────────────────────── 探测向量模型维度（P0-1-37 增补）─────────────────────────────
+
+/**
+ * `POST /api/models/probe-embedding` 请求体（仅 ADMIN）。
+ *
+ * 用**当前表单值**向该 Provider 试发一次 embedding，用来在建/改**向量模型**时**当场**看到
+ * 维度或真实报错（不必翻后端日志、也不必先保存）。**不落库**、不改任何状态。
+ */
+export const probeEmbeddingBodySchema = z.object({
+  providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
+  modelName: z.string({ required_error: '请先填写型号名' }).trim().min(1, '请先填写型号名').max(255),
+  /** 是否走多模态端点（见 `createModelBodySchema.embeddingMultimodal`） */
+  embeddingMultimodal: z.boolean().optional(),
+})
+export type ProbeEmbeddingBody = z.infer<typeof probeEmbeddingBodySchema>
+
+/** 探测成功的结果（失败一律是 `UPSTREAM_ERROR`，消息里带上游原文与请求 URL） */
+export const probeEmbeddingResultSchema = z.object({
+  dim: z.number().int(),
+  providerName: z.string(),
+  modelName: z.string(),
+  /** 实际请求的完整 URL（不含凭据）—— 排查"路径对不对"用 */
+  url: z.string(),
+})
+export type ProbeEmbeddingResult = z.infer<typeof probeEmbeddingResultSchema>

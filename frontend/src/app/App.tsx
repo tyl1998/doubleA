@@ -43,6 +43,7 @@ import { ModelsPage } from '../pages/admin/ModelsPage.js'
 import { UsersListPage } from '../pages/admin/UsersListPage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
+import { ArtifactHistoryPage } from '../pages/artifacts/ArtifactHistoryPage.js'
 import { ChatPage } from '../pages/chat/ChatPage.js'
 import { KnowledgeDetailPage } from '../pages/knowledge/KnowledgeDetailPage.js'
 import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
@@ -77,6 +78,9 @@ export function App() {
               界面上没有任何"别人的凭据"可看。 */}
           <Route path="/mcp" element={<McpServersPage />} />
           <Route path="/mcp/credentials" element={<McpCredentialsPage />} />
+          {/* S-10 · 历史产物（`TaskAgent 记忆与产物` 块 5）：删除会话后保留的产物，
+              登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。 */}
+          <Route path="/artifacts/history" element={<ArtifactHistoryPage />} />
           <Route
             path="/tasks"
             element={

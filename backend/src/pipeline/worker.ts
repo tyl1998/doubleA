@@ -46,11 +46,13 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, canTransitionDocumentStatus, normalizeRetrievalConfig, type DocumentStatus } from '@doubulea/shared'
+import { AppError, canTransitionDocumentStatus, MULTIMODAL_MODEL_REQUIRED_HINT, normalizeRetrievalConfig, type DocumentStatus } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import { buildPoolEmbeddingProvider } from '../llm/embedding/index.js'
+import { resolveEmbeddingTarget } from '../services/model.service.js'
 import { closePipelineQueue, dequeuePipelineJob, pipelineQueueKey, type PipelineJob } from './queue.js'
 import { defaultPipelineStages, type PipelineDocument, type PipelineContext, type PipelineStage } from './stages.js'
 
@@ -71,13 +73,23 @@ const JOB_DOCUMENT_SELECT = {
   fileName: true,
   contentHash: true,
   status: true,
+  imageMode: true,
   /**
    * 分块参数住在**知识库**上（`chunk_size` / `chunk_overlap` 两列 + `retrieval_config.splitStrategy`），
    * 而处理一份文档离不开它们（P0-1-18 的 chunk 阶段要用）。
    * 用一次联表带出来，而不是让阶段自己再查一遍库：三个阶段各查一次就是"同一份数据、三种读法"
    * 的开始，而且那三次查询都发生在**已经拿到行之后**，纯粹是白花的往返。
    */
-  kb: { select: { chunkSize: true, chunkOverlap: true, retrievalConfig: true } },
+  kb: {
+    select: {
+      chunkSize: true,
+      chunkOverlap: true,
+      retrievalConfig: true,
+      // 该库选定的 embedding 模型 + 维度（本批起入库用它，而不是进程级环境变量）
+      embeddingModelId: true,
+      embeddingDim: true,
+    },
+  },
 } as const
 
 /** 可观测计数（验收断言并发与幂等靠它；也是将来 `/health` 或运维面板的雏形） */
@@ -366,6 +378,7 @@ async function handleJob(job: PipelineJob): Promise<void> {
       // jsonb 里可能缺键（老数据 / PATCH 只改了一半）⇒ 一律走 shared 的补默认值，
       // **不在这里写 `?? 'hybrid'`**（那是"散落的第二个真相"，见 `shared/src/knowledgeBase.ts` 文件头 ②）
       splitStrategy: normalizeRetrievalConfig(row.kb.retrievalConfig).splitStrategy,
+      imageMode: row.imageMode,
     }
     const ctx: PipelineContext = { job, document, log }
     let status: DocumentStatus = row.status
@@ -376,6 +389,29 @@ async function handleJob(job: PipelineJob): Promise<void> {
     }
 
     try {
+      // 解析该库**选定**的 embedding 模型（入库用它，而不是进程级环境变量）——
+      // 查库 + 解密 Key 都在这里；失败按"文档处理失败"落库（消息可展示），不是基础设施故障。
+      const target = await resolveEmbeddingTarget(row.kb.embeddingModelId)
+      // 防御性复核：多模态图片模式要求该库模型支持多模态端点（上传时已校验过一次，
+      // 但模型可能在文档排队期间被改过 —— 这里再拦一道，避免图片被当文本静默吞掉）
+      if (row.imageMode === 'MULTIMODAL' && !target.embeddingMultimodal) {
+        throw AppError.conflict(MULTIMODAL_MODEL_REQUIRED_HINT)
+      }
+      ctx.embeddingDim = requireEmbeddingDim(row.kb.embeddingDim)
+      ctx.embeddingBatchSize = config.embedding.batchSize
+      ctx.embeddingProvider = buildPoolEmbeddingProvider(
+        {
+          providerName: target.providerName,
+          baseUrl: target.baseUrl,
+          customUrl: target.customUrl,
+          multimodal: target.embeddingMultimodal,
+          apiKey: target.apiKey,
+          apiModel: target.modelName,
+        },
+        ctx.embeddingDim,
+        ctx.embeddingBatchSize,
+      )
+
       for (const stage of state.stages) await stage.run(ctx)
       const ok = await transition(
         document,
@@ -421,6 +457,19 @@ async function handleJob(job: PipelineJob): Promise<void> {
 /** 累加一个跳过原因（计数进 {@link PipelineWorkerStats.skipped}） */
 function countSkip(reason: string): void {
   state.skipped[reason] = (state.skipped[reason] ?? 0) + 1
+}
+
+/**
+ * 该库必须已有 embedding 维度快照（建库时探测写入）。
+ * `null` = 本功能上线前建的老库 ⇒ 给一句可操作的失败文案，而不是让维度 `undefined` 滑到 SQL 里。
+ */
+function requireEmbeddingDim(dim: number | null): number {
+  if (dim === null) {
+    throw AppError.validation(
+      '该知识库未记录 embedding 维度（可能是本功能上线前建的老库）。请重建知识库并重新选择 embedding 模型后再上传文档',
+    )
+  }
+  return dim
 }
 
 /**

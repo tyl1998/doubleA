@@ -68,17 +68,35 @@ export interface SandboxMcpToolRef {
   inputSchema: unknown
 }
 
+/**
+ * 一项**平台内置工具**（不是 MCP：没有 server / 凭据 / 危险确认）。
+ *
+ * 当前只有「知识库」一族（`knowledge_search` / `list_knowledge`）。它们与 MCP 工具**同一次下发**
+ * （同一个 `/api/sandbox/mcp/tools`），但**不写进 {@link SandboxMcpCatalog.tools}** ——
+ * 那张表是「`mcp_<alias>_<tool>` → 哪台 server 的哪个工具」的反查表，塞进内置工具会让
+ * `map.ts` 把它们当 MCP 卡（`kind:MCP` + 一个假的 `serverId`），而那不是它们。
+ */
+export interface SandboxBuiltinToolRef {
+  /** 注册给引擎的名字（内置名**就是** `knowledge_search` / `list_knowledge`，不加 `mcp_` 前缀） */
+  name: string
+  description: string
+  /** 原样的 JSON Schema（容器侧据此给模型声明参数） */
+  inputSchema: unknown
+}
+
 /** 一次会话的工具清单 + 别名映射 */
 export interface SandboxMcpCatalog {
   /** 参与本轮下发的 server（顺序 = 别名分配顺序） */
   servers: SandboxMcpServerRef[]
   /** **注册给引擎的名字**（`mcp_<alias>_<tool>`）→ 这个工具是谁 */
   tools: Record<string, SandboxMcpToolRef>
+  /** 平台内置工具（知识库检索 / 目录）。**没有就是空数组**（绝大多数 Agent 不绑 KB） */
+  builtins: SandboxBuiltinToolRef[]
 }
 
-/** 空清单（Agent 没绑任何 MCP server —— 这是最常见的一种） */
+/** 空清单（Agent 没绑任何 MCP server / 知识库 —— 这是最常见的一种） */
 export function emptySandboxMcpCatalog(): SandboxMcpCatalog {
-  return { servers: [], tools: {} }
+  return { servers: [], tools: {}, builtins: [] }
 }
 
 // ───────────────────────────── 纯函数：命名 ─────────────────────────────
@@ -237,9 +255,10 @@ function parseCatalog(raw: string): SandboxMcpCatalog | null {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
-    const { servers, tools } = parsed as { servers?: unknown; tools?: unknown }
+    const { servers, tools, builtins } = parsed as { servers?: unknown; tools?: unknown; builtins?: unknown }
     if (!Array.isArray(servers)) return null
     if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) return null
+    // `builtins` 是本批新增的字段：老值（本批之前写进 Redis 的）没有它 ⇒ 缺失按空数组（TTL 会兜底）
 
     const serverRefs: SandboxMcpServerRef[] = []
     for (const entry of servers) {
@@ -272,7 +291,20 @@ function parseCatalog(raw: string): SandboxMcpCatalog | null {
         inputSchema: inputSchema ?? null,
       }
     }
-    return { servers: serverRefs, tools: toolRefs }
+
+    const builtinRefs: SandboxBuiltinToolRef[] = []
+    if (builtins !== undefined) {
+      if (!Array.isArray(builtins)) return null
+      for (const entry of builtins) {
+        if (typeof entry !== 'object' || entry === null) return null
+        const { name, description, inputSchema } = entry as Partial<SandboxBuiltinToolRef>
+        if (typeof name !== 'string' || name === '') return null
+        if (typeof description !== 'string') return null
+        builtinRefs.push({ name, description, inputSchema: inputSchema ?? null })
+      }
+    }
+
+    return { servers: serverRefs, tools: toolRefs, builtins: builtinRefs }
   } catch {
     return null
   }

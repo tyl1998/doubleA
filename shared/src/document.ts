@@ -73,12 +73,69 @@ export function canTransitionDocumentStatus(from: DocumentStatus, to: DocumentSt
 }
 
 /**
- * 可上传的扩展名白名单（`子方案①` §4-1 第 1 条）。
+ * 可上传的扩展名白名单（`子方案①` §4-1 第 1 条；P0-4-x 起并入图片格式）。
+ *
  * ⚠️ 与 `.doc` 是**互斥**的两件事：`.doc` 不在白名单里，但它有**专门**的拦截分支
  * （给"请另存为 .docx 后重传"这句可读提示），不能混成一句"不支持的文件类型"。
+ *
+ * ⚠️ 图片格式（png/jpg/jpeg/webp/gif/bmp）只有在上传时选择了**图片解析方式**
+ * （`imageMode != NONE`）时才真正接受 —— 判据在服务层，见 `IMAGE_FILE_REQUIRES_MODE_HINT`。
+ * 单独把扩展名放进白名单，是为了让 `.doc` 那样的"格式知识"只有一份。
  */
-export const UPLOAD_EXTENSIONS = ['pdf', 'docx', 'md', 'txt'] as const
+export const UPLOAD_EXTENSIONS = ['pdf', 'docx', 'md', 'txt', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] as const
 export type UploadExtension = (typeof UPLOAD_EXTENSIONS)[number]
+
+/** 图片格式（= 直接上传的独立图片文件；区别于文档内的内嵌图） */
+export const IMAGE_UPLOAD_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] as const
+export type ImageUploadExtension = (typeof IMAGE_UPLOAD_EXTENSIONS)[number]
+
+/** 是否是独立图片文件 */
+export function isImageUploadExtension(ext: string): ext is ImageUploadExtension {
+  return (IMAGE_UPLOAD_EXTENSIONS as readonly string[]).includes(ext)
+}
+
+/**
+ * 文档内图片的处理方式（**按文档**，上传时选择；`documents.image_mode`）。
+ *
+ * 取值与 `schema.prisma` 的 `ImageMode` 枚举、`documents.image_mode` 列**逐字一致**
+ * （大写），避免"接口一套、库里一套"的映射层：
+ *   · `NONE`       —— 不解析图片（与历史行为一致；内嵌图按原逻辑丢弃/当正文）。
+ *   · `OCR`        —— 抽取图片后**本地 OCR 成文字**，作为普通文本块进分块/向量化链路。
+ *   · `MULTIMODAL` —— 抽取图片转 base64，作为 content part 交给知识库所选的**多模态 embedding**
+ *                     模型（`/embeddings/multimodal`）直接向量化。要求该模型 `embeddingMultimodal=true`。
+ */
+export const IMAGE_MODES = ['NONE', 'OCR', 'MULTIMODAL'] as const
+export type ImageMode = (typeof IMAGE_MODES)[number]
+
+/** 默认值（与 `documents.image_mode` 的 DB 默认值一致） */
+export const DEFAULT_IMAGE_MODE: ImageMode = 'NONE'
+
+/** 界面展示用的中文标签（前后端共用同一份，避免两边各写一遍漂移） */
+export const IMAGE_MODE_LABELS: Readonly<Record<ImageMode, string>> = Object.freeze({
+  NONE: '不解析图片',
+  OCR: '解析图片（OCR 转文字）',
+  MULTIMODAL: '解析图片（多模态向量化）',
+})
+
+/** 上传时携带图片解析方式的 multipart 字段名（与文件字段 `file` 并列） */
+export const UPLOAD_IMAGE_MODE_FIELD = 'imageMode'
+
+/**
+ * 上传了独立图片文件、但没有选择图片解析方式时的提示。
+ *
+ * 与 `LEGACY_DOC_HINT` 同款：**前后端共用同一句**，且它必须是"用户的下一步动作"
+ * （回上传弹窗选一个解析方式），而不是一句笼统的"不支持"。
+ */
+export const IMAGE_FILE_REQUIRES_MODE_HINT = '图片文件需要在上传时选择"解析图片"方式（OCR 或多模态向量化）'
+
+/**
+ * 选择了多模态向量化、但知识库所选 embedding 模型不支持多模态时的提示。
+ *
+ * `MULTIMODAL` 依赖 `/embeddings/multimodal` 端点，只有模型池里标了 `embeddingMultimodal` 的
+ * 向量模型才有；用错模型时**宁可当场拒绝**，也不要等流水线跑完才发现图片进不了向量空间。
+ */
+export const MULTIMODAL_MODEL_REQUIRED_HINT =
+  '当前知识库使用的 embedding 模型不支持多模态，无法按"多模态向量化"解析图片；请改用"OCR 转文字"，或把知识库换成支持多模态的向量模型后重建'
 
 /** 旧版 Word 二进制格式（决策 10：**不做解析**，直接拒绝并给可操作提示） */
 export const LEGACY_DOC_EXTENSION = 'doc'
@@ -98,6 +155,13 @@ export const MIME_BY_EXTENSION: Readonly<Record<UploadExtension, readonly string
   docx: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/zip'],
   md: ['text/markdown', 'text/x-markdown', 'text/plain'],
   txt: ['text/plain'],
+  // 图片：浏览器对同一张 jpg 可能报 image/jpeg 或 image/jpg，两者都放行
+  png: ['image/png'],
+  jpg: ['image/jpeg', 'image/jpg'],
+  jpeg: ['image/jpeg', 'image/jpg'],
+  webp: ['image/webp'],
+  gif: ['image/gif'],
+  bmp: ['image/bmp', 'image/x-ms-bmp'],
 }
 
 /** 文档列表项 / 上传响应里的文档对象（`GET .../documents` 是 P0-1-21，**同一套投影**） */
@@ -109,6 +173,8 @@ export const documentItemSchema = z.object({
   status: z.enum(DOCUMENT_STATUSES),
   /** 已入库的 chunk 数；非 `READY` 时为 0（见文件头 ②） */
   chunkCount: z.number().int().min(0),
+  /** 该文档的图片处理方式（上传/覆盖重建时选定；见 {@link IMAGE_MODES}） */
+  imageMode: z.enum(IMAGE_MODES),
   /** 仅 `FAILED` 时有值，内容是可直接展示给用户的中文原因 */
   errorMsg: z.string().nullable(),
   /** ISO 8601 */
@@ -220,6 +286,56 @@ export type ListDocumentsQuery = z.infer<typeof listDocumentsQuerySchema>
  */
 export const documentListResultSchema = offsetPageOf(documentItemSchema)
 export type DocumentListResult = z.infer<typeof documentListResultSchema>
+
+// ───────────────────────────── 文档片段（chunk）预览（P0-1-35 增量）─────────────────────────────
+
+/**
+ * 文档的一个片段（`chunks` 表的一行，投影给"块内容预览"用）。
+ *
+ * ── 为什么单开一个端点/投影，而不是复用检索结果 ──
+ * `retrievalHitSchema` 的 `snippet` 是**命中位置附近的原文窗口**（`buildSnippet`），不是整块原文，
+ * 而且只返回 topK 条 —— 它回答的是"这次查询命中了什么"，回答不了"这篇文档被切成了哪些块"。
+ * 预览要的是**按 `seq` 顺序的完整块**，语义不同，故不能复用。
+ *
+ * ── 逐字段的取值口径 ──
+ * · `seq`：块在文档内的序号（0 起，`chunks` 表的口径），预览里就是"第几块"；
+ * · `content`：整块原文（**不加工、不截断**）—— 预览的价值就是让人核对切分是否合理；
+ * · `page` / `headingPath`：来自 `chunks.meta`，缺键的历史行回落 `null` / `[]`
+ *   （读取口径见后端 `retrieval.ts#parseChunkMeta`，两处必须是同一份兜底）。
+ *
+ * ⚠️ **刻意不含 `embedding`**：它是 1024 维向量（数千字符的字符串），预览页用不上，
+ * 放进列表响应会让一页 20 条变成几百 KB 的无用载荷。
+ */
+export const chunkItemSchema = z.object({
+  /** `chunks.id`（uuid(7)） */
+  id: z.string(),
+  docId: z.string(),
+  /** 块在文档内的序号（从 0 开始） */
+  seq: z.number().int().min(0),
+  /** 整块原文（不加工、不截断） */
+  content: z.string(),
+  /** `meta.page`：PDF 才有页码，其余为 `null` */
+  page: z.number().int().nullable(),
+  /** `meta.headingPath`：块所属的标题层级（无标题层级的格式为 `[]`） */
+  headingPath: z.array(z.string()),
+})
+export type ChunkItem = z.infer<typeof chunkItemSchema>
+
+/**
+ * `GET /api/knowledge-bases/:id/documents/:docId/chunks` 查询参数（与文档列表同口径）。
+ *
+ * 默认 `limit` **比文档列表小**（20 而不是它的一次取满 100）：一个块的内容可能上千字符，
+ * 一屏看不了几条；而 `total` 会如实给出，前端据此分页。上限仍是 100（与其余列表一致）。
+ */
+export const listDocumentChunksQuerySchema = z.object({
+  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
+  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+})
+export type ListDocumentChunksQuery = z.infer<typeof listDocumentChunksQuerySchema>
+
+/** 片段列表响应：`{ items, total, offset, limit }`（与文档列表同一套分页形状） */
+export const documentChunkListResultSchema = offsetPageOf(chunkItemSchema)
+export type DocumentChunkListResult = z.infer<typeof documentChunkListResultSchema>
 
 /**
  * `PARSING` 态在列表里的提示文案（`子方案①` §七 → `06` P0-1-19 的坑预判：**必须做**）。

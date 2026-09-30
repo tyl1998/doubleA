@@ -42,8 +42,10 @@
  * ═══════════════════════════════════════════════════════════════════════
  * ⚠️ 两条边界（写在这里免得下次误改）
  * ═══════════════════════════════════════════════════════════════════════
- *   · **产物不跟会话/Agent 的删除走**：删会话会级联删行（schema 的 `onDelete: Cascade`），
- *     但文件与行的**过期收口只有保留期清理器**（`02` §三"消息与产物都不删"的完整语义）。
+ *   · **产物不跟会话/Agent 的删除走**（`TaskAgent记忆与产物` 块 3 起**字面成立**）：
+ *     schema 的 `Artifact.conversationId` 是可空 + `onDelete: SetNull` —— 删会话只把
+ *     `conversation_id` 置空、产物行保留（归"历史产物"，按 `user_id` 可查）；文件与行的
+ *     **过期收口只有保留期清理器**（`02` §三"消息与产物都不删"的完整语义）。
  *   · **收集失败 ≠ 这一轮失败**：编排层对本模块的一切异常都 catch + warn 后继续收尾
  *     （产物是本轮的**赠品**，不是交付物本体；正文已经流出去了）。
  */
@@ -271,6 +273,19 @@ export async function collectRoundArtifacts(input: {
   const { conversationId, containerId, baseline } = input
   const logger = getLogger()
 
+  // 建行要写 `user_id`（`TaskAgent记忆与产物` 块 3：删除会话后产物行靠它归回给用户）。
+  // 从会话行查一次（不信任任何传入值 —— 归属**只能**来自会话的 owner 列）。
+  // ⚠️ 查不到 = 会话已经被删：产物无处归属，这一轮**整轮跳过**（比"每行都建失败再补偿删对象"
+  //    干净 —— 那不是一次两次的偶发，而是结构性的事）。
+  const owner = await getPrisma().conversation.findFirst({
+    where: { id: conversationId },
+    select: { userId: true },
+  })
+  if (owner === null) {
+    logger.warn({ conversationId, containerId }, '产物收集时会话已不存在，本轮产物跳过（无法确定归属用户）')
+    return []
+  }
+
   const current = await snapshotWorkFiles(containerId)
   if (current === undefined) return []
 
@@ -335,6 +350,8 @@ export async function collectRoundArtifacts(input: {
         const row = await getPrisma().artifact.create({
           data: {
             conversationId,
+            // 归属用户（删除会话后"我的历史产物"的唯一判据，见 schema.prisma#Artifact.userId）
+            userId: owner.userId,
             fileKey,
             fileName: path,
             size: bytes.length,

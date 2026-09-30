@@ -19,6 +19,7 @@
  * | `POST .../retry` | `{ document }` |
  * | `DELETE .../documents/:docId` | `{ id, fileName, deletedChunks }` |
  * | `POST .../search` | `{ items, mode, topK, rrfK, candidatePool, elapsedMs, vectorPathSkipped, warnings }` |
+ * | `GET .../documents/:docId/chunks` | `{ items, total, offset, limit }`（每项 = `ChunkItem`） |
  * | `GET .../download` | **字节流**（本仓唯一不套信封的端点，见 `api/client.ts#requestBlob`） |
  *
  * 本仓**刻意四族权限、四种信封形态各不相同**（`docs/06` §六 第 ⑭ 条）：把 `{items}` 类推到
@@ -41,11 +42,13 @@
  */
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { UPLOAD_FILE_FIELD } from '@doubulea/shared'
+import { UPLOAD_FILE_FIELD, UPLOAD_IMAGE_MODE_FIELD } from '@doubulea/shared'
 import type {
   CreateKnowledgeBaseBody,
+  DocumentChunkListResult,
   DocumentItem,
   DocumentListResult,
+  ImageMode,
   KnowledgeBaseItem,
   KnowledgeBaseListResult,
   RemoveDocumentResult,
@@ -189,13 +192,75 @@ export function useDocuments(kbId: string, params: ListDocumentsParams = {}) {
   })
 }
 
+// ───────────────────────────── 片段预览 ─────────────────────────────
+
+/**
+ * 一次取回的片段数（= `listDocumentChunksQuerySchema` 的默认 `limit`，两处同源）。
+ *
+ * 比文档列表的一次取满（100）小得多：一个块的内容可上千字符，一屏放不下几条；
+ * 抽屉里用分页器翻，`total` 由后端如实给出。
+ */
+export const CHUNKS_PAGE_LIMIT = 20
+
+/** 片段预览键（带 `docId` 与分页，避免不同文档/页互相串缓存） */
+export function documentChunksQueryKey(
+  kbId: string,
+  docId: string,
+  offset: number,
+  limit: number,
+): readonly [string, string, string, string, string, number, number] {
+  return ['knowledge-bases', kbId, 'documents', docId, 'chunks', offset, limit] as const
+}
+
+export interface ListDocumentChunksParams {
+  offset?: number
+  limit?: number
+}
+
+export function fetchDocumentChunks(
+  kbId: string,
+  docId: string,
+  params: ListDocumentChunksParams = {},
+): Promise<DocumentChunkListResult> {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? CHUNKS_PAGE_LIMIT
+  return request<DocumentChunkListResult>(
+    `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}` +
+      `/chunks?offset=${offset}&limit=${limit}`,
+  )
+}
+
+/**
+ * 读某篇文档的片段（按 `seq` 升序分页）。
+ *
+ * ⚠️ **必须显式 `enabled`**：抽屉是常驻挂载的（打开/关闭只切 `open`），而关闭时没有目标文档
+ * —— 不给 `enabled` 会在抽屉从未打开过时也发一次请求（`docId` 还是个空串）。
+ * 片段是**已入库的静态内容**（覆盖重建会清空重来），不做轮询：打开时取一次、翻页时再取即可。
+ */
+export function useDocumentChunks(
+  kbId: string,
+  docId: string,
+  params: ListDocumentChunksParams = {},
+  enabled = true,
+) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? CHUNKS_PAGE_LIMIT
+  return useQuery({
+    queryKey: documentChunksQueryKey(kbId, docId, offset, limit),
+    queryFn: () => fetchDocumentChunks(kbId, docId, params),
+    enabled: enabled && docId !== '',
+    placeholderData: keepPreviousData,
+  })
+}
+
 /** 上传一个文档（单文件，字段名 `file`；成功是 `PARSING`，真正的解析由 worker 异步完成） */
 export function useUploadDocument(kbId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (file: File) => {
+    mutationFn: ({ file, imageMode }: { file: File; imageMode: ImageMode }) => {
       const formData = new FormData()
       formData.append(UPLOAD_FILE_FIELD, file)
+      formData.append(UPLOAD_IMAGE_MODE_FIELD, imageMode)
       return requestFormData<UploadDocumentResult>(
         `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
         formData,
@@ -209,9 +274,10 @@ export function useUploadDocument(kbId: string) {
 export function useReuploadDocument(kbId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ docId, file }: { docId: string; file: File }) => {
+    mutationFn: ({ docId, file, imageMode }: { docId: string; file: File; imageMode: ImageMode }) => {
       const formData = new FormData()
       formData.append(UPLOAD_FILE_FIELD, file)
+      formData.append(UPLOAD_IMAGE_MODE_FIELD, imageMode)
       return requestFormData<ReuploadDocumentResult>(
         `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/reupload`,
         formData,

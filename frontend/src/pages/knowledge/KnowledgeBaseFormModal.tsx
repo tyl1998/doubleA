@@ -25,12 +25,13 @@
  * 可访问性靠 `aria-label`（与 P0-1-31 的编辑页同一写法）。
  */
 
-import { Alert, Input, InputNumber, Modal } from 'antd'
+import { Alert, Input, InputNumber, Modal, Select } from 'antd'
 import type { KnowledgeBaseItem } from '@doubulea/shared'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
 import { useCreateKnowledgeBase, useUpdateKnowledgeBase } from '../../api/knowledgeBases.js'
+import { useAvailableEmbeddingModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   buildCreateBody,
@@ -57,11 +58,23 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [embeddingModelId, setEmbeddingModelId] = useState('')
   const [chunkSize, setChunkSize] = useState<number | null>(null)
   const [chunkOverlap, setChunkOverlap] = useState<number | null>(null)
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const editing = kb !== null
+
+  // 建库要选一个 embedding 模型（模型池 `type=EMBEDDING`）；数据源与后端校验同一套（启用中）
+  const embeddingModels = useAvailableEmbeddingModels()
+  const embeddingOptions = useMemo(
+    () =>
+      (embeddingModels.data?.items ?? []).map((model) => ({
+        value: model.id,
+        label: `${model.label}（${model.providerName} / ${model.modelName}）`,
+      })),
+    [embeddingModels.data],
+  )
 
   // 每次打开都按目标对象重置 —— 否则编辑 A 之后打开"创建"，表单里还留着 A 的内容
   useEffect(() => {
@@ -69,6 +82,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
     if (kb === null) {
       setName('')
       setDescription('')
+      setEmbeddingModelId('')
       setChunkSize(null)
       setChunkOverlap(null)
     } else {
@@ -86,13 +100,13 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   /** 两端共用的"能不能提交"：名字必填；两个分块参数**都填了**才判跨字段（见文件头 ①） */
   const chunkingError =
     chunkSize !== null && chunkOverlap !== null ? validateChunking(chunkSize, chunkOverlap) : null
-  const canSubmit = name.trim() !== '' && (editing || chunkingError === null) && !submitting
+  const canSubmit = name.trim() !== '' && (editing || embeddingModelId !== '') && (editing || chunkingError === null) && !submitting
 
   const submit = (): void => {
     setErrorText(null)
 
     if (kb === null) {
-      const values: KnowledgeCreateFormValues = { name, description, chunkSize, chunkOverlap }
+      const values: KnowledgeCreateFormValues = { name, description, embeddingModelId, chunkSize, chunkOverlap }
       if (chunkingError !== null) {
         setErrorText(chunkingError)
         return
@@ -103,8 +117,8 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
           onClose()
           onCreated?.(created)
         },
-        // 失败停留弹窗：用户需要看到原因（最典型的是 500「服务端 embedding 未就绪」——
-        // 建库要快照 `embedding_model`，取不到就建不了。这句话必须让人看见）
+        // 失败停留弹窗：用户需要看到原因（最典型的是所选 embedding 模型不可用 / 探测维度失败、
+        // 或该模型已被停用）。建库要探测维度，失败就不能建 —— 这句话必须让人看见
         onError: (error) => setErrorText(describeError(error).message),
       })
       return
@@ -159,7 +173,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
             }}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            最多 128 个字符。建库是配置动作，不需要先配好模型或 embedding。
+            最多 128 个字符。建库是配置动作；但需要先有一个可用的<strong>向量模型</strong>（见下）。
           </p>
         </div>
 
@@ -174,6 +188,26 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
             onChange={(event) => setDescription(event.target.value)}
           />
         </div>
+
+        {!editing && (
+          <div>
+            <p className="block-label">Embedding 模型</p>
+            <Select
+              value={embeddingModelId === '' ? undefined : embeddingModelId}
+              options={embeddingOptions}
+              loading={embeddingModels.isPending}
+              placeholder="选择一个向量模型（模型池里「向量」类型的模型）"
+              style={{ width: '100%' }}
+              aria-label="Embedding 模型"
+              onChange={setEmbeddingModelId}
+            />
+            <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+              本库的文本将用它向量化。建库时后端会向它<strong>探测一次维度</strong>并快照到本库；
+              之后入库与检索都按该维度进行。下拉里没有可选项？请先到「模型池」新增一个
+              <strong>向量类型</strong>的 Provider 及其模型。
+            </p>
+          </div>
+        )}
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>

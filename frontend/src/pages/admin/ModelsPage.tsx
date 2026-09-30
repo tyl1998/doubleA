@@ -260,25 +260,35 @@ export function ModelsPage() {
       render: (_, model) => <Tag>{MODEL_TYPE_LABELS[model.type]}</Tag>,
     },
     {
-      title: '上下文',
+      // 对话模型看"上下文长度"，向量模型看"维度"（`01` 起向量模型没有 token 上下文这个概念）
+      title: '上下文 / 维度',
       dataIndex: 'maxContext',
-      width: 110,
+      width: 130,
       align: 'right',
-      render: (_, model) => <span className="num">{maxContextText(model.maxContext)}</span>,
+      render: (_, model) =>
+        model.type === 'EMBEDDING' ? (
+          <span className="num">{model.embeddingDim === null ? '维度 —' : `维度 ${model.embeddingDim}`}</span>
+        ) : (
+          <span className="num">{maxContextText(model.maxContext)}</span>
+        ),
     },
     {
       title: '图片',
       dataIndex: 'supportsVision',
       width: 70,
       align: 'center',
-      render: (_, model) => <span className="num">{model.supportsVision ? '✓' : '—'}</span>,
+      render: (_, model) => (
+        <span className="num">{model.type === 'EMBEDDING' ? '—' : model.supportsVision ? '✓' : '—'}</span>
+      ),
     },
     {
       title: '思考',
       dataIndex: 'supportsReasoning',
       width: 70,
       align: 'center',
-      render: (_, model) => <span className="num">{model.supportsReasoning ? '✓' : '—'}</span>,
+      render: (_, model) => (
+        <span className="num">{model.type === 'EMBEDDING' ? '—' : model.supportsReasoning ? '✓' : '—'}</span>
+      ),
     },
     {
       title: '状态',

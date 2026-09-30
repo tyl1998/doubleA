@@ -149,24 +149,46 @@ pnpm sandbox:build -- --registry https://registry.npmmirror.com
 
 | 项 | 值 |
 |----|----|
-| base 镜像 | `doubulea/sandbox-base:3`（P0-3-9b 起；`:2` 里是**空壳**桥扩展，`:1` 还缺 `gen-models.mjs` 那一步） |
-| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:3` |
+| base 镜像 | `doubulea/sandbox-base:5`（P0-3-14 起；`:3` 只注册 MCP 工具，`:2` 里是**空壳**桥扩展，`:1` 还缺 `gen-models.mjs` 那一步） |
+| toolkit 镜像（**= 最终镜像**，`SANDBOX_IMAGE` 指它） | `doubulea/sandbox-toolkit:5` |
 | pin 的引擎 | `@earendil-works/pi-coding-agent@0.87.1`（Node ≥ 22.19.0，镜像内实为 22.23.3） |
 | 镜像内用户 | `agent`（uid 10001，**非 root**）；可写点只有 `/work`（卷）与 `/tmp`（P0-3-3 起是 tmpfs） |
 | pi 配置 | **只读种子**烤进 `/opt/pi/agent`（`PI_AGENT_SEED`，对 agent 只读）；入口 `entrypoint.sh` 把它 `cp -an` **播种**到可写的 `/tmp/pi-agent`（`PI_CODING_AGENT_DIR`）后再 `exec pi`。⚠️ 必须两步：pi 读 `settings.json` 会**先在同目录加锁**，只读目录上加不上锁 ⇒ 整份 settings 被判 invalid 并**静默忽略**。里面**没有 `auth.json`**（Key 走容器环境变量）；**P0-3-4 起播种后多一步 `gen-models.mjs`** ⇒ 运行期生成 `models.json`，而它的 `apiKey` 只是 `${DOUBULEA_LLM_API_KEY}` **引用**（见「沙箱 LLM 注入」一节） |
 | 依赖自检 | 构建末步跑 `toolkit/selfcheck.sh`，缺一个依赖就让 **build 失败** |
-| 桥扩展 | `/opt/pi/agent/extensions/mcp-bridge/index.ts` —— **P0-3-9b 起是真实现**（`session_start` 拉 `GET /api/sandbox/mcp/tools` 并逐个 `pi.registerTool`；每次调用转成 `POST /api/sandbox/mcp/call`）。它**不含任何凭据**，只读容器 env 的 `SANDBOX_BACKEND_URL` / `SANDBOX_TOKEN` / `SANDBOX_PROXY_TIMEOUT_MS`（`sandbox/spec.ts` 是这三个名字的源头） |
+| 桥扩展 | `/opt/pi/agent/extensions/mcp-bridge/index.ts` —— **P0-3-9b 起是真实现**（`session_start` 拉 `GET /api/sandbox/mcp/tools` 并逐个 `pi.registerTool`；MCP 调用转成 `POST /api/sandbox/mcp/call`）。**P0-3-14 起还注册内置工具**（`builtinTools` 段里的 `knowledge_search` / `list_knowledge`，转成 `POST /api/sandbox/builtin/call`）⇒ 绑知识库的 TaskAgent 能检索。它**不含任何凭据**，只读容器 env 的 `SANDBOX_BACKEND_URL` / `SANDBOX_TOKEN` / `SANDBOX_PROXY_TIMEOUT_MS`（`sandbox/spec.ts` 是这三个名字的源头） |
 
 ```bash
 # 在活容器里重跑依赖自检（排障时先跑它，能把"镜像问题"与"用法问题"分开）
-docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:3
+docker run --rm --entrypoint /opt/sandbox-selfcheck.sh doubulea/sandbox-toolkit:5
 # 手 run 一个"能说话"的容器（默认 CMD 就是 --mode rpc）
-docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:3 --help
+docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:5 --help
 ```
 
 > ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
 > `npm i` **必然失败**，而阶段三的验收场景「分析这份 CSV 出汇总表」恰恰要 pandas（`子方案③` §五 2）。
 > 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
+
+**构建提速与清理（P0-3-14 起）**：
+
+- ⭐ **换 Debian 源**（本机最大的提速点）：官方 `deb.debian.org` 本机实测只 **~0.4MB/s**，而清华源
+  `mirrors.tuna.tsinghua.edu.cn` **~6MB/s**（十几倍）。`--registry` 一旦是 `npmmirror`，脚本会**自动**
+  把 Debian 源也换成清华；也可显式给：
+  ```bash
+  pnpm sandbox:build -- --registry https://registry.npmmirror.com --apt-mirror mirrors.tuna.tsinghua.edu.cn
+  # 等价环境变量：SANDBOX_APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+  # 显式留空（--apt-mirror ''）就是走官方源（CI / 海外环境用这个）
+  ```
+- ⭐ **BuildKit 缓存挂载**：base / toolkit 的 `apt` 与 `npm` 步骤改成 `RUN --mount=type=cache` ⇒
+  包里与索引留在**构建缓存**、不进镜像层；改了扩展导致 toolkit 重跑时，**不再重新下载**同样的 deb。
+  ⚠️ 它**不需要** `# syntax=docker/dockerfile:1`（仍是刻意不写，见 Dockerfile 头部）；但要求 daemon 开 BuildKit（现代 Docker 默认开）。
+- ⭐ **`--prune` 回收**：Docker **从不自动删**旧镜像/缓存。加 `--prune` 后，构建完自动清掉
+  **不在保护名单**的旧 `doubulea/sandbox-*` tag、悬空镜像、已停的 sandbox 容器与无主卷，
+  以及 **24h 之前**的构建缓存（保护名单 = 本次构建的两个 tag + `infra/.env` 正在用的 tag）：
+  ```bash
+  pnpm sandbox:build -- --registry https://registry.npmmirror.com --prune
+  ```
+  ⚠️ 想连近 24h 的缓存也一起清：`docker builder prune -f`（本机曾一次回收 ~30GB）。
+  ⚠️ 只重建该变的层可省最多时间：`--base-only`（只改 pi/扩展）/ `--toolkit-only`（只加依赖）。
 > ⚠️ **本步不是可端测里程碑**：容器生命周期**已落地**（P0-3-2，见下一节）、两条网络出口（P0-3-3）、
 > 模型 Key 注入（P0-3-4，见后面「沙箱 LLM 注入」一节）都已落地，但**引擎桥还没接**（P0-3-5/6）
 > ⇒ **当时还不能派活**。⚠️ 那条路已经走完：**P0-3-11 是端测里程碑（已落地）**，批次的镜像版本
@@ -702,9 +724,10 @@ pi（容器内）的 mcp_* 工具（桥扩展在 session_start 里注册的）
 **前置**（四样，缺一样就走不到后面）：
 
 1. 依赖服务 + 后端（13000）起着；
-2. ⭐ **镜像必须重建到 `:3`** —— 桥扩展在 P0-3-1 只是个**空壳**（当时只证明"扩展能被 pi 加载"），
-   真实现是这一批落的：`pnpm sandbox:build -- --registry https://registry.npmmirror.com`，
-   再把 `infra/.env` 的 `SANDBOX_IMAGE` 改成打印出来的 `doubulea/sandbox-toolkit:3`；
+2. ⭐ **镜像必须重建到当前版本（`:5`）** —— 桥扩展在 P0-3-1 只是个**空壳**（当时只证明"扩展能被 pi 加载"），
+   真实现是 P0-3-9b 落的、P0-3-14 又加了内置工具注册：
+   `pnpm sandbox:build -- --registry https://registry.npmmirror.com`，
+   再把 `infra/.env` 的 `SANDBOX_IMAGE` 改成打印出来的 `doubulea/sandbox-toolkit:5`；
    ⚠️ 不重建的症状最隐蔽：后端日志**一条错都没有**，只是"模型从来不调 MCP 工具"（空壳没注册任何工具）；
 3. ⭐ **一个绑了 MCP server 的 `TASK_AGENT`** —— 绑定入口见「浏览器端测 · MCP」那一节（管理页）或
    `POST /api/agents/:id/components`；⚠️ **那台 server 必须有工具缓存**（在 `/mcp` 点一次「测试」拉
@@ -763,6 +786,44 @@ docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/
 > ⇒ 上面每一条都要你自己动手。⚠️ 其中"**扩展到底加载上没有、注册成功没有**"只有**重建镜像到 `:3` 之后**才验得到；
 > 另外 pi 的扩展 API 形状（`session_start` / `registerTool` / **`throw` 才算失败**）来自上游文档，
 > 本仓没有类型可查（`infra/` 不在任何 tsconfig 的 include 里）。
+
+### TaskAgent 知识库（P0-3-14 起；⚠️ 浏览器/命令行档）
+
+**一句话**：给 **TaskAgent**（沙箱里的 pi 引擎）绑知识库，现在它**能识别并使用知识库**了 ——
+和 ChatBot 走**同一套**检索口径（`knowledge_search` / `list_knowledge`），只是工具经**沙箱代理**由后端代跑。
+
+**它修的是哪半条漏接**：知识库原先**只接在 ChatBot 上** —— `chatBot.ts` 才下发两个内置工具、才注入「可用知识库」
+清单；`taskAgent.ts` 既没有 system 通道、沙箱清单（`buildSandboxMcpCatalog`）又只认 `componentType:'MCP'`
+⇒ 模型**不知道有库、也没有检索能力**（P0-3-13 的清单因此把 `citations` 空数组写成"刻意边界"，本批把它补上）。
+
+**链路**（与 MCP 同一条代理思路，执行体与 ChatBot 共用 `orchestrator/knowledgeTools.ts`）：
+
+```
+pi（容器内）的 knowledge_search / list_knowledge（桥扩展在 session_start 里按 builtinTools 段注册）
+  → POST {SANDBOX_BACKEND_URL}/api/sandbox/builtin/call      头: x-sandbox-token   体: {name, arguments}
+  → 后端：① 令牌 ⇒ 会话身份  ② 清单里确实下发过这个内置工具  ③ 现查 Agent 绑定的知识库
+         ④ executeKnowledgeTool(...)（与 ChatBot 逐字同一份）→ 回 {isError, text}
+```
+
+⇒ 模型看到的工具卡是 **`kind: BUILTIN` + serverName「知识库」**（与 ChatBot 路径同一个 kind，**没有 serverId**
+⇒ 卡上不出现「去配置凭据」）。**意识通道**：TaskAgent 只有 pi 的 `prompt` 一条消息（没有 system），
+所以「知识库能力说明 + 引用规则 + 可用知识库清单」作为**前缀**拼进发给引擎的那份（落库仍是用户原文）。
+
+**前置**：① 沙箱镜像**重建**（扩展改了 ⇒ 层版本 +1；不重建的症状同 MCP —— 后端日志一条错都没有，只是模型不调知识库工具）；
+② 给一个 `TASK_AGENT` **绑一个有 READY 文档的知识库**；③ 一个会调工具的模型。
+
+```bash
+# 建/绑：管理页给 TaskAgent 勾一个知识库（或 POST /api/agents/:id/components），库里至少一篇 READY 文档
+# 派活后，在容器里看清单是否带内置工具：
+docker exec "$CID" node -e 'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/mcp/tools",{headers:{"x-sandbox-token":process.env.SANDBOX_TOKEN}}).then(async r=>{const j=await r.json();console.log(j.builtinTools)})'
+#   → [{"name":"list_knowledge",…},{"name":"knowledge_search",…}]   （没绑库 ⇒ []）
+# 问「你有哪些知识库」⇒ 模型调 list_knowledge（卡：kind BUILTIN / 知识库）；
+# 问一个只可能在库里的问题 ⇒ 调 knowledge_search ⇒ 回答基于检索原文。
+```
+
+**已知边界（别当 bug）**：① 改了 Agent 的知识库绑定，同一容器活着期间**不生效**（同 MCP 的"容器即会话"）；
+② 沙箱路径**不发引用卡**（`citations` 仍空 —— 那是 ChatBot 的渲染），命中以 `tool_calls` 落库/展示；
+③ 内置工具卡没有 `serverId`（不是 MCP server）。
 
 ### TaskAgent 计量（P0-3-12 起；⚠️ 命令行档 —— 无界面增量）
 
@@ -1348,7 +1409,7 @@ srv.listen(0, "127.0.0.1", () => console.log("AUTHMCPURL=http://127.0.0.1:" + sr
 | # | 做什么 | 为什么 |
 |---|--------|--------|
 | ① | `pnpm infra:up && pnpm db:deploy && pnpm db:seed && pnpm db:partitions` | 依赖 + 表 + 两个种子账号（**记下 admin 的初始密码**）；⭐ `db:partitions` 是为 `usage_records`（R3 要查它） |
-| ② | ⭐ `pnpm sandbox:build -- --registry https://registry.npmmirror.com`，把末尾打印的两行写回 `infra/.env`（`SANDBOX_IMAGE` / `SANDBOX_IMAGE_BASE`） | **当前 `infra/.env` 里仍是 `:2`**，而带"MCP 桥扩展**真实现**"的是 **`:3`**（P0-3-9b）⇒ 不重建的症状最隐蔽：**后端日志一条错都没有**，只是"模型从来不调 MCP 工具" |
+| ② | ⭐ `pnpm sandbox:build -- --registry https://registry.npmmirror.com`，把末尾打印的两行写回 `infra/.env`（`SANDBOX_IMAGE` / `SANDBOX_IMAGE_BASE`） | **当前是 `:5`**（P0-3-14：桥扩展注册 MCP + 内置知识库工具）。⚠️ 若 `.env` 还停在老 tag，症状最隐蔽：**后端日志一条错都没有**，只是"模型从来不调 MCP / 知识库工具" |
 | ③ | ⭐ 准备一个 **egress 正向代理**，把地址填进 `SANDBOX_EGRESS_PROXY_URL` | 它是容器出公网的**唯一**出口（出口①）。⚠️ **仓库不提供生产级代理**（`子方案③` §四 3 写明"代理本身不属 P0 加固范围"），但**自 2026-09-28 起有一个开发用最小实现**（`egress-up.sh`，见下面「③ 的代理」）；留空 ⇒ `ensureSandbox()` **显式拒绝**、一发消息就是错误卡（不是"卡住不动"） |
 | ④ | 让模型池**可达**：真 Provider，或一台**假 LLM**（它同样要经 ③ 被容器摸到） | 真模型**不会主动写文件**、也不会主动去调刚注册的工具 ⇒ 要么用假 LLM，要么给一句**明确到不能再明确**的提示词（同「浏览器端测 · 任务型对话页」前置 3） |
 | ⑤ | 一个 `TASK_AGENT` 智能体（「智能体」页建，或 curl `POST /api/agents`） | 沙箱路径**只**由库里的 `agent.type` 分流（`resolveChatProducer`），**不加前端参数、也不信前端参数**；⚠️ 类型在库里，不在请求里 |

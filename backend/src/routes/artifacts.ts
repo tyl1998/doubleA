@@ -44,6 +44,7 @@
 import {
   artifactIdParamsSchema,
   conversationIdParamsSchema,
+  listArtifactHistoryQuerySchema,
   listArtifactsQuerySchema,
   ok,
   previewKindOf,
@@ -55,7 +56,12 @@ import {
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { requireAuthContext } from '../plugins/session.js'
-import { listArtifacts, openArtifactSource } from '../services/artifact.service.js'
+import {
+  artifactDownloadContentType,
+  listArtifactHistory,
+  listArtifacts,
+  openArtifactSource,
+} from '../services/artifact.service.js'
 import { buildContentDisposition } from '../services/document.service.js'
 
 /**
@@ -66,21 +72,6 @@ import { buildContentDisposition } from '../services/document.service.js'
  */
 function userIdOf(request: FastifyRequest): string {
   return requireAuthContext(request).user.id
-}
-
-/**
- * 下载响应的 `Content-Type`：唯一来源是 `artifacts.mime`（`子方案④` §四 2 判据 ⑤）。
- *
- * 为什么**不**一律 `application/octet-stream`：那样"下载得到的类型"与"预览用的类型"就变成
- * 两个来源，出现"列表里是 CSV、下载头说是二进制"这种分叉（且没有任何一层会报错）。
- * 空串（理论上不会出现：`artifactMimeOf` 恒回 `octet-stream`）按 `octet-stream` 兜底。
- *
- * ⚠️ 与预览那一路（`P0-3-10`）**刻意不同源的那半边**：预览会把文本类一律压成
- * `text/plain`（"把 URL 贴进地址栏看到的是源码"），下载则给真实类型 ——
- * 因为 `attachment` 已经决定了"浏览器不会解释它"。
- */
-function downloadContentType(mime: string): string {
-  return mime.trim() === '' ? 'application/octet-stream' : mime.trim()
 }
 
 /**
@@ -170,6 +161,26 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
   )
 
   /**
+   * 历史产物（`GET /api/artifacts/history`，**P0-3 记忆与产物 块 4**）。
+   *
+   * 「删除会话后产物还在」的唯一出口：删会话只把产物行的 `conversation_id` 置空
+   * （`TaskAgent记忆与产物` 块 3），于是 `conversationId = null` 的产物 = **历史产物**。
+   *
+   * 判据是 `user_id = me`（产物行自建行起带归属用户，`conversationId` 置空后它仍是
+   * "这是**我的**"的唯一答案）—— 与"产物 → 会话 → 本人"那条老判据**刻意不同**：
+   * 历史产物已经没有会话可 join 了。别人的产物仍然查不到（`where` 里带 `userId`）。
+   *
+   * ⚠️ **静态段与参数段的关系**：`/api/artifacts/history` 与 `/api/artifacts/:id/download`
+   * 同前缀 —— Fastify 对静态段优先于参数段匹配，且 `:id` 有 uuid 校验（`history` 不是 uuid），
+   * 两条路由互不干扰。
+   */
+  app.get<{ Querystring: ListArtifactsQuery }>(
+    '/api/artifacts/history',
+    { preHandler: app.requireAuth, schema: { querystring: listArtifactHistoryQuerySchema } },
+    async (request) => ok(await listArtifactHistory(userIdOf(request), request.query)),
+  )
+
+  /**
    * 下载产物（`02` §4.8 + `子方案④` §三）：`attachment` + **字节流**，是**后端代理**不是签名 URL。
    *
    * 四个头各有理由：
@@ -177,7 +188,7 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
    *     `attachment`；中文名靠 `filename*`，CR/LF 与引号/路径分隔符由
    *     {@link buildContentDisposition} 剔除 —— 那既是**响应头注入**防护，也把容器内的相对路径
    *     （`out/report.csv`）变成客户端能存的单个文件名）；
-   *   · `Content-Type` 取自 `artifacts.mime`（见 {@link downloadContentType}）；
+   *   · `Content-Type` 取自 `artifacts.mime`（见 {@link artifactDownloadContentType}）；
    *   · `X-Content-Type-Options: nosniff`：**每一路都要有**（`子方案④` §四 2）—— 缺了它，浏览器
    *     可能对 `application/octet-stream` 做内容嗅探，把引擎产出的文件当 HTML 跑起来；
    *   · `Cache-Control: private, no-store`：代理形态的 URL **不带时效**，靠"登录 + 归属"守住
@@ -194,7 +205,7 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
         userId: userIdOf(request),
       })
       return reply
-        .header('content-type', downloadContentType(source.mime))
+        .header('content-type', artifactDownloadContentType(source.mime))
         .header('content-length', String(source.contentLength))
         .header('content-disposition', buildContentDisposition(source.fileName))
         .header('x-content-type-options', 'nosniff')

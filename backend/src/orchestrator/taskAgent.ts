@@ -11,7 +11,9 @@
  *  ① ensureSandbox(conversationId)   → 排队位次 ⇒ `queued` 事件 + `/active` 快照
  *  ② getSandboxRpc(...)              → 一个会话一条桥，与容器同寿命（P0-3-5）
  *  ③ onEvent(map.ts)                 → 引擎事件 ⇒ `delta` / `thinking` / `tool_call{kind:SANDBOX}`
- *  ③.5 snapshotWorkFiles(...)        → **派活之前**拍产物基线（P0-3-7）
+ *  ③.4 写会话记忆 + 前置阅读指令   → `memoryDoc.ts`（块 1）：写 /work/.doubulea/memory.md，
+ *                                     有内容时在这轮 prompt 前加一句"先读它"（落库仍是用户原文）
+ *  ③.5 snapshotWorkFiles(...)        → **派活之前**拍产物基线（P0-3-7；必须排在写记忆之后）
  *  ④ runTurn(content, {signal})      → 派活 + 等 **`agent_settled`**（不是 `agent_end`，见 `bridge.ts`）
  *  ④.5 collectRoundArtifacts(...)    → 对照基线 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（P0-3-7）
  *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
@@ -135,9 +137,19 @@ import {
 import {
   createEngineEventMapper,
   engineTurnBoundaryOf,
+  type EngineBuiltinToolCard,
   type EngineMcpToolCard,
   type EngineUsage,
 } from '../sandbox/map.js'
+import {
+  KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
+  KNOWLEDGE_TOOL_SERVER_NAME,
+  KNOWLEDGE_USAGE_RULES,
+  RETRIEVAL_RULES,
+  formatKnowledgeCatalog,
+} from './chatContext.js'
+import { boundKnowledgeBaseIds, loadKnowledgeCatalog } from './knowledgeTools.js'
+import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
 import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
 
@@ -278,6 +290,12 @@ export const taskAgentProducer: ChatProducer = async (input) => {
    * 全部再报一次 —— `子方案③` §十一 1 点名的症状）。
    */
   let baseline: WorkSnapshot | undefined
+  /**
+   * **发给引擎**的这一轮消息（默认 = 用户原文）。记忆文档有内容时会被前置一条"先读记忆"的指令
+   * （`TaskAgent记忆与产物` 块 1 的读取触发点；见 `memoryDoc.ts#memoryDocReadInstruction`）。
+   * ⚠️ **只改这一份** —— 落库仍用 `content` 原文（`persistRoundQuietly`），用户看不到这条指令。
+   */
+  let engineContent = content
   /** 本轮建成的产物行（发 `artifact` 帧 + 落 `content.artifacts` 段，同一份数据两个去向） */
   const artifactItems: ArtifactItem[] = []
 
@@ -314,8 +332,51 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       // ③ 订阅（判据 ①：**必须早于派活**）
       // ═════════════════════════════════════════════════════════════
-      // ③.5 拍产物基线（P0-3-7；P0-3-6 详规传下来的口径 ②：**必须在派活之前**，
-      //     不许收尾之后补 —— 否则"基线"里已经混进了这一轮的产物，对照出来永远为空）
+      // ③.5 写记忆文档 → 拍产物基线（P0-3-7；P0-3-6 详规传下来的口径 ②：基线**必须在派活
+      //     之前**拍，不许收尾之后补 —— 否则"基线"里已经混进了这一轮的产物，对照出来永远为空）
+      // ═════════════════════════════════════════════════════════════
+      // ★ 「TaskAgent 记忆与产物」块 1：容器回收后 /work 与 pi 的临时记忆都会清空 ⇒ agent 失忆。
+      //   每次派活前**从 DB 现组装**一份记忆（最近几轮对话 + 产物清单）写进容器，
+      //   容器重建 / 复用都能拿到最新的。⚠️ **必须排在拍基线之前**：记忆文件每次都会变，
+      //   写在基线之前它才落在基线里、不会被当成本轮新产物（另有一道隐藏目录兜底，见 memoryDoc.ts）。
+      //   ⚠️ 失败只 warn 不落轮：记忆是本轮的赠品，写不进去 agent 照样能干活。
+      try {
+        const memory = await buildMemoryDoc(conversationId)
+        await writeMemoryDoc(handle.containerId, memory.markdown)
+        // 写入成功且确有内容 ⇒ 让引擎先读它（否则那句指令只是一句"读一个空文件"）。
+        // ⚠️ 只改发给引擎的那份；落库仍是 `content` 原文（见 engineContent 的注释）。
+        if (memory.hasContent) {
+          engineContent = `${memoryDocReadInstruction()}\n\n${content}`
+        }
+      } catch (error) {
+        logger.warn(
+          { err: error, conversationId, containerId: handle.containerId },
+          '记忆文档写入失败（本轮 agent 看不到会话历史与产物清单；派活不受影响）',
+        )
+      }
+
+      // ★ 知识库概览（绑定知识库时）—— 与 ChatBot 的 system prompt **同一段口径**
+      //   （`buildSystemPrompt` 的知识库部分）。为什么走 prompt 前缀而不是 system：
+      //   TaskAgent 经 pi 的 RPC 派活只有一条 `prompt` 消息、**没有 system 通道**，
+      //   所以把「能力说明 + 引用规则 + 可用知识库清单」作为前缀拼进发给引擎的那份。
+      //   ⚠️ 只改 `engineContent`（发给引擎的），落库仍是 `content` 原文（见其注释）；
+      //   ⚠️ 失败只 warn：模型这轮可能不知道有哪些库，但派活与工具注册都不受影响。
+      try {
+        const kbIds = await boundKnowledgeBaseIds(agentId)
+        if (kbIds.length > 0) {
+          const knowledgeCatalog = await loadKnowledgeCatalog(kbIds, KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB)
+          const catalogBlock = formatKnowledgeCatalog(knowledgeCatalog)
+          if (catalogBlock !== '') {
+            engineContent = `${KNOWLEDGE_USAGE_RULES}\n\n${RETRIEVAL_RULES}\n\n${catalogBlock}\n\n${engineContent}`
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          { err: error, conversationId, agentId },
+          '知识库概览注入失败（本轮 agent 可能不知道绑定了哪些库；工具注册与派活不受影响）',
+        )
+      }
+
       baseline = await snapshotWorkFiles(handle.containerId)
 
       // ═════════════════════════════════════════════════════════════
@@ -347,7 +408,20 @@ export const taskAgentProducer: ChatProducer = async (input) => {
                 : { serverId: ref.serverId, serverName: ref.serverName, toolName: ref.toolName }
             }
 
-      const mapper = createEngineEventMapper({ resolveMcpTool })
+      /**
+       * 内置工具（知识库）的反查：**认名字**（`knowledge_search` / `list_knowledge`）—— 它们
+       * 不是 MCP、没有 `alias`，判据只有"清单里下发过它"这一条（`resolverCatalog.builtins`）。
+       * 认出来 ⇒ 卡片 `kind: BUILTIN` + 展示名"知识库"（与 ChatBot 路径同一个 kind）。
+       */
+      const resolveBuiltinTool =
+        resolverCatalog === null
+          ? undefined
+          : (engineToolName: string): EngineBuiltinToolCard | undefined =>
+              resolverCatalog.builtins.some((tool) => tool.name === engineToolName)
+                ? { serverName: KNOWLEDGE_TOOL_SERVER_NAME, toolName: engineToolName }
+                : undefined
+
+      const mapper = createEngineEventMapper({ resolveMcpTool, resolveBuiltinTool })
       unsubscribe = bridge.onEvent((event) => {
         const mapped = mapper.map(event)
 
@@ -407,7 +481,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       engineStarted = true // 计量判据（见收尾处）：从这一行起，token 就已经可能花出去了
       enqueue([{ name: 'status', data: { text: '任务运行中…' } }])
-      outcome = await bridge.runTurn(content, { signal })
+      outcome = await bridge.runTurn(engineContent, { signal })
     } catch (error) {
       // 中断与故障在这里**都只是"记下来"**，统一的收尾在下面（顺序即优先级，与 chatBot 同款）
       failure = error
@@ -551,7 +625,9 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     content,
     assistantText: round.assistantText,
     thinkingText: round.thinkingText,
-    // TaskAgent 本轮**不检索** ⇒ 恒为空（知识库绑定经 §七 代理以工具形态出现，属 P0-3-9b）
+    // TaskAgent **不发引用卡**（那一族是 ChatBot 的 rendering）：知识库走**内置工具卡**
+    // （`knowledge_search` / `list_knowledge` 经 `/api/sandbox/builtin/call`，见 `proxy.ts`），
+    // 结果以 `tool_calls` 落库/展示 ⇒ `citations` 恒为空。这是刻意的口径，不是漏接。
     citations: [],
     toolRecords: round.toolRecords,
     // 本轮建成的产物行（P0-3-7）：事件里发过的那几张卡，刷新后从 `content.artifacts` 恢复

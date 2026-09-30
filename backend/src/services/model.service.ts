@@ -66,10 +66,13 @@ import {
   type UpstreamProtocol,
 } from '@doubulea/shared'
 
+import { config } from '../config.js'
 import { decryptSecret, encryptSecret } from '../infra/crypto.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { describeTarget, fetchRemoteModels, type LlmTarget } from '../llm/client.js'
+import { probeEmbeddingDim } from '../llm/embedding/index.js'
+import { resolveUpstreamUrl } from '../llm/upstream.js'
 
 /**
  * 查询字段白名单（列表 / 建 / 改共用一份）。
@@ -82,6 +85,7 @@ const PROVIDER_SELECT = {
   id: true,
   name: true,
   baseUrl: true,
+  customUrl: true,
   apiKeyEnc: true,
   type: true,
   protocol: true,
@@ -96,6 +100,7 @@ interface ProviderRow {
   id: string
   name: string
   baseUrl: string
+  customUrl: boolean
   apiKeyEnc: string | null
   type: ModelProviderItem['type']
   protocol: UpstreamProtocol
@@ -124,6 +129,7 @@ function toItem(row: ProviderRow): ModelProviderItem {
     id: row.id,
     name: row.name,
     baseUrl: row.baseUrl,
+    customUrl: row.customUrl,
     type: row.type,
     protocol: row.protocol,
     enabled: row.enabled,
@@ -200,6 +206,8 @@ export async function createModelProvider(input: CreateModelProviderBody): Promi
       data: {
         name: input.name,
         baseUrl: input.baseUrl,
+        // 默认 false ⇒ 既有拼接行为（默认值只在服务层补一处，理由同 protocol）
+        customUrl: input.customUrl ?? false,
         type: input.type,
         // 显式写出 protocol/enabled：DB 默认也是这两值，但"新 Provider 默认走兼容协议、默认启用"
         // 属于契约，不该藏在迁移里
@@ -288,6 +296,7 @@ export async function updateModelProvider(
       data: {
         ...(input.name === undefined ? {} : { name: input.name }),
         ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
+        ...(input.customUrl === undefined ? {} : { customUrl: input.customUrl }),
         ...(input.type === undefined ? {} : { type: input.type }),
         ...(input.protocol === undefined ? {} : { protocol: input.protocol }),
         ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
@@ -405,6 +414,8 @@ const MODEL_MANAGE_SELECT = {
   label: true,
   type: true,
   maxContext: true,
+  embeddingDim: true,
+  embeddingMultimodal: true,
   supportsVision: true,
   supportsReasoning: true,
   enabled: true,
@@ -425,6 +436,8 @@ interface ModelRow {
   label: string
   type: ModelItem['type']
   maxContext: number | null
+  embeddingDim: number | null
+  embeddingMultimodal: boolean
   supportsVision: boolean
   supportsReasoning: boolean
   enabled: boolean
@@ -442,6 +455,7 @@ const MODEL_OPTION_SELECT = {
   label: true,
   type: true,
   maxContext: true,
+  embeddingDim: true,
   supportsVision: true,
   supportsReasoning: true,
   provider: { select: { name: true } },
@@ -455,6 +469,7 @@ interface ModelOptionRow {
   label: string
   type: ModelOption['type']
   maxContext: number | null
+  embeddingDim: number | null
   supportsVision: boolean
   supportsReasoning: boolean
   provider: { name: string }
@@ -470,6 +485,8 @@ function toModelItem(row: ModelRow): ModelItem {
     label: row.label,
     type: row.type,
     maxContext: row.maxContext,
+    embeddingDim: row.embeddingDim,
+    embeddingMultimodal: row.embeddingMultimodal,
     supportsVision: row.supportsVision,
     supportsReasoning: row.supportsReasoning,
     enabled: row.enabled,
@@ -488,6 +505,7 @@ function toModelOption(row: ModelOptionRow): ModelOption {
     label: row.label,
     type: row.type,
     maxContext: row.maxContext,
+    embeddingDim: row.embeddingDim,
     supportsVision: row.supportsVision,
     supportsReasoning: row.supportsReasoning,
   }
@@ -545,26 +563,76 @@ export async function listAvailableModels(query: ListAvailableModelsQuery): Prom
 }
 
 /**
+ * 探测某 Provider 下某型号的 **embedding 维度**（建/改**向量模型**时用）。
+ *
+ * 用 `readProviderCredential` 拿到 baseUrl/customUrl/key 后发一次极小 `/embeddings` 请求。
+ * 失败即抛（由调用方翻成可展示的错误）—— 向量模型没有维度就没法用于知识库，宁可建的时候失败。
+ */
+async function probeDimForProvider(providerId: string, modelName: string, multimodal: boolean): Promise<number> {
+  const credential = await readProviderCredential(providerId)
+  return probeEmbeddingDim(
+    {
+      providerName: credential.providerName,
+      baseUrl: credential.baseUrl,
+      customUrl: credential.customUrl,
+      multimodal,
+      apiKey: credential.apiKey,
+      apiModel: modelName,
+    },
+    config.embedding.batchSize,
+  )
+}
+
+/**
+ * **尽力**探测维度：失败返回 `null` 并告警，**不阻断**模型的创建/修改。
+ *
+ * 为什么不像知识库那样硬失败：不是所有 embedding 端点都能按标准 OpenAI 形状探测
+ * （多模态/特殊实现会在 `/embeddings` 上 400），而"登记一个向量模型"不该被探测卡住。
+ * 探测不到的，由管理员在模型编辑里**手动填写维度**。
+ */
+async function tryProbeDimForProvider(
+  providerId: string,
+  modelName: string,
+  multimodal: boolean,
+): Promise<number | null> {
+  try {
+    return await probeDimForProvider(providerId, modelName, multimodal)
+  } catch (error) {
+    getLogger().warn(
+      { providerId, modelName, multimodal, err: error },
+      '向量模型维度探测失败（不阻断保存）；可在模型编辑里手动填写维度',
+    )
+    return null
+  }
+}
+
+/**
  * 建模型（`POST /api/models`，仅 ADMIN）。
  *
- * 两条守卫按"先查再说人话"排：
+ * 四条守卫按"先查再说人话"排：
  *   ① Provider 必须存在 —— 不存在时若直接 create，会撞 `models_provider_id_fkey` 抛 `P2003`（500）；
- *   ② `(providerId, modelName, type)` 唯一（`schema.prisma` 的 `@@unique`）——
+ *   ② **`type` 必须等于 Provider 的 `type`**（方案A：类型跟随 Provider）—— 模型是对话还是向量，
+ *      由它所属的 Provider 决定，不允许"Provider 是向量、模型却是对话"这种不一致配置；
+ *   ③ **向量模型探测维度**：`type=EMBEDDING` 时向上游探测输出维度并落库（对话模型恒 null）；
+ *   ④ `(providerId, modelName, type)` 唯一（`schema.prisma` 的 `@@unique`）——
  *      先查一遍给出可读文案，再 `catch P2002` 兜住并发窗口（`user.service.ts` 同款双保险）。
- *
- * ⚠️ 刻意**不校验**「`type` 必须等于 Provider 的 `type`」：`schema.prisma` 的
- *    `@@unique([providerId, modelName, type])` 注释已明确"同一型号名可能既提供 chat
- *    又提供 embedding（如 bge 系列的兼容端点）"是**合法**的。这里加一条"必须一致"
- *    会把那种合法配置挡在门外，属于自己发明约束。
  */
 export async function createModel(input: CreateModelBody): Promise<ModelItem> {
   const db = getPrisma()
 
   const provider = await db.modelProvider.findUnique({
     where: { id: input.providerId },
-    select: { id: true },
+    select: { id: true, type: true },
   })
   if (provider === null) throw AppError.notFound('Provider 不存在')
+
+  // ② 类型跟随 Provider（方案A）：拦在建之前，给出可读的字段级 400，而不是让不一致的数据落库
+  if (input.type !== provider.type) {
+    throw AppError.validation(
+      `模型类型必须与所属 Provider 一致：该 Provider 是「${provider.type}」，不能创建「${input.type}」类型的模型`,
+      { fields: [{ path: 'body.type', message: `必须与 Provider 的类型（${provider.type}）一致` }] },
+    )
+  }
 
   const duplicated = await db.model.findFirst({
     where: { providerId: input.providerId, modelName: input.modelName, type: input.type },
@@ -572,6 +640,15 @@ export async function createModel(input: CreateModelBody): Promise<ModelItem> {
   })
   if (duplicated !== null) {
     throw AppError.conflict(`该 Provider 下已存在同型号同类型的模型：${input.modelName}`)
+  }
+
+  // ③ 向量模型：维度优先用请求里显式给的；否则**尽力**探测一次（探测失败不阻断保存，留空由管理员补填）
+  const isEmbedding = input.type === 'EMBEDDING'
+  const embeddingMultimodal = isEmbedding ? input.embeddingMultimodal ?? false : false
+  let embeddingDim: number | null = null
+  if (isEmbedding) {
+    embeddingDim =
+      input.embeddingDim ?? (await tryProbeDimForProvider(input.providerId, input.modelName, embeddingMultimodal))
   }
 
   let created: ModelRow
@@ -582,12 +659,14 @@ export async function createModel(input: CreateModelBody): Promise<ModelItem> {
         modelName: input.modelName,
         label: input.label,
         type: input.type,
-        // `maxContext` 可缺省：`null` 与缺省同义（未填写）
-        maxContext: input.maxContext ?? null,
+        // 向量模型不写对话侧字段（上下文/图片/思考），对话模型按输入写
+        maxContext: isEmbedding ? null : input.maxContext ?? null,
+        embeddingDim,
+        embeddingMultimodal,
         // 显式写出两个默认值：DB 默认也是 false/true，但"新模型默认启用、默认不支持图片"
         // 属于契约，不该藏在迁移里（与 createModelProvider 同款理由）
-        supportsVision: input.supportsVision ?? false,
-        supportsReasoning: input.supportsReasoning ?? false,
+        supportsVision: isEmbedding ? false : input.supportsVision ?? false,
+        supportsReasoning: isEmbedding ? false : input.supportsReasoning ?? false,
         enabled: input.enabled ?? true,
       },
       select: MODEL_MANAGE_SELECT,
@@ -639,6 +718,8 @@ export async function updateModel(id: string, input: UpdateModelBody): Promise<M
       providerId: true,
       modelName: true,
       type: true,
+      embeddingDim: true,
+      embeddingMultimodal: true,
       _count: { select: { agents: true } },
     },
   })
@@ -669,6 +750,26 @@ export async function updateModel(id: string, input: UpdateModelBody): Promise<M
     }
   }
 
+  const nextIsEmbedding = nextType === 'EMBEDDING'
+  const nextMultimodal = nextIsEmbedding ? input.embeddingMultimodal ?? target.embeddingMultimodal : false
+  // 向量模型：维度优先用请求里显式给的；改名/维度缺失/切换了端点形状时尽力重探（失败留空，不阻断）
+  let embeddingDimData: { embeddingDim?: number | null } = {}
+  if (nextIsEmbedding) {
+    if (input.embeddingDim !== undefined) {
+      embeddingDimData = { embeddingDim: input.embeddingDim }
+    } else if (
+      nextModelName !== target.modelName ||
+      target.embeddingDim === null ||
+      input.embeddingMultimodal !== undefined
+    ) {
+      embeddingDimData = {
+        embeddingDim: await tryProbeDimForProvider(target.providerId, nextModelName, nextMultimodal),
+      }
+    }
+  } else if (target.type === 'EMBEDDING') {
+    embeddingDimData = { embeddingDim: null }
+  }
+
   let updated: ModelRow
   try {
     updated = await db.model.update({
@@ -677,10 +778,17 @@ export async function updateModel(id: string, input: UpdateModelBody): Promise<M
         ...(input.modelName === undefined ? {} : { modelName: input.modelName }),
         ...(input.label === undefined ? {} : { label: input.label }),
         ...(input.type === undefined ? {} : { type: input.type }),
-        // 三态落点：undefined = 不带这一列（不动）；null = 显式清空；number = 设置
-        ...(input.maxContext === undefined ? {} : { maxContext: input.maxContext }),
-        ...(input.supportsVision === undefined ? {} : { supportsVision: input.supportsVision }),
-        ...(input.supportsReasoning === undefined ? {} : { supportsReasoning: input.supportsReasoning }),
+        // 向量模型不写对话侧字段（上下文/图片/思考）；对话模型按输入走三态
+        ...(nextIsEmbedding
+          ? { maxContext: null, supportsVision: false, supportsReasoning: false, embeddingMultimodal: nextMultimodal }
+          : {
+              // 三态落点：undefined = 不带这一列（不动）；null = 显式清空；number = 设置
+              ...(input.maxContext === undefined ? {} : { maxContext: input.maxContext }),
+              ...(input.supportsVision === undefined ? {} : { supportsVision: input.supportsVision }),
+              ...(input.supportsReasoning === undefined ? {} : { supportsReasoning: input.supportsReasoning }),
+              ...(target.type === 'EMBEDDING' ? { embeddingMultimodal: false } : {}),
+            }),
+        ...embeddingDimData,
         ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
       },
       select: MODEL_MANAGE_SELECT,
@@ -759,20 +867,21 @@ export async function removeModel(id: string): Promise<{ id: string; modelName: 
  */
 async function readProviderCredential(
   providerId: string,
-): Promise<{ providerName: string; baseUrl: string; apiKey: string | null; protocol: UpstreamProtocol }> {
+): Promise<{ providerName: string; baseUrl: string; customUrl: boolean; apiKey: string | null; protocol: UpstreamProtocol }> {
   const db = getPrisma()
   const row = await db.modelProvider.findUnique({
     where: { id: providerId },
-    select: { name: true, baseUrl: true, apiKeyEnc: true, protocol: true },
+    select: { name: true, baseUrl: true, customUrl: true, apiKeyEnc: true, protocol: true },
   })
   if (row === null) throw AppError.notFound('Provider 不存在')
   if (row.apiKeyEnc === null) {
-    return { providerName: row.name, baseUrl: row.baseUrl, apiKey: null, protocol: row.protocol }
+    return { providerName: row.name, baseUrl: row.baseUrl, customUrl: row.customUrl, apiKey: null, protocol: row.protocol }
   }
   try {
     return {
       providerName: row.name,
       baseUrl: row.baseUrl,
+      customUrl: row.customUrl,
       apiKey: decryptSecret(row.apiKeyEnc, providerKeyAad(providerId)),
       protocol: row.protocol,
     }
@@ -826,7 +935,7 @@ export async function resolveChatTarget(modelId: string | null): Promise<LlmTarg
       supportsVision: true,
       supportsReasoning: true,
       providerId: true,
-      provider: { select: { name: true, baseUrl: true, enabled: true, protocol: true } },
+      provider: { select: { name: true, baseUrl: true, customUrl: true, enabled: true, protocol: true } },
     },
   })
   if (row === null) throw AppError.notFound('模型不存在')
@@ -863,11 +972,124 @@ export async function resolveChatTarget(modelId: string | null): Promise<LlmTarg
     // （`02` §4.3：`protocol` 定义在 `model_providers` 上）
     protocol: row.provider.protocol,
     baseUrl: row.provider.baseUrl,
+    customUrl: row.provider.customUrl,
     apiKey: credential.apiKey,
   }
   // 记日志一律走 describeTarget（只打 id/名字/hasKey），**绝不整体序列化 target**（里面是明文 Key）
   getLogger().debug(describeTarget(target), '已解析上游模型目标')
   return target
+}
+
+/**
+ * 解析「一个 **EMBEDDING** 模型 → 可用于知识库的向量化上游目标」。
+ *
+ * 与 {@link resolveChatTarget} 同族，但有三处刻意不同：
+ *   ① 断言 `type = EMBEDDING`（对话模型不能当 embedding 用）；
+ *   ② **不要求配 Key**（内网嵌入式实现常免鉴权，缺 Key 照走，成不成由上游决定）；
+ *   ③ 返回的是构造 `ApiEmbeddingProvider` 所需的字段，而不是 {@link LlmTarget}。
+ *
+ * @throws {AppError} `CONFLICT`(409) 未绑定 / 类型不符 / 模型或 Provider 停用；`NOT_FOUND`(404)；`INTERNAL`(500) Key 解不开
+ */
+export async function resolveEmbeddingTarget(modelId: string | null): Promise<{
+  modelId: string
+  modelName: string
+  label: string
+  /** 建模型时探测好的维度；`null` = 未记录（本功能上线前的向量模型，调用方需现场探测兜底） */
+  embeddingDim: number | null
+  /** 是否走多模态 embedding 端点（`/embeddings/multimodal` + content 分片 input） */
+  embeddingMultimodal: boolean
+  providerName: string
+  baseUrl: string
+  customUrl: boolean
+  apiKey: string | null
+}> {
+  if (modelId === null) {
+    throw AppError.conflict(
+      '该知识库未绑定 embedding 模型（可能因建库时未选择、或所选模型已被删除）。请重建知识库并重新选择 embedding 模型',
+    )
+  }
+  const db = getPrisma()
+  const row = await db.model.findUnique({
+    where: { id: modelId },
+    select: {
+      id: true,
+      modelName: true,
+      label: true,
+      type: true,
+      enabled: true,
+      embeddingDim: true,
+      embeddingMultimodal: true,
+      providerId: true,
+      provider: { select: { name: true, enabled: true } },
+    },
+  })
+  if (row === null) throw AppError.notFound('embedding 模型不存在')
+  if (row.type !== 'EMBEDDING') {
+    throw AppError.conflict(`所选模型不是向量模型（EMBEDDING），不能用于知识库：${row.modelName}`)
+  }
+  if (!row.enabled) throw AppError.conflict(`所选 embedding 模型已停用：${row.modelName}`)
+  if (!row.provider.enabled) {
+    throw AppError.conflict(`所选 embedding 模型所属的 Provider「${row.provider.name}」已停用`)
+  }
+
+  const credential = await readProviderCredential(row.providerId)
+  return {
+    modelId: row.id,
+    modelName: row.modelName,
+    label: row.label,
+    embeddingDim: row.embeddingDim,
+    embeddingMultimodal: row.embeddingMultimodal,
+    providerName: row.provider.name,
+    baseUrl: credential.baseUrl,
+    customUrl: credential.customUrl,
+    apiKey: credential.apiKey,
+  }
+}
+
+/**
+ * 按**表单值**试探一个向量模型的维度（`POST /api/models/probe-embedding`，仅 ADMIN）。
+ *
+ * **不落库、不改状态**：让管理员在建/改**向量模型**时**当场**看到维度或真实报错
+ * （不必翻后端日志、也不必先保存）。失败时抛上游原文（`UPSTREAM_ERROR`），界面直接展示。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) Provider 不存在 / `CONFLICT`(409) Provider 已停用 /
+ *   `UPSTREAM_ERROR`(502) 探测失败（消息含请求 URL 与上游响应）
+ */
+export async function probeModelEmbedding(input: {
+  providerId: string
+  modelName: string
+  embeddingMultimodal?: boolean
+}): Promise<{ dim: number; providerName: string; modelName: string; url: string }> {
+  const db = getPrisma()
+  const provider = await db.modelProvider.findUnique({
+    where: { id: input.providerId },
+    select: { id: true, enabled: true },
+  })
+  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (!provider.enabled) throw AppError.conflict('该 Provider 已停用，无法探测；请先启用它')
+
+  const credential = await readProviderCredential(input.providerId)
+  const multimodal = input.embeddingMultimodal === true
+  const dim = await probeEmbeddingDim(
+    {
+      providerName: credential.providerName,
+      baseUrl: credential.baseUrl,
+      customUrl: credential.customUrl,
+      multimodal,
+      apiKey: credential.apiKey,
+      apiModel: input.modelName,
+    },
+    config.embedding.batchSize,
+  )
+  return {
+    dim,
+    providerName: credential.providerName,
+    modelName: input.modelName,
+    url: resolveUpstreamUrl(
+      { baseUrl: credential.baseUrl, customUrl: credential.customUrl },
+      multimodal ? '/embeddings/multimodal' : '/embeddings',
+    ),
+  }
 }
 
 /**

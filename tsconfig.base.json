@@ -25,7 +25,10 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
 
-    "baseUrl": ".",
+    // ⚠️ 这里**不设 baseUrl**（TS 7.0 将移除该选项，设置会报弃用错误）。
+    // `paths` 的键值均为相对路径，未设 baseUrl 时 TS 按「声明它的 tsconfig 所在目录」解析，
+    // 即本文件所在 monorepo 根，等价于原来的 `"baseUrl": "."`。
+    //
     // ⚠️ 为什么 `@doubulea/shared` 走 paths 指向**源码**而不是 dist 类型：
     //
     // 本机 pnpm 12.4.2 无法创建目录符号链接（Windows 需开发者模式；pnpm 失败时**静默**）

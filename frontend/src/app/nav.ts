@@ -50,6 +50,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页与我的凭据页换成真实页面）
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
   { code: 'CR', label: '我的凭据', path: '/mcp/credentials', serial: 'S-06b · 凭据' },
+  // 已落地 ⇒ 不带 `batch`（`TaskAgent 记忆与产物` 块 5：删除会话后保留的产物入口，登录即可）
+  { code: 'AH', label: '历史产物', path: '/artifacts/history', serial: 'S-10 · 历史产物' },
   /**
    * 管理面**两条**（P0-1-36 落地）。
    *

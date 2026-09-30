@@ -376,6 +376,12 @@ export function piApiForProtocol(protocol: UpstreamProtocol | null | undefined):
  *
  * ⚠️ 这条差异**已实测**（`06` §五 P0-3-4 的实测记录）：假上游分别收到
  * `POST /v1/chat/completions` 与 `POST /v1/messages` ⇒ 两个 SDK 的拼接口径与上面一致。
+ *
+ * ⚠️ 与 Provider 的「自定义 URL」（`ModelProvider.customUrl`）的关系：那个开关是**直连
+ * HTTP 层**（chatBot：`llm/client.ts` / `llm/upstream.ts#resolveUpstreamUrl`）的特性 ——
+ * 原样用 baseUrl、不拼后缀。**沙箱这条路用的是 pi 官方 SDK，路径由 SDK 拥有**，一个
+ * "完整端点"的自定义 URL 在这里无法被原样使用。故自定义 URL 的 Provider 若要用于
+ * TaskAgent，其 baseUrl 仍须满足此处 SDK 的"host + 版本段"约定（本函数不因 customUrl 改变行为）。
  */
 export function piBaseUrlFor(protocol: UpstreamProtocol | null | undefined, baseUrl: string): string {
   const trimmed = baseUrl.replace(/\/+$/u, '')

@@ -72,6 +72,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
 
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [customUrl, setCustomUrl] = useState(EMPTY_PROVIDER_FORM_VALUES.customUrl)
   const [type, setType] = useState<ModelType>(EMPTY_PROVIDER_FORM_VALUES.type)
   const [protocol, setProtocol] = useState<UpstreamProtocol>(EMPTY_PROVIDER_FORM_VALUES.protocol)
   const [enabled, setEnabled] = useState(true)
@@ -91,6 +92,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     const values = provider === null ? EMPTY_PROVIDER_FORM_VALUES : providerEditValuesOf(provider)
     setName(values.name)
     setBaseUrl(values.baseUrl)
+    setCustomUrl(values.customUrl)
     setType(values.type)
     setProtocol(values.protocol)
     setEnabled(values.enabled)
@@ -106,7 +108,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     setErrorText(null)
 
     if (provider === null) {
-      create.mutate(buildCreateProviderBody({ name, baseUrl, type, protocol, enabled, apiKey }), {
+      create.mutate(buildCreateProviderBody({ name, baseUrl, customUrl, type, protocol, enabled, apiKey }), {
         onSuccess: (created) => {
           feedback.ok(
             `已创建 Provider「${created.name}」` +
@@ -121,7 +123,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
 
     const body = buildProviderUpdateBody(
       provider,
-      { name, baseUrl, type, protocol, enabled, apiKey },
+      { name, baseUrl, customUrl, type, protocol, enabled, apiKey },
       clearRequested,
     )
     if (body === null) {
@@ -186,7 +188,21 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
             必须 http:// 或 https:// 开头；服务端会去掉<strong>尾部斜杠</strong>
             （否则拼出来的 <code>/v1//chat/completions</code> 有的网关当 404）。
             <br />
-            {protocolBaseUrlHint(protocol)}
+            {customUrl ? '已开启「自定义 URL」：这里填的就是完整端点，后端原样发请求、不再拼后缀。' : protocolBaseUrlHint(protocol)}
+          </p>
+        </div>
+
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
+            <Switch checked={customUrl} onChange={setCustomUrl} aria-label="自定义 URL" />
+            <p className="block-label" style={{ margin: 0 }}>自定义 URL</p>
+          </div>
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            第三方端点不按 <code>{'{host}/v1'}</code> + 固定后缀规范时开启：上面的 Base URL 会被
+            <strong>原样</strong>当作完整端点（可含完整路径、甚至 query），后端<strong>不再拼</strong>
+            <code>/chat/completions</code> 等后缀。
+            <br />
+            ⚠️ 开启后「拉取上游模型」（<code>GET /models</code> 探测）无法从后缀派生，型号名请手工录入。
           </p>
         </div>
 

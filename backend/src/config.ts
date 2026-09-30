@@ -614,6 +614,27 @@ const envSchema = z
      * 于是断言时有时无。改一个键就能把消费方隔离开（验收脚本正是这么用的）。
      */
     PIPELINE_QUEUE_KEY: defaultedVar(z.string().trim().min(1), 'pipeline:jobs'),
+
+    // ── 文档图片解析（P0-4-x）──
+    /**
+     * 单张图片上限（字节）。超过则跳过该图（不因一张大图撑爆内存 / base64 上限）。
+     * 10MB 与前端预览的内联闸门同量级（`子方案/文件预览.md`），够覆盖扫描页与常见插图。
+     */
+    IMAGE_MAX_BYTES: byteSizeVar('IMAGE_MAX_BYTES', '10MB'),
+    /** 单篇文档最多处理的图片数（防止"一本图册"把 OCR / 向量化拖成分钟级）。 */
+    IMAGE_MAX_COUNT: intVar('IMAGE_MAX_COUNT', 50, { min: 1, max: 1000 }),
+    /**
+     * 本地 OCR 的语言（`chi_sim+eng` 这类 `+` 分隔串，也接受逗号）。
+     * 中英混排是内部文档的常态，故默认两种语言都上。
+     */
+    OCR_LANGS: defaultedVar(z.string().trim().min(1), 'chi_sim+eng'),
+    /**
+     * OCR 语言包目录（离线环境指向本地的 `*.traineddata`）。
+     * 不设置时用 tesseract.js 默认（从 CDN 拉取并缓存）——**内网部署必须设置**。
+     */
+    OCR_LANG_PATH: optionalText,
+    /** OCR 缓存目录（tesseract.js 的 `cachePath`；不设置时由其默认处理）。 */
+    OCR_CACHE_PATH: optionalText,
   })
   .superRefine((env, ctx) => {
     if (env.CHUNK_OVERLAP_DEFAULT >= env.CHUNK_SIZE_DEFAULT) {
@@ -791,6 +812,20 @@ export interface AppConfig {
     candidatePoolFactor: number
     /** 流水线队列的 Redis 键（见 `PIPELINE_QUEUE_KEY` 的注释：可换键 = 可隔离消费方） */
     queueKey: string
+    /** 单张图片上限（字节；见 `IMAGE_MAX_BYTES`） */
+    imageMaxBytes: number
+    /** 单篇文档最多处理的图片数（见 `IMAGE_MAX_COUNT`） */
+    imageMaxCount: number
+  }
+
+  /** 本地 OCR（`OCR` 模式解析文档图片时用；见 `pipeline/ocr.ts`） */
+  ocr: {
+    /** 语言列表（已从 `OCR_LANGS` 的 `+`/`,` 分隔串拆好） */
+    langs: string[]
+    /** 语言包目录；`null` = 用 tesseract.js 默认（CDN） */
+    langPath: string | null
+    /** 缓存目录；`null` = 由其默认处理 */
+    cachePath: string | null
   }
 
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
@@ -891,34 +926,11 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     vars.EMBEDDING_API_KEY !== undefined &&
     vars.EMBEDDING_API_MODEL !== undefined
 
-  if (vars.EMBEDDING_MODE === 'api' && !apiReady) {
-    const missing = (['EMBEDDING_API_URL', 'EMBEDDING_API_KEY', 'EMBEDDING_API_MODEL'] as const).filter(
-      (key) => vars[key] === undefined,
-    )
-    warnings.push(
-      `EMBEDDING_MODE=api 但未设置 ${missing.join(' / ')} —— 入库/检索会在 P0-1-13 初始化 embedding provider 时硬报错。` +
-        '（P0-1-3 不拦截：按待决事项 2「先跑 api 模式打通链路」放行，避免阻塞后续批次开工。）',
-    )
-  }
-  if (vars.EMBEDDING_MODE === 'local' && !existsSync(vars.LOCAL_EMBEDDING_MODEL_PATH)) {
-    warnings.push(
-      `EMBEDDING_MODE=local 但模型目录不存在：${vars.LOCAL_EMBEDDING_MODEL_PATH}` +
-        '（待决事项 2：bge-m3 int8 文件获取渠道未定，P0-1-13 补验）',
-    )
-  }
-  if (vars.EMBEDDING_MODE === 'local' && vars.LOCAL_EMBEDDING_RUNTIME_MODULE === undefined) {
-    warnings.push(
-      'EMBEDDING_MODE=local 但未设置 LOCAL_EMBEDDING_RUNTIME_MODULE（本地推理运行时模块）—— ' +
-        '入库/检索会在 P0-1-13 初始化 embedding provider 时硬报错。' +
-        '运行时契约见 docs/02 §八；只想先把链路跑通用 EMBEDDING_MODE=api。',
-    )
-  }
-  if (vars.EMBEDDING_DIM !== 1024) {
-    warnings.push(
-      `EMBEDDING_DIM=${vars.EMBEDDING_DIM} 与 chunks.embedding 的 vector(1024) 不一致（子方案① §4-4），` +
-        '换维度须走「新建 chunks_v2 → 双写 → 切检索 → 弃旧表」路径',
-    )
-  }
+  // ⚠️ 自「知识库 embedding 改用模型池选定模型」（2026-09-30）起，`EMBEDDING_MODE` /
+  //    `EMBEDDING_API_*` / `LOCAL_EMBEDDING_*` / `EMBEDDING_DIM` **不再被入库与检索使用**
+  //    （改由建库时选定的模型 + 探测出的维度决定）。这里刻意**不再就它们告警** ——
+  //    留着"未配置会硬报错"的旧警告只会把运维引向一个已经作废的配置面。
+  //    这些环境变量与 `config.embedding` 暂时保留仅为兼容（`apiReady` 仍被下方装配引用）。
   if (vars.NODE_ENV === 'production' && vars.CREDENTIAL_MASTER_KEY.length < 44) {
     warnings.push('生产环境主密钥长度异常（应恒为 44 字符的 base64）')
   }
@@ -1029,6 +1041,16 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retrievalScore: vars.RETRIEVAL_SCORE_DEFAULT,
       candidatePoolFactor: vars.CANDIDATE_POOL_FACTOR,
       queueKey: vars.PIPELINE_QUEUE_KEY,
+      imageMaxBytes: vars.IMAGE_MAX_BYTES.bytes,
+      imageMaxCount: vars.IMAGE_MAX_COUNT,
+    },
+    ocr: {
+      // `chi_sim+eng` / `chi_sim,eng` 两种写法都拆开（tesseract 历史上两种都用过）
+      langs: vars.OCR_LANGS.split(/[+,]/u)
+        .map((lang) => lang.trim())
+        .filter((lang) => lang !== ''),
+      langPath: vars.OCR_LANG_PATH ?? null,
+      cachePath: vars.OCR_CACHE_PATH ?? null,
     },
 
     warnings,

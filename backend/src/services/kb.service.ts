@@ -53,7 +53,8 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { getS3Client } from '../infra/s3.js'
-import { embeddingReadiness, getEmbeddingProvider } from '../llm/embedding/index.js'
+import { apiEmbeddingName, probeEmbeddingDim } from '../llm/embedding/index.js'
+import { resolveEmbeddingTarget } from './model.service.js'
 
 /**
  * 查询字段白名单（列表 / 建 / 改共用一份）。
@@ -67,11 +68,23 @@ const KB_SELECT = {
   name: true,
   description: true,
   embeddingModel: true,
+  embeddingModelId: true,
+  embeddingDim: true,
   chunkSize: true,
   chunkOverlap: true,
   retrievalConfig: true,
   createdAt: true,
   updatedAt: true,
+  // 漂移探测：该库**选定模型**是否还在 / 启用（模型被删时关系为 null）
+  embeddingModelRef: {
+    select: {
+      modelName: true,
+      enabled: true,
+      // 是否支持多模态（上传文档选"多模态向量化"时前端据此提示/禁用）
+      embeddingMultimodal: true,
+      provider: { select: { enabled: true } },
+    },
+  },
 } as const
 
 type KnowledgeBaseRow = {
@@ -79,11 +92,19 @@ type KnowledgeBaseRow = {
   name: string
   description: string | null
   embeddingModel: string
+  embeddingModelId: string | null
+  embeddingDim: number | null
   chunkSize: number
   chunkOverlap: number
   retrievalConfig: unknown
   createdAt: Date
   updatedAt: Date
+  embeddingModelRef: {
+    modelName: string
+    enabled: boolean
+    embeddingMultimodal: boolean
+    provider: { enabled: boolean }
+  } | null
 }
 
 /** Prisma 错误码鸭式判断（`instanceof` 跨包会失效，见 `user.service.ts` 同款） */
@@ -97,47 +118,20 @@ function hasPrismaCode(error: unknown, code: string): boolean {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// embedding 快照与漂移探测（`子方案①` §八 ① 的"探测与告警要在 P0 就位"）
+// embedding 漂移探测（`子方案①` §八 ① 的"探测与告警要在 P0 就位"）
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 当前 embedding provider 的标识 —— **建库时快照用**，取不到就拒绝建库（见文件头 ②）。
- *
- * 包装 `getEmbeddingProvider()` 而不是自己拼名字：`name()` 由 provider 自己给
- * （P0-1-13 定案），"自检里的名字"与"实际落库的名字"必须是同一个值，
- * 否则 §八 的换模型探测直接失效。
+ * §八 ① 的探测：该库**选定模型**是否仍可用于向量化（任一命中即"需重建/处理"）：
+ *   · 模型已被删（关系为 `null`）；
+ *   · 模型或其 Provider 被停用；
+ *   · 模型的上游型号名变了（库内快照 `embeddingModel` 与当前 `api:<modelName>` 不一致）。
  */
-function requireEmbeddingModelName(): string {
-  try {
-    return getEmbeddingProvider().name()
-  } catch (error) {
-    // 沿用 P0-1-13 的错误码（INTERNAL）—— "服务端配置不齐"是同一类问题，
-    // 换成两套说法只会让排查的人多跳一次。这里补上"建库"的上下文与出路。
-    const reason = error instanceof AppError ? error.message : String(error)
-    throw AppError.internal(
-      `无法创建知识库：服务端 embedding 未就绪，取不到 embedding_model 快照。${reason}`,
-    )
-  }
-}
-
-/**
- * 当前 provider 的标识；**未就绪时返回 `null`**（供 §八 的漂移探测用，绝不抛错）。
- *
- * 为什么不能直接 `getEmbeddingProvider()`：那会在列表接口里抛 500 ——
- * 一个库都列不出来（连"哪个库需要重建"都看不到），而 provider 没配好是**运维要先修的事**，
- * 不该让只读接口不可用。故探测走 `embeddingReadiness()`（纯配置计算，不抛）。
- */
-function currentEmbeddingNameOrNull(): string | null {
-  return embeddingReadiness().name
-}
-
-/**
- * §八 ① 的探测：`kb.embeddingModel` 与当前 provider 名不一致 ⇒ 该库需重建。
- * `null` = 无法判定（provider 未就绪）。见 shared 契约里 `embeddingModelChanged` 的三态说明。
- */
-function detectEmbeddingModelChanged(snapshot: string, current: string | null): boolean | null {
-  if (current === null) return null
-  return snapshot !== current
+function embeddingModelChanged(row: KnowledgeBaseRow): boolean {
+  const ref = row.embeddingModelRef
+  if (ref === null) return true
+  if (!ref.enabled || !ref.provider.enabled) return true
+  return row.embeddingModel !== apiEmbeddingName(ref.modelName)
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -184,14 +178,16 @@ function snapshotDefaults(): {
 function toItem(
   row: KnowledgeBaseRow,
   counts: { documentCount: number; agentCount: number },
-  currentEmbeddingName: string | null,
 ): KnowledgeBaseItem {
   return {
     id: row.id,
     name: row.name,
     description: row.description,
     embeddingModel: row.embeddingModel,
-    embeddingModelChanged: detectEmbeddingModelChanged(row.embeddingModel, currentEmbeddingName),
+    embeddingModelId: row.embeddingModelId,
+    embeddingDim: row.embeddingDim,
+    embeddingMultimodal: row.embeddingModelRef?.embeddingMultimodal ?? false,
+    embeddingModelChanged: embeddingModelChanged(row),
     chunkSize: row.chunkSize,
     chunkOverlap: row.chunkOverlap,
     // ⚠️ 唯一入口：库里可能是 `{}` 或缺键（老数据 / 局部写入 / 手工改库）
@@ -230,7 +226,6 @@ export async function listKnowledgeBases(
   query: ListKnowledgeBasesQuery,
 ): Promise<OffsetPage<KnowledgeBaseItem>> {
   const db = getPrisma()
-  const currentEmbeddingName = currentEmbeddingNameOrNull()
 
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位
   const [rows, total] = await db.$transaction([
@@ -257,7 +252,7 @@ export async function listKnowledgeBases(
 
   return {
     items: rows.map((row) =>
-      toItem(row, { documentCount: row._count.documents, agentCount: agentCountByRef.get(row.id) ?? 0 }, currentEmbeddingName),
+      toItem(row, { documentCount: row._count.documents, agentCount: agentCountByRef.get(row.id) ?? 0 }),
     ),
     total,
     offset: query.offset,
@@ -274,7 +269,7 @@ export async function getKnowledgeBase(id: string): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const row = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
   if (row === null) throw AppError.notFound('知识库不存在')
-  return toItem(row, await countsOf(id), currentEmbeddingNameOrNull())
+  return toItem(row, await countsOf(id))
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -297,9 +292,33 @@ export async function createKnowledgeBase(
   const db = getPrisma()
   const defaults = snapshotDefaults()
 
-  // ⚠️ 顺序有意为之：先把 embedding 快照拿到手，再谈其他 —— 这样"没配 embedding"时
-  //    不会先做一堆无用功（也保证日志里失败原因始终是同一条）。
-  const embeddingModel = requireEmbeddingModelName()
+  // ① 解析建库时**选定**的 embedding 模型（必须存在、是 EMBEDDING 类型、模型与 Provider 都启用）
+  const target = await resolveEmbeddingTarget(input.embeddingModelId)
+  // ② 维度：优先用**建模型时探测好的**维度（`models.embedding_dim`）；
+  //    缺失（本功能上线前建的向量模型）才现场探测一次兜底。
+  let embeddingDim = target.embeddingDim
+  if (embeddingDim === null) {
+    try {
+      embeddingDim = await probeEmbeddingDim(
+        {
+          providerName: target.providerName,
+          baseUrl: target.baseUrl,
+          customUrl: target.customUrl,
+          multimodal: target.embeddingMultimodal,
+          apiKey: target.apiKey,
+          apiModel: target.modelName,
+        },
+        config.embedding.batchSize,
+      )
+    } catch (error) {
+      const reason = error instanceof AppError ? error.message : String(error)
+      throw AppError.validation(
+        `无法确定 embedding 模型「${target.label}」的维度：${reason}。` +
+          '请在「模型池」编辑该向量模型并手动填写它的输出维度后重试（不是所有 embedding 端点都能被自动探测）',
+      )
+    }
+  }
+  const embeddingModel = apiEmbeddingName(target.modelName)
 
   const chunkSize = input.chunkSize ?? defaults.chunkSize
   const chunkOverlap = input.chunkOverlap ?? defaults.chunkOverlap
@@ -313,6 +332,8 @@ export async function createKnowledgeBase(
       name: input.name,
       description: input.description ?? null,
       embeddingModel,
+      embeddingModelId: target.modelId,
+      embeddingDim,
       chunkSize,
       chunkOverlap,
       retrievalConfig,
@@ -321,11 +342,11 @@ export async function createKnowledgeBase(
   })
 
   getLogger().info(
-    { kbId: created.id, name: created.name, embeddingModel, chunkSize, chunkOverlap },
+    { kbId: created.id, name: created.name, embeddingModel, embeddingDim, chunkSize, chunkOverlap },
     '已创建知识库',
   )
   // 刚建的库必然 0 文档 0 引用，不必再查库（也避免"建完立刻查"这一对多余的往返）
-  return toItem(created, { documentCount: 0, agentCount: 0 }, currentEmbeddingNameOrNull())
+  return toItem(created, { documentCount: 0, agentCount: 0 })
 }
 
 /**
@@ -392,7 +413,7 @@ export async function updateKnowledgeBase(
   })
 
   getLogger().info({ kbId: id, changed: Object.keys(input) }, '已更新知识库')
-  return toItem(updated, await countsOf(id), currentEmbeddingNameOrNull())
+  return toItem(updated, await countsOf(id))
 }
 
 // ═════════════════════════════════════════════════════════════════════

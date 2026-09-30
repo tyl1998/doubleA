@@ -58,5 +58,9 @@ allowBuilds:
   protobufjs: true
   ssh2: false
   cpu-features: false
+  # tesseract.js（P0-4-x 文档图片解析引入）：npm 包**已自带构建好的 dist**，其生命周期脚本
+  # 只是发布前的打包（prepare/prepublish），运行时不需要任何编译 ⇒ 与 ssh2 同款登记 `false`
+  # 阻止脚本执行，避免在无工具链的机器上多出一次无意义的构建。
+  tesseract.js: false
 minimumReleaseAgeExclude:
   - '@modelcontextprotocol/sdk@1.30.1'

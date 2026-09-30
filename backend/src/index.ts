@@ -144,7 +144,7 @@ try {
     //    "P0-3-9b …"（那会让自检必红）。支线当时的写法是「P0-3-11 + P0-3-9b」：既说明代码状态是
     //    "里程碑批次之上叠了这条支线"，又仍带着那个最大批次号。⚠️ **P0-3-12 起该写法退役** ——
     //    P0-3-12 > P0-3-11 > P0-3-9b ⇒ 本行直接写"P0-3-12 …"即可（规则只在"补做的批次号更小"时才需绕）。
-    step: 'P0-3-13 P0-3 包验收（阶段三出口验收）：**纯文档批次**（零业务代码改动）—— 产出 = `README` 新增「阶段三出口验收（人工 · P0-3-13 收尾）」整节：前置六步 / **R1~R6**（建 TaskAgent → 派活 → 沙箱过程可见 → 下载/预览产物 → 停止 → 会话恢复）/ **三条"包级才成立"的附加门槛**（跨两个阶段串一遍：同一轮里沙箱工具卡 + MCP 工具卡共存 + 危险工具弹确认卡；新建账号自己走一遍；流内与刷新后投影逐字一致）/ 逐行结论表 / 七条边界 / 复位。★ **原计划的包级验收脚本作废**（`backend/scripts/**` 已于 2026-09-24 整目录删除）⇒ 九行门槛**全部待人工取证**。★ 本批把两处环境真相当成清单硬前置写了出来：① `infra/.env` 的 `SANDBOX_IMAGE` 仍是 `:2`（含 MCP 桥真实现的是 `:3`）；② `SANDBOX_EGRESS_PROXY_URL` 留空且仓库不提供代理 ⇒ 一发消息就是 `ensureSandbox` 的显式拒绝。另订正 `子方案③` §十二「需求 30」那行自 P0-3-0a 起遗留的旧口径（签名 URL → 后端流式代理）。上一层是 **P0-3-12**（TaskAgent 计量）与 **P0-3-11 里程碑**（任务型对话页 + 产物面板 + 预览弹层）',
+    step: 'P0-3-14 TaskAgent 知识库支持：**绑定知识库的 TaskAgent 现在能识别并使用知识库**。① 抽出内置知识库工具（`knowledge_search` / `list_knowledge`）的**唯一执行体** `orchestrator/knowledgeTools.ts`（ChatBot 工具循环与沙箱代理路径共用）。② 沙箱工具清单（`sandbox/mcpMap.ts#SandboxMcpCatalog`）新增 `builtins` 段，`sandbox/proxy.ts#buildSandboxMcpCatalog` 在 Agent 绑库时把这两个工具下发；新增内置工具调用端点 `POST /api/sandbox/builtin/call`（经令牌认证，库/文档全在后端查）。③ 容器侧 `mcp-bridge` 扩展注册内置工具（走 `builtinTools` 段 + `BUILTIN_CALL_PATH`）。④ `sandbox/map.ts` 新增 `resolveBuiltinTool` 注入 ⇒ 内置工具卡 `kind:BUILTIN`（与 ChatBot 同 kind）+ 展示名"知识库"。⑤ `taskAgent.ts` 派活前把「知识库能力说明 + 引用规则 + 可用知识库清单」作为 prompt 前缀注入（走 pi 的 `prompt` 通道，TaskAgent 没有 system 通道），并订正 `citations` 写死空数组的过时注释。上一层是 **P0-3-13**（P0-3 包验收）',
     address,
   })
   logger.info(

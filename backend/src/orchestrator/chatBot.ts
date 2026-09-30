@@ -4,10 +4,11 @@
  * ```
  * 入口：POST /chat（已建会话，type=CHATBOT）
  *  1. 并发闸：信号量（上限 50），满则 error{code: BUSY}
- *  2. 组装上下文：system = agent.system_prompt + 检索块；history = 最近 20 轮；user = content
+ *  2. 组装上下文：system = agent.system_prompt +（绑库时）能力说明 + 引用规则 + 可用知识库清单；
+ *     history = 最近 20 轮；user = content（⚠️ **无前置检索**：知识库走工具式，见 `knowledge_search`）
  *  3. LLM 流式调用 → delta / thinking 透传
  *  4. 工具循环（MCP）→ 已落地（P0-2-8 起；危险工具先过确认 ⇒ P0-2-10）
- *  5. done：整条消息落库 + usage 透传
+ *  5. 收尾：按**回答里真正引用的文档**发 `citations`（产品反馈 2026-09-30）→ `done` + 落库 + usage 透传
  * ```
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -16,7 +17,7 @@
  * `routes/conversations.ts` →（前置闸门 `assertConversationSendable`）→ `orchestrator/sse.ts`
  * （通道：帧 / 互斥锁 / 停止 / 心跳）→ **本文件**（生产帧）→ `llm/client.ts`（传输层）。
  * 它由 `orchestrator/index.ts#resolveChatProducer()` 单点接回 —— 路由一行都不用改（P0-1-26 的接回点）。
- * 纯逻辑（system prompt / 检索块 / 历史截断 / 落库形态）在 `chatContext.ts`（可进无依赖档），
+ * 纯逻辑（system prompt / 检索块拼装 / 历史截断 / 落库形态）在 `chatContext.ts`（可进无依赖档），
  * 并发闸在 `semaphore.ts`（同上），本文件只留"必须碰 DB / 上游 / 日志"的那一半。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -29,11 +30,12 @@
  *    ⚠️ **唯一的例外是锁丢了（`lock-lost`）**：那时这个会话可能已经有**另一个流**在写历史，
  *    我们再写一次就是两边往同一份历史里插消息（sse.ts 文件头 ③ 的最后一条）。
  *
- * ② **前置失败（智能体没了 / 知识库检索不可用）不落库**：落库的单位是"**一轮问答**"，
+ * ② **前置失败（智能体没了 / 会话没了 / 模型池不合法）不落库**：落库的单位是"**一轮问答**"，
  *    而这一轮根本没发生（一个字的回答都没有、用户看到的是流内错误卡）。
  *    留一条"只有问题、永远没有答案"的记录，会让下次刷新时用户以为自己问过但被丢了。
- *    这与"检索失败要整轮失败"是同一判断的两面：检索层把"搜不了"报成 409/500 而不是空结果
- *    （P0-1-20 定案："空结果会被读成'库里没有相关内容'，是一句假话"），本层**不吞这个错**。
+ *    ⚠️ 2026-09-30 起**知识库检索不再是前置步骤**（改成工具式，见 `KNOWLEDGE_USAGE_RULES`），
+ *    所以"检索失败"也不再是前置失败 —— 它发生在工具循环里，按"单条工具失败"回填给模型
+ *    （整轮不因此失败，见下面的内置工具分支）。
  *
  * ③ **`usage_records` 表已上线，但 ChatBot 仍不写**（P0-3-12 起）：
  *    表本身在 **P0-3-12** 就落地了（`schema.prisma#UsageRecord`，按月分区）—— 因为
@@ -106,22 +108,27 @@ import {
 } from '../mcp/client.js'
 import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
-import { searchKnowledgeBase } from '../services/retrieval.js'
 import {
+  KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
+  KNOWLEDGE_SEARCH_TOOL_NAME,
+  KNOWLEDGE_TOOL_SERVER_NAME,
+  LIST_KNOWLEDGE_TOOL_NAME,
   TOOL_CONFIRM_REJECTED_OUTPUT,
   TOOL_CONFIRM_TIMEOUT_OUTPUT,
   TOOL_LOOP_LIMIT_NOTICE,
   buildAssistantToolCallsMessage,
   buildSystemPrompt,
   buildToolResultMessages,
-  mergeRetrievalHits,
+  knowledgeListTool,
+  knowledgeSearchTool,
   selectHistoryMessages,
   summarizeToolInput,
-  toCitationItems,
+  toUsedCitationItems,
   truncateToolResult,
   type HistoryRow,
   type ToolOutcome,
 } from './chatContext.js'
+import { executeKnowledgeTool, loadKnowledgeCatalog } from './knowledgeTools.js'
 import { persistRoundQuietly } from './persist.js'
 import { createSemaphore } from './semaphore.js'
 import {
@@ -147,8 +154,8 @@ const chatBotSlots = createSemaphore(config.concurrency.chatbot)
 /**
  * ChatBot 的编排循环（`orchestrator/index.ts` 的返回值）。
  *
- * @throws {AppError} `BUSY`(429) 并发闸满 / `NOT_FOUND`(404) 智能体已不存在 /
- *   检索层的错误**原样透出**（知识库 409 / 500 ⇒ 整轮失败，见文件头 ②）
+ * @throws {AppError} `BUSY`(429) 并发闸满 / `NOT_FOUND`(404) 智能体已不存在
+ *   （⚠️ 知识库检索自 2026-09-30 起在工具循环内完成，它的失败**不会**从这里抛出，见文件头 ②）
  * @throws {LlmAbortError} 只有"没接住的中断"才会漏出去（正常路径下中断被本函数接住并转成 `STOPPED`）
  */
 export const chatBotProducer: ChatProducer = async (input) => {
@@ -172,7 +179,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
    */
   let assistantText = ''
   let thinkingText = ''
-  let citations: CitationItem[] = []
+  /**
+   * 本轮引用卡条目。
+   *
+   * ⚠️ **故意不在这里初始化**：它在回答结束后由 {@link toUsedCitationItems} 一次性算出
+   * （判据是"回答里真的引用了哪几篇"，见 ⑤′），早于那里读它都是错的；不给初值能让
+   * "在算出来之前被读到"变成编译期错误，而不是一个静默的空数组。
+   */
+  let citations: CitationItem[]
   /**
    * 本轮的**工具调用记录**（P0-2-8）。
    *
@@ -204,30 +218,36 @@ export const chatBotProducer: ChatProducer = async (input) => {
       .filter((component) => component.componentType === 'MCP')
       .map((component) => component.refId)
 
-    // ── ③ 逐库检索（`02` §六 第 2 步）──
-    // ⚠️ 每个库各调一次 `searchKnowledgeBase` ⇒ **同一句 query 会被 embed 多次**。
-    //    这是刻意的：那条函数是"一次检索"的完整语义（读库配置 → 双路 → RRF），
-    //    为了省一次 embedding 就绕过它（自己拼 SQL）会让"检索口径"出现第二个实现。
-    //    库的数量是个位数，代价可接受；要优化应当把它做成接受多库的函数（属后续批次）。
-    const perKb: RetrievalHit[][] = []
-    for (const kbId of kbIds) {
-      const result = await searchKnowledgeBase({ kbId, query: content })
-      perKb.push(result.items)
-      if (result.warnings.length > 0) {
-        logger.warn({ conversationId, kbId, warnings: result.warnings }, '本轮检索发生降级（已记入警告）')
-      }
-    }
-    const hits = mergeRetrievalHits(perKb)
-    citations = toCitationItems(hits)
+    // ── ②′ 可用知识库清单（库名 + 文档名）──
+    /**
+     * "Agent 绑了哪几个库、每个库里有哪些文档" —— **prompt 概览**与「知识库目录」工具**共用**这一份读取。
+     *
+     * 为什么要它：模型是"看不见"知识库的，只有我们告诉它才可能答"我有哪些知识/文档"。
+     * 文档名本身就是需求/主题的大类（"NGPOS星礼包对接需求"…），所以这份清单既是**给模型的概况**，
+     * 也是 `list_knowledge` 工具要回的**目录本体**。
+     *
+     * ⚠️ 文档名**按库限量取**（`maxDocsPerKb`）：库里可能有上千篇，全量塞进 prompt 会撑爆上下文。
+     *    prompt 概览只取 {@link KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB}（30）篇；目录工具另取
+     *    {@link KNOWLEDGE_LIST_MAX_DOCS}（200）篇 —— 因为"列全"正是它的职责。两者都**不静默省略**：
+     *    超出时清单里写「其余 N 篇未列出」。
+     * ⚠️ 排序与文档列表端点一致（`createdAt desc, id desc`）—— 让"清单里看到的头几篇"与用户在
+     *    知识库页面上看到的头几篇是同一批。
+     */
+    // ⚠️ 执行体与"目录读取"同源：`knowledgeTools.ts`（TaskAgent 的沙箱代理路径也用它）
+    const knowledgeCatalog = await loadKnowledgeCatalog(kbIds, KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB)
 
-    // ⚠️ **未命中时一个引用卡都不发**（`01` 决策 12 / `06` 的验收原文）——
-    //    不是发一个 `items: []`：前端按"有没有 citations 事件"决定要不要画引用区
-    //    （`03` §五"完成时随 citations 事件出现"），空事件会让它画一个空卡。
-    if (citations.length > 0) {
-      await input.emit({ name: 'citations', data: { items: citations } })
-    }
+    /**
+     * 命中累积：**只来自模型的主动检索**（内置「知识库检索」工具，2026-09-30）。
+     *
+     * ⚠️ 这里**不再有**"开场自动检索"：默认前置检索（Static RAG）已按产品反馈去掉 —— 无关问题
+     * 也先查一次是纯浪费，且与"工具式（Agentic RAG）"相悖。检索现在发生在工具循环里（见下面的
+     * 内置工具分支），命中的文档同样要进引用卡（否则模型据工具结果回答、卡片却指不出来源）。
+     */
+    const searchHits: RetrievalHit[] = []
+    // ⚠️ `citations` 的**发送**推迟到回答结束后（见 ⑥ 收尾）：判据是"模型真的引用了哪几篇"
+    //    而不是"检索命中了几条"。何时发、发哪几条都由 {@link toUsedCitationItems} 定，见其注释。
 
-    // ── ③′ 本轮可用的 MCP 工具（P0-2-8）──
+    // ── ③ 本轮可用的工具（内置检索 + MCP，P0-2-8）──
     /**
      * 读 `tool_cache` 列组装工具表：**不联网、不碰凭据**（见 `mcpCall.service.ts` 文件头 ⑤）。
      *
@@ -247,6 +267,19 @@ export const chatBotProducer: ChatProducer = async (input) => {
       )
     }
 
+    /**
+     * 内置工具：**绑了知识库才有**「知识库目录 + 检索」（`list_knowledge` / `knowledge_search`）。
+     *
+     * 它们与 MCP 工具**同表下发**（一个数组），但执行时按名字分流（见循环里的 `isBuiltinKnowledgeTool`）——
+     * 不进 `catalog.routes`：那不是 MCP 工具，没有 server / 凭据 / 危险确认，硬塞进 `McpToolRoute`
+     * 只会让那条"名字 → 哪台 server 的哪个工具"的映射表多出一种它描述不了的形状。
+     * 排在 MCP 工具**前面**：让模型先看到它们，与系统提示里"知识库优先"的顺序一致。
+     */
+    const tools =
+      kbIds.length === 0
+        ? catalog.tools
+        : [knowledgeListTool(), knowledgeSearchTool(), ...catalog.tools]
+
     // ── ④ 历史（最近 N 轮）+ system + 本轮用户消息 ──
     const rounds = config.limits.contextRounds
     const historyRows = await db.message.findMany({
@@ -263,7 +296,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
     })
     historyRows.reverse() // 上面是倒序取的（要"最近的 N 条"），还原成时间正序再组装
     const messages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt(agent.systemPrompt, hits) },
+      { role: 'system', content: buildSystemPrompt(agent.systemPrompt, knowledgeCatalog) },
       ...selectHistoryMessages(historyRows as HistoryRow[], rounds),
       { role: 'user', content },
     ]
@@ -350,7 +383,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
          * 撤掉比"等它要了再拒"少一次上游往返，而且**只有请求里没有 `tools` 才是真的禁工具**。
          */
         const atToolLimit = toolRounds >= limit
-        const withTools = catalog.tools.length > 0 && !atToolLimit
+        const withTools = tools.length > 0 && !atToolLimit
         if (atToolLimit && !limitNoticeSent) {
           limitNoticeSent = true
           messages.push({ role: 'user', content: TOOL_LOOP_LIMIT_NOTICE })
@@ -371,8 +404,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
                     modelId: input.target.modelId,
                     ttftMs: Date.now() - requestedAtMs,
                     historyMessages: messages.length - 2, // 去掉 system 与本轮用户消息
-                    citations: citations.length,
-                    tools: catalog.tools.length,
+                    tools: tools.length,
                   },
                   '本轮首字延迟（TTFT）',
                 )
@@ -387,7 +419,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
             // ⚠️ **不写 `onUsage`**：用量从每一轮返回的 `round.usage` 里取（那是外壳合并好的
             //    完整值）。两者同时算会把同一轮的用量记两遍（`onUsage` 回的就是 `round.usage`）。
           },
-          withTools ? { abortSignal: signal, tools: catalog.tools } : { abortSignal: signal },
+          withTools ? { abortSignal: signal, tools } : { abortSignal: signal },
         )
         summary = round
         totalUsage = sumUsages(totalUsage, round.usage)
@@ -419,6 +451,49 @@ export const chatBotProducer: ChatProducer = async (input) => {
 
         const outcomes: ToolOutcome[] = []
         for (const call of round.toolCalls) {
+          // ── 内置知识库工具（检索 / 目录）：在**第一行**与 MCP 调用分流 ──
+          //
+          // 它们没有 MCP server / 凭据 / 危险确认，走不了下面那套（`route` 查不到、`McpToolRoute`
+          // 也描述不了）。检索命中累积进 `searchHits`，供回答结束后的引用卡筛选。
+          const isBuiltinKnowledgeTool =
+            kbIds.length > 0 &&
+            (call.name === KNOWLEDGE_SEARCH_TOOL_NAME || call.name === LIST_KNOWLEDGE_TOOL_NAME)
+          if (isBuiltinKnowledgeTool) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: KNOWLEDGE_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+
+            /**
+             * ★ 执行体在 `orchestrator/knowledgeTools.ts`（**唯一实现**）：TaskAgent 经沙箱代理
+             *   调用的是同一个函数。这里只负责发卡 + 攒引用命中（`searchHits`）。
+             */
+            const outcome = await executeKnowledgeTool({
+              kbIds,
+              name: call.name,
+              arguments: call.arguments,
+              log: { conversationId, agentId },
+            })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const isError = outcome.isError
+            const output = outcome.output
+            searchHits.push(...outcome.hits)
+
+            const finished = { ...base, status, inputSummary, output }
+            emitToolCard(finished)
+            toolRecords.push({ ...finished, arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: output, isError })
+            continue
+          }
+
           const route = catalog.routes[call.name]
           // `serverName` 从目录取（**不依赖执行成功**：失败时卡片也要显示"来自哪台 server"）
           const serverName = route === undefined ? '' : (serverNameById.get(route.serverId) ?? '')
@@ -660,6 +735,17 @@ export const chatBotProducer: ChatProducer = async (input) => {
       // 中断与故障在这里**都**只是"记下来"，统一的收尾在下面（见文件头 ①）：
       // 两条路都要落库（锁丢那一路除外），只是最终发出去的帧不同
       failure = error
+    }
+
+    // ── ⑤′ 引用卡：只在回答**真的引用了某篇文档**时才发（产品反馈 2026-09-30）──
+    //
+    // 判据与筛选在 `toUsedCitationItems`（纯函数）：回答里出现某个命中的文档名 ⇒ 算它被引用；
+    // 按文档去重；回答为空则一条都不发。**不再**"检索到几条就发几条"。
+    // ⚠️ 经**串行队列**发（不是直接 `await input.emit`）：此刻队列里可能还压着没写完的 `delta`，
+    //    直接 emit 会插队、让引用卡跑到正文前面。`enqueue` 保证它排在正文之后、`done` 之前。
+    citations = toUsedCitationItems(searchHits, assistantText)
+    if (citations.length > 0) {
+      enqueue({ name: 'citations', data: { items: citations } })
     }
 
     await emitChain

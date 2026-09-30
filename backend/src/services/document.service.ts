@@ -61,8 +61,11 @@ import type { Readable } from 'node:stream'
 import {
   AppError,
   canTransitionDocumentStatus,
+  IMAGE_FILE_REQUIRES_MODE_HINT,
+  MULTIMODAL_MODEL_REQUIRED_HINT,
   type DocumentItem,
   type DocumentListResult,
+  type ImageMode,
   type RemoveDocumentResult,
   type RetryDocumentResult,
   type ReuploadDocumentResult,
@@ -76,7 +79,7 @@ import { getPrisma } from '../infra/prisma.js'
 // ⚠️ `isS3NoSuchKey` 原本是本文件的私有函数，P0-3-9 提到 `infra/s3.ts`：产物下载端点要
 // 同一个判据（"行在对象没了"），两处各写一份必然先腐烂一处
 import { ensureBucket, getS3Client, isS3NoSuchKey } from '../infra/s3.js'
-import { detectFormat } from '../pipeline/parse/index.js'
+import { detectFormat, isImageFormat } from '../pipeline/parse/index.js'
 import { enqueuePipelineJob } from '../pipeline/queue.js'
 
 /** 文档投影（与 `shared` 的 `documentItemSchema` 一一对应；列表端点 P0-1-21 复用它） */
@@ -86,6 +89,7 @@ const DOCUMENT_SELECT = {
   fileName: true,
   status: true,
   chunkCount: true,
+  imageMode: true,
   errorMsg: true,
   createdAt: true,
   updatedAt: true,
@@ -97,6 +101,7 @@ type DocumentRow = {
   fileName: string
   status: string
   chunkCount: number
+  imageMode: ImageMode
   errorMsg: string | null
   createdAt: Date
   updatedAt: Date
@@ -110,6 +115,7 @@ function toItem(row: DocumentRow): DocumentItem {
     // Prisma 的枚举在类型层是本仓 `schema.prisma` 里的字面量联合；这里只做形状收口
     status: row.status as DocumentItem['status'],
     chunkCount: row.chunkCount,
+    imageMode: row.imageMode,
     errorMsg: row.errorMsg,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -148,6 +154,38 @@ export interface UploadDocumentInput {
   declaredMime: string | undefined
   /** 文件内容（multipart 已读进内存；上限见 `UPLOAD_BODY_LIMIT`） */
   bytes: Buffer
+  /** 图片处理方式（上传时选定；见 `shared#IMAGE_MODES`） */
+  imageMode: ImageMode
+}
+
+/**
+ * 校验"图片处理方式 + 文件格式 + 知识库模型"三者的相容性（上传与覆盖重建共用）。
+ *
+ *  ① 独立图片文件**必须**选一个解析方式（`NONE` 时无从产生任何文本/向量）；
+ *  ② `MULTIMODAL` 要求该库选定的 embedding 模型支持多模态端点（否则图片进不了向量空间）。
+ *
+ * @throws {AppError} `VALIDATION`(400) ① / `CONFLICT`(409) ②
+ */
+async function assertImageModeUsable(
+  kbId: string,
+  format: UploadExtension,
+  imageMode: ImageMode,
+): Promise<void> {
+  if (imageMode === 'NONE') {
+    if (isImageFormat(format)) {
+      throw AppError.validation(`上传的是图片文件，${IMAGE_FILE_REQUIRES_MODE_HINT}`)
+    }
+    return
+  }
+  if (imageMode === 'MULTIMODAL') {
+    const kb = await getPrisma().knowledgeBase.findUnique({
+      where: { id: kbId },
+      select: { embeddingModelRef: { select: { embeddingMultimodal: true } } },
+    })
+    if (kb?.embeddingModelRef?.embeddingMultimodal !== true) {
+      throw AppError.conflict(MULTIMODAL_MODEL_REQUIRED_HINT)
+    }
+  }
 }
 
 /**
@@ -175,6 +213,9 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
 
   // ② 三道前置校验（扩展名 / MIME / 文件头），不合法抛 400
   const format: UploadExtension = detectFormat(input)
+
+  // ②b 图片处理方式相容性（图片文件必须选解析方式；多模态要求模型支持）
+  await assertImageModeUsable(input.kbId, format, input.imageMode)
 
   // ③ 内容判重（`子方案①` §4-1 第 4 条）
   const contentHash = createHash('sha256').update(input.bytes).digest('hex')
@@ -217,6 +258,7 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
         fileKey,
         fileName: input.fileName,
         contentHash,
+        imageMode: input.imageMode,
         // id / status / chunkCount 全走 schema 默认值：`@default(uuid(7))` 是 Prisma 侧
         // 生成（P0-1-14 的实测：函数型默认值不进 DDL），本服务**不**自己生成 id
       },
@@ -365,6 +407,12 @@ const DOWNLOAD_MIME_BY_EXTENSION: Readonly<Record<UploadExtension, string>> = Ob
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   md: 'text/markdown; charset=utf-8',
   txt: 'text/plain; charset=utf-8',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
 })
 
 /** 从文件名取扩展名（小写、不含点）；取不到或不在白名单内时回落 `application/octet-stream` */
@@ -556,10 +604,14 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
   // ② 三道前置校验（与上传同一个入口 —— 覆盖重建不能成为绕过校验的后门）
   const format: UploadExtension = detectFormat(input)
 
-  // ③ 内容没变 ⇒ 视为误操作，直接返回（§七）。⚠️ 注意这里**在写 S3 之前**就返回，
-  //    否则"什么都没做"就变成"落了一个没人引用的对象"
+  // ②b 图片处理方式相容性（同上）
+  await assertImageModeUsable(input.kbId, format, input.imageMode)
+
+  // ③ 内容没变 **且图片处理方式也没变** ⇒ 视为误操作，直接返回（§七）。
+  //    ⚠️ 只比 content_hash 不够：用户可能想对**同一份文件**换一种图片解析方式
+  //    （NONE → OCR / OCR → MULTIMODAL），那必须重新跑流水线，不能被"内容未变"短路。
   const contentHash = createHash('sha256').update(input.bytes).digest('hex')
-  if (contentHash === row.contentHash) {
+  if (contentHash === row.contentHash && input.imageMode === row.imageMode) {
     logger.info(
       { kbId: input.kbId, docId: row.id, fileName: input.fileName },
       '覆盖重建：内容与当前一致，未做任何改动',
@@ -601,6 +653,7 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
           contentHash,
           fileKey,
           chunkCount: 0,
+          imageMode: input.imageMode,
           /**
            * ⚠️ `file_name` 也一起换 —— **这是对 `§七` 列清单的一处刻意补全**。
            *

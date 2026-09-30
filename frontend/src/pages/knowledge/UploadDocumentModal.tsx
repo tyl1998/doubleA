@@ -27,14 +27,26 @@
  *    （表格每 2s 自动刷新）。这句提示必须给，否则"传完了搜不到"会被当成 bug。
  */
 
-import { Alert, Button, Modal, Upload } from 'antd'
-import { REUPLOAD_UNCHANGED_HINT, UPLOAD_EXTENSIONS, type DocumentItem } from '@doubulea/shared'
+import { Alert, Button, Modal, Radio, Upload } from 'antd'
+import {
+  IMAGE_MODE_LABELS,
+  REUPLOAD_UNCHANGED_HINT,
+  UPLOAD_EXTENSIONS,
+  type DocumentItem,
+  type ImageMode,
+} from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
 import { useReuploadDocument, useUploadDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
-import { UPLOAD_ACCEPT_ATTRIBUTE, screenPickedFiles, type FileScreenResult } from './knowledgeModel.js'
+import {
+  UPLOAD_ACCEPT_ATTRIBUTE,
+  imageModeOptions,
+  isImageFile,
+  screenPickedFiles,
+  type FileScreenResult,
+} from './knowledgeModel.js'
 
 export interface UploadDocumentModalProps {
   kbId: string
@@ -42,27 +54,34 @@ export interface UploadDocumentModalProps {
   doc: DocumentItem | null
   open: boolean
   onClose: () => void
+  /** 该库所选 embedding 模型是否支持多模态（决定「多模态向量化」是否可选） */
+  multimodalSupported: boolean
 }
 
 /** 只有 `reject` 这一支会被渲染成提示条 */
 type Rejection = Extract<FileScreenResult, { kind: 'reject' }>
 
-export function UploadDocumentModal({ kbId, doc, open, onClose }: UploadDocumentModalProps) {
+export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSupported }: UploadDocumentModalProps) {
   const feedback = useFeedback()
   const upload = useUploadDocument(kbId)
   const reupload = useReuploadDocument(kbId)
 
   const [picked, setPicked] = useState<File | null>(null)
+  const [imageMode, setImageMode] = useState<ImageMode>('NONE')
   const [rejection, setRejection] = useState<Rejection | null>(null)
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const reuploading = doc !== null
+  const modes = imageModeOptions(multimodalSupported)
+  // 用户选了图片文件却没开解析：发送前拦下（后端也会 400，这里省一次往返并当场说清）
+  const imageModeMissing = picked !== null && isImageFile(picked.name) && imageMode === 'NONE'
 
   // 每次打开都清空：上一次选中的文件不能跟着弹窗留到下一次（否则会"上传了两遍"
-  // 而用户只记得选过一次）
+  // 而用户只记得选过一次）。图片解析方式默认沿用被重传文档的当前方式。
   useEffect(() => {
     if (!open) return
     setPicked(null)
+    setImageMode(doc?.imageMode ?? 'NONE')
     setRejection(null)
     setErrorText(null)
   }, [open, doc])
@@ -76,22 +95,25 @@ export function UploadDocumentModal({ kbId, doc, open, onClose }: UploadDocument
     const onError = (error: unknown): void => setErrorText(describeError(error).message)
 
     if (doc === null) {
-      upload.mutate(picked, {
-        onSuccess: (result) => {
-          feedback.ok(
-            result.deduplicated
-              ? `该库里已有内容完全相同的文档，未新建记录（沿用「${result.document.fileName}」）`
-              : `已上传「${result.document.fileName}」并加入解析队列`,
-          )
-          onClose()
+      upload.mutate(
+        { file: picked, imageMode },
+        {
+          onSuccess: (result) => {
+            feedback.ok(
+              result.deduplicated
+                ? `该库里已有内容完全相同的文档，未新建记录（沿用「${result.document.fileName}」）`
+                : `已上传「${result.document.fileName}」并加入解析队列`,
+            )
+            onClose()
+          },
+          onError,
         },
-        onError,
-      })
+      )
       return
     }
 
     reupload.mutate(
-      { docId: doc.id, file: picked },
+      { docId: doc.id, file: picked, imageMode },
       {
         onSuccess: (result) => {
           feedback.ok(
@@ -121,11 +143,11 @@ export function UploadDocumentModal({ kbId, doc, open, onClose }: UploadDocument
           key="ok"
           type="primary"
           loading={mutating}
-          disabled={picked === null || rejection !== null}
+          disabled={picked === null || rejection !== null || imageModeMissing}
           onClick={submit}
         >
           {reuploading ? '开始重传' : '开始上传'}
-        </Button>,
+        </Button>
       ]}
       onCancel={onClose}
       maskClosable={!mutating}
@@ -166,6 +188,27 @@ export function UploadDocumentModal({ kbId, doc, open, onClose }: UploadDocument
             已选择：<span className="num">{picked.name}</span>
           </p>
         )}
+
+        <div className="stack stack--tight">
+          <p className="ratio">文档内图片怎么处理：</p>
+          <Radio.Group
+            value={imageMode}
+            onChange={(event) => setImageMode(event.target.value as ImageMode)}
+            options={modes.map((mode) => ({
+              value: mode.value,
+              label: IMAGE_MODE_LABELS[mode.value],
+              disabled: mode.disabled,
+            }))}
+          />
+          <p className="ratio">
+            {multimodalSupported
+              ? '「多模态向量化」需要向量模型支持图片输入；「OCR 转文字」在本机离线识别。'
+              : '当前知识库的向量模型不支持多模态，只能选「不解析图片」或「OCR 转文字」。'}
+          </p>
+          {imageModeMissing && (
+            <Alert type="warning" showIcon message="这是图片文件，请选择一种图片解析方式后上传。" />
+          )}
+        </div>
 
         {rejection !== null && (
           <Alert

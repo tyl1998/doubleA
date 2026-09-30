@@ -608,6 +608,16 @@
   overflow-wrap: anywhere;
 }
 
+/* 片段预览抽屉里的一整块原文：**不截断**（预览的价值就是看到完整一块，与上面 `.kb-snippet`
+   的"截三行"正好相反）。保留原文换行（`pre-wrap`）并允许长串断行（`anywhere`），
+   否则一段没有空格的长串（URL / 一串数字）会把表格横向撑爆。 */
+.chunk-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-sm);
+  color: var(--ink-2);
+}
+
 /* ================== 标签变体（P0-1-31 起被真实渲染） ====================== */
 /* 先兑现 `app/theme.ts` 的 Tag 注释里那条待办：Tag 的边框色在 `ComponentToken` 里设不了
    （它取 `token.colorBorder`，而那一档必须留给交互控件的 3:1 边界 `--rule-control`），
@@ -1038,6 +1048,19 @@
   color: var(--surface);
   border-radius: var(--r-sm) var(--r-sm) var(--r-xs) var(--r-sm);
 }
+/* 用户气泡是"深底浅字"（暗色主题下 `--ink`/`--surface` 互换，变成浅底深字）。全局那层
+   `::selection { background: var(--accent-wash) }` 只有 8%/12% 不透明度，叠在气泡自己的底色上
+   几乎看不出来 ⇒ 选中**没有视觉反馈**。这里改用不透明的 `--accent` 作选中底色：文字沿用气泡
+   自身的颜色（浅字/深字各自都够对比），于是两种主题下都看得见。
+
+   ⚠️ 必须写成 `.bubble--user::selection`（**不带空格**）+ `.bubble--user *::selection`（带空格）
+   两条：用户气泡的正文是 `.bubble--user` 的**直接文本子节点**（`MessageList.tsx`：`{view.text}`），
+   带空格的写法只命中"后代元素"，命中不了气泡自身的文本 —— 这正是上一版加了规则却仍无高亮的
+   原因（全局那条恰好是 `::selection`，把直接文本也算进去，所以看起来"有选中、只是很淡"）。 */
+.bubble--user::selection,
+.bubble--user *::selection {
+  background: var(--accent);
+}
 .bubble--agent {
   background: var(--surface);
   border: 1px solid var(--rule);
@@ -1207,6 +1230,10 @@
   color: var(--ink-2);
   font-size: var(--fs-sm);
   line-height: 1.7;
+  /* 引用卡展示的是**整块原文**（与给模型的同一份），必须保留原文换行（标题/列表/规则一行一条），
+     否则 `<p>` 会把所有换行压成空格，读起来是一大坨。长串（URL）允许断行防溢出。 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* 产物卡 */

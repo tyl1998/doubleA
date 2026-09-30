@@ -26,6 +26,9 @@ export const MCP_PATH = '/mcp'
 /** 我的凭据（`03` §二：`/mcp/credentials`，登录即可） */
 export const MCP_CREDENTIALS_PATH = '/mcp/credentials'
 
+/** 历史产物（`TaskAgent 记忆与产物` 块 4/5：删除会话后保留的产物，登录即可、仅本人可见） */
+export const ARTIFACT_HISTORY_PATH = '/artifacts/history'
+
 /**
  * 「我的凭据」地址，可带 `?serverId=` 定位到某一台 server 的分组（`03` §二 的引注、§4.5）。
  *

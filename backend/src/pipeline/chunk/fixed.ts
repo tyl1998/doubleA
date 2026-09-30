@@ -48,6 +48,7 @@ export const fixedStrategy: ChunkStrategy = {
         seq: chunks.length,
         content: chars.slice(start, start + size).join(''),
         meta: metaOf(locateBlock(spans, start)),
+        offset: start,
       })
       // 已经取到结尾（或越过）就停：否则会再产出一个纯重叠的尾块
       if (start + size >= chars.length) break

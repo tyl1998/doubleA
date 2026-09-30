@@ -36,6 +36,9 @@ import {
 } from '@doubulea/shared'
 
 import type { ChatMessage, ChatToolCall } from '../llm/client.js'
+// 只借这个**类型**（`type` 导入，运行时不留依赖）—— 内置工具的定义要与 MCP 工具同形，
+// 才能一起丢进 `ChatOptions.tools`（见 `knowledgeSearchTool`）。
+import type { OpenAiFunctionTool } from '../mcp/toolSchema.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // system prompt
@@ -51,24 +54,183 @@ import type { ChatMessage, ChatToolCall } from '../llm/client.js'
 export const DEFAULT_SYSTEM_PROMPT = '你是一个乐于助人的智能助手，请使用中文回答用户的问题。'
 
 /**
- * 检索使用的规则（**每一轮都注入**，无论有没有命中）。
+ * 平台内置的「知识库检索」工具名（2026-09-30）。
+ *
+ * ⚠️ **不带 `mcp_` 前缀**：MCP 工具名恒以 `mcp_{slug}_{tool}` 开头（`mcp/toolSchema.ts`），
+ * 所以这个名字不会与任何 MCP 工具相撞；编排层据此把它与 MCP 调用分流（不走凭据/危险确认）。
+ */
+export const KNOWLEDGE_SEARCH_TOOL_NAME = 'knowledge_search'
+
+/** 内置工具卡上的"来自哪个系统"（`toolCallRecordSchema.serverName`；非 MCP 时用它） */
+export const KNOWLEDGE_TOOL_SERVER_NAME = '知识库'
+
+/**
+ * 平台内置的「知识库目录」工具名（2026-09-30）—— 列出"有哪些知识库、各有哪些文档"。
+ *
+ * 为什么在「检索」之外还要一个「目录」工具：文档名本身就是需求/主题的**大类**（"NGPOS星礼包
+ * 对接需求"、"美团结算URP方案"…）。用户问"你了解哪些需求/有哪些知识"时，正确回答是**先列出
+ * 文档清单**，而不是直接拿检索结果去总结某一篇的内容 —— 实测模型拿到 `knowledge_search` 后
+ * 会直接总结内容、答成"我了解到以下需求：…"，答非所问（用户反馈 2026-09-30）。
+ * 一个只做"列目录"的工具让这件事变成一个**明确动作**，模型不必靠猜。
+ *
+ * ⚠️ system prompt 里那份「可用知识库」是**概览（每库截断到 30 篇）**；这个工具回**完整清单**
+ * （上限 {@link KNOWLEDGE_LIST_MAX_DOCS} 篇/库，超出写明"其余 N 篇未列出"）—— 那才是"列全"。
+ */
+export const LIST_KNOWLEDGE_TOOL_NAME = 'list_knowledge'
+
+/** 「知识库目录」工具每库最多列出的文档名条数（比 prompt 概览的 30 大，因为它就是为"列全"而生） */
+export const KNOWLEDGE_LIST_MAX_DOCS = 200
+
+/**
+ * 「知识库目录」工具的 OpenAI 形态定义（只在绑了知识库时下发）。
+ *
+ * 参数为空对象：它列的是**这个 agent 绑定的全部**知识库与文档，不需要调用方给任何输入
+ * （要"某一篇的具体内容"用 `knowledge_search`，那是另一个工具的事）。
+ */
+export function knowledgeListTool(): OpenAiFunctionTool {
+  return {
+    type: 'function',
+    function: {
+      name: LIST_KNOWLEDGE_TOOL_NAME,
+      description:
+        '列出已绑定的知识库，以及每个知识库里的文档清单。当用户询问你有哪些知识、知识库、文档、' +
+        '需求或能做什么时调用它，先给出文档清单（文档名即需求/主题分类），再按需检索具体内容。',
+      parameters: { type: 'object', properties: {} },
+    },
+  }
+}
+
+/** 检索块的标题（`formatRetrievalBlock` 拼工具结果时用；也是"结果里有没有来源"的可观测点） */
+export const RETRIEVAL_BLOCK_TITLE = '知识库检索结果'
+
+/**
+ * 检索/**引用**规则（只在绑了知识库时注入，见 {@link buildSystemPrompt}）。
  *
  * ⚠️ 这是 `01` 决策 12「未命中时不编造引用」在 **prompt 层**的落点 —— 它和"不发 `citations`
  * 事件"是这条要求的**两半**，缺一半都只是治表面：
  *   · 只做"不发引用卡" ⇒ 模型照样会在正文里写"根据《XX制度》…"（凭空造一个文档名），
  *     而界面上没有引用卡 ⇒ 用户看到的是**一段看起来有出处、其实没有的回答**；
  *   · 只做 prompt 约束 ⇒ 模型偶尔还是会编，引用卡是用户唯一能核对的东西。
+ *
+ * ⚠️ 2026-09-30 改成**工具口径**：原先写的是"下方「知识库检索结果」"，那是**前置检索**（每轮
+ * 强制先查、结果注入 system）的说法；现在检索由模型主动调 `knowledge_search` 完成，注入的
+ * system prompt 里**没有**现成检索块了，规则必须指向那次工具调用的结果，否则模型找不到"下方"。
  */
 export const RETRIEVAL_RULES = [
-  '回答用户问题时，如果使用了下方「知识库检索结果」中的内容，请以「来源：文档名」的形式在相应位置标注。',
-  '如果「知识库检索结果」为空或其中没有与问题相关的内容，请直接说明知识库中没有找到依据，不要推测、不要编造文档名或来源。',
+  `回答用户问题时，如果使用了 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 检索到的知识库原文，请以「来源：文档名」的形式在相应位置标注。`,
+  '如果检索工具返回"没有检索到相关内容"，请直接说明知识库中没有找到依据，不要推测、不要编造文档名或来源。',
 ].join('\n')
 
-/** 检索块的标题（**同时**用于 prompt 与断言：这条标题是"检索块有没有进去"的可观测点） */
-export const RETRIEVAL_BLOCK_TITLE = '知识库检索结果'
+/**
+ * 绑定知识库时的**能力与优先级**说明（只在绑了知识库时注入，见 {@link buildSystemPrompt}）。
+ *
+ * 为什么必须有它：模型是"看不见"知识库的 —— 它只知道我们下发了哪些工具。没有这段说明，
+ * 问「你有哪些知识」它会去调 MCP 工具（实测 `mcp_apitest_list_my_projects`）、或答"我没有枚举
+ * 知识库的工具"；问知识库内容它可能压根不调检索。这段规则是它"知道自己手里有什么"的**唯一**来源。
+ *
+ * ⚠️ 2026-09-30 改成**工具优先（Agentic RAG）**：知识库检索不再是每轮强制的"前置检索"，而是
+ * 交给模型用 `knowledge_search` 决定"要不要查、查几次、怎么改写 query" —— 这样无关问题不必
+ * 白查一次、复杂问题可多轮迭代。代价：模型不调工具时就没有检索结果，所以第一条必须把
+ * "回答知识库相关问题时先检索"说死。
+ */
+export const KNOWLEDGE_USAGE_RULES = [
+  `你绑定了一个或多个知识库。回答涉及知识库/文档内容的问题前，先用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 工具检索，并基于检索到的原文作答，不要凭通用知识推测。`,
+  `当用户询问你有哪些知识、知识库、文档、需求或能做什么时，调用 \`${LIST_KNOWLEDGE_TOOL_NAME}\` 工具列出知识库与文档清单（文档名通常就是需求/主题的大类），再按需用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 查看某篇的具体内容；不要为此去调用任何外部工具。`,
+  `可以换不同的关键词多次调用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\`，直到拿到足够的信息；不要凭记忆复述上一轮的回答。`,
+  '只有当问题与知识库内容无关、或确实需要外部系统的实时数据时，才使用其他工具。',
+].join('\n')
+
+/**
+ * 「知识库检索」工具的 OpenAI 形态定义（只在绑了知识库时下发给模型）。
+ *
+ * 为什么要有它：不绑库时模型根本没有"重新检索"的能力 —— 检索每轮只跑一次、且 query 是
+ * 用户那句话的字面文本。「重新查一下」「用别的关键词找找」这类要求下，模型手里没有新东西，
+ * 只能复述上一轮（产品反馈 2026-09-30）。给了这个工具，模型就能自己改写 query、多次检索。
+ *
+ * `parameters` 里 `query` 必填，`kb` / `doc` 可选（2026-09-30 增）：
+ *   · `kb` = 知识库名或 id ⇒ **只在这个库里检索**（省略 = 绑定的全部库）；
+ *   · `doc` = 文档名（文件名）或 id ⇒ **只在这个文档里检索**（省略 = 不限制）。
+ * 两者都收"名字或 id"是因为模型看到的是**名字**（目录工具给它的是库名/文件名），而库里用的是 id。
+ * 不给 topK —— 那属于"检索口径"，不该由模型每轮临时决定。
+ */
+export function knowledgeSearchTool(): OpenAiFunctionTool {
+  return {
+    type: 'function',
+    function: {
+      name: KNOWLEDGE_SEARCH_TOOL_NAME,
+      description:
+        '在已绑定的知识库中检索与 query 最相关的原文片段。当用户的问题涉及知识库/文档内容、' +
+        '这一轮的检索结果不足以回答、或用户要求"重新查一下"时调用它；可以换不同的关键词多次调用。' +
+        '可用 kb 限定某个知识库、doc 限定某篇文档。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '检索关键词或自然语言问题' },
+          kb: {
+            type: 'string',
+            description: '（可选）只在这个知识库里检索：知识库名或 id。省略则在绑定的全部知识库里检索。',
+          },
+          doc: {
+            type: 'string',
+            description: '（可选）只在这个文档里检索：文档名（文件名）或 id。省略则不限制文档。',
+          },
+        },
+        required: ['query'],
+      },
+    },
+  }
+}
+
+/** 可用知识库清单的标题（与 `RETRIEVAL_BLOCK_TITLE` 同款：标题本身是"这段有没有进去"的可观测点） */
+export const KNOWLEDGE_CATALOG_TITLE = '可用知识库'
+
+/**
+ * 每个知识库最多列出的文档名条数。
+ *
+ * 上界是必要的：一个库可能有上千篇文档，全列进 prompt 会把上下文撑爆（而"有哪些知识"这类
+ * 问题并不需要看全名单）。超出时清单里写「其余 N 篇未列出」—— **不静默省略**，否则模型会把
+ * "列出来的这些"当成全部。
+ */
+export const KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB = 30
+
+/** 一个知识库在清单里的投影（由 `chatBot.ts` 查库后传入，纯函数只负责排版） */
+export interface KnowledgeCatalogEntry {
+  name: string
+  /** 已列出的文档名（最多 {@link KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB} 条） */
+  documents: readonly string[]
+  /** 该库的文档总数（与 `documents.length` 比较出"未列出多少篇"） */
+  documentTotal: number
+}
 
 /** 没有命中时写进检索块的正文 —— 明确写出来，而不是留白（留白等于让模型自己决定"有没有"） */
 export const RETRIEVAL_EMPTY_HINT = '（本次没有检索到与问题相关的知识库内容）'
+
+/**
+ * 把绑定的知识库排成**可用知识库清单**（`{库名 + 文档名}`），喂给模型回答"有哪些知识"这类问题。
+ *
+ * 形状：
+ * ```
+ * 可用知识库：
+ * 1. 运维手册（共 12 篇文档）
+ *    - 报销制度.md
+ *    - 网络拓扑.txt
+ * ```
+ * 两条口径：
+ *   · **一条知识库都没有时返回空串**（不注入这一段）—— 没绑库却写"可用知识库："是造假；
+ *   · **文档名逐字来自 `documents.file_name`**（与知识库页面上显示的是同一份），不加工、不改写。
+ */
+export function formatKnowledgeCatalog(entries: readonly KnowledgeCatalogEntry[]): string {
+  if (entries.length === 0) return ''
+  const lines = [`${KNOWLEDGE_CATALOG_TITLE}：`]
+  entries.forEach((entry, index) => {
+    lines.push(`${index + 1}. ${entry.name}（共 ${entry.documentTotal} 篇文档）`)
+    for (const document of entry.documents) lines.push(`   - ${document}`)
+    if (entry.documentTotal > entry.documents.length) {
+      lines.push(`   - …（其余 ${entry.documentTotal - entry.documents.length} 篇未列出）`)
+    }
+  })
+  return lines.join('\n')
+}
 
 /**
  * 把命中片段拼成**检索块**（`02` §六 第 2 步的"拼「来源：文档名」前缀"）。
@@ -80,11 +242,15 @@ export const RETRIEVAL_EMPTY_HINT = '（本次没有检索到与问题相关的�
  * 出差住宿标准为每晚上限 500 元，超出部分需部门负责人审批……
  * ```
  * 两条口径：
- *   · **片段原样**（不截断、不再加工）：`snippet` 是由检索层给出的原文窗口
- *     （`SNIPPET_WINDOW_CHARS`），在编排层再截一次会让"引用卡里显示的片段"与
- *     "模型看到的片段"**不一样** —— 而引用卡的全部意义就是"用户能核对模型看到了什么"；
+ *   · **给模型的正文是 `hit.content`（整块原文）**，不是 `hit.snippet`：`snippet` 是检索层按
+ *     `SNIPPET_WINDOW_CHARS` 裁的**命中窗口**，只服务检索测试页那种"一屏看多条"的表格。把它
+ *     当资料喂给模型会让长枚举/规则列表被腰斩（实测：6 条防呆规则被切在「（3）当日：星礼包中的」
+ *     ⇒ 模型只好标注"规则不完整"）。**整块不截断**是这一段的硬要求；
  *   · **序号从 1 开始且连续**：模型在正文里写「来源：X」就是靠这份对应关系，
  *     跳号会让它把两条不同的片段认成同一条。
+ *
+ * ⚠️ 引用卡与这里**用同一份 `content`**（见 {@link toUsedCitationItems}）：卡片的意义就是
+ *    "用户能核对模型到底看到了什么"，两处各给一份必然分叉。
  */
 export function formatRetrievalBlock(hits: readonly RetrievalHit[]): string {
   const lines = [`${RETRIEVAL_BLOCK_TITLE}（每条的「来源」是文档名）：`]
@@ -94,27 +260,48 @@ export function formatRetrievalBlock(hits: readonly RetrievalHit[]): string {
   }
   hits.forEach((hit, index) => {
     lines.push(`${index + 1}. 来源：${hit.docName}`)
-    lines.push(hit.snippet)
+    lines.push(hit.content)
   })
   return lines.join('\n')
 }
 
 /**
- * 组装本轮 system prompt = 智能体提示词 + 检索规则 + 检索块。
+ * 组装本轮 system prompt = 智能体提示词 +（绑了库时）能力与优先级说明 + 检索规则 + 可用知识库清单 + 检索块。
  *
  * 顺序**刻意固定**：模型提示词在前（定义"你是谁、怎么说话"），规则与资料在后
  * （"这一轮你手里有什么"）—— 反过来会让"角色设定"被一大段资料冲淡。
  * `agentPrompt` 为空白（`null` / 空串 / 全空格）时用 {@link DEFAULT_SYSTEM_PROMPT}：
  * 三态字段的"清空"是合法状态，不能让它变成"没有 system 消息"。
+ *
+ * `catalog` 为**空数组**（没绑定任何知识库）时：
+ *   · **不注入** {@link KNOWLEDGE_USAGE_RULES}（没绑库却教它"优先用知识库"是自相矛盾），
+ *   · 也**不注入**清单标题（见 {@link formatKnowledgeCatalog}）。
+ * 检索规则与检索块仍照注入 —— 与之前的每一轮行为一致（未绑库时检索块写"没有检索到"）。
+ */
+/**
+ * 组装本轮 system prompt = 智能体提示词 +（绑了库时）能力说明 + 引用规则 + 可用知识库清单。
+ *
+ * 顺序**刻意固定**：模型提示词在前（定义"你是谁、怎么说话"），规则与资料在后
+ * （"你手里有什么"）—— 反过来会让"角色设定"被一大段资料冲淡。
+ * `agentPrompt` 为空白（`null` / 空串 / 全空格）时用 {@link DEFAULT_SYSTEM_PROMPT}：
+ * 三态字段的"清空"是合法状态，不能让它变成"没有 system 消息"。
+ *
+ * `catalog` 为**空数组**（没绑定任何知识库）时**只注入人设** —— 不注入能力说明，也不注入
+ * 引用规则/清单：没绑库却教它"用知识库检索、标来源"是自相矛盾（它既没有那个工具，也没有"下方"）。
+ *
+ * ⚠️ **不再注入检索块**（2026-09-30）：检索改成模型主动调 `knowledge_search`（Agentic RAG）。
+ * 但 {@link formatRetrievalBlock} 仍然在——它现在是**工具结果的拼装器**（见 `chatBot` 的内置工具分支）。
  */
 export function buildSystemPrompt(
   agentPrompt: string | null | undefined,
-  hits: readonly RetrievalHit[],
+  catalog: readonly KnowledgeCatalogEntry[] = [],
 ): string {
   const persona = agentPrompt === null || agentPrompt === undefined || agentPrompt.trim() === ''
     ? DEFAULT_SYSTEM_PROMPT
     : agentPrompt
-  return [persona, RETRIEVAL_RULES, formatRetrievalBlock(hits)].join('\n\n')
+  const catalogBlock = formatKnowledgeCatalog(catalog)
+  if (catalogBlock === '') return persona
+  return [persona, KNOWLEDGE_USAGE_RULES, RETRIEVAL_RULES, catalogBlock].join('\n\n')
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -146,9 +333,44 @@ export function mergeRetrievalHits(perKb: readonly (readonly RetrievalHit[])[]):
  * `score` 取 `rrfScore`（融合分）：`§九` 的口径是"对外只给融合分"，
  * 且 `vectorScore` / `bigm_similarity` 量纲不可比（一个是余弦、一个是 bigram 相似度），
  * 混在一张卡上会让用户无法解释自己看到的数字。
+ *
+ * ⚠️ `snippet` 字段放的是 **`hit.content`（整块原文）**，不是 `hit.snippet`（命中窗口）：
+ *    引用卡与「知识库检索结果」必须给同一份文本（卡片的意义 = 核对模型看到了什么）。
+ *    `citationItemSchema.snippet` 这个**字段名**沿用至今只为兼容已落库的历史消息，语义是"给模型看的正文"。
  */
 export function toCitationItems(hits: readonly RetrievalHit[]): CitationItem[] {
-  return hits.map((hit) => ({ docName: hit.docName, snippet: hit.snippet, score: hit.rrfScore }))
+  return hits.map((hit) => ({ docName: hit.docName, snippet: hit.content, score: hit.rrfScore }))
+}
+
+/**
+ * 命中 → **回答里真正用到的**引用卡条目（产品反馈 2026-09-30：引用卡只在真被引用时出现）。
+ *
+ * ── 为什么不能"命中就发" ──
+ * 之前的判据只有"检索到 ≥1 条就发"（`01` 决策 12 的"未命中不发"）。但"命中"与"被使用"是两件事：
+ * 只要 query 能召回任何块（哪怕不相关、哪怕模型答"没找到"），每轮都会挂一张引用卡 —— 实测用户
+ * 反馈"聊天一直显示引用"。于是引用卡的判据改成**看最终回答**：
+ *   · 回答里出现了某个命中的 `docName` ⇒ 认为这一篇真被引用了（`RETRIEVAL_RULES` 要求模型以
+ *     「来源：文档名」标注，所以 docName 是可用于核对的稳定标记）；
+ *   · 回答为空（一个字都没生成 / 被立刻停止）⇒ 一条都不发。
+ *
+ * ⚠️ 代价（如实写明）：模型若没按规则写出文档名，这一轮就**一张卡都没有** —— 我们选了"宁可少
+ *    也不要每轮都冒卡"。要恢复"看到模型看到了什么"，把判据换回 `toCitationItems(hits)` 即可。
+ *
+ * ⚠️ **按 `docName` 去重**：同一篇文档常常有多条命中（多个块），而卡片标题写的是「引用 · N 篇」
+ *    —— 不去重就会把"1 篇文档的 5 个块"显示成"5 篇"。`hits` 已按 `rrfScore` 降序（见
+ *    {@link mergeRetrievalHits}），故每个文档保留**第一条**（分最高、片段最优）。
+ */
+export function toUsedCitationItems(hits: readonly RetrievalHit[], answer: string): CitationItem[] {
+  const text = answer.trim()
+  if (text === '') return []
+  const byDoc = new Map<string, CitationItem>()
+  for (const hit of hits) {
+    if (!text.includes(hit.docName)) continue
+    if (byDoc.has(hit.docName)) continue
+    // 存整块原文（与 `formatRetrievalBlock` 给模型的是同一份），理由见 `toCitationItems`
+    byDoc.set(hit.docName, { docName: hit.docName, snippet: hit.content, score: hit.rrfScore })
+  }
+  return [...byDoc.values()]
 }
 
 // ═════════════════════════════════════════════════════════════════════

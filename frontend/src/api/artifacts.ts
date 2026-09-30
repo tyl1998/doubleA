@@ -34,6 +34,7 @@ import { request, requestBlob } from './client.js'
 import {
   artifactContentUrl,
   artifactDownloadUrl,
+  artifactHistoryUrl,
   decodeUtf8Text,
 } from '../components/ArtifactPreview/artifactPreview.js'
 
@@ -76,6 +77,11 @@ export function fetchConversationArtifacts(conversationId: string, limit: number
  * 打出去只会是一个 400/404。
  *
  * `keepPreviousData`：切走再切回时面板**不会闪成空白**（与侧栏列表同款理由）。
+ * ⚠️ **但它只在"两个都有会话"之间保持**：新建会话态（`conversationId === undefined`）必须
+ * **关掉它**（`placeholderData: undefined`）—— 否则它会把**上一个会话**的产物一直顶在面板里
+ * （`TaskAgent 记忆与产物` 问题 2：新建会话后仍显示旧会话产物；`enabled:false` 只让查询
+ * 停发请求，`keepPreviousData` 照样把旧数据喂给渲染）。这是在 `undefined` 与"切换会话"
+ * 之间**刻意区分**：前者是"没有这个列表"，后者才是"上一个列表还在加载"。
  *
  * ⚠️ 它是**"刷新后产物还在"的唯一出口**：`artifact` 事件只发一次、历史消息里的
  * `content.artifacts` 只覆盖那一轮（`messageModel.ts` 的 `messageToView` 刻意返回 `[]`）。
@@ -86,6 +92,39 @@ export function useConversationArtifacts(conversationId: string | undefined, ena
     queryKey: conversationArtifactsQueryKey(conversationId ?? ''),
     queryFn: () => fetchConversationArtifacts(conversationId ?? '', ARTIFACTS_PAGE_LIMIT),
     enabled: enabled && conversationId !== undefined,
+    // 新会话态（无 id）不给 placeholder：见上方那条 ⚠️（问题 2 的修复点）
+    placeholderData: conversationId === undefined ? undefined : keepPreviousData,
+  })
+}
+
+// ───────────────────── 历史产物（TaskAgent 记忆与产物 块 4/5） ─────────────────────
+
+/**
+ * 历史产物列表的缓存键。
+ *
+ * ⚠️ 与 `['conversation', …]` **刻意不同前缀**：历史产物不随任何会话的流变化
+ * （只有在"删除会话"那一刻才会多一条 `conversation_id = null` 的行），用会话前缀会让
+ * "这一轮跑完"顺手失效一份与它无关的列表。
+ * ⚠️ `offset` 进键：分页是服务端做的，翻到第 2 页就该是另一次查询（与面板"一次取满"不同）。
+ */
+export function artifactHistoryQueryKey(offset: number, limit: number): readonly [string, string, number, number] {
+  return ['artifacts', 'history', offset, limit] as const
+}
+
+/** 取一页历史产物（`GET /api/artifacts/history`，`created_at desc`） */
+export function fetchArtifactHistory(offset: number, limit: number): Promise<ArtifactListResult> {
+  return request<ArtifactListResult>(artifactHistoryUrl(offset, limit))
+}
+
+/**
+ * 历史产物列表（**仅本人**：服务端按 `user_id` 过滤，前端不需要、也无法指定别人的）。
+ *
+ * `keepPreviousData`：翻页时上一页的卡片先留着（不闪白），与侧栏列表同款。
+ */
+export function useArtifactHistory(offset: number, limit: number) {
+  return useQuery({
+    queryKey: artifactHistoryQueryKey(offset, limit),
+    queryFn: () => fetchArtifactHistory(offset, limit),
     placeholderData: keepPreviousData,
   })
 }

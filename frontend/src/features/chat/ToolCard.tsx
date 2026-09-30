@@ -36,6 +36,17 @@ const STATUS_PRESENTATION: Record<ToolCallView['status'], { label: string; class
   ERROR: { label: '失败', className: 'tool--fail' },
 }
 
+/**
+ * 工具来源 → 卡片上的中文名（唯一一份映射）。
+ * `BUILTIN` = 平台内置工具（当前只有「知识库检索」），它没有 MCP server，也没有凭据可配
+ * ⇒ 卡片不会出现「去配置凭据」（判据在 `messageModel#canConfigureCredential`：缺 `serverId` 即不提供）。
+ */
+const KIND_LABEL: Record<ToolCallView['kind'], string> = {
+  MCP: 'MCP 工具',
+  SANDBOX: '沙箱工具',
+  BUILTIN: '内置工具',
+}
+
 export interface ToolCardProps {
   tool: ToolCallView
 }
@@ -80,7 +91,7 @@ export function ToolCard({ tool }: ToolCardProps) {
       </summary>
       <div className="tool__body">
         <p className="kicker">
-          {tool.kind === 'MCP' ? 'MCP 工具' : '沙箱工具'} · 调用 ID {tool.callId}
+          {KIND_LABEL[tool.kind]} · 调用 ID {tool.callId}
           {/* 失败原因**必须显示**（`03` §4.1 第 4 行："失败卡片显示原因"）。
               ⚠️ 错误码与 HTTP 状态码是两回事：前者是 `shared/src/errors.ts` 的取值域。
               文案取自 `errorCodeLabel`（= `shared` 那张表的**唯一**来源，

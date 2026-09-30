@@ -9,7 +9,7 @@
  * 为什么单独成模块（而不是塞进 worker 的某个阶段里）
  * ─────────────────────────────────────────────────────────────────────
  * 这里是**唯一**往 `chunks` 表写数据的地方，也是整条流水线里唯一"手写 SQL"的地方 ——
- * 而 `chunks.embedding` 是 Prisma 不认识的 `vector(1024)`（`Unsupported` 列），
+ * 而 `chunks.embedding` 是 Prisma 不认识的 `vector`（`Unsupported` 列，本批起**无固定维度**），
  * 一旦写错（维度不对、事务没包住、delete 漏了）事后**几乎无法分辨**：库里有行、检索却没结果，
  * 或者同一段落被引用两次。集中在一个文件里，才可能被一次读透。
  *
@@ -52,11 +52,17 @@ import type { Logger } from 'pino'
 
 import { AppError } from '@doubulea/shared'
 
-import { config } from '../../config.js'
 import { getLogger } from '../../infra/logger.js'
 import { getPrisma } from '../../infra/prisma.js'
-import { getEmbeddingProvider, type EmbeddingProvider } from '../../llm/embedding/index.js'
+import type { EmbeddingInput, EmbeddingProvider } from '../../llm/embedding/index.js'
 import type { Chunk } from '../chunk/index.js'
+
+/** 一个块 → embedding 输入：有图片（`MULTIMODAL`）时带上图片，否则保持纯文本（历史形态） */
+function chunkToInput(chunk: Chunk): EmbeddingInput {
+  const images = chunk.images
+  if (images === undefined || images.length === 0) return chunk.content
+  return { text: chunk.content, images }
+}
 
 /**
  * 单批写入行数（`§4-4` 的"单批 200 行"）。
@@ -95,17 +101,20 @@ export interface EmbedOutcome {
  * @throws {AppError} `INTERNAL`(500) —— 消息是给用户看的（"文本向量化失败…请稍后重试"），
  *   上游细节由 `llm/upstream.ts` 保证已脱敏（P0-1-12 的 401 回显坑）
  */
-export async function embedChunks(chunks: readonly Chunk[], log: Logger = getLogger()): Promise<EmbedOutcome> {
-  const provider = getEmbeddingProvider()
+export async function embedChunks(
+  chunks: readonly Chunk[],
+  provider: EmbeddingProvider,
+  batchSize: number,
+  log: Logger = getLogger(),
+): Promise<EmbedOutcome> {
   if (chunks.length === 0) return { vectors: [], embeddingName: provider.name() }
 
-  const batchSize = config.embedding.batchSize
   const vectors: number[][] = []
   for (let start = 0; start < chunks.length; start += batchSize) {
     const batch = chunks.slice(start, start + batchSize)
     const batchVectors = await embedBatchWithRetry(
       provider,
-      batch.map((chunk) => chunk.content),
+      batch.map(chunkToInput),
       log,
     )
     if (batchVectors.length !== batch.length) {
@@ -123,19 +132,19 @@ export async function embedChunks(chunks: readonly Chunk[], log: Logger = getLog
 /** 单批 + 重试（见 {@link EMBED_RETRY_DELAYS_MS}） */
 async function embedBatchWithRetry(
   provider: EmbeddingProvider,
-  texts: string[],
+  inputs: readonly EmbeddingInput[],
   log: Logger,
 ): Promise<number[][]> {
   let lastError: unknown
   for (let attempt = 0; attempt <= EMBED_RETRY_DELAYS_MS.length; attempt += 1) {
     try {
-      return await provider.embed(texts)
+      return await provider.embed(inputs)
     } catch (error) {
       lastError = error
       const delay = EMBED_RETRY_DELAYS_MS[attempt]
       if (delay === undefined) break
       log.warn(
-        { err: error, attempt: attempt + 1, retryInMs: delay, batchSize: texts.length },
+        { err: error, attempt: attempt + 1, retryInMs: delay, batchSize: inputs.length },
         '单批 embedding 失败，退避后重试',
       )
       await sleep(delay)
@@ -167,6 +176,8 @@ export interface WriteChunksInput {
   vectors: readonly number[][]
   /** 写进每行 `meta.embeddingName` */
   embeddingName: string
+  /** 向量维度（写到 `chunks.embedding_dim`；= 所属知识库的 `embedding_dim`） */
+  embeddingDim: number
 }
 
 /**
@@ -178,7 +189,7 @@ export interface WriteChunksInput {
  *   （worker 会区分"文档的问题"与"基础设施的问题"，见其文件头）
  */
 export async function writeChunks(input: WriteChunksInput): Promise<number> {
-  const { docId, kbId, chunks, vectors, embeddingName } = input
+  const { docId, kbId, chunks, vectors, embeddingName, embeddingDim } = input
   if (chunks.length !== vectors.length) {
     throw AppError.internal(
       `入库参数不一致：${chunks.length} 个块 / ${vectors.length} 条向量。这是编程错误，请上报。`,
@@ -204,6 +215,8 @@ export async function writeChunks(input: WriteChunksInput): Promise<number> {
         kbId,
         seq: chunk.seq,
         content: chunk.content,
+        // 维度随行存（检索按 `embedding_dim` 收窄；见 migration 的说明）
+        embeddingDim,
         // id / createdAt 走 schema 默认值：`@default(uuid(7))` 是 Prisma 客户端侧生成
         // （P0-1-14 实测：函数型默认值不进 DDL），本模块**不**自己生成 id —— 见文件头
         meta: {

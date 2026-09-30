@@ -171,6 +171,8 @@ const {
   rrfScoreText,
   rankText,
   hitSourceText,
+  chunkLocationText,
+  chunkLengthText,
   searchNotice,
   buildCreateBody,
   buildKnowledgeUpdateBody,
@@ -193,6 +195,8 @@ function makeKb(overrides = {}) {
     name: '运维手册',
     description: '值班同学用的手册',
     embeddingModel: 'api:bge-m3',
+    embeddingModelId: 'model-1',
+    embeddingDim: 1024,
     embeddingModelChanged: false,
     chunkSize: 512,
     chunkOverlap: 64,
@@ -327,28 +331,41 @@ await it('B3 片段数：非 `READY` 显示 `—` 而不是 0', () => {
 
 groupStart('C', '行内操作可见性矩阵（点得动 / 点了必然失败 / 唯一的恢复入口）')
 
-await it('C1 `PARSING`：下载 ✅ / 覆盖重传 ❌ / 重试 ✅ / 删除 ✅', () => {
+await it('C1 `PARSING`：下载 ✅ / 覆盖重传 ❌ / 重试 ✅ / 查看片段 ❌ / 删除 ✅', () => {
   const actions = documentActions('PARSING')
   assertEqual(actions.canDownload, true, '文件在上传成功时就已经在对象存储里了')
   assertEqual(actions.canReupload, false, '解析中不给"换内容"（避免两条流水线抢同一行）')
   assertEqual(actions.canRetry, true, '⚠️ 这是"worker 卡住"时**唯一**的恢复入口，后端刻意放行')
+  assertEqual(actions.canPreviewChunks, false, '还没入库 ⇒ 没有块可看（chunkCount 恒为 0）')
   assertEqual(actions.canDelete, true, '后端不按状态拦删除，界面也不额外拦')
 })
 
-await it('C2 `READY`：**不给**重试（后端会 409）', () => {
+await it('C2 `READY`：**不给**重试（后端会 409）；**给**查看片段', () => {
   const actions = documentActions('READY')
   assertEqual(actions.canRetry, false, '没有东西可重试 —— 摆一个必然失败的按钮比不摆更糟')
   assertEqual(actions.canReupload, true, '已完成的文档正是"覆盖重传"的主要用户')
+  assertEqual(actions.canPreviewChunks, true, 'READY ⟺ 库里有带向量的块 ⇒ 有内容可预览')
   assertEqual(actions.canDownload, true, '下载')
   assertEqual(actions.canDelete, true, '删除')
 })
 
-await it('C3 `FAILED`：四个操作全都在', () => {
+await it('C3 `FAILED`：除「查看片段」外其余操作都在', () => {
   const actions = documentActions('FAILED')
   assertEqual(actions.canDownload, true, '下载')
   assertEqual(actions.canReupload, true, '覆盖重传')
   assertEqual(actions.canRetry, true, '重试（这是它最常见的用法）')
+  assertEqual(actions.canPreviewChunks, false, '失败 ⇒ 没有可用块，打开只会是空抽屉')
   assertEqual(actions.canDelete, true, '删除')
+})
+
+await it('C3b 「查看片段」的可见性与 `isDocumentSearchable` **同源**（不写字面量比较）', () => {
+  for (const status of ['PARSING', 'READY', 'FAILED']) {
+    assertEqual(
+      documentActions(status).canPreviewChunks,
+      isDocumentSearchable(status),
+      `${status}：能否查看片段必须与"是否可检索"逐字等价（判据在 shared）`,
+    )
+  }
 })
 
 await it('C4 两种状态下的「重试」说明**不是同一句**', () => {
@@ -386,16 +403,16 @@ groupStart('E', '建库 / 改库的请求体（三态 + 局部合并 + "没改�
 
 await it('E1 建库：分块参数**留空 = 不带这两个键**（服务端用环境默认值快照）', () => {
   const body = buildCreateBody({ ...EMPTY_KNOWLEDGE_FORM_VALUES, name: ' 运维手册 ' })
-  assertDeepEqual(body, { name: '运维手册' }, '留空时请求体里不能出现 chunkSize / chunkOverlap')
+  assertDeepEqual(body, { name: '运维手册', embeddingModelId: '' }, '留空时请求体里不能出现 chunkSize / chunkOverlap')
   assertExcludes(canonical(body), 'chunkSize', '不带 chunkSize')
   // ⚠️ 反向：填了就必须带上（否则用户以为设了，实际是默认值）
-  const filled = buildCreateBody({ name: 'x', description: '', chunkSize: 256, chunkOverlap: 32 })
-  assertDeepEqual(filled, { name: 'x', chunkSize: 256, chunkOverlap: 32 }, '填了才带')
+  const filled = buildCreateBody({ name: 'x', embeddingModelId: 'model-1', description: '', chunkSize: 256, chunkOverlap: 32 })
+  assertDeepEqual(filled, { name: 'x', embeddingModelId: 'model-1', chunkSize: 256, chunkOverlap: 32 }, '填了才带')
 })
 
 await it('E2 建库：描述留空 ⇒ 不带该键（而不是 `description: null`）', () => {
-  assertExcludes(canonical(buildCreateBody({ name: 'x', description: '   ', chunkSize: null, chunkOverlap: null })), 'description')
-  assertIncludes(canonical(buildCreateBody({ name: 'x', description: '值班手册', chunkSize: null, chunkOverlap: null })), '值班手册')
+  assertExcludes(canonical(buildCreateBody({ name: 'x', embeddingModelId: 'model-1', description: '   ', chunkSize: null, chunkOverlap: null })), 'description')
+  assertIncludes(canonical(buildCreateBody({ name: 'x', embeddingModelId: 'model-1', description: '值班手册', chunkSize: null, chunkOverlap: null })), '值班手册')
 })
 
 await it('E3 改库：没有任何改动 ⇒ `null`（调用方据此不发请求）', () => {
@@ -644,6 +661,46 @@ await it('I3 缺头 / 空头 / 畸形头都返回 `null`（不抛错，调用方
 await it("I4 带语言标签的 `filename*`（UTF-8'zh-CN'…）也能解析", () => {
   const header = `attachment; filename*=UTF-8'zh-CN'${encodeURIComponent('变更记录.pdf')}`
   assertEqual(fileNameFromContentDisposition(header), '变更记录.pdf', 'RFC 5987 三段式')
+})
+
+// ───────────────────────────── J 片段预览 ─────────────────────────────
+
+groupStart('J', '片段预览：位置说明按数据有无拼、字数按码点、原文不截断')
+
+await it('J1 位置说明：块号必有；页码/标题层级按有无出现（不出现 `第 — 页`）', () => {
+  assertIncludes(chunkLocationText({ seq: 3, page: 12, headingPath: ['第三章', '权限'] }), '块 #3', '块号')
+  assertIncludes(chunkLocationText({ seq: 3, page: 12, headingPath: [] }), '第 12 页', 'PDF 有页码')
+  assertIncludes(
+    chunkLocationText({ seq: 3, page: 12, headingPath: ['第三章', '权限'] }),
+    '第三章 / 权限',
+    '标题层级用 / 连接',
+  )
+  const noPage = chunkLocationText({ seq: 0, page: null, headingPath: [] })
+  assertExcludes(noPage, '页', '非 PDF 没有页码时不该出现任何"页"字样（不给占位符）')
+})
+
+await it('J2 字数用**码点**数（含 emoji 的块不能数出偏移的字数）', () => {
+  assertEqual(chunkLengthText('abcd'), '4 字', '常规')
+  assertEqual([...'👍👍'].length, 2, '两个 emoji 是两个码点')
+  assertEqual(chunkLengthText('👍👍'), '2 字', '不能按 UTF-16 长度算成 4')
+  assertIncludes(chunkLengthText('运维手册'), '字', '带单位，避免与"块数"混读')
+})
+
+await it('J3 预览抽屉用 `useDocumentChunks`（关着时不发请求）、原文不截断', () => {
+  const drawer = sourceFiles().find(({ name }) => name === 'pages/knowledge/ChunkPreviewDrawer.tsx')
+  assert(drawer !== undefined, '找不到 ChunkPreviewDrawer.tsx')
+  assertIncludes(drawer.source, 'useDocumentChunks(', '数据来自那个 hook')
+  assertIncludes(drawer.source, 'key={doc.id}', '换文档要重挂载（分页回到第 1 页），否则第 3 页会套到新文档')
+  // ⚠️ 反向：不能复用检索抽屉那个"截三行"的类（预览的价值就是看到完整一块）
+  assertExcludes(drawer.source, 'kb-snippet', '预览不能用命中片段的截断样式')
+  assertIncludes(drawer.source, 'chunk-content', '整块原文用不截断的样式')
+})
+
+await it('J4 表格里「查看片段」按钮受 `actions.canPreviewChunks` 门控（不是无条件渲染）', () => {
+  const table = sourceFiles().find(({ name }) => name === 'pages/knowledge/DocumentTable.tsx')
+  assert(table !== undefined, '找不到 DocumentTable.tsx')
+  assertIncludes(table.source, 'actions.canPreviewChunks', '按钮可见性必须来自 documentActions')
+  assertIncludes(table.source, '查看片段', '按钮文案')
 })
 
 // ───────────────────────────── 结论表 ─────────────────────────────

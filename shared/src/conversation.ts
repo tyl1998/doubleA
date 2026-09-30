@@ -351,6 +351,11 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
  *
  * `score` 是**融合分**（`rrfScore`）而不是任何一路的原始分：`§九` 的口径是"对外只给融合分"
  * （两路量纲不可比，把 `vectorScore` 与 `bigm_similarity` 混在一张卡上会让数字无法解释）。
+ *
+ * ⚠️ **`snippet` 放的是"给模型看的正文"**（2026-09-30 起是**整块原文**，不是命中窗口）：
+ * 引用卡与编排层注入模型的「知识库检索结果」必须是同一份文本（卡片的意义 = 用户核对模型看到了
+ * 什么）。字段名沿用 `snippet` 只为兼容已落库的历史 jsonb（老行里存的是旧窗口；它是个字符串，
+ * 新旧都能读，卡片照常渲染）。
  */
 export const citationItemSchema = z.object({
   docName: z.string(),
@@ -362,13 +367,19 @@ export type CitationItem = z.infer<typeof citationItemSchema>
 // ───────────────────────────── 工具调用（P0-2-8）─────────────────────────────
 
 /**
- * 工具来源（`02` §5.1 的 `tool_call.kind`）：ChatBot 的 MCP 工具 / TaskAgent 的沙箱工具。
+ * 工具来源（`02` §5.1 的 `tool_call.kind`）：ChatBot 的 MCP 工具 / TaskAgent 的沙箱工具 /
+ * **平台内置工具**（2026-09-30 新增）。
  *
  * ⚠️ **P0-2-8 起家在本文**（P0-1-26 时定义在 `sse.ts`）。搬家的理由：同一套取值域现在要出现在
  * **落库**（`messages.content.tool_calls[].kind`）与**事件**（`tool_call` 的 payload）两处，
  * 而"两处各写一份字面量"必然有一处先腐烂。`sse.ts` 改成 `import`（前端从包根 import，**无感**）。
+ *
+ * ⚠️ `BUILTIN`（产品反馈 2026-09-30）：由**平台自己实现**、不经任何外部系统的工具，当前只有
+ * 「知识库检索」（`knowledge_search`）。单独取值而不是复用 `MCP` 的理由：它没有 MCP server
+ * （`serverName` 是"知识库"、`serverId` 连键都没有）、也永远不走凭据/危险确认流 ——
+ * 混进 `MCP` 会让前端卡片摆出「去配置凭据」那种对它无意义的入口。
  */
-export const TOOL_CALL_KINDS = ['MCP', 'SANDBOX'] as const
+export const TOOL_CALL_KINDS = ['MCP', 'SANDBOX', 'BUILTIN'] as const
 export type ToolCallKind = (typeof TOOL_CALL_KINDS)[number]
 
 /** 工具调用状态机（`RUNNING` → `SUCCESS` / `ERROR`）；`02` §5.1 */
@@ -496,6 +507,16 @@ export const listArtifactsQuerySchema = z.object({
     .default(ARTIFACT_PAGE_LIMIT_DEFAULT),
 })
 export type ListArtifactsQuery = z.infer<typeof listArtifactsQuerySchema>
+
+/**
+ * 历史产物列表（`GET /api/artifacts/history`）的查询参数（**P0-3 记忆与产物 块 4**）。
+ *
+ * 与产物列表**逐字同款**（offset/limit、同样的上限与默认值）—— 只给它一个独立的名字，
+ * 让"历史产物"这个端点有自己可读的契约；两个 schema 是**同一个对象**，改一处分页口径
+ * 两边同时变（`docs/06` §六 第 ⑰ 条：同一口径两处各写一遍，必有一处先腐烂）。
+ */
+export const listArtifactHistoryQuerySchema = listArtifactsQuerySchema
+export type ListArtifactHistoryQuery = ListArtifactsQuery
 
 /**
  * 列表里的一条产物 = {@link artifactItemSchema} + `createdAt`。

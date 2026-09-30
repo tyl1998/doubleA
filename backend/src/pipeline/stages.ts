@@ -37,14 +37,16 @@
 
 import type { Logger } from 'pino'
 
-import { AppError } from '@doubulea/shared'
+import { AppError, type ImageMode } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getS3Client } from '../infra/s3.js'
-import { DEFAULT_CHUNK_MIN_CHARS, splitIntoChunks, type Chunk } from './chunk/index.js'
+import type { EmbeddingProvider } from '../llm/embedding/index.js'
+import { buildImageChunks, DEFAULT_CHUNK_MIN_CHARS, splitIntoChunks, type Chunk } from './chunk/index.js'
 import { CHUNK_WRITE_BATCH, embedChunks, writeChunks } from './index/writer.js'
-import { detectFormat, parseDocument, type ParseResult } from './parse/index.js'
+import { recognizeImage } from './ocr.js'
+import { buildParseResult, detectFormat, parseDocument, type ParsedBlock, type ParsedImage, type ParseResult } from './parse/index.js'
 import type { PipelineJob } from './queue.js'
 
 /** 阶段需要知道的文档字段（worker 从 `documents` 行投影出来，不把整个 Prisma 行透传下去） */
@@ -65,6 +67,8 @@ export interface PipelineDocument {
   chunkOverlap: number
   /** 分块策略（`hybrid` | `fixed`；由 `retrieval_config.splitStrategy` 补默认值后得来） */
   splitStrategy: string
+  /** 图片处理方式（`documents.image_mode`；决定解析是否抽图、以及图片如何进链路） */
+  imageMode: ImageMode
 }
 
 /** 一次任务处理的上下文（生命周期 = 一个 job） */
@@ -81,6 +85,17 @@ export interface PipelineContext {
   vectors?: number[][]
   /** 落库用的模型标识（`embed` 写 `EmbeddingProvider.name()`；`index` 写进每行 `meta.embeddingName`） */
   embeddingName?: string
+  /**
+   * 该库选定的 embedding provider（**worker 解析后注入**，`embed` 读它向量化）。
+   *
+   * ⚠️ 由 worker 注入而不是阶段自己查库：阶段层刻意不碰数据库（见 `stages.ts` 文件头），
+   *    而"这个库用哪个模型"正是 worker 从 `kb.embedding_model_id` 解析出来的一次查询。
+   */
+  embeddingProvider?: EmbeddingProvider
+  /** 该库 embedding 向量的维度（worker 注入；`index` 写进 `chunks.embedding_dim`） */
+  embeddingDim?: number
+  /** 单批文本数（worker 注入；来自 `EMBEDDING_BATCH_SIZE`） */
+  embeddingBatchSize?: number
   /**
    * 已入库的 chunk 数（`index` 写）。
    *
@@ -164,18 +179,101 @@ export const parseStage: PipelineStage = {
       throw new Error('流水线配置错误：parse 阶段之前必须有一个 load-source 阶段')
     }
     const format = detectFormat({ fileName: ctx.document.fileName, bytes: source })
-    const parsed = await parseDocument(format, source)
+    const extractImages = ctx.document.imageMode !== 'NONE'
+    const parsed = await parseDocument(format, source, {
+      extractImages,
+      maxImageBytes: config.pipeline.imageMaxBytes,
+    })
+    // 图片数量上限：防止"一本图册"把 OCR / 向量化拖成分钟级（超出部分忽略并记日志）
+    if (parsed.images.length > config.pipeline.imageMaxCount) {
+      ctx.log.warn(
+        { found: parsed.images.length, capped: config.pipeline.imageMaxCount },
+        '文档图片数超过上限，仅处理前若干张（IMAGE_MAX_COUNT）',
+      )
+      parsed.images = parsed.images.slice(0, config.pipeline.imageMaxCount)
+    }
     ctx.parsed = parsed
     ctx.log.debug(
       {
         format,
         blocks: parsed.blocks.length,
+        images: parsed.images.length,
+        imageMode: ctx.document.imageMode,
         chars: parsed.meta.charCount,
         pageCount: parsed.meta.pageCount,
         encoding: parsed.meta.encoding,
         hasHeadings: parsed.meta.hasHeadings,
       },
       '解析完成',
+    )
+  },
+}
+
+/**
+ * ③·补 图片 OCR（`子方案` 文档图片解析；仅 `imageMode=OCR` 生效）。
+ *
+ * 把抽取出的图片逐张本地 OCR，识别出的文字作为**普通文本块**追加回解析结果，
+ * 于是下游（空文本检测、分块、向量化）**一行都不用改** —— OCR 与文本走同一条链路。
+ * 处理完清空 `parsed.images`（图片已转成文字，不再需要图片分块）。
+ *
+ * 放在空文本检测**之前**：扫描件 PDF 常"零文本 + 全是图"，OCR 出的文字必须先算进
+ * `charCount`，否则会被 §五 误判为"疑似扫描件"直接 FAILED。
+ */
+export const ocrImagesStage: PipelineStage = {
+  name: 'ocr-images',
+  async run(ctx) {
+    const parsed = requireParsed(ctx, 'ocr-images')
+    if (ctx.document.imageMode !== 'OCR' || parsed.images.length === 0) return
+
+    // 按锚点把图片分回它在正文里的位置：`anchor = n` 表示"插在 `blocks[n]` 之前"。
+    // 这样"订单入口"那张图的 OCR 文字就落在"订单入口"这段话后面，而不是全堆到文末。
+    const byAnchor = new Map<number, ParsedImage[]>()
+    const tail: ParsedImage[] = []
+    for (const image of parsed.images) {
+      if (image.anchor === undefined || image.anchor === null) {
+        tail.push(image)
+        continue
+      }
+      const key = Math.max(0, Math.min(image.anchor, parsed.blocks.length))
+      const list = byAnchor.get(key)
+      if (list === undefined) byAnchor.set(key, [image])
+      else list.push(image)
+    }
+
+    const ocrBlockOf = async (image: ParsedImage): Promise<ParsedBlock | null> => {
+      const text = await recognizeImage(image.data, (message, msg) => ctx.log.warn(message, msg))
+      if (text === '') return null
+      return {
+        text: `[图片文字] ${text}`,
+        headingPath: [...image.headingPath],
+        page: image.page,
+      }
+    }
+
+    // 一次遍历重建块序列：在 `blocks[i]` 之前插入锚在 i 的图片文字
+    const outBlocks: ParsedBlock[] = []
+    for (let i = 0; i <= parsed.blocks.length; i += 1) {
+      for (const image of byAnchor.get(i) ?? []) {
+        const block = await ocrBlockOf(image)
+        if (block !== null) outBlocks.push(block)
+      }
+      const original = parsed.blocks[i]
+      if (original !== undefined) outBlocks.push(original)
+    }
+    for (const image of tail) {
+      const block = await ocrBlockOf(image)
+      if (block !== null) outBlocks.push(block)
+    }
+
+    // 用统一的收口函数重建 text/meta（与解析器同一条口径，避免字符计数算法分叉）
+    ctx.parsed = buildParseResult(parsed.meta.format, outBlocks, {
+      pageCount: parsed.meta.pageCount,
+      encoding: parsed.meta.encoding,
+      images: [],
+    })
+    ctx.log.debug(
+      { images: parsed.images.length, blocks: outBlocks.length },
+      '图片 OCR 完成（按原位置并入文本块）',
     )
   },
 }
@@ -211,7 +309,9 @@ export const detectEmptyTextStage: PipelineStage = {
     const parsed = requireParsed(ctx, 'detect-empty-text')
     const threshold = config.pipeline.emptyTextThreshold
     const charCount = parsed.meta.charCount
-    if (charCount < threshold) {
+    // 有图片（且选了图片解析方式）时不算"空"：纯图片文档/扫描件正是该被处理的场景，
+    // 图片会被 OCR 转成文字（OCR 模式）或直接向量化（MULTIMODAL 模式）
+    if (charCount < threshold && parsed.images.length === 0) {
       ctx.log.warn(
         { charCount, threshold, pageCount: parsed.meta.pageCount, format: parsed.meta.format },
         '空文本检测未通过（阈值来自 EMPTY_TEXT_THRESHOLD）',
@@ -233,7 +333,7 @@ export const detectEmptyTextStage: PipelineStage = {
 export function buildEmptyTextMessage(charCount: number, threshold: number): string {
   return (
     `解析结果内容过少（有效字符 ${charCount}，不足 ${threshold} 个），疑似扫描件或空白文档；` +
-    '本系统暂不支持图片型 PDF，请上传可复制文本的文件。'
+    '若文档内容是图片（扫描件/截图），请在上传时选择"解析图片"方式（OCR 或多模态向量化）后重传。'
   )
 }
 
@@ -258,14 +358,30 @@ export const chunkStage: PipelineStage = {
       // §二 的 `chunk_min`；见 `chunk/strategy.ts` 的 `DEFAULT_CHUNK_MIN_CHARS`（不是环境变量）
       chunkMin: DEFAULT_CHUNK_MIN_CHARS,
     }
-    const chunks = splitIntoChunks(parsed, options, document.splitStrategy)
-    ctx.chunks = chunks
+    const textChunks = splitIntoChunks(parsed, options, document.splitStrategy)
+    // `MULTIMODAL`：文本块之外再产图片块，并按块起点偏移**归并回原位**。
+    // `OCR` 的图片已在 ocr 阶段变成文本块，`NONE` 没有图片 —— 两者都不会走到这里。
+    const imageChunks =
+      document.imageMode === 'MULTIMODAL' && parsed.images.length > 0
+        ? buildImageChunks(parsed.images, parsed.blocks)
+        : []
+    // 归并排序：同偏移时保持"文本块在前"（稳定用原始下标兜底）；最后统一重排 `seq`
+    const ordered = [...textChunks, ...imageChunks]
+      .map((chunk, index) => ({ chunk, index }))
+      .sort(
+        (a, b) =>
+          (a.chunk.offset ?? Number.POSITIVE_INFINITY) - (b.chunk.offset ?? Number.POSITIVE_INFINITY) ||
+          a.index - b.index,
+      )
+      .map((entry, seq) => ({ ...entry.chunk, seq }))
+    ctx.chunks = ordered
     ctx.log.debug(
       {
         strategy: document.splitStrategy,
         chunkSize: options.chunkSize,
         chunkOverlap: options.chunkOverlap,
-        chunks: chunks.length,
+        chunks: textChunks.length,
+        imageChunks: imageChunks.length,
         chars: parsed.meta.charCount,
       },
       '分块完成（向量化与落库属 ⑥⑦）',
@@ -294,10 +410,15 @@ export const embedStage: PipelineStage = {
   name: 'embed',
   async run(ctx) {
     const chunks = requireChunks(ctx, 'embed')
-    const { vectors, embeddingName } = await embedChunks(chunks, ctx.log)
+    const provider = ctx.embeddingProvider
+    const batchSize = ctx.embeddingBatchSize
+    if (provider === undefined || batchSize === undefined) {
+      throw new Error('流水线配置错误：embed 阶段需要 worker 注入 embeddingProvider / embeddingBatchSize')
+    }
+    const { vectors, embeddingName } = await embedChunks(chunks, provider, batchSize, ctx.log)
     ctx.vectors = vectors
     ctx.embeddingName = embeddingName
-    ctx.log.debug({ chunks: chunks.length, embeddingName, dim: config.embedding.dim }, '向量化完成')
+    ctx.log.debug({ chunks: chunks.length, embeddingName, dim: ctx.embeddingDim ?? null }, '向量化完成')
   },
 }
 
@@ -316,8 +437,9 @@ export const indexStage: PipelineStage = {
     const chunks = requireChunks(ctx, 'index')
     const vectors = ctx.vectors
     const embeddingName = ctx.embeddingName
-    if (vectors === undefined || embeddingName === undefined) {
-      throw new Error('流水线配置错误：index 阶段之前必须有一个 embed 阶段')
+    const embeddingDim = ctx.embeddingDim
+    if (vectors === undefined || embeddingName === undefined || embeddingDim === undefined) {
+      throw new Error('流水线配置错误：index 阶段之前必须有一个 embed 阶段，且 worker 已注入 embeddingDim')
     }
     ctx.chunkCount = await writeChunks({
       docId: ctx.document.id,
@@ -325,6 +447,7 @@ export const indexStage: PipelineStage = {
       chunks,
       vectors,
       embeddingName,
+      embeddingDim,
     })
     ctx.log.debug(
       { chunkCount: ctx.chunkCount, embeddingName, batch: CHUNK_WRITE_BATCH },
@@ -350,6 +473,8 @@ export const indexStage: PipelineStage = {
 export const defaultPipelineStages: readonly PipelineStage[] = [
   loadSourceStage,
   parseStage,
+  // 图片 OCR（仅 imageMode=OCR 生效；无图片/其它模式时是 no-op）
+  ocrImagesStage,
   detectEmptyTextStage,
   chunkStage,
   embedStage,

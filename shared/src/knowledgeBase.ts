@@ -174,6 +174,17 @@ export const knowledgeBaseItemSchema = z.object({
    * （`api:<模型名>` / `local:<目录名>`）。它是 `子方案①` §八「换模型重建路径」的判据。
    */
   embeddingModel: z.string(),
+  /** 建库时**选定**的模型 id（模型池里 `type=EMBEDDING` 的模型）；老库为 `null` */
+  embeddingModelId: z.string().nullable(),
+  /**
+   * 该库所选 embedding 模型是否**支持多模态**（`Model.embeddingMultimodal`）。
+   *
+   * 上传文档时若选"多模态向量化"解析图片，前端据此**提前**禁用/提示（后端仍会再校验一次，
+   * 见 `MULTIMODAL_MODEL_REQUIRED_HINT`）；`embeddingModelId` 为空（老库）时恒为 `false`。
+   */
+  embeddingMultimodal: z.boolean(),
+  /** 该库向量维度快照（建库时探测写入）；老库为 `null` */
+  embeddingDim: z.number().int().nullable(),
   /**
    * §八 ① 的探测：快照值与**当前** provider 的 `name()` 是否不一致（不一致 = 该库需重建）。
    *
@@ -300,6 +311,15 @@ export const createKnowledgeBaseBodySchema = z.object({
   name: kbNameSchema,
   /** `null` 与省略同义（都表示"没填"） */
   description: kbDescriptionSchema.nullish(),
+  /**
+   * **必填**：该库使用的 embedding 模型（模型池里 `type=EMBEDDING` 的模型 id）。
+   *
+   * 取代了旧的环境变量方案（`EMBEDDING_MODE` / `EMBEDDING_API_*`）：建库时选定、
+   * 后端据此**探测维度**并快照，此后入库与检索都用它。不可后改（换模型需重建）。
+   */
+  embeddingModelId: z
+    .string({ required_error: '请选择 embedding 模型' })
+    .uuid('embeddingModelId 不是合法 UUID'),
   chunkSize: chunkSizeSchema.optional(),
   chunkOverlap: chunkOverlapSchema.optional(),
   /** 局部覆盖：只给 `{topK: 10, score: 0.5}` 也行，其余键取默认值 */
@@ -476,7 +496,17 @@ export const retrievalHitSchema = z.object({
   page: z.number().int().nullable(),
   /** `meta.headingPath`：块所属的标题层级（引用卡显示"在哪一节"） */
   headingPath: z.array(z.string()),
-  /** 命中片段（原文窗口，**不加工**，见 {@link SNIPPET_WINDOW_CHARS}） */
+  /**
+   * **整块原文**（不加工、不截断）—— 编排层把它整块喂给模型，引用卡也展示它
+   * （"卡片里显示的 = 模型看到的"）。
+   *
+   * ⚠️ 与 {@link snippet} 的分工：`snippet` 是**命中窗口**（最多 `2×SNIPPET_WINDOW_CHARS`
+   * 加命中词），只服务**检索测试页**那种"一屏看多条"的紧凑表格；把窗口当资料喂给模型会让
+   * 长枚举/规则列表被腰斩（实测：6 条防呆规则被切在「（3）当日：星礼包中的」）。所以资料走
+   * `content`、定位走 `snippet`，两个消费方各不相同。
+   */
+  content: z.string(),
+  /** 命中片段（原文窗口，**不加工**，见 {@link SNIPPET_WINDOW_CHARS}）—— 只给检索测试页用 */
   snippet: z.string(),
   /** 向量路原始相似度 `1 - (embedding <=> query)`；该路未命中为 `null` */
   vectorScore: z.number().nullable(),

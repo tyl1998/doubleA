@@ -14,33 +14,139 @@
  *   · 连续非空行算**一个段落**（内部换行保留）：md 的软换行是排版行为，不是语义分隔。
  */
 
-import { buildParseResult, type ParseResult, type ParsedBlock } from './types.js'
 import { decodeTextBuffer } from './txt.js'
+import { getLogger } from '../../infra/logger.js'
+import {
+  buildParseResult,
+  DEFAULT_PARSE_OPTIONS,
+  normalizeHeadingPath,
+  type ParseOptions,
+  type ParseResult,
+  type ParsedBlock,
+  type ParsedImage,
+} from './types.js'
 
 /** 代码围栏起始/结束（``` 或 ~~~，允许缩进与语言标记） */
 const FENCE = /^\s*(`{3,}|~{3,})/u
 /** ATX 标题：1~6 个 `#` + 空格 + 标题；允许结尾的闭合 `#` */
 const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/u
+/** Markdown 图片语法 `![alt](url "title")`（只取 url；title 可选） */
+const IMAGE_LINK = /!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/gu
 
-export function parseMd(bytes: Buffer): ParseResult {
+/** 外链图片抓取的超时（毫秒） */
+const REMOTE_IMAGE_TIMEOUT_MS = 8000
+
+/**
+ * `data:image/...;base64,...` → 原始字节；不是 data URI 时返回 `undefined`。
+ */
+function decodeDataUri(url: string): { data: Buffer; mime: string } | undefined {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/su.exec(url)
+  if (match === null) return undefined
+  const mime = match[1] ?? 'application/octet-stream'
+  const payload = match[3] ?? ''
+  try {
+    const data = match[2] === ';base64' ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'binary')
+    return { data, mime }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 抓取外链图片（`http(s)`）。**只做最小必要的防护**：8 秒超时、体积上限、
+ * `Content-Type` 必须是 `image/*`。任何失败都**吞掉并返回 `undefined`** ——
+ * 外网图取不到不该让一篇 md 解析失败（它只是内容的一部分）。
+ */
+async function fetchRemoteImage(url: string, maxBytes: number): Promise<{ data: Buffer; mime: string } | undefined> {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return undefined
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REMOTE_IMAGE_TIMEOUT_MS)
+  try {
+    const response = await fetch(parsed, { signal: controller.signal, redirect: 'follow' })
+    if (!response.ok) return undefined
+    const mime = (response.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? ''
+    if (!mime.startsWith('image/')) return undefined
+    const buffer = Buffer.from(await response.arrayBuffer())
+    if (buffer.length > maxBytes) return undefined
+    return { data: buffer, mime }
+  } catch (error) {
+    getLogger().debug({ err: error, url }, 'md 外链图片抓取失败（已跳过）')
+    return undefined
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 图片在正文里的位置（锚点 = 插在 `blocks[anchor]` 之前）+ 所属标题 */
+interface MdImageAnchor {
+  url: string
+  anchor: number
+  headingPath: string[]
+}
+
+/** 按锚点表抓取图片（data URI 与 http(s) 外链；相对路径无法解析，跳过） */
+async function collectImages(
+  anchors: readonly MdImageAnchor[],
+  options: ParseOptions,
+): Promise<ParsedImage[]> {
+  const images: ParsedImage[] = []
+  for (const anchor of anchors) {
+    const decoded = decodeDataUri(anchor.url) ?? (await fetchRemoteImage(anchor.url, options.maxImageBytes))
+    if (decoded === undefined || decoded.data.length === 0) continue
+    if (decoded.data.length > options.maxImageBytes) continue
+    images.push({
+      data: decoded.data,
+      mime: decoded.mime,
+      page: null,
+      headingPath: normalizeHeadingPath(anchor.headingPath),
+      anchor: anchor.anchor,
+    })
+  }
+  return images
+}
+
+export async function parseMd(
+  bytes: Buffer,
+  options: ParseOptions = DEFAULT_PARSE_OPTIONS,
+): Promise<ParseResult> {
   const { text, encoding } = decodeTextBuffer(bytes)
   const blocks: ParsedBlock[] = []
   /** 标题栈（`stack[level-1]` = 第 level 级标题） */
   const stack: string[] = []
+  /** 图片位置表（段落 flush 时落锚，见下） */
+  const imageAnchors: MdImageAnchor[] = []
 
   let paragraph: string[] = []
+  /** 当前段落里出现的图片 url（段落 flush 时转成锚点） */
+  let pendingImageUrls: string[] = []
   let fence: string | null = null
   let fenced: string[] = []
 
   const flushParagraph = (): void => {
-    if (paragraph.length === 0) return
-    blocks.push({ text: paragraph.join('\n').trim(), headingPath: [...stack], page: null })
+    if (paragraph.length > 0) {
+      blocks.push({ text: paragraph.join('\n').trim(), headingPath: normalizeHeadingPath(stack), page: null })
+    }
     paragraph = []
+    // 图片锚在**本段之后**，并继承本段的标题栈（图注就不会跑到文末、也不会丢章节）
+    if (pendingImageUrls.length > 0) {
+      const headingPath = normalizeHeadingPath(stack)
+      for (const url of pendingImageUrls) {
+        imageAnchors.push({ url, anchor: blocks.length, headingPath })
+      }
+      pendingImageUrls = []
+    }
   }
   const flushFence = (): void => {
     // 未闭合的围栏（文件被截断）也照常收成一块 —— 宁可有内容，不要静默丢掉半篇
     const content = fenced.join('\n').trim()
-    if (content !== '') blocks.push({ text: content, headingPath: [...stack], page: null })
+    if (content !== '') blocks.push({ text: content, headingPath: normalizeHeadingPath(stack), page: null })
     fenced = []
     fence = null
   }
@@ -72,7 +178,7 @@ export function parseMd(bytes: Buffer): ParseResult {
       if (stack.length > level - 1) stack.length = level - 1
       if (title !== '') stack[level - 1] = title
       // 标题段自己也在自己的路径里（见 `types.ts` 的 `headingPath` 说明）
-      if (title !== '') blocks.push({ text: title, headingPath: [...stack], page: null })
+      if (title !== '') blocks.push({ text: title, headingPath: normalizeHeadingPath(stack), page: null })
       continue
     }
 
@@ -80,11 +186,16 @@ export function parseMd(bytes: Buffer): ParseResult {
       flushParagraph()
       continue
     }
+    for (const match of line.matchAll(IMAGE_LINK)) {
+      const url = match[1]
+      if (url !== undefined) pendingImageUrls.push(url)
+    }
     paragraph.push(line.trim())
   }
 
   flushParagraph()
   if (fence !== null) flushFence()
 
-  return buildParseResult('md', blocks, { encoding })
+  const images = options.extractImages ? await collectImages(imageAnchors, options) : []
+  return buildParseResult('md', blocks, { encoding, images })
 }

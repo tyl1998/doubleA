@@ -106,7 +106,10 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
         modelName: row.id,
         label: row.id,
         type: provider.type,
-        maxContext: row.contextLength,
+        // 向量模型无"上下文长度"概念（维度由保存时尽力探测 / 管理员手动填）
+        maxContext: provider.type === 'EMBEDDING' ? null : row.contextLength,
+        embeddingDim: null,
+        embeddingMultimodal: false,
         supportsVision: false,
         supportsReasoning: false,
         enabled: true,

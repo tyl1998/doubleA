@@ -82,6 +82,13 @@ const PROXY_TIMEOUT_ENV = 'SANDBOX_PROXY_TIMEOUT_MS'
 const TOOLS_PATH = '/api/sandbox/mcp/tools'
 /** 调用端点（同上，POST） */
 const CALL_PATH = '/api/sandbox/mcp/call'
+/**
+ * **内置工具**调用端点（知识库检索 / 目录；后端侧 `proxy.ts#BUILTIN_CALL_PATH`）。
+ *
+ * 为什么与 `CALL_PATH` 分开：内置工具没有 MCP server / 凭据 / 危险确认，后端那条
+ * "别名 → server → 越权检查"的链路描述不了它（见 `proxy.ts` 的端点注释）。
+ */
+const BUILTIN_CALL_PATH = '/api/sandbox/builtin/call'
 /** 令牌头名（**小写**；`spec.ts#SANDBOX_TOKEN_HEADER` 的另一半） */
 const TOKEN_HEADER = 'x-sandbox-token'
 
@@ -120,6 +127,16 @@ interface ToolListResponse {
     toolName: string
     description: string
     /** 原样的 JSON Schema（下面 {@link parametersFor} 直接转交） */
+    inputSchema: unknown
+  }[]
+  /**
+   * 平台内置工具（知识库一族）。容器侧据此注册 `knowledge_search` / `list_knowledge`，
+   * 执行时走 {@link BUILTIN_CALL_PATH}（不是 `/mcp/call`）。没有绑定知识库时是空数组。
+   */
+  builtinTools: {
+    /** 注册给引擎的名字（内置名，不带 `mcp_` 前缀） */
+    name: string
+    description: string
     inputSchema: unknown
   }[]
 }
@@ -214,8 +231,25 @@ export default function mcpBridge(pi: ExtensionAPI): void {
       })
     }
 
+    // ── 平台内置工具（知识库检索 / 目录）—— 与 MCP 同一份清单、不同执行端点 ──
+    for (const tool of list.builtinTools) {
+      pi.registerTool({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description,
+        parameters: parametersFor(tool.inputSchema),
+        async execute(_toolCallId, params): Promise<ToolResult> {
+          return callBuiltin({ backendUrl, token, timeoutMs, name: tool.name, args: params as Record<string, unknown> })
+        },
+      })
+    }
+
     registered = true
-    log('INFO', `已注册 ${list.tools.length} 个 MCP 工具（来自 ${list.servers.length} 台 server）`)
+    log(
+      'INFO',
+      `已注册 ${list.tools.length} 个 MCP 工具（来自 ${list.servers.length} 台 server）` +
+        ` + ${list.builtinTools.length} 个内置工具`,
+    )
   })
 }
 
@@ -245,7 +279,30 @@ async function callTool(input: {
     // ⚠️ 传输层与协议层的失败（`proxy.ts` 文件头的分界线：令牌不认 / 体不合法 / 别名不存在 /
     //    不属于这个 agent / 清单没下发 ⇒ 4xx）在这里统一成"这次调用没干成"。
     //    文案里带上原因：模型要靠它向用户解释，比一句"请求失败"有用得多。
-    throw new Error(`调用 MCP 工具失败：${describeError(error)}。本次调用未完成。`)
+    throw new Error(`调用 MCP 工具失败：${describeError(error)}。本次调用未完成。`, { cause: error })
+  }
+  if (response.isError) throw new Error(response.text)
+  return { content: [{ type: 'text', text: response.text }], details: undefined }
+}
+
+/**
+ * 一次**内置工具**调用（知识库检索 / 目录）。
+ *
+ * 出口与 {@link callTool} **逐字同款**（成功返回 content / `isError:true` 抛 / 传输层失败抛）：
+ * 卡片三态与模型读到的失败结果都由后端那句文本决定，容器侧不做任何加工。
+ */
+async function callBuiltin(input: {
+  backendUrl: string
+  token: string
+  timeoutMs: number
+  name: string
+  args: Record<string, unknown>
+}): Promise<ToolResult> {
+  let response: CallResponse
+  try {
+    response = await postBuiltin(input)
+  } catch (error) {
+    throw new Error(`调用内置工具失败：${describeError(error)}。本次调用未完成。`, { cause: error })
   }
   if (response.isError) throw new Error(response.text)
   return { content: [{ type: 'text', text: response.text }], details: undefined }
@@ -263,7 +320,9 @@ async function fetchToolList(backendUrl: string, token: string): Promise<ToolLis
   if (!Array.isArray(body.servers) || !Array.isArray(body.tools)) {
     throw new Error('工具清单的形状不对（缺 servers / tools 数组）')
   }
-  return { servers: body.servers, tools: body.tools }
+  // 内置工具字段是后加的：老后端（未升级）不给它 ⇒ 按空数组（"没有内置工具"），不当作形状错误
+  const builtinTools = Array.isArray(body.builtinTools) ? body.builtinTools : []
+  return { servers: body.servers, tools: body.tools, builtinTools }
 }
 
 /** 真发那一次 POST（`{serverAlias, toolName, arguments}` —— **不带** conversationId/userId/agentId） */
@@ -283,6 +342,28 @@ async function postCall(input: {
       toolName: input.toolName,
       arguments: input.args,
     }),
+    signal: AbortSignal.timeout(input.timeoutMs),
+  })
+  if (!response.ok) throw new Error(await describeFailure(response))
+  const body = (await response.json()) as Partial<CallResponse>
+  if (typeof body.isError !== 'boolean' || typeof body.text !== 'string') {
+    throw new Error('代理响应的形状不对（缺 isError / text）')
+  }
+  return { isError: body.isError, text: body.text }
+}
+
+/** 真发那一次内置工具的 POST（体：`{name, arguments}`；同样**不带**身份字段） */
+async function postBuiltin(input: {
+  backendUrl: string
+  token: string
+  timeoutMs: number
+  name: string
+  args: Record<string, unknown>
+}): Promise<CallResponse> {
+  const response = await fetch(endpoint(input.backendUrl, BUILTIN_CALL_PATH), {
+    method: 'POST',
+    headers: { [TOKEN_HEADER]: input.token, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: input.name, arguments: input.args }),
     signal: AbortSignal.timeout(input.timeoutMs),
   })
   if (!response.ok) throw new Error(await describeFailure(response))

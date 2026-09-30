@@ -25,6 +25,17 @@
  * 3 块（每块 60 余字），而文档要的是"整体切不动就整块留"（`docs/06` 的验收：传 200 字短通知
  * → **恰好 1 个 chunk**）。反过来，全文超过 chunk_size 时 Section 仍按"能装下就整块装"处理
  * —— 这正是 hybrid 与 fixed 的区别所在（保结构）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ③ 只含标题、没有正文的 Section **向前并入下一节**（不单独成块）
+ * ─────────────────────────────────────────────────────────────────────
+ * 父标题下面直接挂子标题（或标题与正文之间空一行）时，解析出的 blocks 里会有一个"只有标题
+ * 文本、没有任何正文段"的 Section。它若单独成块，就得到一个几字长的碎片块 —— 而它与正文在
+ * 字面上最接近查询词（`实体星礼包单独售卖` 这种），**向量与全文两路都会把它排在前面**，
+ * 于是 `topK` 被标题占满、真正有内容的块全部落选（实测：25 块里 9 块是纯标题，问「有哪些内容」
+ * 时 topK=5 全是标题，模型只看到标题 ⇒ 答不出内容却仍发出引用卡）。
+ * 处置：把这种 Section 的标题文本**前插**到下一节，让"父标题"和它的内容待在同一个块里。
+ * `headingPath` 本就带父标题（`types.ts` 的 `headingPath` 说明），所以这只影响块文本、不影响 meta。
  */
 
 import type { ParseResult, ParsedBlock } from '../parse/types.js'
@@ -44,6 +55,8 @@ interface Section {
   /** 在 `parsed.text` 的**码点**坐标系里的起点（块 meta 的反查要用它，见 `strategy.ts` 不变式 ③） */
   start: number
   text: string
+  /** 是否含**正文段**（不只是标题）—— 只含标题的 Section 会被前插合并（见文件头 ③） */
+  hasBody: boolean
 }
 
 /** Section 内的一段候选块：`start` 是 **Section 内**偏移，`text` 是该段文本 */
@@ -66,13 +79,14 @@ export const hybridStrategy: ChunkStrategy = {
           seq: 0,
           content: source.text,
           meta: metaOf(locateBlock(blockSpans(source.blocks), 0)),
+          offset: 0,
         },
       ]
     }
 
     const spans = blockSpans(source.blocks)
     const chunks: Chunk[] = []
-    for (const section of splitIntoSections(source.blocks)) {
+    for (const section of mergeHeadingOnlySections(splitIntoSections(source.blocks))) {
       const segments = segmentSection(section, options)
       for (let index = 0; index < segments.length; index += 1) {
         const segment = segments[index]
@@ -81,12 +95,15 @@ export const hybridStrategy: ChunkStrategy = {
         // （一个 Section 的结尾 + 另一个 Section 的开头），检索命中后读起来是语义断裂的。
         const prefix =
           index === 0 ? '' : tailByCodePoint(segments[index - 1]?.text ?? '', options.chunkOverlap)
+        // 块起点偏移（不含重叠前缀）：既是 meta 反查的依据，也用于把图片块插回原位
+        const contentStart = section.start + segment.start
         chunks.push({
           seq: chunks.length,
           content: prefix + segment.text,
           // ⚠️ 反查用的是 **Section 起点 + 段内偏移**（不含重叠前缀）：
           //    重叠前缀来自上一块，用它定位会把这一块的页码说成上一块所在的页。
-          meta: metaOf(locateBlock(spans, section.start + segment.start)),
+          meta: metaOf(locateBlock(spans, contentStart)),
+          offset: contentStart,
         })
       }
     }
@@ -96,22 +113,83 @@ export const hybridStrategy: ChunkStrategy = {
 
 /** 按"连续同名标题"切成 Section（见文件头 ①），并算出各自在 `parsed.text` 里的起点 */
 function splitIntoSections(blocks: readonly ParsedBlock[]): Section[] {
-  const drafts: Array<{ key: string; start: number; parts: string[] }> = []
+  const drafts: Array<{ key: string; start: number; parts: string[]; hasBody: boolean }> = []
   let cursor = 0
 
   for (const block of blocks) {
     const key = JSON.stringify(block.headingPath)
     const last = drafts[drafts.length - 1]
     if (last === undefined || last.key !== key) {
-      drafts.push({ key, start: cursor, parts: [] })
+      drafts.push({ key, start: cursor, parts: [], hasBody: false })
     }
     const target = drafts[drafts.length - 1]
     // `target` 一定存在（上面刚 push 过或本来就非空）
-    if (target !== undefined) target.parts.push(block.text)
+    if (target !== undefined) {
+      target.parts.push(block.text)
+      if (!isHeadingBlock(block)) target.hasBody = true
+    }
     cursor += [...block.text].length + 2
   }
 
-  return drafts.map((draft) => ({ start: draft.start, text: draft.parts.join('\n\n') }))
+  return drafts.map((draft) => ({
+    start: draft.start,
+    text: draft.parts.join('\n\n'),
+    hasBody: draft.hasBody,
+  }))
+}
+
+/**
+ * 这一段是不是**标题段**。
+ *
+ * 判据来自解析层的构造口径（`parse/types.ts` 的 `headingPath` 说明）：**标题段自己也在
+ * 自己的路径里**（`# 报销制度` 这一段的 `headingPath` 末位就是 `报销制度`，且 `text` 就是它）。
+ * 于是"标题段" ⟺ 有标题路径且文本恰为该路径的最内层。正文段即便挂在标题下，文本也不等于标题。
+ *
+ * ⚠️ 唯一的假阳性是"正文段恰好逐字等于它所属的标题"（如标题「概述」下第一句也是「概述」）——
+ * 概率极低，且最坏后果只是把这个短段并入下一节（内容不丢，只是挪了位置）。
+ */
+function isHeadingBlock(block: ParsedBlock): boolean {
+  return block.headingPath.length > 0 && block.text === block.headingPath[block.headingPath.length - 1]
+}
+
+/**
+ * 把"只含标题、没有正文"的 Section **前插**合并到下一节（见文件头 ③）。
+ *
+ * 连续多个纯标题 Section（父标题 → 子标题 → …）会**累积**后一起并进后面第一个有正文的节，
+ * 于是"父标题链 + 正文"落在同一个块里。合并后以**最靠前那个标题的起点**为 `start`
+ * （文本里标题确实在那个位置，`locateBlock` 才能反查到正确的块）。
+ *
+ * 收尾的纯标题（文档以标题结束）没有"下一节"可并 ⇒ 追加到前一个已合并的节；
+ * 整篇都是标题（没有任何正文）时保持原样，交给上游的低质内容判断，不在这里吞掉。
+ */
+function mergeHeadingOnlySections(sections: readonly Section[]): Section[] {
+  const merged: Section[] = []
+  /** 待前插的纯标题文本（'' = 没有） */
+  let carryText = ''
+  let carryStart = 0
+
+  const withCarry = (text: string): string => (carryText === '' ? text : `${carryText}\n\n${text}`)
+  const carryStartOr = (start: number): number => (carryText === '' ? start : Math.min(carryStart, start))
+
+  for (const section of sections) {
+    if (!section.hasBody) {
+      if (carryText === '') carryStart = section.start
+      carryText = withCarry(section.text)
+      continue
+    }
+    merged.push({ start: carryStartOr(section.start), text: withCarry(section.text), hasBody: true })
+    carryText = ''
+  }
+
+  if (carryText !== '') {
+    const last = merged[merged.length - 1]
+    if (last === undefined) {
+      // 整篇只有标题：不合并掉（保留原样，交给上游按它本来的样子处理）
+      return sections.map((section) => ({ ...section }))
+    }
+    last.text = `${last.text}\n\n${carryText}`
+  }
+  return merged
 }
 
 /**

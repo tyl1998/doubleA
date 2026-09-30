@@ -33,6 +33,25 @@ declare module 'mammoth' {
     /** 样式映射（本项目**不传**：传它会替换掉 mammoth 的默认映射，标题反而会丢） */
     styleMap?: string[]
     includeDefaultStyleMap?: boolean
+    /** 图片转换器（P0-4-x：抽取内嵌图时传 `mammoth.images.imgElement(...)`） */
+    convertImage?: MammothImageConverter
+  }
+
+  /** 传给 mammoth 的图片转换器（由 `images.imgElement` 造出来） */
+  export interface MammothImageConverter {
+    __mammothBrand: 'ImageConverter'
+  }
+
+  /** mammoth 交给转换器的图片读接口 */
+  export interface MammothImage {
+    contentType: string
+    readAsBuffer: () => Promise<Buffer>
+    readAsBase64String: () => Promise<string>
+  }
+
+  /** 图片转换器的返回值（我们只要它别在 HTML 里渲染，故 `src` 给空串） */
+  export interface MammothImageAttributes {
+    src: string
   }
 
   /** Word 语义结构 → HTML（本项目据此取标题层级与段落） */
@@ -44,6 +63,10 @@ declare module 'mammoth' {
   const mammoth: {
     convertToHtml: typeof convertToHtml
     extractRawText: typeof extractRawText
+    images: {
+      dataUri: MammothImageConverter
+      imgElement: (f: (image: MammothImage) => Promise<MammothImageAttributes>) => MammothImageConverter
+    }
   }
   export default mammoth
 }

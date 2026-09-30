@@ -85,6 +85,7 @@ import {
   fetchUpstreamJson,
   linkAbort,
   redactSecret,
+  resolveUpstreamUrl,
   snippet,
   throwUpstreamStatus,
   toUpstreamFailure,
@@ -137,6 +138,12 @@ export interface LlmTarget {
   protocol?: UpstreamProtocol
   /** 已归一化（去尾斜杠），拼路径不会出现 `//` */
   baseUrl: string
+  /**
+   * 自定义 URL（Provider 级配置）。为 `true` 时 {@link baseUrl} **就是完整端点**，
+   * 传输层原样发请求、**不再拼**协议后缀（见 `upstream.ts#resolveUpstreamUrl`）。
+   * 缺省等价于 `false` —— 与 `protocol` 同款，验收脚本手工构造的 target 不必带它。
+   */
+  customUrl?: boolean
   /** 未配置时为 `null` —— 有的自建/内网 OpenAI 兼容实现不校验凭据 */
   apiKey: string | null
 }
@@ -257,6 +264,7 @@ function endpointOf(target: LlmTarget): UpstreamEndpoint {
     providerName: target.providerName,
     subject: target.modelName,
     baseUrl: target.baseUrl,
+    customUrl: target.customUrl,
     apiKey: target.apiKey,
     logFields: { modelId: target.modelId, providerId: target.providerId, label: target.label },
   }
@@ -395,7 +403,7 @@ export async function chatStream(
   let response: Response
   try {
     deadline.arm(headingMs, '首次响应（到响应头）')
-    response = await fetch(`${target.baseUrl}${protocol.chatPath}`, {
+    response = await fetch(resolveUpstreamUrl(endpoint, protocol.chatPath), {
       method: 'POST',
       headers: protocol.headers(endpoint, { accept: 'text/event-stream' }),
       body: JSON.stringify(body),
@@ -655,13 +663,14 @@ interface StreamState {
  * @throws {LlmAbortError} 调用方中断
  */
 export async function fetchRemoteModels(
-  target: Pick<LlmTarget, 'providerName' | 'baseUrl' | 'apiKey'> & Pick<Partial<LlmTarget>, 'protocol'>,
+  target: Pick<LlmTarget, 'providerName' | 'baseUrl' | 'apiKey'> & Pick<Partial<LlmTarget>, 'protocol' | 'customUrl'>,
   options: Pick<ChatOptions, 'abortSignal' | 'timeoutMs'> = {},
 ): Promise<{ items: RemoteModel[]; total: number; truncated: boolean }> {
   // 这个探测请求没有"某个模型"这个主语（`subject` 缺省时消息里只写上游名）
   const endpoint: UpstreamEndpoint = {
     providerName: target.providerName,
     baseUrl: target.baseUrl,
+    customUrl: target.customUrl,
     apiKey: target.apiKey,
   }
   const protocol = protocolOf(target.protocol)

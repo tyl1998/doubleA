@@ -33,3 +33,13 @@ export function useAvailableChatModels() {
     queryFn: () => request<ModelOptionListResult>('/api/models/available?type=CHAT'),
   })
 }
+
+export const AVAILABLE_EMBEDDING_MODELS_QUERY_KEY = ['models', 'available', 'EMBEDDING'] as const
+
+/** 读"可直接用于向量化"的模型列表（`type=EMBEDDING`；建/改知识库时选它） */
+export function useAvailableEmbeddingModels() {
+  return useQuery({
+    queryKey: AVAILABLE_EMBEDDING_MODELS_QUERY_KEY,
+    queryFn: () => request<ModelOptionListResult>('/api/models/available?type=EMBEDDING'),
+  })
+}

@@ -24,10 +24,27 @@ import { AppError } from '@doubulea/shared'
 import mammoth from 'mammoth'
 
 import { getLogger } from '../../infra/logger.js'
-import { buildParseResult, type ParseResult, type ParsedBlock } from './types.js'
+import {
+  buildParseResult,
+  DEFAULT_PARSE_OPTIONS,
+  normalizeHeadingPath,
+  type ParseOptions,
+  type ParseResult,
+  type ParsedBlock,
+  type ParsedImage,
+} from './types.js'
 
 /** mammoth 输出里的"叶子块"：标题 / 段落 / 列表项（三者的内容都直接是文本） */
 const LEAF_BLOCK = /<(h[1-6]|p|li)\b[^>]*>([\s\S]*?)<\/\1>/giu
+
+/**
+ * 图片占位符的 `src` 前缀。`convertImage` 给每张图返回 `doubulea-img-<n>`，
+ * 于是 mammoth 的 HTML 里会在**图片原本的位置**留下 `<img src="doubulea-img-n" />` ——
+ * 我们据此还原"这张图在正文的哪个位置"（图片字节本身由回调另存）。
+ */
+const IMAGE_SRC_PREFIX = 'doubulea-img-'
+/** 从一段 HTML 里依次取出图片占位符的序号 */
+const IMAGE_TOKEN = /doubulea-img-(\d+)/gu
 
 /** HTML 实体（mammoth 只产出这几种；`&amp;` 与 `&quot;` 最常见） */
 const ENTITIES: Readonly<Record<string, string>> = {
@@ -49,25 +66,42 @@ function toPlainText(html: string): string {
     .trim()
 }
 
-/** mammoth 的 HTML → 段落块（标题维护层级栈） */
-function htmlToBlocks(html: string): ParsedBlock[] {
+/** 图片在 `blocks` 里的锚点（见 {@link ParsedImage.anchor}） */
+interface ImageAnchor {
+  /** 插在 `blocks[anchor]` 之前 */
+  anchor: number
+  headingPath: string[]
+}
+
+/**
+ * mammoth 的 HTML → 段落块（标题维护层级栈）+ **图片锚点表**。
+ *
+ * 关键点：图片是"就地取材"的 —— 扫到含 `<img>` 的段落时，记下"此刻已产出多少块"作为锚点，
+ * 并带上当前标题栈。下游（OCR / 图片分块）据此把图注插回原位，而不是统统堆到文末。
+ */
+function htmlToBlocks(html: string): { blocks: ParsedBlock[]; imageAnchors: Map<number, ImageAnchor> } {
   const blocks: ParsedBlock[] = []
+  const imageAnchors = new Map<number, ImageAnchor>()
   const stack: string[] = []
   for (const match of html.matchAll(LEAF_BLOCK)) {
     const tag = (match[1] ?? '').toLowerCase()
-    const text = toPlainText(match[2] ?? '')
-    if (text === '') continue
+    const inner = match[2] ?? ''
+    const imageIndexes = [...inner.matchAll(IMAGE_TOKEN)].map((token) => Number(token[1]))
+    const text = toPlainText(inner)
+    if (text === '' && imageIndexes.length === 0) continue
 
-    if (/^h[1-6]$/u.test(tag)) {
+    if (text !== '' && /^h[1-6]$/u.test(tag)) {
       const level = Number(tag.slice(1))
       if (stack.length > level - 1) stack.length = level - 1
       stack[level - 1] = text
-      blocks.push({ text, headingPath: [...stack], page: null })
-      continue
     }
-    blocks.push({ text, headingPath: [...stack], page: null })
+    // 空文本段落（纯图片段）不产出块，但图片仍要锚在这里（夹在前后块之间）
+    if (text !== '') blocks.push({ text, headingPath: normalizeHeadingPath(stack), page: null })
+    for (const index of imageIndexes) {
+      imageAnchors.set(index, { anchor: blocks.length, headingPath: normalizeHeadingPath(stack) })
+    }
   }
-  return blocks
+  return { blocks, imageAnchors }
 }
 
 /**
@@ -77,10 +111,36 @@ function htmlToBlocks(html: string): ParsedBlock[] {
  * 出现它往往意味着"文档里有些东西没能还原"，排查解析质量时要看，故记 debug 日志
  * （不在正常路径打 info：多数文档都会带几条样式告警，否则日志会被刷满）。
  */
-export async function parseDocx(bytes: Buffer): Promise<ParseResult> {
+export async function parseDocx(
+  bytes: Buffer,
+  options: ParseOptions = DEFAULT_PARSE_OPTIONS,
+): Promise<ParseResult> {
   let html: string
+  /** 图片字节，按 mammoth 回调顺序（= 文档内顺序）以序号为键 */
+  const byIndex = new Map<number, { data: Buffer; mime: string }>()
+  let counter = 0
   try {
-    const result = await mammoth.convertToHtml({ buffer: bytes })
+    const result = await mammoth.convertToHtml(
+      { buffer: bytes },
+      options.extractImages
+        ? {
+            // 每张图：① 存下字节；② 返回 `doubulea-img-<n>` 作为 `src`，
+            //    使图片在 HTML 里**保留原位占位**（由 `htmlToBlocks` 还原锚点）。
+            //    占位符不会被渲染成真实图片（我们不要正文里出现图），只是位置标记。
+            convertImage: mammoth.images.imgElement(async (image) => {
+              const index = counter
+              counter += 1
+              try {
+                const buffer = await image.readAsBuffer()
+                byIndex.set(index, { data: buffer, mime: image.contentType || 'application/octet-stream' })
+              } catch {
+                // 单张图读失败不影响文档解析
+              }
+              return { src: `${IMAGE_SRC_PREFIX}${index}` }
+            }),
+          }
+        : undefined,
+    )
     html = result.value
     if (result.messages.length > 0) {
       getLogger().debug(
@@ -96,5 +156,21 @@ export async function parseDocx(bytes: Buffer): Promise<ParseResult> {
       `无法解析 docx：文件不是有效的 Word 文档（可能已损坏，或被改名的其它格式）。${String(error)}`,
     )
   }
-  return buildParseResult('docx', htmlToBlocks(html))
+
+  const { blocks, imageAnchors } = htmlToBlocks(html)
+  const images: ParsedImage[] = []
+  for (const index of [...byIndex.keys()].sort((a, b) => a - b)) {
+    const collected = byIndex.get(index)
+    if (collected === undefined || collected.data.length > options.maxImageBytes) continue
+    const anchor = imageAnchors.get(index)
+    images.push({
+      data: collected.data,
+      mime: collected.mime,
+      page: null,
+      // 图注继承"图片所在位置"的标题栈；取不到时退回文末
+      headingPath: anchor?.headingPath ?? [],
+      anchor: anchor?.anchor ?? blocks.length,
+    })
+  }
+  return buildParseResult('docx', blocks, { images })
 }

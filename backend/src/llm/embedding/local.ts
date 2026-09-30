@@ -48,7 +48,7 @@ import { Worker } from 'node:worker_threads'
 import { AppError } from '@doubulea/shared'
 
 import { getLogger } from '../../infra/logger.js'
-import type { EmbeddingProvider } from './index.js'
+import type { EmbeddingInput, EmbeddingProvider } from './index.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // worker 协议（`embedding.worker.ts` 用 `import type` 引这一组，编译期擦除、不产生运行期环）
@@ -181,8 +181,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     return this.#options.dim
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) return []
+  async embed(inputs: readonly EmbeddingInput[]): Promise<number[][]> {
+    if (inputs.length === 0) return []
+    // 本地 bge-m3 是**纯文本**模型：收到图片直接拒绝（静默当文本处理会把图片内容悄悄丢掉）
+    if (inputs.some((input) => typeof input !== 'string' && (input.images?.length ?? 0) > 0)) {
+      throw AppError.internal('本地 embedding 模型（bge-m3）不支持图片，请改用支持多模态的向量模型或"OCR 转文字"')
+    }
+    const texts = inputs.map((input) => (typeof input === 'string' ? input : input.text))
     await this.#ensureWorker()
     const response = await this.#send({ type: 'embed', texts })
     const vectors = response.vectors ?? []

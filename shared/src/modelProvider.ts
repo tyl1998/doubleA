@@ -135,6 +135,12 @@ export const modelProviderItemSchema = z.object({
   name: z.string(),
   /** 已去掉尾部斜杠（拼接 `/chat/completions` 时不会出现 `//`，见 {@link providerBaseUrlSchema}） */
   baseUrl: z.string(),
+  /**
+   * 自定义 URL（P0：非规范第三方端点）。为 `true` 时 {@link baseUrl} **就是完整端点**，
+   * 后端原样发请求、**不再拼**任何路径后缀（`/chat/completions` 等）。默认 `false` = 既有拼接。
+   * ⚠️ 开启后「远程拉模型」（`GET /models` 探测）无法从固定后缀派生，型号名需手动录入。
+   */
+  customUrl: z.boolean(),
   type: z.enum(MODEL_TYPES),
   /**
    * 上游协议（P0-1-37）。⚠️ 与 `type` 是两件事：这个是"**怎么说话**"，`type` 是"**干什么用**"。
@@ -225,6 +231,11 @@ export const createModelProviderBodySchema = z.object({
   baseUrl: providerBaseUrlSchema,
   type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
   /**
+   * 自定义 URL（非规范第三方端点）。缺省即 `false`（= 既有拼接行为）。
+   * 与 `protocol` 同款：`.optional()` 而非 `.default()`，默认值只在服务层补一处。
+   */
+  customUrl: z.boolean().optional(),
+  /**
    * 上游协议；**缺省即 {@link DEFAULT_UPSTREAM_PROTOCOL}**（= P0-1-37 之前的所有行为）。
    *
    * ⚠️ 这里用 `.optional()` 而**不是** `.default()`：与 `update` 保持同一口径，
@@ -278,6 +289,8 @@ export const updateModelProviderBodySchema = z
   .object({
     name: z.string().trim().min(1, '名称不能为空').max(128, '名称最多 128 个字符').optional(),
     baseUrl: providerBaseUrlSchema.optional(),
+    /** 自定义 URL 开关（两态：不带 = 不动；给值 = 改成它）。不加 `.default()`，理由同 `protocol` */
+    customUrl: z.boolean().optional(),
     type: z
       .enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) })
       .optional(),
@@ -302,6 +315,7 @@ export const updateModelProviderBodySchema = z
     (body) =>
       body.name !== undefined ||
       body.baseUrl !== undefined ||
+      body.customUrl !== undefined ||
       body.type !== undefined ||
       body.protocol !== undefined ||
       body.enabled !== undefined ||

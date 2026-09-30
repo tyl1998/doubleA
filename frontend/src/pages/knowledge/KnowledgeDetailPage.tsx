@@ -45,6 +45,7 @@ import {
 } from '../../api/knowledgeBases.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { KNOWLEDGE_PATH } from '../../app/paths.js'
+import { ChunkPreviewDrawer } from './ChunkPreviewDrawer.js'
 import { DeleteKnowledgeBaseModal } from './DeleteKnowledgeBaseModal.js'
 import { DocumentTable } from './DocumentTable.js'
 import { KnowledgeBaseFormModal } from './KnowledgeBaseFormModal.js'
@@ -71,6 +72,8 @@ export function KnowledgeDetailPage() {
   const [searchOpen, setSearchOpen] = useState(false)
   /** 上传弹窗：`null` = 关闭；`'new'` = 上传新文档；否则是**覆盖重传**的目标 */
   const [uploadTarget, setUploadTarget] = useState<'new' | DocumentItem | null>(null)
+  /** 片段预览：`null` = 关闭；否则是正在预览的那篇文档 */
+  const [chunkTarget, setChunkTarget] = useState<DocumentItem | null>(null)
   const [deleting, setDeleting] = useState(false)
 
   const kb = kbQuery.data
@@ -226,7 +229,12 @@ export function KnowledgeDetailPage() {
                 }
               />
             ) : (
-              <DocumentTable kbId={kb.id} documents={documents} onReupload={(doc) => setUploadTarget(doc)} />
+              <DocumentTable
+                kbId={kb.id}
+                documents={documents}
+                onReupload={(doc) => setUploadTarget(doc)}
+                onPreviewChunks={(doc) => setChunkTarget(doc)}
+              />
             )}
 
             {documents.length > 0 && (
@@ -324,10 +332,17 @@ export function KnowledgeDetailPage() {
       <KnowledgeBaseFormModal kb={kb} open={editing} onClose={() => setEditing(false)} />
       <KnowledgeConfigModal kb={kb} open={editingConfig} onClose={() => setEditingConfig(false)} />
       <SearchTestDrawer kbId={kb.id} kbName={kb.name} open={searchOpen} onClose={() => setSearchOpen(false)} />
+      <ChunkPreviewDrawer
+        kbId={kb.id}
+        doc={chunkTarget}
+        open={chunkTarget !== null}
+        onClose={() => setChunkTarget(null)}
+      />
       <UploadDocumentModal
         kbId={kb.id}
         doc={uploadTarget === 'new' ? null : uploadTarget}
         open={uploadTarget !== null}
+        multimodalSupported={kb.embeddingMultimodal}
         onClose={() => setUploadTarget(null)}
       />
       <DeleteKnowledgeBaseModal

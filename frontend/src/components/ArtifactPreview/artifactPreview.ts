@@ -50,6 +50,20 @@ export function artifactDownloadUrl(artifactId: string): string {
   return `/api/artifacts/${encodeURIComponent(artifactId)}/download`
 }
 
+/**
+ * 历史产物列表（`GET /api/artifacts/history`，**TaskAgent 记忆与产物 块 4/5**）。
+ *
+ * ⚠️ **与上面两个出口不同，它带 query**（offset/limit 分页）—— 但那不是"同一个端点加参数"：
+ * 上面两条是**同一个资源**的两种**出口**（下载 / 预览），而这一条是**另一个资源**
+ * （跨会话的历史产物清单）。分页参数属于列表本身，不存在"用 query 选安全策略"的问题。
+ * 放在本文件（与那两个 URL Builder 同处）只是因为 F 组那条源码级断言把"拼 `/api/artifacts/`
+ * 前缀"这件事钉在**这一个文件**里 —— 不在这里加，别的模块就会各拼一次。
+ */
+export function artifactHistoryUrl(offset: number, limit: number): string {
+  const search = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  return `/api/artifacts/history?${search.toString()}`
+}
+
 // ───────────────────────────── 体积闸门 ─────────────────────────────
 
 /** 人类可读的字节数（1 位小数；< 1024 给整数 B） */

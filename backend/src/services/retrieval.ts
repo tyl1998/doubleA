@@ -42,7 +42,6 @@ import {
   FULLTEXT_QUERY_MIN_CHARS,
   SNIPPET_WINDOW_CHARS,
   VECTOR_PATH_SKIPPED_MODEL_CHANGED,
-  VECTOR_PATH_SKIPPED_NOT_READY,
   normalizeRetrievalConfig,
   type RetrievalConfig,
   type RetrievalHit,
@@ -51,9 +50,11 @@ import {
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
+import { Prisma } from '../../generated/prisma/client.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import { embeddingReadiness, getEmbeddingProvider } from '../llm/embedding/index.js'
+import { buildPoolEmbeddingProvider, type EmbeddingProvider } from '../llm/embedding/index.js'
+import { resolveEmbeddingTarget } from './model.service.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 纯函数①：全文路 query 预处理
@@ -301,26 +302,42 @@ interface VectorUnavailable {
 }
 
 /**
- * 本次检索能不能走向量路？不能则给出**可展示的原因**。
+ * 本次检索能不能走向量路？能则返回该库**选定模型**构造的 provider，不能则给出**可展示的原因**。
  *
- * 两种情形刻意分开（见 `shared` 里两条常量的注释）：模型变了是"这个库要重建"（业务动作），
- * 未就绪是"这台机器没配好"（运维动作）。合成一条会让用户去重做一个治不好的动作。
+ * 与旧实现的关键差异：不再比对进程级环境变量（那套已停用），而是看**该库自己的
+ * `embedding_model_id`** —— 没绑定（老库）/模型被删/模型或 Provider 停用/维度缺失，
+ * 都归到 `MODEL_CHANGED`（业务动作：重建或启用），并附上具体原因。
  */
-function vectorUnavailableReason(kbEmbeddingModel: string): VectorUnavailable | null {
-  const readiness = embeddingReadiness()
-  if (!readiness.ready) {
-    return {
-      kind: 'NOT_READY',
-      message: `${VECTOR_PATH_SKIPPED_NOT_READY}（${readiness.problems.join('；')}）`,
-    }
-  }
-  if (readiness.name !== kbEmbeddingModel) {
+async function resolveVectorProvider(kb: {
+  embeddingModelId: string | null
+  embeddingDim: number | null
+}): Promise<{ provider: EmbeddingProvider } | VectorUnavailable> {
+  if (kb.embeddingModelId === null || kb.embeddingDim === null) {
     return {
       kind: 'MODEL_CHANGED',
-      message: `${VECTOR_PATH_SKIPPED_MODEL_CHANGED}（库内快照：${kbEmbeddingModel}，当前：${readiness.name ?? '未知'}）`,
+      message: `${VECTOR_PATH_SKIPPED_MODEL_CHANGED}（该库未绑定 embedding 模型或缺少维度快照，需重建）`,
     }
   }
-  return null
+  try {
+    const target = await resolveEmbeddingTarget(kb.embeddingModelId)
+    return {
+      provider: buildPoolEmbeddingProvider(
+        {
+          providerName: target.providerName,
+          baseUrl: target.baseUrl,
+          customUrl: target.customUrl,
+          multimodal: target.embeddingMultimodal,
+          apiKey: target.apiKey,
+          apiModel: target.modelName,
+        },
+        kb.embeddingDim,
+        config.embedding.batchSize,
+      ),
+    }
+  } catch (error) {
+    const reason = error instanceof AppError ? error.message : String(error)
+    return { kind: 'MODEL_CHANGED', message: `${VECTOR_PATH_SKIPPED_MODEL_CHANGED}（${reason}）` }
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -330,6 +347,16 @@ function vectorUnavailableReason(kbEmbeddingModel: string): VectorUnavailable | 
 interface RankedRow {
   id: string
   score: number
+}
+
+/**
+ * `doc_id` 过滤的 SQL 片段（可选）。没有指定文档时返回 `Prisma.empty`（一段空 SQL）——
+ * 于是"有没有文档过滤"**共用同一条语句**，不必写两份（两份 SQL 迟早漂移一处）。
+ */
+function docFilterSql(docIds: readonly string[] | undefined): Prisma.Sql {
+  return docIds === undefined || docIds.length === 0
+    ? Prisma.empty
+    : Prisma.sql`AND doc_id = ANY(${docIds}::uuid[])`
 }
 
 /**
@@ -347,15 +374,17 @@ interface RankedRow {
 async function vectorSearch(
   kbIds: readonly string[],
   vectorLiteral: string,
+  dim: number,
   pool: number,
   minScore: number,
+  docIds?: readonly string[],
 ): Promise<RankedRow[]> {
   const rows = await getPrisma().$queryRaw<RankedRow[]>`
     SELECT t.id::text AS id, t.score
     FROM (
       SELECT id, (1 - (embedding <=> ${vectorLiteral}::vector))::float8 AS score
       FROM chunks
-      WHERE kb_id = ANY(${kbIds}::uuid[]) AND embedding IS NOT NULL
+      WHERE kb_id = ANY(${kbIds}::uuid[]) ${docFilterSql(docIds)} AND embedding IS NOT NULL AND embedding_dim = ${dim}
       ORDER BY embedding <=> ${vectorLiteral}::vector
       LIMIT ${pool}
     ) AS t
@@ -377,13 +406,14 @@ async function fulltextSearch(
   kbIds: readonly string[],
   needle: string,
   pool: number,
+  docIds?: readonly string[],
 ): Promise<RankedRow[]> {
   const rows = await getPrisma().$queryRaw<RankedRow[]>`
     SELECT t.id::text AS id, t.score
     FROM (
       SELECT id, bigm_similarity(content, ${needle})::float8 AS score
       FROM chunks
-      WHERE kb_id = ANY(${kbIds}::uuid[]) AND content LIKE '%' || ${needle} || '%'
+      WHERE kb_id = ANY(${kbIds}::uuid[]) ${docFilterSql(docIds)} AND content LIKE '%' || ${needle} || '%'
       ORDER BY score DESC
       LIMIT ${pool}
     ) AS t
@@ -416,6 +446,12 @@ export interface SearchKnowledgeBaseInput {
   topK?: number
   /** 单次请求覆盖该库的 `mode`（检索测试页用） */
   mode?: RetrievalMode
+  /**
+   * 只在**指定的文档**里检索（可选；`knowledge_search` 工具的 `doc` 参数用它）。
+   * 空/未给 = 不限制（在该库全部文档里检索）。逐路 SQL 里加 `AND doc_id = ANY(...)`
+   * （见 {@link docFilterSql}）—— 与 `kb_id` 过滤同一个位置，不改变召回/排序语义。
+   */
+  docIds?: readonly string[]
 }
 
 interface ChunkRow {
@@ -444,7 +480,7 @@ export async function searchKnowledgeBase(
   const db = getPrisma()
   const kb = await db.knowledgeBase.findUnique({
     where: { id: input.kbId },
-    select: { id: true, embeddingModel: true, retrievalConfig: true },
+    select: { id: true, embeddingModel: true, embeddingModelId: true, embeddingDim: true, retrievalConfig: true },
   })
   if (kb === null) throw AppError.notFound('知识库不存在')
 
@@ -463,27 +499,26 @@ export async function searchKnowledgeBase(
   let vectorScores = new Map<string, number>()
   let vectorPathSkipped = mode === 'FULLTEXT'
   if (mode !== 'FULLTEXT') {
-    const unavailable = vectorUnavailableReason(kb.embeddingModel)
-    if (unavailable === null) {
-      const provider = getEmbeddingProvider()
-      const [vector] = await provider.embed([input.query])
+    const resolved = await resolveVectorProvider(kb)
+    if ('provider' in resolved) {
+      const [vector] = await resolved.provider.embed([input.query])
       if (vector === undefined) {
         // provider 的契约保证"条数相符"，走到这里说明契约被破坏了：宁可整次失败，
         // 也不要拿一个 undefined 去拼 SQL（那会变成 SQL 语法错误，排查方向完全不同）
         throw AppError.internal('embedding 未返回 query 向量（provider 契约被破坏），本次检索已中止')
       }
       const literal = `[${vector.join(',')}]`
-      const rows = await vectorSearch(kbIds, literal, candidatePool, kbConfig.score)
+      const rows = await vectorSearch(kbIds, literal, kb.embeddingDim ?? vector.length, candidatePool, kbConfig.score, input.docIds)
       vectorRanked = rows.map((row) => row.id)
       vectorScores = new Map(rows.map((row) => [row.id, row.score]))
     } else if (mode === 'VECTOR') {
       // VECTOR 模式没有可退的路：返回空数组会被读成"库里没有相关内容"（一句假话）。
-      throw unavailable.kind === 'MODEL_CHANGED'
-        ? AppError.conflict(`${unavailable.message}；本次 mode=VECTOR 无法降级为全文检索`)
-        : AppError.internal(unavailable.message)
+      throw resolved.kind === 'MODEL_CHANGED'
+        ? AppError.conflict(`${resolved.message}；本次 mode=VECTOR 无法降级为全文检索`)
+        : AppError.internal(resolved.message)
     } else {
       vectorPathSkipped = true
-      warnings.push(`${unavailable.message}，本次已降级为全文检索`)
+      warnings.push(`${resolved.message}，本次已降级为全文检索`)
     }
   }
 
@@ -495,7 +530,7 @@ export async function searchKnowledgeBase(
     if (fulltextQuery.skipped) {
       warnings.push(FULLTEXT_PATH_SKIPPED_TOO_SHORT)
     } else {
-      const rows = await fulltextSearch(kbIds, fulltextQuery.text, candidatePool)
+      const rows = await fulltextSearch(kbIds, fulltextQuery.text, candidatePool, input.docIds)
       fulltextRanked = rows.map((row) => row.id)
       fulltextScores = new Map(rows.map((row) => [row.id, row.score]))
     }
@@ -537,6 +572,8 @@ export async function searchKnowledgeBase(
       seq: row.seq,
       page: meta.page,
       headingPath: meta.headingPath,
+      // 整块原文（给模型与引用卡）与命中窗口（只给检索测试页）—— 分工见 `retrievalHitSchema`
+      content: row.content,
       snippet: buildSnippet(row.content, fulltextQuery.skipped ? '' : fulltextQuery.text),
       vectorScore: vectorScores.get(row.id) ?? null,
       vectorRank: hit.vectorRank,
@@ -577,18 +614,26 @@ export async function searchKnowledgeBase(
 }
 
 /**
- * `chunks.meta` 的读取口径（唯一入口）。
+ * `chunks.meta` 的读取口径（唯一入口；导出给 `chunk.service.ts` 的片段预览复用）。
  *
  * 它是 jsonb，历史行可能缺键（P0-1-18 起写入，但手工插的行不会）⇒ 逐键兜底，
  * 且 `page` 只认**有限数字**（`JSON.parse` 出来的可能是字符串或 null）。
  * 形状见 `子方案①` §4-4：`{ headingPath, page, embeddingName }`。
+ *
+ * ⚠️ 入参是 `unknown` 而不是 `string`：检索层用手写 SQL，拿到的 jsonb 是**文本**；
+ * 片段预览用 Prisma `findMany`，拿到的是**已解析的对象** —— 两种形状都从这里收口，
+ * 否则"缺键怎么兜底"会有第二份实现，迟早先腐烂一处。
  */
-function parseChunkMeta(raw: string): { headingPath: string[]; page: number | null } {
-  let value: unknown
-  try {
-    value = JSON.parse(raw)
-  } catch {
-    return { headingPath: [], page: null }
+export function parseChunkMeta(raw: unknown): { headingPath: string[]; page: number | null } {
+  // `meta` 的两个来源形状不同：手写 SQL（检索层）回的是 **jsonb 文本**，Prisma 的
+  // `findMany`（chunk 预览）回的是**已解析的对象**。这里两种都收，避免同一个兜底口径写两遍。
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      return { headingPath: [], page: null }
+    }
   }
   if (typeof value !== 'object' || value === null) return { headingPath: [], page: null }
   const record = value as { headingPath?: unknown; page?: unknown }

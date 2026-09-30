@@ -43,12 +43,30 @@ export interface ChunkMeta {
   page: number | null
 }
 
+/** 随块一起向量化的一张图片（`MULTIMODAL` 模式；由 embedding 层转成 content part） */
+export interface ChunkImage {
+  mime: string
+  data: Buffer
+}
+
 /** 一个待入库的块（P0-1-19 把它写进 `chunks`：`content` → 文本、`meta` → jsonb、`seq` → 列） */
 export interface Chunk {
   /** 文档内序号（0 起；`schema.prisma` 的 `Chunk.seq`） */
   seq: number
   content: string
   meta: ChunkMeta
+  /**
+   * 块起点在 `parsed.text` 里的**码点偏移**（内部字段，**不落库**）。
+   *
+   * 存在的唯一理由：`MULTIMODAL` 模式下图片块要按原位置插回文本块之间（否则图片块全排在文末，
+   * 与它所属的章节脱节）。有了它，`chunkStage` 就能按偏移把"文本块 + 图片块"归并成一个有序序列。
+   */
+  offset?: number
+  /**
+   * 与文本一起向量化的图片（`MULTIMODAL` 图片模式）。纯文本块不带该字段。
+   * ⚠️ 不落库（图片不持久化，重建时从原文件重抽）；只在本轮 embedding 里用。
+   */
+  images?: ChunkImage[]
 }
 
 /** 分块参数（KB 级，建库时快照自环境默认值 —— §十一） */

@@ -136,6 +136,18 @@ enum DocumentStatus {
   @@map("document_status")
 }
 
+/// 文档内图片的处理方式（上传/覆盖重建时选定；与 `shared/src/document.ts#IMAGE_MODES` 逐字一致）。
+/// · NONE —— 不解析图片（历史行为）；
+/// · OCR —— 抽取图片后本地 OCR 成文字，作为普通文本块进分块/向量化；
+/// · MULTIMODAL —— 抽取图片转 base64，作为 content part 交给多模态 embedding 模型直接向量化。
+enum ImageMode {
+  NONE
+  OCR
+  MULTIMODAL
+
+  @@map("image_mode")
+}
+
 /// MCP server 的注册方式（`02` §三：`auth_type(NONE|OAUTH)`）。
 /// ⚠️ **P0 只接受 `NONE`**：`OAUTH` 的列先建出来（免得 P1 改表），但注册时收到它就 400 ——
 /// 与 P0-1-23 拒绝 `MCP` 绑定同一条定案（`06` §4.0 口径 1："接口留位、能力不做"，
@@ -202,6 +214,7 @@ model User {
   mcpServers     McpServer[]
   mcpCredentials McpCredential[]
   usageRecords   UsageRecord[]
+  artifacts      Artifact[]
 
   @@map("users")
 }
@@ -215,6 +228,10 @@ model ModelProvider {
   id        String    @id @default(uuid(7)) @db.Uuid
   name      String    @db.VarChar(128)
   baseUrl   String    @map("base_url") @db.Text
+  /// 自定义 URL（第三方端点不按 `{host}/v1` + 固定后缀规范时）：为 true 时 `base_url`
+  /// **就是完整端点**，后端直接拿它发请求、**不再拼** `/chat/completions` 等后缀
+  /// （见 `backend/src/llm/upstream.ts#resolveUpstreamUrl`）。默认 false = 既有拼接行为。
+  customUrl Boolean   @default(false) @map("custom_url")
   apiKeyEnc String?   @map("api_key_enc") @db.Text
   type      ModelType
   /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`
@@ -233,8 +250,9 @@ model ModelProvider {
 ///
 /// · `label` = 别名（界面上给业务同学看的名字），`model_name` = 上游真实型号名。
 /// · `@@unique([providerId, modelName, type])`：同一 provider 下同型号同类型只应有一条。
-///   带 `type` 是因为同一型号名可能既提供 chat 又提供 embedding（如 bge 系列的兼容端点），
-///   不带 type 会把这种合法情况误判成重复。
+///   ⚠️ 方案A 起**模型 `type` 跟随 Provider 的 `type`**（`createModel` 强校验一致），
+///   所以这条唯一约束实际等价于 `(providerId, modelName)`；保留 `type` 列是为了不动约束、
+///   且对历史数据仍能正确判重。
 /// · `@@index([type, enabled])`：服务 `GET /api/models?type=CHAT`（全员可选模型列表，
 ///   `enabled=false` 的必须筛掉 —— `01` §3.2「无效模型创建 Agent 时不可选」）。
 /// · 删除语义 `onDelete: Cascade`：模型之于 provider 没有独立意义，provider 没了模型也留不住。
@@ -245,6 +263,13 @@ model Model {
   label          String    @db.VarChar(128)
   type           ModelType
   maxContext     Int?      @map("max_context")
+  /// **向量模型专属**：embedding 输出维度（建/改模型时向上游**探测**写入）。对话模型为 NULL。
+  /// 知识库建库时**复制**该值作为维度快照（`KnowledgeBase.embeddingDim`），故正常不再二次探测。
+  embeddingDim   Int?      @map("embedding_dim")
+  /// **向量模型专属**：是否走**多模态** embedding 端点（如火山 `doubao-embedding-vision`）。
+  /// 为 true 时请求打 `POST {baseUrl}/embeddings/multimodal` 且 `input` 为 `[{type:"text",text}]`；
+  /// 为 false（默认）走标准 OpenAI `POST {baseUrl}/embeddings` + `input: [string]`。
+  embeddingMultimodal Boolean @default(false) @map("embedding_multimodal")
   supportsVision Boolean   @default(false) @map("supports_vision")
   // 是否支持"深度思考"（reasoning / thinking）。默认 false —— 与 supportsVision 同款：
   // 既是选模型侧的读数，也在对话链路上决定"是否向上游请求思考"（见 llm/protocol.ts 各协议 buildBody）。
@@ -256,6 +281,8 @@ model Model {
   provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
   agents   Agent[]
   agentPool AgentModel[]
+  /// 把本模型用作 embedding 的知识库（`KnowledgeBase.embeddingModelId`）
+  knowledgeBases KnowledgeBase[] @relation("KnowledgeBaseEmbeddingModel")
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -470,6 +497,12 @@ model KnowledgeBase {
   name           String   @db.VarChar(128)
   description    String?  @db.Text
   embeddingModel String   @map("embedding_model") @db.VarChar(255)
+  /// 建库时**选定**的 embedding 模型（来自模型池的 `EMBEDDING` 类型模型）。
+  /// 可空只为兼容本列引入前的老库；新建库必填。模型被删时置空（该库向量路不可用，需重建）。
+  embeddingModelId String? @map("embedding_model_id") @db.Uuid
+  /// 该库 embedding 向量的维度快照（建库时**探测**该模型输出后写入）。
+  /// `chunks.embedding` 自本批起是**无固定维度**的 `vector`，检索按此维度收窄。
+  embeddingDim   Int?     @map("embedding_dim")
   chunkSize      Int      @default(512) @map("chunk_size")
   chunkOverlap   Int      @default(64) @map("chunk_overlap")
   /// 形状见 `子方案①` §二：`{topK, score, mode, splitStrategy, rrfK, weights:{vector,fulltext}}`
@@ -478,6 +511,8 @@ model KnowledgeBase {
   updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   documents Document[]
+  /// 选定的 embedding 模型（删模型时不删库，只把引用置空 ⇒ 该库退化为纯全文检索，需重建）
+  embeddingModelRef Model? @relation("KnowledgeBaseEmbeddingModel", fields: [embeddingModelId], references: [id], onDelete: SetNull)
 
   @@map("knowledge_bases")
 }
@@ -503,6 +538,8 @@ model Document {
   chunkCount  Int            @default(0) @map("chunk_count")
   errorMsg    String?        @map("error_msg") @db.Text
   contentHash String         @map("content_hash") @db.VarChar(64)
+  /// 图片处理方式（上传/覆盖重建时选定）。`NONE` = 历史行为。见 {@link ImageMode}
+  imageMode   ImageMode      @default(NONE) @map("image_mode")
   createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt   DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -537,10 +574,12 @@ model Chunk {
   kbId      String                      @map("kb_id") @db.Uuid
   seq       Int
   content   String                      @db.Text
-  /// pgvector 列，DDL 里是 `vector(1024)`；Prisma 侧只作声明，读写走手写 SQL。
-  /// 它的 HNSW 索引**不在本文件声明**（Prisma 表达不了），建在迁移里且刻意做成
-  /// 部分索引 —— 理由与代价见本文件顶部说明 2。
-  embedding Unsupported("vector(1024)")?
+  /// pgvector 列，DDL 里是**无固定维度**的 `vector`（本批起支持任意维度的 embedding 模型）；
+  /// Prisma 侧只作声明，读写走手写 SQL。维度记在 `embedding_dim`，检索按它收窄。
+  embedding Unsupported("vector")?
+  /// 该向量的维度（= 所属知识库的 `embedding_dim`）。逐行存一份，检索时 `WHERE embedding_dim = $n`
+  /// 双保险（避免不同维度的向量被放进同一次距离比较）；也便于将来按维度建 ANN 索引。
+  embeddingDim Int?                  @map("embedding_dim")
   meta      Json                        @default("{}") @db.JsonB
   createdAt DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
 
@@ -704,12 +743,19 @@ model Sandbox {
 /// "列表里有个文件、点下载才发现对象不存在"）。行是"下载/预览"的唯一入口（P0-3-9），
 /// `fileKey` 不出现在任何对外契约里（对外只有 `id`，见 `shared#artifactItemSchema`）。
 ///
-/// ⚠️ **产物不跟会话走**：`02` §三 的"消息与产物都不删"—— 删会话会级联删行，但
-/// 过期收口**只由保留期清理器做**（`sandbox/artifacts.ts#reapExpiredArtifacts`，
+/// ⚠️ **产物不跟会话删除走**（`docs/子方案/TaskAgent记忆与产物.md` 块 3）：
+/// `conversationId` **可空** + 外键 `ON DELETE SET NULL` —— 删除会话时产物行**保留**、
+/// 仅把 `conversation_id` 置空，归入"历史产物"（按 `userId` 可查、可下载），过期收口
+/// **只由保留期清理器做**（`sandbox/artifacts.ts#reapExpiredArtifacts`，
 /// `ARTIFACT_RETENTION_DAYS` 默认 7 天），不存在"会话一删文件就没了"的路径。
 model Artifact {
   id String @id @default(uuid(7)) @db.Uuid
-  conversationId String @map("conversation_id") @db.Uuid
+  /// 所属会话；**可空** = 会话已删（产物转为历史产物，`GET /api/artifacts/history` 查得到）
+  conversationId String? @map("conversation_id") @db.Uuid
+  /// 产物归属用户（= 当时会话的 `conversations.user_id`，建行时从会话查一次写入）。
+  /// ⚠️ 它是"我的历史产物"的**唯一判据**：删除会话后 `conversationId` 被置空，
+  /// 只有这一列还能把产物归回给用户（`02` §三 的"产物 → 会话 → 本人"对历史产物不再成立）
+  userId String @map("user_id") @db.Uuid
   /// S3 对象键：`artifacts/{conversationId}/{uuid}/{安全化的文件名}`（uuid 是存储层随机段，
   /// 与 `document.service.ts` 的 `kb/...` 键同一条纪律：对象名不需要有序）
   fileKey String @map("file_key") @db.VarChar(512)
@@ -728,12 +774,17 @@ model Artifact {
   /// 默认值只是兜底（同 `Sandbox.createdAt` 的口径）。
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
-  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  /// ⚠️ `SetNull` 而不是 `Cascade`：删除会话**保留产物行**（历史产物，见上方的方案链接）。
+  /// 行保留后由 `userId` 归回给用户 —— 这是 `delete 会话 → 产物还能查到` 的落点
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   /// P0-3-9 的产物列表（`GET /:id/artifacts`）扫描键
   @@index([conversationId, createdAt(sort: Desc)])
   /// 保留期清理器的扫描键（`createdAt < now - ARTIFACT_RETENTION_DAYS`）
   @@index([createdAt])
+  /// 历史产物列表（`GET /api/artifacts/history`：`userId = me AND conversationId = null`）扫描键
+  @@index([userId, conversationId, createdAt(sort: Desc)])
   @@map("artifacts")
 }
 
