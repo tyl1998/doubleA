@@ -23,8 +23,14 @@ export const KNOWLEDGE_PATH = '/knowledge'
 /** MCP server 管理（`03` §二：`/mcp`，登录即可） */
 export const MCP_PATH = '/mcp'
 
-/** 我的凭据（`03` §二：`/mcp/credentials`，登录即可） */
-export const MCP_CREDENTIALS_PATH = '/mcp/credentials'
+/**
+ * 我的凭据（`03` §二：`/settings/credentials`，登录即可）。
+ *
+ * ⚠️ 它是**个人凭据页**，与 MCP 解耦 —— 「代表你调用工具」是个人设置，
+ * 归入 `/settings` 一族（与 `/settings/password` 同族），后续可扩展别的凭据类型。
+ * 页面**内容**仍是按 MCP server 分组的表单，后端端点也仍是 `/api/mcp/credentials`。
+ */
+export const CREDENTIALS_PATH = '/settings/credentials'
 
 /** 历史产物（`TaskAgent 记忆与产物` 块 4/5：删除会话后保留的产物，登录即可、仅本人可见） */
 export const ARTIFACT_HISTORY_PATH = '/artifacts/history'
@@ -40,8 +46,8 @@ export const ARTIFACT_HISTORY_PATH = '/artifacts/history'
  * 不传 `serverId` ⇒ **裸路径**（不是 `?serverId=`）：凭据页据此区分"要定位到某台"与"就看看全部"，
  * 而空串会让它去 `document.getElementById('cred-')` 找一个不存在的锚点（静默什么都不发生）。
  */
-export function mcpCredentialsPath(serverId?: string): string {
-  return serverId === undefined ? MCP_CREDENTIALS_PATH : `${MCP_CREDENTIALS_PATH}?serverId=${encodeURIComponent(serverId)}`
+export function credentialsPath(serverId?: string): string {
+  return serverId === undefined ? CREDENTIALS_PATH : `${CREDENTIALS_PATH}?serverId=${encodeURIComponent(serverId)}`
 }
 
 /**

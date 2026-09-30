@@ -795,7 +795,8 @@ await it('I1 导航里 `MC` / `CR` 两条的 `batch` 台账已删（页面落地
   const nav = sourceFiles().find(({ name }) => name === 'app/nav.ts')
   assert(nav !== undefined, '找不到 app/nav.ts')
   assertIncludes(nav.source, "path: '/mcp'", '/mcp 还在导航里')
-  assertIncludes(nav.source, "path: '/mcp/credentials'", '/mcp/credentials 也在')
+  assertIncludes(nav.source, "path: '/settings/credentials'", '我的凭据**与 MCP 解耦**后的路由（个人设置族）也在')
+  assertExcludes(nav.source, "path: '/mcp/credentials'", '旧路由必须消失（不再跟在 MCP 后面）')
   assertExcludes(nav.source, '端点尚未存在', '两条台账文案必须删掉（否则这份台账会变成"哪些页还没做"的错误答案）')
 })
 
@@ -808,7 +809,7 @@ await it('I2 `/mcp` 两条路由指向真页面，**不再**是占位页', () =>
   assertExcludes(app.source, "batch=\"P0-2\"", '不该还有 P0-2 的占位页')
 })
 
-await it('I3 「从别处跳到凭据页」只有**一个**构造点（`app/paths.ts#mcpCredentialsPath`）', () => {
+await it('I3 「从别处跳到凭据页」只有**一个**构造点（`app/paths.ts#credentialsPath`）', () => {
   const files = sourceFiles()
   const withQuery = files.filter(({ source }) => source.includes('?serverId='))
   assertDeepEqual(
@@ -851,7 +852,7 @@ await it('I6 确认应答走 `POST /:id/confirm`，且**收卡**由 store 的一
 await it('I7 工具卡的「去配置凭据」用**那一个**路径构造点（不手拼字符串）', () => {
   const card = sourceFiles().find(({ name }) => name === 'features/chat/ToolCard.tsx')
   assert(card !== undefined, '找不到工具卡')
-  assertIncludes(card.source, 'mcpCredentialsPath(', '用 paths.ts 的函数')
+  assertIncludes(card.source, 'credentialsPath(', '用 paths.ts 的函数')
   assertIncludes(card.source, 'canConfigureCredential(', '判据来自 messageModel')
   assertExcludes(card.source, '?serverId=', '不手拼查询串')
 })

@@ -44,6 +44,7 @@ import {
   useKnowledgeBase,
 } from '../../api/knowledgeBases.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { usePageCrumb } from '../../app/crumbContext.js'
 import { KNOWLEDGE_PATH } from '../../app/paths.js'
 import { ChunkPreviewDrawer } from './ChunkPreviewDrawer.js'
 import { DeleteKnowledgeBaseModal } from './DeleteKnowledgeBaseModal.js'
@@ -82,22 +83,14 @@ export function KnowledgeDetailPage() {
   const summary = summarizeDocuments(documents)
   const notice = kb === undefined ? null : embeddingChangedNotice(kb.embeddingModelChanged)
 
-  const crumb = (
-    <nav className="crumb" aria-label="面包屑">
-      <Link to={KNOWLEDGE_PATH}>知识库</Link>
-      <span className="crumb__sep" aria-hidden="true">
-        /
-      </span>
-      <span className="crumb__here">{kb?.name ?? '详情'}</span>
-    </nav>
-  )
+  // 面包屑已挪到顶栏：把知识库名作为「细节段」上报（顶栏渲染 `工作台 / 知识库 / <name>`）
+  usePageCrumb(kb?.name ?? '详情')
 
   // ── 三态：加载 / 失败（404 单独一档） / 正常 ──────────────────────────────
 
   if (kbQuery.isPending) {
     return (
       <>
-        {crumb}
         <div className="page__head">
           <div>
             <h1>知识库</h1>
@@ -113,7 +106,6 @@ export function KnowledgeDetailPage() {
     const notFound = kbQuery.error instanceof ApiError && kbQuery.error.status === 404
     return (
       <>
-        {crumb}
         <div className="page__head">
           <div>
             <h1>{notFound ? '知识库不存在' : '知识库加载失败'}</h1>
@@ -163,8 +155,6 @@ export function KnowledgeDetailPage() {
 
   return (
     <>
-      {crumb}
-
       <div className="page__head">
         <div>
           <h1>

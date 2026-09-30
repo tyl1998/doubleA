@@ -8,7 +8,7 @@
  * （`TOOL_CALL_STATUSES` 是 DB/契约的取值域，与 `tool_call` 事件同源）。
  *
  * ⚠️ **P0-2-11 起「去配置凭据」真的接上了**（这个按钮在 P0-1 期间是**刻意不提供**的：
- * 目标页 `/mcp/credentials` 当时还是占位页，摆一个点不通的入口比没有更差）。
+ * 目标页当时还是占位页，摆一个点不通的入口比没有更差）。
  * 现在判据是 `messageModel#canConfigureCredential`（**三个条件缺一不可**：
  * `ERROR` + `errorCode === 'NEED_CREDENTIAL'` + **有 `serverId`**）。第三条是最容易漏的一条，
  * 漏了会拼出一个 `?serverId=`（空值）的链接 —— 用户点了、页面也跳了、就是什么都不发生。
@@ -27,7 +27,7 @@ import {
   toolErrorHint,
   type ToolCallView,
 } from './messageModel.js'
-import { mcpCredentialsPath } from '../../app/paths.js'
+import { credentialsPath } from '../../app/paths.js'
 
 /** 状态 → 中文标签与刻度类（唯一一份映射，别在 JSX 里再判一次 status） */
 const STATUS_PRESENTATION: Record<ToolCallView['status'], { label: string; className: string }> = {
@@ -124,7 +124,7 @@ export function ToolCard({ tool }: ToolCardProps) {
           <div className="row row--wrap" style={{ marginTop: 'var(--sp-3)', gap: 'var(--sp-3)' }}>
             <span className="ratio">{hint}</span>
             {needsCredential && tool.serverId !== undefined ? (
-              <Link to={mcpCredentialsPath(tool.serverId)}>
+              <Link to={credentialsPath(tool.serverId)}>
                 <Button size="small" type="primary">
                   去配置凭据
                 </Button>

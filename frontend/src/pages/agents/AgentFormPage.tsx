@@ -77,7 +77,8 @@ import { useKnowledgeBases } from '../../api/knowledgeBases.js'
 import { useMcpServers, useMyCredentials } from '../../api/mcp.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH, chatPath, mcpCredentialsPath } from '../../app/paths.js'
+import { usePageCrumb } from '../../app/crumbContext.js'
+import { HOME_PATH, chatPath, credentialsPath } from '../../app/paths.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import {
@@ -121,6 +122,16 @@ export function AgentEditPage() {
 function AgentFormPage({ agentId }: { agentId?: string }) {
   const agentQuery = useAgent(agentId)
 
+  // 面包屑已挪到顶栏：这里把"创建 / 编辑 · 名称"作为「细节段」上报
+  //（顶栏渲染 `工作台 / 智能体 / <detail>`）
+  const crumbDetail =
+    agentId === undefined
+      ? '创建'
+      : agentQuery.data !== undefined
+        ? `编辑 · ${agentQuery.data.name}`
+        : '编辑智能体'
+  usePageCrumb(crumbDetail)
+
   if (agentId !== undefined && agentQuery.isPending) {
     return (
       <>
@@ -154,13 +165,6 @@ function AgentFormPage({ agentId }: { agentId?: string }) {
 function EditHead({ title, lead }: { title: string; lead: string }) {
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>智能体</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">{title}</span>
-      </nav>
       <div className="page__head">
         <div>
           <h1>{title}</h1>
@@ -440,14 +444,6 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>智能体</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">{initialItem === undefined ? '创建' : `编辑 · ${initialItem.name}`}</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>{initialItem === undefined ? '创建智能体' : '编辑智能体'}</h1>
@@ -791,7 +787,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                               {needsCredential ? (
                                 <>
                                   {' · '}
-                                  <Link to={mcpCredentialsPath(server.id)}>去配置凭据</Link>
+                                  <Link to={credentialsPath(server.id)}>去配置凭据</Link>
                                 </>
                               ) : null}
                             </span>

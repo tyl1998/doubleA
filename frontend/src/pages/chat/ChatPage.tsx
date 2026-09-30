@@ -52,7 +52,7 @@
  *   · 没有终帧（断线 / 停止超时）⇒ 按条数让位（那一条，是对齐动作的一部分）。
  */
 
-import { Button, Select, Tag } from 'antd'
+import { Button, Drawer, Select, Tag } from 'antd'
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
@@ -69,6 +69,7 @@ import {
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { confirmConversation } from '../../api/mcp.js'
+import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
 import { HOME_PATH, agentEditPath, chatPath } from '../../app/paths.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
@@ -175,6 +176,8 @@ export function ChatPage() {
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
   const [confirmPending, setConfirmPending] = useState(false)
+  /** 窄屏下的产物抽屉开关（第三列被 CSS 藏在 ≥1280 才显示，窄屏用抽屉给入口，见 `ArtifactPanel` 那段） */
+  const [artifactDrawerOpen, setArtifactDrawerOpen] = useState(false)
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
   const frameRef = useRef<HTMLDivElement>(null)
   /**
@@ -194,6 +197,8 @@ export function ChatPage() {
 
   const agent = agentQuery.data
   const agentName = agent?.name ?? '智能体'
+  // 面包屑（顶栏）里这一页的细节段 = 智能体名 ⇒ `工作台 / 智能体 / <名称>`（加载中只到「智能体」）
+  usePageCrumb(agent?.name ?? null)
   /**
    * 头部副标题里显示的模型名：**跟随本会话当前选中/正在用的模型**，而不是永远显示默认模型
    * （产品反馈 2026-09-29：选了 flash 后副标题还停在 pro）。`selectedModelId` 为
@@ -612,6 +617,20 @@ export function ChatPage() {
                   绑定模型不可用
                 </Tag>
               ) : null}
+              {/* 窄屏产物入口：第三列在 <1280px 被 CSS 藏起来（`app.css` 的 1280 断点），
+                  这枚按钮只在窄屏显示（同款断点），点开一个抽屉承载同一个 `ArtifactPanel`。
+                  宽屏下按钮被 CSS 隐藏、第三列常驻 ⇒ 不重复。 */}
+              {showPanel ? (
+                <Button
+                  size="small"
+                  className="chat__panel-toggle"
+                  onClick={() => setArtifactDrawerOpen(true)}
+                  title="查看产物列表"
+                >
+                  产物
+                  {artifactItems.length > 0 ? ` · ${artifactItems.length}` : ''}
+                </Button>
+              ) : null}
               {agent === undefined ? null : (
                 <Link to={agentEditPath(agent.id)}>
                   <Button size="small">编辑智能体</Button>
@@ -769,6 +788,30 @@ export function ChatPage() {
         open={previewedArtifact !== null}
         onClose={closePreview}
       />
+
+      {/* 产物列表抽屉（窄屏入口，见头部那枚 `chat__panel-toggle`）。⚠️ 与第三列共用同一个
+          `ArtifactPanel`：数据（`items` / `total` / 失败与重试 / 流式）全在这一页算好，
+          面板只是换一种摆法。AntD `Drawer` 默认**首次打开才挂载**子节点 ⇒ 宽屏下不产生第二个
+          `useMinuteTick` 节拍器。 */}
+      {showPanel ? (
+        <Drawer
+          title="产物"
+          placement="right"
+          width={340}
+          open={artifactDrawerOpen}
+          onClose={() => setArtifactDrawerOpen(false)}
+        >
+          <ArtifactPanel
+            items={artifactItems}
+            total={artifactsQuery.data?.total}
+            listFailed={artifactsQuery.isError}
+            onRetry={() => {
+              void artifactsQuery.refetch()
+            }}
+            streaming={round?.status === 'streaming'}
+          />
+        </Drawer>
+      ) : null}
 
       {/* 撤回 / 修改重发最新一轮（产品优化 2026-09-29）。`conversationId ?? ''` 是类型兜底：
           弹窗只在 `recallTarget` 非空时发请求，而那时 `conversationId` 必然存在（见 `recallable` 的判据） */}

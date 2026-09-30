@@ -1,40 +1,65 @@
 /**
- * 应用外壳（P0-1-30；P0-1-34 加「专注布局」）
+ * 应用外壳（P0-1-30；本次改版：左侧栏 + 顶栏面包屑）
  *
- * 依据：`docs/03-前端设计.md` §三（全局布局：Logo + 导航 + 头像菜单 + ADMIN 才可见的管理入口；
- *      **对话页为全屏布局：保留 Logo 与头像菜单，其余导航收进「工作台」下拉**）、
- *      `design/agents.html` 的 `.shell` 构成（左仪表轨 + 顶栏 + `.page` 内容区）、
- *      `design/chat.html` 的顶栏（`工作台 ▾` + 主题开关 + 头像）。
+ * 依据：`docs/03-前端设计.md` §三（全局布局：左侧栏 + 顶栏面包屑 + 头像菜单 +
+ *      ADMIN 才可见的管理入口）。
+ *
+ * 两块导航：
+ * - **左侧栏**（`.rail`）：承载**全部导航项**，每项 = 图标 + 文字，且可**收起**成图标条
+ *   （默认展开）。文字标签来自 `nav.ts#NAV_ITEMS`。**所有页面都用它** —— 对话页也不例外
+ *   （改版前对话页走"专注布局"隐藏侧栏、改用「工作台」下拉，现按用户要求取消：保持侧栏）。
+ * - **顶栏**（`.topbar`）：不再是全局文字导航，改为**快捷页面导航**（面包屑
+ *   `工作台 / 模块 / 细节`）。静态前缀由 `nav.ts#crumbBaseForPath` 推出，二级页的细节段
+ *   由页面用 `usePageCrumb` 上报（见 `crumbContext.ts`）。对话页 = `工作台 / 智能体 / <智能体名>`。
  *
  * 三件事只在这里做，别的页面不要重复：
  * 1. **`<main>` 地标与页面级留白**（`.page`）—— 页面组件只渲染自己的内容；
  * 2. **导航的权限过滤与当前项高亮** —— 判据来自 `nav.ts` 的 `adminOnly` 单一来源；
  * 3. **全局服务状态灯** —— 真实数据来自 `GET /health`（`api/health.ts`），不是装饰。
- *
- * 顶部两块导航（仪表轨的字母、顶栏的文字）是**同一批目的地**：点击行为一致，只是密度不同。
- * 这不是重复劳动 —— 仪表轨是随手可达的锚点，顶栏是第一次用的人能读懂的文字。
- *
- * ─────────────────────────────────────────────────────────────────────
- * 专注布局（P0-1-34）：为什么仪表轨**也**要收起来
- * ─────────────────────────────────────────────────────────────────────
- * `03` §三 说的是"其余导航项收纳进「工作台」下拉入口 —— 避免导航孤岛（**全隐藏**会形成导航孤岛）"。
- * 落地时有两个只做一半的写法，各自都会让这句话落空：
- *   · **只把顶栏文字导航换成下拉、仪表轨照旧** ⇒ 导航一点没收敛，"全屏"也省不下左侧那 62px；
- *   · **只藏次要项** ⇒ 正是 `04-设计评审报告` 第 2 条否掉的那条路（"哪些算次要未定义"）。
- * 所以专注布局 = **不渲染仪表轨** + 顶栏的「工作台」下拉里放**按角色过滤后的全部导航项**。
- * 判据在 `nav.ts#isFocusPath`（"哪一屏用什么外壳"与"这一屏叫什么"是同一件事的两面）。
  */
 
+import {
+  ApiOutlined,
+  AppstoreOutlined,
+  BookOutlined,
+  DatabaseOutlined,
+  HistoryOutlined,
+  KeyOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  RobotOutlined,
+  TeamOutlined,
+} from '@ant-design/icons'
 import { Button, Dropdown, type MenuProps } from 'antd'
 import type { AuthUser } from '@doubulea/shared'
+import { Fragment, useState, type ReactNode } from 'react'
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 import { useCurrentUser, useLogout } from '../api/auth.js'
 import { HEALTH_TARGET_LABEL, useHealth } from '../api/health.js'
 import { useUiStore } from '../stores/ui.js'
 import { useFeedback } from './feedback.js'
-import { isFocusPath, matchNavItem, serialForPath, visibleNavItems, type NavItem } from './nav.js'
+import { PageCrumbContext } from './crumbContext.js'
+import {
+  crumbBaseForPath,
+  matchNavItem,
+  serialForPath,
+  visibleNavItems,
+  type CrumbSegment,
+  type NavItem,
+} from './nav.js'
 import { ADMIN_MODELS_PATH, ADMIN_USERS_PATH, HOME_PATH, PASSWORD_PATH, loginPath } from './paths.js'
+
+/** 每个导航项一个图标（按 `NavItem.code` 认领，`nav.ts` 因此不必认识 antd） */
+const ICON_BY_CODE: Record<string, ReactNode> = {
+  AG: <RobotOutlined />,
+  KB: <BookOutlined />,
+  MC: <ApiOutlined />,
+  AH: <HistoryOutlined />,
+  CR: <KeyOutlined />,
+  US: <TeamOutlined />,
+  ML: <DatabaseOutlined />,
+}
 
 /** 头像上的字：中文名取首字，拉丁名取前两位（`design/*.html` 的 `avatar__face`） */
 function initialsOf(user: AuthUser): string {
@@ -63,62 +88,56 @@ function serviceLed(health: ReturnType<typeof useHealth>): { className: string; 
   return { className: 'led led--warn', title: `部分依赖不可用 —— ${broken}` }
 }
 
-function RailNavItem({ item }: { item: NavItem }) {
+function RailNavItem({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
   return (
     <li>
       <NavLink
         className="rail__btn"
         to={item.path}
         end={item.path === HOME_PATH}
-        title={item.label}
+        // 收起时文字被隐藏 ⇒ 用 `title` 补回可读性
+        title={collapsed ? item.label : undefined}
         aria-label={item.label}
       >
-        {item.code}
-      </NavLink>
-    </li>
-  )
-}
-
-function TopNavItem({ item }: { item: NavItem }) {
-  return (
-    <li>
-      <NavLink className="nav__item" to={item.path} end={item.path === HOME_PATH}>
-        {item.label}
+        <span className="rail__icon" aria-hidden="true">
+          {ICON_BY_CODE[item.code] ?? <AppstoreOutlined />}
+        </span>
+        <span className="rail__label">{item.label}</span>
       </NavLink>
     </li>
   )
 }
 
 /**
- * 「工作台」下拉（专注布局专用，`03` §三）：顶栏文字导航的**替代物**。
+ * 顶栏的「快捷页面导航」（面包屑）。
  *
- * 内容 = `visibleNavItems(role)`（与仪表轨、顶栏**同一份来源**，ADMIN 过滤在 `nav.ts` 里做），
- * 所以"哪几个入口该出现"仍然只有一处判据 —— 这里只是换一种摆法。
- * 用 AntD `Dropdown` + `menu`：它的键盘行为（↓ 展开、Esc 关、方向键在项间移动）是现成的，
- * 自写一个 `<div onClick>` 会让这个入口对键盘用户失效（原型的 `.menu` 是纯 hover 的演示件）。
+ * 静态前缀来自 `crumbBaseForPath(pathname)`（`工作台 / 模块`），`detail` 非空时追加为当前段
+ * （二级页用 `usePageCrumb` 上报）。有 `detail` 时前缀各段渲染成链接，否则末段即当前页。
  */
-function WorkspaceMenu({ items }: { items: NavItem[] }) {
-  const navigate = useNavigate()
-
-  const menuItems: MenuProps['items'] = [
-    { type: 'group' as const, label: '工作台', children: items.map((item) => ({ key: item.path, label: item.label })) },
-  ]
+function PageCrumb({ pathname, detail }: { pathname: string; detail: string | null }) {
+  const base = crumbBaseForPath(pathname)
+  const trail: CrumbSegment[] = detail === null ? base : [...base, { label: detail }]
 
   return (
-    <Dropdown
-      menu={{
-        items: menuItems,
-        onClick: ({ key }) => {
-          navigate(key)
-        },
-      }}
-      trigger={['click']}
-      placement="bottomLeft"
-    >
-      <Button size="small" type="text" aria-haspopup="menu">
-        工作台 ▾
-      </Button>
-    </Dropdown>
+    <nav className="crumb" aria-label="面包屑">
+      {trail.map((segment, index) => {
+        const last = index === trail.length - 1
+        return (
+          <Fragment key={`${segment.label}-${index}`}>
+            {index > 0 ? (
+              <span className="crumb__sep" aria-hidden="true">
+                /
+              </span>
+            ) : null}
+            {!last && segment.to !== undefined ? (
+              <Link to={segment.to}>{segment.label}</Link>
+            ) : (
+              <span className={last ? 'crumb__here' : undefined}>{segment.label}</span>
+            )}
+          </Fragment>
+        )
+      })}
+    </nav>
   )
 }
 
@@ -179,33 +198,25 @@ export function AppLayout() {
   const themeMode = useUiStore((state) => state.themeMode)
   const toggleThemeMode = useUiStore((state) => state.toggleThemeMode)
   const health = useHealth()
+  /** 左侧栏是否收起（默认展开；本组件跨路由常驻，故状态天然保持） */
+  const [railCollapsed, setRailCollapsed] = useState(false)
+  /** 二级页上报给顶栏面包屑的**细节段**（见 `crumbContext.ts`） */
+  const [crumbDetail, setCrumbDetail] = useState<string | null>(null)
   // 退出登录后 queryClient 被 clear，本组件可能在卸载前再渲染一次 ⇒ 兜一下 undefined
   if (user === undefined || user === null) return null
 
   const items = visibleNavItems(user.role)
   const led = serviceLed(health)
   const current = matchNavItem(location.pathname)
-  /** 对话页用专注布局（`03` §三）：不渲染仪表轨，顶栏用一个「工作台」下拉代替文字导航 */
-  const focus = isFocusPath(location.pathname)
+  // 左侧栏默认展开；本组件跨路由常驻，收起状态天然保持
+  const shellClass = `shell${railCollapsed ? '' : ' shell--rail-open'}`
 
   const topbar = (
     <header className="topbar">
       <Link className="topbar__brand" to={HOME_PATH}>
         doubuleA <span>工作台</span>
       </Link>
-      {focus ? (
-        <nav aria-label="主导航">
-          <WorkspaceMenu items={items} />
-        </nav>
-      ) : (
-        <nav aria-label="主导航">
-          <ul className="nav">
-            {items.map((item) => (
-              <TopNavItem key={item.path} item={item} />
-            ))}
-          </ul>
-        </nav>
-      )}
+      <PageCrumb pathname={location.pathname} detail={crumbDetail} />
       <div className="topbar__right">
         <Button
           size="small"
@@ -228,43 +239,44 @@ export function AppLayout() {
     </main>
   )
 
-  if (focus) {
-    // `shell--focus` 只做一件事：把网格从"仪表轨 + 内容"改成单列（`styles/app.css`）。
-    // ⚠️ `.page` 的上下留白**不动** —— 对话页的一屏高是按它算出来的
-    //（`.chat` 的 `height: calc(100vh - … - var(--sp-6) - var(--sp-8))`），
-    // 顺手把 padding 抹平会让对话页比视口高出 104px。
-    return (
-      <div className="shell shell--focus">
+  return (
+    <PageCrumbContext.Provider value={setCrumbDetail}>
+      <div className={shellClass}>
+        <aside className={`rail${railCollapsed ? ' rail--collapsed' : ''}`} aria-label="全局导航">
+          <div className="rail__head">
+            <Link className="rail__mark" to={HOME_PATH} aria-label="doubuleA 工作台">
+              A
+            </Link>
+            <button
+              className="rail__toggle"
+              type="button"
+              onClick={() => {
+                setRailCollapsed((value) => !value)
+              }}
+              aria-label={railCollapsed ? '展开导航' : '收起导航'}
+              aria-expanded={!railCollapsed}
+              title={railCollapsed ? '展开导航' : '收起导航'}
+            >
+              {railCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+            </button>
+          </div>
+          <div className="rail__rule" aria-hidden="true" />
+          <ul className="rail__nav">
+            {items.map((item) => (
+              <RailNavItem key={item.path} item={item} collapsed={railCollapsed} />
+            ))}
+          </ul>
+          <div className="rail__status">
+            <span className={led.className} title={led.title} role="img" aria-label={led.title} />
+            <span className="rail__serial num">{serialForPath(location.pathname)}</span>
+          </div>
+        </aside>
+
         <div>
           {topbar}
           {page}
         </div>
       </div>
-    )
-  }
-
-  return (
-    <div className="shell">
-      <aside className="rail" aria-label="全局导航">
-        <Link className="rail__mark" to={HOME_PATH} aria-label="doubuleA 工作台">
-          A
-        </Link>
-        <div className="rail__rule" aria-hidden="true" />
-        <ul className="rail__nav">
-          {items.map((item) => (
-            <RailNavItem key={item.path} item={item} />
-          ))}
-        </ul>
-        <div className="rail__status">
-          <span className={led.className} title={led.title} role="img" aria-label={led.title} />
-          <span className="rail__serial num">{serialForPath(location.pathname)}</span>
-        </div>
-      </aside>
-
-      <div>
-        {topbar}
-        {page}
-      </div>
-    </div>
+    </PageCrumbContext.Provider>
   )
 }

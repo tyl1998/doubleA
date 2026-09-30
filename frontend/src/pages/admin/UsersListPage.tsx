@@ -33,14 +33,12 @@
 import { Alert, Button, Input, Popconfirm, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
 import { PASSWORD_MAX_BYTES, type InitialPasswordResult, type UserListItem } from '@doubulea/shared'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
 
 import { useAdminUsers, useResetUserPassword, useUpdateUser } from '../../api/adminUsers.js'
 import { useCurrentUser } from '../../api/auth.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH } from '../../app/paths.js'
 import { InitialPasswordModal } from './InitialPasswordModal.js'
 import { UserFormModal } from './UserFormModal.js'
 import { USER_ROLE_LABELS, describeUserStatus, userRowActions } from './adminModel.js'
@@ -234,14 +232,6 @@ export function UsersListPage() {
 
   const head = (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">用户管理</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>用户管理</h1>

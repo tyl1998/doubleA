@@ -33,7 +33,7 @@ import { AGENTS_PAGE_LIMIT_MAX, useAgents } from '../../api/agents.js'
 import { AGENT_TYPE_LABEL, formatUpdatedAt, mcpRefsOf } from './agentModel.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
-import { AGENTS_NEW_PATH, HOME_PATH, chatPath, agentEditPath } from '../../app/paths.js'
+import { AGENTS_NEW_PATH, chatPath, agentEditPath } from '../../app/paths.js'
 
 /** 类型筛选：`ALL` 是"全部"，其余取 `AGENT_TYPES` 的字面量 */
 type TypeFilter = 'ALL' | AgentType
@@ -155,14 +155,6 @@ export function AgentsListPage() {
 
   const head = (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">智能体</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>智能体</h1>

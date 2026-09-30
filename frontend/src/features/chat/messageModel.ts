@@ -63,7 +63,7 @@ export interface ToolCallView {
    * 工具所属 MCP server 的 **id**（`kind=SANDBOX` 时没有这个键）。
    *
    * ⚠️ **P0-2-11 的契约增量**（`shared/src/conversation.ts#toolCallRecordSchema`）：
-   * 工具卡上那条「去配置凭据」要跳 `/mcp/credentials?serverId=…`，而 `serverName` 做不到
+   * 工具卡上那条「去配置凭据」要跳 `/settings/credentials?serverId=…`，而 `serverName` 做不到
    * （它是展示名，可重名）；从 `toolName` 的 `mcp_{slug}_{tool}` 反推更不行
    * （slug 刻意不唯一 ⇒ 会指到别的 server 上）。
    */
@@ -87,7 +87,7 @@ export interface ToolCallView {
  * + **知道是哪台 server**（`serverId` 存在）。
  *
  * ⚠️ 第三条最容易漏，而漏了的后果很具体：`serverId` 缺失时（历史里 P0-2-11 之前落库的老记录、
- * 或 `kind=SANDBOX` 的工具）会拼出 `/mcp/credentials?serverId=`（**空值**）——
+ * 或 `kind=SANDBOX` 的工具）会拼出 `/settings/credentials?serverId=`（**空值**）——
  * 用户点了按钮、页面也跳过去了、就是什么都不发生（因为凭据页拿到了一个不在清单里的空 id
  * ⇒ `resolveScrollTarget` 返回 `null`）。那是"点不通的入口"的变体，而它更难查：
  * 页面确实跳转了。

@@ -976,9 +976,11 @@ await it('J12 管理页的样式只用已有类（不发明第二套读数类名
   const sources = files.map((name) => sourceFiles().find((item) => item.name === name))
   for (const [index, file] of sources.entries()) {
     assert(file !== undefined, `找不到 ${files[index]}`)
-    for (const className of ['kb-cell', 'kb-cell__name', 'kb-cell__sub', 'led led--', 'card', 'crumb']) {
+    for (const className of ['kb-cell', 'kb-cell__name', 'kb-cell__sub', 'led led--', 'card']) {
       assertIncludes(file.source, className, `${files[index]} 复用 ${className}`)
     }
+    // 快捷页面导航（面包屑）已统一挪到顶栏 ⇒ 页面不再自带 `.crumb`（见 AppLayout / crumbContext）
+    assertExcludes(file.source, 'className="crumb"', `${files[index]} 不再自带面包屑`)
   }
 })
 
@@ -1059,7 +1061,7 @@ console.log(`  1 创建/编辑形态（≤6 字段用弹窗、同实体同形态
 console.log(`  2 删除分级（普通 = Popconfirm；级联 = Modal + 危险按钮 + 影响范围）… H3~H5（Provider 级联 / 模型普通 / 用户无删除）`)
 console.log(`  3 保存语义（显式保存、失败停页 + 标注、成功 message）… 三个弹窗的 onOk + Alert + \`feedback.ok\``)
 console.log(`  4 反馈通道（成功 message、失败 notification 带错误码、收在 api 层）… \`app/feedback.ts\`（本批零新增）`)
-console.log(`  5 二级页动线（面包屑 / 左上返回）… 两页的 \`.crumb\``)
+console.log(`  5 二级页动线（面包屑 / 左上返回）… 面包屑已统一挪到顶栏（AppLayout），页面不再自带`)
 console.log(`  6 表格规范（操作列右固定、文字链、危险红、删除最后、>3 收"更多"、每页 20）… 三张表都 \`fixed: 'right'\``)
 console.log(`     ${c.d}❗ 三张表的操作数分别是 3 / 3 / 2 ⇒ "更多"菜单**当前无消费方**，不为用而用${c.x}`)
 console.log(`  7 列表三态（空态带引导 / 骨架屏 / 错误带重试）… \`ListStates\`（本批零新增）`)

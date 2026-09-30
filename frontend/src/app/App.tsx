@@ -12,9 +12,11 @@
  *          （文档上传 / 覆盖重传 / 重试 / 下载 / 删除 + 检索测试抽屉 + 状态轮询）。
  * P0-1-36：`/admin/users` 与 `/admin/models` 换成真实的用户管理与模型池管理
  *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
- * P0-2-11：`/mcp` 与 `/mcp/credentials` 换成真实的 MCP 管理页与我的凭据页
+ * P0-2-11：`/mcp` 与 `/settings/credentials` 换成真实的 MCP 管理页与我的凭据页
  *          （**至此 `03` §二 的 P0 十条路由全部落地**，`BatchPlaceholderPage` 只剩 `/tasks`
  *           与 `/admin/usage` 两条 P1 路由，以及那个 `*` 未找到页）。
+ *          ⚠️ 我的凭据页**与 MCP 解耦**：路由从 `/mcp/credentials` 改为 `/settings/credentials`
+ *          （个人设置族，与 `/settings/password` 同族），页面内容仍按 MCP server 分组。
  *
  * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
  *
@@ -77,7 +79,9 @@ export function App() {
               ⇒ 人人可改可删（第五族，`02` §4.7）；凭据那一族的收窄在 `user_id` 上、只在服务端，
               界面上没有任何"别人的凭据"可看。 */}
           <Route path="/mcp" element={<McpServersPage />} />
-          <Route path="/mcp/credentials" element={<McpCredentialsPage />} />
+          {/* S-08b · 我的凭据（P0-2-11 接真页面）。它是**个人凭据页、与 MCP 解耦**：
+              归入 `/settings` 一族（与 `/settings/password` 同族），后端端点仍是 `/api/mcp/credentials`。 */}
+          <Route path="/settings/credentials" element={<McpCredentialsPage />} />
           {/* S-10 · 历史产物（`TaskAgent 记忆与产物` 块 5）：删除会话后保留的产物，
               登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。 */}
           <Route path="/artifacts/history" element={<ArtifactHistoryPage />} />

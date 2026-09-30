@@ -9,7 +9,7 @@
  */
 
 import { Button } from 'antd'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 import { useCurrentUser } from '../../api/auth.js'
 import { HOME_PATH } from '../../app/paths.js'
@@ -21,14 +21,6 @@ export function PasswordPage() {
 
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">修改密码</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <p className="kicker">S-08 · 改密</p>

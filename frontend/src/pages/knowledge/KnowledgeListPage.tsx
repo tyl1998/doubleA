@@ -31,7 +31,7 @@ import { Link, useNavigate } from 'react-router-dom'
 
 import { KNOWLEDGE_BASES_PICKER_LIMIT, useKnowledgeBases } from '../../api/knowledgeBases.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
-import { HOME_PATH, knowledgeDetailPath } from '../../app/paths.js'
+import { knowledgeDetailPath } from '../../app/paths.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { DeleteKnowledgeBaseModal } from './DeleteKnowledgeBaseModal.js'
 import { KnowledgeBaseFormModal } from './KnowledgeBaseFormModal.js'
@@ -140,14 +140,6 @@ export function KnowledgeListPage() {
 
   const head = (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">知识库</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>知识库</h1>

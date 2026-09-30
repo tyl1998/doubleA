@@ -387,14 +387,6 @@ export function ModelsPage() {
 
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">模型池</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>模型池</h1>

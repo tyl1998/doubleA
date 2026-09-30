@@ -15,12 +15,13 @@
 import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
+import { usePageCrumb } from '../app/crumbContext.js'
 import { HOME_PATH, LOGIN_PATH } from '../app/paths.js'
 
 export type NoticeTone = 'accent' | 'warn' | 'danger'
 
 export interface NoticePageProps {
-  /** 仪器读数式的屏号（与仪表轨底部同一口径） */
+  /** 仪器读数式的屏号（与左侧栏底部同一口径） */
   serial: string
   title: string
   lead: ReactNode
@@ -35,18 +36,14 @@ function toneClass(tone: NoticeTone | undefined): string {
 }
 
 export function NoticePage({ serial, title, lead, tag, bullets, actions }: NoticePageProps) {
+  // 面包屑（快捷页面导航）已挪到**顶栏**：这里把页面标题作为「细节段」上报，
+  // 顶栏渲染成 `工作台 / <title>`（占位页 / 未找到没有独立的模块段）。
+  usePageCrumb(title)
+
   // ⚠️ 这里**不套 `.page`**：页面级留白与 `<main>` 地标由 AppLayout 统一提供
   // （登录页不走 AppLayout，它自带 `.auth` 两栏，故不在此约定内）。
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={HOME_PATH}>工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">{title}</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <p className="kicker">{serial}</p>
@@ -135,7 +132,7 @@ export function NotFoundPage() {
       serial="S-00 · 未找到"
       title="页面不存在"
       tag={{ text: '404 NOT_FOUND', tone: 'danger' }}
-      lead="地址可能写错了，或者这个页面已经改名。左侧仪表轨上的字母缩写是全部目的地。"
+      lead="地址可能写错了，或者这个页面已经改名。左侧栏里的导航项就是全部目的地。"
       actions={
         <Link to={LOGIN_PATH}>
           ← 回到登录页

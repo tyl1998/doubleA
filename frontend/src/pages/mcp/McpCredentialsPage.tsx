@@ -1,5 +1,5 @@
 /**
- * 我的凭据页（`/mcp/credentials`，P0-2-11 换掉占位页）
+ * 我的凭据页（`/settings/credentials`，P0-2-11 换掉占位页；与 MCP 解耦的个人凭据页）
  *
  * 依据：`docs/03` §4.5（"顶部：面包屑返回；支持 `?serverId=` 定位（自动滚动 + 高亮该 server
  *      分组），可从 Agent 编辑页/工具失败卡片直达；按 server 分组的表单：每个 credential 参数一行
@@ -34,9 +34,10 @@
  *   · `tools/call`（对话里真调工具）⇒ 注入**我**填的这份；
  *   · `POST /:id/test` 与 `GET /:id/tools` ⇒ 注入**该 server 所属人**的那份
  *     （`tool_cache` 是 **server 级共享**的一份 ⇒ 主语必须唯一确定）。
- * ⇒ 本页对**每个人**都仍然要填（不是只有所属人才填），但**测试按钮报的"凭据有效 / 无效"
- * 说的是所属人那一份**。页脚那段说明必须把这条讲清楚 —— 否则用户会拿自己的填法去解释
- * 测试结果（P0-2-12 的实测正是这么翻车的：把自己没填当成"令牌错了"）。
+ * ⇒ 本页对**每个人**都仍然要填（不是只有所属人才填），只是"测试"报的"凭据有效 / 无效"
+ * 说的是**所属人**那一份。
+ * ⚠️ 本页**刻意不再**用页脚卡解释"这些凭据会被用在哪里"（那会把这页读成 MCP 的子页）：与 MCP
+ * 相关的这层说明由 `/mcp` 管理页顶部的 Alert 承担 —— 那里才是"测试用所属人凭据"的现场。
  */
 
 import { Alert, Button, Input, Popconfirm, Tag } from 'antd'
@@ -113,20 +114,11 @@ export function McpCredentialsPage() {
 
   const head = (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to={MCP_PATH}>MCP server</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">我的凭据</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>我的凭据</h1>
           <p className="page__lead">
-            凭据仅用于代表你<strong>调用</strong>工具（「测试」与工具列表用的是<strong>所属人</strong>的那一份），
-            不会展示给他人，也不会出现在会话记录里。
+            凭据仅用于代表你<strong>调用</strong>工具，不会展示给他人，也不会出现在会话记录里。
             列表接口永不返回明文或掩码 —— 保存之后界面上只剩一个「已配置」标记。
           </p>
         </div>
@@ -325,22 +317,6 @@ export function McpCredentialsPage() {
             </div>
           )
         })}
-      </div>
-
-      <div className="card card--flat card--pad" style={{ marginTop: 'var(--sp-6)' }}>
-        <p className="block-label">这些凭据会被用在哪里</p>
-        <p className="ratio">
-          只有你<strong>调用工具</strong>时会带上它们。而「测试」与工具列表用的是<strong>所属人</strong>的凭据
-          （工具缓存是全员共享的一份，主语必须唯一确定）⇒ 某一台测试报「凭据无效 / 尚未配置」时，
-          该去补的是<strong>所属人</strong>那一份，不是自己的。
-          三种入口会把你送到这一页：顶部「我的凭据」、Agent 编辑页的「未配置」红点、
-          以及会话里失败工具卡的「去配置凭据」（都会带上 <code>serverId</code> 查询参数，直接定位到你该填的那一组）。
-        </p>
-        <div className="row" style={{ marginTop: 'var(--sp-3)' }}>
-          <Link to={MCP_PATH}>
-            <Button size="small">← 回 MCP 管理页</Button>
-          </Link>
-        </div>
       </div>
     </>
   )

@@ -55,7 +55,7 @@ import { credentialCell, formatToolCount, serverStatusView, unconfiguredCount } 
 import { McpServerFormModal } from './McpServerFormModal.js'
 import { McpServerToolsModal } from './McpServerToolsModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
-import { MCP_CREDENTIALS_PATH, mcpCredentialsPath } from '../../app/paths.js'
+import { CREDENTIALS_PATH, credentialsPath } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
 import type { McpServerItem } from '@doubulea/shared'
 
@@ -153,7 +153,7 @@ export function McpServersPage() {
         if (cell.kind === 'configured') return <Tag className="tag--ok">已配置</Tag>
         if (cell.kind === 'missing') {
           return (
-            <Link to={mcpCredentialsPath(server.id)} title={cell.hint}>
+            <Link to={credentialsPath(server.id)} title={cell.hint}>
               <span className="cred-dot" aria-hidden="true" />
               未配置
             </Link>
@@ -237,14 +237,6 @@ export function McpServersPage() {
 
   return (
     <>
-      <nav className="crumb" aria-label="面包屑">
-        <Link to="/">工作台</Link>
-        <span className="crumb__sep" aria-hidden="true">
-          /
-        </span>
-        <span className="crumb__here">MCP server</span>
-      </nav>
-
       <div className="page__head">
         <div>
           <h1>MCP server</h1>
@@ -262,7 +254,7 @@ export function McpServersPage() {
         <div className="page__head-actions">
           {/* §4.4：**「我的凭据」入口常驻此页顶部**，徽标显示未配置数量。
               ⚠️ 这里的数字与表格里那一列同源（见文件头 ②），不是另算一遍。 */}
-          <Link to={MCP_CREDENTIALS_PATH}>
+          <Link to={CREDENTIALS_PATH}>
             <Button>
               我的凭据
               {missingCount > 0 && (

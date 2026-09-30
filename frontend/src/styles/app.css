@@ -15,7 +15,7 @@
    ⚠️ **按钮 / 输入框 / 标签 / 提示条刻意不在此文件里**：它们由 AntD 5 承担，
    视觉口径通过 `frontend/src/app/theme.ts` 的 ConfigProvider token 注入
    （`design/README.md` §三「原型令牌 → AntD 5 token 一一映射」）。
-   本文件只放 AntD **没有等价物**的构成：仪表轨、顶栏、四角括号、状态灯、分段控件、
+   本文件只放 AntD **没有等价物**的构成：左侧栏、顶栏、四角括号、状态灯、分段控件、
    登录页的非对称两栏、四区表单的刻度线。
    ⚠️ 同理**表格不在此文件里**：原型那一整套 `.table*` 由 AntD `Table` 承担，
    这里只补它表达不了的"名称 + 副标题"两行单元（`.agent-cell`）。
@@ -30,7 +30,8 @@
    ========================================================================== */
 
 /* =========================== 应用外壳 ====================================== */
-/* 记忆点 ①：左侧「仪表轨」—— 承载序列号、状态灯、全局态，是全站最稳定的视觉锚点 */
+/* 记忆点 ①：左侧栏 —— 承载全部导航项（图标 + 文字）与状态灯、序列号。
+   默认展开（`shell--rail-open`），可收起到仅图标（回到 `--rail-w`）。 */
 .shell {
   position: relative;
   z-index: 1;
@@ -39,10 +40,8 @@
   min-height: 100vh;
 }
 
-/* 专注布局（P0-1-34）：对话页不渲染仪表轨 ⇒ 网格收成单列（`docs/03` §三 的"全屏布局"）。
-   ⚠️ 只改列定义，**不动 `.page` 的上下留白** —— 对话页的一屏高是按它算出来的
-   （`.chat` 的 `height: calc(100vh - … - var(--sp-6) - var(--sp-8))`）。 */
-.shell--focus { grid-template-columns: minmax(0, 1fr); }
+/* 左侧栏展开：让出图标 + 文字的宽度（收起时 `.shell` 用 `--rail-w`） */
+.shell--rail-open { grid-template-columns: var(--rail-open-w) minmax(0, 1fr); }
 
 .rail {
   position: sticky;
@@ -50,12 +49,20 @@
   z-index: 20;
   display: flex;
   flex-direction: column;
-  align-items: center;
   gap: var(--sp-4);
   height: 100vh;
-  padding: var(--sp-4) 0;
+  padding: var(--sp-4) var(--sp-3);
   background: var(--surface);
   border-right: 1px solid var(--rule-strong);
+  overflow: hidden;
+}
+
+/* 顶部：品牌字标 + 收起 / 展开切换 */
+.rail__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
 }
 
 .rail__mark {
@@ -73,6 +80,25 @@
 }
 .rail__mark:hover { background: var(--accent); }
 
+.rail__toggle {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
+    border-color var(--dur-micro) ease-out;
+}
+.rail__toggle:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+  border-color: var(--rule);
+}
+
 .rail__rule {
   width: 22px;
   height: 1px;
@@ -88,21 +114,21 @@
   list-style: none;
 }
 
-/* 图标位用等宽字形替代装饰性图标集：每个字母都指向真实目的地，不做纯装饰 */
+/* 导航项 = 图标 + 文字（文字来自 `nav.ts` 的标签，与顶栏曾是同一份来源） */
 .rail__btn {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 38px;
+  padding: 0 var(--sp-3);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
   color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: var(--fs-2xs);
+  font-size: var(--fs-sm);
   font-weight: 600;
-  letter-spacing: 0.02em;
   cursor: pointer;
+  white-space: nowrap;
   transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
     border-color var(--dur-micro) ease-out;
 }
@@ -116,22 +142,53 @@
   background: var(--accent-wash);
   border-color: var(--accent-rule);
 }
+.rail__icon {
+  display: inline-flex;
+  font-size: var(--fs-md);
+  line-height: 1;
+}
+.rail__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 收起态：整条退回仅图标的窄轨（与改版前的宽度一致） */
+.rail--collapsed {
+  align-items: center;
+  padding: var(--sp-4) 0;
+}
+.rail--collapsed .rail__head {
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.rail--collapsed .rail__nav { align-items: center; }
+.rail--collapsed .rail__btn {
+  width: 34px;
+  height: 34px;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+}
+.rail--collapsed .rail__label { display: none; }
+.rail--collapsed .rail__status { align-items: center; }
 
 .rail__status {
   margin-top: auto;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--sp-3);
 }
 
-/* 竖排序列号：把「这是第几屏」写成仪器读数 */
+/* 序列号：**展开态横排**（跟文字导航同向），**收起态竖排**（仪器读数式的窄轨记忆点） */
 .rail__serial {
-  writing-mode: vertical-rl;
   font-family: var(--font-mono);
   font-size: var(--fs-2xs);
-  letter-spacing: 0.28em;
   color: var(--muted-2);
+}
+.rail--collapsed .rail__serial {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.28em;
 }
 
 /* =========================== 顶栏 ========================================== */
@@ -262,6 +319,15 @@
 .crumb__sep { color: var(--muted-2); }
 .crumb__here { color: var(--ink); }
 
+/* 顶栏里的面包屑（**快捷页面导航**）：不再需要页面级下留白，长名截断不撑破顶栏 */
+.topbar .crumb { margin-bottom: 0; min-width: 0; }
+.topbar .crumb .crumb__here {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+
 /* =========================== 卡片（含四角括号） ============================ */
 /* 记忆点 ②：四角括号。取代常见的"统一圆角 + 统一阴影"卡片脸 */
 .card {
@@ -348,7 +414,7 @@
   padding: var(--sp-6);
   text-align: center;
 }
-/* 读数行：等宽 + 状态灯，与仪表轨同一语言 */
+/* 读数行：等宽 + 状态灯，与左侧栏同一语言 */
 .boot__line {
   display: inline-flex;
   align-items: center;
@@ -490,7 +556,7 @@
 .avatar__role { display: block; font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--muted); }
 
 /* =========================== 登录页页级构成 =============================== */
-/* 登录页是公开路由，不带应用外壳（无仪表轨 / 无顶栏），但仍继承全部令牌。
+/* 登录页是公开路由，不带应用外壳（无左侧栏 / 无顶栏），但仍继承全部令牌。
    构成：左"识别板" + 右"操作板"的非对称两栏 —— 这一屏要给
    "这是什么系统、谁在用、什么版本"一个答案。 */
 .auth {
@@ -788,21 +854,41 @@
 }
 
 @media (max-width: 720px) {
-  /* 移动端答案：仪表轨转为底部横条，不硬塞侧边 */
-  .shell { grid-template-columns: minmax(0, 1fr); padding-bottom: 56px; }
-  /* 专注布局没有那条底部横条 ⇒ 底部留白要还回去（否则对话页底部凭空多出 56px 空白） */
-  .shell--focus { padding-bottom: 0; }
-  .rail {
+  /* 移动端答案：左侧栏转为底部横条，不硬塞侧边 */
+  .shell,
+  .shell--rail-open { grid-template-columns: minmax(0, 1fr); padding-bottom: 56px; }
+  /* 对话页现在也带这条底部横条（改版后不再有"专注布局"）：一屏高要**多扣掉 56px**，
+     否则底部那条横条会盖住输入区、并多出一条滚动条。 */
+  .chat { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8) - 56px); }
+  .rail,
+  .rail--collapsed {
     position: fixed;
     inset: auto 0 0 0;
     flex-direction: row;
+    align-items: center;
     justify-content: space-around;
+    gap: 0;
     height: 56px;
+    padding: 0 var(--sp-2);
     border-right: 0;
     border-top: 1px solid var(--rule-strong);
+    overflow: visible;
   }
-  .rail__rule, .rail__serial { display: none; }
-  .rail__status { margin-top: 0; }
+  /* 底部横条只留图标：品牌字标与收起开关没有意义 */
+  .rail__head, .rail__rule, .rail__serial { display: none; }
+  .rail__nav,
+  .rail--collapsed .rail__nav { flex-direction: row; gap: var(--sp-1); align-items: center; }
+  .rail__btn,
+  .rail--collapsed .rail__btn {
+    width: auto;
+    height: 44px;
+    padding: 0 var(--sp-3);
+    justify-content: center;
+  }
+  .rail__label,
+  .rail--collapsed .rail__label { display: none; }
+  .rail__status,
+  .rail--collapsed .rail__status { margin-top: 0; align-items: center; }
   .page__head { flex-direction: column; align-items: flex-start; }
   .page__head-actions { margin-left: 0; }
 }
@@ -852,10 +938,15 @@
    它们的 `height` 与 `grid-template-columns` 如今被后面 base 规则盖住了），此处不重复它。
    ≥1280px 才配第三列（原型 `design/styles/components.css` 同款）：窄屏上产物面板会把消息流
    挤到 700px 以下。⚠️ 「能预览产物」这条能力**没有消失** —— 消息流里的产物卡仍然带
-   [预览][下载]（它们就在这一页上），面板只是那一列不显示。 */
+   [预览][下载]（它们就在这一页上），并且头部多一枚 `chat__panel-toggle` 按钮（只在此断点显示）
+   打开一个承载同一个 `ArtifactPanel` 的抽屉 ⇒ **产物列表始终有入口**。 */
+.chat__panel-toggle { display: none; }
+
 @media (max-width: 1280px) {
   .chat--with-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
   .chat--with-panel .panel { display: none; }
+  /* 第三列被藏的同一段宽度里，把产物入口按钮显示出来（同一个断点，单一口径） */
+  .chat__panel-toggle { display: inline-flex; }
 }
 
 /* ── 会话侧栏（P0-1-34）───────────────────────────────────────────────────── */
@@ -999,7 +1090,15 @@
   font-weight: 800;
   letter-spacing: -0.025em;
 }
-.chat__head-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
+.chat__head-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  /* 窄屏控件多（模型选择器 / 产物入口 / 编辑）⇒ 允许换行，别横向溢出把入口挤出可视区 */
+  flex-wrap: wrap;
+}
 
 /* 消息流：内部滚动（输入区固定在页面底部，不随消息滚走） */
 .stream {

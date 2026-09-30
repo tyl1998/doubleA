@@ -313,7 +313,7 @@ for (const group of groups) {
 }
 
 console.log(`\n${c.d}── 本档验不到的（别当全批验收）──`)
-console.log(`  · 三栏布局（\`chat--with-panel\` 的宽度、1280px 断点下第三列藏没藏）⇒ 浏览器${c.x}`)
+console.log(`  · 三栏布局（\`chat--with-panel\` 的宽度、1280px 断点下第三列藏没藏 + 入口按钮是否改走抽屉）⇒ 浏览器${c.x}`)
 console.log(`  · 抽屉真渲染 / 六个渲染器 / 五种格式 / MD 外链图片被拦下 ⇒ 浏览器端测（P0-3-11 本批）${c.x}`)
 console.log(`  · "一轮结束后那条从『刚生成』变成时刻读数"的**时序** ⇒ 浏览器端测（需真产物）${c.x}`)
 
