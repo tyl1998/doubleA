@@ -33,16 +33,12 @@
  */
 
 import { Alert, Button, Tag } from 'antd'
-import type { DocumentItem } from '@doubulea/shared'
+import { REBUILD_SEARCHABLE_HINT, type DocumentItem } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { ApiError } from '../../api/client.js'
-import {
-  DOCUMENTS_PAGE_LIMIT_MAX,
-  useDocuments,
-  useKnowledgeBase,
-} from '../../api/knowledgeBases.js'
+import { DOCUMENTS_PAGE_LIMIT_MAX, useDocuments, useKnowledgeBase } from '../../api/knowledgeBases.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { KNOWLEDGE_PATH } from '../../app/paths.js'
@@ -82,6 +78,14 @@ export function KnowledgeDetailPage() {
   const documentTotal = documentsQuery.data?.total ?? 0
   const summary = summarizeDocuments(documents)
   const notice = kb === undefined ? null : embeddingChangedNotice(kb.embeddingModelChanged)
+
+  /**
+   * 整库重建（P1-5）**没有独立按钮**：换模型的动作发生在「编辑」弹窗里，弹窗检测到换了模型就
+   * 提示"需重建"、保存成功后自动触发重建。本页只负责**如实反映状态**：
+   * `embeddingModelChanged === true`（快照与当前模型不一致 = 旧 chunk 不是新模型产的）
+   * 且本页有文档在 `PARSING` ⇒ 说明重建正在跑，给一条"旧索引仍可检索"的横幅。
+   */
+  const rebuilding = kb?.embeddingModelChanged === true && summary.parsing > 0
 
   // 面包屑已挪到顶栏：把知识库名作为「细节段」上报（顶栏渲染 `工作台 / 知识库 / <name>`）
   usePageCrumb(kb?.name ?? '详情')
@@ -173,6 +177,7 @@ export function KnowledgeDetailPage() {
         </div>
         <div className="page__head-actions">
           <Button onClick={() => setSearchOpen(true)}>检索测试</Button>
+          {/* 没有独立的「重建索引」按钮：换模型在「编辑」弹窗里做，检测到换模型即提示并自动重建 */}
           <Button onClick={() => setEditing(true)}>编辑</Button>
           <Button type="primary" onClick={() => setUploadTarget('new')}>
             上传文档
@@ -182,6 +187,8 @@ export function KnowledgeDetailPage() {
 
       <div className="split split--form">
         <div className="stack">
+          {/* "需重建 / 无法判定"由 `embeddingModelChanged` 三态驱动；**不挂按钮** ——
+              重建由「编辑」弹窗换模型时自动触发（见 `KnowledgeBaseFormModal`） */}
           {notice !== null && <Alert type={notice.tone === 'warn' ? 'warning' : 'info'} showIcon message={notice.text} />}
 
           <div className="card">
@@ -219,12 +226,24 @@ export function KnowledgeDetailPage() {
                 }
               />
             ) : (
-              <DocumentTable
-                kbId={kb.id}
-                documents={documents}
-                onReupload={(doc) => setUploadTarget(doc)}
-                onPreviewChunks={(doc) => setChunkTarget(doc)}
-              />
+              <>
+                {/* 判定见上方 `rebuilding`：模型快照已换、还有文档在重跑 ⇒ 常驻"旧索引仍可检索"。
+                    与普通上传不同：整库重建**不清旧 chunk**，所以这里没有检索空窗。 */}
+                {rebuilding && (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message={`整库重建进行中（本页还有 ${summary.parsing} 篇在重跑）。${REBUILD_SEARCHABLE_HINT}`}
+                    style={{ margin: '0 var(--sp-5) var(--sp-4)' }}
+                  />
+                )}
+                <DocumentTable
+                  kbId={kb.id}
+                  documents={documents}
+                  onReupload={(doc) => setUploadTarget(doc)}
+                  onPreviewChunks={(doc) => setChunkTarget(doc)}
+                />
+              </>
             )}
 
             {documents.length > 0 && (

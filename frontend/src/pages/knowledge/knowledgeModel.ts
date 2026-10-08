@@ -554,6 +554,8 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
 export interface KnowledgeEditFormValues {
   name: string
   description: string
+  /** 当前选定的向量模型 id（老库为 `''`，表示没有） */
+  embeddingModelId: string
   chunkSize: number
   chunkOverlap: number
 }
@@ -562,9 +564,20 @@ export function editValuesOf(kb: KnowledgeBaseItem): KnowledgeEditFormValues {
   return {
     name: kb.name,
     description: kb.description ?? '',
+    embeddingModelId: kb.embeddingModelId ?? '',
     chunkSize: kb.chunkSize,
     chunkOverlap: kb.chunkOverlap,
   }
+}
+
+/**
+ * 编辑表单里是否**换了向量模型**（P1-5）。
+ *
+ * 判据只有"选中的 id 与库当前的不同"这一条 —— 空串（老库没绑模型）与某个 id 比较时也算换。
+ * 弹窗据此：① 显示"换模型需重建"的告警；② 保存成功后直接引导触发整库重建。
+ */
+export function isEmbeddingModelChanged(baseline: KnowledgeBaseItem, embeddingModelId: string): boolean {
+  return embeddingModelId !== '' && embeddingModelId !== (baseline.embeddingModelId ?? '')
 }
 
 /**
@@ -607,6 +620,10 @@ export function buildKnowledgeUpdateBody(
 
   if (values.chunkSize !== baseline.chunkSize) body.chunkSize = values.chunkSize
   if (values.chunkOverlap !== baseline.chunkOverlap) body.chunkOverlap = values.chunkOverlap
+  // 换模型：只在真的选了新模型时带上（空串不是"清空模型"，schema 也不接受 null）
+  if (isEmbeddingModelChanged(baseline, values.embeddingModelId)) {
+    body.embeddingModelId = values.embeddingModelId
+  }
 
   return Object.keys(body).length === 0 ? null : body
 }

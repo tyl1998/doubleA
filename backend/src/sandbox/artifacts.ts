@@ -44,8 +44,9 @@
  * ═══════════════════════════════════════════════════════════════════════
  *   · **产物不跟会话/Agent 的删除走**（`TaskAgent记忆与产物` 块 3 起**字面成立**）：
  *     schema 的 `Artifact.conversationId` 是可空 + `onDelete: SetNull` —— 删会话只把
- *     `conversation_id` 置空、产物行保留（归"历史产物"，按 `user_id` 可查）；文件与行的
- *     **过期收口只有保留期清理器**（`02` §三"消息与产物都不删"的完整语义）。
+ *     `conversation_id` 置空、产物行保留（归"会话产物"，按 `user_id` 可查，可在
+ *     「会话产物」页主动删除）；文件与行的**过期收口只有保留期清理器**
+ *     （`02` §三"消息与产物都不删"的完整语义）。
  *   · **收集失败 ≠ 这一轮失败**：编排层对本模块的一切异常都 catch + warn 后继续收尾
  *     （产物是本轮的**赠品**，不是交付物本体；正文已经流出去了）。
  */
@@ -251,6 +252,8 @@ export function artifactMimeOf(path: string): string {
 
 /** 对象键里的文件名安全段：路径分隔符与控制字符一律 `_`（键是内部实现，不参与展示） */
 function safeKeySegment(fileName: string): string {
+  // 这里**就是要匹配控制字符**（ASCII 0x00–0x1F 会让 S3 键在某些客户端上难以处理）⇒ 显式豁免
+  // eslint-disable-next-line no-control-regex
   return fileName.replace(/["\\\r\n\u0000-\u001f]/gu, '_')
 }
 
@@ -350,7 +353,7 @@ export async function collectRoundArtifacts(input: {
         const row = await getPrisma().artifact.create({
           data: {
             conversationId,
-            // 归属用户（删除会话后"我的历史产物"的唯一判据，见 schema.prisma#Artifact.userId）
+            // 归属用户（删除会话后"我的会话产物"的唯一判据，见 schema.prisma#Artifact.userId）
             userId: owner.userId,
             fileKey,
             fileName: path,

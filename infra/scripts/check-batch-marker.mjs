@@ -41,8 +41,15 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const DOCS = resolve(repoRoot, 'docs')
 const ENTRY = resolve(repoRoot, 'backend/src/index.ts')
 
-/** `#### P0-1-19 入库 + …  \`[✓]\` 2026-09-22` —— 批次标题行 + 已完成标记 */
-const BATCH_HEADING = /^####\s+(P\d+-\d+-[0-9a-z]+)\s+/
+/**
+ * `#### P0-1-19 入库 + …  \`[✓]\` 2026-09-22` —— 批次标题行 + 已完成标记。
+ *
+ * ⚠️ **2026-10-01 起接受两段式批次号（`P1-1`）**：P0 是"计划-批次-步"三段
+ * （`P0-1-19`），而 P1 只有"计划-项"两层（`P1-1` = P1 计划的第 1 项，见 `05` §三·补）
+ * ⇒ 第三段改成**可选**。不接受它的话，P1 的完成态标题会被本脚本**读不到**，
+ * 于是它一直停在 `P0-3-14`、每批收尾必红（与当年只认纯数字那次的失效同因）。
+ */
+const BATCH_HEADING = /^####\s+(P\d+-\d+(?:-[0-9a-z]+)?)\s+/
 const DONE_MARK = '`[✓]`'
 /** `step: 'P0-1-20 双路检索 + RRF 融合',` */
 const STEP_LINE = /step:\s*'([^']+)'/
@@ -73,12 +80,17 @@ function readText(path) {
  *
  * 字母后缀（`P0-3-0a` / `6b`）排在**同一个数字键之后、下一个数字键之前**：
  * `P0-3-0` < `P0-3-0a` < `P0-3-0b` < `P0-3-1` < `P0-3-6b` < `P0-3-7`。
+ *
+ * ⚠️ 两段式（`P1-1`，第三段缺省）把第三段当 `0`：`P1-1` 落在 `P1-0` 与 `P1-2` 之间，
+ * 且 `P1-0` 视为 `P1-0-0`（同一计划下"还没到第 1 项"）。与三段式共用一条数值轴，
+ * 所以 `P0-3-14` < `P1-1`（计划号是最高位）—— 这正是"P1 接在 P0 之后"的语义。
  */
 function batchKey(id) {
-  const m = /^P(\d+)-(\d+)-(\d+)([a-z]*)$/.exec(id)
+  const m = /^P(\d+)-(\d+)(?:-(\d+)([a-z]*))?$/.exec(id)
   if (m === null) return -1
-  const suffix = m[4] === '' ? 0 : m[4].charCodeAt(0) - 96 // a=1, b=2 …
-  return Number(m[1]) * 1e9 + Number(m[2]) * 1e6 + Number(m[3]) * 1e3 + suffix
+  const step = m[3] === undefined ? 0 : Number(m[3])
+  const suffix = m[4] === undefined || m[4] === '' ? 0 : m[4].charCodeAt(0) - 96 // a=1, b=2 …
+  return Number(m[1]) * 1e9 + Number(m[2]) * 1e6 + step * 1e3 + suffix
 }
 
 /** 扫全部施工图文件，收集标了 `[✓]` 的批次标题，取**批次号最大**的那个 */

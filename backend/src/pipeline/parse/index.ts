@@ -36,12 +36,15 @@
 
 import {
   AppError,
+  CHAT_ATTACHMENT_EXTENSIONS,
   IMAGE_UPLOAD_EXTENSIONS,
   LEGACY_DOC_EXTENSION,
   LEGACY_DOC_HINT,
+  MIME_BY_CHAT_ATTACHMENT_EXTENSION,
   MIME_BY_EXTENSION,
   UPLOAD_EXTENSIONS,
   isImageUploadExtension,
+  type ChatAttachmentExtension,
   type UploadExtension,
 } from '@doubulea/shared'
 
@@ -192,11 +195,38 @@ function extensionOf(fileName: string): string | null {
   return base.slice(dot + 1).toLowerCase()
 }
 
-function isUploadExtension(value: string): value is UploadExtension {
-  return (UPLOAD_EXTENSIONS as readonly string[]).includes(value)
+/**
+ * 一份**格式画像**：把"这次上传允许哪些扩展名 / 各自接受哪些 MIME / 哪些是无签名的纯文本"收成一组，
+ * 供 {@link detectFormat} 参数化 —— **同一段三道校验逻辑**同时服务知识库文档与对话附件两条链路。
+ *
+ * 为什么要参数化而不是各写一份：校验逻辑（`.doc` 拦截 / MIME 交叉 / 文件头魔数 / 纯文本 NUL 判定）
+ * 有五六处分支，两处各写一遍必有一处先腐烂（`06` §六 第 ⑰ 条），而症状是"文档端点拒了 `.doc`、
+ * 附件端点却能塞进去"这类**只有对比才看得出**的偏差。
+ */
+export interface FormatProfile<T extends string> {
+  /** 允许的扩展名（小写、无点） */
+  extensions: readonly T[]
+  /** 扩展名 → 允许声明的 MIME */
+  mimeByExtension: Readonly<Record<T, readonly string[]>>
+  /** **无二进制签名**时允许落在这几个扩展名上（纯文本格式；其余会被判成"内容与扩展名不符"） */
+  textExtensions: readonly T[]
 }
 
-/** 上传探测输入（`routes/documents.ts` 从 multipart 里凑齐这三样） */
+/** 知识库文档的格式画像（历史行为，逐字不变） */
+export const DOCUMENT_FORMAT_PROFILE: FormatProfile<UploadExtension> = {
+  extensions: UPLOAD_EXTENSIONS,
+  mimeByExtension: MIME_BY_EXTENSION,
+  textExtensions: ['md', 'txt'],
+}
+
+/** 对话附件的格式画像（P1-4 补：额外支持 json / csv 两种纯文本；知识库口径不受影响） */
+export const CHAT_ATTACHMENT_FORMAT_PROFILE: FormatProfile<ChatAttachmentExtension> = {
+  extensions: CHAT_ATTACHMENT_EXTENSIONS,
+  mimeByExtension: MIME_BY_CHAT_ATTACHMENT_EXTENSION,
+  textExtensions: ['md', 'txt', 'json', 'csv'],
+}
+
+/** 上传探测输入（`routes/documents.ts` / `services/file.service.ts` 从 multipart 里凑齐这三样） */
 export interface FormatProbeInput {
   /** 原始文件名（用户设备上的名字，已剥掉路径） */
   fileName: string
@@ -211,11 +241,13 @@ export interface FormatProbeInput {
  *
  * @throws {AppError} `VALIDATION`(400) —— 扩展名不支持 / `.doc` / MIME 与扩展名不符 / 内容与扩展名不符
  */
-export function detectFormat(input: FormatProbeInput): UploadExtension {
+export function detectFormat(input: FormatProbeInput): UploadExtension
+export function detectFormat<T extends string>(input: FormatProbeInput, profile: FormatProfile<T>): T
+export function detectFormat(input: FormatProbeInput, profile: FormatProfile<string> = DOCUMENT_FORMAT_PROFILE): string {
   const extension = extensionOf(input.fileName)
   if (extension === null) {
     throw AppError.validation(
-      `无法从文件名「${input.fileName}」识别格式（缺少扩展名）。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}`,
+      `无法从文件名「${input.fileName}」识别格式（缺少扩展名）。支持的格式：${profile.extensions.join(' / ')}`,
     )
   }
 
@@ -225,17 +257,17 @@ export function detectFormat(input: FormatProbeInput): UploadExtension {
     throw AppError.validation(`暂不支持 .doc（旧版 Word 二进制格式），${LEGACY_DOC_HINT}`)
   }
   // ② 白名单
-  if (!isUploadExtension(extension)) {
+  if (!profile.extensions.includes(extension)) {
     throw AppError.validation(
-      `不支持的文件类型 .${extension}。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}` +
-        `（.doc 请${LEGACY_DOC_HINT}）`,
+      `不支持的文件类型 .${extension}。支持的格式：${profile.extensions.join(' / ')}` +
+        `（.doc ${LEGACY_DOC_HINT}）`,
     )
   }
 
   // ③ MIME 与扩展名交叉校验（`application/octet-stream` = "未知"，放行，理由见文件头）
   const declared = (input.declaredMime ?? '').trim().toLowerCase()
   if (declared !== '' && declared !== 'application/octet-stream') {
-    const allowed = MIME_BY_EXTENSION[extension]
+    const allowed = profile.mimeByExtension[extension] ?? []
     if (!allowed.includes(declared)) {
       throw AppError.validation(
         `Content-Type「${input.declaredMime}」与扩展名 .${extension} 不符` +
@@ -265,8 +297,8 @@ export function detectFormat(input: FormatProbeInput): UploadExtension {
     return extension
   }
 
-  // 没有任何二进制签名 ⇒ 应当是纯文本：只允许 md / txt，且不能含 NUL（NUL 是二进制内容的铁证）
-  if (extension !== 'md' && extension !== 'txt') {
+  // 没有任何二进制签名 ⇒ 应当是纯文本：只允许画像里的文本格式，且不能含 NUL（NUL 是二进制内容的铁证）
+  if (!profile.textExtensions.includes(extension)) {
     throw AppError.validation(
       `文件内容与扩展名不符：.${extension} 应当是二进制格式` +
         `（${extension === 'pdf' ? 'PDF 文件头必须是 %PDF-' : 'docx 必须是 ZIP/OOXML 包'}），` +

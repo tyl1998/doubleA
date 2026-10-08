@@ -5,7 +5,7 @@
  * ```
  * system  = agent.system_prompt + 检索块（绑定 KB 逐库混合检索，拼「来源：文档名」前缀）
  * history = 最近 20 轮 messages（含工具调用结构化还原）
- * user    = content + 附件（附件属 P1，本版本只有文本）
+ * user    = content + 附件（✅ P1-4 起：图片→多模态 part；文本类→解析后注入，见 `buildUserChatMessage`）
  * ```
  *      + `01` 决策 12（知识库引用：**未命中时不编造引用**）+ `03` §五（事件 → UI 的单一渲染路径）。
  *
@@ -28,6 +28,8 @@
 import {
   toolCallRecordSchema,
   type ArtifactItem,
+  type AttachmentItem,
+  type ChatAttachmentKind,
   type CitationItem,
   type MessageContent,
   type MessageModelSegment,
@@ -35,7 +37,7 @@ import {
   type ToolCallRecord,
 } from '@doubulea/shared'
 
-import type { ChatMessage, ChatToolCall } from '../llm/client.js'
+import type { ChatContentPart, ChatMessage, ChatToolCall } from '../llm/client.js'
 // 只借这个**类型**（`type` 导入，运行时不留依赖）—— 内置工具的定义要与 MCP 工具同形，
 // 才能一起丢进 `ChatOptions.tools`（见 `knowledgeSearchTool`）。
 import type { OpenAiFunctionTool } from '../mcp/toolSchema.js'
@@ -134,9 +136,14 @@ export const RETRIEVAL_RULES = [
  * "回答知识库相关问题时先检索"说死。
  */
 export const KNOWLEDGE_USAGE_RULES = [
-  `你绑定了一个或多个知识库。回答涉及知识库/文档内容的问题前，先用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 工具检索，并基于检索到的原文作答，不要凭通用知识推测。`,
+  `你绑定了一个或多个知识库，可用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 检索其中的原文。`,
+  // ★ 把"要不要检索"收窄成**少量明确的触发条件**（2026-10-01 用户反馈：原话"回答涉及知识库/文档
+  //   内容的问题前先检索"太宽泛，导致"只让它读附件却去查知识库"）。判据是"缺不缺这份资料"，
+  //   而不是"问题里有没有出现文档二字"。
+  `只在**确实需要知识库里的资料**时才检索：用户明确要求查知识库/查文档、或问题必须在绑定的知识库里找依据（如内部规定、需求、业务口径）。`,
+  `以下情况不要检索：打招呼与闲聊、通用常识、写代码/计算/翻译等与知识库无关的请求；以及**答案已经在本轮消息或其「【附件：…】」里给出**时 —— 附件是已经直接提供给你的原文，不要再用检索工具去找它。`,
   `当用户询问你有哪些知识、知识库、文档、需求或能做什么时，调用 \`${LIST_KNOWLEDGE_TOOL_NAME}\` 工具列出知识库与文档清单（文档名通常就是需求/主题的大类），再按需用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 查看某篇的具体内容；不要为此去调用任何外部工具。`,
-  `可以换不同的关键词多次调用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\`，直到拿到足够的信息；不要凭记忆复述上一轮的回答。`,
+  `需要多次检索时可以换不同的关键词；不要凭记忆复述上一轮的回答。`,
   '只有当问题与知识库内容无关、或确实需要外部系统的实时数据时，才使用其他工具。',
 ].join('\n')
 
@@ -682,6 +689,101 @@ export const TOOL_CONFIRM_REJECTED_OUTPUT =
 export const TOOL_CONFIRM_TIMEOUT_OUTPUT =
   '工具调用未执行：等待用户确认超时（已按取消处理）。请不要重试，直接基于已有信息继续回答；' +
   '如果这个操作对回答是必需的，请如实说明该工具需要用户确认后才能执行。'
+
+// ═════════════════════════════════════════════════════════════════════
+// 本轮用户消息 + 附件（P1-4）—— 纯函数
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 一个附件的正文块标题（给**模型**看的）。`name` 是用户上传时的原始文件名，
+ * 模型据此在回答里能指到"哪个附件"（如"根据《报表.csv》…"）。
+ */
+export function attachmentBlockLabel(name: string): string {
+  return `【附件：${name}】`
+}
+
+/**
+ * 附件说明（**只进发给模型的报文，不落库**）。
+ *
+ * 为什么必须有它：`KNOWLEDGE_USAGE_RULES` 让模型"回答涉及文档内容的问题前先检索知识库"，
+ * 而"文档"这个词会被它理解成"用户刚上传的这份文件" ⇒ **实测出现"只让它读附件、它却去查知识库"**
+ * （2026-10-01 用户反馈）。这句把边界说清：附件的原文已经给它了，不要为找附件去检索知识库。
+ */
+export const ATTACHMENT_CONTEXT_NOTE =
+  '（说明：以下「附件」是本轮用户上传的文件原文，已直接提供给你 —— 请依据它们回答；' +
+  '查找这些附件的内容不需要、也不应调用知识库检索工具。）'
+
+/**
+ * 把附件拼成一段**给模型看的** prompt 文本（文本类拼正文；图片无文本、只留说明）。
+ *
+ * 同时供 ChatBot（拼进本轮用户消息）与 TaskAgent（拼进派活 prompt 前缀）使用 ——
+ * 两条链路对"附件是什么、该不该去知识库找"说**同一句话**，免得只有一边被纠正。
+ */
+export function buildAttachmentPromptBlock(
+  attachments: readonly {
+    name: string
+    kind: ChatAttachmentKind
+    text?: string
+  }[],
+): string {
+  if (attachments.length === 0) return ''
+  const documentBlocks = attachments
+    .filter((item) => item.kind === 'DOCUMENT')
+    .map((item) => `${attachmentBlockLabel(item.name)}\n${item.text ?? ''}`)
+  return [ATTACHMENT_CONTEXT_NOTE, ...documentBlocks].join('\n\n')
+}
+
+/**
+ * 把本轮用户消息 + 附件拼成**协议无关**的 `ChatMessage`（P1-4）。
+ *
+ * 两条口径：
+ *   · **文本类附件拼进正文**（`【附件：名】` + 解析出的正文）：它们与用户那句话是**同一轮输入**，
+ *     拆成两条 `user` 消息会让 Anthropic 的角色交替检查（相邻同角色必须合并）多一类边界；
+ *   · **图片作为内容块 part**（`ChatContentPart`）：只有真有图片时 `content` 才是数组，
+ *     其余情况保持字符串 —— 于是"绝大多数纯文本消息"的报文形状一个字节都没变。
+ *
+ * ⚠️ **没有图片时绝不给数组**：一部分网关对 `content: [{type:'text'}]` 的兼容性不如裸字符串，
+ *   而"没有图片"是绝大多数请求（不该为少数场景付全量的兼容性风险）。
+ */
+export function buildUserChatMessage(
+  text: string,
+  attachments: readonly {
+    name: string
+    mime: string
+    kind: ChatAttachmentKind
+    dataBase64?: string
+    text?: string
+  }[],
+): ChatMessage {
+  // 附件说明 + 文本类正文（只进报文、不落库；落库的用户消息是调用方传进来的 `content` 原文）
+  const attachmentBlock = buildAttachmentPromptBlock(attachments)
+  const composed = [text, attachmentBlock].filter((part) => part !== '').join('\n\n')
+
+  const images = attachments.filter(
+    (item): item is typeof item & { dataBase64: string } =>
+      item.kind === 'IMAGE' && typeof item.dataBase64 === 'string' && item.dataBase64 !== '',
+  )
+  if (images.length === 0) return { role: 'user', content: composed }
+
+  const parts: ChatContentPart[] = [{ type: 'text', text: composed }]
+  for (const image of images) {
+    parts.push({ type: 'image', mimeType: image.mime, dataBase64: image.dataBase64 })
+  }
+  return { role: 'user', content: parts }
+}
+
+/** 附件（解析形态）→ 落库段（`messages.content.attachments[]`）：只取对外契约里的四个字段 + id */
+export function attachmentItemsOf(
+  attachments: readonly { fileId: string; name: string; size: number; mime: string; kind: ChatAttachmentKind }[],
+): AttachmentItem[] {
+  return attachments.map((item) => ({
+    fileId: item.fileId,
+    name: item.name,
+    size: item.size,
+    mime: item.mime,
+    kind: item.kind,
+  }))
+}
 
 // ═════════════════════════════════════════════════════════════════════
 // 落库形态

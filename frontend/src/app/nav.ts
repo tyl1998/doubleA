@@ -55,8 +55,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页换成真实页面）
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
-  // 已落地 ⇒ 不带 `batch`（`TaskAgent 记忆与产物` 块 5：删除会话后保留的产物入口，登录即可）
-  { code: 'AH', label: '历史产物', path: '/artifacts/history', serial: 'S-10 · 历史产物' },
+  // 已落地 ⇒ 不带 `batch`（会话产物：跨会话汇总本人全部产物，登录即可、可预览/下载/删除）
+  { code: 'AH', label: '会话产物', path: '/artifacts', serial: 'S-10 · 会话产物' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把凭据页换成真实页面）。⚠️ **与 MCP 解耦**：路由归入
   // `/settings` 一族（个人设置族），排在个人项这一端，不跟在 `MC` 后面。
   { code: 'CR', label: '我的凭据', path: '/settings/credentials', serial: 'S-08b · 凭据' },

@@ -45,7 +45,7 @@ import { ModelsPage } from '../pages/admin/ModelsPage.js'
 import { UsersListPage } from '../pages/admin/UsersListPage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
-import { ArtifactHistoryPage } from '../pages/artifacts/ArtifactHistoryPage.js'
+import { ArtifactCollectionPage } from '../pages/artifacts/ArtifactCollectionPage.js'
 import { ChatPage } from '../pages/chat/ChatPage.js'
 import { KnowledgeDetailPage } from '../pages/knowledge/KnowledgeDetailPage.js'
 import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
@@ -82,9 +82,9 @@ export function App() {
           {/* S-08b · 我的凭据（P0-2-11 接真页面）。它是**个人凭据页、与 MCP 解耦**：
               归入 `/settings` 一族（与 `/settings/password` 同族），后端端点仍是 `/api/mcp/credentials`。 */}
           <Route path="/settings/credentials" element={<McpCredentialsPage />} />
-          {/* S-10 · 历史产物（`TaskAgent 记忆与产物` 块 5）：删除会话后保留的产物，
-              登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。 */}
-          <Route path="/artifacts/history" element={<ArtifactHistoryPage />} />
+          {/* S-10 · 会话产物：跨会话汇总**本人**全部产物（含删除会话后保留的那些），
+              登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。可预览 / 下载 / 删除。 */}
+          <Route path="/artifacts" element={<ArtifactCollectionPage />} />
           <Route
             path="/tasks"
             element={

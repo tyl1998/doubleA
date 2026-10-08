@@ -334,3 +334,37 @@ export const probeEmbeddingResultSchema = z.object({
   url: z.string(),
 })
 export type ProbeEmbeddingResult = z.infer<typeof probeEmbeddingResultSchema>
+
+// ───────────────────────────── 对话模型连通测试（P1-1）─────────────────────────────
+
+/**
+ * `POST /api/models/probe-chat` 请求体（仅 ADMIN）。
+ *
+ * 与向量维度探测（`probeEmbeddingBodySchema`）同款：用**当前表单值**向该 Provider 试发一次
+ * **极小对话请求**（`max_tokens: 1`），用来在建/改**对话模型**时**当场**验证
+ * `baseUrl` / Key / 协议 / 型号名这一整条链路通不通（不必先保存、也不必等到第一次发消息才以 404 暴露）。
+ * **不落库**、不改任何状态。
+ */
+export const probeChatBodySchema = z.object({
+  providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
+  modelName: z.string({ required_error: '请先填写型号名' }).trim().min(1, '请先填写型号名').max(255),
+})
+export type ProbeChatBody = z.infer<typeof probeChatBodySchema>
+
+/** 连通测试成功的结果（失败一律是 `UPSTREAM_ERROR`/`UPSTREAM_TIMEOUT`，消息里带上游原文与请求 URL） */
+export const probeChatResultSchema = z.object({
+  providerName: z.string(),
+  modelName: z.string(),
+  /** 实际请求的完整 URL（不含凭据）—— 排查"路径/协议对不对"用 */
+  url: z.string(),
+  /**
+   * 上游回的文字（极小请求，可能为空串：思考型模型在 `max_tokens:1` 下可能只产思考）。
+   * 它是"确实通到了模型"的**直接证据**，不是给业务用的回答。
+   */
+  reply: z.string(),
+  /** 上游原值结束原因（OpenAI 词表；可能为 `null`） */
+  finishReason: z.string().nullable(),
+  /** 本次上游调用耗时（毫秒） */
+  durationMs: z.number().int(),
+})
+export type ProbeChatResult = z.infer<typeof probeChatResultSchema>

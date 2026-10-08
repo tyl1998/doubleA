@@ -157,7 +157,6 @@ const {
   credentialDraftsFromFields,
   credentialGroupAnchorId,
   credentialImpactHint,
-  createTemplateRow,
   emptyServerFormDraft,
   formatToolCount,
   formLevelTemplateIssues,

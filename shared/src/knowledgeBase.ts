@@ -339,8 +339,12 @@ export type CreateKnowledgeBaseBody = z.infer<typeof createKnowledgeBaseBodySche
  * · `retrievalConfig` 是**局部合并**：给的键覆盖当前生效值，没给的键保持不动。
  *   若实现写成整体覆盖，"只想调个 topK"会顺手把 `mode` 打回默认值（静默改变检索行为）。
  *
- * · `embeddingModel` **不在契约里**（不可改）：它是建库时的快照、是"需重建"的判据，
- *   让它可改等于允许伪造"已跟进新模型"的状态。换模型走 `子方案①` §八 的新表切换路径。
+ * · `embeddingModelId`（P1-5 起**可改**）：更换该库选定的向量模型。
+ *   ⚠️ **不改 `embeddingModel` 这个"向量来源"快照** —— 服务层只换 `embeddingModelId` +
+ *   重探 `embeddingDim`，于是 `embeddingModelChanged` 变为 `true`（= 旧 chunk 不是新模型产的，
+ *   该库需重建）。要恢复向量检索必须随后调 `POST /:id/rebuild` 全库重跑；
+ *   `chunks.embedding` 自 `20260930140000_kb_embedding_model` 起是**无固定维度**的 `vector`、
+ *   维度按行记在 `chunks.embedding_dim`，故换到**任意维度**的模型都不需要新建向量表。
  */
 export const updateKnowledgeBaseBodySchema = z
   .object({
@@ -350,6 +354,8 @@ export const updateKnowledgeBaseBodySchema = z
     chunkSize: chunkSizeSchema.optional(),
     chunkOverlap: chunkOverlapSchema.optional(),
     retrievalConfig: retrievalConfigInputSchema.optional(),
+    /** 更换该库的向量模型（`models` 里 `type=EMBEDDING` 的 id）；换完需重建索引 */
+    embeddingModelId: z.string().uuid('embeddingModelId 不是合法 UUID').optional(),
   })
   .refine(
     (body) =>
@@ -358,7 +364,8 @@ export const updateKnowledgeBaseBodySchema = z
       body.description !== undefined ||
       body.chunkSize !== undefined ||
       body.chunkOverlap !== undefined ||
-      body.retrievalConfig !== undefined,
+      body.retrievalConfig !== undefined ||
+      body.embeddingModelId !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
 export type UpdateKnowledgeBaseBody = z.infer<typeof updateKnowledgeBaseBodySchema>
@@ -388,6 +395,48 @@ export const removeKnowledgeBaseResultSchema = z.object({
   deletedObjects: z.number().int().min(0),
 })
 export type RemoveKnowledgeBaseResult = z.infer<typeof removeKnowledgeBaseResultSchema>
+
+// ───────────────────────────── 整库重建（P1-5）─────────────────────────────
+
+/**
+ * 整库重建期间检索**仍然可用**的提示（P1-5）。
+ *
+ * `01` §3.5 的验收原文是"重建期间可检索旧库**或**明确提示停机"。本批选的是**前者**：
+ * 重建**刻意不清旧 chunk**（不同于覆盖重建的"先删后建"），旧向量在逐篇重跑完成前一直可被检索，
+ * 所以库里没有检索空窗。这句话要显式说出来，否则用户看到一批文档变「解析中」会以为
+ * "现在搜不到了"（`DOCUMENT_PARSING_HINT` 说的是**这一篇**暂不参与检索，整库重建正好相反）。
+ */
+export const REBUILD_SEARCHABLE_HINT =
+  '重建期间旧索引仍然可用：检索命中的是重建完成前的内容，逐篇重跑完成后自动切换为新的向量'
+
+/**
+ * 更换知识库向量模型时必须重建的提示（P1-5）。
+ *
+ * 换了 `embeddingModelId` 之后，库里已有的 chunk 仍是**旧模型**产出的向量：同维度时它们是
+ * 无意义的相似度、不同维度时直接被 `embedding_dim` 收窄过滤掉 ⇒ 都必须整库重建才能恢复向量检索。
+ * （全文检索不受影响 —— 它不碰 embedding。）
+ */
+export const EMBEDDING_MODEL_CHANGE_REBUILD_HINT =
+  '更换向量模型后需要重建整库索引才能恢复向量检索（旧向量与当前模型不在同一空间）；重建前全文检索仍可用'
+
+/**
+ * `POST /api/knowledge-bases/:id/rebuild` 的响应（P1-5）。
+ *
+ * `total` 是重建**受理的全部文档数**（该库当前文档总数），`enqueued` 是**成功入队**的篇数。
+ * 两者不等的唯一原因是 Redis 队列不可用（入队抛错）—— `failed = total - enqueued` 如实回给界面，
+ * 而不是把"部分入队失败"伪装成整体成功。⚠️ 与上传端点的"入队失败即整次回滚"不同：
+ * 重建不改对象、不改内容，失败的那几篇停在 `PARSING`，**逐篇点「重试」即可恢复**（不丢数据）。
+ */
+export const rebuildKnowledgeBaseResultSchema = z.object({
+  id: z.string(),
+  /** 该库被受理重建的文档总数 */
+  total: z.number().int().min(0),
+  /** 成功入队（交给流水线）的篇数 */
+  enqueued: z.number().int().min(0),
+  /** 入队失败的篇数（= `total - enqueued`；> 0 时界面应提示逐篇重试） */
+  failed: z.number().int().min(0),
+})
+export type RebuildKnowledgeBaseResult = z.infer<typeof rebuildKnowledgeBaseResultSchema>
 
 // ───────────────────────────── 检索（P0-1-20）─────────────────────────────
 

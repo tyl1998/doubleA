@@ -166,6 +166,14 @@ export interface RunTurnOptions {
    * 给一个默认上限只会变成"长任务被莫名的超时打断"。
    */
   timeoutMs?: number
+  /**
+   * 随本轮派活一起发给引擎的图片（**P1-4**；pi RPC `prompt.images` 的原生字段）。
+   *
+   * 形状就是 pi `ImageContent`：`{ type: 'image', data: <base64>, mimeType }`。pi 把它与文本一起
+   * 交给模型 ⇒ **图片能否被"看懂"取决于该 Agent 绑定的模型是否支持图片输入**（闸门已按
+   * `supportsVision` 拦过）。空/缺省 ⇒ 不发 `images` 字段（报文与历史行为逐字一致）。
+   */
+  images?: readonly { type: 'image'; data: string; mimeType: string }[]
 }
 
 export interface SandboxRpc {
@@ -338,9 +346,13 @@ class SandboxRpcSession implements SandboxRpc {
       this.#pending.set(id, { resolve, reject, timer })
       try {
         // ⚠️ 这里**不等 `drain`**（与 pi 文档那句 "Honor stdin backpressure when writing commands"
-        //    有意偏离）：命令只有"派活 / 中断 / 查状态"三类、报文是几百字节到几 KB，
-        //    而 socket 自己的写队列会把它们排好。真要等 `drain` 就得把 `send` 变成
-        //    "排队 + 回压"两件事，代价大于收益。**带图片的 prompt（P1）会改变这个判断**。
+        //    有意偏离）：命令只有"派活 / 中断 / 查状态"三类，报文从几百字节到几 KB。
+        //    ★ **P1-4 起带图片的 prompt 可能到几 MB**，仍维持"不等 drain"的判断，理由是：
+        //    `stream.write()` 即使返回 false 也会**收下整块**（只是进写队列），数据不会丢，
+        //    代价只是内存；而同一容器同一会话的派活是串行的（每轮等 `agent_settled`），
+        //    不会出现"多张大图同时压入"。真要等 drain 就得把 `send` 拆成"排队 + 回压"，
+        //    收益（几十 MB 级并发才显现）小于复杂度。⚠️ **上界提醒**：`uploadBodyLimit` 是附件
+        //    总上限，若将来放宽到几十 MB，这里要重新评估。
         this.#stdio.stream.write(record)
       } catch (error) {
         clearTimeout(timer)
@@ -379,7 +391,10 @@ class SandboxRpcSession implements SandboxRpc {
     const { waiter, outcome } = this.#armSettled(options)
 
     try {
-      await this.send({ type: 'prompt', message })
+      // 图片（P1-4）：pi RPC `prompt` 的原生可选字段（`docs/rpc.md` 的 `images`）。
+      // ⚠️ **没有图片时绝不给这个键**：报文与"纯文本派活"逐字一致（老版本 pi / 网关兼容面不变）。
+      const images = options.images ?? []
+      await this.send(images.length === 0 ? { type: 'prompt', message } : { type: 'prompt', message, images })
     } catch (error) {
       // 派活本身失败 ⇒ 撤掉等待者（否则它会一直挂着，也没人会取消它），按错误分类回结论
       this.#finishWaiter(waiter, { ok: false, reason: 'closed', message: '派活失败' })

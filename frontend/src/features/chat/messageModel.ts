@@ -20,15 +20,13 @@
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 历史里只读**已定义**的段，未定义的段原样留着（不猜形状）
  * ─────────────────────────────────────────────────────────────────────
- * `content` 的写入端契约（`messageContentSchema`）当前声明四段：`text` / `thinking` /
- * `citations` / `tool_calls`（**P0-2-8 定型、P0-2-11 接回**）；`attachments`（附件，属 **P1**）
- * **刻意未定型**（`shared/src/conversation.ts` 的注释："现在写进去只会是猜的形状"）。
- * 所以本文件在解包历史 `content` 时**严格按已定义的那几段取值**，其余键既不读也不删
- * （原样留在视图模型之外的原始对象里）。等 P1 把 `attachments` 的形状定下来，
- * **只需要在本文件的 {@link messageToView} 里加一行映射**，组件一行都不用改 ——
- * 这正是"先归一化"的收益所在。
+ * `content` 的写入端契约（`messageContentSchema`）当前声明五段：`text` / `thinking` /
+ * `citations` / `tool_calls`（**P0-2-8 定型、P0-2-11 接回**）/ `attachments`（**P1-4 定型**）。
+ * 本文件在解包历史 `content` 时**严格按已定义的那几段取值**，其余键既不读也不删
+ * （原样留在视图模型之外的原始对象里）。附件正是这条纪律的收益兑现：P1-4 定型后
+ * **只在本文件的 {@link messageToView} 里加了一行映射**（`pickAttachments`），渲染组件一行都不用改。
  * 反过来说：**不要**为了"提前支持"而在前端猜一个形状 —— 那是自己发明契约，
- * 而后端将来写进去的形状与它不一致时，历史渲染会**安静地错**（字段名差一个字母就渲染出空白卡片）。
+ * 而契约的形状与它不一致时，历史渲染会**安静地错**（字段名差一个字母就渲染出空白卡片）。
  *
  * ⚠️ 开场白（`03` §4.1 第一行）**不是**这个模型的成员：它是 Agent 的静态属性
  * （`agent.openingRemarks`），只在"新会话态"显示，不落库、不进消息数组。
@@ -37,8 +35,10 @@
 import {
   DEFAULT_MESSAGE_BY_ERROR_CODE,
   ERROR_CODES,
+  attachmentItemSchema,
   citationItemSchema,
   toolCallRecordSchema,
+  type ChatAttachmentKind,
   type CitationItem,
   type ErrorCode,
   type MessageItem,
@@ -132,6 +132,20 @@ export interface ArtifactView {
 }
 
 /**
+ * 附件条的视图状态（**P1-4**；`shared#attachmentItemSchema` 的直译）。
+ *
+ * `kind` 由**服务端**在上传时判定（`IMAGE` / `DOCUMENT`）—— 前端据此决定渲染缩略图还是文件条，
+ * **不自己看扩展名**（与"预览形态判据只有一处"同款纪律）。
+ */
+export interface AttachmentView {
+  fileId: string
+  name: string
+  size: number
+  mime: string
+  kind: ChatAttachmentKind
+}
+
+/**
  * 一条消息在界面上的全部内容（**历史与流式共用**）。
  *
  * `status` 的四态对应四种收尾：`complete`（正常）/ `streaming`（在写）/ `stopped`（用户停止）/
@@ -149,6 +163,11 @@ export interface ChatMessageView {
   citations: readonly CitationItem[] | null
   tools: readonly ToolCallView[]
   artifacts: readonly ArtifactView[]
+  /**
+   * 本轮用户消息携带的附件（**P1-4**）：历史从 `content.attachments` 恢复、流式由本地状态带出。
+   * 只出现在 USER 消息上（助手消息恒空数组）。
+   */
+  attachments: readonly AttachmentView[]
   /** ISO 8601；流式消息没有（它在落库前不存在） */
   createdAt: string | null
   status: 'complete' | 'streaming' | 'stopped' | 'error'
@@ -277,6 +296,21 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
 }
 
 /**
+ * 附件段（**P1-4**）：逐项过 `attachmentItemSchema`（**同一个 schema**，与上传响应共用）。
+ * 坏的一项丢弃、全坏 ⇒ 空数组（与 `pickCitations` / `pickToolCalls` 同款处置）。
+ */
+function pickAttachments(source: Record<string, unknown>): AttachmentView[] {
+  const value = source['attachments']
+  if (!Array.isArray(value)) return []
+  const items: AttachmentView[] = []
+  for (const entry of value) {
+    const parsed = attachmentItemSchema.safeParse(entry)
+    if (parsed.success) items.push(parsed.data)
+  }
+  return items
+}
+
+/**
  * 模型段：从 jsonb 里安全取值（与 `pickCitations` 同族 —— 逐字段收窄，坏形状 → `undefined`）。
  * 只认 `messageModelSegmentSchema` 的三个字段全是字符串的情况，其余一律"没有这一段"：
  * 历史是跨版本读的，P0-2 之前的消息没有这个段是正常态，不该渲染出半截模型选择。
@@ -333,6 +367,8 @@ export function messageToView(item: MessageItem): ChatMessageView {
     // 产物卡仍恒空：它的写入端（沙箱产物，P0-3）还没有，见文件头。
     tools: pickToolCalls(content),
     artifacts: [],
+    // 附件（P1-4）：USER 消息的 `content.attachments` 段
+    attachments: pickAttachments(content),
     // 本轮实际使用的模型（产品优化 2026-09-29；旧消息没有这个段 ⇒ undefined）
     model: pickModel(content),
     createdAt: item.createdAt,
@@ -367,6 +403,27 @@ export function messagesToViews(items: readonly MessageItem[]): ChatMessageView[
 }
 
 /**
+ * 收起**最新一轮**（从最后一条 `USER` 消息起、到数组末尾），供"重新生成"期间的渲染使用（**P1-3**）。
+ *
+ * 为什么需要它：重新生成的后端语义是"撤掉上一轮 + 重跑同一段正文"（`POST /:id/regenerate`），
+ * 而前端在流式期间会同时持有**两份**同一轮的数据 —— 历史里那条**正在被替换**的旧轮次，
+ * 与 store 里这一轮新的流式轮次。不收起旧的就会渲染出**重复的用户气泡与两份回答**，
+ * 而用户点的是"替换"。
+ *
+ * 判据与页面里的 `recallable` 同源（"最新一轮 = 最后一条 USER + 其后的一切"），
+ * 且与后端 `recallLastRound` 的取轮口径**逐字一致**（`conversation.service.ts`）——
+ * 三处的"一轮"必须是同一个定义。
+ *
+ * 找不到 `USER` 消息（空历史 / 只有 SYSTEM）⇒ 原样返回（无可收起）。
+ */
+export function dropLastRound(views: readonly ChatMessageView[]): ChatMessageView[] {
+  for (let index = views.length - 1; index >= 0; index--) {
+    if (views[index]?.role === 'USER') return views.slice(0, index)
+  }
+  return [...views]
+}
+
+/**
  * 开场白 → 视图（`03` §4.1 第一行："会话首条用户消息前，Agent 开场白纯文本气泡；
  * **新会话态展示（无 conversationId 进入时即展示，首条消息发送时才创建会话）**"）。
  *
@@ -388,6 +445,7 @@ export function openingView(openingRemarks: string | null | undefined): ChatMess
     citations: null,
     tools: [],
     artifacts: [],
+    attachments: [],
     createdAt: null,
     status: 'complete',
     plain: true,

@@ -59,7 +59,12 @@
 
 import { z } from 'zod'
 
-import { artifactItemSchema, citationItemSchema, toolCallRecordSchema } from './conversation.js'
+import {
+  artifactItemSchema,
+  CHAT_ATTACHMENT_MAX_COUNT,
+  citationItemSchema,
+  toolCallRecordSchema,
+} from './conversation.js'
 import { ERROR_CODES } from './errors.js'
 
 // ───────────────────────────── 事件名与取值域 ─────────────────────────────
@@ -307,15 +312,11 @@ export const MAX_CHAT_CONTENT_CHARS = 20_000
 /**
  * `POST /api/conversations/:id/chat` 请求体（`02` §五 开头：`{ content, attachmentFileIds?[] }`）。
  *
- * ⚠️ `attachmentFileIds` **刻意在本批不可用**：附件要落 `files` 表，而它属 **P1**
- * （`01` §3.4 的"文件附件 P1"），表还不存在。这里的处置与 P0-1-23 对 MCP 引用的处置同款 ——
- * **明确拒绝并指向版本**，而不是"先收下、以后再用"：
- *   · 收下不用 ⇒ 用户以为附件生效了（界面上传成功、回答里却没有图），而且没有任何报错能提示他；
- *   · 明确 400 ⇒ 调用方立刻知道"这个版本还不支持"。
- * 用 `.max(0, …)` 而不是"不给这个字段"的原因：**字段级路径**（错误落在
- * `data.fields[].path = body.attachmentFileIds`，前端能高亮到那个上传按钮），
- * 而 `.refine()` 的失败 path 是空串、只能挂到表单级（P0-1-23 的教训）。
- * P1 的接回点：把 `.max(0, …)` 换成 `.max(附件上限, …)`，其余不变。
+ * `attachmentFileIds` 是**本轮附件**（P1-4）：先走 `POST /api/files/upload` 拿到 `fileId`，
+ * 发消息时把 id 列表带上；服务端按归属解析、按类型决定"多模态直读 / 文本解析注入"。
+ *   · **上限 = `CHAT_ATTACHMENT_MAX_COUNT`**（前后端同源）：它是字段级校验
+ *     （错误落在 `data.fields[].path = body.attachmentFileIds`），前端能高亮到上传区；
+ *   · **只收 id 不复传文件**：正文（base64 / 解析文本）由服务端按 id 现取，客户端无从伪造内容。
  */
 export const chatRequestBodySchema = z.object({
   content: z
@@ -335,10 +336,29 @@ export const chatRequestBodySchema = z.object({
   modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
   attachmentFileIds: z
     .array(z.string().uuid('附件 ID 不是合法 UUID'))
-    .max(0, '附件上传属 P1（files 表尚未落地）；本版本请只发送文本')
+    .max(CHAT_ATTACHMENT_MAX_COUNT, `一次最多携带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`)
     .optional(),
 })
 export type ChatRequestBody = z.infer<typeof chatRequestBodySchema>
+
+/**
+ * `POST /api/conversations/:id/regenerate` 请求体（**P1-3 重新生成**；`01` §3.4 / 决策 27）。
+ *
+ * 需求原文是"重跑**最后一轮用户消息**，替换原回答，原回答丢弃，**不产生重复消息**"。
+ * 由此推出两条契约口径：
+ *   · **不收 `content`**：正文取自库里最后一条 `USER` 消息 —— 让客户端传正文就等于允许它
+ *     把这一轮改写成任意内容，那是"修改重发"（已有入口）而不是"重新生成"；
+ *   · 只有一个可选项 `modelId`（与 `/chat` 同一套语义：省略走该智能体默认模型，给了就必须
+ *     是它的模型池成员）。它让"换个模型重跑一遍"成为可能，而这正是重新生成最常见的用法。
+ *
+ * ⚠️ **它不是 `chatRequestBodySchema` 的变体**：那个 schema 的必填 `content` 在这里恰恰是
+ * 不该存在的东西。两者只在"`modelId` 的可选语义"上相同，硬合并成一个会让"要不要正文"
+ * 变成一个随字段有无而变的隐式判据。
+ */
+export const regenerateConversationBodySchema = z.object({
+  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
+})
+export type RegenerateConversationBody = z.infer<typeof regenerateConversationBodySchema>
 
 /**
  * `POST /api/conversations/:id/stop` 的响应。

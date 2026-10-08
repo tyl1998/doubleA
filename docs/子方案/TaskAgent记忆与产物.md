@@ -51,7 +51,7 @@
    - 写入路径以 `.` 开头 ⇒ `artifacts.ts#filterChangedFiles` 的"隐藏文件跳过"规则天然排除，不会被当产物上传。
 2. **产物映射表（artifact manifest）**：`artifacts` 表本身就是产物 → S3 的映射（`conversationId, fileKey, fileName, size, mime`），S3 对象回收后仍在。缺的是容器侧下载通道。
 3. **按需下载（agent 自己下载）**：新增沙箱产物下载端点，agent 需要时经 `SANDBOX_BACKEND_URL` + per-container token 自己拉回。
-4. **历史产物**：删除会话时产物行**不删**（改 schema 可空 + `SetNull`），归入"历史产物"，按用户可查。
+4. **会话产物**：删除会话时产物行**不删**（改 schema 可空 + `SetNull`），归入"会话产物"，按用户可查（且可在该页主动删除）。
 
 实现范围：**后端 + 前端全做**（用户已确认）。
 
@@ -92,26 +92,30 @@ writeMemoryDoc(containerId, doc) → void
 - 响应：字节流 + 与公网下载同款的响应头（`Content-Disposition` / `Content-Type` / `nosniff` / `no-store`），可复用 `routes/artifacts.ts#buildContentDisposition`。
 - 服务层加一个 `openArtifactSourceForConversation({ artifactId, conversationId })`，与现有 `openArtifactSource` 共用取流逻辑，避免两份 S3 判据。
 
-### 块 3：删除会话保留产物行（历史产物）
+### 块 3：删除会话保留产物行（会话产物）
 
 **改动点** `backend/prisma/schema.prisma` + `backend/src/services/conversation.service.ts`：
 
 - `Artifact.conversationId` 改可空（`String?`），`onDelete: Cascade` → `SetNull`。
-- 补 `Artifact.userId`（产物归属用户，删除会话后仍可查"我的历史产物"）—— 建行时从 `conversation.userId` 写入（`artifacts.ts#collectRoundArtifacts` 现在没有 userId，需要从会话查一次，或由编排层传进来）。
+- 补 `Artifact.userId`（产物归属用户，删除会话后仍可查"我的会话产物"）—— 建行时从 `conversation.userId` 写入（`artifacts.ts#collectRoundArtifacts` 现在没有 userId，需要从会话查一次，或由编排层传进来）。
 - `removeConversation`：删会话行后产物行 `conversationId` 自动置空，**不再删产物行**；S3 对象本来就没删（`collectConversationObjectKeys` 返回 `[]`，见下）。
-- ⚠️ 顺带修一个**隐藏 bug**：`conversation.service.ts:389-392` `collectConversationObjectKeys` 至今返回 `[]`，注释写"P0-3 加一句"但没加 —— 删除会话时产物 S3 对象从未删除。本次既然改删除语义（产物保留为历史），这个函数改为**不再收集产物键**（或干脆删除 S3 清理那段，避免误删历史产物）。
+- ⚠️ 顺带修一个**隐藏 bug**：`conversation.service.ts:389-392` `collectConversationObjectKeys` 至今返回 `[]`，注释写"P0-3 加一句"但没加 —— 删除会话时产物 S3 对象从未删除。本次既然改删除语义（产物保留为会话产物），这个函数改为**不再收集产物键**（或干脆删除 S3 清理那段，避免误删会话产物）。
 
-### 块 4：历史产物后端端点
+### 块 4：会话产物后端端点
+
+> ⚠️ **2026-10-01 修订**：原「历史产物」只列 `conversationId = null` 的产物，语义太窄 ⇒ 改为
+> **「会话产物」= 跨会话汇总本人全部产物**（不加 `conversationId` 过滤），并补一个**删除**端点。
 
 **改动点** `backend/src/routes/artifacts.ts` + `backend/src/services/artifact.service.ts` + `shared/src/conversation.ts`：
 
-- `GET /api/artifacts/history?offset&limit`（仅本人）：查 `artifacts` where `userId = me AND conversationId = null`，返回 `{ items, total, offset, limit }`。
-- shared 增加 `listArtifactHistoryQuerySchema`（复用 `listArtifactsQuerySchema`）与响应 schema（复用 `artifactListResultSchema` 即可，字段同）。
+- `GET /api/artifacts?offset&limit`（仅本人）：查 `artifacts` where `userId = me`，返回 `{ items, total, offset, limit }`（`created_at desc`）。
+- `DELETE /api/artifacts/:id`（仅本人）：**真删除** —— 先删 S3 对象、成功才删 `artifacts` 行；别人的 / 不存在的 id 一律 404，对象删不掉 ⇒ 500 且不动库。
+- shared 增加 `listMyArtifactsQuerySchema`（复用 `listArtifactsQuerySchema`）与响应 schema（复用 `artifactListResultSchema` 即可，字段同）。
 
 ### 块 5：前端
 
 - **问题 2 修复**：`frontend/src/api/artifacts.ts:84` `useConversationArtifacts` —— `conversationId === undefined`（新会话态）时返回空清单，不用 `keepPreviousData` 顶旧数据。改法：`enabled` 已为 false，问题在 placeholder；可将 queryFn 在无 id 时返回空结果，或去掉 `placeholderData`。
-- **历史产物入口**：前端加"历史产物"页面/抽屉，调块 4 的端点，复用现有 `ArtifactCard` 的下载/预览能力（`frontend/src/features/chat/ArtifactCard.tsx`、`frontend/src/api/artifacts.ts` 的 `saveArtifactFile` / `fetchArtifactText`）。
+- **会话产物入口**：前端加"会话产物"页面（`ArtifactCollectionPage`，路由 `/artifacts`），调块 4 的端点，复用现有 `ArtifactCard` 的下载/预览能力（`frontend/src/features/chat/ArtifactCard.tsx`、`frontend/src/api/artifacts.ts` 的 `saveArtifactFile` / `fetchArtifactText`）；并给 `ArtifactCard` 加**可选** `onDelete`（`Popconfirm` ⇒ `DELETE /api/artifacts/:id`），只在该页传入。
 
 ---
 
@@ -123,7 +127,7 @@ writeMemoryDoc(containerId, doc) → void
    - 派活后 `docker exec <container> cat /work/.doubulea/memory.md` 能看到对话摘要 + 产物清单；
    - 停止/空闲回收容器后重新聊天，agent 能说出之前生成过哪些文件；
    - 容器内按记忆文档的下载命令能取回产物内容（curl 不行，用 node fetch 验证）。
-4. **历史产物**：删除含产物的会话 → `/api/artifacts/history` 仍能查到该产物并可下载；前端历史产物入口可见。
+4. **会话产物**：删除含产物的会话 → `/api/artifacts` 仍能查到该产物并可下载；前端「会话产物」入口可见；在该页删除一条产物 ⇒ 对象与行一并移除、刷新后不再出现。
 
 ---
 
@@ -131,5 +135,5 @@ writeMemoryDoc(containerId, doc) → void
 
 - **不做全量产物恢复**：容器重建只写记忆文档（几 KB），不把产物下载回 /work —— 延迟与磁盘成本都不可接受。
 - **不做历史全文重放给引擎**：记忆文档只给"摘要 + 产物清单"，不是逐字历史；pi 会话活着时它自己记得全部。
-- **产物保留期不变**：历史产物仍受 `ARTIFACT_RETENTION_DAYS`（默认 7 天）清理收口，不因"历史产物"而变成永久。
+- **产物保留期不变**：会话产物仍受 `ARTIFACT_RETENTION_DAYS`（默认 7 天）清理收口，不因"可汇总查看"而变成永久。用户也可在「会话产物」页**主动删除**（对象 + 行一并移除）。
 - **撤回最新一轮（recall）的删除语义不变**：`conversation.service.ts#recallLastRound` 仍删该轮产物行 + S3 对象（撤回=撤销那一轮，与"删除会话"是两种操作）。

@@ -39,7 +39,7 @@
  *    所以必须把消息数**在同一个事务里数出来**再删（跨语句数会出现"数了 5 条、实际删了 6 条"，
  *    与 P0-1-19 的 `deletedChunks` 同款；用事务是为了消掉这个 TOCTOU）。
  *    ⚠️ **产物行不跟着删**（`TaskAgent记忆与产物` 块 3 起）：`artifacts.conversation_id` 是
- *    可空 + `ON DELETE SET NULL`，删会话只把它置空、产物归入"历史产物"。这不是漏了 ——
+ *    可空 + `ON DELETE SET NULL`，删会话只把它置空、产物归入"会话产物"。这不是漏了 ——
  *    `02` §三 的"消息与产物都不删"现在在删除路径上字面成立。
  *
  * **⑤ 「只读」= 不能再产生消息；改名与删除**刻意不按 status 拦**。**
@@ -50,11 +50,12 @@
  *    （P0-1-11 的教训：自己发明约束会把合法操作挡在门外）。
  *
  * **⑥ 会话删除**不再收集/删除产物对象（`TaskAgent记忆与产物` 块 3）。**
- *   产物行随删除被置空 `conversation_id`、保留为"历史产物"，S3 对象**必须跟着保留**
- *   （行是下载的唯一入口，对象删了行就成了 404 —— 那正是"误删历史产物"）。
+ *   产物行随删除被置空 `conversation_id`、保留为"会话产物"，S3 对象**必须跟着保留**
+ *   （行是下载的唯一入口，对象删了行就成了 404 —— 那正是"误删会话产物"）。
  *   所以 `removeConversation` **不再碰 S3**（也不再需要 `collectConversationObjectKeys`）。
- *   ⚠️ 唯一例外是"**撤回最新一轮**"（{@link recallLastRound}）：撤回 = 撤销那一轮，
- *   产物行与 S3 对象一起删 —— 它是与"删除会话"**刻意不同**的另一种操作。
+ *   ⚠️ 真正删产物对象只有两条路，都**不是**删会话：① **撤回最新一轮**（{@link recallLastRound}）
+ *   —— 撤回 = 撤销那一轮，产物行与 S3 对象一起删；② 用户在「会话产物」页**主动删除**
+ *   （`DELETE /api/artifacts/:id`，见 `artifact.service.ts#deleteArtifact`）。
  *   ⇒ 本文件里 `removeConversationObjects` 仍保留，但它**只被撤回路径使用**。
  *
  * **⑦ 消息历史（P0-1-28）的游标是"行 id"，不是时间戳；且排序必须与上下文窗口同源。**
@@ -108,6 +109,7 @@ import { getPrisma, type PrismaClientInstance } from '../infra/prisma.js'
 import { chatActiveKey, getRedis } from '../infra/redis.js'
 import { getS3Client } from '../infra/s3.js'
 import type { LlmTarget } from '../llm/client.js'
+import { resolveChatAttachments, type ChatAttachmentContext } from './file.service.js'
 import { resolveChatTarget } from './model.service.js'
 
 /**
@@ -362,11 +364,12 @@ export async function removeConversation(
     getLogger().warn({ err: error, conversationId: id }, '活跃流锁清理失败（会话已删除，键会自行过期）')
   }
 
-  // ⚠️ ③ 产物**不删**（文件头 ⑥）：`conversation_id` 由外键自动置空、产物归"历史产物"，
-  //    S3 对象跟着保留。这里**刻意不碰 S3** —— 唯一删产物对象的口子是撤回最新一轮。
+  // ⚠️ ③ 产物**不删**（文件头 ⑥）：`conversation_id` 由外键自动置空、产物归"会话产物"，
+  //    S3 对象跟着保留。这里**刻意不碰 S3** —— 删产物对象的口子只有"撤回最新一轮"与
+  //    用户在「会话产物」页主动删除（`DELETE /api/artifacts/:id`）。
   getLogger().info(
     { conversationId: id, agentId: target.agentId, deletedMessages },
-    '已删除会话（产物行保留为历史产物，conversation_id 由外键置空）',
+    '已删除会话（产物行保留为会话产物，conversation_id 由外键置空）',
   )
   return { id, agentId: target.agentId, topic: target.topic, deletedMessages }
 }
@@ -458,7 +461,8 @@ export async function recallLastRound(
   const db = getPrisma()
 
   // 事务外要用的 S3 对象键：`$transaction` 的回闭里写入、事务提交后再删对象
-  let objectKeys: string[] = []
+  // （`const` 即可：只 `push`、从不整体重新赋值）
+  const objectKeys: string[] = []
 
   const result = await db.$transaction(async (tx) => {
     // ① 最新一轮的起点 = 最后一条 USER 消息（`MESSAGE_CHRONO_ORDER` 是"新 → 旧"）
@@ -742,6 +746,14 @@ export interface ChatSendContext {
    * "我要走哪条链路"。它在本函数的 `select` 里顺带取出来（同一个 `agent` 关系），零额外往返。
    */
   agentType: AgentType
+  /**
+   * 本轮携带的附件（**P1-4**；已解析成"图片 base64 / 文本正文"两形态，见
+   * `file.service.ts#ChatAttachmentContext`）。空数组 = 本轮没有附件。
+   *
+   * ⚠️ 它**不是**请求体里的 `attachmentFileIds`（那只是 id 列表）：这里是**已归属校验 + 已解析**
+   * 的结果 ⇒ 编排层拿到的就是可以直接拼进报文的内容，不必再碰 S3 / 解析器。
+   */
+  attachments: ChatAttachmentContext[]
 }
 
 /**
@@ -780,6 +792,7 @@ export async function assertConversationSendable(
   id: string,
   viewer: ConversationViewer,
   requestedModelId?: string,
+  attachmentFileIds?: readonly string[],
 ): Promise<ChatSendContext> {
   const db = getPrisma()
   const row = await db.conversation.findFirst({
@@ -806,7 +819,91 @@ export async function assertConversationSendable(
   }
 
   const target = await resolveChatTarget(chosenModelId)
-  return { conversationId: row.id, agentId: row.agentId, target, agentType: row.agent.type }
+
+  // ③″ 附件（P1-4）：整段解析（归属校验 + 取对象 + 图片 base64 / 文本解析）都在服务层完成，
+  //     编排层只拿结果 —— 于是"附件能不能用"的失败走**前置信封**（在写出任何 SSE 帧之前）。
+  //     两条自己独有的判据：TaskAgent 暂不支持（沙箱链路没有多模态注入的落点）；图片要求
+  //     所选模型 `supportsVision`（否则上游收到图片 part 会 400，文案还听不懂）。
+  //     TaskAgent 要拿到**所有附件的原始字节**：图片走 pi RPC `prompt.images` 发给引擎、原文件同时
+  //     落盘到容器 /work/attachments/（供工具处理）；文本类正文拼进 prompt、原文件也落盘。
+  //     唯一的自己判据：**带图片时模型必须支持图片输入**（两条链路都一样 —— 否则上游收到图片
+  //     part 会 400，或引擎报一个听不懂的错）。
+  const attachments = await resolveChatAttachments(attachmentFileIds ?? [], viewer.id, {
+    documentBytes: row.agent.type === 'TASK_AGENT',
+  })
+  if (attachments.length > 0) {
+    const hasImage = attachments.some((item) => item.kind === 'IMAGE')
+    if (hasImage && !target.supportsVision) {
+      throw AppError.conflict('所选模型不支持图片输入，请换一个支持图片的模型，或去掉图片附件后重发')
+    }
+  }
+
+  return { conversationId: row.id, agentId: row.agentId, target, agentType: row.agent.type, attachments }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 重新生成（P1-3）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 从一条消息的 `content`（jsonb）里安全地取出正文（与 `textOfHistoryRow` 同一条"坏行当空串"的口径） */
+function textOfMessageContent(raw: unknown): string {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return ''
+  const text = (raw as Record<string, unknown>)['text']
+  return typeof text === 'string' ? text : ''
+}
+
+/**
+ * 重新生成要用的上下文 = 一次"可发送"的上下文 + **被重跑的正文**。
+ *
+ * `content` 刻意由服务端从库里读（不是请求体传的，见 `regenerateConversationBodySchema`）——
+ * 这是"重跑最后一轮用户消息"这句话的字面落地。
+ */
+export interface RegenerateContext extends ChatSendContext {
+  /** 库里最后一条 `USER` 消息的正文（`POST /:id/regenerate` 会用它再跑一轮） */
+  content: string
+}
+
+/**
+ * 重新生成的前置闸门（`POST /api/conversations/:id/regenerate` 的第一步）。
+ *
+ * 三处判据，**顺序即用户看到什么**：
+ *   ① 可发送 —— **整段复用 `assertConversationSendable`**（会话是我的 / 未只读 / 模型池成员 /
+ *      Provider 有 Key）。重新生成与发消息对"这一轮能不能跑"的要求**逐条相同**，
+ *      各写一遍必然漂移（P0-1-27 的 `resolveChatTarget` 复用就是同一条理由）。
+ *   ② **有最后一条用户消息** → 否则 **409**。"没有可重跑的轮次"是一个真实终局
+ *      （空会话），不是参数错误。
+ *   ③ 那条消息**有正文** → 否则 **409**：空正文重跑不出任何东西，而它本不该存在
+ *      （`chatRequestBodySchema` 的 `.min(1)` 拦过；这里是跨版本读 `content` 的兜底）。
+ *
+ * ⚠️ **刻意的 TOCTOU（与发消息同款）**：真正"撤掉上一轮"的动作在**拿到会话互斥锁之后**
+ * 由路由传入的回调执行（`sse.ts#streamChatReply` 的 `onLockAcquired`）——
+ * 在那里删才不会误删另一个正在跑的流的历史。本函数只负责"这一轮跑得起来吗"。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 会话/模型不存在 / `CONFLICT`(409) 只读 / 无用户消息 /
+ *                   最后一条没有正文 / 模型不在池中或不可用 / `NEED_CREDENTIAL`(424)
+ */
+export async function assertConversationRegenerable(
+  id: string,
+  viewer: ConversationViewer,
+  requestedModelId?: string,
+): Promise<RegenerateContext> {
+  const sendable = await assertConversationSendable(id, viewer, requestedModelId)
+
+  const lastUser = await getPrisma().message.findFirst({
+    where: { conversationId: id, role: 'USER' },
+    orderBy: [...MESSAGE_CHRONO_ORDER],
+    select: { content: true },
+  })
+  if (lastUser === null) {
+    throw AppError.conflict('这个会话还没有可以重新生成的消息，请先发送一条')
+  }
+
+  const content = textOfMessageContent(lastUser.content)
+  if (content === '') {
+    throw AppError.conflict('最后一条用户消息没有正文，无法重新生成')
+  }
+
+  return { ...sendable, content }
 }
 
 // ═════════════════════════════════════════════════════════════════════

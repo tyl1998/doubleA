@@ -27,7 +27,7 @@ import { PassThrough } from 'node:stream'
 import Docker from 'dockerode'
 
 import { getLogger } from '../infra/logger.js'
-import { SANDBOX_LLM_ENV, sandboxFilter, sandboxFilterFor, type SandboxLabels } from './spec.js'
+import { SANDBOX_LLM_ENV, sandboxFilter, sandboxFilterFor } from './spec.js'
 
 let client: Docker | undefined
 

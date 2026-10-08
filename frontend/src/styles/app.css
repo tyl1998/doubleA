@@ -1612,3 +1612,40 @@
   background: var(--warn);
   vertical-align: middle;
 }
+
+/* ═══════════════════════ 附件（P1-4）═══════════════════════ */
+/* 输入区已选附件（`ChatInput`）：图片显缩略图、文本类显文件条 --------------------------- */
+.composer__attachments { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.attachment-chip {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  max-width: 220px; padding: 2px 4px 2px 2px;
+  background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+}
+.attachment-chip__thumb { width: 26px; height: 26px; object-fit: cover; border-radius: var(--r-xs); display: block; }
+.attachment-chip__doc { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; }
+.attachment-chip__doc::after { content: '📄'; }
+.attachment-chip__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip__remove { padding: 0 2px; background: none; border: 0; cursor: pointer; color: var(--muted); font-size: var(--fs-sm); line-height: 1; }
+.attachment-chip__remove:hover { color: var(--danger); }
+
+/* 输入框左侧的 📎（`[📎] [输入框] [发送]` 版式；原生 label + 隐藏 input） */
+.composer__attach {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 34px; cursor: pointer; font-size: 16px; opacity: 0.85;
+}
+.composer__attach input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.composer__attach[data-disabled='true'] { opacity: 0.35; cursor: default; }
+.composer__attach[data-disabled='true'] input { cursor: default; }
+
+/* 用户气泡里的附件（`MessageList`）------------------------------------------------------ */
+.msg__attachments { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-2); justify-content: flex-end; }
+.msg__attachment-image img { display: block; width: 120px; height: 120px; object-fit: cover; border: 1px solid var(--rule); border-radius: var(--r-sm); }
+.msg__attachment-doc {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+}
+.msg__attachment-doc-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg__attachment-doc-size { color: var(--muted); }

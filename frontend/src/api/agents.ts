@@ -133,6 +133,22 @@ export function useUpdateAgent() {
   })
 }
 
+/**
+ * 复制智能体（`POST /api/agents/:id/copy`，**登录即可**；P1-2）。
+ *
+ * 无请求体：服务端把源整份拷贝成一个**归当前用户**的新智能体（名字加「（副本）」）。
+ * 响应是**裸 `AgentItem`**（与创建同款）。复制会新增一条 `canEdit=true` 的记录，
+ * 且新智能体的组件绑定会让知识库侧的 `agentCount` 变化 ⇒ 复用 `invalidateAffectedViews`。
+ */
+export function useCopyAgent() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      request<AgentItem>(`/api/agents/${encodeURIComponent(id)}/copy`, { method: 'POST' }),
+    onSuccess: () => invalidateAffectedViews(queryClient),
+  })
+}
+
 /** 组件绑定**整体替换**（`PUT`）：提交的集合就是全部；`components: []` 即解绑全部 */
 export function useReplaceAgentComponents() {
   const queryClient = useQueryClient()

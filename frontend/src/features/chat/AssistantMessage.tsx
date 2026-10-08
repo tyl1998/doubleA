@@ -34,6 +34,13 @@ export interface AssistantMessageProps {
   view: ChatMessageView
   /** 头部显示的名字（`03` §4.1 的 `msg__head`） */
   agentName: string
+  /**
+   * 「重新生成」（P1-3）。**只在最新一轮的助手消息上给**（判据在页面：这一条是历史里最后
+   * 一条助手回答，且当前没有流在跑）—— 传 `undefined` 表示这一条不显示该按钮。
+   *
+   * 需求："重跑最后一轮用户消息，替换原回答"。按钮挂在这条**回答**上，因为被替换的正是它。
+   */
+  onRegenerate?: (() => void) | undefined
 }
 
 /** token 用量 → 一行文案；两个数各自可空（`usage.tokensIn` 是 `number | null`） */
@@ -68,7 +75,7 @@ function headLedClass(view: ChatMessageView): string {
   return 'led led--ok'
 }
 
-export function AssistantMessage({ view, agentName }: AssistantMessageProps) {
+export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMessageProps) {
   const feedback = useFeedback()
   const [copying, setCopying] = useState(false)
 
@@ -159,6 +166,18 @@ export function AssistantMessage({ view, agentName }: AssistantMessageProps) {
         >
           复制全文
         </button>
+        {/* 重新生成（P1-3）：只挂在最新一轮的回答上（判据在页面）。流式中不提供
+            （页面在"有流在跑"时根本不会传这个回调）⇒ 不会出现"点了两次"的入口。 */}
+        {onRegenerate === undefined ? null : (
+          <button
+            type="button"
+            onClick={onRegenerate}
+            disabled={view.status === 'streaming'}
+            title="重跑这一轮的问题，用新的回答替换当前回答"
+          >
+            重新生成
+          </button>
+        )}
       </div>
     </article>
   )

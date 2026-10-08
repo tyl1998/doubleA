@@ -32,7 +32,8 @@ import type { SseEvent } from '@doubulea/shared'
 import { create } from 'zustand'
 
 import type { ClientErrorCode } from '../api/client.js'
-import { beginRound, reduceRound, type StreamRound } from '../features/chat/roundReducer.js'
+import type { AttachmentView } from '../features/chat/messageModel.js'
+import { beginRound, reduceRound, type RoundKind, type StreamRound } from '../features/chat/roundReducer.js'
 
 /**
  * 顶部黄条（`03` §4.1："断线 → 顶部黄条提示，**点击黄条 = 立即拉取历史对齐**"）。
@@ -58,8 +59,18 @@ interface ChatStreamState {
   round: StreamRound | null
   /** 顶部黄条（`null` = 本地与后端状态一致） */
   disconnect: DisconnectState | null
-  /** 开一轮：**流已经成功建立之后**才调用（前置失败不该在界面上留下任何痕迹） */
-  begin: (conversationId: string, userText: string, startedAt: string) => void
+  /**
+   * 开一轮：**流已经成功建立之后**才调用（前置失败不该在界面上留下任何痕迹）。
+   * `kind` 默认 `'send'`；重新生成传 `'regenerate'` —— 只影响页面的"收起正在被替换的一轮"，
+   * 事件归约与收尾**完全同款**（见 `roundReducer.ts#RoundKind`）。
+   */
+  begin: (
+    conversationId: string,
+    userText: string,
+    startedAt: string,
+    kind?: RoundKind,
+    userAttachments?: readonly AttachmentView[],
+  ) => void
   /** 喂一帧（未开轮时静默忽略：`done` 之后仍可能有尾帧，那是正常现象） */
   apply: (event: SseEvent) => void
   /**
@@ -107,10 +118,14 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
   round: null,
   disconnect: null,
 
-  begin: (conversationId, userText, startedAt) => {
+  begin: (conversationId, userText, startedAt, kind, userAttachments) => {
     // 开新一轮 ⇒ 上一轮的黄条自动消失（`03` §4.1 的状态机里，`idle → streaming` 是一个干净的起点；
     // 留着旧黄条会让用户以为**这一轮**出问题了）
-    set({ streamFor: conversationId, round: beginRound(userText, startedAt), disconnect: null })
+    set({
+      streamFor: conversationId,
+      round: beginRound(userText, startedAt, kind, userAttachments),
+      disconnect: null,
+    })
   },
 
   apply: (event) => {

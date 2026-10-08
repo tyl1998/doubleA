@@ -97,7 +97,7 @@ import {
 export { LlmAbortError, redactSecret }
 // 同理：`ChatMessage` / `ChatUsage` 的实现（定义）P0-1-37 起搬到了 `./protocol.ts`
 // （依赖方向原因，见那边的文件头），**调用点同样不用改 import 路径**。
-export type { ChatMessage, ChatUsage, DecodedFrame } from './protocol.js'
+export type { ChatMessage, ChatMessageContent, ChatContentPart, ChatUsage, DecodedFrame } from './protocol.js'
 // P0-2-8：工具调用的**协议无关形态**与参数解析也在这里再导出 —— 编排层（`chatBot.ts`）只
 // import `llm/client.js`，不必知道 `protocol.ts` 的存在（它与 `ChatMessage` 是同一条纪律）。
 export { parseToolArguments, sumUsages } from './protocol.js'

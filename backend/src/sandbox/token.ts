@@ -109,15 +109,10 @@ export async function resolveSandboxToken(raw: string | undefined): Promise<Sand
   if (token.length > config.sandbox.tokenLen * 2) return undefined
 
   const redis = await ensureRedisConnected()
-  let payload: string | null
-  try {
-    payload = await redis.get(sandboxTokenKey(token))
-  } catch (error) {
-    // ⚠️ 这里**向上抛**（不吞成 `undefined`）：Redis 挂了时"令牌无效"（401）与
-    // "我们查不了"（500）必须分得开 —— 前者会让容器以为自己的令牌是错的，
-    // 而它会照常报一条"代理拒绝了我"，把基础设施故障伪装成一个配置问题。
-    throw error
-  }
+  // ⚠️ 这里**不接住异常**（不吞成 `undefined`，也就不写 try/catch）：Redis 挂了时
+  // "令牌无效"（401）与"我们查不了"（500）必须分得开 —— 吞掉会让容器以为自己的令牌是错的，
+  // 而它会照常报一条"代理拒绝了我"，把基础设施故障伪装成一个配置问题。
+  const payload = await redis.get(sandboxTokenKey(token))
   const record = parseTokenRecord(payload)
   if (record === undefined) return undefined
 

@@ -35,12 +35,14 @@ import {
   listModelsQuerySchema,
   modelIdParamsSchema,
   ok,
+  probeChatBodySchema,
   probeEmbeddingBodySchema,
   updateModelBodySchema,
   type CreateModelBody,
   type ListAvailableModelsQuery,
   type ListModelsQuery,
   type ModelIdParams,
+  type ProbeChatBody,
   type ProbeEmbeddingBody,
   type UpdateModelBody,
 } from '@doubulea/shared'
@@ -50,6 +52,7 @@ import {
   createModel,
   listAvailableModels,
   listModels,
+  probeModelChat,
   probeModelEmbedding,
   removeModel,
   updateModel,
@@ -93,6 +96,16 @@ export function registerModelRoutes(app: FastifyInstance): void {
     '/api/models/probe-embedding',
     { preHandler: app.requireAdmin, schema: { body: probeEmbeddingBodySchema } },
     async (request) => ok(await probeModelEmbedding(request.body)),
+  )
+
+  /**
+   * 对话模型连通测试（仅 ADMIN；P1-1）：按表单值试发一次极小对话（`max_tokens: 1`），
+   * **不落库**。与 `/probe-embedding` 同款——静态段、不会被 `:id` 参数路由抢先匹配。
+   */
+  app.post<{ Body: ProbeChatBody }>(
+    '/api/models/probe-chat',
+    { preHandler: app.requireAdmin, schema: { body: probeChatBodySchema } },
+    async (request) => ok(await probeModelChat(request.body)),
   )
 
   /** 部分更新（仅 ADMIN）。三条守卫（迁移 Provider / 改 type 有引用 / 唯一冲突）在服务层 */

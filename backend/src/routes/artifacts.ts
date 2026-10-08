@@ -44,8 +44,8 @@
 import {
   artifactIdParamsSchema,
   conversationIdParamsSchema,
-  listArtifactHistoryQuerySchema,
   listArtifactsQuerySchema,
+  listMyArtifactsQuerySchema,
   ok,
   previewKindOf,
   type ArtifactIdParams,
@@ -58,8 +58,9 @@ import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { requireAuthContext } from '../plugins/session.js'
 import {
   artifactDownloadContentType,
-  listArtifactHistory,
+  deleteArtifact,
   listArtifacts,
+  listMyArtifacts,
   openArtifactSource,
 } from '../services/artifact.service.js'
 import { buildContentDisposition } from '../services/document.service.js'
@@ -161,23 +162,40 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
   )
 
   /**
-   * 历史产物（`GET /api/artifacts/history`，**P0-3 记忆与产物 块 4**）。
+   * 会话产物（`GET /api/artifacts`，**跨会话汇总本人全部产物**）。
    *
-   * 「删除会话后产物还在」的唯一出口：删会话只把产物行的 `conversation_id` 置空
-   * （`TaskAgent记忆与产物` 块 3），于是 `conversationId = null` 的产物 = **历史产物**。
+   * 「删了会话之后产物还在」的唯一出口也在这里：删会话只把产物行的 `conversation_id` 置空
+   * （`TaskAgent记忆与产物` 块 3），产物行本身保留 ⇒ 仍会出现在本列表里。
    *
    * 判据是 `user_id = me`（产物行自建行起带归属用户，`conversationId` 置空后它仍是
    * "这是**我的**"的唯一答案）—— 与"产物 → 会话 → 本人"那条老判据**刻意不同**：
-   * 历史产物已经没有会话可 join 了。别人的产物仍然查不到（`where` 里带 `userId`）。
+   * 跨会话清单没有单一的会话可 join。别人的产物仍然查不到（`where` 里带 `userId`）。
    *
-   * ⚠️ **静态段与参数段的关系**：`/api/artifacts/history` 与 `/api/artifacts/:id/download`
-   * 同前缀 —— Fastify 对静态段优先于参数段匹配，且 `:id` 有 uuid 校验（`history` 不是 uuid），
-   * 两条路由互不干扰。
+   * ⚠️ **静态段与参数段的关系**：`/api/artifacts` 与 `/api/artifacts/:id/download`
+   * 同前缀 —— 本集合路由无路径参数，`:id` 那两条有 uuid 校验，互不干扰。
    */
   app.get<{ Querystring: ListArtifactsQuery }>(
-    '/api/artifacts/history',
-    { preHandler: app.requireAuth, schema: { querystring: listArtifactHistoryQuerySchema } },
-    async (request) => ok(await listArtifactHistory(userIdOf(request), request.query)),
+    '/api/artifacts',
+    { preHandler: app.requireAuth, schema: { querystring: listMyArtifactsQuerySchema } },
+    async (request) => ok(await listMyArtifacts(userIdOf(request), request.query)),
+  )
+
+  /**
+   * 删除产物（`DELETE /api/artifacts/:id`，仅本人；**会话产物列表的删除动作**）。
+   *
+   * 真删除：S3 对象与 `artifacts` 行一并移除（与保留期清理同款顺序：先删对象、成功才删行）。
+   * 归属判据在服务层的 `where`（`userId = me`）⇒ 别人的产物与不存在的 id 都是 **404**。
+   *
+   * ⚠️ 与"删除会话"刻意不同：删会话只把产物行 `conversation_id` 置空、产物转历史保留；
+   * 本端点才是"用户明确不要这条产物"的出口。
+   */
+  app.delete<{ Params: ArtifactIdParams }>(
+    '/api/artifacts/:id',
+    { preHandler: app.requireAuth, schema: { params: artifactIdParamsSchema } },
+    async (request) => {
+      await deleteArtifact({ artifactId: request.params.id, userId: userIdOf(request) })
+      return ok(null)
+    },
   )
 
   /**

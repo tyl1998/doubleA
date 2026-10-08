@@ -24,6 +24,10 @@ export default tseslint.config(
       '**/*.map',
       'backend/generated/**',
       '.workbuddy/**',
+      // Agent Manager 的工作树（完整仓库副本，自带 tsconfig）—— 不排除会让 `eslint .`
+      // 从根目录扫到第二份 tsconfig，typescript-eslint 因 **多个候选 `tsconfigRootDir`**
+      // 直接对每个文件报 Parsing error（472 条、全是解析错误），掩盖真正的规则错误
+      '.kilo/**',
     ],
   },
 
@@ -59,7 +63,14 @@ export default tseslint.config(
     // 施工/验收脚本 + CLI：控制台输出就是它的接口
     // （`pnpm infra:verify` 的 PASS/FAIL 要能直接被 grep；`prisma/seed.ts` 要打印初始密码，
     //  那是**交付初始密码的唯一通道**，与业务代码走 pino 的口径不冲突 —— 它不是在记日志）
-    files: ['**/scripts/**/*.{js,mjs}', '**/*.config.{js,mjs,ts}', '**/prisma/seed.ts'],
+    // 镜像构建期的生成脚本（`infra/sandbox/**`，如 `gen-models.mjs`）同属这一类：
+    // 它们的输出进构建日志给排障用，不是业务日志
+    files: [
+      '**/scripts/**/*.{js,mjs}',
+      '**/*.config.{js,mjs,ts}',
+      '**/prisma/seed.ts',
+      'infra/sandbox/**/*.mjs',
+    ],
     rules: { 'no-console': 'off' },
   },
 )

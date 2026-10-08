@@ -25,6 +25,7 @@ import { registerAgentRoutes } from './routes/agents.js'
 import { registerArtifactRoutes } from './routes/artifacts.js'
 import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
+import { registerFileRoutes } from './routes/files.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
@@ -176,6 +177,9 @@ export function buildApp(): FastifyInstance {
   //    与知识库文档下载那条"登录即可"**刻意不同** —— 照抄它就漏掉归属校验。
   //    ⚠️ 下载是本仓**第三个**不套信封的端点（字节流 / 失败才信封），客户端按响应形状分支。
   registerArtifactRoutes(app)
+  // ⑮ 文件附件（P1-4）：上传（multipart）/ 取内容（字节流）。上传登录即可，
+  //    取内容是**仅本人**（`files.uploader_id`）—— 与会话/产物同族。
+  registerFileRoutes(app)
 
   return app
 }

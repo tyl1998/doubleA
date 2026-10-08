@@ -33,8 +33,9 @@ import type { ArtifactListResult } from '@doubulea/shared'
 import { request, requestBlob } from './client.js'
 import {
   artifactContentUrl,
+  artifactDeleteUrl,
   artifactDownloadUrl,
-  artifactHistoryUrl,
+  artifactsCollectionUrl,
   decodeUtf8Text,
 } from '../components/ArtifactPreview/artifactPreview.js'
 
@@ -97,36 +98,46 @@ export function useConversationArtifacts(conversationId: string | undefined, ena
   })
 }
 
-// ───────────────────── 历史产物（TaskAgent 记忆与产物 块 4/5） ─────────────────────
+// ───────────────────── 会话产物（跨会话汇总本人全部产物） ─────────────────────
 
 /**
- * 历史产物列表的缓存键。
+ * 会话产物列表的缓存键。
  *
- * ⚠️ 与 `['conversation', …]` **刻意不同前缀**：历史产物不随任何会话的流变化
- * （只有在"删除会话"那一刻才会多一条 `conversation_id = null` 的行），用会话前缀会让
- * "这一轮跑完"顺手失效一份与它无关的列表。
+ * ⚠️ 与 `['conversation', …]` **刻意不同前缀**：会话产物是**用户作用域**的
+ * （`userId = me`），不随某一个会话的流变化；用会话前缀会让"这一轮跑完"顺手失效一份
+ * 与它无关的列表。
  * ⚠️ `offset` 进键：分页是服务端做的，翻到第 2 页就该是另一次查询（与面板"一次取满"不同）。
  */
-export function artifactHistoryQueryKey(offset: number, limit: number): readonly [string, string, number, number] {
-  return ['artifacts', 'history', offset, limit] as const
+export function myArtifactsQueryKey(offset: number, limit: number): readonly [string, string, number, number] {
+  return ['artifacts', 'collection', offset, limit] as const
 }
 
-/** 取一页历史产物（`GET /api/artifacts/history`，`created_at desc`） */
-export function fetchArtifactHistory(offset: number, limit: number): Promise<ArtifactListResult> {
-  return request<ArtifactListResult>(artifactHistoryUrl(offset, limit))
+/** 取一页会话产物（`GET /api/artifacts`，`created_at desc`） */
+export function fetchMyArtifacts(offset: number, limit: number): Promise<ArtifactListResult> {
+  return request<ArtifactListResult>(artifactsCollectionUrl(offset, limit))
 }
 
 /**
- * 历史产物列表（**仅本人**：服务端按 `user_id` 过滤，前端不需要、也无法指定别人的）。
+ * 会话产物列表（**仅本人**：服务端按 `user_id` 过滤，前端不需要、也无法指定别人的）。
  *
  * `keepPreviousData`：翻页时上一页的卡片先留着（不闪白），与侧栏列表同款。
  */
-export function useArtifactHistory(offset: number, limit: number) {
+export function useMyArtifacts(offset: number, limit: number) {
   return useQuery({
-    queryKey: artifactHistoryQueryKey(offset, limit),
-    queryFn: () => fetchArtifactHistory(offset, limit),
+    queryKey: myArtifactsQueryKey(offset, limit),
+    queryFn: () => fetchMyArtifacts(offset, limit),
     placeholderData: keepPreviousData,
   })
+}
+
+/**
+ * 删除一个产物（`DELETE /api/artifacts/:id`，**真删除**：S3 对象与行一并移除）。
+ *
+ * 失败（404 不是我的 / 500 存储不可用）与其余接口同款抛 `ApiError`，
+ * 由调用方（会话产物页）复用统一的错误提示。
+ */
+export function deleteArtifact(artifactId: string): Promise<null> {
+  return request<null>(artifactDeleteUrl(artifactId), { method: 'DELETE' })
 }
 
 /**

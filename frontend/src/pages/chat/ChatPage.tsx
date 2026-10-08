@@ -57,7 +57,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import type { ReactNode, RefObject } from 'react'
-import { HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
+import { CHAT_ATTACHMENT_MAX_COUNT, HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
 import type { RecallConversationResult, RemoveConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
@@ -68,6 +68,7 @@ import {
   useConversationMessages,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
+import { uploadChatFile } from '../../api/files.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -82,7 +83,13 @@ import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MessageList } from '../../features/chat/MessageList.js'
 import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
-import { messagesToViews, openingView, type ChatMessageView } from '../../features/chat/messageModel.js'
+import {
+  dropLastRound,
+  messagesToViews,
+  openingView,
+  type AttachmentView,
+  type ChatMessageView,
+} from '../../features/chat/messageModel.js'
 import { roundToViews } from '../../features/chat/roundReducer.js'
 import { chatErrorTitle, shouldToastChatError } from '../../features/chat/streamErrors.js'
 import { useChatStream } from '../../features/chat/useChatStream.js'
@@ -143,7 +150,7 @@ export function ChatPage() {
    */
   const preserveSelectionRef = useRef(false)
 
-  const { round, sending, stopping, disconnect, streamingId, send, stop, align } = useChatStream(
+  const { round, sending, stopping, disconnect, streamingId, send, regenerate, stop, align } = useChatStream(
     agentId,
     conversationId,
     {
@@ -160,6 +167,14 @@ export function ChatPage() {
   const [draft, setDraft] = useState('')
   const [aligning, setAligning] = useState(false)
   /**
+   * 本轮**已上传好**的附件（P1-4）：先上传拿 `fileId`，发送时只带 id（后端按归属解析）。
+   * 新会话首条消息发送时，`conversationId` 会从 `undefined` 变成新 id —— 那次变化不算"切换会话"，
+   * 附件必须保留到"发送成功"再清（与 `selectedModelId` 的保留逻辑同源）。
+   */
+  const [attachments, setAttachments] = useState<readonly AttachmentView[]>([])
+  /** 有附件正在上传（此时发送按钮禁用，避免"附件没带上就发出去"） */
+  const [uploading, setUploading] = useState(false)
+  /**
    * 本会话**这一轮选用的模型**（模型池特性）。`undefined` = 走智能体默认模型（`agent.modelId`）。
    * 切换会话时重置（下面的 effect）：一个会话选的模型不该带到另一个会话。
    * ⚠️ 但"新建会话的第一条消息"**不算切换**（`onConversationCreated` 会先置
@@ -172,6 +187,8 @@ export function ChatPage() {
       return
     }
     setSelectedModelId(undefined)
+    // 切换会话时清掉上一个会话选的附件（附件是"这一条消息"的，不该跨会话留着）
+    setAttachments([])
   }, [conversationId])
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
@@ -210,8 +227,22 @@ export function ChatPage() {
     agent?.modelLabel ??
     null
 
-  // 历史（正序）→ 视图；流式轮次 → 视图；两者**同一形状**（单一渲染路径）
-  const history = useMemo(() => messagesToViews(flattenMessagePages(messagesQuery.data)), [messagesQuery.data])
+  /**
+   * 历史（正序）→ 视图；流式轮次 → 视图；两者**同一形状**（单一渲染路径）。
+   *
+   * ⚠️ **两份历史**：`allHistory` 是服务端原样（"落库的真相"），`history` 是**渲染用**的
+   * —— 重新生成期间（`round.kind === 'regenerate'`）把**正在被替换的那一轮**从渲染里收起
+   * （`dropLastRound`）。后端此刻正用同一段正文重跑、并把旧轮次替换掉，不收起来就会
+   * 与新流式轮次渲染出重复气泡（而用户点的是"替换"）。
+   *
+   * ⚠️ 不能用 `history`（渲染用的那份）去判"落库版本是否已到位"—— 它把新落的那一轮也一起
+   * 收起来了，会让收尾后的"让位"永远等不到（见下面的对齐 effect）。故那里用 `allHistory`。
+   */
+  const allHistory = useMemo(() => messagesToViews(flattenMessagePages(messagesQuery.data)), [messagesQuery.data])
+  const history = useMemo(
+    () => (round?.kind === 'regenerate' ? dropLastRound(allHistory) : allHistory),
+    [allHistory, round?.kind],
+  )
   const streamViews = useMemo(() => (round === null ? [] : roundToViews(round)), [round])
 
   /**
@@ -219,14 +250,15 @@ export function ChatPage() {
    * 段的助手消息取（越靠后越新）。重进会话时头部选择器要回显它，而不是每次都回落到默认。
    */
   const lastUsedModel = useMemo(() => {
-    for (let index = history.length - 1; index >= 0; index--) {
-      const view = history[index]
+    // 用**未收起**的历史：模型回显要的是"落库的最后一轮用了什么"，与渲染收起无关
+    for (let index = allHistory.length - 1; index >= 0; index--) {
+      const view = allHistory[index]
       if (view === undefined) continue
       const model = view.model
       if (model !== undefined) return model
     }
     return undefined
-  }, [history])
+  }, [allHistory])
 
   /**
    * 重进会话回显"上次用的模型"（产品优化 2026-09-29）。
@@ -285,6 +317,29 @@ export function ChatPage() {
     }
   }, [conversationId, history, round])
 
+  /**
+   * 可「重新生成」的目标（P1-3）：**历史里最后一条助手回答** + 它所回答的那条用户消息正文。
+   *
+   * 判据四条：有会话 + 没有流在跑 + 最后一条是**助手回答** + 它能找到紧邻往前的用户消息。
+   * 「最后一条是助手回答」是刻意的：按钮挂在**被替换的那条回答**上（需求："替换原回答"）；
+   * 若最新一轮只有问题、还没有回答，用户该用的是那条用户消息上的「撤回/修改重发」。
+   *
+   * 用 `allHistory`（未收起）而不是 `history`：重新生成期间后者会把这一轮整体收掉，
+   * 但那时 `round !== null`、本 memo 本来就返回 `null`，用哪份都一样；显式用 allHistory
+   * 是为了让"判据看的是落库真相"这件事一目了然。
+   */
+  const regenerable = useMemo(() => {
+    if (conversationId === undefined) return null
+    if (round !== null) return null
+    const last = allHistory[allHistory.length - 1]
+    if (last === undefined || last.role !== 'ASSISTANT') return null
+    for (let index = allHistory.length - 2; index >= 0; index--) {
+      const view = allHistory[index]
+      if (view?.role === 'USER') return { key: last.key, userText: view.text }
+    }
+    return null
+  }, [conversationId, allHistory, round])
+
   // ── 产物面板（P0-3-11）──────────────────────────────────────────────────────
   //
   // ⚠️ **只有 TaskAgent 有这一列**（`03` §4.1 的"TaskAgent 差异"）。判据是 `agent.type`
@@ -328,10 +383,29 @@ export function ChatPage() {
     if (round === null || round.status === 'streaming') return
     const messageId = round.assistantMessageId
     if (messageId === null) return
-    if (history.some((view) => view.key === messageId)) {
+    // ⚠️ 用 `allHistory`（**未收起**）：重新生成期间渲染用的 `history` 把整个最新一轮都收掉了
+    // （包括刚落库的新回答）⇒ 用它会永远匹配不到，流式版本永远不让位。
+    if (allHistory.some((view) => view.key === messageId)) {
       useChatStreamStore.getState().reset()
     }
-  }, [round, history])
+  }, [round, allHistory])
+
+  /**
+   * 重新生成**失败** ⇒ 收掉这一轮的流式版本，让历史重新呈现服务端真实状态（P1-3）。
+   *
+   * 为什么必须收：重新生成期间页面把"正在被替换的那一轮"从渲染里收起了（见上面的 `history`），
+   * 而**失败并不意味着那一轮被换掉** —— 前置失败（闸门 409/424）与并发冲突（`CONFLICT`）
+   * 都发生在撤销动作之前/未改库，旧回答还在。不收掉这一轮，用户就会**看不到自己原有的回答**
+   * （被 `dropLastRound` 一直藏着），而屏幕上只挂着一张错误卡。
+   *
+   * 收掉之后：`round` 回到 `null` ⇒ 收起判据失效 ⇒ 历史（`performStream` 收尾已让它失效重取）
+   * 自行呈现服务端真相 —— 旧回答还在就显示旧的，已被替换成部分回答就显示部分回答。
+   * 失败的告知不受影响：服务端故障走错误卡 + toast（下面那个 effect），客户端中断走顶部黄条。
+   */
+  useEffect(() => {
+    if (round === null || round.kind !== 'regenerate' || round.status !== 'error') return
+    useChatStreamStore.getState().reset()
+  }, [round])
 
   /**
    * **贴底跟随**：流式期间每一帧都会长高，不跟随的话新内容长在视口外 —— 而"看着回答长出来"
@@ -377,21 +451,66 @@ export function ChatPage() {
     feedback.fail(new ApiError(code, round.error.message, status), chatErrorTitle(code))
   }, [round, feedback])
 
+  /**
+   * 选中附件（P1-4）：**逐个上传**（不并发），成功的立即出现、失败的各自提示。
+   *
+   * 三条口径：
+   *   · **逐个**而不是 `Promise.all`：一个失败不会连累另外几个（它们其实已经传成功了，
+   *     `Promise.all` 的 reject 会让那几份变成"传了但界面上没有"的孤儿）；
+   *   · **超出上限的截掉并明说**（`CHAT_ATTACHMENT_MAX_COUNT`，与后端 schema 同源）；
+   *   · 上传中置 `uploading` ⇒ 发送按钮禁用（否则会发出一条"附件还没带上"的消息）。
+   */
+  const handlePickFiles = useCallback(
+    (files: FileList): void => {
+      const picked = Array.from(files)
+      const slots = CHAT_ATTACHMENT_MAX_COUNT - attachments.length
+      if (slots <= 0) {
+        feedback.note(`最多只能带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`)
+        return
+      }
+      const accepted = picked.slice(0, slots)
+      if (picked.length > slots) feedback.note(`最多只能带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件，多余的已忽略`)
+
+      setUploading(true)
+      void (async () => {
+        const added: AttachmentView[] = []
+        for (const file of accepted) {
+          try {
+            added.push(await uploadChatFile(file))
+          } catch (error) {
+            feedback.fail(error, `附件「${file.name}」上传失败`)
+          }
+        }
+        if (added.length > 0) setAttachments((previous) => [...previous, ...added])
+        setUploading(false)
+      })()
+    },
+    [attachments.length, feedback],
+  )
+
+  /** 移除一个已上传附件（只从本轮移除；服务端那份不影响历史消息） */
+  const handleRemoveAttachment = useCallback((fileId: string): void => {
+    setAttachments((previous) => previous.filter((item) => item.fileId !== fileId))
+  }, [])
+
   const submit = useCallback(async (): Promise<void> => {
     const text = draft.trim()
     if (text === '') return
     // 先清空输入框（体感"发出去了"），失败时再还回来 —— 见下面的 `setDraft(text)`。
     // ⚠️ "能不能发"由输入区状态机（`composerState.ts#canSend`）判，这里**不再判一次**：
     // 两处判据必然漂移（最典型：这里放行了、按钮却是灰的，用户看到"没反应"）
+    const sentAttachments = attachments
     setDraft('')
-    const outcome = await send(text, selectedModelId)
+    setAttachments([])
+    const outcome = await send(text, selectedModelId, sentAttachments)
     if (!outcome.ok) {
       // 前置失败（401/400/404/409 只读/424 缺凭据）与**同标签页重复发送**（`BUSY`）：
-      // 这一轮一个字都没落库 ⇒ 界面上不该留下它，正文还给输入框，用户不必重打
+      // 这一轮一个字都没落库 ⇒ 界面上不该留下它，正文与附件还给输入区，用户不必重来
       setDraft(text)
+      setAttachments(sentAttachments)
       feedback.fail(outcome.error, '发送失败')
     }
-  }, [draft, feedback, send, selectedModelId])
+  }, [attachments, draft, feedback, send, selectedModelId])
 
   /**
    * 点「停止」（`03` §4.1 的时序在 `useChatStream` → `stopController`，这里只报告结果）。
@@ -407,6 +526,20 @@ export function ChatPage() {
       }
     })
   }, [feedback, stop])
+
+  /**
+   * 点「重新生成」（P1-3）：**重跑最新一轮的问题、替换当前回答**。
+   *
+   * 走的是当前选中的模型（`selectedModelId`）—— 于是"换个模型重跑一遍"就是先在选择器里选好、
+   * 再点重新生成。失败（前置失败：会话只读 / 模型不可用 / 缺凭据 / 并发冲突）与发送同口径：
+   * 只给一条提示，界面上原有的一轮**不动**（后端那一步大概率也没发生）。
+   */
+  const handleRegenerate = useCallback((): void => {
+    if (regenerable === null) return
+    void regenerate(regenerable.userText, selectedModelId).then((outcome) => {
+      if (!outcome.ok) feedback.fail(outcome.error, '重新生成失败')
+    })
+  }, [regenerable, regenerate, selectedModelId, feedback])
 
   /**
    * 点黄条 = 对齐历史（`03` §4.1）。结果分三档，**提示的口径也跟着分**（`alignHistory.ts`）：
@@ -709,6 +842,8 @@ export function ChatPage() {
                 recallable={recallable}
                 onRecall={(text, hadTools) => openRecall(text, hadTools, false)}
                 onResend={(text, hadTools) => openRecall(text, hadTools, true)}
+                regenerable={regenerable}
+                onRegenerate={handleRegenerate}
               />
             </StreamFrame>
           )}
@@ -750,6 +885,10 @@ export function ChatPage() {
             onStop={handleStop}
             onConfirmAnswer={handleConfirmAnswer}
             confirmPending={confirmPending}
+            attachments={attachments}
+            uploading={uploading}
+            onPickFiles={handlePickFiles}
+            onRemoveAttachment={handleRemoveAttachment}
           />
         </main>
 

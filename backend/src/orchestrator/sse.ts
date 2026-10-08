@@ -111,6 +111,7 @@ import {
   getRedis,
 } from '../infra/redis.js'
 import { LlmAbortError, type LlmTarget } from '../llm/client.js'
+import type { ChatAttachmentContext } from '../services/file.service.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 常量与纯函数
@@ -553,9 +554,13 @@ export interface ChatProducerInput {
    * 为什么由出口层转交、而不是让编排层回头查库：这条消息**此刻还没落库**
    * （落库发生在 `done`，见 `02` §5.2"事件即真相"），而它同时是"检索的 query"与
    * "落库时用户消息的正文"（P0-1-27 的编排循环两处都要用）。
-   * 传引用/传引用类型（而不是整个 body）是刻意的：附件（P1）之类的新字段不会顺着这里流进去。
    */
   content: string
+  /**
+   * 本轮附件（**P1-4**；已归属校验 + 已解析，见 `services/file.service.ts#ChatAttachmentContext`）。
+   * 空数组 = 没有附件。编排层只用它两件事：拼本轮用户消息的报文、随用户消息落库 `content.attachments`。
+   */
+  attachments: readonly ChatAttachmentContext[]
   /** 已解析的上游目标（含明文 Key ⇒ 只进内存，日志用 `describeTarget`） */
   target: LlmTarget
   /** 本次流的开始时刻（ISO 8601）—— 同时也是锁的归属标识（见文件头 ③） */
@@ -1125,9 +1130,23 @@ export interface StreamChatReplyInput {
   agentId: string
   /** 本轮用户消息正文（`shared` 的 `chatRequestBodySchema` 已 trim）—— 转交给 producer */
   content: string
+  /** 本轮附件（P1-4；已解析）—— 转交给 producer，`regenerate` 恒传空数组 */
+  attachments?: readonly ChatAttachmentContext[]
   target: LlmTarget
   /** 编排循环（P0-1-27）；本批是占位实现，见 `orchestrator/index.ts` */
   producer: ChatProducer
+  /**
+   * 拿到会话互斥锁之后、写出任何响应之前执行的准备动作（**P1-3 重新生成**的唯一用途）。
+   *
+   * 为什么入口在这里、而不是在路由里：它要删掉"上一轮"（用户名下的消息 + 产物），
+   * 而**删必须发生在锁之后** —— 拿不到锁即意味着这个会话已有另一条流在跑，
+   * 那时删掉的是**别人正在写的历史**（症状：另一条流的落库凭空少一轮）。
+   * 路由层拿到不到"锁已就绪"这一刻，故由本层在 ② 之后回调它。
+   *
+   * ⚠️ 它被安排在 `reply.hijack()` **之前**：失败（如会话在闸门之后被删）走的是
+   * **JSON 信封**（Fastify errorHandler）而不是一个 SSE `error` 帧 —— 与其余前置失败同口径。
+   */
+  onLockAcquired?: () => Promise<void>
 }
 
 /**
@@ -1178,7 +1197,7 @@ async function writeSseErrorReply(reply: FastifyReply, payload: SseErrorPayload)
  * （ALS 会传播到其后创建的异步资源）⇒ 心跳与收尾日志天然与发起请求对齐（`02` §十三）。
  */
 export async function streamChatReply(input: StreamChatReplyInput): Promise<void> {
-  const { reply, conversationId, agentId, content, target, producer } = input
+  const { reply, conversationId, agentId, content, attachments, target, producer, onLockAcquired } = input
   const logger = getLogger()
   const startedAt = new Date().toISOString()
 
@@ -1205,6 +1224,11 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
   try {
     // ② 残留停止信号：两道防线里的第二道（第一道在 `/stop` 侧的 EXISTS，见 `signalStop`）
     await clearStopSignal(conversationId)
+
+    // ②′ 锁已就绪的准备动作（**P1-3 重新生成**：先撤掉上一轮再跑全新的流）。
+    //     位置见 `StreamChatReplyInput#onLockAcquired`：必须在锁之后（否则会删掉别人的历史）、
+    //     且必须在 `hijack()` 之前（失败走 JSON 信封）。它抛错 ⇒ 外层 finally 释放锁、异常照常上抛。
+    if (onLockAcquired !== undefined) await onLockAcquired()
 
     // ③④ 接管响应
     reply.hijack()
@@ -1255,6 +1279,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
         conversationId,
         agentId,
         content,
+        attachments: attachments ?? [],
         target,
         startedAt,
         signal: channel.signal,

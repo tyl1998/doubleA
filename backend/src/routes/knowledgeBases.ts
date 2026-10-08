@@ -41,6 +41,7 @@ import {
   createKnowledgeBase,
   getKnowledgeBase,
   listKnowledgeBases,
+  rebuildKnowledgeBase,
   removeKnowledgeBase,
   updateKnowledgeBase,
 } from '../services/kb.service.js'
@@ -89,6 +90,25 @@ export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
     '/api/knowledge-bases/:id',
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
     async (request) => ok(await removeKnowledgeBase(request.params.id)),
+  )
+
+  /**
+   * 整库重建（登录即可；P1-5，`02` §4.6 的 `POST /:id/rebuild`）。
+   *
+   * 把该库全部文档逐篇按 `REBUILD` 重新入队，用该库**当前选定**的 embedding 模型重跑
+   * 解析 → 分块 → 向量化 → 入库（`子方案①` §八："换模型后整库重建"）。
+   *
+   * 三条口径（细节在服务层文件头）：**先把全库翻成 `PARSING`**（否则 worker 会因"已是 READY"
+   * 全部跳过）、**刻意不清旧 chunk**（重建窗口内检索照常命中旧内容 ⇒ 无检索空窗）、
+   * 入队**逐篇失败隔离**并把 `failed` 数量如实回报。响应 `{ id, total, enqueued, failed }`。
+   *
+   * ⚠️ 无请求体：重建用的模型由库自己决定（`embeddingModelId` **不可改**，`shared` 的
+   *    `updateKnowledgeBaseBodySchema` 注释）。维度变化的新表切换不在本批范围。
+   */
+  app.post<{ Params: KnowledgeBaseIdParams }>(
+    '/api/knowledge-bases/:id/rebuild',
+    { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
+    async (request) => ok(await rebuildKnowledgeBase(request.params.id)),
   )
 
   /**

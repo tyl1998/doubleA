@@ -164,6 +164,33 @@ export const MIME_BY_EXTENSION: Readonly<Record<UploadExtension, readonly string
   bmp: ['image/bmp', 'image/x-ms-bmp'],
 }
 
+/**
+ * 对话附件**额外**支持的纯文本格式（**P1-4 补 · 2026-10-01**）：`json` / `csv`。
+ *
+ * ⚠️ **刻意不进 `UPLOAD_EXTENSIONS`**：那是**知识库文档**的白名单（含其解析流水线能力），
+ * 知识库格式已被需求收窄为 pdf/docx/md/txt（连 `.doc` 都拒绝）—— 把 json/csv 混进去会
+ * 让知识库也放行它，而流水线没有为它们做结构性解析。对话附件是另一条链路（文本解析注入），
+ * 故它有自己的白名单（见后端 `pipeline/parse` 的 `CHAT_ATTACHMENT_FORMAT_PROFILE`）。
+ */
+export const CHAT_ATTACHMENT_TEXT_EXTENSIONS = ['json', 'csv'] as const
+export type ChatAttachmentTextExtension = (typeof CHAT_ATTACHMENT_TEXT_EXTENSIONS)[number]
+
+/** 对话附件的完整扩展名白名单 = 文档白名单 + {@link CHAT_ATTACHMENT_TEXT_EXTENSIONS} */
+export const CHAT_ATTACHMENT_EXTENSIONS = [...UPLOAD_EXTENSIONS, ...CHAT_ATTACHMENT_TEXT_EXTENSIONS] as const
+export type ChatAttachmentExtension = (typeof CHAT_ATTACHMENT_EXTENSIONS)[number]
+
+/**
+ * 对话附件的「扩展名 → 允许声明的 MIME」表（第三道校验用；`application/octet-stream` 一律放行）。
+ *
+ * `json` / `csv` 都放行 `text/plain`：不少系统（含部分浏览器 / 代理）会把它们报成 plain text，
+ * 那**不是**矛盾声明（真正能抓住"改名"的是文件头与扩展名，而不是声明）。
+ */
+export const MIME_BY_CHAT_ATTACHMENT_EXTENSION: Readonly<Record<ChatAttachmentExtension, readonly string[]>> = {
+  ...MIME_BY_EXTENSION,
+  json: ['application/json', 'text/json', 'text/plain'],
+  csv: ['text/csv', 'application/csv', 'text/plain', 'application/vnd.ms-excel'],
+}
+
 /** 文档列表项 / 上传响应里的文档对象（`GET .../documents` 是 P0-1-21，**同一套投影**） */
 export const documentItemSchema = z.object({
   id: z.string(),

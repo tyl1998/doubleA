@@ -37,7 +37,8 @@
  * 卡片只接受一个已经算好的字符串。
  */
 
-import { Button } from 'antd'
+import { Button, Popconfirm } from 'antd'
+import { useState } from 'react'
 
 import { useArtifactDownload } from '../../components/ArtifactPreview/useArtifactDownload.js'
 import { previewAvailability } from '../../components/ArtifactPreview/artifactPreview.js'
@@ -51,6 +52,13 @@ export interface ArtifactCardProps {
    * `null` / `undefined` = 这一处不显示时间（消息流：流式产物没有落库时刻）。
    */
   timeText?: string | null
+  /**
+   * 提供时渲染「删除」按钮（**会话产物页**用；对话页 / 产物面板不传 ⇒ 行为逐字不变）。
+   *
+   * 删除是**真删除**（对象 + 行），故做成 `Popconfirm` 二次确认；`onDelete` 返回 Promise
+   * 时按钮进入 loading 直到它落定 —— 失败由调用方（页面）统一提示。
+   */
+  onDelete?: () => Promise<void> | void
 }
 
 /** 文件大小（`artifact.size` 是字节数）—— 人类可读，1 位小数 */
@@ -67,9 +75,10 @@ function kindOf(fileName: string): string {
   return fileName.slice(dot + 1).toUpperCase().slice(0, 4)
 }
 
-export function ArtifactCard({ artifact, timeText = null }: ArtifactCardProps) {
+export function ArtifactCard({ artifact, timeText = null, onDelete }: ArtifactCardProps) {
   const openPreview = useArtifactPreviewStore((state) => state.openPreview)
   const { downloading, download } = useArtifactDownload()
+  const [deleting, setDeleting] = useState(false)
 
   // 「这个产物能不能预览」—— 唯一的判据（见文件头）。不可预览时不渲染按钮，
   // 而不是渲染一个置灰的：`none` 与"超大"是两件不同的事，但结论相同（只有下载）。
@@ -108,6 +117,29 @@ export function ArtifactCard({ artifact, timeText = null }: ArtifactCardProps) {
         >
           下载
         </Button>
+        {onDelete ? (
+          <Popconfirm
+            title="删除这个产物？"
+            description="删除后不可恢复：文件与记录都会一并移除。"
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            onConfirm={async () => {
+              setDeleting(true)
+              try {
+                await onDelete()
+              } catch {
+                // 删除失败由调用方（页面）统一提示；这里只负责结束 loading，不再往外抛
+              } finally {
+                setDeleting(false)
+              }
+            }}
+          >
+            <Button size="small" danger loading={deleting}>
+              删除
+            </Button>
+          </Popconfirm>
+        ) : null}
       </div>
     </div>
   )

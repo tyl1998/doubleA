@@ -66,6 +66,7 @@
  */
 
 import {
+  AGENT_NAME_MAX_CHARS,
   AppError,
   canEditAgent,
   normalizeGuideQuestions,
@@ -410,6 +411,98 @@ export async function createAgent(
   )
   // 刚建的必然没有组件绑定，不必再查库
   return toItem(created, [], viewer)
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 复制（P1-2）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 复制体的名字后缀（`01` §3.3「复制 Agent」的默认命名） */
+const COPY_NAME_SUFFIX = '（副本）'
+
+/**
+ * 复制体的名字：原名 + 「（副本）」；原名过长时**截断原名**，保证总长不超过 `AGENT_NAME_MAX_CHARS`。
+ *
+ * 只截原名不截后缀：后缀是"这是一份副本"的唯一标记，截了它反而与原件分不清。
+ */
+function copyNameOf(sourceName: string): string {
+  const max = AGENT_NAME_MAX_CHARS - COPY_NAME_SUFFIX.length
+  const base = sourceName.length > max ? sourceName.slice(0, Math.max(0, max)) : sourceName
+  return `${base}${COPY_NAME_SUFFIX}`
+}
+
+/**
+ * 复制智能体（`POST /api/agents/:id/copy`，**登录即可**；P1-2）。
+ *
+ * 「含组件绑定整份拷贝」：新行逐字沿用源的全部可配置字段（描述 / 图标 / 类型 / 系统提示词 /
+ * 开场白 / 引导问题 / 默认模型 / 模型池）+ 组件绑定；**只改两处** —— `name`（加「（副本）」）
+ * 与 `createdBy`（= 调用者）。复制体**归调用者**，因此他随后可自由编辑/删除它。
+ *
+ * 三条口径（都与"看起来该怎么做"不同，各有理由）：
+ *  ① **不要求源可编辑**（`canEditAgent` 不用）：`GET /api/agents/:id` 本来就对全员开放、
+ *     详情**含系统提示词** ⇒ 复制不泄露任何"看不到"的东西；而语义是"以别人建好的智能体为模板
+ *     起一个自己的副本"，把权限收成 `canEdit` 会让"复制"变成"只有作者能复制"（`01` §3.3 没这条）。
+ *  ② **模型与组件逐字照搬、不重新校验**：源在库里的样子就是它当下的真实状态（模型被停用/被删时
+ *     外键已把它解绑或清空池行）。若照 `createAgent` 那样 `assertChatModelsBindable`，会出现
+ *     "源里某个模型事后被停用 ⇒ 连复制都失败" —— 而用户要的只是"照着它拷一份"。
+ *  ③ **建 agent / 落模型池 / 落组件在同一事务**：复制要么整份成功，要么一行都不建（不留半份）。
+ *
+ * 名称**不查重**（与 {@link createAgent} 同款：`agents` 上没有 `name` 唯一约束），
+ * 多次复制得到多个「xxx（副本）」由 id 区分。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 源不存在或已软删
+ */
+export async function copyAgent(id: string, viewer: AgentViewer): Promise<AgentItem> {
+  const db = getPrisma()
+  const source = await db.agent.findFirst({
+    where: { id, deletedAt: null },
+    select: AGENT_SELECT,
+  })
+  if (source === null) throw AppError.notFound('智能体不存在')
+
+  const pool = source.pool.map((entry) => entry.modelId)
+  const components = await componentsOf(id)
+
+  const created = await db.$transaction(async (tx) => {
+    const agent = await tx.agent.create({
+      data: {
+        name: copyNameOf(source.name),
+        description: source.description,
+        icon: source.icon,
+        type: source.type,
+        systemPrompt: source.systemPrompt,
+        openingRemarks: source.openingRemarks,
+        // 经唯一入口归一（jsonb 可能是任何形状）后再落库
+        guideQuestions: normalizeGuideQuestions(source.guideQuestions),
+        modelId: source.modelId,
+        createdBy: viewer.id,
+        pool: { create: pool.map((modelId) => ({ modelId })) },
+      },
+      select: AGENT_SELECT,
+    })
+    if (components.length > 0) {
+      await tx.agentComponent.createMany({
+        data: components.map((ref) => ({
+          agentId: agent.id,
+          componentType: ref.componentType,
+          refId: ref.refId,
+        })),
+      })
+    }
+    return agent
+  })
+
+  getLogger().info(
+    {
+      agentId: created.id,
+      copiedFrom: id,
+      name: created.name,
+      poolSize: pool.length,
+      componentCount: components.length,
+    },
+    '已复制智能体（含模型池与组件绑定）',
+  )
+  return toItem(created, components, viewer)
 }
 
 // ═════════════════════════════════════════════════════════════════════

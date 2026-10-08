@@ -23,10 +23,11 @@
  * 而"哪个 handler 漏了一次判定"是这类越权最经典的来源。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 刻意**尚未注册**的两条路由（不要顺手补）
+ * 刻意**尚未注册**的路由（不要顺手补）
  * ─────────────────────────────────────────────────────────────────────
- *   · `POST /api/agents/:id/copy` —— **P1**（`02` §4.4 已标 P1、`01` §3.3 复制 Agent 也是 P1）。
- *     P0 不做，验收脚本里有一条"它必须 404"守着，防止有人"顺手"把它实现出来。
+ *   · `POST /api/agents/:id/copy` —— **P0 不做、P1-2 已落地**（见本文件末尾的复制路由）。
+ *     ⚠️ P0-1 当时的验收脚本有一条"它必须 404"守着"防顺手实现"，P1-2 落地时那条断言
+ *     **随脚本删除一并作废**（`verify-app.mjs` 已于 2026-09-24 整目录删除）。
  *   · `GET /api/agents/:id/conversations` —— **P0-1-25 已落地**（包 F 的会话管理），
  *     注册在 `routes/conversations.ts`（它读的是 `conversations` 表，见该文件头）。
  *     ⚠️ P0-1-22 时这一条在"刻意不做"清单里，P0-1-23 时 `PUT …/components` 也翻转过一次 ——
@@ -55,6 +56,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { requireAuthContext } from '../plugins/session.js'
 import {
+  copyAgent,
   createAgent,
   getAgent,
   listAgents,
@@ -107,6 +109,20 @@ export function registerAgentRoutes(app: FastifyInstance): void {
     '/api/agents',
     { preHandler: app.requireAuth, schema: { body: createAgentBodySchema } },
     async (request) => ok(await createAgent(request.body, viewerOf(request))),
+  )
+
+  /**
+   * 复制（**登录即可**；P1-2）。无请求体：新名字由服务端生成「原名（副本）」，
+   * 内容整份沿用源（含模型池与组件绑定），`createdBy` 记为**调用者**。
+   *
+   * ⚠️ **不做行级权限判定**（与 `PATCH`/`DELETE` 刻意不同）：源本就全员可见
+   * （详情含系统提示词），复制产出的新智能体归调用者，语义是"以它为模板起一个自己的"。
+   * 见服务层 `copyAgent` 的口径 ①。
+   */
+  app.post<{ Params: AgentIdParams }>(
+    '/api/agents/:id/copy',
+    { preHandler: app.requireAuth, schema: { params: agentIdParamsSchema } },
+    async (request) => ok(await copyAgent(request.params.id, viewerOf(request))),
   )
 
   /** 编辑（**登录即可进入，行级判定：创建者或 ADMIN**，否则 403） */

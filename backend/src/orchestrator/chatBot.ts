@@ -116,9 +116,11 @@ import {
   TOOL_CONFIRM_REJECTED_OUTPUT,
   TOOL_CONFIRM_TIMEOUT_OUTPUT,
   TOOL_LOOP_LIMIT_NOTICE,
+  attachmentItemsOf,
   buildAssistantToolCallsMessage,
   buildSystemPrompt,
   buildToolResultMessages,
+  buildUserChatMessage,
   knowledgeListTool,
   knowledgeSearchTool,
   selectHistoryMessages,
@@ -298,7 +300,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
     const messages: ChatMessage[] = [
       { role: 'system', content: buildSystemPrompt(agent.systemPrompt, knowledgeCatalog) },
       ...selectHistoryMessages(historyRows as HistoryRow[], rounds),
-      { role: 'user', content },
+      // 本轮用户消息 + 附件（P1-4）：图片→多模态 part、文本类→拼进正文（见 `buildUserChatMessage`）
+      buildUserChatMessage(content, input.attachments),
     ]
 
     // ── ⑤ LLM 流式调用 + 工具循环（`delta` / `thinking` 透传；P0-2-8 起含 MCP 工具）──
@@ -791,6 +794,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
     const messageId = await persistRoundQuietly({
       conversationId,
       content,
+      // 附件（P1-4）：随用户消息落库，刷新后用户气泡里仍能看到当时带过什么
+      attachments: attachmentItemsOf(input.attachments),
       assistantText,
       thinkingText,
       citations,

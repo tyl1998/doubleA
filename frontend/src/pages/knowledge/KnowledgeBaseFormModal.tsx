@@ -26,17 +26,22 @@
  */
 
 import { Alert, Input, InputNumber, Modal, Select } from 'antd'
-import type { KnowledgeBaseItem } from '@doubulea/shared'
+import { EMBEDDING_MODEL_CHANGE_REBUILD_HINT, type KnowledgeBaseItem } from '@doubulea/shared'
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
-import { useCreateKnowledgeBase, useUpdateKnowledgeBase } from '../../api/knowledgeBases.js'
+import {
+  useCreateKnowledgeBase,
+  useRebuildKnowledgeBase,
+  useUpdateKnowledgeBase,
+} from '../../api/knowledgeBases.js'
 import { useAvailableEmbeddingModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   buildCreateBody,
   buildKnowledgeUpdateBody,
   editValuesOf,
+  isEmbeddingModelChanged,
   validateChunking,
   type KnowledgeCreateFormValues,
   type KnowledgeEditFormValues,
@@ -55,6 +60,8 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   const feedback = useFeedback()
   const create = useCreateKnowledgeBase()
   const update = useUpdateKnowledgeBase()
+  // 换模型后自动触发整库重建（`kb` 为 null 时是创建形态，永不调用它）
+  const rebuild = useRebuildKnowledgeBase(kb?.id ?? '')
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -89,6 +96,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       const values = editValuesOf(kb)
       setName(values.name)
       setDescription(values.description)
+      setEmbeddingModelId(values.embeddingModelId)
       setChunkSize(values.chunkSize)
       setChunkOverlap(values.chunkOverlap)
     }
@@ -127,9 +135,11 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
     const values: KnowledgeEditFormValues = {
       name,
       description,
+      embeddingModelId,
       chunkSize: chunkSize ?? kb.chunkSize,
       chunkOverlap: chunkOverlap ?? kb.chunkOverlap,
     }
+    const modelChanged = isEmbeddingModelChanged(kb, embeddingModelId)
     const body = buildKnowledgeUpdateBody(kb, values)
     if (body === null) {
       feedback.note('没有需要保存的改动')
@@ -140,8 +150,23 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       { id: kb.id, body },
       {
         onSuccess: (saved) => {
-          feedback.ok(`已保存「${saved.name}」`)
           onClose()
+          // 换了模型：旧 chunk 不是新模型产的 ⇒ 立刻引导重建，否则该库向量检索实际停用。
+          // 无文档时没啥可重建（`rebuild` 后端也会 409），只提示已保存。
+          if (modelChanged && saved.documentCount > 0) {
+            rebuild.mutate(undefined, {
+              onSuccess: (result) =>
+                result.failed > 0
+                  ? feedback.note(
+                      `已更换向量模型；已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请到文档列表逐篇重试`,
+                    )
+                  : feedback.ok(`已更换向量模型，并开始重建 ${result.enqueued} 篇文档`),
+              // 重建没提交成功也不能说"保存失败"——模型已经换好了，只是需要手动去详情页点重建
+              onError: (error) => feedback.fail(error, '向量模型已更换，但整库重建未提交成功，请到详情页手动重建'),
+            })
+          } else {
+            feedback.ok(`已保存「${saved.name}」`)
+          }
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -189,25 +214,40 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
           />
         </div>
 
-        {!editing && (
-          <div>
-            <p className="block-label">Embedding 模型</p>
-            <Select
-              value={embeddingModelId === '' ? undefined : embeddingModelId}
-              options={embeddingOptions}
-              loading={embeddingModels.isPending}
-              placeholder="选择一个向量模型（模型池里「向量」类型的模型）"
-              style={{ width: '100%' }}
-              aria-label="Embedding 模型"
-              onChange={setEmbeddingModelId}
+        <div>
+          <p className="block-label">Embedding 模型</p>
+          <Select
+            value={embeddingModelId === '' ? undefined : embeddingModelId}
+            options={embeddingOptions}
+            loading={embeddingModels.isPending}
+            placeholder="选择一个向量模型（模型池里「向量」类型的模型）"
+            style={{ width: '100%' }}
+            aria-label="Embedding 模型"
+            onChange={setEmbeddingModelId}
+          />
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            {editing ? (
+              <>
+                本库的文本用它向量化。更换后会向新模型<strong>重探一次维度</strong>；
+                因为旧文档的向量是旧模型产出的，保存后平台会<strong>自动触发整库重建</strong>。
+              </>
+            ) : (
+              <>
+                本库的文本将用它向量化。建库时后端会向它<strong>探测一次维度</strong>并快照到本库；
+                之后入库与检索都按该维度进行。下拉里没有可选项？请先到「模型池」新增一个
+                <strong>向量类型</strong>的 Provider 及其模型。
+              </>
+            )}
+          </p>
+          {editing && kb !== null && isEmbeddingModelChanged(kb, embeddingModelId) && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 'var(--sp-2)' }}
+              message={EMBEDDING_MODEL_CHANGE_REBUILD_HINT}
             />
-            <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-              本库的文本将用它向量化。建库时后端会向它<strong>探测一次维度</strong>并快照到本库；
-              之后入库与检索都按该维度进行。下拉里没有可选项？请先到「模型池」新增一个
-              <strong>向量类型</strong>的 Provider 及其模型。
-            </p>
-          </div>
-        )}
+          )}
+        </div>
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>

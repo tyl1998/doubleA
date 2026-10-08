@@ -19,7 +19,7 @@
  * `artifacts` 段，写入端就是这里）；ChatBot 不传该参数 ⇒ 它的落库口径与从前**逐字不变**。
  */
 
-import type { ArtifactItem, CitationItem, MessageModelSegment, ToolCallRecord } from '@doubulea/shared'
+import type { ArtifactItem, AttachmentItem, CitationItem, MessageModelSegment, ToolCallRecord } from '@doubulea/shared'
 import { deriveConversationTopic } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
@@ -71,6 +71,11 @@ export interface UsageRecordInput {
 export interface PersistRoundInput {
   conversationId: string
   content: string
+  /**
+   * 本轮用户消息携带的附件（**P1-4**；落进 USER 消息的 `content.attachments` 段）。
+   * 不传 / 空数组都表示"本轮没有附件" —— 省键即"本来就没有"（与 `artifacts` 同口径）。
+   */
+  attachments?: readonly AttachmentItem[]
   assistantText: string
   thinkingText: string
   citations: CitationItem[]
@@ -131,6 +136,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
   const {
     conversationId,
     content,
+    attachments,
     assistantText,
     thinkingText,
     citations,
@@ -151,7 +157,16 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
     const db = getPrisma()
     return await db.$transaction(async (tx) => {
       await tx.message.create({
-        data: { conversationId, role: 'USER', content: { text: content } },
+        data: {
+          conversationId,
+          role: 'USER',
+          // 附件（P1-4）：只在非空时写这个键（省键 = 本轮没有附件，与 `buildAssistantContent` 同口径）。
+          // 它让"刷新后用户气泡里还能看到当时带过什么"成立（历史消息原样透出 `content`）。
+          content:
+            attachments === undefined || attachments.length === 0
+              ? { text: content }
+              : { text: content, attachments: [...attachments] },
+        },
       })
       let assistantMessageId: string | null = null
       if (hasAssistantContent) {

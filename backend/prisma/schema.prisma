@@ -215,6 +215,7 @@ model User {
   mcpCredentials McpCredential[]
   usageRecords   UsageRecord[]
   artifacts      Artifact[]
+  files          File[]
 
   @@map("users")
 }
@@ -866,4 +867,44 @@ model UsageRecord {
   /// "某段时间的全局用量"由分区裁剪（partition pruning）完成，再挂一个时间索引只增写放大。
   /// ⚠️ 也**刻意没有 `@@index([model])`**：按型号聚合是 P1 报表的事，届时按实际查询形状再加。
   @@map("usage_records")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// files（P1-4 文件附件；`02` §三 的 `files` 行）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// files —— 对话附件（P1-4）。一行 = 一次 `POST /api/files/upload` 落下的对象。
+///
+/// 三条口径：
+/// · **归属列是 `uploader_id`**（不是"会话"）：附件在**上传时**就存在，而会话可能要等
+///   首条消息发送才创建（`03` §4.1）⇒ 归属只能挂到人身上。取内容端点的判据就是它
+///   （`files → uploader_id = 调用者`，与 conversations 同族：**仅本人**，ADMIN 无后门）。
+/// · `file_key` 是 S3 对象键（`files/{uploaderId}/{随机段}/source.{ext}`），
+///   **不出现在任何对外契约里**（对外只有 `id`，见 `shared#attachmentItemSchema`）。
+/// · **行只增不删**：本批不提供删除入口（附件挂在历史消息上，删对象会让历史气泡里的图裂掉）。
+///   过期收口属后续批次（与 `artifacts` 的保留期清理同族）。
+///
+/// `mime` 是**服务端按扩展名定死**的那一个（不是客户端声明的那个）：它同时是取内容端点的
+/// `Content-Type` 与"图片/文本"判据的唯一来源（与 `artifacts.mime` 同一条纪律）。
+/// `kind`（IMAGE / DOCUMENT）由服务端在上传时判定并**随行返回**，前端据此选渲染器。
+model File {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  uploaderId String   @map("uploader_id") @db.Uuid
+  /// S3 对象键（存储层细节，不出现在对外契约里）
+  fileKey    String   @map("file_key") @db.VarChar(512)
+  /// 用户上传时的原始文件名（展示用；不改写、不剥路径 —— 与 `documents.file_name` 同口径）
+  name       String   @db.VarChar(255)
+  size       Int
+  /// 服务端按扩展名定死的 MIME（见上方口径）
+  mime       String   @db.VarChar(255)
+  /// IMAGE / DOCUMENT（`shared#CHAT_ATTACHMENT_KINDS`）；决定"多模态直读 / 解析注入"
+  kind       String   @db.VarChar(16)
+  /// ⚠️ 由**调用方显式传入**（本机 PG 会话时区非 UTC 时 `@default(now())` 会偏一个时区）
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  uploader User @relation(fields: [uploaderId], references: [id], onDelete: Restrict)
+
+  /// 「我的附件」列表与取内容时的归属校验扫描键
+  @@index([uploaderId, createdAt(sort: Desc)])
+  @@map("files")
 }

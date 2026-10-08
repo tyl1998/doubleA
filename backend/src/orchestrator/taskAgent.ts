@@ -145,9 +145,12 @@ import {
   KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
   KNOWLEDGE_TOOL_SERVER_NAME,
   KNOWLEDGE_USAGE_RULES,
+  ATTACHMENT_CONTEXT_NOTE,
   RETRIEVAL_RULES,
+  attachmentItemsOf,
   formatKnowledgeCatalog,
 } from './chatContext.js'
+import { taskAttachmentPromptBlock, writeAttachmentFiles } from './attachmentFiles.js'
 import { boundKnowledgeBaseIds, loadKnowledgeCatalog } from './knowledgeTools.js'
 import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
@@ -377,6 +380,26 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         )
       }
 
+      // ★ 附件（P1-4，2026-10-01 修订）—— 两件事，且**都必须在拍基线之前**：
+      //   ① 原文件写进容器 `/work/attachments/`（写晚了会被当成"本轮 agent 新产物"上传）；
+      //   ② 拼 prompt 块：文本类的正文直接可读，所有文件的容器内路径都告诉 agent。
+      //   ⚠️ 引擎经 pi 只有 `prompt` 文本通道 ⇒ **图片不能直接"看"**，但文件本体落盘后
+      //   agent 可以用工具处理（尺寸/转码/图像工具）。写失败只 warn：文本类正文仍已可用。
+      //   **落库仍是 `content` 原文**，界面气泡的附件由 `persist` 另存（见其调用处）。
+      let attachmentPaths: string[] | null = null
+      if (input.attachments.length > 0) {
+        try {
+          attachmentPaths = await writeAttachmentFiles(handle.containerId, input.attachments)
+        } catch (error) {
+          logger.warn(
+            { err: error, conversationId, containerId: handle.containerId },
+            '附件写入容器失败（本轮 agent 拿不到文件本体；文本类正文仍拼进了 prompt）',
+          )
+        }
+      }
+      const attachmentBlock = taskAttachmentPromptBlock(input.attachments, attachmentPaths, ATTACHMENT_CONTEXT_NOTE)
+      if (attachmentBlock !== '') engineContent = `${attachmentBlock}\n\n${engineContent}`
+
       baseline = await snapshotWorkFiles(handle.containerId)
 
       // ═════════════════════════════════════════════════════════════
@@ -481,7 +504,18 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       engineStarted = true // 计量判据（见收尾处）：从这一行起，token 就已经可能花出去了
       enqueue([{ name: 'status', data: { text: '任务运行中…' } }])
-      outcome = await bridge.runTurn(engineContent, { signal })
+      // 图片附件（P1-4）：走 pi RPC `prompt.images` 原生字段（引擎模型需支持图片输入，闸门已拦）。
+      // 与"写进容器"并存：容器里是原文件（可被工具处理），这里是让**模型**直接看到。
+      const imageParts = input.attachments
+        .filter(
+          (item): item is typeof item & { dataBase64: string } =>
+            item.kind === 'IMAGE' && typeof item.dataBase64 === 'string' && item.dataBase64 !== '',
+        )
+        .map((item) => ({ type: 'image' as const, data: item.dataBase64, mimeType: item.mime }))
+      outcome = await bridge.runTurn(engineContent, {
+        signal,
+        ...(imageParts.length === 0 ? {} : { images: imageParts }),
+      })
     } catch (error) {
       // 中断与故障在这里**都只是"记下来"**，统一的收尾在下面（顺序即优先级，与 chatBot 同款）
       failure = error
@@ -623,6 +657,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   const messageId = await persistRoundQuietly({
     conversationId,
     content,
+    // 附件（P1-4）：随用户消息落库（刷新后气泡上仍能看到当时带过什么）
+    attachments: attachmentItemsOf(input.attachments),
     assistantText: round.assistantText,
     thinkingText: round.thinkingText,
     // TaskAgent **不发引用卡**（那一族是 ChatBot 的 rendering）：知识库走**内置工具卡**

@@ -58,6 +58,7 @@ import {
   type ModelOption,
   type ModelProviderItem,
   type OffsetPage,
+  type ProbeChatResult,
   type ProviderBoundModelsResult,
   type RemoteModelListResult,
   type RemoveModelProviderResult,
@@ -70,8 +71,9 @@ import { config } from '../config.js'
 import { decryptSecret, encryptSecret } from '../infra/crypto.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import { describeTarget, fetchRemoteModels, type LlmTarget } from '../llm/client.js'
+import { chat, describeTarget, fetchRemoteModels, type LlmTarget } from '../llm/client.js'
 import { probeEmbeddingDim } from '../llm/embedding/index.js'
+import { protocolOf } from '../llm/protocol.js'
 import { resolveUpstreamUrl } from '../llm/upstream.js'
 
 /**
@@ -1089,6 +1091,69 @@ export async function probeModelEmbedding(input: {
       { baseUrl: credential.baseUrl, customUrl: credential.customUrl },
       multimodal ? '/embeddings/multimodal' : '/embeddings',
     ),
+  }
+}
+
+/**
+ * 按**表单值**测试一个对话模型能不能用（`POST /api/models/probe-chat`，仅 ADMIN；P1-1）。
+ *
+ * **不落库、不改状态**：让管理员在建/改**对话模型**时**当场**验证
+ * `baseUrl` / Key / 协议 / 型号名这一整条链路 —— 走的是与真实对话**同一个** `chat()`
+ * （`llm/client.ts`），只是把 `max_tokens` 压到 `1`、消息压到一条 `ping`。
+ * 用真实链路而不是另写一个"探活"的好处：**协议差异（路径 / 鉴权头 / 必填字段）自动被验证到**，
+ * 不会出现"探测说通、一发消息就 400"。
+ *
+ * ⚠️ 与 {@link resolveChatTarget} 的区别：那条要求"模型已落库 + 已启用 + Provider 配了 Key"
+ * （它服务的是真实对话）；探测服务的是**还没保存的表单值** ⇒ 只校验 Provider 存在且启用，
+ * **不要求 Key**（自建/内网实现常免鉴权，让上游自己回答"通不通"）。也不请求深度思考
+ * （探测不该因为一个思考参数把上游打 400）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) Provider 不存在 / `CONFLICT`(409) Provider 已停用 /
+ *   `UPSTREAM_ERROR`(502) 上游非 2xx 或报文不可解析 / `UPSTREAM_TIMEOUT`(504) 超时
+ *   （消息含请求 URL 与上游原文，界面直接展示）
+ */
+export async function probeModelChat(input: {
+  providerId: string
+  modelName: string
+}): Promise<ProbeChatResult> {
+  const db = getPrisma()
+  const provider = await db.modelProvider.findUnique({
+    where: { id: input.providerId },
+    select: { id: true, enabled: true },
+  })
+  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (!provider.enabled) throw AppError.conflict('该 Provider 已停用，无法测试；请先启用它')
+
+  const credential = await readProviderCredential(input.providerId)
+  // 手工组装一个"未落库"的目标：`modelId` 给空串（日志里用 label 区分），其余字段与
+  // `resolveChatTarget` 的产物同形，只是能力位一律取保守值（探测不做多模态/思考）。
+  const target: LlmTarget = {
+    modelId: '',
+    modelName: input.modelName,
+    label: input.modelName,
+    maxContext: null,
+    supportsVision: false,
+    supportsReasoning: false,
+    providerId: input.providerId,
+    providerName: credential.providerName,
+    protocol: credential.protocol,
+    baseUrl: credential.baseUrl,
+    customUrl: credential.customUrl,
+    apiKey: credential.apiKey,
+  }
+
+  const result = await chat(target, [{ role: 'user', content: 'ping' }], { maxTokens: 1 })
+  return {
+    providerName: credential.providerName,
+    modelName: input.modelName,
+    // 路径随协议变（`/chat/completions` / `/responses` / `/messages`）—— 从协议钩子取，不在这里写死
+    url: resolveUpstreamUrl(
+      { baseUrl: credential.baseUrl, customUrl: credential.customUrl },
+      protocolOf(credential.protocol).chatPath,
+    ),
+    reply: result.text,
+    finishReason: result.rawFinishReason,
+    durationMs: result.durationMs,
   }
 }
 

@@ -100,6 +100,17 @@ export function setUnauthorizedHandler(handler: (() => void) | undefined): void 
  */
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
 
+/**
+ * 拼一个**可直接放进 `src` / 打开**的完整接口地址（P1-4 的附件缩略图用）。
+ *
+ * ⚠️ 只给"浏览器自己发请求"的场景（`<img src>`）：它**走不了** {@link request} 那套信封解析，
+ * 所以只适用于"成功即字节流、失败体面降级"的端点（附件取内容的失败由 `onError` 兜底）。
+ * 常规接口一律走 {@link request} / {@link requestFormData}，别用它绕开错误处理。
+ */
+export function apiUrl(path: string): string {
+  return `${API_BASE_URL}${path}`
+}
+
 function isEnvelope(value: unknown): value is Envelope<unknown> {
   if (typeof value !== 'object' || value === null) return false
   // 先收敛成 `Record<string, unknown>` 再逐字段看：直接写 `'code' in value && …` 会让

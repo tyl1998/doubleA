@@ -44,6 +44,7 @@ import {
   type KnowledgeBaseItem,
   type ListKnowledgeBasesQuery,
   type OffsetPage,
+  type RebuildKnowledgeBaseResult,
   type RemoveKnowledgeBaseResult,
   type RetrievalConfig,
   type UpdateKnowledgeBaseBody,
@@ -54,6 +55,7 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { getS3Client } from '../infra/s3.js'
 import { apiEmbeddingName, probeEmbeddingDim } from '../llm/embedding/index.js'
+import { enqueuePipelineJob } from '../pipeline/queue.js'
 import { resolveEmbeddingTarget } from './model.service.js'
 
 /**
@@ -276,26 +278,29 @@ export async function getKnowledgeBase(id: string): Promise<KnowledgeBaseItem> {
 // 建
 // ═════════════════════════════════════════════════════════════════════
 
-/**
- * 建库（`POST /api/knowledge-bases`，登录即可）。
- *
- * 流程：取 embedding 快照（取不到直接 500，见文件头 ②）→ 快照环境默认值 →
- * 用请求体覆盖 → 校验跨字段约束 → 落库。
- *
- * **`chunk_overlap < chunk_size` 在服务层校验而不是 zod**：两者可只给其一
- * （省略的那个取环境默认值），zod 看不到"省略的那个会变成多少" —— 只有这里能算。
- * （`config.ts` 对两个**环境变量**做过同样的校验，那是"默认值自身合法"的另一层。）
- */
-export async function createKnowledgeBase(
-  input: CreateKnowledgeBaseBody,
-): Promise<KnowledgeBaseItem> {
-  const db = getPrisma()
-  const defaults = snapshotDefaults()
+/** 一个 embedding 模型 → 建库/换模型要写进 `knowledge_bases` 的三元组 */
+interface EmbeddingSnapshot {
+  /** `EmbeddingProvider.name()`（`api:<模型名>`）——"当前向量来源"的判据 */
+  embeddingModel: string
+  embeddingModelId: string
+  embeddingDim: number
+}
 
-  // ① 解析建库时**选定**的 embedding 模型（必须存在、是 EMBEDDING 类型、模型与 Provider 都启用）
-  const target = await resolveEmbeddingTarget(input.embeddingModelId)
-  // ② 维度：优先用**建模型时探测好的**维度（`models.embedding_dim`）；
-  //    缺失（本功能上线前建的向量模型）才现场探测一次兜底。
+/**
+ * 解析"这个 embedding 模型建库/换模型时该快照成什么"（建库与换模型**共用**的唯一实现）。
+ *
+ * 三步：① `resolveEmbeddingTarget` 校验模型存在、是 `EMBEDDING` 类型、模型与 Provider 都启用；
+ * ② 维度优先用**建模型时探测好的** `models.embedding_dim`，缺失（本功能上线前建的向量模型）
+ *    才现场 `probeEmbeddingDim` 兜底；③ 名字取 `apiEmbeddingName(modelName)`。
+ *
+ * ⚠️ 维度快照是换模型能否安全重建的前提：`chunks.embedding` 无固定维度、按\
+ *    `chunks.embedding_dim` 逐行收窄（见 `20260930140000_kb_embedding_model` 迁移），
+ *    所以任何维度都能换，但**探测不出维度就不让换**（否则入库会写出一批维度未知的向量）。
+ *
+ * @throws {AppError} 模型不可用（`resolveEmbeddingTarget`） / `VALIDATION`(400) 维度探测失败
+ */
+async function resolveEmbeddingSnapshot(modelId: string): Promise<EmbeddingSnapshot> {
+  const target = await resolveEmbeddingTarget(modelId)
   let embeddingDim = target.embeddingDim
   if (embeddingDim === null) {
     try {
@@ -318,7 +323,32 @@ export async function createKnowledgeBase(
       )
     }
   }
-  const embeddingModel = apiEmbeddingName(target.modelName)
+  return {
+    embeddingModel: apiEmbeddingName(target.modelName),
+    embeddingModelId: target.modelId,
+    embeddingDim,
+  }
+}
+
+/**
+ * 建库（`POST /api/knowledge-bases`，登录即可）。
+ *
+ * 流程：取 embedding 快照（取不到直接 500，见文件头 ②）→ 快照环境默认值 →
+ * 用请求体覆盖 → 校验跨字段约束 → 落库。
+ *
+ * **`chunk_overlap < chunk_size` 在服务层校验而不是 zod**：两者可只给其一
+ * （省略的那个取环境默认值），zod 看不到"省略的那个会变成多少" —— 只有这里能算。
+ * （`config.ts` 对两个**环境变量**做过同样的校验，那是"默认值自身合法"的另一层。）
+ */
+export async function createKnowledgeBase(
+  input: CreateKnowledgeBaseBody,
+): Promise<KnowledgeBaseItem> {
+  const db = getPrisma()
+  const defaults = snapshotDefaults()
+
+  // 解析建库时**选定**的 embedding 模型 → `{ embeddingModel, embeddingModelId, embeddingDim }`
+  const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId)
+  const { embeddingModel, embeddingDim } = snapshot
 
   const chunkSize = input.chunkSize ?? defaults.chunkSize
   const chunkOverlap = input.chunkOverlap ?? defaults.chunkOverlap
@@ -332,7 +362,7 @@ export async function createKnowledgeBase(
       name: input.name,
       description: input.description ?? null,
       embeddingModel,
-      embeddingModelId: target.modelId,
+      embeddingModelId: snapshot.embeddingModelId,
       embeddingDim,
       chunkSize,
       chunkOverlap,
@@ -369,17 +399,26 @@ function assertChunkWindow(chunkSize: number, chunkOverlap: number): void {
 /**
  * 改库（`PATCH /api/knowledge-bases/:id`，登录即可）。
  *
- * 三个"局部改动"的语义都在这里收口（契约侧的注释解释了为什么）：
+ * 四个"局部改动"的语义都在这里收口（契约侧的注释解释了为什么）：
  * · `description` 三态：不带 = 不动 / `null` = 清空 / 字符串 = 设置；
  * · `chunkSize` / `chunkOverlap` 只给一个时，另一个保持**当前值**（然后一起过跨字段校验）；
  * · `retrievalConfig` 与**当前生效值**合并（先 `normalize` 出完整形状再覆盖），
- *   所以"只调 topK"不会把 `mode` 打回默认值。
+ *   所以"只调 topK"不会把 `mode` 打回默认值；
+ * · `embeddingModelId`（P1-5）：换库选定的向量模型。
  *
  * ⚠️ 改 `chunk_size` / `chunk_overlap` / `retrieval_config` **不会**自动重建已入库文档
  *    （`子方案①` §十一："改 KB 参数不自动重建已入库文档（需手动触发，避免意外大规模重跑）"）。
  *    这就是为什么这里**不做**"改了就重跑"——静默重跑一个百万 chunk 的库是最糟的行为。
  *
- * @throws {AppError} `NOT_FOUND`(404) / `VALIDATION`(400) 跨字段不合法
+ * ⚠️ **换模型（`embeddingModelId`）同样不在这里自动重跑**，但语义与上面不同：换完之后旧 chunk
+ *    仍是旧模型产的向量 ⇒ 我们**只换 `embeddingModelId` + 重探 `embeddingDim`，刻意不动
+ *    `embeddingModel` 那个"向量来源"快照** ⇒ `embeddingModelChanged` 立刻变 `true`、详情页
+ *    出现"需重建"告警（前端保存后也会直接引导触发 `POST /:id/rebuild`）。检索侧不会崩：
+ *    不同维度时旧 chunk 被 `embedding_dim` 收窄过滤（向量路空、全文路照常），同维度时
+ *    相似度无意义但全文路可用 —— 都由那条告警覆盖。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) / `VALIDATION`(400) 跨字段不合法 / 换模型时模型不可用
+ *   （`resolveEmbeddingSnapshot`：停用/删除/维度探测失败）
  */
 export async function updateKnowledgeBase(
   id: string,
@@ -399,6 +438,19 @@ export async function updateKnowledgeBase(
     input.retrievalConfig,
   )
 
+  // 换模型：只换"选哪个模型 + 维度快照"，**不动 embeddingModel**（见文件头 ⚠️）。同一个 id 不重探。
+  // ⚠️ 例外：**空库**没有任何旧向量可重建 ⇒ 快照直接跟进，否则会留下一条"需重建"的假告警。
+  let embeddingPatch: { embeddingModelId?: string; embeddingDim?: number; embeddingModel?: string } = {}
+  if (input.embeddingModelId !== undefined && input.embeddingModelId !== current.embeddingModelId) {
+    const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId)
+    const documentCount = await db.document.count({ where: { kbId: id } })
+    embeddingPatch = {
+      embeddingModelId: snapshot.embeddingModelId,
+      embeddingDim: snapshot.embeddingDim,
+      ...(documentCount === 0 ? { embeddingModel: snapshot.embeddingModel } : {}),
+    }
+  }
+
   const updated = await db.knowledgeBase.update({
     where: { id },
     data: {
@@ -408,12 +460,132 @@ export async function updateKnowledgeBase(
       chunkSize,
       chunkOverlap,
       retrievalConfig,
+      ...embeddingPatch,
     },
     select: KB_SELECT,
   })
 
   getLogger().info({ kbId: id, changed: Object.keys(input) }, '已更新知识库')
   return toItem(updated, await countsOf(id))
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 整库重建（P1-5，`01` §3.5 需求 36）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 整库重建（`POST /api/knowledge-bases/:id/rebuild`，登录即可）。
+ *
+ * 把**该库当前全部文档**逐篇按 `mode: REBUILD` 重新入队，由既有流水线用该库**当前选定**的
+ * embedding 模型重新解析 → 分块 → 向量化 → 入库。用途是 `子方案①` §八 的"换模型后整库重建"：
+ * 库里存的旧向量与当前模型的 query 向量不在同一语义空间时（`embeddingModelChanged=true`），
+ * 重建把它们拉回同一个空间。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 两条与"覆盖重建"刻意相反的取舍
+ * ─────────────────────────────────────────────────────────────────────
+ * **① 先把文档翻成 `PARSING`，否则整库空跑。** worker 的幂等第 ④ 道是"已是 `READY` ⇒ 跳过"
+ *    （`worker.ts`），而整库重建面对的多半正是 `READY` 的存量文档 —— 不翻状态就投 `REBUILD`
+ *    job，worker 会逐篇跳过，接口回 200 却什么都没发生（最难查的一类）。故这里用一次
+ *    `updateMany` 把全库翻到 `PARSING`（`READY → PARSING` 是合法迁移，见状态机表）。
+ *
+ * **② 刻意不清旧 chunk**（与覆盖重建的"先删后建"相反）。旧向量留到该篇重跑完成、
+ *    writer 在**一个事务里**先删后插（`pipeline/index/writer.ts`）才被替换 ⇒ 重建窗口内
+ *    检索照常命中旧内容，**没有检索空窗**（`01` §3.5 的"重建期间可检索旧库"）。
+ *    代价是重建期间命中的是旧内容 —— 由 `shared` 的 `REBUILD_SEARCHABLE_HINT` 明说，不静默。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 入队失败：如实回报，不假装整次成功
+ * ─────────────────────────────────────────────────────────────────────
+ * 与上传"入队失败即回滚整行"不同：重建没有可回滚的登记（行是既有文档），失败的那几篇停在
+ * `PARSING`，逐篇点「重试」即可恢复（`retryDocument` 对 `PARSING` 放行）。故逐篇收集成功/失败，
+ * 全部失败才抛 500；部分失败把 `failed` 数量如实回给界面。
+ *
+ * ⚠️ **不需要 chunks_v2 新表切换**：`chunks.embedding` 自 `20260930140000_kb_embedding_model`
+ *    起是**无固定维度**的 `vector`，维度按行记在 `chunks.embedding_dim` ⇒ 换到任意维度的模型
+ *    都能就地重建（旧表的 `子方案①` §八 双写/切表设计已被该迁移取代）。本函数只要求目标模型
+ *    **现在可用**（否则投一批注定 FAILED 的 job）。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 库不存在 / `CONFLICT`(409) 库无文档、未记录
+ *   embedding 模型/维度（早期建的库）、或目标模型不可用（停用/删除） /
+ *   `INTERNAL`(500) 全部入队失败（队列不可用）
+ */
+export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledgeBaseResult> {
+  const db = getPrisma()
+  const logger = getLogger()
+
+  const kb = await db.knowledgeBase.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      name: true,
+      embeddingModel: true,
+      embeddingModelId: true,
+      embeddingDim: true,
+      documents: { select: { id: true, contentHash: true } },
+    },
+  })
+  if (kb === null) throw AppError.notFound('知识库不存在')
+
+  // 入库/检索都离不开"这个库选定的模型 + 维度快照"（worker 用它们构造 provider）。
+  // 老库可能缺其一 ⇒ 早失败并给可操作文案，而不是投一批注定 FAILED 的 job
+  if (kb.embeddingModelId === null || kb.embeddingDim === null) {
+    throw AppError.conflict(
+      '该知识库未记录 embedding 模型或维度（多为本功能上线前建的老库），无法整库重建；请重建该知识库并重新选择 embedding 模型',
+    )
+  }
+  if (kb.documents.length === 0) {
+    throw AppError.conflict('该知识库还没有文档，无需重建索引')
+  }
+
+  // ① 目标模型**现在就必须可用**：不存在 / 类型不符 / 模型或 Provider 停用都在这里 409
+  //    （`resolveEmbeddingTarget` 的既有判据）。不先探这一下，下面翻 PARSING + 入队只会
+  //    得到一整批注定 FAILED 的 job —— 用户看到的是"全库失败"，而根因其实一句话就能说清。
+  //    ⚠️ **任意维度都能重建**：`chunks.embedding` 自 `20260930140000_kb_embedding_model`
+  //    起是无固定维度的 `vector`、维度按行记在 `embedding_dim`，故这里不比对维度，
+  //    也不需要 chunks_v2 新表切换（那套设计已被该迁移取代）。
+  const target = await resolveEmbeddingTarget(kb.embeddingModelId)
+
+  // ② 全库翻到 PARSING（理由见文件头 ①）—— 保留 chunkCount，不删旧 chunk（文件头 ②）
+  await db.document.updateMany({
+    where: { kbId: id },
+    data: { status: 'PARSING', errorMsg: null },
+  })
+
+  // ③ 逐篇入队。单篇失败不中断其余（部分成功比整体放弃更接近用户预期）
+  let enqueued = 0
+  for (const doc of kb.documents) {
+    try {
+      await enqueuePipelineJob({
+        docId: doc.id,
+        kbId: id,
+        contentHash: doc.contentHash,
+        mode: 'REBUILD',
+      })
+      enqueued += 1
+    } catch (error) {
+      logger.error({ err: error, kbId: id, docId: doc.id }, '整库重建：单篇文档入队失败（该篇停在 PARSING，可重试）')
+    }
+  }
+  const failed = kb.documents.length - enqueued
+
+  if (enqueued === 0) {
+    throw AppError.internal('任务入队失败（队列不可用），整库重建未被受理，请稍后重试')
+  }
+
+  // ④ 快照跟进：重建后库里的向量就由**当前**模型产出 ⇒ 把 `embedding_model` 快照刷成当前名字，
+  //    否则 `embeddingModelChanged` 会一直为 `true`（它比的是快照 vs 当前模型名），
+  //    界面那条"需重建"告警永不消失。维度用的是 `knowledgeBase.embeddingDim`（换模型时已更新）。
+  const embeddingModel = apiEmbeddingName(target.modelName)
+  if (embeddingModel !== kb.embeddingModel) {
+    await db.knowledgeBase.update({ where: { id }, data: { embeddingModel } })
+  }
+
+  logger.info(
+    { kbId: id, name: kb.name, total: kb.documents.length, enqueued, failed, embeddingModel },
+    '整库重建已受理（全库翻 PARSING 并批量入队，旧索引在逐篇完成前仍可检索）',
+  )
+  return { id, total: kb.documents.length, enqueued, failed }
 }
 
 // ═════════════════════════════════════════════════════════════════════

@@ -20,8 +20,50 @@
 import { useState } from 'react'
 
 import { useFeedback } from '../../app/feedback.js'
+import { fileContentUrl } from '../../api/files.js'
 import { AssistantMessage } from './AssistantMessage.js'
-import type { ChatMessageView } from './messageModel.js'
+import type { AttachmentView, ChatMessageView } from './messageModel.js'
+
+/** 人类可读的体积（附件条上的一行小字；不引入依赖，纯展示） */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * 用户消息的附件区（**P1-4**）。`kind` 由**服务端**判定：`IMAGE` 渲染缩略图、
+ * `DOCUMENT` 渲染文件条（前端**不看扩展名** —— 判据只有服务端一处）。
+ */
+function UserAttachments({ items }: { items: readonly AttachmentView[] }) {
+  if (items.length === 0) return null
+  return (
+    <div className="msg__attachments" data-testid="user-message-attachments">
+      {items.map((item) =>
+        item.kind === 'IMAGE' ? (
+          <a
+            key={item.fileId}
+            className="msg__attachment-image"
+            href={fileContentUrl(item.fileId)}
+            target="_blank"
+            rel="noreferrer"
+            title={item.name}
+          >
+            <img src={fileContentUrl(item.fileId)} alt={item.name} />
+          </a>
+        ) : (
+          <span key={item.fileId} className="msg__attachment-doc" title={item.name}>
+            <span className="msg__attachment-doc-icon" aria-hidden="true">
+              📄
+            </span>
+            <span className="msg__attachment-doc-name">{item.name}</span>
+            <span className="msg__attachment-doc-size num">{formatSize(item.size)}</span>
+          </span>
+        ),
+      )}
+    </div>
+  )
+}
 
 export interface MessageListProps {
   messages: readonly ChatMessageView[]
@@ -36,6 +78,13 @@ export interface MessageListProps {
   onRecall?: (text: string, hadTools: boolean) => void
   /** 修改重发最新一轮（撤回后把正文放回输入框） */
   onResend?: (text: string, hadTools: boolean) => void
+  /**
+   * 可「重新生成」的那条**助手消息**（P1-3）。`null` = 不提供（有流在跑 / 没有会话 /
+   * 最后一轮不是一条回答）。判据（哪一条是"最新一轮的回答"）在页面，这里只比对 key。
+   */
+  regenerable?: { key: string } | null
+  /** 点「重新生成」（P1-3）——页面据此调 `useChatStream#regenerate` */
+  onRegenerate?: () => void
 }
 
 /** 用户消息头部的时刻：`09-22 17:41`（流式消息没有 `createdAt`，那一行就不显示时刻） */
@@ -82,6 +131,7 @@ function UserMessage({
   return (
     <article className="msg msg--user" data-testid="user-message">
       <p className="msg__head">{stamp === null ? '刚刚' : <span className="num">{stamp}</span>}</p>
+      <UserAttachments items={view.attachments} />
       <div className="bubble bubble--user">{view.text}</div>
       <div className="msg__tools">
         {/* 快捷复制（产品优化 2026-09-29）：用户消息也要能快速复制 —— 之前只有助手消息有 */}
@@ -117,7 +167,15 @@ function OpeningMessage({ view, agentName }: { view: ChatMessageView; agentName:
   )
 }
 
-export function MessageList({ messages, agentName, recallable, onRecall, onResend }: MessageListProps) {
+export function MessageList({
+  messages,
+  agentName,
+  recallable,
+  onRecall,
+  onResend,
+  regenerable,
+  onRegenerate,
+}: MessageListProps) {
   // ⚠️ **不在这里包 `.stream` / `.stream__inner`**：滚动容器与居中列由页面的 `StreamFrame`
   // （`ChatPage.tsx`）持有，三态（骨架 / 错误 / 空态）与消息流共用同一个外框。
   // 之前在这里再包一层，实测会得到**两层 `.stream`** —— padding 被叠加、还多出一个嵌套滚动容器
@@ -138,7 +196,15 @@ export function MessageList({ messages, agentName, recallable, onRecall, onResen
           )
         }
         if (view.plain === true) return <OpeningMessage key={view.key} view={view} agentName={agentName} />
-        return <AssistantMessage key={view.key} view={view} agentName={agentName} />
+        // 「重新生成」只挂在被 `regenerable` 点中的那一条（= 最新一轮的回答）；其余不传回调
+        return (
+          <AssistantMessage
+            key={view.key}
+            view={view}
+            agentName={agentName}
+            {...(regenerable?.key === view.key && onRegenerate !== undefined ? { onRegenerate } : {})}
+          />
+        )
       })}
     </>
   )

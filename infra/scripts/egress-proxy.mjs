@@ -103,7 +103,7 @@ if (ALLOW_FILE !== '') {
     last = ''
   }
   setInterval(() => {
-    let content = ''
+    let content
     try {
       content = fs.readFileSync(ALLOW_FILE, 'utf8').trim()
     } catch {
@@ -272,7 +272,7 @@ server.on('clientError', (_err, socket) => {
 
 server.listen(PORT, LISTEN_HOST, () => {
   log(`listening on ${LISTEN_HOST}:${PORT}`)
-  log(`白名单（${RULES.length} 条）：${RULES.join(', ')}`)
+  log(`白名单（${RULES.length} 条，初始来源 ${initialSource}）：${RULES.join(', ')}`)
   if (!ALLOW_ALL) {
     log('不在白名单的目标一律 403 —— 三条腿的验证方式见 infra/scripts/egress-up.sh 输出')
   }

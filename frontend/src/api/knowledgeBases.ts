@@ -51,6 +51,7 @@ import type {
   ImageMode,
   KnowledgeBaseItem,
   KnowledgeBaseListResult,
+  RebuildKnowledgeBaseResult,
   RemoveDocumentResult,
   RemoveKnowledgeBaseResult,
   ReuploadDocumentResult,
@@ -150,6 +151,27 @@ export function useRemoveKnowledgeBase() {
   return useMutation({
     mutationFn: (id: string) =>
       request<RemoveKnowledgeBaseResult>(`/api/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => invalidateKnowledgeViews(queryClient),
+  })
+}
+
+/**
+ * 整库重建（P1-5，`POST /api/knowledge-bases/:id/rebuild`，**无请求体**）。
+ *
+ * 把该库全部文档按当前选定的 embedding 模型重新入队（用途：换模型后把旧向量拉回同一语义空间）。
+ * 后端**先翻 PARSING 再入队** ⇒ 本 hook 的 `onSuccess` 失效知识库视图后，文档列表会自动进入
+ * 2s 轮询（判据是"本页有 `PARSING`"，见 `useDocuments`），用户据此看进度。
+ *
+ * `failed > 0` 不是异常抛出：那是"部分篇数没入队成功、停在解析中、可逐篇重试"，
+ * 由调用方决定提示语气（整体失败才会 reject）。
+ */
+export function useRebuildKnowledgeBase(kbId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      request<RebuildKnowledgeBaseResult>(`/api/knowledge-bases/${encodeURIComponent(kbId)}/rebuild`, {
+        method: 'POST',
+      }),
     onSuccess: () => invalidateKnowledgeViews(queryClient),
   })
 }

@@ -114,11 +114,24 @@ export interface ToolCallChunk {
   argumentsReplace?: string
 }
 
+/**
+ * 一段**多模态内容**（P1-4）—— 协议无关的形态，三协议各映射到自己的字段名
+ * （OpenAI `image_url` / Anthropic `image.source` / Responses `input_image`）。
+ *
+ * 只有 user 消息可能带它（本轮附件里的图片）；system / assistant / tool 一律是纯字符串。
+ */
+export type ChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; mimeType: string; dataBase64: string }
+
+/** 消息内容：纯文本（绝大多数）或**内容块数组**（带图片的多模态用户消息） */
+export type ChatMessageContent = string | ChatContentPart[]
+
 /** 对话消息 —— **协议无关**的形态（各协议怎么落到报文里由 `buildBody` 负责，见文件头 ③） */
 export type ChatMessage =
   | {
       role: 'system' | 'user' | 'assistant'
-      content: string
+      content: ChatMessageContent
       /** 助手这一轮**请求调用**的工具（`finish_reason=tool_calls` 时才有） */
       toolCalls?: ChatToolCall[]
     }
@@ -472,6 +485,47 @@ function toOpenAiToolCalls(toolCalls: readonly ChatToolCall[]): Record<string, u
  *     （带 `tool_calls` 时空串会让一部分网关 400；`null` 是规范允许的形态）。
  * ⚠️ 原样透出还有第二个坏处：`toolCallId` / `isError` 这些**我们自己的字段名**会漏到线上。
  */
+/** 内容为空判定（字符串空串 / 空块数组都算空）—— 三协议共用 */
+function isEmptyContent(content: ChatMessageContent): boolean {
+  if (typeof content === 'string') return content === ''
+  return content.length === 0
+}
+
+/** 图片 data URL（OpenAI / Responses 的 `image_url` 都收这种形态） */
+function toDataUrl(part: Extract<ChatContentPart, { type: 'image' }>): string {
+  return `data:${part.mimeType};base64,${part.dataBase64}`
+}
+
+/** 协议无关内容 → OpenAI 的 `content`（字符串原样；块数组映射 `text` / `image_url`） */
+function toOpenAiContent(content: ChatMessageContent): unknown {
+  if (typeof content === 'string') return content
+  return content.map((part) =>
+    part.type === 'text'
+      ? { type: 'text', text: part.text }
+      : { type: 'image_url', image_url: { url: toDataUrl(part) } },
+  )
+}
+
+/** 协议无关内容 → Responses 的 `content`（块数组用 `input_text` / `input_image`） */
+function toResponsesContent(content: ChatMessageContent): unknown {
+  if (typeof content === 'string') return content
+  return content.map((part) =>
+    part.type === 'text'
+      ? { type: 'input_text', text: part.text }
+      : { type: 'input_image', image_url: toDataUrl(part) },
+  )
+}
+
+/** 协议无关内容 → Anthropic 的块数组（`text` / `image.source`） */
+function toAnthropicBlocks(content: ChatMessageContent): AnthropicBlock[] {
+  if (typeof content === 'string') return content === '' ? [] : [{ type: 'text', text: content }]
+  return content.map((part) =>
+    part.type === 'text'
+      ? { type: 'text', text: part.text }
+      : { type: 'image', source: { type: 'base64', media_type: part.mimeType, data: part.dataBase64 } },
+  )
+}
+
 function toOpenAiMessages(messages: readonly ChatMessage[]): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   for (const message of messages) {
@@ -479,10 +533,10 @@ function toOpenAiMessages(messages: readonly ChatMessage[]): Record<string, unkn
       out.push({ role: 'tool', tool_call_id: message.toolCallId, content: message.content })
       continue
     }
-    const row: Record<string, unknown> = { role: message.role, content: message.content }
+    const row: Record<string, unknown> = { role: message.role, content: toOpenAiContent(message.content) }
     if (message.toolCalls !== undefined && message.toolCalls.length > 0) {
       row.tool_calls = toOpenAiToolCalls(message.toolCalls)
-      if (message.content === '') row.content = null
+      if (isEmptyContent(message.content)) row.content = null
     }
     out.push(row)
   }
@@ -649,7 +703,9 @@ function toResponsesInput(messages: readonly ChatMessage[]): Record<string, unkn
       continue
     }
     // 带 `tool_calls` 而正文为空是常态（模型直接给调用、不回一句话）⇒ 空正文不占一个 item
-    if (message.content !== '') out.push({ role: message.role, content: message.content })
+    if (!isEmptyContent(message.content)) {
+      out.push({ role: message.role, content: toResponsesContent(message.content) })
+    }
     for (const call of message.toolCalls ?? []) {
       out.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments })
     }
@@ -967,7 +1023,7 @@ function toAnthropicMessages(
       continue
     }
     // 正文与"工具调用请求"可以同时存在（模型先说一句、再调工具）；两者都空则不占一条消息
-    if (message.content !== '') append(message.role, [{ type: 'text', text: message.content }])
+    append(message.role, toAnthropicBlocks(message.content))
     const toolCalls = message.toolCalls
     if (toolCalls === undefined || toolCalls.length === 0) continue
     append(

@@ -9,6 +9,8 @@
  * **P0-2-10 的确认应答**）：Agent 会话列表 / 新建 / 重命名 / 删除 / `/active` /
  * **`/chat`（SSE）** / **`/stop`** / **`/messages`** / **`/confirm`**。
  * `02` §4.5 那张表的九条路由**至此无缺口** ⇒ 本文头部"仍缺一条"的旧注记已删除。
+ * ⚠️ **P1-3 追加第十条 `/regenerate`（SSE）** —— 它是"撤掉上一轮 + 重跑同一段正文"的
+ * 组合端点，跑的是**同一条 `/chat` 链路**（不新增 SSE 事件），故不改变上表九条的任何一条口径。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 权限：**只有本人**，且靠"查询条件里带 userId"实现，路由层没有任何判据
@@ -41,6 +43,7 @@ import {
   listConversationsQuerySchema,
   listMessagesQuerySchema,
   ok,
+  regenerateConversationBodySchema,
   renameConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
@@ -50,6 +53,7 @@ import {
   type CreateConversationBody,
   type ListConversationsQuery,
   type ListMessagesQuery,
+  type RegenerateConversationBody,
   type RenameConversationBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -58,6 +62,7 @@ import { resolveChatProducer } from '../orchestrator/index.js'
 import { answerConfirm, signalStop, streamChatReply } from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
+  assertConversationRegenerable,
   assertConversationSendable,
   createConversation,
   getConversationActive,
@@ -227,6 +232,9 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         request.params.id,
         viewerOf(request),
         request.body.modelId,
+        // 附件（P1-4）：闸门内完成归属校验 + 取对象 + 图片 base64 / 文本解析；
+        // 失败走前置信封（404/409/400），在写出任何 SSE 帧之前
+        request.body.attachmentFileIds,
       )
       await streamChatReply({
         reply,
@@ -235,9 +243,60 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         // `content` 已由路由级 schema（`chatRequestBodySchema`）trim 过；它**同时**是
         // 检索的 query 与落库时用户消息的正文（P0-1-27 的编排循环两处都要用）
         content: request.body.content,
+        // 已解析的附件（P1-4）——转交编排层拼报文 + 随用户消息落库
+        attachments: sendable.attachments,
         target: sendable.target,
         // ⚠️ 判据来自闸门（= 库里的 `agents.type`），**不是请求体** —— 见 `ChatSendContext#agentType`
         producer: resolveChatProducer(sendable.agentType),
+      })
+    },
+  )
+
+  /**
+   * 重新生成（`01` §3.4 / 决策 27；**P1-3**）。**SSE**，与 `/chat` 同族。
+   *
+   * 需求："重跑最后一轮用户消息，替换原回答，原回答丢弃，不产生重复消息"。
+   * 落地形态 = **撤掉上一轮 + 重跑同一段正文**，两件事在**同一次请求里**完成：
+   *   ① 闸门 `assertConversationRegenerable` 解出这一轮该用的模型与**被重跑的正文**
+   *      （正文取自库里最后一条 USER 消息，不收请求体）；
+   *   ② 走**同一条 SSE 出口** `streamChatReply`，只是在拿到会话互斥锁之后、开流之前多一步
+   *      `onLockAcquired`：调用**既有的** `recallLastRound` 撤掉上一轮（消息 + 产物）。
+   *
+   * 三处刻意：
+   *   · **复用 `recallLastRound`**（2026-09-29 的"撤回/修改重发"地基）：产物行 + S3 对象一并删、
+   *     空会话时把标题/活跃时间重置回 `null` —— 这些口径**已经在一处**，重新生成不该有第二份；
+   *   · **撤回动作在锁之后**（`onLockAcquired`）：不拿锁就删，会删掉另一条正在跑的流的历史；
+   *   · **不新增 SSE 事件**：重新生成跑的是同一条 `/chat` 链路，前端读到的仍是那 11 个事件，
+   *     故"单一渲染路径"不受影响（需求要的"替换"由前端把上一轮暂时收起呈现，见 `03`）。
+   *
+   * ⚠️ 与 `/chat` 一样，**并发冲突走流内 `error{code:CONFLICT}`**（闸门在加锁之前，占位失败的
+   * 420/409/424 走 JSON 信封）—— 分界线仍是"主语"（`shared/src/sse.ts` 文件头 ③）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: RegenerateConversationBody }>(
+    '/api/conversations/:id/regenerate',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: regenerateConversationBodySchema },
+    },
+    async (request, reply) => {
+      const viewer = viewerOf(request)
+      const regenerable = await assertConversationRegenerable(
+        request.params.id,
+        viewer,
+        request.body.modelId,
+      )
+      await streamChatReply({
+        reply,
+        conversationId: regenerable.conversationId,
+        agentId: regenerable.agentId,
+        // 正文来自库里最后一条用户消息（闸门读出来的），**不是请求体** —— 见 `RegenerateContext`
+        content: regenerable.content,
+        target: regenerable.target,
+        producer: resolveChatProducer(regenerable.agentType),
+        // ★ 锁已就绪 ⇒ 撤掉上一轮（在锁之后删才安全，见 `StreamChatReplyInput#onLockAcquired`）
+        onLockAcquired: async () => {
+          await recallLastRound(regenerable.conversationId, viewer)
+        },
       })
     },
   )

@@ -34,10 +34,13 @@
  * 但它照样能干活。把它升级成"这一轮失败"会把一个可降级的功能变成一次不可用。
  */
 
+import type { AttachmentItem } from '@doubulea/shared'
+
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { ARTIFACT_EXEC_TIMEOUT_MS, SANDBOX_WORK_DIR } from '../sandbox/index.js'
 import { execInSandbox } from '../sandbox/docker.js'
+import { listConversationAttachments } from '../services/file.service.js'
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
 import { textOfHistoryRow, type HistoryRow } from './chatContext.js'
 
@@ -109,11 +112,15 @@ export async function buildMemoryDoc(conversationId: string): Promise<MemoryDocR
   })
   const artifactTotal = await db.artifact.count({ where: { conversationId } })
 
-  // "有没有值得读的内容"与渲染同源：历史里有**非空正文**的消息，或有产物
+  // ── 该会话收到过的附件清单（用户上传；按消息时间先后、按 fileId 去重）──
+  //    附件本体同样在 S3 里、随容器走的是副本 ⇒ 容器重建后要把"有哪些、怎么取回"讲给 agent。
+  const attachments = await listConversationAttachments(conversationId)
+
+  // "有没有值得读的内容"与渲染同源：历史里有**非空正文**的消息，或有产物，或有附件
   const hasHistory = history.some((row) => textOfHistoryRow(row).trim() !== '')
   return {
-    markdown: renderMemoryDoc({ conversationId, history, artifacts, artifactTotal }),
-    hasContent: hasHistory || artifacts.length > 0,
+    markdown: renderMemoryDoc({ conversationId, history, artifacts, artifactTotal, attachments }),
+    hasContent: hasHistory || artifacts.length > 0 || attachments.length > 0,
   }
 }
 
@@ -133,9 +140,11 @@ export async function buildMemoryDoc(conversationId: string): Promise<MemoryDocR
 export function memoryDocReadInstruction(): string {
   return (
     '【会话记忆】本会话在容器之外保存了一份记忆文档（此前对话摘要 + 已产出文件清单 + ' +
-    `按需取回产物文件的方法），路径：\`${MEMORY_DOC_PATH}\`。\n` +
+    '用户上传过的附件清单 + 按需取回文件的方法），路径：`' +
+    MEMORY_DOC_PATH +
+    '`。\n' +
     '在开始处理下面这条消息前，请先用 read 工具读取该文件，以便了解本会话之前发生过什么、' +
-    '以及已经产出过哪些文件（需要时可按文档里的命令把它们取回 /work）。'
+    '已经产出过哪些文件、以及用户上传过哪些附件（需要时可按文档里的命令把它们取回 /work）。'
   )
 }
 
@@ -148,6 +157,7 @@ export function renderMemoryDoc(input: {
   history: readonly HistoryRow[]
   artifacts: readonly MemoryDocArtifact[]
   artifactTotal: number
+  attachments: readonly AttachmentItem[]
 }): string {
   const lines: string[] = []
 
@@ -200,11 +210,28 @@ export function renderMemoryDoc(input: {
   }
   lines.push('')
 
+  // ── 附件清单（用户上传过、被引用在本会话消息里的文件）──
+  lines.push('## 本会话收到过的附件（用户上传）')
+  lines.push('')
+  if (input.attachments.length === 0) {
+    lines.push('（本会话还没有收到过附件）')
+  } else {
+    lines.push('| 附件 ID | 文件名 | 大小 | 类型 |')
+    lines.push('|---------|--------|------|------|')
+    for (const attachment of input.attachments) {
+      lines.push(
+        `| \`${attachment.fileId}\` | \`${escapeCell(attachment.name)}\` | ${formatBytes(attachment.size)} | ${attachment.kind} |`,
+      )
+    }
+  }
+  lines.push('')
+
   // ── 如何按需取回（块 2 的下载通道）──
-  lines.push('## 如何取回某个产物')
+  lines.push('## 如何取回某个产物 / 附件')
   lines.push('')
   lines.push(
-    '产物本体存在对象存储里，容器内**没有**这些文件。需要时用下面的命令按需下载回 `/work`：',
+    '产物与附件本体都存在对象存储里，容器内**没有**这些文件（容器重建后 `/work` 会被清空）。' +
+      '需要时用下面的命令按需下载回 `/work`：',
   )
   lines.push('')
   lines.push('```bash')
@@ -214,11 +241,17 @@ export function renderMemoryDoc(input: {
   lines.push(
     '- `<产物ID>` 用上表「产物 ID」那一列；`<保存路径>` 是相对 `/work` 的目标路径（例如 `out/report.csv`）。',
   )
+  lines.push('')
+  lines.push('```bash')
+  lines.push(NODE_FETCH_ATTACHMENT_COMMAND)
+  lines.push('```')
+  lines.push('')
+  lines.push('- `<附件ID>` 用上表「附件 ID」那一列（用户上传的文件用它取回；`<保存路径>` 同上）。')
   lines.push(
     '- 环境变量 `SANDBOX_BACKEND_URL`（后端地址）与 `SANDBOX_TOKEN`（本容器身份令牌）**已经注入**，命令里直接引用即可，不要打印或外传。',
   )
   lines.push(
-    '- 镜像**刻意没装 `curl` / `wget`**，上面这条用容器里已有的 `node` + 内置 `fetch`（这也是它长这样的原因）。',
+    '- 镜像**刻意没装 `curl` / `wget`**，上面这两条用容器里已有的 `node` + 内置 `fetch`（这也是它们长这样的原因）。',
   )
   lines.push('')
 
@@ -239,6 +272,22 @@ export const NODE_FETCH_DOWNLOAD_COMMAND =
   '.then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.arrayBuffer()})' +
   '.then(b=>require("fs").writeFileSync(out,Buffer.from(b)))' +
   '.catch(e=>{console.error(e);process.exit(1)})\' <产物ID> <保存路径>'
+
+/**
+ * 容器内按需下载**用户上传附件**的命令（与 {@link NODE_FETCH_DOWNLOAD_COMMAND} 同款，
+ * 只把路径从 `/api/sandbox/artifacts/` 换成 `/api/sandbox/attachments/`）。
+ *
+ * 为什么附件与产物分成两条命令而不是一条带类型参数的命令：两个端点的**归属判据不同**
+ * （产物按 `conversation_id`、附件按"消息里引用过 + uploader"），命令正文对 agent 而言
+ * 越直白越好 —— 多写一行代码，换 agent 少一次猜。
+ */
+export const NODE_FETCH_ATTACHMENT_COMMAND =
+  'node -e \'const id=process.argv[1],out=process.argv[2];' +
+  'fetch(process.env.SANDBOX_BACKEND_URL+"/api/sandbox/attachments/"+id,' +
+  '{headers:{"x-sandbox-token":process.env.SANDBOX_TOKEN}})' +
+  '.then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.arrayBuffer()})' +
+  '.then(b=>require("fs").writeFileSync(out,Buffer.from(b)))' +
+  '.catch(e=>{console.error(e);process.exit(1)})\' <附件ID> <保存路径>'
 
 /**
  * 把记忆文档写进容器 `/work/.doubulea/memory.md`（**唯一**的容器写入点）。

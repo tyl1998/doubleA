@@ -25,7 +25,7 @@
  * （与 `conversation.service.ts` 文件头 ① 同一条纪律）。
  * ⚠️ **自「TaskAgent 记忆与产物」块 3 起归属判据是 `artifacts.user_id` 直查**（不再是
  * `conversation: { userId }` join）：产物行建行时写入 owner，删会话后 `conversation_id`
- * 被置空、转成"历史产物"，那条 join 会 404 —— 直查 `userId` 才是"这是不是我的"的稳定答案。
+ * 被置空、转成"会话产物"，那条 join 会 404 —— 直查 `userId` 才是"这是不是我的"的稳定答案。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ★ 判据二：下载是**后端流式代理**，不是签名 URL
@@ -144,25 +144,26 @@ export async function listArtifacts(
 }
 
 /**
- * 历史产物列表（`GET /api/artifacts/history`，仅本人；**P0-3 记忆与产物 块 4**）。
+ * 「会话产物」列表（`GET /api/artifacts`，仅本人；**跨会话汇总**）。
  *
- * 查的是「删过会话、产物行保留下来」的那一批：`conversationId = null` + `userId = me`。
- * 判据落在 `where` 里（与其余会话族同一条纪律）：别人的历史产物与不存在的行都是空页，
+ * 查的是本人**全部**产物（`userId = me`）—— 不论会话是否还在：会话在 ⇒ 会话面板里也看得到；
+ * 会话被删 ⇒ 产物行保留下来（`conversationId` 置空，`TaskAgent记忆与产物` 块 3）仍在这里出现。
+ * 判据落在 `where` 里（与其余会话族同一条纪律）：别人的产物与不存在的行都是空页，
  * **不存在"忘了判归属"的写法**。
  *
- * ⚠️ 与 {@link listArtifacts} 的三处不同（都是"为什么不能照抄"的理由）：
- *   · **不需要先判会话归属**：这里没有会话（`conversationId` 恒 `null`），归属就是 `userId` 一列；
- *   · **`conversationId = null` 必须显式写**：它是"历史产物"的定义，漏了就会把当前会话的
- *     产物也拉进来（那已经是 `GET /:id/artifacts` 的事）；
+ * ⚠️ 与 {@link listArtifacts}（单会话面板）的两处不同：
+ *   · **不需要先判会话归属**：这里跨会话，归属就是 `userId` 一列；
+ *   · **刻意不按 `conversationId` 过滤**：本列表的定义就是"我的所有产物"，
+ *     只给某一会话的清单是面板（`GET /:id/artifacts`）的事。
  *   · 排序/分页/投影与列表**完全同款**（`ARTIFACT_CHRONO_ORDER` + `ARTIFACT_SELECT`）——
  *     前端复用同一套卡片渲染。
  */
-export async function listArtifactHistory(
+export async function listMyArtifacts(
   userId: string,
   query: ListArtifactsQuery,
 ): Promise<ArtifactListResult> {
   const db = getPrisma()
-  const where = { userId, conversationId: null } as const
+  const where = { userId } as const
   const [rows, total] = await db.$transaction([
     db.artifact.findMany({
       where,
@@ -201,7 +202,7 @@ export interface ArtifactSource {
  *
  * ⚠️ **P0-3 记忆与产物（块 2/3）起归属判据换成了 `userId` 直查**：产物行自
  * 建行起带 `user_id`，不再经由 `conversation → user` join —— 否则"删除会话后产物
- * 转历史产物（`conversation_id` 置空）"的那些行会因 join 不到会话而 404。
+ * 转会话产物（`conversation_id` 置空）"的那些行会因 join 不到会话而 404。
  * 判据仍是"产物 → 本人"，只是主语从会话换成了产物自己的 owner 列。
  *
  * 四步各有理由：
@@ -305,4 +306,44 @@ async function openArtifactSourceWhere(
 /** 下载响应的 `Content-Type`：唯一来源是 `artifacts.mime`（`子方案④` §四 2 判据 ⑤）。 */
 export function artifactDownloadContentType(mime: string): string {
   return mime.trim() === '' ? 'application/octet-stream' : mime.trim()
+}
+
+/**
+ * 删除产物（`DELETE /api/artifacts/:id`，仅本人；**会话产物的用户主动删除**）。
+ *
+ * 「会话产物」列表给了用户两个动作：预览 / 下载（只读）+ **删除**（本次）。删除是**真删除** ——
+ * S3 对象与 `artifacts` 行**一起删**（与保留期清理 `reapExpiredArtifacts` 同款顺序：**先删对象、
+ * 对象删成功才删行**），避免"行删了、对象还在"的暗账。
+ *
+ * ⚠️ 与"删除会话"**刻意不同**：删会话只把产物行 `conversation_id` 置空、产物转为历史保留；
+ * 而用户点这个按钮是明确说"这条产物我不要了" ⇒ 才真的删。
+ *
+ * 归属判据落在 `where`（`userId = me`）：别人的产物与不存在的 id 一样是 **404**
+ * （与会话族同一条纪律，见文件头判据一）。
+ *
+ * ⚠️ `removeObject` 对**不存在的键**通常是幂等的（MinIO 直接成功）⇒ "对象早已过期清掉、行还在"
+ * 这一种也能删干净；真正的 S3 故障（网络 / 权限）则抛 500、**行保留**，下一次可重试。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 产物不存在 / 不是我的
+ *   `INTERNAL`(500) 存储不可用（对象删不掉 ⇒ 不动数据库）
+ */
+export async function deleteArtifact(params: { artifactId: string; userId: string }): Promise<void> {
+  const db = getPrisma()
+  const row = await db.artifact.findFirst({
+    where: { id: params.artifactId, userId: params.userId },
+    select: { id: true, fileKey: true },
+  })
+  if (row === null) throw AppError.notFound('产物不存在')
+
+  const bucket = config.s3.bucket
+  try {
+    // 先删对象：删不掉就不删行（行是下载的唯一入口，先删行会留下"对象还在、谁也找不到"的暗账）
+    await getS3Client().removeObject(bucket, row.fileKey)
+  } catch (error) {
+    getLogger().error({ err: error, artifactId: row.id, fileKey: row.fileKey }, '删除产物对象失败（行保留）')
+    throw AppError.internal('存储服务暂时不可用，请稍后重试')
+  }
+
+  await db.artifact.delete({ where: { id: row.id } })
+  getLogger().info({ artifactId: row.id, userId: params.userId }, '用户删除了产物（对象与行一并移除）')
 }

@@ -509,14 +509,14 @@ export const listArtifactsQuerySchema = z.object({
 export type ListArtifactsQuery = z.infer<typeof listArtifactsQuerySchema>
 
 /**
- * 历史产物列表（`GET /api/artifacts/history`）的查询参数（**P0-3 记忆与产物 块 4**）。
+ * 「会话产物」列表（`GET /api/artifacts`）的查询参数（**会话产物**：跨会话汇总本人全部产物）。
  *
  * 与产物列表**逐字同款**（offset/limit、同样的上限与默认值）—— 只给它一个独立的名字，
- * 让"历史产物"这个端点有自己可读的契约；两个 schema 是**同一个对象**，改一处分页口径
+ * 让"会话产物"这个跨会话端点有自己可读的契约；两个 schema 是**同一个对象**，改一处分页口径
  * 两边同时变（`docs/06` §六 第 ⑰ 条：同一口径两处各写一遍，必有一处先腐烂）。
  */
-export const listArtifactHistoryQuerySchema = listArtifactsQuerySchema
-export type ListArtifactHistoryQuery = ListArtifactsQuery
+export const listMyArtifactsQuerySchema = listArtifactsQuerySchema
+export type ListMyArtifactsQuery = ListArtifactsQuery
 
 /**
  * 列表里的一条产物 = {@link artifactItemSchema} + `createdAt`。
@@ -615,6 +615,51 @@ export function previewKindOf(mime: string | null | undefined): PreviewKind {
   return 'none'
 }
 
+// ───────────────────── 附件（P1-4 定型）─────────────────────
+
+/**
+ * 一次对话最多携带几个附件（**前后端同源**：`chatRequestBodySchema` 的上限与输入区的
+ * "还能不能再选"都用它，避免两处各写一个数字）。
+ */
+export const CHAT_ATTACHMENT_MAX_COUNT = 5
+
+/**
+ * 附件的**两种处置**（`01` §3.4 需求 35 的原文："图片多模态直读；文本类后端解析注入"）。
+ *
+ *   · `IMAGE` —— 图片（png/jpg/jpeg/webp/gif/bmp）：转 base64 作为多模态 part 直读，
+ *     要求所选模型 `supportsVision=true`（否则服务层 409 拦下）；
+ *   · `DOCUMENT` —— 文本类（txt/md/pdf/docx）：后端解析出正文后**注入**到本轮用户消息里。
+ *
+ * 刻意只有两种而不是"按 MIME 细分"：它决定的是**走哪条链路**（多模态 vs 文本注入），
+ * 而卡片渲染上两者本就是"缩略图"与"文件条"两种形态。
+ */
+export const CHAT_ATTACHMENT_KINDS = ['IMAGE', 'DOCUMENT'] as const
+export type ChatAttachmentKind = (typeof CHAT_ATTACHMENT_KINDS)[number]
+
+/**
+ * 一个附件（`POST /api/files/upload` 的响应 ↔ `messages.content.attachments[]` 落库段
+ * ↔ 前端消息气泡的渲染输入，三处共用的**唯一形状**；与 `artifactItemSchema` 同一条纪律）。
+ *
+ * · `fileId` = `files` 行主键，取内容端点的路径参数就是它（对象键是存储层细节、不出现在契约里）；
+ * · `kind` 由**服务端**在上传时按扩展名判定一次（前端拿它决定渲染成缩略图还是文件条，
+ *   **不自己看扩展名**——与 `previewKindOf` 同款：判据只有一处）。
+ */
+export const attachmentItemSchema = z.object({
+  fileId: z.string().min(1),
+  /** 用户上传时的原始文件名（展示用） */
+  name: z.string(),
+  size: z.number().int().min(0),
+  mime: z.string(),
+  kind: z.enum(CHAT_ATTACHMENT_KINDS),
+})
+export type AttachmentItem = z.infer<typeof attachmentItemSchema>
+
+/** 路径参数（`/api/files/:id/content` 的 `:id` = `files` 行主键，`uuid(7)`） */
+export const fileIdParamsSchema = z.object({
+  id: z.string().uuid('附件 ID 不是合法 UUID'),
+})
+export type FileIdParams = z.infer<typeof fileIdParamsSchema>
+
 /**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *
@@ -623,8 +668,8 @@ export function previewKindOf(mime: string | null | undefined): PreviewKind {
  *     （`orchestrator/chatContext.ts#selectHistoryMessages`）—— 缺了它，多轮对话就断了。
  *   · `thinking` / `citations` / `tool_calls` / `artifacts` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
  *     与"它有但是空的"在界面上是两件事（思考折叠区 / 引用区 / 工具区该不该出现）。
- *   · `attachments` **当前仍未定型**：附件属 **P1**（`files` 表），现在写进去只会是"猜的形状"，
- *     而 `02` §三 已写明"结构一经写入**不改语义**"。`tool_calls` 已在 **P0-2-8** 定型
+ *   · `attachments` 已在 **P1-4** 定型（见 {@link attachmentItemSchema}）：只出现在 USER 消息上，
+ *     `files` 表 + 上传端点 + 前端渲染三处都落地。`tool_calls` 已在 **P0-2-8** 定型
  *     （见 {@link toolCallRecordSchema}）、`artifacts` 已在 **P0-3-7** 定型（见 {@link artifactItemSchema}）
  *     —— 定型的判据是"写入端与读取端都已落地"，
  *     不是"字段想清楚了"（P0-1-27 当时留着它，正是因为那时**没有写入端**）。
@@ -640,6 +685,8 @@ export const messageContentSchema = z.object({
   tool_calls: z.array(toolCallRecordSchema).optional(),
   /** 本轮产出文件（P0-3-7；TaskAgent 专属 —— ChatBot 恒省略这个键） */
   artifacts: z.array(artifactItemSchema).optional(),
+  /** 本轮用户消息携带的附件（**P1-4 定型**；只出现在 USER 消息上，见 {@link attachmentItemSchema}） */
+  attachments: z.array(attachmentItemSchema).optional(),
   /** 本轮实际使用的模型（产品优化 2026-09-29；ChatBot 写入，见 {@link messageModelSegmentSchema}） */
   model: messageModelSegmentSchema.optional(),
 })

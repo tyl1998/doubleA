@@ -62,6 +62,7 @@ import {
   flattenMessagePages,
   stopConversation,
   streamChat,
+  streamRegenerate,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
@@ -70,7 +71,8 @@ import { decideAlign, type AlignOutcome } from './alignHistory.js'
 import { createSendGate } from './composerState.js'
 import { reportSseIssue } from './chatStream.js'
 import { createStopController, waitForRoundSettled, type StopOutcome } from './stopController.js'
-import type { StreamRound } from './roundReducer.js'
+import type { AttachmentView } from './messageModel.js'
+import type { RoundKind, StreamRound } from './roundReducer.js'
 
 /** `send` 的结果：`ok: false` 时调用方应当**把正文还给输入框**（前置失败不留痕迹） */
 export type SendOutcome = { ok: true } | { ok: false; error: unknown }
@@ -110,8 +112,19 @@ export interface UseChatStreamResult {
    * 那段时间界面**确实**还在等服务端收口，亮着是对的）。
    */
   streamingId: string | null
-  /** 发一条消息；返回 `ok:false` 时正文应当还给输入框。`modelId` 省略走智能体默认模型 */
-  send: (text: string, modelId?: string) => Promise<SendOutcome>
+  /**
+   * 发一条消息；返回 `ok:false` 时正文应当还给输入框。`modelId` 省略走智能体默认模型。
+   * `attachments` 是**已经上传好的**附件（P1-4）：正文展开成多模态 part / 文本注入由后端做。
+   */
+  send: (text: string, modelId?: string, attachments?: readonly AttachmentView[]) => Promise<SendOutcome>
+  /**
+   * 重新生成最新一轮（P1-3；`POST /:id/regenerate`）。
+   *
+   * `userText` 是**被重跑的那一轮用户消息正文**（页面从历史里取，用来渲染这一轮的流式气泡
+   * —— 后端会自己从库里读同一段正文，不接收请求体）。返回 `ok:false` 时页面应给出提示、
+   * 并**保留**界面上原有的一轮（后端那一步大概率也没发生）。
+   */
+  regenerate: (userText: string, modelId?: string) => Promise<SendOutcome>
   /** 点「停止」（时序见 `stopController.ts`）；返回值供页面决定说什么 */
   stop: () => Promise<StopOutcome>
   /**
@@ -199,8 +212,107 @@ export function useChatStream(
   const alignRef = useRef(align)
   alignRef.current = align
 
+  /**
+   * "别的会话正在生成" ⇒ 拒绝（P0-1-34）。`send` 与 `regenerate` **共用这一条判据**
+   * （两处各写一遍必然漂移）。返回 `null` = 可以继续。
+   *
+   * 为什么必须拦：本批的前端只有**一个轮次槽**（`stores/chatStream.ts` 的 `round`）。
+   * 侧栏让"切到别的会话再发一条"变成一个很容易的动作，而那时：
+   *   · `store.begin(targetId, …)` 会**覆盖**掉另一个会话正在进行的一轮；
+   *   · 旧流的帧还在往同一个槽里灌（`apply` 不认识"这一帧属于谁"）。
+   * 两者合起来是一个**静默串台**：B 的回答里混进 A 的增量，而两个会话各自看起来
+   * 都"有内容"。后端每个会话各有一把锁（允许并行），"同时只能有一条"是本批前端的约束
+   * （多流要把 store 改成 `Map`，属后续批次）。
+   *
+   * ⚠️ 文案要**能照着做**（"等它结束，或到那个会话点停止"），不能只说"不允许"。
+   */
+  const streamingElsewhere = useCallback((targetId: string | undefined): ApiError | null => {
+    const state = useChatStreamStore.getState()
+    const running = state.round !== null && state.round.status === 'streaming' ? state.streamFor : null
+    if (running === null || running === targetId) return null
+    return new ApiError('BUSY', '另一个会话正在生成中：等它结束，或到那个会话点「停止」', 429)
+  }, [])
+
+  /** 一次流的"开流参数"（`streamChat` / `streamRegenerate` 的公共形状：URL/body 不同，读流一致） */
+  type StreamOpener = (signal: AbortSignal) => Promise<Awaited<ReturnType<typeof streamChat>>>
+
+  /**
+   * 开一轮并把流读完 —— `send` 与 `regenerate` **共用的执行段**（P1-3 从 `send` 里抽出）。
+   *
+   * 两件事在这里，且都**只该有一处**：
+   *   · 开一轮（`begin`）→ 读流（`open`）→ 三类失败的处置（没收到终帧 / 读流抛错）；
+   *   · 收尾时失效三棵查询（消息历史 / 会话列表 / 产物面板）。
+   * 抽出来的理由与 `06` §六 第 ⑰ 条一致：重新生成跑的是**同一条链路**，
+   * 两处各写一遍这套收尾，迟早有一处先腐烂（症状：重新生成后侧栏排序不动、或产物面板停在旧数）。
+   *
+   * `kind` 只影响渲染层（页面据此收起正在被替换的一轮），事件归约与收尾逐字同款。
+   */
+  const performStream = useCallback(
+    async (
+      targetId: string,
+      content: string,
+      kind: RoundKind,
+      open: StreamOpener,
+      userAttachments: readonly AttachmentView[] = [],
+    ): Promise<SendOutcome> => {
+      // 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）
+      const controller = new AbortController()
+      abortRef.current?.abort()
+      abortRef.current = controller
+      useChatStreamStore.getState().begin(targetId, content, new Date().toISOString(), kind, userAttachments)
+
+      try {
+        const result = await open(controller.signal)
+
+        if (!result.terminated && !controller.signal.aborted) {
+          // 流没给终帧就结束了（服务端被 kill / 代理断开）。**必须让用户看到**：
+          // 半条回答与完整回答在界面上长得一样，静默接受就是"把故障显示成成功"。
+          // 两个通道各司其职：消息流内的错误卡（说"这一轮没成"）+ 顶部黄条（说"点我对齐"）
+          useChatStreamStore.getState().fail({
+            code: 'NETWORK',
+            message: '与服务器的连接中断，已生成的内容保留（可点顶部的提示对齐历史）',
+          })
+          useChatStreamStore.getState().showDisconnect({ extra: 'NETWORK · 没收到服务端的收口事件' })
+        }
+        return { ok: true }
+      } catch (error) {
+        // 读流中途的失败（fetch 之后的异常）与"没收到终帧"同族：这一轮**已经开始过**，
+        // 故在消息流内收口，而不是假装它没发生（前置失败在调用方那儿就已经返回了）
+        if (!controller.signal.aborted) {
+          const code: ClientErrorCode = error instanceof ApiError ? error.code : 'NETWORK'
+          const message = error instanceof ApiError ? error.message : '读取回答时连接中断'
+          useChatStreamStore.getState().fail({ code, message })
+          useChatStreamStore.getState().showDisconnect({ extra: `${code} · ${message}` })
+        }
+        return { ok: true }
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null
+        // 这一轮真的发生过 ⇒ 库里可能多了消息（`02` §5.2："中断/故障照样落库"）
+        // ⇒ 让历史失效，下次读到的就是落库后的版本。
+        // ⚠️ **不做这件事的后果很隐蔽**：`staleTime` 是 30s（`api/queryClient.ts`），
+        // 用户在 30s 内切走再切回对话页，会看到**流式那一轮凭空消失**的旧历史。
+        void queryClient.invalidateQueries({ queryKey: conversationMessagesQueryKey(targetId) })
+        // 侧栏（P0-1-34）的排序键是 `last_message_at`，而它**正是这一轮落库时才被推进的**
+        // （`02` §4.5 ④ 的唯一写入口 `touchConversation`）⇒ 不在这里失效，刚说过话的会话
+        // 就不会冒到「今天」那一组的最前面 —— 这正是 P0-1-34 的坑预判原文
+        //（`03` §五 的 `done` 行："**刷新会话列表排序**"）。
+        // 放在 `finally` 而不是 `done` 那一支：中断/断线的一轮**也可能落库**，
+        // 而"没落库"时多拉一次列表的代价只是一次几十行的查询（`03` §五 的 `done` 行是下限，不是上限）。
+        void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+        // 产物面板（P0-3-11）也是"这一轮真的发生过 ⇒ 库里可能多了几行"。它**没有**
+        // `last_message_at` 那种排序副作用，但面板上那一条要从"刚生成"变成真正的时刻读数
+        // （`artifactPanelModel#artifactTimeText` 的 `live` 那一档），靠的就是这份列表重取回来。
+        // ⚠️ 非 TaskAgent 时这个查询**根本没建**（`enabled: false`）⇒ 这一行是空转、
+        // 不多打请求；写在这里而不是在 TaskAgent 分支里，是为了让"一轮结束要失效什么"
+        // 只出现在一个地方（漏一处就是这个面板停在旧数据上的那种静默错）。
+        void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(targetId) })
+      }
+    },
+    [agentId, queryClient],
+  )
+
   const send = useCallback(
-    async (text: string, modelId?: string): Promise<SendOutcome> => {
+    async (text: string, modelId?: string, attachments: readonly AttachmentView[] = []): Promise<SendOutcome> => {
       const content = text.trim()
       // 空正文：与后端 `.min(1)` 同口径，不发请求（把"必填"的失败留给界面自己判，见 `ChatPage`）
       if (content === '') return { ok: true }
@@ -216,32 +328,11 @@ export function useChatStream(
 
       setSending(true)
       try {
-        const store = useChatStreamStore.getState()
-
-        // ③ **别的会话正在生成 ⇒ 不开新的这一轮**（P0-1-34）。
-        //
-        // 为什么必须在这里拦：本批的前端只有**一个轮次槽**（`stores/chatStream.ts` 的 `round`）。
-        // 侧栏让"切到别的会话再发一条"变成一个很容易的动作，而那时：
-        //   · `store.begin(targetId, …)` 会**覆盖**掉另一个会话正在进行的一轮；
-        //   · 旧流的帧还在往同一个槽里灌（`apply` 不认识"这一帧属于谁"）。
-        // 两者合起来是一个**静默串台**：B 的回答里混进 A 的增量，而两个会话各自看起来
-        // 都"有内容"。后端每个会话各有一把锁（允许并行），"同时只能有一条"是本批前端的约束
-        // （多流要把 store 改成 `Map`，属后续批次）。
-        //
+        // ③ 别的会话正在生成 ⇒ 拒绝（见 `streamingElsewhere`）。
         // ⚠️ 它排在 `createConversation` **之前**：放到后面会在"新建会话态"下先建出一个
         //    空会话再报错（用户侧栏里凭空多一条"新会话"）。
-        // ⚠️ 文案要**能照着做**（"等它结束，或到那个会话点停止"），不能只说"不允许"。
-        const running = store.round !== null && store.round.status === 'streaming' ? store.streamFor : null
-        if (running !== null && running !== conversationIdRef.current) {
-          return {
-            ok: false,
-            error: new ApiError(
-              'BUSY',
-              '另一个会话正在生成中：等它结束，或到那个会话点「停止」',
-              429,
-            ),
-          }
-        }
+        const busy = streamingElsewhere(conversationIdRef.current)
+        if (busy !== null) return { ok: false, error: busy }
 
         // ④ 没有会话就先建（`03` §4.1：首条消息发送时才创建会话）
         let targetId = conversationIdRef.current
@@ -256,75 +347,82 @@ export function useChatStream(
           onConversationCreatedRef.current?.(created)
         }
 
-        // ⑤ 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）
-        const controller = new AbortController()
-        abortRef.current?.abort()
-        abortRef.current = controller
-        store.begin(targetId, content, new Date().toISOString())
-
-        try {
-          const result = await streamChat(
-            targetId,
-            content,
-            {
-              onEvent: (event) => useChatStreamStore.getState().apply(event),
-              // 形状不对 = 两侧契约漂了（后端每帧都过同一份 schema）。**只记不改这一轮**：
-              // 丢一帧的代价远小于"把已经渲染好的回答改花"，而线索必须留下（见 `reportSseIssue`）
-              onIssue: reportSseIssue,
-            },
-            controller.signal,
-            modelId,
-          )
-
-          if (!result.terminated && !controller.signal.aborted) {
-            // 流没给终帧就结束了（服务端被 kill / 代理断开）。**必须让用户看到**：
-            // 半条回答与完整回答在界面上长得一样，静默接受就是"把故障显示成成功"。
-            // 两个通道各司其职：消息流内的错误卡（说"这一轮没成"）+ 顶部黄条（说"点我对齐"）
-            useChatStreamStore.getState().fail({
-              code: 'NETWORK',
-              message: '与服务器的连接中断，已生成的内容保留（可点顶部的提示对齐历史）',
-            })
-            useChatStreamStore.getState().showDisconnect({ extra: 'NETWORK · 没收到服务端的收口事件' })
-          }
-          return { ok: true }
-        } catch (error) {
-          // 读流中途的失败（fetch 之后的异常）与"没收到终帧"同族：这一轮**已经开始过**，
-          // 故在消息流内收口，而不是假装它没发生（前置失败在 ③ 里就已经返回了）
-          if (!controller.signal.aborted) {
-            const code: ClientErrorCode = error instanceof ApiError ? error.code : 'NETWORK'
-            const message = error instanceof ApiError ? error.message : '读取回答时连接中断'
-            useChatStreamStore.getState().fail({ code, message })
-            useChatStreamStore.getState().showDisconnect({ extra: `${code} · ${message}` })
-          }
-          return { ok: true }
-        } finally {
-          if (abortRef.current === controller) abortRef.current = null
-          // 这一轮真的发生过 ⇒ 库里可能多了消息（`02` §5.2："中断/故障照样落库"）
-          // ⇒ 让历史失效，下次读到的就是落库后的版本。
-          // ⚠️ **不做这件事的后果很隐蔽**：`staleTime` 是 30s（`api/queryClient.ts`），
-          // 用户在 30s 内切走再切回对话页，会看到**流式那一轮凭空消失**的旧历史。
-          void queryClient.invalidateQueries({ queryKey: conversationMessagesQueryKey(targetId) })
-          // 侧栏（P0-1-34）的排序键是 `last_message_at`，而它**正是这一轮落库时才被推进的**
-          // （`02` §4.5 ④ 的唯一写入口 `touchConversation`）⇒ 不在这里失效，刚说过话的会话
-          // 就不会冒到「今天」那一组的最前面 —— 这正是 P0-1-34 的坑预判原文
-          //（`03` §五 的 `done` 行："**刷新会话列表排序**"）。
-          // 放在 `finally` 而不是 `done` 那一支：中断/断线的一轮**也可能落库**，
-          // 而"没落库"时多拉一次列表的代价只是一次几十行的查询（`03` §五 的 `done` 行是下限，不是上限）。
-          void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
-          // 产物面板（P0-3-11）也是"这一轮真的发生过 ⇒ 库里可能多了几行"。它**没有**
-          // `last_message_at` 那种排序副作用，但面板上那一条要从"刚生成"变成真正的时刻读数
-          // （`artifactPanelModel#artifactTimeText` 的 `live` 那一档），靠的就是这份列表重取回来。
-          // ⚠️ 非 TaskAgent 时这个查询**根本没建**（`enabled: false`）⇒ 这一行是空转、
-          // 不多打请求；写在这里而不是在 TaskAgent 分支里，是为了让"一轮结束要失效什么"
-          // 只出现在一个地方（漏一处就是这个面板停在旧数据上的那种静默错）。
-          void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(targetId) })
-        }
+        // ⑤ 开一轮并读完流
+        return await performStream(
+          targetId,
+          content,
+          'send',
+          (signal) =>
+            streamChat(
+              targetId,
+              content,
+              {
+                onEvent: (event) => useChatStreamStore.getState().apply(event),
+                // 形状不对 = 两侧契约漂了（后端每帧都过同一份 schema）。**只记不改这一轮**：
+                // 丢一帧的代价远小于"把已经渲染好的回答改花"，而线索必须留下（见 `reportSseIssue`）
+                onIssue: reportSseIssue,
+              },
+              signal,
+              modelId,
+              attachments.map((item) => item.fileId),
+            ),
+          attachments,
+        )
       } finally {
         sendGate.leave()
         setSending(false)
       }
     },
-    [agentId, queryClient, sendGate],
+    [agentId, performStream, sendGate, streamingElsewhere],
+  )
+
+  /**
+   * 重新生成最新一轮（P1-3）。
+   *
+   * 与 `send` 的**两处刻意不同**：
+   *   · **不建会话**：重新生成只在"已有会话 + 有已落库的一轮"时提供，没有会话就直接拒绝
+   *     （不去建一个空会话 —— 那会凭空多出一条侧栏项）；
+   *   · **不校验 `content` 长度**：正文来自历史里那条消息（后端也会自己从库里读同一段），
+   *     这里只用它渲染这一轮的气泡。空正文只是"这轮没什么可重跑"，拒绝即可。
+   *
+   * 其余（同步闸门 / 别处正在生成 / 三类失败 / 三处失效）全部复用 {@link performStream}。
+   */
+  const regenerate = useCallback(
+    async (userText: string, modelId?: string): Promise<SendOutcome> => {
+      const content = userText.trim()
+      const targetId = conversationIdRef.current
+      if (targetId === undefined) {
+        return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法重新生成', 0) }
+      }
+      if (content === '') {
+        return { ok: false, error: new ApiError('VALIDATION', '这一轮没有可重新生成的正文', 0) }
+      }
+      if (!sendGate.enter()) {
+        return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
+      }
+
+      setSending(true)
+      try {
+        const busy = streamingElsewhere(targetId)
+        if (busy !== null) return { ok: false, error: busy }
+
+        return await performStream(targetId, content, 'regenerate', (signal) =>
+          streamRegenerate(
+            targetId,
+            {
+              onEvent: (event) => useChatStreamStore.getState().apply(event),
+              onIssue: reportSseIssue,
+            },
+            signal,
+            modelId,
+          ),
+        )
+      } finally {
+        sendGate.leave()
+        setSending(false)
+      }
+    },
+    [performStream, sendGate, streamingElsewhere],
   )
 
   /**
@@ -435,6 +533,7 @@ export function useChatStream(
     disconnect,
     streamingId,
     send,
+    regenerate,
     stop,
     align: alignAndClear,
   }

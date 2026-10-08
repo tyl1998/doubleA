@@ -19,6 +19,7 @@
  * | `GET /api/conversations/:id/active` | **裸 `ConversationActive`**（含派生的 `streaming`） |
  * | `POST /api/conversations/:id/stop` | **裸 `StopConversationResult`**（`{ id, signaled }`） |
  * | `POST /api/conversations/:id/chat` | **不是 JSON** —— `200 text/event-stream`（见下） |
+ * | `POST /api/conversations/:id/regenerate` | 同上（**P1-3**）：`200 text/event-stream`，只是开流前会先撤掉上一轮 |
  *
  * ─────────────────────────────────────────────────────────────────────
  * `chat` 是"两类失败、两个出口"的那一个端点
@@ -318,11 +319,45 @@ export async function streamChat(
   handlers: StreamChatHandlers,
   signal?: AbortSignal,
   modelId?: string,
+  attachmentFileIds?: readonly string[],
 ): Promise<Awaited<ReturnType<typeof readChatEventStream>>> {
   const response = await openEventStream(`/api/conversations/${encodeURIComponent(conversationId)}/chat`, {
     // `modelId` 省略 ⇒ 走该会话智能体的默认模型；给了则必须是其模型池成员（后端校验）
-    body: { content, ...(modelId === undefined ? {} : { modelId }) },
+    body: {
+      content,
+      ...(modelId === undefined ? {} : { modelId }),
+      // 附件（P1-4）：省略 / 空数组都不带这个键（服务层按"没有附件"处理）
+      ...(attachmentFileIds === undefined || attachmentFileIds.length === 0
+        ? {}
+        : { attachmentFileIds: [...attachmentFileIds] }),
+    },
     ...(signal === undefined ? {} : { signal }),
   })
+  return readChatEventStream(response, handlers)
+}
+
+/**
+ * 重新生成最新一轮（`POST /api/conversations/:id/regenerate`，**P1-3**）。
+ *
+ * 与 {@link streamChat} 同族（同样返回一条要读完的事件流、同样的 `StreamChatHandlers`）：
+ * 后端跑的是**同一条 `/chat` 链路**（不新增 SSE 事件），只是开流前会先撤掉上一轮。
+ *
+ * ⚠️ **不传正文**：后端"重跑最后一轮用户消息"，正文取自库里那条消息
+ *（`shared/src/sse.ts#regenerateConversationBodySchema`）。客户端唯一能给的是 `modelId`
+ *（换个模型重跑）—— 这也是它与"修改重发"的分工：想改字走撤回/修改重发，这里只重跑。
+ */
+export async function streamRegenerate(
+  conversationId: string,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal,
+  modelId?: string,
+): Promise<Awaited<ReturnType<typeof readChatEventStream>>> {
+  const response = await openEventStream(
+    `/api/conversations/${encodeURIComponent(conversationId)}/regenerate`,
+    {
+      body: { ...(modelId === undefined ? {} : { modelId }) },
+      ...(signal === undefined ? {} : { signal }),
+    },
+  )
   return readChatEventStream(response, handlers)
 }

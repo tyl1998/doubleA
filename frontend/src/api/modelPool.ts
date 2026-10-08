@@ -50,6 +50,8 @@ import type {
   ModelListResult,
   ModelProviderItem,
   ModelProviderListResult,
+  ProbeChatBody,
+  ProbeChatResult,
   ProbeEmbeddingBody,
   ProbeEmbeddingResult,
   ProviderBoundModelsResult,
@@ -257,5 +259,17 @@ export function useProbeEmbeddingModel() {
   return useMutation({
     mutationFn: (body: ProbeEmbeddingBody) =>
       request<ProbeEmbeddingResult>('/api/models/probe-embedding', { method: 'POST', body }),
+  })
+}
+
+/**
+ * 对话模型连通测试（仅 ADMIN，**不落库**；P1-1）：按当前表单值试发一次极小对话请求
+ * （`max_tokens: 1`），成功即拿到上游回的短文本与耗时；失败则抛出上游原文（含请求 URL），
+ * 供界面直接展示。与 `useProbeEmbeddingModel` 同款。
+ */
+export function useProbeChatModel() {
+  return useMutation({
+    mutationFn: (body: ProbeChatBody) =>
+      request<ProbeChatResult>('/api/models/probe-chat', { method: 'POST', body }),
   })
 }

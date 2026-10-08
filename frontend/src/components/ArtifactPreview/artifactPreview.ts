@@ -51,17 +51,27 @@ export function artifactDownloadUrl(artifactId: string): string {
 }
 
 /**
- * 历史产物列表（`GET /api/artifacts/history`，**TaskAgent 记忆与产物 块 4/5**）。
+ * 会话产物列表（`GET /api/artifacts`，**跨会话汇总本人全部产物**）。
  *
  * ⚠️ **与上面两个出口不同，它带 query**（offset/limit 分页）—— 但那不是"同一个端点加参数"：
  * 上面两条是**同一个资源**的两种**出口**（下载 / 预览），而这一条是**另一个资源**
- * （跨会话的历史产物清单）。分页参数属于列表本身，不存在"用 query 选安全策略"的问题。
+ * （跨会话的会话产物清单）。分页参数属于列表本身，不存在"用 query 选安全策略"的问题。
  * 放在本文件（与那两个 URL Builder 同处）只是因为 F 组那条源码级断言把"拼 `/api/artifacts/`
  * 前缀"这件事钉在**这一个文件**里 —— 不在这里加，别的模块就会各拼一次。
  */
-export function artifactHistoryUrl(offset: number, limit: number): string {
+export function artifactsCollectionUrl(offset: number, limit: number): string {
   const search = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-  return `/api/artifacts/history?${search.toString()}`
+  return `/api/artifacts?${search.toString()}`
+}
+
+/**
+ * 删除产物（`DELETE /api/artifacts/:id`，**会话产物列表的删除动作**）。
+ *
+ * ⚠️ 与上面两个 URL 同处一个文件：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
+ * 只出现在**这一个文件**（否则就有第二处会各自演化）。
+ */
+export function artifactDeleteUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}`
 }
 
 // ───────────────────────────── 体积闸门 ─────────────────────────────

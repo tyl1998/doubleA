@@ -71,6 +71,7 @@ import {
 import { askConversation, ChatStoppedError, type ConfirmQuestion } from '../orchestrator/sse.js'
 import { artifactDownloadContentType, openArtifactSourceForConversation } from '../services/artifact.service.js'
 import { buildContentDisposition } from '../services/document.service.js'
+import { openFileSourceForConversation } from '../services/file.service.js'
 import { executeMcpToolCall } from '../services/mcpCall.service.js'
 import {
   emptySandboxMcpCatalog,
@@ -503,6 +504,56 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
       } catch (error) {
         // 产物不存在 / 不属于这个会话 ⇒ 404（与 `/mcp/call` 的"4xx = 协议层拒绝"同族）。
         // 其余（S3 不可用等）照常向上抛，由 listener 的默认错误处理收口。
+        if (error instanceof AppError) return sendError(reply, error.status, error.code, error.message)
+        throw error
+      }
+    },
+  )
+
+  /**
+   * 沙箱**按需下载用户上传的附件**（`GET /api/sandbox/attachments/:fileId`，**P1-4 修订**）。
+   *
+   * 解决的是"容器重建后 `/work/attachments/` 被清空、agent 再也读不到用户此前上传的文件"
+   * （工作卷随容器走，附件本体在 S3 里一直在）。记忆文档里写着"这个会话收到过哪些附件、
+   * ID 是什么"，agent 需要时用这条端点把它们**自己拉回 `/work`**（命令见
+   * `orchestrator/memoryDoc.ts#NODE_FETCH_ATTACHMENT_COMMAND`）。
+   *
+   * ★ 认证与归属：令牌 ⇒ 会话身份（与 `/mcp/call`、`/api/sandbox/artifacts` 同一条）；
+   *   `fileId` 必须真的出现在该会话的消息里、且 `files.uploader_id` = 令牌里的 `userId`
+   *   （`openFileSourceForConversation` 把两问一次判完）—— 容器只能取回**自己这个会话**
+   *   收到过的附件，取不到别人的、也取不到别的会话的。
+   *
+   * ⚠️ 响应头与 `/api/sandbox/artifacts` 逐字同款（字节流 + 失败信封），容器侧 `fetch`
+   *   按 `r.ok` 分支即可。
+   */
+  app.get<{ Params: { fileId: string } }>(
+    '/api/sandbox/attachments/:fileId',
+    async (request, reply) => {
+      const auth = await authenticate(tokenFromHeader(request.headers))
+      if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+
+      const parsedId = z.string().uuid().safeParse(request.params.fileId)
+      if (!parsedId.success) return sendError(reply, 400, 'VALIDATION', '附件 ID 不是合法 UUID')
+
+      try {
+        const source = await openFileSourceForConversation({
+          fileId: parsedId.data,
+          conversationId: auth.record.conversationId,
+          uploaderId: auth.record.userId,
+        })
+        getLogger().info(
+          { conversationId: auth.record.conversationId, fileId: parsedId.data },
+          '沙箱按需下载附件（容器经代理令牌自证身份）',
+        )
+        return reply
+          .header('content-type', source.contentType)
+          .header('content-length', String(source.contentLength))
+          .header('content-disposition', buildContentDisposition(source.fileName))
+          .header('x-content-type-options', 'nosniff')
+          .header('cache-control', 'private, no-store')
+          .send(source.body)
+      } catch (error) {
+        // 附件不存在 / 不属于这个会话 ⇒ 404（与产物下载同族：4xx = 协议层拒绝）。
         if (error instanceof AppError) return sendError(reply, error.status, error.code, error.message)
         throw error
       }

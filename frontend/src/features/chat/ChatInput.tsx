@@ -1,7 +1,8 @@
 /**
  * 输入区（P0-1-33）
  *
- * 依据：`docs/03-前端设计.md` §4.1 的版式（`[📎] [输入框…] [停止/发送]`，📎 附件属 P1 ⇒ **P0 不渲染**）
+ * 依据：`docs/03-前端设计.md` §4.1 的版式（`[📎] [输入框…] [停止/发送]`；📎 附件自 **P1-4** 起渲染 ——
+ *      选中即上传拿 `fileId`，发送时随 `attachmentFileIds` 带上，见 `api/files.ts`）
  *      与「输入区状态机」全文、§七 的键盘约定（"Enter 发送（对话输入框）"）。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -22,11 +23,49 @@
  */
 
 import { Button } from 'antd'
-import type { KeyboardEvent } from 'react'
+import type { ChangeEvent, KeyboardEvent } from 'react'
 
+import { CHAT_ATTACHMENT_MAX_COUNT } from '@doubulea/shared'
+
+import { fileContentUrl } from '../../api/files.js'
 import { ConfirmCard } from './ConfirmCard.js'
 import { composeState, isSubmitKey } from './composerState.js'
+import type { AttachmentView } from './messageModel.js'
 import type { StreamRound } from './roundReducer.js'
+
+/**
+ * 文件选择器的 `accept`（P1-4）。
+ *
+ * ⚠️ **刻意手写、不从 `MIME_BY_CHAT_ATTACHMENT_EXTENSION` 派生**：那张表里 docx 允许
+ * `application/zip`（第三道校验要放行"客户端把 docx 报成 zip"），若拿它拼 accept，选择器就会
+ * 把**任意 zip** 也当成可选 —— accept 只用来灰掉明显不支持的（`.exe`/`.xlsx`…），不是白名单本体。
+ * 扩展名与 MIME **两种都写**：见使用处的注释（macOS Chrome 光靠扩展名不置灰）。
+ */
+const ACCEPT_ATTACHMENT = [
+  '.pdf',
+  '.docx',
+  '.md',
+  '.txt',
+  '.json',
+  '.csv',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.gif',
+  '.bmp',
+  'application/pdf',
+  'application/json',
+  'text/csv',
+  'text/plain',
+  'text/markdown',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'image/bmp',
+].join(',')
 
 export interface ChatInputProps {
   /** 当前会话进行中的那一轮（`null` = 空闲） */
@@ -58,6 +97,14 @@ export interface ChatInputProps {
   onConfirmAnswer: (accepted: boolean) => void
   /** 确认应答正在提交（两个按钮都禁用，防连点） */
   confirmPending: boolean
+  /** 本轮已上传好的附件（P1-4；`fileId` + 展示信息） */
+  attachments: readonly AttachmentView[]
+  /** 有附件正在上传（此时发送按钮禁用，避免"附件还没传完就发出去"） */
+  uploading: boolean
+  /** 选中文件（页面负责上传与去重） */
+  onPickFiles: (files: FileList) => void
+  /** 移除一个附件 */
+  onRemoveAttachment: (fileId: string) => void
 }
 
 export function ChatInput({
@@ -71,6 +118,10 @@ export function ChatInput({
   onStop,
   onConfirmAnswer,
   confirmPending,
+  attachments,
+  uploading,
+  onPickFiles,
+  onRemoveAttachment,
 }: ChatInputProps) {
   const view = composeState({ round, sending, stopping, elsewhere, draft })
 
@@ -85,7 +136,8 @@ export function ChatInput({
       return
     }
     event.preventDefault()
-    if (view.canSend) onSubmit()
+    // 有附件没传完 ⇒ 先不发送（与按钮禁用同一条判据，避免"附件没带上就发出去"）
+    if (view.canSend && !uploading) onSubmit()
   }
 
   return (
@@ -94,10 +146,35 @@ export function ChatInput({
       data-testid="composer"
       onSubmit={(event) => {
         event.preventDefault()
-        if (view.canSend) onSubmit()
+        if (view.canSend && !uploading) onSubmit()
       }}
     >
       <div className="composer__inner">
+        {/* 已选附件（P1-4）：图片显缩略图、文本类显文件条；上传中不出现（传完才有 fileId） */}
+        {attachments.length === 0 ? null : (
+          <div className="composer__attachments" data-testid="composer-attachments">
+            {attachments.map((item) => (
+              <span key={item.fileId} className="attachment-chip" data-attachment-kind={item.kind}>
+                {item.kind === 'IMAGE' ? (
+                  <img className="attachment-chip__thumb" src={fileContentUrl(item.fileId)} alt={item.name} />
+                ) : (
+                  <span className="attachment-chip__doc" aria-hidden="true" />
+                )}
+                <span className="attachment-chip__name" title={item.name}>
+                  {item.name}
+                </span>
+                <button
+                  type="button"
+                  className="attachment-chip__remove"
+                  aria-label={`移除附件 ${item.name}`}
+                  onClick={() => onRemoveAttachment(item.fileId)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         {/* 确认卡：`confirm` 事件到达 ⇒ 锁输入显示确认卡（`03` §4.1）。
             ⚠️ **P0-2-11 起它接的是真数据源**：`source` / `expiresAt` 都来自服务端的
             `confirm` 事件（`round.confirm` 就是那个载荷），倒计时读 `expiresAt` 而不是
@@ -115,6 +192,37 @@ export function ChatInput({
         )}
 
         <div className="composer__box" data-composer-state={view.state}>
+          {/* 附件入口（P1-4）：📎 选文件 → 页面负责上传；达到上限 / 不可输入时禁用 */}
+          <label
+            className="composer__attach"
+            title={
+              attachments.length >= CHAT_ATTACHMENT_MAX_COUNT
+                ? `最多 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`
+                : '添加附件（图片 / PDF / Word / 文本 / JSON / CSV）'
+            }
+            data-disabled={!view.canType || uploading || attachments.length >= CHAT_ATTACHMENT_MAX_COUNT}
+          >
+            <span aria-hidden="true">📎</span>
+            {/* `accept` 只是选择器初筛；真正的白名单判据在服务端（`detectFormat` + 附件画像），
+                改这里不改后端不会放行 —— 与"判据只有一处"同款。
+                ⚠️ **扩展名 + MIME 两种都写**：macOS 的 Chrome 光靠扩展名列表**不会把不支持的文件置灰**
+                （它只是把选择器默认筛选到这些类型），补上 MIME 才能让原生弹窗把其余文件灰掉。
+                这是浏览器/系统行为，不是本仓的判据 —— 因此后端那三道校验仍然必须留着。 */}
+            <input
+              type="file"
+              multiple
+              accept={ACCEPT_ATTACHMENT}
+              data-testid="composer-file"
+              disabled={!view.canType || uploading || attachments.length >= CHAT_ATTACHMENT_MAX_COUNT}
+              onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                const files = event.target.files
+                if (files !== null && files.length > 0) onPickFiles(files)
+                // 复位，让同一个文件能被再次选中（否则第二次选它不会触发 change）
+                event.target.value = ''
+              }}
+            />
+          </label>
+
           <textarea
             rows={1}
             value={draft}
@@ -148,10 +256,10 @@ export function ChatInput({
               type="primary"
               htmlType="submit"
               data-testid="composer-primary"
-              disabled={view.primary.disabled}
-              loading={view.primary.kind === 'busy'}
+              disabled={view.primary.disabled || uploading}
+              loading={view.primary.kind === 'busy' || uploading}
             >
-              {view.primary.label}
+              {uploading ? '附件上传中…' : view.primary.label}
             </Button>
           )}
         </div>

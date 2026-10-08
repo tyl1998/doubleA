@@ -42,6 +42,7 @@ import {
   artifactViewFromEvent,
   toolViewFromEvent,
   type ArtifactView,
+  type AttachmentView,
   type ChatMessageView,
   type ToolCallView,
 } from './messageModel.js'
@@ -59,10 +60,28 @@ export interface StreamAssistant {
   artifacts: ArtifactView[]
 }
 
+/**
+ * 这一轮是**怎么发起的**（P1-3）。
+ *
+ *   · `'send'` = 用户新发一条消息（默认）；
+ *   · `'regenerate'` = **重新生成**最新一轮 —— 后端会先撤掉上一轮再重跑同一段正文
+ *     （`POST /:id/regenerate`）。它唯一影响的是**渲染**：页面据此把历史里"正在被替换的
+ *     那一轮"暂时收起（`messageModel.ts#dropLastRound`），否则会与这一轮渲染出重复气泡。
+ *     归约/收尾逻辑与 `'send'` **逐字一致**（同一条 `/chat` 链路、同一套事件）。
+ */
+export type RoundKind = 'send' | 'regenerate'
+
 /** 当前这一轮的全部状态（用户消息 + 助手消息 + 收尾信息） */
 export interface StreamRound {
+  /** 这一轮的发起方式（见 {@link RoundKind}）——只影响页面渲染，不影响事件归约 */
+  kind: RoundKind
   /** 本轮用户消息的正文（已 trim，与后端落库的正文一致） */
   userText: string
+  /**
+   * 本轮用户消息携带的附件（**P1-4**）—— 由页面在 `begin` 时传入（此刻它们已经在服务端上传好了）。
+   * `regenerate` 恒为空数组（重新生成不带附件，见 `useChatStream#regenerate`）。
+   */
+  userAttachments: readonly AttachmentView[]
   /** 本轮开始时刻（ISO 8601，客户端侧）—— 与后端 `done` 无关，只用于"已用时"展示 */
   startedAt: string
   assistant: StreamAssistant
@@ -137,9 +156,16 @@ export interface StreamRound {
 }
 
 /** 开一轮（用户按下发送、且流已经成功建立时调用） */
-export function beginRound(userText: string, startedAt: string): StreamRound {
+export function beginRound(
+  userText: string,
+  startedAt: string,
+  kind: RoundKind = 'send',
+  userAttachments: readonly AttachmentView[] = [],
+): StreamRound {
   return {
+    kind,
     userText,
+    userAttachments,
     startedAt,
     assistant: { text: '', thinking: '', citations: null, tools: [], artifacts: [] },
     status: 'streaming',
@@ -293,6 +319,7 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       citations: null,
       tools: [],
       artifacts: [],
+      attachments: round.userAttachments,
       createdAt: null,
       status: 'complete',
     },
@@ -304,6 +331,7 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       citations: round.assistant.citations,
       tools: round.assistant.tools,
       artifacts: round.assistant.artifacts,
+      attachments: [],
       createdAt: null,
       status: round.status,
       ...(round.statusText === null ? {} : { statusText: round.statusText }),

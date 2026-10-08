@@ -25,7 +25,13 @@ import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem,
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
-import { useCreateModel, useProbeEmbeddingModel, useProbeRemoteModels, useUpdateModel } from '../../api/modelPool.js'
+import {
+  useCreateModel,
+  useProbeChatModel,
+  useProbeEmbeddingModel,
+  useProbeRemoteModels,
+  useUpdateModel,
+} from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   EMPTY_MODEL_FORM_VALUES,
@@ -58,6 +64,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   const create = useCreateModel()
   const update = useUpdateModel()
   const probeEmbedding = useProbeEmbeddingModel()
+  const probeChat = useProbeChatModel()
 
   const [providerId, setProviderId] = useState('')
   const [modelName, setModelName] = useState('')
@@ -150,7 +157,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   const canSubmit =
     modelName.trim() !== '' && label.trim() !== '' && (editing || providerId !== '') && contextError === null && !submitting
 
-  const probing = probeEmbedding.isPending
+  const probing = probeEmbedding.isPending || probeChat.isPending
   const canProbe = providerId !== '' && modelName.trim() !== '' && !probing && !submitting
 
   /** 探测向量模型维度（不落库）：成功即回填维度并提示；失败把上游原文显示在表单里 */
@@ -162,6 +169,21 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         onSuccess: (result) => {
           setEmbeddingDim(result.dim)
           feedback.ok(`探测成功：维度 ${result.dim}。请求 ${result.url}`)
+        },
+        onError: (error) => setErrorText(describeError(error).message),
+      },
+    )
+  }
+
+  /** 对话模型连通测试（不落库；P1-1）：成功提示上游回的短文本与耗时；失败把上游原文显示在表单里 */
+  const runChatProbe = (): void => {
+    setErrorText(null)
+    probeChat.mutate(
+      { providerId, modelName: modelName.trim() },
+      {
+        onSuccess: (result) => {
+          const reply = result.reply.trim() === '' ? '（空回复）' : result.reply.trim()
+          feedback.ok(`连通成功（${result.durationMs} ms）：${reply}`)
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -346,7 +368,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
                   placeholder="留空则在保存时尽力向上游探测"
                   onChange={(value) => setEmbeddingDim(value === null ? null : Number(value))}
                 />
-                <Button onClick={runProbe} loading={probing} disabled={!canProbe}>
+                <Button onClick={runProbe} loading={probeEmbedding.isPending} disabled={!canProbe}>
                   探测
                 </Button>
               </div>
@@ -407,6 +429,20 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
                 <code>reasoning_effort</code>、Responses 走 <code>reasoning</code>、Anthropic 走
                 <code>thinking</code>。只对<strong>真正支持思考的模型</strong>勾选 —— 上游若不认这个参数会报错，
                 那时关掉它即可。
+              </p>
+            </div>
+
+            <div>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>连通测试</span>
+                <Button onClick={runChatProbe} loading={probeChat.isPending} disabled={!canProbe}>
+                  测试
+                </Button>
+              </div>
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                点「测试」会<strong>当场</strong>向该模型发一次极小对话请求（<code>max_tokens:1</code>，不保存），
+                验证 <code>baseUrl</code> / Key / 协议 / 型号名这一整条链路 —— 成功提示上游回的短文本与耗时；
+                失败会把上游原文显示在下方。与真实对话走<strong>同一条</strong>调用路径，因此"探测通、一发消息就错"不会发生。
               </p>
             </div>
           </>

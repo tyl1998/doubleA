@@ -29,10 +29,11 @@ import { AGENT_TYPES, type AgentItem, type AgentType } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
-import { AGENTS_PAGE_LIMIT_MAX, useAgents } from '../../api/agents.js'
+import { AGENTS_PAGE_LIMIT_MAX, useAgents, useCopyAgent } from '../../api/agents.js'
 import { AGENT_TYPE_LABEL, formatUpdatedAt, mcpRefsOf } from './agentModel.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { useFeedback } from '../../app/feedback.js'
 import { AGENTS_NEW_PATH, chatPath, agentEditPath } from '../../app/paths.js'
 
 /** 类型筛选：`ALL` 是"全部"，其余取 `AGENT_TYPES` 的字面量 */
@@ -40,9 +41,11 @@ type TypeFilter = 'ALL' | AgentType
 
 export function AgentsListPage() {
   const navigate = useNavigate()
+  const feedback = useFeedback()
   const [keyword, setKeyword] = useState('')
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL')
   const [pendingDelete, setPendingDelete] = useState<AgentItem | null>(null)
+  const copy = useCopyAgent()
 
   const { data, isPending, isError, error, isFetching, refetch } = useAgents({
     offset: 0,
@@ -133,11 +136,27 @@ export function AgentsListPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 190,
+      // 复制对所有行都提供（不需要编辑权限，见服务层 `copyAgent` 口径 ①）⇒ 比原来宽一点
+      width: 240,
       align: 'right',
       render: (_, agent) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
           <Link to={chatPath(agent.id)}>对话</Link>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0 }}
+            disabled={copy.isPending}
+            loading={copy.isPending && copy.variables === agent.id}
+            onClick={() => {
+              copy.mutate(agent.id, {
+                onSuccess: (created) => feedback.ok(`已复制为「${created.name}」`),
+                onError: (error) => feedback.fail(error, '复制失败'),
+              })
+            }}
+          >
+            复制
+          </Button>
           {agent.canEdit ? (
             <>
               <Link to={agentEditPath(agent.id)}>编辑</Link>
