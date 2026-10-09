@@ -57,13 +57,24 @@ import {
   type RegenerateConversationBody,
   type RenameConversationBody,
   type SetConversationAutoApproveBody,
+  type SseEvent,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
+import { config } from '../config.js'
+import { subscribeFrames } from '../orchestrator/frameBus.js'
 import { resolveChatProducer } from '../orchestrator/index.js'
-import { answerConfirm, setAutoApprove, signalStop, streamChatReply } from '../orchestrator/sse.js'
+import {
+  answerConfirm,
+  serializeSseFrame,
+  setAutoApprove,
+  signalStop,
+  SSE_RESPONSE_HEADERS,
+  streamChatReply,
+} from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
+  assertConversationOwner,
   assertConversationRegenerable,
   assertConversationSendable,
   createConversation,
@@ -169,6 +180,62 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     '/api/conversations/:id/active',
     { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
     async (request) => ok(await getConversationActive(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * **观察流**（`GET /api/conversations/:id/stream`，P1-6 方案 A）：只读 SSE，把这条会话
+   * **此刻正在跑的那一轮**的帧实时转给订阅者。
+   *
+   * 为什么需要它：定时任务一轮是 headless 的（`scheduledRun.ts`），帧原本进空 sink，用户打开
+   * 会话窗口看不到任何进展。写侧（`SseChannel#emit` 与 `scheduledRun`）现在把帧发进**帧总线**
+   * （`orchestrator/frameBus.ts`），本端点订阅后转发 —— 于是"不是本页发起的那一轮"也能实时看。
+   *
+   * 三条约定：
+   *   · **仅本人**（`assertConversationOwner`，别人的会话与不存在同 404）；
+   *   · **只读**：不拿锁、不写库、不发命令，只是转发帧（+ ping 心跳）；
+   *   · **迟到者补帧**：总线按会话缓冲本轮已发的帧，订阅时先回放 ⇒ 打开晚一点也能补齐开头。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/stream',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request, reply) => {
+      await assertConversationOwner(request.params.id, viewerOf(request))
+      const conversationId = request.params.id
+
+      reply.hijack()
+      reply.raw.writeHead(200, SSE_RESPONSE_HEADERS)
+      reply.raw.flushHeaders()
+
+      let closed = false
+      const write = (event: SseEvent): void => {
+        if (closed) return
+        try {
+          reply.raw.write(serializeSseFrame(event))
+        } catch {
+          closed = true
+        }
+      }
+      const unsubscribe = subscribeFrames(conversationId, write)
+      const ping = setInterval(() => {
+        if (closed) return
+        try {
+          // 注释行心跳（与 `/chat` 的 SSE 同一手法）：不产生事件，只保活
+          reply.raw.write(': ping\n\n')
+        } catch {
+          closed = true
+        }
+      }, config.limits.ssePingIntervalSec * 1000)
+      ping.unref()
+
+      const cleanup = (): void => {
+        if (closed) return
+        closed = true
+        clearInterval(ping)
+        unsubscribe()
+      }
+      reply.raw.once('close', cleanup)
+      reply.raw.once('error', cleanup)
+    },
   )
 
   /**

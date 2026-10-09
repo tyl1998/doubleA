@@ -233,14 +233,14 @@ const EVENT_STREAM_CONTENT_TYPE = 'text/event-stream'
  */
 export async function openEventStream(
   path: string,
-  options: { body?: unknown; signal?: AbortSignal } = {},
+  options: { body?: unknown; signal?: AbortSignal; method?: 'POST' | 'GET' } = {},
 ): Promise<Response> {
-  const { body, signal } = options
+  const { body, signal, method = 'POST' } = options
 
   let response: Response
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
-      method: 'POST',
+      method,
       credentials: 'include',
       headers: body === undefined ? {} : { 'content-type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),

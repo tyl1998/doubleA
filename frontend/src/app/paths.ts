@@ -35,6 +35,9 @@ export const CREDENTIALS_PATH = '/settings/credentials'
 /** 会话产物（跨会话汇总本人全部产物，含删除会话后保留的那些；登录即可、仅本人可见） */
 export const ARTIFACT_COLLECTION_PATH = '/artifacts'
 
+/** 任务中心（`03` §二：`/tasks`，登录即可 —— **定时任务**管理；P1-6） */
+export const TASKS_PATH = '/tasks'
+
 /**
  * 「我的凭据」地址，可带 `?serverId=` 定位到某一台 server 的分组（`03` §二 的引注、§4.5）。
  *

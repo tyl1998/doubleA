@@ -95,6 +95,7 @@ import {
 import { roundToViews } from '../../features/chat/roundReducer.js'
 import { chatErrorTitle, shouldToastChatError } from '../../features/chat/streamErrors.js'
 import { useChatStream } from '../../features/chat/useChatStream.js'
+import { useConversationWatch } from '../../features/chat/useConversationWatch.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
 import { useChatStreamStore } from '../../stores/chatStream.js'
 
@@ -165,6 +166,9 @@ export function ChatPage() {
       ...(agentQuery.data === undefined ? {} : { agentType: agentQuery.data.type }),
     },
   )
+
+  // P1-6 方案 A：观察这条会话"不是本页发起的那一轮"（定时任务后台运行的实时视图）
+  useConversationWatch(conversationId)
 
   const [draft, setDraft] = useState('')
   const [aligning, setAligning] = useState(false)

@@ -45,7 +45,7 @@ export interface NavItem {
  *   或工具失败卡直达"，放进全局导航才不会成为孤岛（§三 的动线要求）。⚠️ 它**与 MCP 解耦**：
  *   路由是 `/settings/credentials`（个人设置族，与 `/settings/password` 同族），
  *   **刻意不排在 `MC` 后面**，免得被读成 MCP 的子页；
- * - 「任务」是 P1（`03` §4.7），本阶段不进导航 —— 摆一个点进去是空壳的入口比没有更差。
+ * - 「任务」P1-6 已落地（`03` §4.7 的**定时任务**管理），本批进导航（此前因"点进去是空壳"而刻意不进）。
  */
 export const NAV_ITEMS: readonly NavItem[] = [
   // 已落地 ⇒ 不带 `batch`（P0-1-31 起把首页换成真实的智能体列表；编辑页不带导航项，
@@ -57,6 +57,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
   // 已落地 ⇒ 不带 `batch`（会话产物：跨会话汇总本人全部产物，登录即可、可预览/下载/删除）
   { code: 'AH', label: '会话产物', path: '/artifacts', serial: 'S-10 · 会话产物' },
+  // 已落地 ⇒ 不带 `batch`（P1-6 把任务中心占位页换成真页面：**定时任务**管理）
+  { code: 'TK', label: '任务', path: '/tasks', serial: 'S-09 · 任务中心' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把凭据页换成真实页面）。⚠️ **与 MCP 解耦**：路由归入
   // `/settings` 一族（个人设置族），排在个人项这一端，不跟在 `MC` 后面。
   { code: 'CR', label: '我的凭据', path: '/settings/credentials', serial: 'S-08b · 凭据' },
@@ -71,7 +73,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
    * 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
    * **一个读数错了的仪表比没有仪表更容易误导**（`nav.ts` 的 `SERIAL_BY_PREFIX` 注释里已有
    * 同款教训：`/agents/new` 那次）。用量统计是 P1，**不进来**（摆一个点进去是空壳的入口
-   * 比没有更差，与「任务」不进导航同一条理由）。
+   * 比没有更差；「任务」同因在 P1-6 落地前也不进来，本批已落地 ⇒ 已加导航项）。
    */
   { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
   { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池', adminOnly: true },

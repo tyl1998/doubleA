@@ -32,6 +32,7 @@ import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
 import { registerMcpServerRoutes } from './routes/mcpServers.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
+import { registerTaskRoutes } from './routes/tasks.js'
 import { registerUserRoutes } from './routes/users.js'
 
 /**
@@ -180,6 +181,10 @@ export function buildApp(): FastifyInstance {
   // ⑮ 文件附件（P1-4）：上传（multipart）/ 取内容（字节流）。上传登录即可，
   //    取内容是**仅本人**（`files.uploader_id`）—— 与会话/产物同族。
   registerFileRoutes(app)
+  // ⑯ 任务中心（P1-6，2026-10-09 需求变更：**定时任务**）：`/api/tasks` 五条（列表 / 建 / 改 /
+  //    删 / 立即执行）。权限与会话同族（**仅本人**，`scheduled_tasks.user_id`）；
+  //    到点自动派活的后台调度器是**进程级组件**，归 `index.ts` 生命周期，不在这里注册。
+  registerTaskRoutes(app)
 
   return app
 }

@@ -114,6 +114,7 @@ import {
 } from '../infra/redis.js'
 import { LlmAbortError, type LlmTarget } from '../llm/client.js'
 import type { ChatAttachmentContext } from '../services/file.service.js'
+import { closeRun, openRun, publishFrame } from './frameBus.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 常量与纯函数
@@ -131,7 +132,7 @@ import type { ChatAttachmentContext } from '../services/file.service.js'
  *     里也写了 `proxy_buffering off`，但网关配置不是我们能保证的，双写一遍更稳）；
  *   · `connection: keep-alive`：显式声明长连接（老代理看到 `close` 会当一次性请求收尾）。
  */
-const SSE_RESPONSE_HEADERS: Readonly<Record<string, string>> = {
+export const SSE_RESPONSE_HEADERS: Readonly<Record<string, string>> = {
   'content-type': SSE_CONTENT_TYPE,
   'cache-control': 'no-cache, no-transform',
   'x-accel-buffering': 'no',
@@ -241,6 +242,19 @@ export async function clearStopSignal(conversationId: string): Promise<void> {
   } catch (error) {
     // 清不掉不阻塞开工/收尾：最坏是这一轮被残留信号秒停（可重发），而抛出去会让"发消息"整个失败
     getLogger().warn({ err: error, conversationId }, '清除停止信号失败（本次流可能被残留信号中断）')
+  }
+}
+
+/**
+ * 读停止信号（**不消费**）。给 **headless 运行**（`scheduledRun.ts`）轮询用：
+ * `signalStop` 写入后，`SseChannel` 自己会轮询，而定时运行没有通道 ⇒ 由它自己按心跳节奏读，
+ * 读到即中断。读不到时返回 `false`（Redis 抖动不该让"停止"误触发）。
+ */
+export async function readStopSignal(conversationId: string): Promise<boolean> {
+  try {
+    return (await getRedis().get(chatStopKey(conversationId))) !== null
+  } catch {
+    return false
   }
 }
 
@@ -741,6 +755,10 @@ class SseChannel {
     // 连接已经没了 ⇒ 静默丢弃，**不要**再尝试写（`write()` 在已销毁的 socket 上会异步抛
     // `ERR_STREAM_DESTROYED`，那是个没有调用方能接的 'error' 事件；见 {@link #waitDrain}）
     if (this.#closed || this.#raw.destroyed) return
+
+    // 广播给"订阅了这个会话的观察者"（P1-6 方案 A：后台/他处运行可被实时看到）。
+    // 放在"连接还在"之后：连接断了这条流会被 abort，再广播没有意义。
+    publishFrame(this.conversationId, event)
 
     try {
       const flushed = this.#raw.write(serializeSseFrame(event))
@@ -1315,6 +1333,8 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
      */
     registerActiveChannel(activeChannel)
     channel.start()
+    // 开这条会话的帧频道（P1-6 方案 A）：本流发出的每一帧都会进总线，供观察者订阅
+    openRun(conversationId)
 
     // ⑤ 客户端断开 = 流结束。**这一条是"锁不会漏"的关键**：没有它，用户关掉标签页之后
     //    这条流会一直跑（占着锁与上游连接）直到锁的 TTL 到期。
@@ -1394,6 +1414,8 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
        */
       unregisterActiveChannel(activeChannel)
       channel.dispose()
+      // 关帧频道（P1-6 方案 A）：停止缓冲；观察者的连接各自关闭时再 unsubscribe
+      closeRun(conversationId)
       // ⚠️ 顺序：清停止键必须在**释放锁之前**（此刻锁还在我们手上 ⇒ 不可能有别的流在跑 ⇒
       //    这个键只可能是写给我们的）。挪到外层 finally 之后就可能和新流的 `/stop` 抢键 ——
       //    把新流刚拿到的停止信号删掉，症状是"点了停止但停不下来"。

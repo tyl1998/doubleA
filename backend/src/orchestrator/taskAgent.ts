@@ -654,6 +654,20 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       }
     : undefined
 
+  /**
+   * 收口"没等到结局"的工具卡（`RUNNING` → `ERROR`）。
+   *
+   * ⚠️ 引擎先发 `tool_execution_start`（落一张 `RUNNING` 卡）、`tool_execution_end` 才改成
+   * `SUCCESS`/`ERROR`。一轮被**中断 / 超时 / 引擎异常**时，最后一张卡可能永远等不到 end ⇒
+   * 落库后刷新会话就会看到一张**永远转圈**的工具卡（用户实测：headless 定时任务里
+   * `bash ls -la /work` 一直显示"运行中"—— 那一轮其实已经中断，只是卡没被收口）。
+   * 这里在落库前把仍是 `RUNNING` 的卡一律改成 `ERROR`，与"这一轮没跑完"的事实一致；
+   * 已结束的卡（同一 `callId` 的 end 记录）不受影响（前端按 `callId` upsert，后者覆盖前者）。
+   */
+  const finalToolRecords = round.toolRecords.map((record) =>
+    record.status === 'RUNNING' ? { ...record, status: 'ERROR' as const } : record,
+  )
+
   const messageId = await persistRoundQuietly({
     conversationId,
     content,
@@ -665,7 +679,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     // （`knowledge_search` / `list_knowledge` / `read_document` 经 `/api/sandbox/builtin/call`，见 `proxy.ts`），
     // 结果以 `tool_calls` 落库/展示 ⇒ `citations` 恒为空。这是刻意的口径，不是漏接。
     citations: [],
-    toolRecords: round.toolRecords,
+    toolRecords: finalToolRecords,
     // 本轮建成的产物行（P0-3-7）：事件里发过的那几张卡，刷新后从 `content.artifacts` 恢复
     artifacts: artifactItems,
     usage: roundUsage,

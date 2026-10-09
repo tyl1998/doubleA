@@ -189,6 +189,27 @@ enum SandboxStatus {
   @@map("sandbox_status")
 }
 
+/// 定时任务最近一次运行的状态（P1-6）。终态只有 SUCCESS/FAILED；RUNNING 是调度器置的中间态
+/// （进程崩溃会残留，下次启动可自愈）。
+enum ScheduledRunStatus {
+  NEVER
+  RUNNING
+  SUCCESS
+  FAILED
+
+  @@map("scheduled_run_status")
+}
+
+/// 定时任务的通知渠道（P1-6 增量，`01` 场景 1）。`NONE` = 不通知。
+enum NotifyType {
+  NONE
+  WECOM
+  FEISHU
+  WEBHOOK
+
+  @@map("notify_type")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -217,6 +238,7 @@ model User {
   usageRecords   UsageRecord[]
   artifacts      Artifact[]
   files          File[]
+  scheduledTasks ScheduledTask[]
 
   @@map("users")
 }
@@ -326,6 +348,7 @@ model Agent {
   pool          AgentModel[]
   conversations Conversation[]
   usageRecords  UsageRecord[]
+  scheduledTasks ScheduledTask[]
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
@@ -406,6 +429,8 @@ model Conversation {
   /// 本会话的产出文件（P0-3-7）。⚠️ 删会话会级联删行，但**对象与行的过期收口只由保留期
   /// 清理器做**（`02` §三"消息与产物都不删"指的是不跟会话/Agent 的删除走）
   artifacts Artifact[]
+  /// 把本会话当作"最近一次运行"的定时任务（P1-6；删会话置空，不级联删任务）
+  scheduledTaskRuns ScheduledTask[] @relation("ScheduledTaskLastRun")
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -748,6 +773,62 @@ model Sandbox {
   /// 空闲回收的扫描键：`status = RUNNING AND last_active_at < 阈值`
   @@index([status, lastActiveAt])
   @@map("sandboxes")
+}
+
+/// scheduled_tasks —— 定时任务（P1-6，2026-10-09 需求变更：任务中心 = 定时任务）
+///
+/// 一条定时任务 = 「某个 **TaskAgent** + 一段**指令** + 一个 **cron 周期**」。到点由进程内的
+/// 调度器（`scheduler/scheduledTasks.ts`）**新建一个会话**把指令发给该 TaskAgent —— 消息与产物
+/// 因而按会话归档，**复用既有 TaskAgent 链路**，本表不新造执行器（见 `docs/02` §4.8）。
+///
+/// ⚠️ **两个 datetime 都由 JS 侧显式写入**（`nextRunAt`/`lastRunAt`）：本机 PG 会话时区非 UTC 时
+/// `@default(now())` 与 JS 侧边界相差一个时区偏移，而调度的比较正是 JS 侧边界
+/// （`nextRunAt <= now`）—— 写偏了就会整批早跑/晚跑一个时区（见 `06` §七 待决 8）。
+model ScheduledTask {
+  id        String @id @default(uuid(7)) @db.Uuid
+  /// owner（= 到点派活时那个会话的 `user_id`）。**唯一判据**：只有本人能看/改/删/执行
+  userId    String @map("user_id") @db.Uuid
+  /// 目标 TaskAgent（建时校验 `type = TASK_AGENT` 且未软删；软删后停用、不再触发）
+  agentId   String @map("agent_id") @db.Uuid
+  name      String @db.VarChar(120)
+  /// 到点发给 TaskAgent 的指令正文（拼进那一轮的用户消息）
+  prompt    String @db.Text
+  /// 5 段 cron（分 时 日 月 周）；合法性由 `shared/src/cron.ts` 唯一校验
+  cronExpr  String @map("cron_expr") @db.VarChar(120)
+  enabled   Boolean @default(true)
+  /// 无人值守时对**危险工具（MCP 破坏性操作）**的处置：`true` = 自动放行（按"已确认"），
+  /// `false` = 一律拒绝。默认 `true`（定时任务本就要能干活；不想要的用户在任务里关掉）。
+  /// ⚠️ 它与会话级 `chat.autoapprove` 是两码事：前者是**任务**的策略、随任务持久化，后者是运行时。
+  autoApprove Boolean @default(true) @map("auto_approve")
+  /// 通知渠道（`01` 场景 1：定时获取信息后经企微/飞书等渠道通知我）。默认 `NONE` = 不通知。
+  notifyType NotifyType @default(NONE) @map("notify_type")
+  /// webhook 地址（**密文**，`infra/crypto.ts#encryptSecret`；含 key，绝不回显）。`NONE` 时为 `NULL`
+  notifyUrl String? @map("notify_url") @db.Text
+  /// 飞书自定义机器人签名密钥（**密文**，可选）
+  notifySecret String? @map("notify_secret") @db.Text
+  /// 通知模板（**明文**；占位符 `{{task}}/{{time}}/{{status}}/{{result}}`）。空 = 用内置默认
+  notifyTemplate String? @map("notify_template") @db.Text
+  /// 下一次该跑的时刻（**本地时区**，JS 侧计算并显式写入）；停用时置 `NULL`
+  nextRunAt DateTime? @map("next_run_at") @db.Timestamptz(3)
+  /// 最近一次开始运行的时刻
+  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(3)
+  lastRunStatus ScheduledRunStatus @default(NEVER) @map("last_run_status")
+  /// 最近一次运行产生的会话（去对话页看过程/产物）；从未跑过为 `NULL`。
+  /// ⚠️ `ON DELETE SET NULL`：删会话不影响任务本身（只丢"最近一次"的定位）
+  lastConversationId String? @map("last_conversation_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  /// 最近一次运行的会话（可空；删会话时置 `NULL`，任务本身不受影响）
+  lastConversation Conversation? @relation("ScheduledTaskLastRun", fields: [lastConversationId], references: [id], onDelete: SetNull)
+
+  /// 调度器的扫描键：`enabled AND next_run_at <= now`
+  @@index([enabled, nextRunAt])
+  /// 本人的列表（`03` §4.7：按最近创建倒序）
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("scheduled_tasks")
 }
 
 /// artifacts —— TaskAgent 产出文件（`02` §三 / §4.8；P0-3-7 落地）

@@ -28,6 +28,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   RobotOutlined,
+  ScheduleOutlined,
   TeamOutlined,
 } from '@ant-design/icons'
 import { Button, Dropdown, type MenuProps } from 'antd'
@@ -56,6 +57,7 @@ const ICON_BY_CODE: Record<string, ReactNode> = {
   KB: <BookOutlined />,
   MC: <ApiOutlined />,
   AH: <HistoryOutlined />,
+  TK: <ScheduleOutlined />,
   CR: <KeyOutlined />,
   US: <TeamOutlined />,
   ML: <DatabaseOutlined />,

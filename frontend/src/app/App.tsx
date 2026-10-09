@@ -13,8 +13,9 @@
  * P0-1-36：`/admin/users` 与 `/admin/models` 换成真实的用户管理与模型池管理
  *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
  * P0-2-11：`/mcp` 与 `/settings/credentials` 换成真实的 MCP 管理页与我的凭据页
- *          （**至此 `03` §二 的 P0 十条路由全部落地**，`BatchPlaceholderPage` 只剩 `/tasks`
- *           与 `/admin/usage` 两条 P1 路由，以及那个 `*` 未找到页）。
+ *          （**至此 `03` §二 的 P0 十条路由全部落地**）。
+ * P1-6：`/tasks` 换成真实的**任务中心（定时任务）**页 —— 本仓最后一个 P1 页面入口就位，
+ *       `BatchPlaceholderPage` 只剩 `/admin/usage` 一条（属 P1-7）以及那个 `*` 未找到页。
  *          ⚠️ 我的凭据页**与 MCP 解耦**：路由从 `/mcp/credentials` 改为 `/settings/credentials`
  *          （个人设置族，与 `/settings/password` 同族），页面内容仍按 MCP server 分组。
  *
@@ -53,6 +54,7 @@ import { LoginPage } from '../pages/login/LoginPage.js'
 import { McpCredentialsPage } from '../pages/mcp/McpCredentialsPage.js'
 import { McpServersPage } from '../pages/mcp/McpServersPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
+import { TasksPage } from '../pages/tasks/TasksPage.js'
 
 export function App() {
   return (
@@ -85,16 +87,9 @@ export function App() {
           {/* S-10 · 会话产物：跨会话汇总**本人**全部产物（含删除会话后保留的那些），
               登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。可预览 / 下载 / 删除。 */}
           <Route path="/artifacts" element={<ArtifactCollectionPage />} />
-          <Route
-            path="/tasks"
-            element={
-              <BatchPlaceholderPage
-                serial="S-09 · 任务中心"
-                title="任务中心"
-                bullets={['TaskAgent 的会话视图：任务 / Agent / 状态 / 最近活动', '继续对话与停止']}
-              />
-            }
-          />
+          {/* S-09 · 任务中心（P1-6 接真页面：**定时任务**管理）。登录即可、**仅本人**
+              （服务端按 `scheduled_tasks.user_id` 收窄）。 */}
+          <Route path="/tasks" element={<TasksPage />} />
           <Route path="/settings/password" element={<PasswordPage />} />
 
           {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见）。两页都在 P0-1-36 接上真页面 */}

@@ -80,6 +80,7 @@
 import {
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
+  SEND_NOTIFICATION_TOOL_NAME,
   type CitationItem,
   type ErrorCode,
   type RetrievalHit,
@@ -108,6 +109,7 @@ import {
 } from '../mcp/client.js'
 import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
+import { executeSendNotification, getNotifyTarget, notifyOpenAiTool, NOTIFY_TOOL_SERVER_NAME } from '../notify/index.js'
 import {
   KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
   KNOWLEDGE_TOOL_SERVER_NAME,
@@ -281,10 +283,10 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 只会让那条"名字 → 哪台 server 的哪个工具"的映射表多出一种它描述不了的形状。
      * 排在 MCP 工具**前面**：让模型先看到它们，与系统提示里"知识库优先"的顺序一致。
      */
-    const tools =
-      kbIds.length === 0
-        ? catalog.tools
-        : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool(), ...catalog.tools]
+    const builtinTools = kbIds.length === 0 ? [] : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()]
+    // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行（含"立即执行"）时下发
+    if (getNotifyTarget(conversationId) !== undefined) builtinTools.push(notifyOpenAiTool())
+    const tools = [...builtinTools, ...catalog.tools]
 
     // ── ④ 历史（最近 N 轮）+ system + 本轮用户消息 ──
     const rounds = config.limits.contextRounds
@@ -544,6 +546,30 @@ export const chatBotProducer: ChatProducer = async (input) => {
             emitToolCard(finished)
             toolRecords.push({ ...finished, arguments: call.arguments })
             outcomes.push({ callId: call.id, text: output, isError })
+            continue
+          }
+
+          // ── 内置「发送通知」工具（P1-6，场景 1）：与知识库同属内置族，按名字分流 ──
+          if (call.name === SEND_NOTIFICATION_TOOL_NAME && getNotifyTarget(conversationId) !== undefined) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: NOTIFY_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+            // 执行体在 `notify/index.ts`（**唯一实现**）：TaskAgent 经沙箱代理调的是同一个函数
+            const outcome = await executeSendNotification({ conversationId, arguments: call.arguments })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const finished = { ...base, status, inputSummary, output: outcome.output }
+            emitToolCard(finished)
+            toolRecords.push({ ...finished, arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
             continue
           }
 

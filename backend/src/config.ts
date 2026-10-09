@@ -565,6 +565,25 @@ const envSchema = z
      */
     ARTIFACT_RETENTION_DAYS: intVar('ARTIFACT_RETENTION_DAYS', 7, { min: 1, max: 3650 }),
 
+    // ── 定时任务（P1-6，2026-10-09 需求变更）──
+    /**
+     * 调度器 tick 间隔（秒）。定成配置项的理由与所有"窗口类"参数相同：要能注入小值才验得了一条
+     * "到点触发"的断言。默认 30s 是"分钟粒度够用"与"不空转"的折中（cron 最小粒度是分钟）。
+     */
+    SCHEDULED_TASK_TICK_SEC: intVar('SCHEDULED_TASK_TICK_SEC', 30, { min: 5, max: 3600 }),
+    /**
+     * 单次定时运行的**墙钟上限**（分钟）：到点派活后，超过它仍未收口就中断（`AbortController`）。
+     * 必须有 —— 无人值守的运行没有"用户点停止"这条兜底，卡住的引擎会一直占着沙箱名额。
+     */
+    SCHEDULED_TASK_RUN_TIMEOUT_MIN: intVar('SCHEDULED_TASK_RUN_TIMEOUT_MIN', 30, { min: 1, max: 1440 }),
+    /**
+     * 一轮 tick 最多处理多少条到期任务（防止积压时一次性拉起过多运行打爆沙箱）。
+     * 超出的留到下一轮（`nextRunAt` 已按 cron 推进，不会丢触发——只可能延后到后续 tick）。
+     */
+    SCHEDULED_TASK_MAX_DUE_PER_TICK: intVar('SCHEDULED_TASK_MAX_DUE_PER_TICK', 20, { min: 1, max: 200 }),
+    /** 通知 webhook 的单次请求上限（毫秒）；企微/飞书都是即时返回，超时只记 warn（不拖垮那一轮） */
+    NOTIFY_TIMEOUT_MS: intVar('NOTIFY_TIMEOUT_MS', 10_000, { min: 500, max: 120_000 }),
+
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
      * 「到响应头」的上限（连接 + TTFT）。流式路径**收到头就撤**（之后交给 LLM_STREAM_IDLE_TIMEOUT_MS），
@@ -890,6 +909,21 @@ export interface AppConfig {
     minShortSidePx: number
   }
 
+  /**
+   * 定时任务（P1-6，2026-10-09 需求变更）。消费方 = `scheduler/scheduledTasks.ts`（进程级后台组件，
+   * 由 `index.ts` 生命周期驱动）。
+   */
+  scheduledTask: {
+    /** 调度器 tick 间隔（秒） */
+    tickSec: number
+    /** 单次运行的墙钟上限（分钟），到点派活后超时即中断 */
+    runTimeoutMin: number
+    /** 一轮 tick 最多处理多少条到期任务 */
+    maxDuePerTick: number
+    /** 通知 webhook 的单次请求上限（毫秒） */
+    notifyTimeoutMs: number
+  }
+
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
   warnings: string[]
 }
@@ -1121,6 +1155,12 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     imageCaption: {
       minShortSidePx: vars.IMAGE_CAPTION_MIN_PX,
     },
+    scheduledTask: {
+      tickSec: vars.SCHEDULED_TASK_TICK_SEC,
+      runTimeoutMin: vars.SCHEDULED_TASK_RUN_TIMEOUT_MIN,
+      maxDuePerTick: vars.SCHEDULED_TASK_MAX_DUE_PER_TICK,
+      notifyTimeoutMs: vars.NOTIFY_TIMEOUT_MS,
+    },
 
     warnings,
   }
@@ -1183,6 +1223,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     },
     llm: value.llm,
     mcp: value.mcp,
+    scheduledTask: value.scheduledTask,
     limits: {
       uploadBodyLimit: `${value.limits.uploadBodyLimitRaw}（${value.limits.uploadBodyLimitBytes} 字节）`,
       ssePingIntervalSec: value.limits.ssePingIntervalSec,

@@ -765,6 +765,18 @@ export interface ChatSendContext {
   attachments: ChatAttachmentContext[]
 }
 
+/** 只做归属校验（观察端点 `GET /:id/stream` 用：仅本人能看这条会话的帧流）；不是我的 / 不存在都 404 */
+export async function assertConversationOwner(
+  conversationId: string,
+  viewer: ConversationViewer,
+): Promise<void> {
+  const row = await getPrisma().conversation.findFirst({
+    where: { id: conversationId, userId: viewer.id },
+    select: { id: true },
+  })
+  if (row === null) throw AppError.notFound('会话不存在')
+}
+
 /**
  * 发消息的前置闸门（`POST /:id/chat` 的第一步，**在写出任何 SSE 帧之前**跑完）。
  *

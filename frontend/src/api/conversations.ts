@@ -385,3 +385,22 @@ export async function streamRegenerate(
   )
   return readChatEventStream(response, handlers)
 }
+
+/**
+ * 观察一条会话的**活跃运行**（`GET /api/conversations/:id/stream`，P1-6 方案 A）。
+ *
+ * 只读：把该会话此刻正在跑的那一轮的帧读进来（**含迟到补帧**，见后端 `frameBus`），
+ * 用于渲染"**不是本页发起的那一轮**"（典型：定时任务的后台运行）。没有活跃运行时这条流只发心跳，
+ * 页面可以常开；`terminated` 的口径与 `/chat` 一致（没收到 `done`/`error` 就断了）。
+ */
+export async function streamConversationWatch(
+  conversationId: string,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal,
+): Promise<Awaited<ReturnType<typeof readChatEventStream>>> {
+  const response = await openEventStream(`/api/conversations/${encodeURIComponent(conversationId)}/stream`, {
+    method: 'GET',
+    ...(signal === undefined ? {} : { signal }),
+  })
+  return readChatEventStream(response, handlers)
+}

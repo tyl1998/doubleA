@@ -22,6 +22,11 @@ import { closePrisma } from './infra/prisma.js'
 import { closeRedis } from './infra/redis.js'
 import { getPipelineWorkerStats, startPipelineWorker, stopPipelineWorker } from './pipeline/worker.js'
 import {
+  getScheduledTaskStats,
+  startScheduledTaskScheduler,
+  stopScheduledTaskScheduler,
+} from './scheduler/scheduledTasks.js'
+import {
   closeAllSandboxRpcs,
   getSandboxListenerStats,
   getSandboxRpcStats,
@@ -90,6 +95,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
     //    再收 app，最后关依赖。反过来的话它们会拿着已关闭的连接继续干活，
     //    日志里出现一堆"数据库不可用"的假故障。
     await stopPipelineWorker()
+    // 定时任务调度器（P1-6）：同一条纪律 —— 它还在用 PG/Redis 驱动 TaskAgent，
+    // 必须在关依赖之前停掉（在飞的那几轮不打断，跑完自己收尾）。
+    await stopScheduledTaskScheduler()
     // ★ P0-3-5：**先拆引擎桥**（在此之前停对账器，免得它把正在被"告别"的容器也删一遍）。
     //   拆桥 = 关掉 attach 连接 + 把在飞的那一轮判成"桥已关闭"，**不碰容器** ——
     //   容器留在磁盘上由**下一次启动的 `reconcileOnBoot()` 清掉**（`子方案③` §九 2：
@@ -146,7 +154,7 @@ try {
     //    P0-3-12 > P0-3-11 > P0-3-9b ⇒ 本行直接写"P0-3-12 …"即可（规则只在"补做的批次号更小"时才需绕）。
     // ⚠️ **P1 批次号是两段式（P1-1）**：与 P0 的"计划-批次-步"三段式不同，P1 只有
     //    "计划-项"两层 ⇒ `check:batch` 的正则从 P1-1 起**同时接受两段与三段**（见该脚本）。
-    step: 'P1-12 `.doc` 按内容嗅探（HTML/MIME 导出件，能力增量/新需求）。① **不再见到 `.doc` 就拒**：`parse/index.ts#detectFormat` 对 `.doc` 先按内容嗅探（`sniffLegacyDoc`：OLE2 魔数 / RTF / MIME 头（multipart·mime-version·content-type:text/html）/ HTML 标记 / 其它）——命中 HTML 或 MHTML 则放行、归一成解析格式 `html`（返回 `ParseFormat`，`.doc` 仍是唯一入口，`html` 不是可上传扩展名）；真 OLE2 / RTF / 其它仍拒并保留「请另存为 .docx」。② **新增解析器** `pipeline/parse/html.ts`：裸 HTML 与 MHTML（按 boundary 拆 part、取 `text/html` part 并**按 MIME 声明的 `charset` 解**（`charset="unicode"`=UTF-16LE，Word 导出件常见）+ base64/quoted-printable）→ 与 md/docx 同族的块形状（标题栈 / 段落 / 表格 `kind=table` / 实体解码，表格网格复用 `docx#parseTableGrid`、去标签复用 `docx#toPlainText`）；**抽图**：data URI / MHTML 同包 `image/*` part（`Content-Id`/`Content-Location`/相对 URL/文件名回查）/ 远程 http(s)（复用 `md#decodeDataUri`/`fetchRemoteImage`），单张失败只跳过；`types.ts#PARSE_FORMATS` 加 `html`。真实样例（`2026-09+URP-广发积分兑换券核销.doc`）实测 308 blocks / 7 表 / 7435 字 / 3 张 PNG 全出。③ 画像开关 `FormatProfile.sniffLegacyDoc`（**只有知识库文档画像开**，对话附件维持拒 `.doc`）。④ **前端**：`knowledgeModel.ts#screenPickedFiles` 在扩展名层放行 `.doc` + 新增 `sniffLegacyDocHead`/`screenLegacyDocContent`（镜像后端嗅探），`UploadDocumentModal.tsx` 选中 `.doc` 后读文件头按内容判（HTML/MHTML 放行、真 OLE2/RTF 拦下给"另存为 .docx"）。⑤ 自证脚本 `backend/scripts/doc-sniff-regression.ts`（`pnpm --filter @doubulea/backend doc:sniff`，27 项，含内嵌图抽取）+ `pnpm verify:knowledge-ui`（A3 改为按文件头判内容）。⑥ **图片低清不识别扩展到 OCR**（用户定案）：新增 env `IMAGE_OCR_MIN_PX`（默认 256，与 `IMAGE_CAPTION_MIN_PX` 独立可调），识别方式=`OCR` 时短边低于它**不跑本地 OCR**、标 `unreliable`（`pipeline/stages.ts#ocrImagesStage` 用 `probeImageSize` 判；嗅探不出照常识别；不影响向量化）。`pnpm -r typecheck`（三包 Done）+ `eslint`（无输出）+ `ocr:regression`（10 项）+ `check:batch`。**零新依赖、零新表、零迁移**。上一层是 **P1-11**（图片"含义"理解）',
+    step: 'P1-6 任务中心（**定时任务**，2026-10-09 需求变更：原"TaskAgent 会话视图"作废）。① 契约新增 `shared/src/cron.ts`（5 段 cron 解析 / 命中 / 下一次触发；`分 时 日 月 周`，服务器本地时区；零新依赖、前后端共用）+ `shared/src/task.ts`（`scheduledTaskItemSchema` / 建改 body / 列表结果 / `runScheduledTaskResultSchema` / `scheduledTaskIdParamsSchema`）。② 新增表 `scheduled_tasks`（迁移 `20261009100000_scheduled_tasks` + `20261009110000_scheduled_task_auto_approve` + `20261009120000_scheduled_task_notify`：owner/agent（ChatBot 或 TaskAgent）/name/prompt/cronExpr/enabled/autoApprove/nextRunAt/lastRunAt/lastRunStatus/lastConversationId；`next_run_at`/`last_run_at` 由 JS 侧写）。③ 后端：`services/scheduledTask.service.ts`（CRUD+投影）、`scheduler/scheduledTasks.ts`（进程级调度器：tick 30s 查 `enabled && nextRunAt<=now`，**先 CAS 推进 nextRunAt 再触发**，`inFlight` 防重；**启动对账 `reconcileScheduledRunsOnBoot` 把上个进程遗留的 RUNNING 标 FAILED**）、`orchestrator/scheduledRun.ts`（**无 HTTP 驱动 `ChatProducer`** —— 新建会话 + 空 sink + `awaitConfirm` 按任务级 `autoApprove`（默认放行）+ 墙钟上限；`resolveChatProducer(agentType)` ⇒ **ChatBot 与 TaskAgent 都支持**）、`routes/tasks.ts`（`GET/POST/PATCH/DELETE /api/tasks` + `POST /api/tasks/:id/run`，仅本人）+ `app.ts` 注册 + `config.ts`（`scheduledTask` 视图 + `SCHEDULED_TASK_TICK_SEC`/`RUN_TIMEOUT_MIN`/`MAX_DUE_PER_TICK`/`NOTIFY_TIMEOUT_MS`）+ `index.ts` 生命周期起停；**通知（场景 1）：`notify/{index,channels,template}.ts`（跑完自动推送 + `send_notification` 内置工具；按渠道分别渲染：企微 markdown / 飞书 interactive 卡片 / 通用纯文本；**任务级模板 `{{task}}/{{time}}/{{status}}/{{result}}`**；渠道密文存储、经会话登记表传递；ChatBot 进程内 / TaskAgent 沙箱代理共用执行体）**。④ 前端：`/tasks` 占位页换成真页（`pages/tasks/{TasksPage,TaskFormModal,taskModel}` + `api/tasks.ts`）、`nav.ts` 加 `TK · 任务`、`paths.ts` 加 `TASKS_PATH`、`AppLayout` 加图标；cron 输入实时解析（`describeCron` + `nextCronRuns` 预览接下来 3 次）。⑤ **方案 A：后台运行可被实时观察**（用户选定）—— `orchestrator/frameBus.ts`（会话帧总线：实时推送 + 按会话缓冲、迟到者先回放）+ `SseChannel#emit` 与 `scheduledRun` 都 `publishFrame` + `scheduledRun` 拿会话锁 / 写 `/active` 快照 / 消费停止信号（页面「停止」对定时运行也生效）+ `GET /api/conversations/:id/stream` 观察端点（`routes/conversations.ts`，仅本人、只读）+ 前端 `useConversationWatch`（把帧喂进同一个 chatStream store，与本页自己发起的那一轮互斥、终帧以落库历史为准）。⑥ 自证 `pnpm cron:regression`（17 项）+ `pnpm notify:regression`（22 项）+ `pnpm frame-bus:regression`（6 项）+ 迁移反向探针 No difference。`pnpm -r typecheck`（三包 Done）+ `eslint` + `check:batch`。**零新增依赖**。上一层是 **P1-12**（`.doc` 按内容嗅探）',
     address,
   })
   logger.info(
@@ -182,6 +190,12 @@ try {
   // ⚠️ 与前面几项同款纪律：**失败只 warn**（没配镜像 / 端口被占 / Docker 不可达都不该让后端起不来）。
   const listenerUp = await startSandboxListener()
   logger.info(getSandboxListenerStats(), listenerUp ? '沙箱代理 listener 就绪' : '沙箱代理 listener 未就绪')
+
+  // 定时任务调度器（P1-6，2026-10-09 需求变更）：**进程级后台组件**，同 `startPipelineWorker`
+  // 的纪律放在 index.ts（不放进 buildApp —— 否则 app.inject 式契约验收会顺带把调度器拉起来）。
+  // ⚠️ 必须在 listen 之后：`app.inject` 验收不该触碰到点派活。
+  logger.info(getScheduledTaskStats(), '正在启动定时任务调度器')
+  startScheduledTaskScheduler()
 } catch (error) {
   logger.fatal({ err: error, port: config.port }, '监听端口失败，进程退出')
   await shutdown('listen-failed', 1)

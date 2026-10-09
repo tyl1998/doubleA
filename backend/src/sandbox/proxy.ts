@@ -53,7 +53,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { z } from 'zod'
 
-import { AppError } from '@doubulea/shared'
+import { AppError, SEND_NOTIFICATION_TOOL_NAME } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -62,6 +62,7 @@ import { McpAbortError } from '../mcp/errors.js'
 import { isDangerousTool } from '../mcp/risk.js'
 import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
+import { executeSendNotification, getNotifyTarget, notifyBuiltinDescriptor } from '../notify/index.js'
 import { knowledgeListTool, knowledgeSearchTool, readDocumentTool, summarizeToolInput } from '../orchestrator/chatContext.js'
 import {
   boundKnowledgeBaseIds,
@@ -186,8 +187,10 @@ export async function buildSandboxMcpCatalog(
   // ── 平台内置工具（知识库检索 / 目录 / 整篇阅读）—— 绑了库才下发 ──
   // 与 ChatBot 同源（`knowledgeTools.ts`）；容器侧注册的商品名下不带 `mcp_` 前缀，
   // 执行时经 `/api/sandbox/builtin/call` 由后端代跑（凭据/库都不进容器）。见 `子方案③` §七。
-  if (knowledgeIds.length > 0) catalog.builtins = knowledgeBuiltinTools()
-  else catalog.builtins = []
+  const builtins = knowledgeIds.length > 0 ? knowledgeBuiltinTools() : []
+  // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行时下发
+  if (getNotifyTarget(conversationId) !== undefined) builtins.push(notifyBuiltinDescriptor())
+  catalog.builtins = builtins
 
   await writeSandboxMcpCatalog(conversationId, catalog)
   logger.info(
@@ -426,8 +429,9 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     }
     const body = parsed.data
 
-    // 只认内置知识库工具（其他名字不是这条端点的职责）
-    if (!isKnowledgeToolName(body.name)) {
+    const isNotify = body.name === SEND_NOTIFICATION_TOOL_NAME
+    // 只认内置工具（知识库一族 + 通知）；其他名字不是这条端点的职责
+    if (!isKnowledgeToolName(body.name) && !isNotify) {
       return sendError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
     }
 
@@ -442,7 +446,16 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     }
     // 清单必须**确实下发过**这个内置工具（与 MCP 的 findOfferedTool 同一条判据）
     if (!catalog.builtins.some((tool) => tool.name === body.name)) {
-      return sendError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器（绑定里没有知识库）。`)
+      return sendError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器。`)
+    }
+
+    // 通知工具：执行体与 ChatBot 共用（`notify/index.ts`），渠道从本次运行的会话登记表取
+    if (isNotify) {
+      const outcome = await executeSendNotification({
+        conversationId: auth.record.conversationId,
+        arguments: JSON.stringify(body.arguments),
+      })
+      return reply.send({ isError: outcome.isError, text: outcome.output })
     }
 
     // ★ 库**现查**（不从清单快照取）：绑定可以在容器活着期间被改掉；没有绑定就如实回"没有库"。
