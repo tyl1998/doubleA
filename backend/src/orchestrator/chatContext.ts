@@ -84,10 +84,34 @@ export const LIST_KNOWLEDGE_TOOL_NAME = 'list_knowledge'
 export const KNOWLEDGE_LIST_MAX_DOCS = 200
 
 /**
+ * 平台内置的「整篇阅读」工具名（2026-10-08）。
+ *
+ * 为什么在「检索」之外还要一个「读文档」工具：`knowledge_search` 只回 topK 个**相关片段**
+ * （`services/retrieval.ts`），它的职责是"找到相关的一块"，天生凑不齐整篇。于是用户想
+ * "了解某篇文档的**全部内容**"时，模型只能反复换关键词检索、逐块拼凑（实测症状：一篇文档要
+ * 调十几次 `knowledge_search`，且总有块被 topK 挤掉），既慢又漏。
+ * 一个按 `seq` 顺序**整篇分页读出**的工具让这件事变成一个明确动作：`read_document` 一次读一页、
+ * 返回里告诉模型"还有多少块、下一次带什么 offset"，直到读完 —— 这就是父文档/整篇读取
+ * （parent-document read）在工具式 RAG 里的落地形态。
+ *
+ * ⚠️ **不带 `mcp_` 前缀**（同 `knowledge_search`）：MCP 工具名恒以 `mcp_{slug}_{tool}` 开头。
+ */
+export const READ_DOCUMENT_TOOL_NAME = 'read_document'
+
+/**
+ * 「整篇阅读」一次最多带回的块数。
+ *
+ * 它和 {@link READ_DOCUMENT_PAGE_CHAR_BUDGET} 是**两道独立的闸**：块数兜住"块特别短"时一页
+ * 塞进几百块（模型读到一坨、还占满下一轮上下文），字符预算兜住"块特别长"时一整页超限被腰斩。
+ * 两者都只影响"一页多大"，不影响能否读全 —— 读不完就靠 offset 继续。
+ */
+export const READ_DOCUMENT_MAX_PAGE_CHUNKS = 20
+
+/**
  * 「知识库目录」工具的 OpenAI 形态定义（只在绑了知识库时下发）。
  *
  * 参数为空对象：它列的是**这个 agent 绑定的全部**知识库与文档，不需要调用方给任何输入
- * （要"某一篇的具体内容"用 `knowledge_search`，那是另一个工具的事）。
+ * （要"某一篇的具体内容"用 `knowledge_search`，要"整篇通读"用 `read_document`，那是另外两个工具的事）。
  */
 export function knowledgeListTool(): OpenAiFunctionTool {
   return {
@@ -96,7 +120,7 @@ export function knowledgeListTool(): OpenAiFunctionTool {
       name: LIST_KNOWLEDGE_TOOL_NAME,
       description:
         '列出已绑定的知识库，以及每个知识库里的文档清单。当用户询问你有哪些知识、知识库、文档、' +
-        '需求或能做什么时调用它，先给出文档清单（文档名即需求/主题分类），再按需检索具体内容。',
+        '需求或能做什么时调用它，先给出文档清单（文档名即需求/主题分类），再按需检索具体内容或通读某篇文档。',
       parameters: { type: 'object', properties: {} },
     },
   }
@@ -143,6 +167,7 @@ export const KNOWLEDGE_USAGE_RULES = [
   `只在**确实需要知识库里的资料**时才检索：用户明确要求查知识库/查文档、或问题必须在绑定的知识库里找依据（如内部规定、需求、业务口径）。`,
   `以下情况不要检索：打招呼与闲聊、通用常识、写代码/计算/翻译等与知识库无关的请求；以及**答案已经在本轮消息或其「【附件：…】」里给出**时 —— 附件是已经直接提供给你的原文，不要再用检索工具去找它。`,
   `当用户询问你有哪些知识、知识库、文档、需求或能做什么时，调用 \`${LIST_KNOWLEDGE_TOOL_NAME}\` 工具列出知识库与文档清单（文档名通常就是需求/主题的大类），再按需用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 查看某篇的具体内容；不要为此去调用任何外部工具。`,
+  `当用户想了解**某篇文档的全部/完整内容**（如"这篇文档讲了什么""把里面的内容完整列一下""通读一遍"）时，用 \`${READ_DOCUMENT_TOOL_NAME}\` 按顺序读完整篇：doc 指定文档；若返回里提示还有更多块，就用同一个 doc 加上返回的 offset 继续读，直到读完。不要用 \`${KNOWLEDGE_SEARCH_TOOL_NAME}\` 反复换关键词拼凑整篇。`,
   `需要多次检索时可以换不同的关键词；不要凭记忆复述上一轮的回答。`,
   '只有当问题与知识库内容无关、或确实需要外部系统的实时数据时，才使用其他工具。',
 ].join('\n')
@@ -183,6 +208,50 @@ export function knowledgeSearchTool(): OpenAiFunctionTool {
           },
         },
         required: ['query'],
+      },
+    },
+  }
+}
+
+/**
+ * 「整篇阅读」工具的 OpenAI 形态定义（只在绑了知识库时下发）。
+ *
+ * 与 {@link knowledgeSearchTool} 的分工一句话：
+ *   · `knowledge_search` = **找相关的一块**（topK 片段，问答用）；
+ *   · `read_document` = **按顺序读整篇**（分页读全，通读/总结/完整列举用）。
+ *
+ * `doc` 必填（文档名或 id，与 `knowledge_search` 的 `doc` 同口径）；`kb` 可选（重名文档时指定库）；
+ * `offset` 可选（从第几块开始，0 起）—— 页尾会回"下一次带什么 offset"，模型据此翻页。
+ * ⚠️ 不给 topK：整篇读取的语义就是"按 seq 读下去"，topK 是检索口径，在这里没有意义。
+ */
+export function readDocumentTool(): OpenAiFunctionTool {
+  return {
+    type: 'function',
+    function: {
+      name: READ_DOCUMENT_TOOL_NAME,
+      description:
+        '按顺序读取已绑定知识库里**某一篇文档的完整内容**（按分块顺序返回，可分页读完）。' +
+        '当用户想了解某篇文档的全部内容、整体讲了什么、要完整列出其中要点，或需要通读该文档时调用它，' +
+        '不要用 knowledge_search 反复换关键词拼凑整篇。doc 必填；若返回里提示还有更多内容，' +
+        '用同一个 doc 加上返回的 offset 继续读，直到读完。可用 kb 在重名文档间指定知识库。',
+      parameters: {
+        type: 'object',
+        properties: {
+          doc: {
+            type: 'string',
+            description: '要阅读的文档：文档名（文件名）或 id（必填）。',
+          },
+          kb: {
+            type: 'string',
+            description: '（可选）文档所在的知识库名或 id；仅当有重名文档时才需要。',
+          },
+          offset: {
+            type: 'integer',
+            description:
+              '（可选）从第几块开始读（从 0 起）。首次阅读省略；返回里提示还有更多时，用返回的 offset 继续。',
+          },
+        },
+        required: ['doc'],
       },
     },
   }
@@ -527,6 +596,14 @@ export function selectHistoryMessages(rows: readonly HistoryRow[], rounds: numbe
  */
 export const TOOL_RESULT_MAX_CHARS = 8000
 
+/**
+ * 「整篇阅读」一页的字符预算（按码点），**低于**回填上限 {@link TOOL_RESULT_MAX_CHARS}。
+ *
+ * 留出的差额给页头与页尾那段"还有 N 块、下次带什么 offset"的提示 —— 提示被截掉，模型就不知道
+ * 还能继续读（而"读得全"正是这个工具存在的意义）。见 `knowledgeTools.ts#readDocumentPage`。
+ */
+export const READ_DOCUMENT_PAGE_CHAR_BUDGET = TOOL_RESULT_MAX_CHARS - 500
+
 /** 工具卡上"参数摘要"的上限（字符）—— 它是要画在卡片上的一行字（`01` 决策 17） */
 export const TOOL_INPUT_SUMMARY_MAX_CHARS = 200
 
@@ -664,6 +741,110 @@ export function buildAssistantToolCallsMessage(text: string, toolCalls: readonly
 export const TOOL_LOOP_LIMIT_NOTICE =
   '（系统提示：本次回答中可用的工具调用次数已达上限，后续不能再调用任何工具。' +
   '请仅根据已获得的信息给出最终回答；如果信息仍不完整，请如实说明还缺什么。）'
+
+/**
+ * 已到工具轮数上限、**未执行**的调用回填给模型的文本（也是那张 ERROR 卡上的文本）。
+ *
+ * ⚠️ 与 {@link TOOL_CONFIRM_REJECTED_OUTPUT} 同形：明写"不要重试" —— 到上限后重试毫无意义，
+ * 只会再把同一段话吐一遍。`rounds` 是上限值，写出来是为了让模型/用户知道"卡在第几轮"。
+ */
+export function toolLoopLimitUnexecutedOutput(rounds: number): string {
+  return (
+    `工具调用未执行：本轮工具调用已达上限（${rounds} 轮）。请不要重试；` +
+    '如需继续，请在下一轮对话里再发起。'
+  )
+}
+
+/**
+ * 到上限、本轮结束时**给用户看**的收尾提示（追加在正文之后）。
+ *
+ * 为什么要有一句给用户的：模型被撤掉工具后仍可能把工具调用**以文本形式回吐**（如 mimo 的
+ * `<tool_call><function=…>`），过滤掉那些脏文本后，正文可能空掉或显得莫名其妙 —— 这句明确
+ * 告诉用户"为什么没继续、下一步怎么走"，避免把"平台主动停手"误读成"模型出了 bug"。
+ */
+export function toolLoopLimitUserNotice(rounds: number): string {
+  return (
+    `\n\n（本轮工具调用已达上限（${rounds} 轮），为避免无限循环已停止调用工具，` +
+    '未执行的操作已跳过。如需继续，请再发一条消息。）'
+  )
+}
+
+/**
+ * 模型把工具调用**回吐进正文 content** 时的标记（mimo/xiaomi 等实测会这样）。
+ *
+ * 这不是合法的 OpenAI/Anthropic 报文（真正的调用走 `tool_calls` 通道），而是模型在
+ * "工具被撤掉后仍想调用"时，用自己的原生文本格式（`<tool_call><function=…><parameter=…>`）
+ * 在正文里模仿一次调用。它既不是给人看的正文，也不能回填给模型（会强化这种行为），
+ * 所以在**流式出口**与**回填历史**两处都要滤掉。
+ */
+const TOOL_MARKUP_TAG_HEADS = ['<tool_call', '<function', '<parameter'] as const
+
+/** 完整块的闭合配对（**非贪婪**；大小写不敏感、跨行）—— 只删成对的，孤立的开标签交给调用方按流处理 */
+const TOOL_MARKUP_PAIRS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/<tool_call\b[^>]*>[\s\S]*?<\/tool_call\s*>/gi, ''],
+  [/<function\b[^>]*>[\s\S]*?<\/function\s*>/gi, ''],
+  [/<parameter\b[^>]*>[\s\S]*?<\/parameter\s*>/gi, ''],
+]
+
+/**
+ * 把一段**完整文本**里的工具回吐标记整段删掉（回填历史用；流式场景见
+ * {@link createToolCallTextFilter}）。删不掉的孤立开标签也一并丢弃 —— 那必然是半截脏文本。
+ */
+export function stripToolCallMarkup(text: string): string {
+  let out = text
+  for (const [pattern, replacement] of TOOL_MARKUP_PAIRS) out = out.replace(pattern, replacement)
+  return out
+}
+
+/**
+ * **流式**版 {@link stripToolCallMarkup}：逐片喂 `push`，返回"当前可以安全上流/落库"的文本。
+ *
+ * 为什么不能一片片直接 `strip`：脏标记**跨分片**到达（`<tool_` 与 `call>` 可能两片），
+ * 直接删会漏网（`push` 那一刻它还不是一个完整标记）。于是这里保留一段 `carry`：
+ *   · 先删完整块；
+ *   · 若还剩**孤立的开标签**（收到 `<tool_call` 但还没有 `</tool_call>`）⇒ 从它起全部扣住，
+ *     等后续分片把它补成完整块再删（或流结束由 `flush` 丢弃）；
+ *   · 再检查 buffer **结尾**是否是某个标记头的前缀（如刚收到 `<tool_`）⇒ 也扣住，
+ *     否则 `push` 会把半截标记当正文发出去。
+ * 只有"确实不是任何标记的前缀"的尾巴才会被放行。
+ */
+export function createToolCallTextFilter(): { push(text: string): string; flush(): string } {
+  let carry = ''
+  const holdFromDanglingOpen = (buffer: string): { safe: string; rest: string } => {
+    const lower = buffer.toLowerCase()
+    let cut = -1
+    for (const head of TOOL_MARKUP_TAG_HEADS) {
+      const idx = lower.lastIndexOf(head)
+      if (idx !== -1 && (cut === -1 || idx < cut)) cut = idx
+    }
+    return cut === -1 ? { safe: buffer, rest: '' } : { safe: buffer.slice(0, cut), rest: buffer.slice(cut) }
+  }
+  return {
+    push(text: string): string {
+      carry += text
+      carry = stripToolCallMarkup(carry)
+      const { safe, rest } = holdFromDanglingOpen(carry)
+      carry = rest
+      if (carry !== '') return safe
+      const maxHold = Math.max(...TOOL_MARKUP_TAG_HEADS.map((head) => head.length)) - 1
+      for (let len = Math.min(maxHold, safe.length); len >= 1; len -= 1) {
+        const tail = safe.slice(safe.length - len).toLowerCase()
+        if (TOOL_MARKUP_TAG_HEADS.some((head) => head.slice(0, len) === tail)) {
+          carry = safe.slice(safe.length - len)
+          return safe.slice(0, safe.length - len)
+        }
+      }
+      return safe
+    },
+    /** 流结束：扣住的若是以标记头开头，就是半截脏文本 ⇒ 丢弃；否则如实放行（不该丢正文） */
+    flush(): string {
+      const rest = carry
+      carry = ''
+      const lower = rest.toLowerCase()
+      return TOOL_MARKUP_TAG_HEADS.some((head) => lower.startsWith(head)) ? '' : rest
+    },
+  }
+}
 
 /**
  * 用户**点了取消**（或超时按取消）时，回填给模型的工具结果（P0-2-10）。

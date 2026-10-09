@@ -19,7 +19,6 @@
 
 import {
   DOCUMENT_PARSING_HINT,
-  IMAGE_MODES,
   LEGACY_DOC_EXTENSION,
   LEGACY_DOC_HINT,
   UPLOAD_EXTENSIONS,
@@ -28,7 +27,7 @@ import {
   type ChunkItem,
   type DocumentItem,
   type DocumentStatus,
-  type ImageMode,
+  type ImageRecognition,
   type KnowledgeBaseItem,
   type RetrievalConfig,
   type RetrievalHit,
@@ -42,11 +41,11 @@ import {
 /**
  * `<input type="file">` 的 `accept` 属性。
  *
- * ⚠️ **`.doc` 是故意加进来的**（看着像 bug，其实不是）：验收原文要求"选 `.doc` 立即提示
- * **且不发请求**"。若 `accept` 只写四个合法扩展名，系统文件选择器会把 `.doc` 直接过滤掉
- * —— 用户在小窗里根本选不中它，那句"请另存为 .docx 后重传"的提示**永远不会出现**，
- * 而验收看到的只是"什么都点不动"。把它放进 `accept`，才轮到下面的
- * {@link screenPickedFiles} 给出可操作的文案。
+ * ⚠️ **`.doc` 是故意加进来的**（看着像 bug，其实不是）：**P1-12 起 `.doc` 可能是 HTML/MIME
+ * （MHTML）导出件、本可正常解析**，故它不该在选择器里被过滤掉。而且真 OLE2 `.doc` 的
+ * "请另存为 .docx 后重传"提示也只有在系统选择器**放它进来**时才可能触发（`accept` 只写
+ * 四个白名单会让 `.doc` 是灰的、用户根本选不中）。把它放进 `accept`，才轮到
+ * {@link screenPickedFiles} + {@link screenLegacyDocContent}（读文件头）给出结论。
  *
  * 顺序与 `UPLOAD_EXTENSIONS` 一致（只此一处枚举），`.doc` 排在最后。
  */
@@ -79,6 +78,65 @@ export interface PickedFileLike {
   size: number
 }
 
+/** 读多少字节做 `.doc` 内容嗅探 —— 与后端 `pipeline/parse/index.ts#HEAD_PROBE_BYTES` 同值 */
+export const LEGACY_DOC_PROBE_BYTES = 4096
+
+/** `.doc` 按内容嗅探的结论（镜像后端 `sniffLegacyDoc`，见 `parse/index.ts`） */
+export type LegacyDocKind = 'html' | 'mhtml' | 'ole2' | 'rtf' | 'other'
+
+/** 字节 → latin1 文本（仅用于嗅探开头几个 ASCII 标记；UTF-16 BOM 另走 TextDecoder） */
+function latin1Of(bytes: Uint8Array): string {
+  let out = ''
+  for (const byte of bytes) out += String.fromCharCode(byte)
+  return out
+}
+
+/** 取文件头文本（UTF-16 BOM 与 latin1 两种；侦探用，不做完整编码嗅探）——镜像后端 */
+function legacyDocHeadText(head: Uint8Array): string {
+  if (head.length >= 2 && head[0] === 0xff && head[1] === 0xfe) {
+    try {
+      return new TextDecoder('utf-16le').decode(head.subarray(2))
+    } catch {
+      return ''
+    }
+  }
+  return latin1Of(head)
+}
+
+/**
+ * 按内容判断一个 `.doc` 到底是什么（P1-12；镜像后端 `sniffLegacyDoc`）。
+ *
+ * ⚠️ **前端这一份只是"提前给提示"**（判错最坏是多一次往返、由后端给出更准的结论，与
+ * {@link extensionOf} 同一取舍）：真正把关的是后端 `pipeline/parse/index.ts`。判定顺序
+ * = 确定性证据优先（OLE2 魔数 → RTF → MIME 头 → HTML 标记 → 其它）。
+ */
+export function sniffLegacyDocHead(head: Uint8Array): LegacyDocKind {
+  if (
+    head.length >= 8 &&
+    head[0] === 0xd0 &&
+    head[1] === 0xcf &&
+    head[2] === 0x11 &&
+    head[3] === 0xe0 &&
+    head[4] === 0xa1 &&
+    head[5] === 0xb1 &&
+    head[6] === 0x1a &&
+    head[7] === 0xe1
+  ) {
+    return 'ole2'
+  }
+  if (latin1Of(head.subarray(0, 5)) === '{\\rtf') return 'rtf'
+
+  const text = legacyDocHeadText(head)
+  if (
+    /^[A-Za-z][A-Za-z0-9-]*:\s*.+$/mu.test(text) &&
+    /(multipart\/|mime-version|content-type:\s*text\/html)/iu.test(text)
+  ) {
+    return 'mhtml'
+  }
+  if (/<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/iu.test(text)) return 'html'
+  return 'other'
+}
+
 export type FileRejectionCode = 'NO_FILE' | 'MULTIPLE' | 'LEGACY_DOC' | 'UNSUPPORTED' | 'EMPTY'
 
 export type FileScreenResult =
@@ -100,7 +158,9 @@ export type FileScreenResult =
  *     多选不是"排队传"，而是 413。界面上一次只处理一个文件，所以这里直接拒绝多选而不是
  *     悄悄取第一个（"我明明选了 3 个，只传了 1 个"比"一次只能传一个"更难查）。
  *   · `LEGACY_DOC` —— 单独一类（不并进 `UNSUPPORTED`），因为它有**可操作**的下一步
- *     （`LEGACY_DOC_HINT` = "请另存为 .docx 后重传"）。
+ *     （`LEGACY_DOC_HINT` = "请另存为 .docx 后重传"）。⚠️ **P1-12 起它不再在"看扩展名"阶段产生**
+ *     —— `.doc` 可能是 HTML/MIME 导出件，故这里放行，读完文件头后由 {@link screenLegacyDocContent}
+ *     再判（只有真 OLE2/RTF 才落到这个 code）。
  *   · `EMPTY` —— 0 字节文件后端会 400（"上传的文件是空的（0 字节）"），提前拦。
  *   · `UNSUPPORTED` —— 其余不在白名单里的扩展名（含**没有扩展名**）。
  *
@@ -124,15 +184,10 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
   const file = files[0] as PickedFileLike
   const extension = extensionOf(file.name)
 
-  if (extension === LEGACY_DOC_EXTENSION) {
-    return {
-      kind: 'reject',
-      code: 'LEGACY_DOC',
-      message: `「${file.name}」不在白名单内：本平台只解析 ${UPLOAD_EXTENSIONS.join(' / ')} 这些格式，旧版 .doc 需先转换。`,
-      hint: LEGACY_DOC_HINT,
-    }
-  }
-  if (extension === null || !(UPLOAD_EXTENSIONS as readonly string[]).includes(extension)) {
+  // ⚠️ **`.doc` 是唯一"扩展名不定生死"的格式（P1-12）**：它可能是 HTML/MIME（MHTML）导出件，
+  //    本可正常解析 ⇒ 这里放行，内容判定由调用方读文件头走 {@link screenLegacyDocContent}。
+  //    真正的把关始终在后端 `detectFormat`（前端这份只是提前提示）。
+  if (extension === null || (extension !== LEGACY_DOC_EXTENSION && !(UPLOAD_EXTENSIONS as readonly string[]).includes(extension))) {
     return {
       kind: 'reject',
       code: 'UNSUPPORTED',
@@ -140,7 +195,7 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
         extension === null
           ? `无法从文件名「${file.name}」识别格式（缺少扩展名）。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}`
           : `不支持的文件类型 .${extension}。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}`,
-      hint: `（.doc 请${LEGACY_DOC_HINT}）`,
+      hint: null,
     }
   }
   if (file.size === 0) {
@@ -148,6 +203,26 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
   }
 
   return { kind: 'accept', fileName: file.name }
+}
+
+/**
+ * `.doc` 的**内容判定**（P1-12）—— 读完文件头后调用，决定它是"网页导出件（放行）"
+ * 还是"真 OLE2/RTF（拦下，给可操作的下一步）"。
+ *
+ * ⚠️ 与 {@link screenPickedFiles} **分两步**是刻意的：文件头要读字节（异步），而
+ * `screenPickedFiles` 是同步纯函数（验收档直接跑）。判定口径镜像后端 `sniffLegacyDoc`。
+ */
+export function screenLegacyDocContent(fileName: string, head: Uint8Array): FileScreenResult {
+  const kind = sniffLegacyDocHead(head)
+  if (kind === 'html' || kind === 'mhtml') {
+    return { kind: 'accept', fileName }
+  }
+  return {
+    kind: 'reject',
+    code: 'LEGACY_DOC',
+    message: `「${fileName}」是旧版 Word 二进制格式（.doc）：本平台只解析 ${UPLOAD_EXTENSIONS.join(' / ')} 这些格式，旧版 .doc 需先转换。`,
+    hint: LEGACY_DOC_HINT,
+  }
 }
 
 /** 扩展名（用于表格里那个等宽小标）—— 识别不出时给 `—`，**不编**一个格式出来 */
@@ -161,21 +236,20 @@ export function isImageFile(fileName: string): boolean {
   return extension !== null && isImageUploadExtension(extension)
 }
 
-/**
- * 图片解析方式是否**可选**。
- *
- * `MULTIMODAL` 依赖 `/embeddings/multimodal`，只有知识库所选向量模型标了 `embeddingMultimodal`
- * 才允许（后端也会再拦一道）。其余方式恒可选。
- */
-export function isImageModeAllowed(mode: ImageMode, multimodalSupported: boolean): boolean {
-  return mode !== 'MULTIMODAL' || multimodalSupported
+/** 图片选项各自是否**可选**的能力前置（与后端 `assertImageOptionsUsable` 同口径） */
+export interface ImageOptionCapabilities {
+  /** 该库 embedding 模型是否支持多模态 → 决定「图片向量化」可否选 */
+  multimodalSupported: boolean
+  /** 该库是否已选「图片描述模型」→ 决定识别方式「大模型识别（LLM）」可否选 */
+  describeSupported: boolean
 }
 
-/** 图片解析方式的可选项（`MULTIMODAL` 在模型不支持时标记 disabled） */
-export function imageModeOptions(
-  multimodalSupported: boolean,
-): Array<{ value: ImageMode; disabled: boolean }> {
-  return IMAGE_MODES.map((mode) => ({ value: mode, disabled: !isImageModeAllowed(mode, multimodalSupported) }))
+/**
+ * 某个识别方式此刻是否可用（不可用时前端 disabled；后端也会再拦一道）。
+ * `NONE`/`OCR` 恒可用（本机离线、无依赖）；`LLM` 需该库已选描述模型。
+ */
+export function isRecognitionAllowed(recognition: ImageRecognition, caps: ImageOptionCapabilities): boolean {
+  return recognition !== 'LLM' || caps.describeSupported
 }
 
 // ───────────────────────────── 文档状态展示 ─────────────────────────────
@@ -508,6 +582,8 @@ export interface KnowledgeCreateFormValues {
   description: string
   /** 建库时**选定**的 embedding 模型 id（模型池 `type=EMBEDDING`）；必填 */
   embeddingModelId: string
+  /** 图片描述模型 id（P1-11，可选；空串 = 不启用图片描述） */
+  captionModelId: string
   chunkSize: number | null
   chunkOverlap: number | null
 }
@@ -516,6 +592,7 @@ export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
   name: '',
   description: '',
   embeddingModelId: '',
+  captionModelId: '',
   chunkSize: null,
   chunkOverlap: null,
 }
@@ -531,6 +608,7 @@ export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
 export function buildCreateBody(values: KnowledgeCreateFormValues): {
   name: string
   embeddingModelId: string
+  captionModelId?: string
   description?: string
   chunkSize?: number
   chunkOverlap?: number
@@ -538,6 +616,7 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
   const body: {
     name: string
     embeddingModelId: string
+    captionModelId?: string
     description?: string
     chunkSize?: number
     chunkOverlap?: number
@@ -545,6 +624,10 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
 
   const description = values.description.trim()
   if (description !== '') body.description = description
+  // 图片描述模型为空 ⇒ 不带这个键（建库时 null 与省略同义，省略更干净）。
+  // `?? ''` 兜住"夹具/老调用方没给该字段"（undefined）的情形。
+  const captionModelId = values.captionModelId ?? ''
+  if (captionModelId !== '') body.captionModelId = captionModelId
   if (values.chunkSize !== null) body.chunkSize = values.chunkSize
   if (values.chunkOverlap !== null) body.chunkOverlap = values.chunkOverlap
   return body
@@ -556,6 +639,8 @@ export interface KnowledgeEditFormValues {
   description: string
   /** 当前选定的向量模型 id（老库为 `''`，表示没有） */
   embeddingModelId: string
+  /** 当前选定的图片描述模型 id（`''` = 未启用图片描述） */
+  captionModelId: string
   chunkSize: number
   chunkOverlap: number
 }
@@ -565,6 +650,7 @@ export function editValuesOf(kb: KnowledgeBaseItem): KnowledgeEditFormValues {
     name: kb.name,
     description: kb.description ?? '',
     embeddingModelId: kb.embeddingModelId ?? '',
+    captionModelId: kb.captionModelId ?? '',
     chunkSize: kb.chunkSize,
     chunkOverlap: kb.chunkOverlap,
   }
@@ -623,6 +709,15 @@ export function buildKnowledgeUpdateBody(
   // 换模型：只在真的选了新模型时带上（空串不是"清空模型"，schema 也不接受 null）
   if (isEmbeddingModelChanged(baseline, values.embeddingModelId)) {
     body.embeddingModelId = values.embeddingModelId
+  }
+
+  // 图片描述模型（P1-11）三态：空串 = 清除（仅当原来有值时提交 `null`）/ 选了新值 = 设值
+  const captionModelId = values.captionModelId ?? ''
+  if (captionModelId === '') {
+    // `?? null` 兜住"老契约/夹具里没有该字段"（undefined）的情形 —— 与 null 同义，都表示"原本没有"
+    if ((baseline.captionModelId ?? null) !== null) body.captionModelId = null
+  } else if (captionModelId !== baseline.captionModelId) {
+    body.captionModelId = captionModelId
   }
 
   return Object.keys(body).length === 0 ? null : body

@@ -46,13 +46,14 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, canTransitionDocumentStatus, MULTIMODAL_MODEL_REQUIRED_HINT, normalizeRetrievalConfig, type DocumentStatus } from '@doubulea/shared'
+import { AppError, canTransitionDocumentStatus, MULTIMODAL_MODEL_REQUIRED_HINT, normalizeRetrievalConfig, type DocumentStatus, type ImageRecognition } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import type { LlmTarget } from '../llm/client.js'
 import { buildPoolEmbeddingProvider } from '../llm/embedding/index.js'
-import { resolveEmbeddingTarget } from '../services/model.service.js'
+import { resolveChatTarget, resolveEmbeddingTarget } from '../services/model.service.js'
 import { closePipelineQueue, dequeuePipelineJob, pipelineQueueKey, type PipelineJob } from './queue.js'
 import { defaultPipelineStages, type PipelineDocument, type PipelineContext, type PipelineStage } from './stages.js'
 
@@ -73,7 +74,8 @@ const JOB_DOCUMENT_SELECT = {
   fileName: true,
   contentHash: true,
   status: true,
-  imageMode: true,
+  imageRecognize: true,
+  imageVectorize: true,
   /**
    * 分块参数住在**知识库**上（`chunk_size` / `chunk_overlap` 两列 + `retrieval_config.splitStrategy`），
    * 而处理一份文档离不开它们（P0-1-18 的 chunk 阶段要用）。
@@ -88,6 +90,8 @@ const JOB_DOCUMENT_SELECT = {
       // 该库选定的 embedding 模型 + 维度（本批起入库用它，而不是进程级环境变量）
       embeddingModelId: true,
       embeddingDim: true,
+      // 该库选定的图片描述模型（P1-11；可空 = 该库不产出图片描述）
+      captionModelId: true,
     },
   },
 } as const
@@ -378,7 +382,8 @@ async function handleJob(job: PipelineJob): Promise<void> {
       // jsonb 里可能缺键（老数据 / PATCH 只改了一半）⇒ 一律走 shared 的补默认值，
       // **不在这里写 `?? 'hybrid'`**（那是"散落的第二个真相"，见 `shared/src/knowledgeBase.ts` 文件头 ②）
       splitStrategy: normalizeRetrievalConfig(row.kb.retrievalConfig).splitStrategy,
-      imageMode: row.imageMode,
+      imageRecognize: row.imageRecognize,
+      imageVectorize: row.imageVectorize,
     }
     const ctx: PipelineContext = { job, document, log }
     let status: DocumentStatus = row.status
@@ -392,12 +397,18 @@ async function handleJob(job: PipelineJob): Promise<void> {
       // 解析该库**选定**的 embedding 模型（入库用它，而不是进程级环境变量）——
       // 查库 + 解密 Key 都在这里；失败按"文档处理失败"落库（消息可展示），不是基础设施故障。
       const target = await resolveEmbeddingTarget(row.kb.embeddingModelId)
-      // 防御性复核：多模态图片模式要求该库模型支持多模态端点（上传时已校验过一次，
+      // 防御性复核：勾了「图片向量化」要求该库模型支持多模态端点（上传时已校验过一次，
       // 但模型可能在文档排队期间被改过 —— 这里再拦一道，避免图片被当文本静默吞掉）
-      if (row.imageMode === 'MULTIMODAL' && !target.embeddingMultimodal) {
+      if (row.imageVectorize && !target.embeddingMultimodal) {
         throw AppError.conflict(MULTIMODAL_MODEL_REQUIRED_HINT)
       }
-      ctx.embeddingDim = requireEmbeddingDim(row.kb.embeddingDim)
+      // 维度对齐（P1-5 修复）：worker 是**唯一**用"该库当前模型"做向量化的收口点（重试 / 新上传 /
+      // 整库重建都经过它）。模型池里那一行可能被改过维度（或本功能上线前建的库维度快照为空），
+      // 若继续用知识库那个可能过期的 `embeddingDim`，上游会报"返回 N 维、期望 M 维"整批失败
+      // （2026-10-08 实测：模型改名后点「重试」失败，走重建才恢复）。故以**模型当前维度**为准，
+      // 顺便把知识库快照刷新成它（后续检索按新维度收窄旧 chunk）。
+      const alignedDim = await alignEmbeddingDim(row.kbId, row.kb.embeddingDim, target.embeddingDim, log)
+      ctx.embeddingDim = requireEmbeddingDim(alignedDim)
       ctx.embeddingBatchSize = config.embedding.batchSize
       ctx.embeddingProvider = buildPoolEmbeddingProvider(
         {
@@ -410,6 +421,13 @@ async function handleJob(job: PipelineJob): Promise<void> {
         },
         ctx.embeddingDim,
         ctx.embeddingBatchSize,
+      )
+      // 图片"含义"理解（P1-11）：勾了「图片含义识别」+ 该库配了描述模型时解析其 vision 目标并注入。
+      // 解析失败 / 模型不支持视觉得**降级为 no-op**（不使文档失败）—— 描述是可选的锦上添花。
+      ctx.captionTarget = await resolveCaptionTarget(
+        row.kb.captionModelId,
+        row.imageRecognize,
+        log,
       )
 
       for (const stage of state.stages) await stage.run(ctx)
@@ -470,6 +488,68 @@ function requireEmbeddingDim(dim: number | null): number {
     )
   }
   return dim
+}
+
+/**
+ * 解析图片描述（P1-11）用的 vision 模型目标。
+ *
+ * 模型来源是**知识库级**的 `kb.captionModelId`（建/改库时从模型池选定，见 `kb.service`），
+ * 不再是进程级环境变量。
+ *
+ * 与 embedding 目标**刻意不同**：这里**不抛**，任何不可用都降级为 `undefined`（→ 描述阶段 no-op），
+ * 因为描述是可选的增强、且失败不该影响入库。三类降级各留一条 warn 便于运维定位：
+ * 该库未配置 / 识别方式不是「大模型识别（LLM）」/ 模型不可用（不存在·停用·未配 Key）/ 不支持视觉。
+ */
+async function resolveCaptionTarget(
+  modelId: string | null,
+  imageRecognize: ImageRecognition,
+  log: Logger,
+): Promise<LlmTarget | undefined> {
+  if (modelId === null || imageRecognize !== 'LLM') return undefined
+  try {
+    const target = await resolveChatTarget(modelId)
+    if (!target.supportsVision) {
+      log.warn(
+        { modelId, modelName: target.modelName },
+        '该库选定的图片描述模型不支持视觉（supportsVision=false），图片描述阶段跳过',
+      )
+      return undefined
+    }
+    return target
+  } catch (error) {
+    log.warn(
+      { err: error, modelId },
+      '图片描述模型不可用（不存在/停用/未配 Key），图片描述阶段跳过（不影响文档入库）',
+    )
+    return undefined
+  }
+}
+
+/**
+ * 让"这一篇用哪个维度入库"与该库**当前模型**的输出维度一致（P1-5 修复）。
+ *
+ * 优先级：模型的 `embeddingDim`（模型池里改名/改维度后 `updateModel` 会重探它）> 知识库快照。
+ * 两者不一致（或快照为空）时把**知识库快照**刷新成模型维度 —— 一致性由知识库快照承载
+ * （检索也读它），刷新后新入库的行与检索口径同一维度，旧 chunk 被维度收窄自然排除。
+ *
+ * ⚠️ 只刷 `embeddingDim`，**不动 `embeddingModel`（"向量来源"名字快照）** —— 那条由整库重建
+ * 成功后收口（`kb.service#rebuildKnowledgeBase`），避免"只重试了一篇就把'需重建'告警清掉"。
+ *
+ * @returns 本次入库应使用的维度（模型维度可用则用它，否则回落知识库快照，由调用方判空）
+ */
+async function alignEmbeddingDim(
+  kbId: string,
+  snapshotDim: number | null,
+  modelDim: number | null,
+  log: Logger,
+): Promise<number | null> {
+  if (modelDim === null || modelDim === snapshotDim) return snapshotDim
+  await getPrisma().knowledgeBase.update({ where: { id: kbId }, data: { embeddingDim: modelDim } })
+  log.warn(
+    { kbId, from: snapshotDim, to: modelDim },
+    '知识库 embedding 维度快照与当前模型不一致，已按模型维度刷新（旧 chunk 在重建完成前被维度收窄排除）',
+  )
+  return modelDim
 }
 
 /**

@@ -42,13 +42,17 @@
  */
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { UPLOAD_FILE_FIELD, UPLOAD_IMAGE_MODE_FIELD } from '@doubulea/shared'
+import {
+  UPLOAD_FILE_FIELD,
+  UPLOAD_IMAGE_RECOGNIZE_FIELD,
+  UPLOAD_IMAGE_VECTORIZE_FIELD,
+} from '@doubulea/shared'
 import type {
   CreateKnowledgeBaseBody,
   DocumentChunkListResult,
+  DocumentImageOptions,
   DocumentItem,
   DocumentListResult,
-  ImageMode,
   KnowledgeBaseItem,
   KnowledgeBaseListResult,
   RebuildKnowledgeBaseResult,
@@ -279,10 +283,11 @@ export function useDocumentChunks(
 export function useUploadDocument(kbId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ file, imageMode }: { file: File; imageMode: ImageMode }) => {
+    mutationFn: ({ file, options }: { file: File; options: DocumentImageOptions }) => {
       const formData = new FormData()
       formData.append(UPLOAD_FILE_FIELD, file)
-      formData.append(UPLOAD_IMAGE_MODE_FIELD, imageMode)
+      formData.append(UPLOAD_IMAGE_RECOGNIZE_FIELD, options.imageRecognize)
+      formData.append(UPLOAD_IMAGE_VECTORIZE_FIELD, String(options.imageVectorize))
       return requestFormData<UploadDocumentResult>(
         `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
         formData,
@@ -296,10 +301,11 @@ export function useUploadDocument(kbId: string) {
 export function useReuploadDocument(kbId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ docId, file, imageMode }: { docId: string; file: File; imageMode: ImageMode }) => {
+    mutationFn: ({ docId, file, options }: { docId: string; file: File; options: DocumentImageOptions }) => {
       const formData = new FormData()
       formData.append(UPLOAD_FILE_FIELD, file)
-      formData.append(UPLOAD_IMAGE_MODE_FIELD, imageMode)
+      formData.append(UPLOAD_IMAGE_RECOGNIZE_FIELD, options.imageRecognize)
+      formData.append(UPLOAD_IMAGE_VECTORIZE_FIELD, String(options.imageVectorize))
       return requestFormData<ReuploadDocumentResult>(
         `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/reupload`,
         formData,

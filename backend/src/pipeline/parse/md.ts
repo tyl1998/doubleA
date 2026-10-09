@@ -2,16 +2,18 @@
  * Markdown 解析（P0-1-16；`子方案/知识库流水线.md` §4-1：MD 原生，按 `#` 层级记录标题）
  *
  * 为什么"原生"（不引 markdown 解析库）：本层要的不是渲染，而是**结构 + 正文**，
- * 而 md 的标题/段落/代码围栏这三件事用行级正则就够 —— 引一个 AST 库会顺手带来
- * 表格、内联 HTML、脚注等一大堆与本项目无关的语义，且"到底什么算一个段落"会变成
+ * 而 md 的标题/段落/代码围栏/表格这四件事用行级正则就够 —— 引一个 AST 库会顺手带来
+ * 内联 HTML、脚注等一大堆与本项目无关的语义，且"到底什么算一个段落"会变成
  * 那个库的口径而不是我们的（下游 hybrid 分块要靠这个粒度）。
  *
- * 三条明确的口径（都是"选了就要写下来"的取舍）：
+ * 四条明确的口径（都是"选了就要写下来"的取舍）：
  *   · 只认 **ATX 标题**（`# 一级`…`###### 六级`）；setext 标题（下划线式）不做 ——
  *     它与分隔线 `---` 在行级无法可靠区分，误判会把分隔线吃成标题。
  *   · **代码围栏内的 `#` 不是标题**（``` / ~~~，可缩进）：这是 md 解析最常见的假阳性来源。
  *     围栏内容仍然收成一个 block（它是内容，只是不参与标题层级）。
  *   · 连续非空行算**一个段落**（内部换行保留）：md 的软换行是排版行为，不是语义分隔。
+ *   · **GFM 表格**（表头行 + 分隔行 + 数据行）原样收成一个 `kind='table'` 块，供分块层
+ *     当原子单元；判定要求"下一行是分隔行"，避免正文里孤立的 `|` 被误判成表格。
  */
 
 import { decodeTextBuffer } from './txt.js'
@@ -33,13 +35,32 @@ const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/u
 /** Markdown 图片语法 `![alt](url "title")`（只取 url；title 可选） */
 const IMAGE_LINK = /!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/gu
 
+/**
+ * 表格行判据（GFM）：一行里含 `|` 且非空。**单看它不足以成表** —— 正文里偶然出现 `|`
+ * 也满足它，故真正判定要求"下一行是分隔行"（见 {@link parseMd} 的 lookahead）。
+ */
+function isTableRow(line: string): boolean {
+  return line.includes('|') && line.trim() !== ''
+}
+
+/** 分隔行：`| --- | :---: |` 这类（每格只由 `-` 与可选的 `:` 构成，且至少一个 `-`） */
+function isTableDelimiter(line: string): boolean {
+  const trimmed = line.trim()
+  if (trimmed === '' || !trimmed.includes('-')) return false
+  const cells = trimmed.replace(/^\|/u, '').replace(/\|$/u, '').split('|')
+  return cells.length > 0 && cells.every((cell) => /^\s*:?-+:?\s*$/u.test(cell))
+}
+
 /** 外链图片抓取的超时（毫秒） */
 const REMOTE_IMAGE_TIMEOUT_MS = 8000
 
 /**
  * `data:image/...;base64,...` → 原始字节；不是 data URI 时返回 `undefined`。
+ *
+ * ⚠️ **导出供 HTML 链路复用**（`.doc` 实为 HTML/MIME 导出件，P1-12）：导出件里的
+ * `data:` 图与 md 里的是同一种东西，解码口径只该有一份（同 {@link fetchRemoteImage}）。
  */
-function decodeDataUri(url: string): { data: Buffer; mime: string } | undefined {
+export function decodeDataUri(url: string): { data: Buffer; mime: string } | undefined {
   const match = /^data:([^;,]+)?(;base64)?,(.*)$/su.exec(url)
   if (match === null) return undefined
   const mime = match[1] ?? 'application/octet-stream'
@@ -57,7 +78,7 @@ function decodeDataUri(url: string): { data: Buffer; mime: string } | undefined 
  * `Content-Type` 必须是 `image/*`。任何失败都**吞掉并返回 `undefined`** ——
  * 外网图取不到不该让一篇 md 解析失败（它只是内容的一部分）。
  */
-async function fetchRemoteImage(url: string, maxBytes: number): Promise<{ data: Buffer; mime: string } | undefined> {
+export async function fetchRemoteImage(url: string, maxBytes: number): Promise<{ data: Buffer; mime: string } | undefined> {
   let parsed: URL
   try {
     parsed = new URL(url)
@@ -151,7 +172,11 @@ export async function parseMd(
     fence = null
   }
 
-  for (const line of text.split(/\r\n|\r|\n/u)) {
+  const lines = text.split(/\r\n|\r|\n/u)
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index] ?? ''
+
     if (fence !== null) {
       const marker = FENCE.exec(line)
       if (marker !== null && marker[1]?.[0] === fence[0]) {
@@ -159,6 +184,7 @@ export async function parseMd(
       } else {
         fenced.push(line)
       }
+      index += 1
       continue
     }
 
@@ -166,6 +192,24 @@ export async function parseMd(
     if (marker !== null) {
       flushParagraph()
       fence = marker[1] ?? '```'
+      index += 1
+      continue
+    }
+
+    // 表格：仅当"本行是表格行且下一行是分隔行"时成表（lookahead 避免正文里的孤立 `|` 误判）。
+    // 整张表**原样**收成一个 `kind='table'` 块 —— 原文已是 Markdown 管道表，保留最忠实。
+    if (isTableRow(line) && isTableDelimiter(lines[index + 1] ?? '')) {
+      flushParagraph()
+      let end = index + 2
+      while (end < lines.length && isTableRow(lines[end] ?? '')) end += 1
+      const table = lines
+        .slice(index, end)
+        .map((raw) => raw.trim())
+        .join('\n')
+      if (table.trim() !== '') {
+        blocks.push({ text: table, headingPath: normalizeHeadingPath(stack), page: null, kind: 'table' })
+      }
+      index = end
       continue
     }
 
@@ -179,11 +223,13 @@ export async function parseMd(
       if (title !== '') stack[level - 1] = title
       // 标题段自己也在自己的路径里（见 `types.ts` 的 `headingPath` 说明）
       if (title !== '') blocks.push({ text: title, headingPath: normalizeHeadingPath(stack), page: null })
+      index += 1
       continue
     }
 
     if (line.trim() === '') {
       flushParagraph()
+      index += 1
       continue
     }
     for (const match of line.matchAll(IMAGE_LINK)) {
@@ -191,6 +237,7 @@ export async function parseMd(
       if (url !== undefined) pendingImageUrls.push(url)
     }
     paragraph.push(line.trim())
+    index += 1
   }
 
   flushParagraph()

@@ -71,13 +71,13 @@ export interface SandboxMcpToolRef {
 /**
  * 一项**平台内置工具**（不是 MCP：没有 server / 凭据 / 危险确认）。
  *
- * 当前只有「知识库」一族（`knowledge_search` / `list_knowledge`）。它们与 MCP 工具**同一次下发**
+ * 当前只有「知识库」一族（`knowledge_search` / `list_knowledge` / `read_document`）。它们与 MCP 工具**同一次下发**
  * （同一个 `/api/sandbox/mcp/tools`），但**不写进 {@link SandboxMcpCatalog.tools}** ——
  * 那张表是「`mcp_<alias>_<tool>` → 哪台 server 的哪个工具」的反查表，塞进内置工具会让
  * `map.ts` 把它们当 MCP 卡（`kind:MCP` + 一个假的 `serverId`），而那不是它们。
  */
 export interface SandboxBuiltinToolRef {
-  /** 注册给引擎的名字（内置名**就是** `knowledge_search` / `list_knowledge`，不加 `mcp_` 前缀） */
+  /** 注册给引擎的名字（内置名**就是** `knowledge_search` / `list_knowledge` / `read_document`，不加 `mcp_` 前缀） */
   name: string
   description: string
   /** 原样的 JSON Schema（容器侧据此给模型声明参数） */
@@ -90,7 +90,7 @@ export interface SandboxMcpCatalog {
   servers: SandboxMcpServerRef[]
   /** **注册给引擎的名字**（`mcp_<alias>_<tool>`）→ 这个工具是谁 */
   tools: Record<string, SandboxMcpToolRef>
-  /** 平台内置工具（知识库检索 / 目录）。**没有就是空数组**（绝大多数 Agent 不绑 KB） */
+  /** 平台内置工具（知识库检索 / 目录 / 整篇阅读）。**没有就是空数组**（绝大多数 Agent 不绑 KB） */
   builtins: SandboxBuiltinToolRef[]
 }
 

@@ -92,11 +92,19 @@ export function buildImageChunks(images: readonly ParsedImage[], blocks: readonl
     const where = image.headingPath.length > 0 ? image.headingPath.join(' / ') : ''
     const label = caption !== '' ? caption : where
     const suffix = total > 1 ? ` （第${ordinal}张/共${total}张）` : ''
+    const base = label === '' ? `[图片]${suffix}` : `[图片] ${label}${suffix}`
+    // P1-11：VLM 描述（若 describe-images 阶段产出了）并进图片块 content —— 多模态块的文本路
+    // 因此从"只有图注"变成"图注 + 含义"，检索/引用能读到图上讲了什么（图片仍用于视觉向量）。
+    const content = image.description !== undefined && image.description !== '' ? `${base}\n${image.description}` : base
     const chunkImage: ChunkImage = { mime: image.mime, data: image.data }
     chunks.push({
       seq: 0, // 真实 seq 由 `chunkStage` 归并后统一分配
-      content: label === '' ? `[图片]${suffix}` : `[图片] ${label}${suffix}`,
-      meta: { headingPath: [...image.headingPath], page: image.page },
+      content,
+      meta: {
+        headingPath: [...image.headingPath],
+        page: image.page,
+        ...(image.imageKind === undefined ? {} : { imageKind: image.imageKind }),
+      },
       offset: imageOffset(anchor, spans, blocks),
       images: [chunkImage],
     })

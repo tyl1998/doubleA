@@ -52,7 +52,7 @@
  * ④ 工具循环（P0-2-8）的三条判据
  * ─────────────────────────────────────────────────────────────────────
  * ① **"还允不允许要工具"的判据是"已执行了几轮"，不是"请求了几次"**（`06` 门槛 3 的口径）：
- *    到 `TOOL_LOOP_LIMIT` 后**当轮就把 `tools` 撤掉**，而不是等模型第 11 次要了再拒。
+ *    到 `TOOL_LOOP_LIMIT` 后**当轮就把 `tools` 撤掉**，而不是等模型再多要一次工具才拒。
  *    两者的可观测结果一致（门槛 3 取证的是"假 MCP 的调用计数恰好 **10** + `done{COMPLETE}`"），
  *    但撤掉省一次明知不会执行的上游往返；而且**只有"请求里没有 `tools` 字段"才是真的禁工具**
  *    —— 只在提示里写"不许调"，模型仍可能吐一个工具名出来（那时只能收尾，见循环里那个分支）。
@@ -110,9 +110,7 @@ import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.s
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
 import {
   KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
-  KNOWLEDGE_SEARCH_TOOL_NAME,
   KNOWLEDGE_TOOL_SERVER_NAME,
-  LIST_KNOWLEDGE_TOOL_NAME,
   TOOL_CONFIRM_REJECTED_OUTPUT,
   TOOL_CONFIRM_TIMEOUT_OUTPUT,
   TOOL_LOOP_LIMIT_NOTICE,
@@ -121,16 +119,21 @@ import {
   buildSystemPrompt,
   buildToolResultMessages,
   buildUserChatMessage,
+  createToolCallTextFilter,
   knowledgeListTool,
   knowledgeSearchTool,
+  readDocumentTool,
   selectHistoryMessages,
+  stripToolCallMarkup,
   summarizeToolInput,
   toUsedCitationItems,
+  toolLoopLimitUnexecutedOutput,
+  toolLoopLimitUserNotice,
   truncateToolResult,
   type HistoryRow,
   type ToolOutcome,
 } from './chatContext.js'
-import { executeKnowledgeTool, loadKnowledgeCatalog } from './knowledgeTools.js'
+import { executeKnowledgeTool, isKnowledgeToolName, loadKnowledgeCatalog } from './knowledgeTools.js'
 import { persistRoundQuietly } from './persist.js'
 import { createSemaphore } from './semaphore.js'
 import {
@@ -270,9 +273,10 @@ export const chatBotProducer: ChatProducer = async (input) => {
     }
 
     /**
-     * 内置工具：**绑了知识库才有**「知识库目录 + 检索」（`list_knowledge` / `knowledge_search`）。
+     * 内置工具：**绑了知识库才有**「知识库目录 + 检索 + 整篇阅读」（`list_knowledge` /
+     * `knowledge_search` / `read_document`）。
      *
-     * 它们与 MCP 工具**同表下发**（一个数组），但执行时按名字分流（见循环里的 `isBuiltinKnowledgeTool`）——
+     * 它们与 MCP 工具**同表下发**（一个数组），但执行时按名字分流（见循环里的 `isKnowledgeToolName`）——
      * 不进 `catalog.routes`：那不是 MCP 工具，没有 server / 凭据 / 危险确认，硬塞进 `McpToolRoute`
      * 只会让那条"名字 → 哪台 server 的哪个工具"的映射表多出一种它描述不了的形状。
      * 排在 MCP 工具**前面**：让模型先看到它们，与系统提示里"知识库优先"的顺序一致。
@@ -280,7 +284,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
     const tools =
       kbIds.length === 0
         ? catalog.tools
-        : [knowledgeListTool(), knowledgeSearchTool(), ...catalog.tools]
+        : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool(), ...catalog.tools]
 
     // ── ④ 历史（最近 N 轮）+ system + 本轮用户消息 ──
     const rounds = config.limits.contextRounds
@@ -344,6 +348,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
     let toolRounds = 0
     /** "已达上限"那条提示**只注入一次**（否则每次都要多一轮上游往返） */
     let limitNoticeSent = false
+    /**
+     * 本轮**是否触发过工具轮数上限**（= 上面对模型注入过 {@link TOOL_LOOP_LIMIT_NOTICE}）。
+     * 收尾时据此决定要不要给用户追加一句"已达上限"的说明（见 {@link toolLoopLimitUserNotice}）。
+     */
+    let limitReached = false
+    /** 上限值（收尾文案要用；循环里每轮重读 config，这里缓存触发时的那份） */
+    let limitRounds = 0
+    /**
+     * 流式出口的脏文本过滤器（见 `chatContext.ts#createToolCallTextFilter`）：把模型**回吐进
+     * 正文**的工具调用标记（`<tool_call><function=…>`，mimo 实测）扣下并丢弃，别让它上流/落库。
+     */
+    const toolTextFilter = createToolCallTextFilter()
     /** 实际流过的上游轮数（= 1 + 工具轮数；日志与排查用） */
     let upstreamRounds = 0
 
@@ -389,6 +405,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
         const withTools = tools.length > 0 && !atToolLimit
         if (atToolLimit && !limitNoticeSent) {
           limitNoticeSent = true
+          limitReached = true
+          limitRounds = limit
           messages.push({ role: 'user', content: TOOL_LOOP_LIMIT_NOTICE })
         }
 
@@ -412,8 +430,16 @@ export const chatBotProducer: ChatProducer = async (input) => {
                   '本轮首字延迟（TTFT）',
                 )
               }
-              assistantText += text
-              enqueue({ name: 'delta', data: { text } })
+              /**
+               * ⚠️ 过滤**在累加与上流之前**（不是落库前）：模型回吐的工具调用标记（如
+               * `<tool_call><function=…>`）不该出现在用户眼前，也不该进 `assistantText`
+               * （否则会进引用筛选 / 落库 / 回填历史）。过滤器按流扣住跨分片的半截标记，见
+               * `chatContext.ts#createToolCallTextFilter`。
+               */
+              const clean = toolTextFilter.push(text)
+              if (clean === '') return
+              assistantText += clean
+              enqueue({ name: 'delta', data: { text: clean } })
             },
             onThinking: (text) => {
               thinkingText += text
@@ -434,9 +460,32 @@ export const chatBotProducer: ChatProducer = async (input) => {
         if (atToolLimit) {
           /**
            * 已经撤掉 `tools` 并且提示过"不能再调工具"，模型**仍然**报了一个工具调用 ——
-           * 模型侧的行为不可控 ⇒ 只能收尾：不能执行（那就是突破上限），
-           * 也不能再追加一次提示（那会变成无限循环）。
+           * 模型侧的行为不可控 ⇒ 只能收尾：不能执行（那就是突破上限），也不能再追加一次提示
+           * （那会变成无限循环）。
+           *
+           * ⚠️ 但**不能静默丢弃**（旧行为就是直接 `break`）：这里给每个未执行的调用补一张
+           * `tool_call{status:ERROR}` 卡（上流 + 落库），让用户与排查都能看到"为什么这些调用没跑"，
+           * 而不是让模型那一段被过滤掉的脏文本成为唯一的线索。
            */
+          for (const call of round.toolCalls) {
+            const route = catalog.routes[call.name]
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const finished = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: route === undefined ? '' : (serverNameById.get(route.serverId) ?? ''),
+              ...(route === undefined ? {} : { serverId: route.serverId }),
+              kind: 'MCP' as const,
+              status: 'ERROR' as const,
+              inputSummary,
+              output: toolLoopLimitUnexecutedOutput(limit),
+            }
+            emitToolCard(finished)
+            toolRecords.push({ ...finished, arguments: call.arguments })
+          }
           logger.warn(
             {
               conversationId,
@@ -444,23 +493,24 @@ export const chatBotProducer: ChatProducer = async (input) => {
               limit,
               toolCalls: round.toolCalls.map((call) => call.name),
             },
-            '已禁用工具并提示达上限，模型仍要求调用工具 ⇒ 不再执行，直接收尾',
+            '已禁用工具并提示达上限，模型仍要求调用工具 ⇒ 不再执行，直接收尾（已补 ERROR 卡留痕）',
           )
           break
         }
 
         // 助手这一轮"我要调这些工具"的消息 —— **必须排在结果之前**（三协议都要求成对）
-        messages.push(buildAssistantToolCallsMessage(round.text, round.toolCalls))
+        // ⚠️ `round.text` 过一遍 `stripToolCallMarkup`：模型可能把工具调用**回吐进正文**，
+        //    那半截脏文本回填给模型会强化"用文本模仿调用"的行为（见 `chatContext.ts`）。
+        messages.push(buildAssistantToolCallsMessage(stripToolCallMarkup(round.text), round.toolCalls))
 
         const outcomes: ToolOutcome[] = []
         for (const call of round.toolCalls) {
-          // ── 内置知识库工具（检索 / 目录）：在**第一行**与 MCP 调用分流 ──
+          // ── 内置知识库工具（检索 / 目录 / 整篇阅读）：在**第一行**与 MCP 调用分流 ──
           //
           // 它们没有 MCP server / 凭据 / 危险确认，走不了下面那套（`route` 查不到、`McpToolRoute`
           // 也描述不了）。检索命中累积进 `searchHits`，供回答结束后的引用卡筛选。
-          const isBuiltinKnowledgeTool =
-            kbIds.length > 0 &&
-            (call.name === KNOWLEDGE_SEARCH_TOOL_NAME || call.name === LIST_KNOWLEDGE_TOOL_NAME)
+          // 白名单判据收在 `isKnowledgeToolName`（唯一实现）—— 增删内置工具时不必回来改这里。
+          const isBuiltinKnowledgeTool = kbIds.length > 0 && isKnowledgeToolName(call.name)
           if (isBuiltinKnowledgeTool) {
             const parsed = parseToolArguments(call.arguments)
             const inputSummary = parsed.ok
@@ -738,6 +788,25 @@ export const chatBotProducer: ChatProducer = async (input) => {
       // 中断与故障在这里**都**只是"记下来"，统一的收尾在下面（见文件头 ①）：
       // 两条路都要落库（锁丢那一路除外），只是最终发出去的帧不同
       failure = error
+    }
+
+    // ── ⑤″ 流式过滤器的收尾 + "已达工具轮数上限"的用户可见提示 ──
+    //
+    // 1) `flush()`：放行过滤器 `carry` 里最后那段安全文本（若它其实以工具标记开头 ⇒ 判定为半截
+    //    脏文本，丢弃）。不做这一步，流结束时扣住的尾巴会**凭空少一段正文**。
+    // 2) 触发过工具轮数上限时，明确告诉用户"为什么停了"：模型回吐的脏文本已被滤掉，正文可能显得
+    //    没头没尾，这一句是唯一的解释来源（见 `chatContext.ts#toolLoopLimitUserNotice`）。
+    //    ⚠️ 只在**正常收尾**（无故障、未被中断）时补 —— 故障/中断下用户看到的是错误/停止卡，
+    //    再叠一句"工具达上限"会让人误判这一轮到底是哪种结局。
+    const trailing = toolTextFilter.flush()
+    if (trailing !== '') {
+      assistantText += trailing
+      enqueue({ name: 'delta', data: { text: trailing } })
+    }
+    if (limitReached && failure === null && abortReasonOf(signal) === undefined) {
+      const notice = toolLoopLimitUserNotice(limitRounds)
+      assistantText += notice
+      enqueue({ name: 'delta', data: { text: notice } })
     }
 
     // ── ⑤′ 引用卡：只在回答**真的引用了某篇文档**时才发（产品反馈 2026-09-30）──

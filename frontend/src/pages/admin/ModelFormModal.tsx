@@ -20,11 +20,12 @@
  *    写成 `.optional().default(null)` 会让"改个别名"顺手把上下文长度抹掉。
  */
 
-import { Alert, AutoComplete, Button, Input, InputNumber, Modal, Select, Switch } from 'antd'
+import { Alert, App as AntdApp, AutoComplete, Button, Input, InputNumber, Modal, Select, Switch } from 'antd'
 import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem, type ModelType } from '@doubulea/shared'
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
+import { useKnowledgeBases } from '../../api/knowledgeBases.js'
 import {
   useCreateModel,
   useProbeChatModel,
@@ -40,6 +41,8 @@ import {
   MODEL_TYPE_FOLLOWS_PROVIDER_REASON,
   buildCreateModelBody,
   buildModelUpdateBody,
+  knowledgeBasesUsingModel,
+  modelEditAffectsVectors,
   modelEditValuesOf,
   modelTypeForProvider,
   remoteModelRows,
@@ -61,10 +64,13 @@ const TYPE_OPTIONS = MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE
 
 export function ModelFormModal({ model, open, providers, defaultProviderId, onClose }: ModelFormModalProps) {
   const feedback = useFeedback()
+  const { modal } = AntdApp.useApp()
   const create = useCreateModel()
   const update = useUpdateModel()
   const probeEmbedding = useProbeEmbeddingModel()
   const probeChat = useProbeChatModel()
+  // 编辑被引用的向量模型时要列出"哪些库需要重建"（列表取前 100 条，足够覆盖内部工具的规模）
+  const knowledgeBases = useKnowledgeBases()
 
   const [providerId, setProviderId] = useState('')
   const [modelName, setModelName] = useState('')
@@ -216,16 +222,50 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       onClose()
       return
     }
-    update.mutate(
-      { id: model.id, body },
-      {
-        onSuccess: (saved) => {
-          feedback.ok(`已保存「${saved.label}」`)
-          onClose()
+
+    const doSave = (): void => {
+      update.mutate(
+        { id: model.id, body },
+        {
+          onSuccess: (saved) => {
+            feedback.ok(`已保存「${saved.label}」`)
+            onClose()
+          },
+          onError: (error) => setErrorText(describeError(error).message),
         },
-        onError: (error) => setErrorText(describeError(error).message),
-      },
-    )
+      )
+    }
+
+    // 改了会让"引用它的知识库"向量作废的字段（型号/维度/多模态/停用）⇒ 先弹确认、列出受影响的库（P1-5 补）
+    if (modelEditAffectsVectors(model, values) && model.knowledgeBaseCount > 0) {
+      const affected = knowledgeBasesUsingModel(model.id, knowledgeBases.data?.items ?? [])
+      modal.confirm({
+        title: '保存后这些知识库需要重建索引',
+        content: (
+          <div>
+            <p>
+              模型「{model.label}」正被 <strong>{model.knowledgeBaseCount}</strong> 个知识库用作向量模型：
+            </p>
+            {affected.length > 0 && (
+              <ul style={{ margin: 'var(--sp-2) 0 var(--sp-3)', paddingLeft: 'var(--sp-5)' }}>
+                {affected.map((kb) => (
+                  <li key={kb.id}>{kb.name}</li>
+                ))}
+              </ul>
+            )}
+            <p>
+              改动型号 / 维度 / 多模态或停用后，这些库已有的向量会作废、<strong>向量检索会停用</strong>；
+              需到各库「编辑」里保存以重建索引（全文检索不受影响）。
+            </p>
+          </div>
+        ),
+        okText: '继续保存',
+        cancelText: '取消',
+        onOk: doSave,
+      })
+      return
+    }
+    doSave()
   }
 
   const providerOptions = providers.map((provider) => ({

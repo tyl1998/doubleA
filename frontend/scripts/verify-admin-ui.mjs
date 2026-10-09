@@ -178,6 +178,8 @@ const {
   summarizeModels,
   remoteModelRows,
   remoteModelNotice,
+  modelEditAffectsVectors,
+  knowledgeBasesUsingModel,
 } = await import('../src/pages/admin/adminModel.ts')
 
 const { serialForPath, visibleNavItems } = await import('../src/app/nav.ts')
@@ -230,6 +232,7 @@ function makeModel(overrides = {}) {
     supportsReasoning: false,
     enabled: true,
     agentCount: 0,
+    knowledgeBaseCount: 0,
     createdAt: '2026-09-23T10:00:00.000Z',
     updatedAt: '2026-09-23T10:00:00.000Z',
     ...overrides,
@@ -1036,6 +1039,36 @@ await it('J14 ⚠️ 协议下拉标灰 + 改类型走收口函数；列表里�
   assert(page !== undefined, '找不到 ModelsPage.tsx')
   assertIncludes(page.source, "title: '上游协议'", 'Provider 表要单独一列显示协议（类型与协议是两个维度）')
   assertIncludes(page.source, 'UPSTREAM_PROTOCOL_LABELS[provider.protocol]', '列里读的是契约字段，不是自己拼的字符串')
+})
+
+// ───────────────────────────── P1-5：编辑被引用的向量模型要提示"哪些库需重建" ─────────────────────────────
+
+groupStart('K', 'P1-5：编辑被引用的向量模型提示"哪些库需重建"', '判据：`modelEditAffectsVectors` / `knowledgeBasesUsingModel`')
+
+await it('K1 改型号 / 维度 / 多模态 / 停用 才算"影响向量"；只改别名不算', () => {
+  const emb = makeModel({ type: 'EMBEDDING', modelName: 'bge-m3', embeddingDim: 1024, embeddingMultimodal: false, enabled: true })
+  const form = (over = {}) =>
+    makeModelForm({ type: 'EMBEDDING', modelName: 'bge-m3', embeddingDim: 1024, embeddingMultimodal: false, enabled: true, ...over })
+  assert(modelEditAffectsVectors(emb, form()) === false, '无改动 ⇒ 不影响')
+  assert(modelEditAffectsVectors(emb, form({ modelName: 'other' })) === true, '改型号 ⇒ 影响')
+  assert(modelEditAffectsVectors(emb, form({ embeddingDim: 1536 })) === true, '改维度 ⇒ 影响')
+  assert(modelEditAffectsVectors(emb, form({ embeddingMultimodal: true })) === true, '改多模态 ⇒ 影响')
+  assert(modelEditAffectsVectors(emb, form({ enabled: false })) === true, '停用 ⇒ 影响')
+  assert(modelEditAffectsVectors(emb, form({ label: '换个别名' })) === false, '只改别名 ⇒ 不影响')
+  assert(
+    modelEditAffectsVectors(makeModel({ type: 'CHAT' }), makeModelForm({ modelName: 'gpt-5' })) === false,
+    '对话模型恒不影响',
+  )
+})
+
+await it('K2 `knowledgeBasesUsingModel` 只挑绑定到该模型的库', () => {
+  const kbs = [
+    { id: 'k1', embeddingModelId: 'm-1' },
+    { id: 'k2', embeddingModelId: 'm-2' },
+    { id: 'k3', embeddingModelId: null },
+  ]
+  assertDeepEqual(knowledgeBasesUsingModel('m-1', kbs).map((kb) => kb.id), ['k1'], '只挑绑定的')
+  assertDeepEqual(knowledgeBasesUsingModel('m-9', kbs).map((kb) => kb.id), [], '没有绑定的返回空')
 })
 
 // ───────────────────────────── 结论表 ─────────────────────────────

@@ -78,8 +78,8 @@ export function canTransitionDocumentStatus(from: DocumentStatus, to: DocumentSt
  * ⚠️ 与 `.doc` 是**互斥**的两件事：`.doc` 不在白名单里，但它有**专门**的拦截分支
  * （给"请另存为 .docx 后重传"这句可读提示），不能混成一句"不支持的文件类型"。
  *
- * ⚠️ 图片格式（png/jpg/jpeg/webp/gif/bmp）只有在上传时选择了**图片解析方式**
- * （`imageMode != NONE`）时才真正接受 —— 判据在服务层，见 `IMAGE_FILE_REQUIRES_MODE_HINT`。
+ * ⚠️ 图片格式（png/jpg/jpeg/webp/gif/bmp）只有在上传时**至少勾了一个图片选项**
+ * 时才真正接受 —— 判据在服务层，见 `IMAGE_FILE_REQUIRES_MODE_HINT`。
  * 单独把扩展名放进白名单，是为了让 `.doc` 那样的"格式知识"只有一份。
  */
 export const UPLOAD_EXTENSIONS = ['pdf', 'docx', 'md', 'txt', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] as const
@@ -95,47 +95,89 @@ export function isImageUploadExtension(ext: string): ext is ImageUploadExtension
 }
 
 /**
- * 文档内图片的处理方式（**按文档**，上传时选择；`documents.image_mode`）。
+ * 文档内图片的**识别方式**（**按文档**，上传/覆盖重建时选择；`documents.image_recognize` 列）。
  *
- * 取值与 `schema.prisma` 的 `ImageMode` 枚举、`documents.image_mode` 列**逐字一致**
- * （大写），避免"接口一套、库里一套"的映射层：
- *   · `NONE`       —— 不解析图片（与历史行为一致；内嵌图按原逻辑丢弃/当正文）。
- *   · `OCR`        —— 抽取图片后**本地 OCR 成文字**，作为普通文本块进分块/向量化链路。
- *   · `MULTIMODAL` —— 抽取图片转 base64，作为 content part 交给知识库所选的**多模态 embedding**
- *                     模型（`/embeddings/multimodal`）直接向量化。要求该模型 `embeddingMultimodal=true`。
+ * 2026-10-08 由旧的三值 `ImageMode`（NONE/OCR/MULTIMODAL）重构而来。用户定案：**OCR 与大模型识别
+ * 互斥**（VLM 看一张图本就reads 上面的文字，再叠一遍本地 OCR 是重复劳动），故"怎么识别"是**三选一**：
+ *   · `NONE` —— 不识别图片（可与"图片向量化"组合，即只向量化不产文字）；
+ *   · `OCR`  —— **图片文字识别**：本地 OCR 出图上文字（`pipeline/ocr.ts`，离线、无依赖）；
+ *   · `LLM`  —— **图片含义识别**：用该库选定的「图片描述模型」生成含义/描述（P1-11，VLM）。
+ *
+ * 与**图片向量化**（{@link DocumentImageOptions.imageVectorize}）**正交**：识别产出**文本块**，
+ * 向量化产出**图片块**，可各自独立开关（含"只识别不向量化""只向量化不识别"）。
  */
-export const IMAGE_MODES = ['NONE', 'OCR', 'MULTIMODAL'] as const
-export type ImageMode = (typeof IMAGE_MODES)[number]
+export const IMAGE_RECOGNITIONS = ['NONE', 'OCR', 'LLM'] as const
+export type ImageRecognition = (typeof IMAGE_RECOGNITIONS)[number]
 
-/** 默认值（与 `documents.image_mode` 的 DB 默认值一致） */
-export const DEFAULT_IMAGE_MODE: ImageMode = 'NONE'
+/** 默认识别方式（与 `documents.image_recognize` 的 DB 默认值一致） */
+export const DEFAULT_IMAGE_RECOGNITION: ImageRecognition = 'NONE'
 
 /** 界面展示用的中文标签（前后端共用同一份，避免两边各写一遍漂移） */
-export const IMAGE_MODE_LABELS: Readonly<Record<ImageMode, string>> = Object.freeze({
-  NONE: '不解析图片',
-  OCR: '解析图片（OCR 转文字）',
-  MULTIMODAL: '解析图片（多模态向量化）',
+export const IMAGE_RECOGNITION_LABELS: Readonly<Record<ImageRecognition, string>> = Object.freeze({
+  NONE: '不识别图片',
+  OCR: '图片文字识别（本地 OCR）',
+  LLM: '图片含义识别（大模型）',
 })
 
-/** 上传时携带图片解析方式的 multipart 字段名（与文件字段 `file` 并列） */
-export const UPLOAD_IMAGE_MODE_FIELD = 'imageMode'
+/** 文档内图片的处理选项：识别方式（三选一）+ 是否向量化 */
+export interface DocumentImageOptions {
+  imageRecognize: ImageRecognition
+  imageVectorize: boolean
+}
+
+/** 默认：不识别 + 不向量化（= 不处理图片，与旧 `NONE` 一致） */
+export const DEFAULT_DOCUMENT_IMAGE_OPTIONS: DocumentImageOptions = Object.freeze({
+  imageRecognize: DEFAULT_IMAGE_RECOGNITION,
+  imageVectorize: false,
+})
+
+/** 上传/覆盖重建时携带图片选项的 multipart 字段名（与文件字段 `file` 并列） */
+export const UPLOAD_IMAGE_RECOGNIZE_FIELD = 'imageRecognize'
+export const UPLOAD_IMAGE_VECTORIZE_FIELD = 'imageVectorize'
+
+/** 图片向量化选项的展示标签（识别方式的标签见 {@link IMAGE_RECOGNITION_LABELS}） */
+export const IMAGE_VECTORIZE_LABEL = '图片向量化（多模态）'
+
+/** 是否至少选了一种图片处理（独立图片文件必须为 true；全不选 = 不处理图片） */
+export function hasAnyImageOption(options: DocumentImageOptions): boolean {
+  return options.imageRecognize !== 'NONE' || options.imageVectorize
+}
+
+/** 人读的一句话，列出这篇文档的图片处理（文档表格里显示；全不选返回空串） */
+export function describeImageOptions(options: DocumentImageOptions): string {
+  const parts: string[] = []
+  if (options.imageRecognize === 'OCR') parts.push('文字识别')
+  else if (options.imageRecognize === 'LLM') parts.push('含义识别')
+  if (options.imageVectorize) parts.push('向量化')
+  return parts.join(' + ')
+}
 
 /**
- * 上传了独立图片文件、但没有选择图片解析方式时的提示。
+ * 上传了独立图片文件、但既没选识别方式也没开向量化时的提示。
  *
  * 与 `LEGACY_DOC_HINT` 同款：**前后端共用同一句**，且它必须是"用户的下一步动作"
- * （回上传弹窗选一个解析方式），而不是一句笼统的"不支持"。
+ * （回上传弹窗至少选一项），而不是一句笼统的"不支持"。
  */
-export const IMAGE_FILE_REQUIRES_MODE_HINT = '图片文件需要在上传时选择"解析图片"方式（OCR 或多模态向量化）'
+export const IMAGE_FILE_REQUIRES_MODE_HINT =
+  '图片文件需要在上传时至少选择一种图片处理方式（图片文字识别 / 图片含义识别 / 图片向量化）'
 
 /**
- * 选择了多模态向量化、但知识库所选 embedding 模型不支持多模态时的提示。
+ * 勾了"图片向量化"、但知识库所选 embedding 模型不支持多模态时的提示。
  *
- * `MULTIMODAL` 依赖 `/embeddings/multimodal` 端点，只有模型池里标了 `embeddingMultimodal` 的
- * 向量模型才有；用错模型时**宁可当场拒绝**，也不要等流水线跑完才发现图片进不了向量空间。
+ * 依赖 `/embeddings/multimodal` 端点，只有模型池里标了 `embeddingMultimodal` 的向量模型才有；
+ * 用错模型时**宁可当场拒绝**，也不要等流水线跑完才发现图片进不了向量空间。
  */
 export const MULTIMODAL_MODEL_REQUIRED_HINT =
-  '当前知识库使用的 embedding 模型不支持多模态，无法按"多模态向量化"解析图片；请改用"OCR 转文字"，或把知识库换成支持多模态的向量模型后重建'
+  '当前知识库使用的 embedding 模型不支持多模态，无法对图片做"图片向量化"；请关闭该选项，或把知识库换成支持多模态的向量模型后重建'
+
+/**
+ * 勾了"图片含义识别"、但该知识库没有选「图片描述模型」时的提示。
+ *
+ * 含义识别的模型是**知识库级**配置（建/改库时选一个支持视觉的对话模型）；没选就该当场拒绝，
+ * 否则用户以为识别开了、结果什么都没产出。
+ */
+export const IMAGE_DESCRIBE_MODEL_REQUIRED_HINT =
+  '当前知识库未选择「图片描述模型」，无法做"图片含义识别"；请到知识库编辑里选一个支持图片的对话模型，或关闭该选项'
 
 /** 旧版 Word 二进制格式（决策 10：**不做解析**，直接拒绝并给可操作提示） */
 export const LEGACY_DOC_EXTENSION = 'doc'
@@ -200,8 +242,10 @@ export const documentItemSchema = z.object({
   status: z.enum(DOCUMENT_STATUSES),
   /** 已入库的 chunk 数；非 `READY` 时为 0（见文件头 ②） */
   chunkCount: z.number().int().min(0),
-  /** 该文档的图片处理方式（上传/覆盖重建时选定；见 {@link IMAGE_MODES}） */
-  imageMode: z.enum(IMAGE_MODES),
+  /** 图片识别方式（三选一：不识别 / 本地 OCR / 大模型含义；上传/覆盖重建时选定） */
+  imageRecognize: z.enum(IMAGE_RECOGNITIONS),
+  /** 图片向量化（多模态；与识别方式正交，可独立开关） */
+  imageVectorize: z.boolean(),
   /** 仅 `FAILED` 时有值，内容是可直接展示给用户的中文原因 */
   errorMsg: z.string().nullable(),
   /** ISO 8601 */

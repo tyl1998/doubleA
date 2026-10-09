@@ -45,6 +45,7 @@ import type {
   MessagePageResult,
   RecallConversationResult,
   RemoveConversationResult,
+  SetConversationAutoApproveResult,
   SseEvent,
   StopConversationResult,
 } from '@doubulea/shared'
@@ -291,6 +292,29 @@ export function stopConversation(conversationId: string): Promise<StopConversati
 export function fetchConversationActive(conversationId: string): Promise<ConversationActive> {
   return request<ConversationActive>(
     `/api/conversations/${encodeURIComponent(conversationId)}/active`,
+  )
+}
+
+// ───────────────────────────── 会话级自动审批开关 ─────────────────────────────
+
+/**
+ * 打开 / 关闭**会话级自动审批**（`POST /api/conversations/:id/auto-approve`）。
+ *
+ * 打开后本会话内危险的 MCP 工具不再逐次弹确认卡（由服务端编排层直接放行）——
+ * 面向"一个场景里连续调很多次 MCP、不想一次次点确认"的用法。
+ *
+ * ⚠️ **不做成 `useMutation`**：它不是"打开弹窗"那类有生命周期的动作，而是对话页头部一个
+ * 开关（本地 `useState` 管当前值即可）—— 与 {@link fetchConversationActive} 同款。
+ * 响应回带落定后的 `autoApprove`，调用方据此对齐本地状态（与 `/stop` 的 `signaled` 同款：
+ * "把请求原样确认一遍"，而不是自己猜服务端有没有写进去）。
+ */
+export function setConversationAutoApprove(
+  conversationId: string,
+  enabled: boolean,
+): Promise<SetConversationAutoApproveResult> {
+  return request<SetConversationAutoApproveResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/auto-approve`,
+    { method: 'POST', body: { enabled } },
   )
 }
 

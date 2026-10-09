@@ -82,6 +82,14 @@ export const modelItemSchema = z.object({
    * "显示 0 个却能删不掉"（`02` §三 删除语义、P0-1-10 同款结论）。
    */
   agentCount: z.number().int().min(0),
+  /**
+   * 有多少个**知识库**把该模型用作 embedding（`knowledge_bases.embedding_model_id`；对话模型恒为 0）。
+   *
+   * 编辑一个**被引用**的向量模型（改型号 / 改维度 / 改多模态 / 停用）会让那些库里已有的向量作废
+   * ⇒ 它们需要重建索引。模型编辑弹窗据此弹确认并列出库名（P1-5 补）。
+   * 与 `agentCount` 不同，它**不**是删除守卫：删模型会把 `embedding_model_id` 置空（`onDelete: SetNull`）。
+   */
+  knowledgeBaseCount: z.number().int().min(0),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),

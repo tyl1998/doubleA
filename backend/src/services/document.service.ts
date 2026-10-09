@@ -61,11 +61,15 @@ import type { Readable } from 'node:stream'
 import {
   AppError,
   canTransitionDocumentStatus,
+  hasAnyImageOption,
+  IMAGE_DESCRIBE_MODEL_REQUIRED_HINT,
   IMAGE_FILE_REQUIRES_MODE_HINT,
+  KNOWLEDGE_BASE_NEEDS_REBUILD_HINT,
   MULTIMODAL_MODEL_REQUIRED_HINT,
+  type DocumentImageOptions,
   type DocumentItem,
   type DocumentListResult,
-  type ImageMode,
+  type ImageRecognition,
   type RemoveDocumentResult,
   type RetryDocumentResult,
   type ReuploadDocumentResult,
@@ -79,8 +83,10 @@ import { getPrisma } from '../infra/prisma.js'
 // ⚠️ `isS3NoSuchKey` 原本是本文件的私有函数，P0-3-9 提到 `infra/s3.ts`：产物下载端点要
 // 同一个判据（"行在对象没了"），两处各写一份必然先腐烂一处
 import { ensureBucket, getS3Client, isS3NoSuchKey } from '../infra/s3.js'
-import { detectFormat, isImageFormat } from '../pipeline/parse/index.js'
+import { detectFormat, isImageFormat, type ParseFormat } from '../pipeline/parse/index.js'
 import { enqueuePipelineJob } from '../pipeline/queue.js'
+// 入库前置闸门复用 kb.service 的**同一套**"需重建"判据（详见 assertKbReadyForSingleDoc）
+import { KB_DRIFT_SELECT, kbNeedsRebuild } from './kb.service.js'
 
 /** 文档投影（与 `shared` 的 `documentItemSchema` 一一对应；列表端点 P0-1-21 复用它） */
 const DOCUMENT_SELECT = {
@@ -89,7 +95,8 @@ const DOCUMENT_SELECT = {
   fileName: true,
   status: true,
   chunkCount: true,
-  imageMode: true,
+  imageRecognize: true,
+  imageVectorize: true,
   errorMsg: true,
   createdAt: true,
   updatedAt: true,
@@ -101,7 +108,8 @@ type DocumentRow = {
   fileName: string
   status: string
   chunkCount: number
-  imageMode: ImageMode
+  imageRecognize: ImageRecognition
+  imageVectorize: boolean
   errorMsg: string | null
   createdAt: Date
   updatedAt: Date
@@ -115,7 +123,8 @@ function toItem(row: DocumentRow): DocumentItem {
     // Prisma 的枚举在类型层是本仓 `schema.prisma` 里的字面量联合；这里只做形状收口
     status: row.status as DocumentItem['status'],
     chunkCount: row.chunkCount,
-    imageMode: row.imageMode,
+    imageRecognize: row.imageRecognize,
+    imageVectorize: row.imageVectorize,
     errorMsg: row.errorMsg,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -154,37 +163,71 @@ export interface UploadDocumentInput {
   declaredMime: string | undefined
   /** 文件内容（multipart 已读进内存；上限见 `UPLOAD_BODY_LIMIT`） */
   bytes: Buffer
-  /** 图片处理方式（上传时选定；见 `shared#IMAGE_MODES`） */
-  imageMode: ImageMode
+  /** 图片识别方式（三选一）+ 是否向量化（上传时选定；见 `shared#DocumentImageOptions`） */
+  imageRecognize: ImageRecognition
+  imageVectorize: boolean
 }
 
 /**
- * 校验"图片处理方式 + 文件格式 + 知识库模型"三者的相容性（上传与覆盖重建共用）。
+ * 校验"图片选项 + 文件格式 + 知识库模型"三者的相容性（上传与覆盖重建共用）。
  *
- *  ① 独立图片文件**必须**选一个解析方式（`NONE` 时无从产生任何文本/向量）；
- *  ② `MULTIMODAL` 要求该库选定的 embedding 模型支持多模态端点（否则图片进不了向量空间）。
+ *  ① 独立图片文件**至少**选一种图片处理（全不选时无从产生任何文本/向量）；
+ *  ② 开了「图片向量化」⇒ 该库选定的 embedding 模型必须支持多模态端点；
+ *  ③ 识别方式选了「大模型识别（LLM）」⇒ 该库必须选了「图片描述模型」。
  *
- * @throws {AppError} `VALIDATION`(400) ① / `CONFLICT`(409) ②
+ * ⚠️ ②③ 是**能力前置**（缺了那次处理必然跑不成），故当场拒绝；③刻意不要求 Provider 已配 Key
+ * （那是运行期的事，worker 会降级）——这里只保证"模型已选定"这个配置前提。
+ *
+ * @throws {AppError} `VALIDATION`(400) ① / `CONFLICT`(409) ②③
  */
-async function assertImageModeUsable(
+async function assertImageOptionsUsable(
   kbId: string,
-  format: UploadExtension,
-  imageMode: ImageMode,
+  format: ParseFormat,
+  options: DocumentImageOptions,
 ): Promise<void> {
-  if (imageMode === 'NONE') {
+  if (!hasAnyImageOption(options)) {
     if (isImageFormat(format)) {
       throw AppError.validation(`上传的是图片文件，${IMAGE_FILE_REQUIRES_MODE_HINT}`)
     }
     return
   }
-  if (imageMode === 'MULTIMODAL') {
-    const kb = await getPrisma().knowledgeBase.findUnique({
-      where: { id: kbId },
-      select: { embeddingModelRef: { select: { embeddingMultimodal: true } } },
-    })
-    if (kb?.embeddingModelRef?.embeddingMultimodal !== true) {
-      throw AppError.conflict(MULTIMODAL_MODEL_REQUIRED_HINT)
-    }
+  if (!options.imageVectorize && options.imageRecognize !== 'LLM') return
+
+  const kb = await getPrisma().knowledgeBase.findUnique({
+    where: { id: kbId },
+    select: {
+      captionModelId: true,
+      embeddingModelRef: { select: { embeddingMultimodal: true } },
+    },
+  })
+  if (options.imageVectorize && kb?.embeddingModelRef?.embeddingMultimodal !== true) {
+    throw AppError.conflict(MULTIMODAL_MODEL_REQUIRED_HINT)
+  }
+  if (options.imageRecognize === 'LLM' && (kb === null || kb.captionModelId === null)) {
+    throw AppError.conflict(IMAGE_DESCRIBE_MODEL_REQUIRED_HINT)
+  }
+}
+
+/**
+ * 入库前置闸门（P1-5）：知识库处于 `needsRebuild` 时，**单篇**入库动作一律 409。
+ *
+ * 为什么必须挡：上传 / 重试 / 覆盖重传一次只向量化**一篇**。模型或维度变了之后这么做，
+ * 会让库里新旧向量混在一起（维度不同时旧文档被 `embedding_dim` 收窄过滤、只剩全文），
+ * 用户却只看到"我重试了一篇"—— 这是最坏的静默半迁移。唯一正确的动作是**整库重建**
+ * （详情页在 `needsRebuild` 时给出该入口），所以这里直接把单篇入口关掉。
+ *
+ * 判据与详情页显示**同源**（`kbNeedsRebuild`），不会出现"页面说不用重建、上传却被拒"。
+ *
+ * @throws {AppError} `CONFLICT`(409) {@link KNOWLEDGE_BASE_NEEDS_REBUILD_HINT}
+ */
+async function assertKbReadyForSingleDoc(kbId: string): Promise<void> {
+  const kb = await getPrisma().knowledgeBase.findUnique({
+    where: { id: kbId },
+    // `_count.documents` 与详情的 `needsRebuild` 同口径：空库没有待重建的旧向量、放行
+    select: { ...KB_DRIFT_SELECT, _count: { select: { documents: true } } },
+  })
+  if (kb !== null && kb._count.documents > 0 && kbNeedsRebuild(kb)) {
+    throw AppError.conflict(KNOWLEDGE_BASE_NEEDS_REBUILD_HINT)
   }
 }
 
@@ -211,11 +254,14 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
   const kb = await db.knowledgeBase.findUnique({ where: { id: input.kbId }, select: { id: true } })
   if (kb === null) throw AppError.notFound('知识库不存在')
 
-  // ② 三道前置校验（扩展名 / MIME / 文件头），不合法抛 400
-  const format: UploadExtension = detectFormat(input)
+  // ①b 该库若"需整库重建"（模型/维度已变），单篇上传会写出混合维度 ⇒ 拒绝，要求先整库重建
+  await assertKbReadyForSingleDoc(input.kbId)
 
-  // ②b 图片处理方式相容性（图片文件必须选解析方式；多模态要求模型支持）
-  await assertImageModeUsable(input.kbId, format, input.imageMode)
+  // ② 三道前置校验（扩展名 / MIME / 文件头），不合法抛 400
+  const format: ParseFormat = detectFormat(input)
+
+  // ②b 图片选项相容性（图片文件至少勾一个；向量化要求多模态模型、含义识别要求已选描述模型）
+  await assertImageOptionsUsable(input.kbId, format, input)
 
   // ③ 内容判重（`子方案①` §4-1 第 4 条）
   const contentHash = createHash('sha256').update(input.bytes).digest('hex')
@@ -258,7 +304,8 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
         fileKey,
         fileName: input.fileName,
         contentHash,
-        imageMode: input.imageMode,
+        imageRecognize: input.imageRecognize,
+        imageVectorize: input.imageVectorize,
         // id / status / chunkCount 全走 schema 默认值：`@default(uuid(7))` 是 Prisma 侧
         // 生成（P0-1-14 的实测：函数型默认值不进 DDL），本服务**不**自己生成 id
       },
@@ -602,22 +649,30 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
   if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
 
   // ② 三道前置校验（与上传同一个入口 —— 覆盖重建不能成为绕过校验的后门）
-  const format: UploadExtension = detectFormat(input)
+  const format: ParseFormat = detectFormat(input)
 
   // ②b 图片处理方式相容性（同上）
-  await assertImageModeUsable(input.kbId, format, input.imageMode)
+  await assertImageOptionsUsable(input.kbId, format, input)
 
-  // ③ 内容没变 **且图片处理方式也没变** ⇒ 视为误操作，直接返回（§七）。
-  //    ⚠️ 只比 content_hash 不够：用户可能想对**同一份文件**换一种图片解析方式
-  //    （NONE → OCR / OCR → MULTIMODAL），那必须重新跑流水线，不能被"内容未变"短路。
+  // ③ 内容没变 **且三个图片选项也没变** ⇒ 视为误操作，直接返回（§七）。
+  //    ⚠️ 只比 content_hash 不够：用户可能想对**同一份文件**改图片选项（如新开"含义识别"），
+  //    那必须重新跑流水线，不能被"内容未变"短路。
   const contentHash = createHash('sha256').update(input.bytes).digest('hex')
-  if (contentHash === row.contentHash && input.imageMode === row.imageMode) {
+  if (
+    contentHash === row.contentHash &&
+    input.imageRecognize === row.imageRecognize &&
+    input.imageVectorize === row.imageVectorize
+  ) {
     logger.info(
       { kbId: input.kbId, docId: row.id, fileName: input.fileName },
       '覆盖重建：内容与当前一致，未做任何改动',
     )
     return { document: toItem(row), unchanged: true }
   }
+
+  // ③b 该库若"需整库重建"（模型/维度已变），单篇覆盖重建同样会写出混合维度 ⇒ 拒绝。
+  //     放在"内容未变"早退**之后**：那种情况不产生任何向量、跳过它没有坏处。
+  await assertKbReadyForSingleDoc(input.kbId)
 
   // ④ 状态机守卫（防御性）：三种在库状态都允许回到 PARSING，所以正常永远进不来；
   //    真进来了说明状态值与状态机脱节了，宁可 409 也不要写坏那行
@@ -653,7 +708,8 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
           contentHash,
           fileKey,
           chunkCount: 0,
-          imageMode: input.imageMode,
+          imageRecognize: input.imageRecognize,
+          imageVectorize: input.imageVectorize,
           /**
            * ⚠️ `file_name` 也一起换 —— **这是对 `§七` 列清单的一处刻意补全**。
            *
@@ -732,6 +788,10 @@ export async function retryDocument(params: { kbId: string; docId: string }): Pr
   if (row.status === 'READY') {
     throw AppError.conflict('该文档已是就绪状态，无需重试；如需替换内容请使用覆盖重建')
   }
+
+  // 该库若"需整库重建"（模型/维度已变），重试单篇会写出混合维度 ⇒ 拒绝，要求先整库重建
+  // （2026-10-08：这正是用户实测"模型改名后点重试失败 / 半迁移"的入口，改为强制闸门）
+  await assertKbReadyForSingleDoc(params.kbId)
 
   // 先把"上次失败的原因"清掉并翻到 PARSING（CAS：只对 FAILED 生效；PARSING 时本来就不匹配）
   const { count } = await db.document.updateMany({

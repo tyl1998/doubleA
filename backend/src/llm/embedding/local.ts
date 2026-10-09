@@ -185,7 +185,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (inputs.length === 0) return []
     // 本地 bge-m3 是**纯文本**模型：收到图片直接拒绝（静默当文本处理会把图片内容悄悄丢掉）
     if (inputs.some((input) => typeof input !== 'string' && (input.images?.length ?? 0) > 0)) {
-      throw AppError.internal('本地 embedding 模型（bge-m3）不支持图片，请改用支持多模态的向量模型或"OCR 转文字"')
+      throw AppError.internal('本地 embedding 模型（bge-m3）不支持图片，请改用支持多模态的向量模型或"图片转文字（OCR）"')
     }
     const texts = inputs.map((input) => (typeof input === 'string' ? input : input.text))
     await this.#ensureWorker()

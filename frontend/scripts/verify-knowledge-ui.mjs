@@ -154,6 +154,8 @@ const {
   UPLOAD_ACCEPT_ATTRIBUTE,
   extensionOf,
   screenPickedFiles,
+  screenLegacyDocContent,
+  sniffLegacyDocHead,
   documentExtensionLabel,
   DOCUMENT_STATUS_META,
   chunkCountText,
@@ -198,6 +200,8 @@ function makeKb(overrides = {}) {
     embeddingModelId: 'model-1',
     embeddingDim: 1024,
     embeddingModelChanged: false,
+    captionModelId: null,
+    captionModelName: null,
     chunkSize: 512,
     chunkOverlap: 64,
     retrievalConfig: { ...DEFAULT_RETRIEVAL_CONFIG },
@@ -230,7 +234,7 @@ function file(name, size = 1024) {
 
 // ───────────────────────────── A 上传白名单与发送前拦截 ─────────────────────────────
 
-groupStart('A', '上传白名单与发送前拦截（`.doc` / 多选 / 空文件都在发请求前拦下）')
+groupStart('A', '上传白名单与发送前拦截（`.doc` 按内容判 / 多选 / 空文件都在发请求前拦下）')
 
 await it('A1 `accept` 里**同时**含四个白名单扩展名与 `.doc`（`.doc` 是故意的）', () => {
   for (const extension of UPLOAD_EXTENSIONS) {
@@ -253,12 +257,33 @@ await it('A2 `.pdf` / `.DOC`（大写）/ `运维手册-v3.md` 都能被接受',
   assertEqual(screenPickedFiles([file('归档.tar.gz')]).kind, 'reject', '最后一个点决定扩展名（gz 不在白名单）')
 })
 
-await it('A3 `.doc` 走**专门**一类，并带上可操作的下一步', () => {
-  const result = screenPickedFiles([file('复盘-0908.doc')])
-  assertEqual(result.kind, 'reject', 'kind')
-  assertEqual(result.code, 'LEGACY_DOC', 'code 必须是独立的一类（不能并进 UNSUPPORTED）')
-  assertIncludes(result.hint ?? '', LEGACY_DOC_HINT, 'hint 必须是 shared 那句"请另存为 .docx 后重传"')
-  assertIncludes(result.message, '复盘-0908.doc', '文案要指出是哪个文件')
+await it('A3 `.doc` 不再只看扩展名：读文件头判内容（P1-12）', () => {
+  // 看扩展名这一层：`.doc` 放行（内容判定在下一层 —— 见 A3b）
+  assertEqual(screenPickedFiles([file('复盘-0908.doc')]).kind, 'accept', '`.doc` 在扩展名层放行')
+
+  // 内容层：HTML / MHTML → 放行；OLE2 / RTF / 其它 → 拦下并带上可操作的下一步
+  const html = new TextEncoder().encode('<!doctype html><html><body><p>x</p></body></html>')
+  assertEqual(sniffLegacyDocHead(html), 'html', '裸 HTML → html')
+  assertEqual(screenLegacyDocContent('a.doc', html).kind, 'accept', 'HTML 导出件放行')
+
+  const mhtml = new TextEncoder().encode(
+    'Subject: Exported From Confluence\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary="b"\r\n\r\n--b\r\n',
+  )
+  assertEqual(sniffLegacyDocHead(mhtml), 'mhtml', 'MIME 头 → mhtml')
+  assertEqual(screenLegacyDocContent('a.doc', mhtml).kind, 'accept', 'MHTML 导出件放行')
+
+  const ole2 = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0])
+  assertEqual(sniffLegacyDocHead(ole2), 'ole2', 'OLE2 魔数 → ole2')
+  const ole2Result = screenLegacyDocContent('复盘-0908.doc', ole2)
+  assertEqual(ole2Result.kind, 'reject', '真 OLE2 必须拦下')
+  assertEqual(ole2Result.code, 'LEGACY_DOC', 'code 必须是独立的一类（不能并进 UNSUPPORTED）')
+  assertIncludes(ole2Result.hint ?? '', LEGACY_DOC_HINT, 'hint 必须是 shared 那句"请另存为 .docx 后重传"')
+  assertIncludes(ole2Result.message, '复盘-0908.doc', '文案要指出是哪个文件')
+
+  const rtf = new TextEncoder().encode('{\\rtf1\\ansi 旧版}')
+  assertEqual(sniffLegacyDocHead(rtf), 'rtf', 'RTF → rtf')
+  assertEqual(screenLegacyDocContent('a.doc', rtf).kind, 'reject', 'RTF 必须拦下')
+  assertEqual(sniffLegacyDocHead(new Uint8Array([1, 2, 3, 4, 5])), 'other', '随机字节 → other')
 })
 
 await it('A4 缺扩展名 / 不在白名单：两条不同的文案（不要合成一句）', () => {
@@ -448,6 +473,27 @@ await it('E6 改库：只有分块参数变了才带上它们', () => {
   )
 })
 
+await it('E6b 图片描述模型（P1-11）三态：不带 = 不动 / 空串 = 清空 / 选新值 = 设值', () => {
+  // 原本没有 → 用户也没选 ⇒ 不动（不发 captionModelId）
+  assertEqual(buildKnowledgeUpdateBody(makeKb(), editValuesOf(makeKb())), null, '都没动 ⇒ null')
+  // 原本有 → 用户清空 ⇒ 提交 `captionModelId: null`
+  const withCaption = makeKb({ captionModelId: 'cap-1', captionModelName: '读图模型' })
+  assertDeepEqual(
+    buildKnowledgeUpdateBody(withCaption, { ...editValuesOf(withCaption), captionModelId: '' }),
+    { captionModelId: null },
+    '清空要提交 null',
+  )
+  // 原本有 → 换一个 ⇒ 提交新值
+  assertDeepEqual(
+    buildKnowledgeUpdateBody(withCaption, { ...editValuesOf(withCaption), captionModelId: 'cap-2' }),
+    { captionModelId: 'cap-2' },
+    '换模型只带 captionModelId',
+  )
+  // 建库：留空 ⇒ 不带该键
+  assertExcludes(canonical(buildCreateBody({ ...EMPTY_KNOWLEDGE_FORM_VALUES, name: 'x', embeddingModelId: 'm' })), 'captionModelId')
+  assertIncludes(canonical(buildCreateBody({ ...EMPTY_KNOWLEDGE_FORM_VALUES, name: 'x', embeddingModelId: 'm', captionModelId: 'cap-1' })), 'captionModelId')
+})
+
 await it('E7 检索配置：逐键比较，没改就不发', () => {
   const kb = makeKb()
   assertEqual(buildRetrievalPatch(kb, retrievalValuesOf(kb)), null, '全都没改 ⇒ null')
@@ -569,13 +615,17 @@ await it('G4 本页统计：三态各计各的，总数等于条目数', () => {
   )
 })
 
-await it('G5 删除弹窗已去掉逐字输入确认（需求优化），但保留"被绑定时禁用删除"的 409 守卫', () => {
+await it('G5 删除弹窗不再逐字确认、也不因"被智能体绑定"而禁用删除（改为提示 + 自动解绑）', () => {
   const modal = stripComments(
     readFileSync(fileURLToPath(new URL('../src/pages/knowledge/DeleteKnowledgeBaseModal.tsx', import.meta.url)), 'utf8'),
   )
   assertExcludes(modal, 'isKnowledgeDeleteConfirmed', '不再逐字确认')
   assertExcludes(modal, 'app/confirm.js', '不再 import 已删除的 confirm 模块')
-  assertIncludes(modal, 'disabled: bound', '被智能体绑定时仍禁用删除（409 出路）')
+  // 2026-10-08：被引用不再 409 —— 后端删库时自动解绑，前端只提示、不禁用按钮
+  assertExcludes(modal, 'disabled: bound', '不再因被绑定而禁用删除按钮')
+  assertExcludes(modal, '409', '不再宣称"后端会拒绝（409）"')
+  assertIncludes(modal, 'unboundAgents', '成功提示带上"解绑了几个智能体"')
+  assertIncludes(modal, '会自动解除这些智能体的绑定', '被引用时给出"自动解绑"的说明')
 })
 
 await it('G6 覆盖重建"内容未变化"的提示只有一处写法（shared 常量）', () => {
@@ -720,13 +770,13 @@ console.log(`        ${c.d}浏览器端测（` + '`README`' + ` 的知识库清�
 console.log(`  ${c.g}②${c.x} 扫描件显示 FAILED + 原因 ............... B1/B3（红 + errorMsg）+ C3（失败行的四个操作）`)
 console.log(`  ${c.g}③${c.x} 检索测试能看到双路得分 + 融合排名 ...... F1~F4（` + '`null` 与 `0` 分开、两套小数位、来源列' + `）`)
 console.log(`     ${c.y}⚠️${c.x} 分数本身对不对要问后端 ⇒ ` + '`pnpm verify:retrieval`' + `${c.x}`)
-console.log(`  ${c.g}④${c.x} 选 .doc 立即提示且不发请求 ............. A1（accept 故意含 .doc）+ A3（专门一类 + 可操作提示）`)
+console.log(`  ${c.g}④${c.x} 选真 .doc 立即提示且不发请求 ........... A1（accept 故意含 .doc）+ A3（读文件头判内容：HTML/MHTML 放行、OLE2/RTF 拦下 + 可操作提示）`)
 console.log(`     ${c.g}+${c.x} "不发请求"由 H4 守着（` + '`beforeUpload` 里 `return false`' + `，判据是纯函数）`)
 console.log(`  ${c.g}坑${c.x} 状态轮询（refetchInterval + 终止条件）... D1/D2 + H3（判据只有一处来源）`)
 
 console.log(`\n${c.d}── 本档验不到的（别当全批验收）──`)
 console.log(`  · React 渲染与交互（表格 / 弹窗 / 抽屉长什么样，"点得动"）⇒ 浏览器端测（` + '`README`' + `）`)
-console.log(`  · 真后端：上传的 400/413 文案、reupload 的 unchanged、检索的分数与名次、删除的 409` + `⇒ `)
+  console.log(`  · 真后端：上传的 400/413 文案、reupload 的 unchanged、检索的分数与名次、删除的自动解绑` + `⇒ `)
 console.log(`    ` + '`pnpm verify:documents`' + ` / ` + '`verify:knowledge-bases`' + ` / ` + '`verify:retrieval`' + `${c.d}`)
 console.log(`  · 打包产物：本档跑的是**源码**（` + '`node --import tsx`' + `），不经 vite${c.x}`)
 

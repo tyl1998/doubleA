@@ -287,6 +287,17 @@ const optionalBoolVar = (label: string) =>
       .optional(),
   )
 
+/** 布尔变量（1/0/true/false/yes/no）；未设置/空串 → 默认值 */
+const boolVar = (label: string, fallback: boolean) =>
+  defaultedVar(
+    z
+      .enum(['1', '0', 'true', 'false', 'yes', 'no'], {
+        errorMap: () => ({ message: `${label} 只能是 1/0/true/false/yes/no` }),
+      })
+      .transform((value) => value === '1' || value === 'true' || value === 'yes'),
+    fallback ? 'true' : 'false',
+  )
+
 /**
  * 字节数：接受 `100MB` / `512KB` / `104857600` 三种写法。
  * 依据：`02` §十一 `UPLOAD_BODY_LIMIT`（默认 100MB）。
@@ -428,7 +439,7 @@ const envSchema = z
     UPLOAD_BODY_LIMIT: byteSizeVar('UPLOAD_BODY_LIMIT', '100MB'),
     SSE_PING_INTERVAL_SEC: intVar('SSE_PING_INTERVAL_SEC', 20),
     CONTEXT_ROUNDS: intVar('CONTEXT_ROUNDS', 20),
-    TOOL_LOOP_LIMIT: intVar('TOOL_LOOP_LIMIT', 10),
+    TOOL_LOOP_LIMIT: intVar('TOOL_LOOP_LIMIT', 30),
     /**
      * ⚠️ **P0 不生效但保留登记**（`子方案④` §三 2 / §二）：下载形态由签名 URL 改为**后端流式代理**
      * （决定性理由是 HTML/SVG 的 CSP 隔离头只有我方响应头加得上）⇒ "签名 URL 时效"无处可用。
@@ -624,10 +635,15 @@ const envSchema = z
     /** 单篇文档最多处理的图片数（防止"一本图册"把 OCR / 向量化拖成分钟级）。 */
     IMAGE_MAX_COUNT: intVar('IMAGE_MAX_COUNT', 50, { min: 1, max: 1000 }),
     /**
-     * 本地 OCR 的语言（`chi_sim+eng` 这类 `+` 分隔串，也接受逗号）。
-     * 中英混排是内部文档的常态，故默认两种语言都上。
+     * 本地 OCR 的语言（`chi_sim` 这类 `+`/`,` 分隔串）。
+     *
+     * ⚠️ **默认单语言 `chi_sim`，不要随意与 `eng` 混用**（P1-10 实测）：tesseract.js v7
+     * 的多语言会互相劣化 —— 中文文档一旦带上 `eng`，前几个字会被英文模型抢成 latin 乱码
+     * （`报销` → `报色`、`500` → `S00`）；旧默认 `chi_sim+eng` 只是因 `eng` 加载失败"
+     * 侥幸退化成纯 chi_sim"，环境一变（eng 加载成功）即崩。`chi_sim` 对常见英文与数字仍可识别。
+     * 确需纯英文场景时，把它设为 `eng`。
      */
-    OCR_LANGS: defaultedVar(z.string().trim().min(1), 'chi_sim+eng'),
+    OCR_LANGS: defaultedVar(z.string().trim().min(1), 'chi_sim'),
     /**
      * OCR 语言包目录（离线环境指向本地的 `*.traineddata`）。
      * 不设置时用 tesseract.js 默认（从 CDN 拉取并缓存）——**内网部署必须设置**。
@@ -635,6 +651,33 @@ const envSchema = z
     OCR_LANG_PATH: optionalText,
     /** OCR 缓存目录（tesseract.js 的 `cachePath`；不设置时由其默认处理）。 */
     OCR_CACHE_PATH: optionalText,
+    /**
+     * tesseract `tessedit_pageseg_mode`（页面分割模式）。默认 6（`SINGLE_BLOCK`，整页单栏）；
+     * 稀疏文本（截图/零散文字）可设 11（`SPARSE_TEXT`）——不同文档形态最优值不同，故可配。
+     */
+    OCR_PSM: intVar('OCR_PSM', 6, { min: 0, max: 13 }),
+    /**
+     * 交给 tesseract 的目标 DPI（映射到 `user_defined_dpi`）。缺省 DPI 会让 tesseract
+     * 按 96 缩放导致小字崩，故显式给一个"文档级"DPI（默认 300）。
+     */
+    OCR_TARGET_DPI: intVar('OCR_TARGET_DPI', 300, { min: 70, max: 1200 }),
+    /**
+     * 图像预处理总开关（P1-10，纯 JS）：灰度化 → 对比度拉伸 → Otsu 二值化 → 小图放大 → 轻量去噪。
+     * 针对扫描件/照片（低分辨率、光照不均、噪声）收益最大；关掉可对照/回退。
+     */
+    OCR_PREPROCESS: boolVar('OCR_PREPROCESS', true),
+    /**
+     * 低清图判据（P1-11）：短边（min(width,height)）**小于**它的图片判为 `unreliable`，
+     * **不交给 VLM**（只保留图注 / OCR 文本）—— 实测导出件里的低清缩略图（如 `293×250`）
+     * 会让 VLM 一本正经地幻觉，**宁缺毋滥**。默认 256（覆盖实测样例），可按图源定标调整。
+     */
+    IMAGE_CAPTION_MIN_PX: intVar('IMAGE_CAPTION_MIN_PX', 256, { min: 32, max: 4096 }),
+    /**
+     * 低清图判据（图片**文字识别**·本地 OCR）：短边（min(width,height)）**小于**它的图片
+     * 不跑 OCR（标记 `unreliable`）。与 `IMAGE_CAPTION_MIN_PX`（VLM）**独立** —— 两种识别的
+     * 容错不同（OCR 还能靠预处理放大抢救一点，VLM 会幻觉），故各自可调。默认 256。
+     */
+    IMAGE_OCR_MIN_PX: intVar('IMAGE_OCR_MIN_PX', 256, { min: 32, max: 4096 }),
   })
   .superRefine((env, ctx) => {
     if (env.CHUNK_OVERLAP_DEFAULT >= env.CHUNK_SIZE_DEFAULT) {
@@ -826,6 +869,25 @@ export interface AppConfig {
     langPath: string | null
     /** 缓存目录；`null` = 由其默认处理 */
     cachePath: string | null
+    /** tesseract `tessedit_pageseg_mode`（见 `OCR_PSM`） */
+    psm: number
+    /** 交给 tesseract 的目标 DPI（`user_defined_dpi`，见 `OCR_TARGET_DPI`） */
+    targetDpi: number
+    /** 图像预处理总开关（见 `OCR_PREPROCESS`） */
+    preprocess: boolean
+    /** 低清图判据（短边像素）；低于它**不跑 OCR**、标记 `unreliable`（见 `IMAGE_OCR_MIN_PX`） */
+    minShortSidePx: number
+  }
+
+  /**
+   * 图片"含义"理解（P1-11，轨道二 · VLM 描述）。
+   *
+   * ⚠️ **模型选择在知识库级**（`knowledge_bases.caption_model_id`，建/改库时从模型池选），
+   * 不是环境变量 —— 这里只剩一个流水线级阈值。见 `子方案/图片OCR与图片理解.md` §十 待决 2（已定案）。
+   */
+  imageCaption: {
+    /** 低清图判据（短边像素）；低于它不交给 VLM（见 `IMAGE_CAPTION_MIN_PX`） */
+    minShortSidePx: number
   }
 
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
@@ -1051,6 +1113,13 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         .filter((lang) => lang !== ''),
       langPath: vars.OCR_LANG_PATH ?? null,
       cachePath: vars.OCR_CACHE_PATH ?? null,
+      psm: vars.OCR_PSM,
+      targetDpi: vars.OCR_TARGET_DPI,
+      preprocess: vars.OCR_PREPROCESS,
+      minShortSidePx: vars.IMAGE_OCR_MIN_PX,
+    },
+    imageCaption: {
+      minShortSidePx: vars.IMAGE_CAPTION_MIN_PX,
     },
 
     warnings,
@@ -1126,6 +1195,8 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       healthProbeTimeoutMs: value.limits.healthProbeTimeoutMs,
     },
     pipeline: value.pipeline,
+    ocr: value.ocr,
+    imageCaption: value.imageCaption,
     warnings: value.warnings,
   }
 }

@@ -23,6 +23,7 @@
  */
 
 import { Button } from 'antd'
+import { useEffect, useRef } from 'react'
 import type { ChangeEvent, KeyboardEvent } from 'react'
 
 import { CHAT_ATTACHMENT_MAX_COUNT } from '@doubulea/shared'
@@ -125,6 +126,23 @@ export function ChatInput({
 }: ChatInputProps) {
   const view = composeState({ round, sending, stopping, elsewhere, draft })
 
+  /**
+   * 输入框高度**跟着正文走**（`app.css` 里 `.composer textarea` 的 `min-height`/`max-height`）。
+   *
+   * ⚠️ 原生 `<textarea>` **不会**因为内容变多而自己长高：`rows={1}` 把它钉在一行，超出部分
+   * 只能在框内滚 —— 用户看到的就是"写多了后面的字被挡住"。`max-height`（180px）是**上限**
+   * 而不是替代品：超过它才该内滚。所以这里每帧把 `height` 先归零再读 `scrollHeight`（不归零
+   * 读到的是当前被撑开的高度，缩不回短内容；清空草稿时也靠这一步回到一行）。
+   * `max-height` 仍由 CSS 兜底 ⇒ 这里不必再判上限。
+   */
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const textarea = textareaRef.current
+    if (textarea === null) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${textarea.scrollHeight}px`
+  }, [draft])
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     // 判据在 `composerState.ts#isSubmitKey`（含中文输入法候选词的 `isComposing` 那一条 ——
     // 少了它，拼音打到一半按 Enter 就会把半截拼音发出去）
@@ -225,6 +243,7 @@ export function ChatInput({
 
           <textarea
             rows={1}
+            ref={textareaRef}
             value={draft}
             disabled={!view.canType}
             placeholder={view.placeholder}
@@ -268,8 +287,10 @@ export function ChatInput({
           <span>
             <kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行
           </span>
-          {/* 提示文案与按钮同源（`composerState.ts` 的 TEXT）：不会出现"按钮说停止、提示说发送" */}
-          <span data-testid="composer-hint">{view.hint}</span>
+          {/* 提示文案与按钮同源（`composerState.ts` 的 TEXT）：不会出现"按钮说停止、提示说发送"。
+              ⚠️ `idle` 的文案（"Enter 发送 · Shift+Enter 换行"）与左边那行键盘约定**逐字相同**
+              ⇒ 这一档不渲染它（否则同一句话连出两遍）；只有进入别的状态才用得着。 */}
+          {view.state === 'idle' ? null : <span data-testid="composer-hint">{view.hint}</span>}
           {/* 状态名（端测/截图时的可读锚点）。⚠️ 用 `data-composer-led` 而不是复用 `.led--run`
               那套类：那几个类只设 `background`，加在一段**文字**上会把文字底色涂成色块 */}
           <span

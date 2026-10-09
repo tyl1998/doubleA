@@ -63,12 +63,16 @@
 
 import { AppError, type UpstreamProtocol } from '@doubulea/shared'
 
+import { randomUUID } from 'node:crypto'
+
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import {
   absorbToolCalls,
   createToolCallBuffer,
   mergeUsage,
+  parseTextToolCalls,
+  parseToolArguments,
   protocolOf,
   readToolCalls,
   type ChatMessage,
@@ -338,7 +342,7 @@ export async function chat(
     // 上层（`chatBot`）靠 `!== 'stop'` 判"可能被截断"，三协议必须是同一套词表
     rawFinishReason: parsed.finishReason,
     usage: parsed.usage,
-    toolCalls: readToolCalls(buffer).calls,
+    toolCalls: recoverToolCallsFromText(target, readToolCalls(buffer).calls, parsed.text),
     durationMs: Date.now() - startedAt,
   }
 }
@@ -614,10 +618,40 @@ export async function chatStream(
     usage: state.usage,
     deltaCount: state.deltaCount,
     malformedFrames: state.malformedFrames,
-    toolCalls: toolCalls.calls,
+    toolCalls: recoverToolCallsFromText(target, toolCalls.calls, state.text),
     incompleteToolCalls: toolCalls.incomplete,
     durationMs: Date.now() - startedAt,
   }
+}
+
+/**
+ * 归一"原生 `tool_calls`"与"**正文里的** mimo 原生 XML 调用"（2026-10-08 实测缺陷）。
+ *
+ * 背景见 `protocol.parseTextToolCalls`：mimo 流式下发工具调用时，参数的一部分会从 `content`
+ * 通道以 XML 形式吐出，导致原生 `arguments` 被截断成非法 JSON。这里做恢复：
+ *   · 正文里没有该格式（标准三家）⇒ 原样返回原生调用，**零影响**；
+ *   · 正文里有、且原生调用**缺失或存在非法参数**（按出现顺序尽量复用原生 `id`）⇒ 用**正文**重建；
+ *   · 正文里有、但原生调用**齐全且都合法**（罕见：模型只是把格式写进了回答）⇒ 仍尊重原生。
+ * ⚠️ 恢复出来的调用带上（或合成）`id`：工具结果要按 `id` 回配对，缺 id 会被网关 400。
+ */
+function recoverToolCallsFromText(
+  target: LlmTarget,
+  native: ChatToolCall[],
+  text: string,
+): ChatToolCall[] {
+  const recovered = parseTextToolCalls(text)
+  if (recovered.length === 0) return native
+  const nativeBroken = native.length === 0 || native.some((call) => !parseToolArguments(call.arguments).ok)
+  if (!nativeBroken && native.length === recovered.length) return native
+  getLogger().warn(
+    { ...describeTarget(target), native: native.length, recovered: recovered.length },
+    '上游把工具调用回吐进了正文（mimo 原生 XML）—— 按正文重建调用，丢弃截断的原生 arguments',
+  )
+  return recovered.map((call, index) => ({
+    id: native[index]?.id ?? `call_text_${randomUUID()}`,
+    name: call.name,
+    arguments: call.arguments,
+  }))
 }
 
 /** {@link readToolCalls} 里"缺 id/name 的段"的统一告警口（两处调用点共用同一句文案） */

@@ -35,7 +35,7 @@ import {
   useRebuildKnowledgeBase,
   useUpdateKnowledgeBase,
 } from '../../api/knowledgeBases.js'
-import { useAvailableEmbeddingModels } from '../../api/models.js'
+import { useAvailableChatModels, useAvailableEmbeddingModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   buildCreateBody,
@@ -66,6 +66,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [embeddingModelId, setEmbeddingModelId] = useState('')
+  const [captionModelId, setCaptionModelId] = useState('')
   const [chunkSize, setChunkSize] = useState<number | null>(null)
   const [chunkOverlap, setChunkOverlap] = useState<number | null>(null)
   const [errorText, setErrorText] = useState<string | null>(null)
@@ -83,6 +84,19 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
     [embeddingModels.data],
   )
 
+  // 图片描述模型（P1-11，可选）：从对话模型里**只留支持视觉**的（后端也会再校验一次）
+  const chatModels = useAvailableChatModels()
+  const captionOptions = useMemo(
+    () =>
+      (chatModels.data?.items ?? [])
+        .filter((model) => model.supportsVision)
+        .map((model) => ({
+          value: model.id,
+          label: `${model.label}（${model.providerName} / ${model.modelName}）`,
+        })),
+    [chatModels.data],
+  )
+
   // 每次打开都按目标对象重置 —— 否则编辑 A 之后打开"创建"，表单里还留着 A 的内容
   useEffect(() => {
     if (!open) return
@@ -90,6 +104,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       setName('')
       setDescription('')
       setEmbeddingModelId('')
+      setCaptionModelId('')
       setChunkSize(null)
       setChunkOverlap(null)
     } else {
@@ -97,6 +112,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       setName(values.name)
       setDescription(values.description)
       setEmbeddingModelId(values.embeddingModelId)
+      setCaptionModelId(values.captionModelId)
       setChunkSize(values.chunkSize)
       setChunkOverlap(values.chunkOverlap)
     }
@@ -110,11 +126,38 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
     chunkSize !== null && chunkOverlap !== null ? validateChunking(chunkSize, chunkOverlap) : null
   const canSubmit = name.trim() !== '' && (editing || embeddingModelId !== '') && (editing || chunkingError === null) && !submitting
 
+  /**
+   * 该库此刻是否处于"需重建"状态（P1-5，重建的**唯一触发点**在这里）：
+   * · 本次在表单里换了模型（`isEmbeddingModelChanged`）；或
+   * · 模型池里那一行被改名/停用（`kb.embeddingModelChanged === true`，快照与当前模型不一致）。
+   *
+   * 后一种情形没有"换个模型再换回来"之外的入口 —— 所以**保存动作**也承担触发重建：只要该库需重建，
+   * 点「保存」就会重建（没有独立按钮，见 `KnowledgeDetailPage`）。
+   */
+  const needsRebuild =
+    kb !== null && (isEmbeddingModelChanged(kb, embeddingModelId) || kb.embeddingModelChanged === true)
+
+  /** 触发整库重建；无文档时无事可做，如实说明（后端也会 409） */
+  const triggerRebuild = (documentCount: number): void => {
+    if (documentCount === 0) {
+      feedback.ok('已保存（该库还没有文档，无需重建索引）')
+      return
+    }
+    rebuild.mutate(undefined, {
+      onSuccess: (result) =>
+        result.failed > 0
+          ? feedback.note(`已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请到文档列表逐篇重试`)
+          : feedback.ok(`已开始重建 ${result.enqueued} 篇文档`),
+      // 重建没提交成功也不能说"保存失败"——模型/配置已经存好了，只是重建没排上队
+      onError: (error) => feedback.fail(error, '整库重建未提交成功，请稍后重试'),
+    })
+  }
+
   const submit = (): void => {
     setErrorText(null)
 
     if (kb === null) {
-      const values: KnowledgeCreateFormValues = { name, description, embeddingModelId, chunkSize, chunkOverlap }
+      const values: KnowledgeCreateFormValues = { name, description, embeddingModelId, captionModelId, chunkSize, chunkOverlap }
       if (chunkingError !== null) {
         setErrorText(chunkingError)
         return
@@ -136,14 +179,16 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       name,
       description,
       embeddingModelId,
+      captionModelId,
       chunkSize: chunkSize ?? kb.chunkSize,
       chunkOverlap: chunkOverlap ?? kb.chunkOverlap,
     }
-    const modelChanged = isEmbeddingModelChanged(kb, embeddingModelId)
     const body = buildKnowledgeUpdateBody(kb, values)
     if (body === null) {
-      feedback.note('没有需要保存的改动')
       onClose()
+      // 没有字段要改、但该库仍需重建（模型池改名等）⇒ 保存动作直接触发重建
+      if (needsRebuild) triggerRebuild(kb.documentCount)
+      else feedback.note('没有需要保存的改动')
       return
     }
     update.mutate(
@@ -151,22 +196,9 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       {
         onSuccess: (saved) => {
           onClose()
-          // 换了模型：旧 chunk 不是新模型产的 ⇒ 立刻引导重建，否则该库向量检索实际停用。
-          // 无文档时没啥可重建（`rebuild` 后端也会 409），只提示已保存。
-          if (modelChanged && saved.documentCount > 0) {
-            rebuild.mutate(undefined, {
-              onSuccess: (result) =>
-                result.failed > 0
-                  ? feedback.note(
-                      `已更换向量模型；已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请到文档列表逐篇重试`,
-                    )
-                  : feedback.ok(`已更换向量模型，并开始重建 ${result.enqueued} 篇文档`),
-              // 重建没提交成功也不能说"保存失败"——模型已经换好了，只是需要手动去详情页点重建
-              onError: (error) => feedback.fail(error, '向量模型已更换，但整库重建未提交成功，请到详情页手动重建'),
-            })
-          } else {
-            feedback.ok(`已保存「${saved.name}」`)
-          }
+          // 该库需重建（换了模型 / 模型池改名）⇒ 保存后立刻触发重建，否则向量检索实际停用。
+          if (needsRebuild) triggerRebuild(saved.documentCount)
+          else feedback.ok(`已保存「${saved.name}」`)
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -239,7 +271,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
               </>
             )}
           </p>
-          {editing && kb !== null && isEmbeddingModelChanged(kb, embeddingModelId) && (
+          {editing && needsRebuild && (
             <Alert
               type="warning"
               showIcon
@@ -247,6 +279,25 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
               message={EMBEDDING_MODEL_CHANGE_REBUILD_HINT}
             />
           )}
+        </div>
+
+        <div>
+          <p className="block-label">图片描述模型（可选）</p>
+          <Select
+            value={captionModelId === '' ? undefined : captionModelId}
+            options={captionOptions}
+            loading={chatModels.isPending}
+            allowClear
+            placeholder="不启用（不产出图片描述）"
+            style={{ width: '100%' }}
+            aria-label="图片描述模型"
+            onChange={(value) => setCaptionModelId(value ?? '')}
+          />
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            传图片文档（选「图片转文字」或「图片向量化」）时，用这个 vision 模型读出图的<strong>含义</strong>
+            （摘要 / 流程图转 Mermaid / 关键标签），补 OCR 只能识别文字的不足。留空则不启用；
+            下拉里只列支持图片的对话模型（模型池里勾选「支持图片」的）。⚠️ 低清图不会交给模型（防止乱编）。
+          </p>
         </div>
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>

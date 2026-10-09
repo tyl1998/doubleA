@@ -565,6 +565,31 @@ export function buildModelUpdateBody(model: ModelItem, values: ModelFormValues):
 }
 
 /**
+ * 本次编辑是否会让**引用该模型的知识库**已有向量作废（P1-5 补）。
+ *
+ * 命中即"这些库需要重建索引"：改**型号**（换了上游模型）、改**维度**、改**多模态**、
+ * 或把启用中的模型**停用**。只改别名 / 上下文等则不影响。
+ * 判据与 `buildModelUpdateBody` 同源（都看"与已存值是否不同"），仅对 `EMBEDDING` 类型有意义。
+ */
+export function modelEditAffectsVectors(model: ModelItem, values: ModelFormValues): boolean {
+  if (model.type !== 'EMBEDDING') return false
+  return (
+    values.modelName.trim() !== model.modelName ||
+    (values.embeddingDim !== null && values.embeddingDim !== model.embeddingDim) ||
+    values.embeddingMultimodal !== model.embeddingMultimodal ||
+    (model.enabled && !values.enabled)
+  )
+}
+
+/** 从知识库列表里挑出**绑定到该模型**的库（`embedding_model_id === modelId`）—— 弹窗据此列出库名 */
+export function knowledgeBasesUsingModel<T extends { embeddingModelId: string | null }>(
+  modelId: string,
+  knowledgeBases: readonly T[],
+): T[] {
+  return knowledgeBases.filter((kb) => kb.embeddingModelId === modelId)
+}
+
+/**
  * 该模型的 `type` 能不能改（`02` §4.3 第三条守卫：被 Agent 引用时 409）。
  *
  * CHAT / EMBEDDING 不可互换，改了等于让已上线的智能体静默换一类模型（下一次发消息才暴露）。

@@ -17,7 +17,14 @@
 | `PLATFORM` | 本平台的危险工具判定 | 工具的 MCP `annotations` 没有声明 `readOnlyHint:true`（或声明了 `destructiveHint:true`）⇒ 保守判为"危险" ⇒ 执行前问一句。**注意**：很多 MCP server 根本不写 annotations，于是它们的工具（含只读查询）也会走这条确认。 |
 | `SERVER` | 上游 MCP server 反向发起（`elicitation/create`） | 工具在执行途中主动要求用户确认/补充输入（例如"删除前二次确认"）。 |
 
-> ⚠️ 目前**没有**任何"免确认名单 / auto-approve"。想让危险工具执行，客户端**必须**实现本协议。只读工具（正确声明 `readOnlyHint:true`）不会触发 confirm，可直接执行。
+> ⚠️ 目前**没有**逐 `server+tool` 的"免确认名单"。想让危险工具执行，客户端**必须**实现本协议
+> （或让用户在该会话里打开下面的**会话级自动审批**开关）。只读工具（正确声明 `readOnlyHint:true`）
+> 不会触发 confirm，可直接执行。
+>
+> ⚠️ **会话级自动审批（2026-10-08 新增）**：平台支持一个**会话级**开关，打开后该会话内
+> **所有**危险工具（含 `SERVER` 来源的 elicitation）都不再弹卡、由服务端直接放行
+> —— 面向"一个场景里连续调很多次 MCP、不想逐次确认"的用法。它是**运行时、会话级**的
+> （存 Redis、不落库、有 12h 兜底 TTL），**不是**按工具的白名单。端点见 §3.5。
 
 ---
 
@@ -95,11 +102,13 @@ GET /api/conversations/:id/active
   "currentTool": null,
   "startedAt": "2026-…Z",
   "pendingConfirmId": "…或 null",
-  "queuedPosition": null
+  "queuedPosition": null,
+  "autoApprove": false
 }
 ```
 
 - 断线重连后：先查这个。`pendingConfirmId !== null` 表示"有一个确认在等你"，用它作为 `confirmId` 去回 `/confirm` 即可（`confirm` 事件本身可能在断线时错过了）。
+- `autoApprove` = 本会话的自动审批开关当前值（见 §3.5）。
 
 ### 3.4 停止本轮
 
@@ -109,6 +118,26 @@ POST /api/conversations/:id/stop   →   { "id":"…", "signaled": true|false }
 
 - 仅写停止信号；真正停止由流里的 `done{finishReason:"STOPPED"}` 宣布。
 - 注意：`/confirm` 的 `accepted:false`（取消）**只是跳过这个工具、本轮继续**；要**终止整轮**请用 `/stop`。两者是不同动作。
+
+### 3.5 打开 / 关闭会话级自动审批
+
+```
+POST /api/conversations/:id/auto-approve
+Content-Type: application/json
+
+{ "enabled": true }        // true 开启、false 关闭
+```
+
+响应：
+
+```json
+{ "id": "<会话id>", "autoApprove": true }
+```
+
+- 打开后，本会话内**所有**危险工具（`PLATFORM` 判定）与 `SERVER` elicitation 都**不再发 `confirm` 事件**，由服务端直接按"确认"执行 —— 客户端此时收不到确认卡，走的是正常的 `tool_call{RUNNING→SUCCESS/ERROR}`。
+- **运行时、会话级**：存 Redis（键 `chat.autoapprove:{id}`，12h 兜底 TTL），**不落库**；删除会话或关闭开关即清除。键缺失 / 读取失败一律退回"要确认"（安全默认）。
+- 服务端**每次危险调用都重读**该开关 ⇒ 用户中途打开/关闭可立即生效；但**已经弹出、正在等待应答的那张卡不会因此自动消失**（它已经挂起）。
+- 权限与其它会话端点一致（仅本人；不是我的会话 ⇒ 404）。
 
 ---
 
@@ -237,7 +266,7 @@ for (;;) {
 
 1. **`confirmId` 必须原样回传**，服务端按它匹配"回答的是不是当前这个问题"；对不上就 `applied:false` 静默忽略。
 2. **倒计时读 `expiresAt`**，不要自己数 120 秒——两边有时差会出现"你以为还没到、服务端已按取消处理"。
-3. **只读工具不会有 confirm**——如果你希望某些工具免确认，让对应 MCP server 给它声明 `annotations.readOnlyHint:true`（且非 destructive）。平台侧目前没有 auto-approve 名单。
+3. **只读工具不会有 confirm**——如果你希望某些工具免确认，让对应 MCP server 给它声明 `annotations.readOnlyHint:true`（且非 destructive）；或用 §3.5 的**会话级自动审批**开关一次性放行整个会话（平台侧仍**没有**逐 `server+tool` 的白名单）。
 4. **`SERVER` 来源要求上游连接支持服务端→客户端请求**（有会话 / SSE 升级）。若上游 MCP server 以无会话的"每请求单响应"模式服务，它发不出 `elicitation/create`，该工具会以错误结果返回（见下节）。
 5. **区分取消与停止**：`/confirm{accepted:false}` = 跳过工具、继续；`/stop` = 终止本轮。
 

@@ -36,9 +36,18 @@
  * 时 topK=5 全是标题，模型只看到标题 ⇒ 答不出内容却仍发出引用卡）。
  * 处置：把这种 Section 的标题文本**前插**到下一节，让"父标题"和它的内容待在同一个块里。
  * `headingPath` 本就带父标题（`types.ts` 的 `headingPath` 说明），所以这只影响块文本、不影响 meta。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ④ 表格块（`kind='table'`）是**原子单元**
+ * ─────────────────────────────────────────────────────────────────────
+ * 表格的语义全在行列对应关系里，切在行中间等于把它毁掉。故本策略在每个 Section 内先把
+ * 连续的普通块合成"文本单元"、每个表块各自成"表单元"：文本单元照旧按句末回退切、相邻片可
+ * 重叠；表单元整块保留，超过 `chunk_size` 时按行切并**重复表头**（`parse/table.ts` 的
+ * `splitTableText`），且**不与相邻文本块重叠** —— 避免把无关文字缝进表格。
  */
 
-import type { ParseResult, ParsedBlock } from '../parse/types.js'
+import type { ParseResult, ParsedBlock, ParsedBlockKind } from '../parse/types.js'
+import { splitTableText } from '../parse/table.js'
 import {
   blockSpans,
   isSentenceBoundary,
@@ -50,19 +59,29 @@ import {
   type ChunkStrategy,
 } from './strategy.js'
 
+/** Section 内的一个块：`start` 是**全局码点**偏移（`parsed.text` 坐标系） */
+interface SectionBlock {
+  start: number
+  text: string
+  kind: ParsedBlockKind
+}
+
 /** 标题相同的**连续**段落构成一个 Section（见文件头 ①） */
 interface Section {
-  /** 在 `parsed.text` 的**码点**坐标系里的起点（块 meta 的反查要用它，见 `strategy.ts` 不变式 ③） */
+  /** 首块在 `parsed.text` 的**码点**坐标系里的起点（块 meta 的反查要用它，见 `strategy.ts` 不变式 ③） */
   start: number
   text: string
   /** 是否含**正文段**（不只是标题）—— 只含标题的 Section 会被前插合并（见文件头 ③） */
   hasBody: boolean
+  /** 本节按顺序的块（含表块）；分段时据它把表当原子单元（见文件头 ④） */
+  blocks: SectionBlock[]
 }
 
-/** Section 内的一段候选块：`start` 是 **Section 内**偏移，`text` 是该段文本 */
+/** 一段候选块：`start` 是**全局码点**偏移（`parsed.text` 坐标系） */
 interface Segment {
   start: number
   text: string
+  kind: ParsedBlockKind
 }
 
 export const hybridStrategy: ChunkStrategy = {
@@ -91,19 +110,21 @@ export const hybridStrategy: ChunkStrategy = {
       for (let index = 0; index < segments.length; index += 1) {
         const segment = segments[index]
         if (segment === undefined) continue
-        // 重叠只发生在**同一个 Section 内**：跨 Section 的重叠会把两段不相干的内容缝在一起
-        // （一个 Section 的结尾 + 另一个 Section 的开头），检索命中后读起来是语义断裂的。
+        const previous = segments[index - 1]
+        // 重叠只发生在**相邻的两个文本片**之间：表格片不与任何东西重叠（避免把无关文字缝进表格），
+        // 也不跨 Section（跨 Section 的重叠会把两段不相干内容缝在一起，命中后语义断裂）。
         const prefix =
-          index === 0 ? '' : tailByCodePoint(segments[index - 1]?.text ?? '', options.chunkOverlap)
+          previous === undefined || previous.kind === 'table' || segment.kind === 'table'
+            ? ''
+            : tailByCodePoint(previous.text, options.chunkOverlap)
         // 块起点偏移（不含重叠前缀）：既是 meta 反查的依据，也用于把图片块插回原位
-        const contentStart = section.start + segment.start
         chunks.push({
           seq: chunks.length,
           content: prefix + segment.text,
-          // ⚠️ 反查用的是 **Section 起点 + 段内偏移**（不含重叠前缀）：
-          //    重叠前缀来自上一块，用它定位会把这一块的页码说成上一块所在的页。
-          meta: metaOf(locateBlock(spans, contentStart)),
-          offset: contentStart,
+          // ⚠️ 反查用的是**段起点**（不含重叠前缀）：重叠前缀来自上一块，
+          //    用它定位会把这一块的页码说成上一块所在的页。
+          meta: metaOf(locateBlock(spans, segment.start)),
+          offset: segment.start,
         })
       }
     }
@@ -113,21 +134,25 @@ export const hybridStrategy: ChunkStrategy = {
 
 /** 按"连续同名标题"切成 Section（见文件头 ①），并算出各自在 `parsed.text` 里的起点 */
 function splitIntoSections(blocks: readonly ParsedBlock[]): Section[] {
-  const drafts: Array<{ key: string; start: number; parts: string[]; hasBody: boolean }> = []
+  const drafts: Array<{
+    key: string
+    start: number
+    parts: string[]
+    hasBody: boolean
+    blocks: SectionBlock[]
+  }> = []
   let cursor = 0
 
   for (const block of blocks) {
     const key = JSON.stringify(block.headingPath)
-    const last = drafts[drafts.length - 1]
-    if (last === undefined || last.key !== key) {
-      drafts.push({ key, start: cursor, parts: [], hasBody: false })
+    let target = drafts[drafts.length - 1]
+    if (target === undefined || target.key !== key) {
+      target = { key, start: cursor, parts: [], hasBody: false, blocks: [] }
+      drafts.push(target)
     }
-    const target = drafts[drafts.length - 1]
-    // `target` 一定存在（上面刚 push 过或本来就非空）
-    if (target !== undefined) {
-      target.parts.push(block.text)
-      if (!isHeadingBlock(block)) target.hasBody = true
-    }
+    target.parts.push(block.text)
+    target.blocks.push({ start: cursor, text: block.text, kind: block.kind ?? 'text' })
+    if (!isHeadingBlock(block)) target.hasBody = true
     cursor += [...block.text].length + 2
   }
 
@@ -135,6 +160,7 @@ function splitIntoSections(blocks: readonly ParsedBlock[]): Section[] {
     start: draft.start,
     text: draft.parts.join('\n\n'),
     hasBody: draft.hasBody,
+    blocks: draft.blocks,
   }))
 }
 
@@ -164,21 +190,30 @@ function isHeadingBlock(block: ParsedBlock): boolean {
  */
 function mergeHeadingOnlySections(sections: readonly Section[]): Section[] {
   const merged: Section[] = []
-  /** 待前插的纯标题文本（'' = 没有） */
+  /** 待前插的纯标题文本（'' = 没有）与它们的块 */
   let carryText = ''
   let carryStart = 0
+  let carryBlocks: SectionBlock[] = []
 
-  const withCarry = (text: string): string => (carryText === '' ? text : `${carryText}\n\n${text}`)
-  const carryStartOr = (start: number): number => (carryText === '' ? start : Math.min(carryStart, start))
+  const mergedText = (text: string): string => (carryText === '' ? text : `${carryText}\n\n${text}`)
+  const mergedStart = (start: number): number => (carryText === '' ? start : Math.min(carryStart, start))
+  const mergedBlocks = (blocks: SectionBlock[]): SectionBlock[] => [...carryBlocks, ...blocks]
 
   for (const section of sections) {
     if (!section.hasBody) {
       if (carryText === '') carryStart = section.start
-      carryText = withCarry(section.text)
+      carryText = mergedText(section.text)
+      carryBlocks = [...carryBlocks, ...section.blocks]
       continue
     }
-    merged.push({ start: carryStartOr(section.start), text: withCarry(section.text), hasBody: true })
+    merged.push({
+      start: mergedStart(section.start),
+      text: mergedText(section.text),
+      hasBody: true,
+      blocks: mergedBlocks(section.blocks),
+    })
     carryText = ''
+    carryBlocks = []
   }
 
   if (carryText !== '') {
@@ -188,6 +223,7 @@ function mergeHeadingOnlySections(sections: readonly Section[]): Section[] {
       return sections.map((section) => ({ ...section }))
     }
     last.text = `${last.text}\n\n${carryText}`
+    last.blocks = [...last.blocks, ...carryBlocks]
   }
   return merged
 }
@@ -195,21 +231,72 @@ function mergeHeadingOnlySections(sections: readonly Section[]): Section[] {
 /**
  * 把一个 Section 切成若干候选块（§4-2 第 2、3 步）。
  *
+ * 先按"原子单元"分解（见文件头 ④）：连续的普通块 → 文本单元（按字符切、可重叠）；
+ * 每个表块 → 表单元（整块保留，超长按行切并重复表头）。
+ */
+function segmentSection(section: Section, options: ChunkOptions): Segment[] {
+  const segments: Segment[] = []
+  for (const unit of sectionUnits(section)) {
+    if (unit.kind === 'table') {
+      for (const piece of splitTableText(unit.text, options.chunkSize)) {
+        segments.push({ start: unit.start, text: piece, kind: 'table' })
+      }
+      continue
+    }
+    segments.push(...segmentText(unit, options))
+  }
+  return segments
+}
+
+/** Section 内的原子单元：连续普通块合成文本单元；每个表块各自成表单元 */
+interface Unit {
+  kind: ParsedBlockKind
+  start: number
+  text: string
+}
+
+function sectionUnits(section: Section): Unit[] {
+  const units: Unit[] = []
+  let parts: string[] = []
+  let unitStart = section.start
+  const flush = (): void => {
+    if (parts.length > 0) {
+      units.push({ kind: 'text', start: unitStart, text: parts.join('\n\n') })
+      parts = []
+    }
+  }
+  for (const block of section.blocks) {
+    if (block.kind === 'table') {
+      flush()
+      units.push({ kind: 'table', start: block.start, text: block.text })
+    } else {
+      if (parts.length === 0) unitStart = block.start
+      parts.push(block.text)
+    }
+  }
+  flush()
+  return units
+}
+
+/**
+ * 文本单元按字符切（§4-2 第 2、3 步）。
+ *
  * 循环条件写 `剩余 > chunkSize`（而不是 `>=`）：等于时"正好装满"，再切一刀只会得到一个
  * 空尾块。收尾那一块（剩余 ≤ chunkSize）无条件收下，再按 `chunkMin` 决定要不要并入前块。
  */
-function segmentSection(section: Section, options: ChunkOptions): Segment[] {
-  const chars = [...section.text]
-  if (chars.length <= options.chunkSize) return [{ start: 0, text: section.text }]
+function segmentText(unit: Unit, options: ChunkOptions): Segment[] {
+  const chars = [...unit.text]
+  if (chars.length === 0) return []
+  if (chars.length <= options.chunkSize) return [{ start: unit.start, text: unit.text, kind: 'text' }]
 
   const segments: Segment[] = []
   let start = 0
   while (chars.length - start > options.chunkSize) {
     const cut = cutPoint(chars, start, options)
-    segments.push({ start, text: chars.slice(start, cut).join('') })
+    segments.push({ start: unit.start + start, text: chars.slice(start, cut).join(''), kind: 'text' })
     start = cut
   }
-  segments.push({ start, text: chars.slice(start).join('') })
+  segments.push({ start: unit.start + start, text: chars.slice(start).join(''), kind: 'text' })
 
   // 尾块合并：`< chunk_min` 的碎块并进前块（§4-2 第 2 条后半）。
   // 代价说清楚：合并后前块会**越过 chunk_size**（最多 chunkSize + chunkMin + overlap）

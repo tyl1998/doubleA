@@ -37,12 +37,14 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, type ImageMode } from '@doubulea/shared'
+import { AppError, type ImageRecognition } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getS3Client } from '../infra/s3.js'
+import type { LlmTarget } from '../llm/client.js'
 import type { EmbeddingProvider } from '../llm/embedding/index.js'
+import { descriptionTextOf, describeImageWithTarget, probeImageSize } from './caption.js'
 import { buildImageChunks, DEFAULT_CHUNK_MIN_CHARS, splitIntoChunks, type Chunk } from './chunk/index.js'
 import { CHUNK_WRITE_BATCH, embedChunks, writeChunks } from './index/writer.js'
 import { recognizeImage } from './ocr.js'
@@ -67,8 +69,10 @@ export interface PipelineDocument {
   chunkOverlap: number
   /** 分块策略（`hybrid` | `fixed`；由 `retrieval_config.splitStrategy` 补默认值后得来） */
   splitStrategy: string
-  /** 图片处理方式（`documents.image_mode`；决定解析是否抽图、以及图片如何进链路） */
-  imageMode: ImageMode
+  /** 图片识别方式（`documents.image_recognize`；三选一：不识别 / 本地 OCR / 大模型含义） */
+  imageRecognize: ImageRecognition
+  /** 是否图片向量化（`documents.image_vectorize`；与识别方式正交） */
+  imageVectorize: boolean
 }
 
 /** 一次任务处理的上下文（生命周期 = 一个 job） */
@@ -96,6 +100,13 @@ export interface PipelineContext {
   embeddingDim?: number
   /** 单批文本数（worker 注入；来自 `EMBEDDING_BATCH_SIZE`） */
   embeddingBatchSize?: number
+  /**
+   * 图片描述用的 vision 对话模型目标（P1-11；worker 解析后注入）。
+   *
+   * ⚠️ 由 worker 注入而不是阶段自己查库（与 {@link embeddingProvider} 同款纪律）：阶段层刻意不碰数据库。
+   * **缺省 = 本阶段 no-op**（未勾「图片含义识别」、该库未选描述模型、或配置不可用时 worker 不注入）。
+   */
+  captionTarget?: LlmTarget
   /**
    * 已入库的 chunk 数（`index` 写）。
    *
@@ -179,7 +190,8 @@ export const parseStage: PipelineStage = {
       throw new Error('流水线配置错误：parse 阶段之前必须有一个 load-source 阶段')
     }
     const format = detectFormat({ fileName: ctx.document.fileName, bytes: source })
-    const extractImages = ctx.document.imageMode !== 'NONE'
+    // 只要识别或向量化其一，就要抽图（都不选 = 历史行为：不抽图、内嵌图按原逻辑丢弃）
+    const extractImages = ctx.document.imageRecognize !== 'NONE' || ctx.document.imageVectorize
     const parsed = await parseDocument(format, source, {
       extractImages,
       maxImageBytes: config.pipeline.imageMaxBytes,
@@ -198,7 +210,8 @@ export const parseStage: PipelineStage = {
         format,
         blocks: parsed.blocks.length,
         images: parsed.images.length,
-        imageMode: ctx.document.imageMode,
+        imageRecognize: ctx.document.imageRecognize,
+        imageVectorize: ctx.document.imageVectorize,
         chars: parsed.meta.charCount,
         pageCount: parsed.meta.pageCount,
         encoding: parsed.meta.encoding,
@@ -210,20 +223,92 @@ export const parseStage: PipelineStage = {
 }
 
 /**
- * ③·补 图片 OCR（`子方案` 文档图片解析；仅 `imageMode=OCR` 生效）。
+ * ③·补·前 图片"含义"理解 —— VLM 描述（P1-11，轨道二；仅 `OCR`/`MULTIMODAL` + 配了 caption 模型时生效）。
  *
- * 把抽取出的图片逐张本地 OCR，识别出的文字作为**普通文本块**追加回解析结果，
- * 于是下游（空文本检测、分块、向量化）**一行都不用改** —— OCR 与文本走同一条链路。
- * 处理完清空 `parsed.images`（图片已转成文字，不再需要图片分块）。
+ * 把抽取出的图片逐张交给**一个 vision 对话模型**，产出结构化描述（摘要 / Mermaid / 标签），
+ * 写回 `parsed.images[i].description` / `imageKind`，供下游两处消费：
+ *   · `OCR` 模式：{@link ocrImagesStage} 把描述追加到该图的 OCR 文本块（`[图片含义] …`）；
+ *   · `MULTIMODAL` 模式：{@link buildImageChunks} 把描述并进图片块 `content`（图注 + 描述）。
  *
- * 放在空文本检测**之前**：扫描件 PDF 常"零文本 + 全是图"，OCR 出的文字必须先算进
- * `charCount`，否则会被 §五 误判为"疑似扫描件"直接 FAILED。
+ * ⚠️ **位置在 OCR 之前**：`ocrImagesStage` 处理完会清空 `parsed.images`（图片已转文字），
+ *    之后就没图可描述了；故描述必须先跑，二者互不干扰（描述只写字段、不消费图片）。
+ *
+ * ⚠️ **只在识别方式选了「大模型识别（LLM）」时生效**：否则 / 未注入 `captionTarget`
+ *    （该库没选描述模型、或模型不可用）即整体 no-op。
+ * ⚠️ **全程降级、绝不使文档 FAILED**：单张图的 VLM 调用失败只记 warn、跳过该图（保留图注/OCR）；
+ *    低清图（短边 < `IMAGE_CAPTION_MIN_PX`）标记 `unreliable`、**不交给 VLM**
+ *    （§五·补 实证：低清缩略图会让 VLM 幻觉）。
+ */
+export const describeImagesStage: PipelineStage = {
+  name: 'describe-images',
+  async run(ctx) {
+    const parsed = requireParsed(ctx, 'describe-images')
+    if (ctx.document.imageRecognize !== 'LLM') return
+    const target = ctx.captionTarget
+    if (target === undefined || parsed.images.length === 0) return
+
+    const minPx = config.imageCaption.minShortSidePx
+    let described = 0
+    let unreliable = 0
+    let failed = 0
+    for (const image of parsed.images) {
+      const size = probeImageSize(image.data, image.mime)
+      const shortSide = size === null ? null : Math.min(size.width, size.height)
+      if (shortSide !== null && shortSide < minPx) {
+        // 宁缺毋滥：低清图不产出图结构（幻觉比缺失更坏）
+        image.unreliable = true
+        unreliable += 1
+        continue
+      }
+      try {
+        const description = await describeImageWithTarget(target, image)
+        const text = descriptionTextOf(description)
+        if (text === '') {
+          failed += 1
+          continue
+        }
+        image.description = text
+        image.imageKind = description.kind
+        described += 1
+      } catch (error) {
+        failed += 1
+        ctx.log.warn({ err: error, mime: image.mime }, '图片描述（VLM）失败，已降级为仅图注/OCR 文本')
+      }
+    }
+    ctx.log.debug(
+      { images: parsed.images.length, described, unreliable, failed, minPx },
+      '图片含义理解（VLM 描述）完成',
+    )
+  },
+}
+
+/**
+ * ③·补 图片 → 文本块（`子方案` 文档图片解析）。
+ *
+ * 把抽取出的图片的**文字**（本地 OCR）与**含义**（VLM 描述，见 {@link describeImagesStage}）作为
+ * **普通文本块**追加回解析结果，于是下游（空文本检测、分块、向量化）**一行都不用改** ——
+ * 与正文文本走同一条链路。
+ *
+ * 触发条件（**不是只看 OCR**）：识别方式为 `OCR`，**或**（识别方式为 `LLM` **且未开向量化**）。
+ * 后者是"大模型识别、不向量化"的唯一出口 —— 那种组合下描述没有图片块可挂，必须落成文本块；
+ * 若同时开了向量化，描述由 {@link buildImageChunks} 并进图片块，本阶段只负责 OCR 文字（避免重复）。
+ *
+ * 图片是否保留取决于 `imageVectorize`：勾了向量化就留给下游 `chunkStage` 生成图片块，
+ * 否则图片已转成文字、清空。
+ *
+ * ⚠️ **低清不识别（OCR 侧，`IMAGE_OCR_MIN_PX`）**：识别方式为 `OCR` 时，短边 <
+ * `IMAGE_OCR_MIN_PX` 的图**不跑 OCR**、标 `unreliable`（与 VLM 侧的低清防护正交、阈值独立）。
+ * 该图若同时**未开向量化**，就完全不产出（这是有意的：低清识别只会是噪声）。
+ *
+ * 放在空文本检测**之前**：扫描件 PDF 常"零文本 + 全是图"，这些文字必须先算进 `charCount`，
+ * 否则会被 §五 误判为"疑似扫描件"直接 FAILED。
  */
 export const ocrImagesStage: PipelineStage = {
   name: 'ocr-images',
   async run(ctx) {
     const parsed = requireParsed(ctx, 'ocr-images')
-    if (ctx.document.imageMode !== 'OCR' || parsed.images.length === 0) return
+    const flushDescriptionAsText = ctx.document.imageRecognize === 'LLM' && !ctx.document.imageVectorize
+    if ((ctx.document.imageRecognize !== 'OCR' && !flushDescriptionAsText) || parsed.images.length === 0) return
 
     // 按锚点把图片分回它在正文里的位置：`anchor = n` 表示"插在 `blocks[n]` 之前"。
     // 这样"订单入口"那张图的 OCR 文字就落在"订单入口"这段话后面，而不是全堆到文末。
@@ -241,10 +326,33 @@ export const ocrImagesStage: PipelineStage = {
     }
 
     const ocrBlockOf = async (image: ParsedImage): Promise<ParsedBlock | null> => {
-      const text = await recognizeImage(image.data, (message, msg) => ctx.log.warn(message, msg))
-      if (text === '') return null
+      // 只有识别方式是「本地 OCR」才真的跑 OCR（否则本阶段是为"大模型识别、不向量化"落描述文本的）
+      let text = ''
+      if (ctx.document.imageRecognize === 'OCR') {
+        // 低清防护（OCR 侧，`IMAGE_OCR_MIN_PX`）：短边过小的图**不跑 OCR**（标 `unreliable`）。
+        // 宁缺毋滥 —— 低清图上 tesseract 只会吐出噪声；与 VLM 侧（`describeImagesStage`）正交、
+        // 阈值各自独立。嗅探不出尺寸时照常识别（不因探测失败漏掉内容）。
+        const size = probeImageSize(image.data, image.mime)
+        const shortSide = size === null ? null : Math.min(size.width, size.height)
+        if (shortSide !== null && shortSide < config.ocr.minShortSidePx) {
+          image.unreliable = true
+          return null
+        }
+        text = await recognizeImage(image.data, {
+          mime: image.mime,
+          log: (message, msg) => ctx.log.warn(message, msg),
+        })
+      }
+      // OCR 文字与 VLM 描述互补（文字密集用 OCR、图形/截图用描述），同一块内两段并存。
+      // 描述仅在本阶段负责落文本时（未勾向量化）才并入 —— 勾了向量化时它由图片块承载。
+      const parts: string[] = []
+      if (text !== '') parts.push(`[图片文字] ${text}`)
+      if (flushDescriptionAsText && image.description !== undefined && image.description !== '') {
+        parts.push(`[图片含义] ${image.description}`)
+      }
+      if (parts.length === 0) return null
       return {
-        text: `[图片文字] ${text}`,
+        text: parts.join('\n'),
         headingPath: [...image.headingPath],
         page: image.page,
       }
@@ -265,11 +373,13 @@ export const ocrImagesStage: PipelineStage = {
       if (block !== null) outBlocks.push(block)
     }
 
-    // 用统一的收口函数重建 text/meta（与解析器同一条口径，避免字符计数算法分叉）
+    // 用统一的收口函数重建 text/meta（与解析器同一条口径，避免字符计数算法分叉）。
+    // ⚠️ 图片是否保留取决于「图片向量化」：同时勾了识别 + 向量化时，图片既转成文字块、
+    //    也要留给下游 `chunkStage` 生成图片块；只识别不向量化时图片已无用，清空。
     ctx.parsed = buildParseResult(parsed.meta.format, outBlocks, {
       pageCount: parsed.meta.pageCount,
       encoding: parsed.meta.encoding,
-      images: [],
+      images: ctx.document.imageVectorize ? parsed.images : [],
     })
     ctx.log.debug(
       { images: parsed.images.length, blocks: outBlocks.length },
@@ -333,7 +443,7 @@ export const detectEmptyTextStage: PipelineStage = {
 export function buildEmptyTextMessage(charCount: number, threshold: number): string {
   return (
     `解析结果内容过少（有效字符 ${charCount}，不足 ${threshold} 个），疑似扫描件或空白文档；` +
-    '若文档内容是图片（扫描件/截图），请在上传时选择"解析图片"方式（OCR 或多模态向量化）后重传。'
+    '若文档内容是图片（扫描件/截图），请在上传时选择一种图片处理方式（图片转文字 / 图片向量化）后重传。'
   )
 }
 
@@ -359,10 +469,10 @@ export const chunkStage: PipelineStage = {
       chunkMin: DEFAULT_CHUNK_MIN_CHARS,
     }
     const textChunks = splitIntoChunks(parsed, options, document.splitStrategy)
-    // `MULTIMODAL`：文本块之外再产图片块，并按块起点偏移**归并回原位**。
-    // `OCR` 的图片已在 ocr 阶段变成文本块，`NONE` 没有图片 —— 两者都不会走到这里。
+    // 「图片向量化」：文本块之外再产图片块，并按块起点偏移**归并回原位**。
+    // 只识别（OCR/含义）时图片已变成文本块、不产生图片块；三个选项全关时没有图片。
     const imageChunks =
-      document.imageMode === 'MULTIMODAL' && parsed.images.length > 0
+      document.imageVectorize && parsed.images.length > 0
         ? buildImageChunks(parsed.images, parsed.blocks)
         : []
     // 归并排序：同偏移时保持"文本块在前"（稳定用原始下标兜底）；最后统一重排 `seq`
@@ -473,7 +583,10 @@ export const indexStage: PipelineStage = {
 export const defaultPipelineStages: readonly PipelineStage[] = [
   loadSourceStage,
   parseStage,
-  // 图片 OCR（仅 imageMode=OCR 生效；无图片/其它模式时是 no-op）
+  // 图片"含义"理解（P1-11；仅勾了「图片含义识别」+ 该库配了描述模型 + 有图时生效，否则 no-op）——
+  // ⚠️ 必须在 ocr-images 之前：ocr 阶段可能清空 parsed.images（未勾向量化时）。
+  describeImagesStage,
+  // 图片文字识别（仅勾了「图片文字识别」生效；无图片/未勾时是 no-op）
   ocrImagesStage,
   detectEmptyTextStage,
   chunkStage,

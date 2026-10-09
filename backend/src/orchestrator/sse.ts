@@ -102,9 +102,11 @@ import { randomUUID } from 'node:crypto'
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import {
+  CHAT_AUTO_APPROVE_TTL_SEC,
   CHAT_CONFIRM_TTL_SEC,
   CHAT_STOP_TTL_SEC,
   chatActiveKey,
+  chatAutoApproveKey,
   chatConfirmKey,
   chatStopKey,
   ensureRedisConnected,
@@ -376,6 +378,47 @@ export async function answerConfirm(
     '确认应答已交给等待中的那一轮',
   )
   return { ...result, applied: true }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 会话级自动审批开关（`chat.autoapprove:{id}`）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 读会话的自动审批开关。**永不抛错**：值坏 / Redis 读失败一律按 `false`（关）返回。
+ *
+ * 为什么失败要退回"关"而不是向上抛：本函数的调用点在 {@link SseChannel.awaitConfirm} 里，
+ * 而那里是"这一轮能不能继续跑下去"的必经之路 —— Redis 抖一下就让一次工具调用失败（甚至
+ * 让整轮报错）是不可接受的。代价只是"这次多问用户一句"，而**危险工具的默认口径本来就是"要问"**。
+ */
+export async function readAutoApprove(conversationId: string): Promise<boolean> {
+  try {
+    const redis = await ensureRedisConnected()
+    // 只认 `'1'`：与 `infra/redis.ts#chatAutoApproveKey` 的注释一致（键不存在 = 关）
+    return (await redis.get(chatAutoApproveKey(conversationId))) === '1'
+  } catch (error) {
+    getLogger().warn({ err: error, conversationId }, '读取自动审批开关失败（按关闭处理）')
+    return false
+  }
+}
+
+/**
+ * 写会话的自动审批开关（`POST /api/conversations/:id/auto-approve` 的落点）。
+ *
+ * `enabled=false` 走 `DEL`（而不是写 `'0'`）：**键的存在与否**是唯一判据，写 `'0'` 会让
+ * `redis-cli KEYS chat.autoapprove:*` 里躺着一条"看着像开着、其实是关"的键。
+ *
+ * @throws {AppError} Redis 写失败——**向上抛**：用户点了"打开自动审批"，我们却告诉他"已打开"
+ *   而键其实没写进去，等于把一次会放行破坏性操作的模式开关说成成功（与 `answerConfirm` 同款）。
+ */
+export async function setAutoApprove(conversationId: string, enabled: boolean): Promise<void> {
+  const redis = await ensureRedisConnected()
+  if (enabled) {
+    await redis.set(chatAutoApproveKey(conversationId), '1', 'EX', CHAT_AUTO_APPROVE_TTL_SEC)
+  } else {
+    await redis.del(chatAutoApproveKey(conversationId))
+  }
+  getLogger().info({ conversationId, enabled }, '会话自动审批开关已更新')
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -823,6 +866,29 @@ class SseChannel {
    * 若在这里另起一个续期，就会造出第二条续期路径（迟早与心跳那条打架）。
    */
   async awaitConfirm(question: ConfirmQuestion): Promise<ConfirmDecision> {
+    /**
+     * 会话级自动审批（`chat.autoapprove:{id}`）：开了就直接按"已确认"返回，**不登记
+     * `pendingConfirmId`、不发 `confirm` 帧、不挂起**。于是前端根本看不到确认卡，工具直接执行。
+     *
+     * ⚠️ 它对本函数的两条来源（`PLATFORM` 危险判定 / `SERVER` elicitation）**一视同仁** ——
+     * "本会话不再逐次确认"就是这个开关的语义，不该只放行其中一条。
+     * ⚠️ **中断优先**：信号已中止时不放行，抛 `ChatStoppedError` 交给收尾（否则"点了停止
+     * 却还把破坏性工具跑完"）。判据与 {@link #waitForConfirm} 的 ① 同款。
+     * ⚠️ 读开关**每次调用都读**（而不是开流时快照一次）⇒ 用户中途打开/关闭能立刻生效。
+     */
+    if (await readAutoApprove(this.#conversationId)) {
+      if (this.#controller.signal.aborted) throw abortErrorOf(this.#controller.signal)
+      getLogger().info(
+        {
+          conversationId: this.#conversationId,
+          source: question.source,
+          toolName: question.toolName,
+        },
+        '会话已开启自动审批 ⇒ 跳过确认卡，直接放行',
+      )
+      return 'CONFIRMED'
+    }
+
     await clearConfirmSignal(this.#conversationId)
 
     const confirmId = randomUUID()

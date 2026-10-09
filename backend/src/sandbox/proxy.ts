@@ -62,7 +62,7 @@ import { McpAbortError } from '../mcp/errors.js'
 import { isDangerousTool } from '../mcp/risk.js'
 import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
-import { knowledgeListTool, knowledgeSearchTool, summarizeToolInput } from '../orchestrator/chatContext.js'
+import { knowledgeListTool, knowledgeSearchTool, readDocumentTool, summarizeToolInput } from '../orchestrator/chatContext.js'
 import {
   boundKnowledgeBaseIds,
   executeKnowledgeTool,
@@ -183,7 +183,7 @@ export async function buildSandboxMcpCatalog(
     }
   })
 
-  // ── 平台内置工具（知识库检索 / 目录）—— 绑了库才下发 ──
+  // ── 平台内置工具（知识库检索 / 目录 / 整篇阅读）—— 绑了库才下发 ──
   // 与 ChatBot 同源（`knowledgeTools.ts`）；容器侧注册的商品名下不带 `mcp_` 前缀，
   // 执行时经 `/api/sandbox/builtin/call` 由后端代跑（凭据/库都不进容器）。见 `子方案③` §七。
   if (knowledgeIds.length > 0) catalog.builtins = knowledgeBuiltinTools()
@@ -204,13 +204,13 @@ export async function buildSandboxMcpCatalog(
 }
 
 /**
- * 绑了知识库时下发给容器的**内置工具**（`knowledge_search` / `list_knowledge`）。
+ * 绑了知识库时下发给容器的**内置工具**（`knowledge_search` / `list_knowledge` / `read_document`）。
  *
- * 形状直接取自 ChatBot 那两个工具的**同一份**定义（`chatContext.ts`），只是转成容器清单要的
+ * 形状直接取自 ChatBot 那几个工具的**同一份**定义（`chatContext.ts`），只是转成容器清单要的
  * `{name, description, inputSchema}` —— 两处各写一份就会漂移（`06` §六 第 ⑰ 条）。
  */
 export function knowledgeBuiltinTools(): SandboxBuiltinToolRef[] {
-  return [knowledgeListTool(), knowledgeSearchTool()].map((tool) => ({
+  return [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()].map((tool) => ({
     name: tool.function.name,
     description: tool.function.description ?? '',
     inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
@@ -254,7 +254,7 @@ interface SandboxMcpToolsResponse {
   }[]
   /**
    * 平台内置工具（知识库一族）。**没有就是空数组** —— 容器侧据此注册 `knowledge_search` /
-   * `list_knowledge`，执行时走 {@link BUILTIN_CALL_PATH}（不是 `/mcp/call`）。
+   * `list_knowledge` / `read_document`，执行时走 {@link BUILTIN_CALL_PATH}（不是 `/mcp/call`）。
    */
   builtinTools: { name: string; description: string; inputSchema: unknown }[]
 }
@@ -402,7 +402,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
   })
 
   /**
-   * 平台**内置工具**调用（当前只有知识库：`knowledge_search` / `list_knowledge`）。
+   * 平台**内置工具**调用（当前只有知识库：`knowledge_search` / `list_knowledge` / `read_document`）。
    *
    * 与 `/mcp/call` 分开一条路径的原因：内置工具**没有 MCP server / 凭据 / 危险确认**，
    * 执行体是 `orchestrator/knowledgeTools.ts` 的**同一个函数**（ChatBot 也用它）。

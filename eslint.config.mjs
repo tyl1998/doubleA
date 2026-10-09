@@ -66,7 +66,7 @@ export default tseslint.config(
     // 镜像构建期的生成脚本（`infra/sandbox/**`，如 `gen-models.mjs`）同属这一类：
     // 它们的输出进构建日志给排障用，不是业务日志
     files: [
-      '**/scripts/**/*.{js,mjs}',
+      '**/scripts/**/*.{js,mjs,ts}',
       '**/*.config.{js,mjs,ts}',
       '**/prisma/seed.ts',
       'infra/sandbox/**/*.mjs',

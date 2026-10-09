@@ -32,16 +32,26 @@
  * 表尾把这件事说出来（原型的表尾也写着类似的一句），否则用户会以为"状态怎么自己变了"。
  */
 
-import { Alert, Button, Tag } from 'antd'
-import { REBUILD_SEARCHABLE_HINT, type DocumentItem } from '@doubulea/shared'
+import { Alert, Button, Tag, Tooltip } from 'antd'
+import {
+  KNOWLEDGE_BASE_NEEDS_REBUILD_HINT,
+  REBUILD_SEARCHABLE_HINT,
+  type DocumentItem,
+} from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { ApiError } from '../../api/client.js'
-import { DOCUMENTS_PAGE_LIMIT_MAX, useDocuments, useKnowledgeBase } from '../../api/knowledgeBases.js'
-import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import {
+  DOCUMENTS_PAGE_LIMIT_MAX,
+  useDocuments,
+  useKnowledgeBase,
+  useRebuildKnowledgeBase,
+} from '../../api/knowledgeBases.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
+import { useFeedback } from '../../app/feedback.js'
 import { KNOWLEDGE_PATH } from '../../app/paths.js'
+import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { ChunkPreviewDrawer } from './ChunkPreviewDrawer.js'
 import { DeleteKnowledgeBaseModal } from './DeleteKnowledgeBaseModal.js'
 import { DocumentTable } from './DocumentTable.js'
@@ -61,8 +71,10 @@ export function KnowledgeDetailPage() {
   const { id = '' } = useParams<{ id: string }>()
   const navigate = useNavigate()
 
+  const feedback = useFeedback()
   const kbQuery = useKnowledgeBase(id)
   const documentsQuery = useDocuments(id, { offset: 0, limit: DOCUMENTS_PAGE_LIMIT_MAX })
+  const rebuild = useRebuildKnowledgeBase(id)
 
   const [editing, setEditing] = useState(false)
   const [editingConfig, setEditingConfig] = useState(false)
@@ -78,14 +90,29 @@ export function KnowledgeDetailPage() {
   const documentTotal = documentsQuery.data?.total ?? 0
   const summary = summarizeDocuments(documents)
   const notice = kb === undefined ? null : embeddingChangedNotice(kb.embeddingModelChanged)
-
   /**
-   * 整库重建（P1-5）**没有独立按钮**：换模型的动作发生在「编辑」弹窗里，弹窗检测到换了模型就
-   * 提示"需重建"、保存成功后自动触发重建。本页只负责**如实反映状态**：
-   * `embeddingModelChanged === true`（快照与当前模型不一致 = 旧 chunk 不是新模型产的）
-   * 且本页有文档在 `PARSING` ⇒ 说明重建正在跑，给一条"旧索引仍可检索"的横幅。
+   * 该库必须先**整库重建**（模型被删/停用/改名，或维度变了）。
+   *
+   * `needsRebuild` 时后端的**上传 / 重试 / 覆盖重传一律 409**（避免单篇入库造成"半迁移"），
+   * 所以本页的唯一正确动作是重建 —— 那条常驻告警上的「重建整库索引」按钮就是**强制入口**
+   * （它不是常驻工具按钮，只在异常态出现）。正常换模型也能在「编辑」保存时自动重建。
    */
-  const rebuilding = kb?.embeddingModelChanged === true && summary.parsing > 0
+  const needsRebuild = kb?.needsRebuild === true
+
+  function handleRebuild(): void {
+    rebuild.mutate(undefined, {
+      onSuccess: (result) => {
+        if (result.failed > 0) {
+          feedback.note(
+            `已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请稍后在文档列表逐篇重试`,
+          )
+        } else {
+          feedback.ok(`已开始重建 ${result.enqueued} 篇文档，进度见下方文档列表`)
+        }
+      },
+      onError: (error) => feedback.fail(error, '整库重建未提交成功'),
+    })
+  }
 
   // 面包屑已挪到顶栏：把知识库名作为「细节段」上报（顶栏渲染 `工作台 / 知识库 / <name>`）
   usePageCrumb(kb?.name ?? '详情')
@@ -163,8 +190,12 @@ export function KnowledgeDetailPage() {
         <div>
           <h1>
             {kb.name}{' '}
-            <span className="kicker" title="建库时快照的 embedding 模型">
-              {kb.embeddingModel}
+            {/* `embeddingModel` 是"库里已有向量由谁产出"的快照；模型在模型池被改名后它刻意不变，
+                要等重建完成才刷新。两者不同时显示 `旧 → 新`，避免"模型都改了、界面还显示旧名"。 */}
+            <span className="kicker" title="embedding 模型：向量来源（快照）→ 当前选定">
+              {kb.embeddingModelChanged && kb.embeddingModelCurrent !== null
+                ? `${kb.embeddingModel} → ${kb.embeddingModelCurrent}`
+                : kb.embeddingModel}
             </span>
           </h1>
           <p className="page__lead">
@@ -177,19 +208,39 @@ export function KnowledgeDetailPage() {
         </div>
         <div className="page__head-actions">
           <Button onClick={() => setSearchOpen(true)}>检索测试</Button>
-          {/* 没有独立的「重建索引」按钮：换模型在「编辑」弹窗里做，检测到换模型即提示并自动重建 */}
+          {/* 没有**常驻**的「重建索引」按钮：正常换模型在「编辑」弹窗里做、保存即自动重建；
+              只有"需重建"异常态才在下面告警里给一个强制入口 */}
           <Button onClick={() => setEditing(true)}>编辑</Button>
-          <Button type="primary" onClick={() => setUploadTarget('new')}>
-            上传文档
-          </Button>
+          <Tooltip title={needsRebuild ? KNOWLEDGE_BASE_NEEDS_REBUILD_HINT : undefined}>
+            <Button type="primary" disabled={needsRebuild} onClick={() => setUploadTarget('new')}>
+              上传文档
+            </Button>
+          </Tooltip>
         </div>
       </div>
 
       <div className="split split--form">
         <div className="stack">
-          {/* "需重建 / 无法判定"由 `embeddingModelChanged` 三态驱动；**不挂按钮** ——
-              重建由「编辑」弹窗换模型时自动触发（见 `KnowledgeBaseFormModal`） */}
-          {notice !== null && <Alert type={notice.tone === 'warn' ? 'warning' : 'info'} showIcon message={notice.text} />}
+          {needsRebuild ? (
+            /* 强制闸门：模型/维度已变 ⇒ 后端挡住单篇入库，这里是**唯一**合法动作（整库重建）。
+               按钮只在异常态出现，不是常驻工具按钮。 */
+            <Alert
+              type="warning"
+              showIcon
+              message="该知识库需要重建索引"
+              description={`${KNOWLEDGE_BASE_NEEDS_REBUILD_HINT}。${REBUILD_SEARCHABLE_HINT}。`}
+              action={
+                <Button size="small" loading={rebuild.isPending} onClick={handleRebuild}>
+                  重建整库索引
+                </Button>
+              }
+            />
+          ) : (
+            /* 无法判定/普通漂移提示（`embeddingModelChanged` 三态）—— 不挂按钮 */
+            notice !== null && (
+              <Alert type={notice.tone === 'warn' ? 'warning' : 'info'} showIcon message={notice.text} />
+            )
+          )}
 
           <div className="card">
             <div className="card__head">
@@ -226,24 +277,13 @@ export function KnowledgeDetailPage() {
                 }
               />
             ) : (
-              <>
-                {/* 判定见上方 `rebuilding`：模型快照已换、还有文档在重跑 ⇒ 常驻"旧索引仍可检索"。
-                    与普通上传不同：整库重建**不清旧 chunk**，所以这里没有检索空窗。 */}
-                {rebuilding && (
-                  <Alert
-                    type="info"
-                    showIcon
-                    message={`整库重建进行中（本页还有 ${summary.parsing} 篇在重跑）。${REBUILD_SEARCHABLE_HINT}`}
-                    style={{ margin: '0 var(--sp-5) var(--sp-4)' }}
-                  />
-                )}
-                <DocumentTable
-                  kbId={kb.id}
-                  documents={documents}
-                  onReupload={(doc) => setUploadTarget(doc)}
-                  onPreviewChunks={(doc) => setChunkTarget(doc)}
-                />
-              </>
+              <DocumentTable
+                kbId={kb.id}
+                documents={documents}
+                rebuildRequired={needsRebuild}
+                onReupload={(doc) => setUploadTarget(doc)}
+                onPreviewChunks={(doc) => setChunkTarget(doc)}
+              />
             )}
 
             {documents.length > 0 && (
@@ -352,6 +392,7 @@ export function KnowledgeDetailPage() {
         doc={uploadTarget === 'new' ? null : uploadTarget}
         open={uploadTarget !== null}
         multimodalSupported={kb.embeddingMultimodal}
+        describeSupported={kb.captionModelId !== null}
         onClose={() => setUploadTarget(null)}
       />
       <DeleteKnowledgeBaseModal

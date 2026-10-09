@@ -7,8 +7,12 @@
  * ─────────────────────────────────────────────────────────────────────
  * 「前置校验」到底校验什么：扩展名、声明 MIME、**文件头**
  * ─────────────────────────────────────────────────────────────────────
- * §4-1 列的四道是：① 扩展名白名单 ② `.doc` 直接拒绝并提示 ③ MIME 与扩展名交叉校验
+ * §4-1 列的四道是：① 扩展名白名单 ② `.doc` 处理 ③ MIME 与扩展名交叉校验
  * ④ 大小 ≤ `UPLOAD_BODY_LIMIT`。①②③ 都在本文件，④ 在传输层（见 `routes/documents.ts`：
+ *
+ * ⚠️ **P1-12 起 ② 不再"见到 `.doc` 就拒"**：先按内容嗅探（{@link sniffLegacyDoc}）——
+ * 命中 HTML/MIME（MHTML）导出件则放行、归一成解析格式 `'html'`；真 OLE2 / RTF / 其它
+ * 仍拒并保留"另存为 .docx"提示。
  * Fastify 的 `bodyLimit` 给出 **413**，本层不重复实现"大小"这件事，只处理"流被截断"这一结果）。
  *
  * ⚠️ **本批在 ③ 之外补了"文件头魔数"这一道，原因是 ③ 单独做不到它承诺的事**：
@@ -49,13 +53,15 @@ import {
 } from '@doubulea/shared'
 
 import { parseDocx } from './docx.js'
+import { parseHtml } from './html.js'
 import { parseImage } from './image.js'
 import { parseMd } from './md.js'
 import { parsePdf } from './pdf.js'
 import { parseTxt } from './txt.js'
-import { DEFAULT_PARSE_OPTIONS, type ParseOptions, type ParseResult } from './types.js'
+import { DEFAULT_PARSE_OPTIONS, type ParseFormat, type ParseOptions, type ParseResult } from './types.js'
 
-export { parseDocx, parseImage, parseMd, parsePdf, parseTxt }
+export { parseDocx, parseHtml, parseImage, parseMd, parsePdf, parseTxt }
+export { extractMhtmlHtml, htmlToBlocks, parseMhtml } from './html.js'
 export * from './types.js'
 
 /**
@@ -187,6 +193,62 @@ const SIGNATURES: readonly Signature[] = [
   },
 ]
 
+/**
+ * `.doc` 按**内容**嗅探的结论（P1-12；`子方案/图片OCR与图片理解.md` §六·补）。
+ *
+ * 扩展名 `doc` **不可信**——存量 `.doc` 里很大一部分是 Confluence / Word「另存为网页」/
+ * 邮件导出的 **HTML 或 MHTML**，它们本可正常抽文本；只有真 OLE2 二进制才必须"另存为 .docx"。
+ */
+export type LegacyDocKind = 'html' | 'mhtml' | 'ole2' | 'rtf' | 'other'
+
+/** 取文件头文本（UTF-16 BOM 与 latin1 两种；侦探用，不做完整编码嗅探） */
+function probeHeadText(head: Buffer): string {
+  if (head.length >= 2 && head[0] === 0xff && head[1] === 0xfe) return head.subarray(2).toString('utf16le')
+  if (head.length >= 2 && head[0] === 0xfe && head[1] === 0xff) {
+    const swapped = Buffer.from(head.subarray(2))
+    swapped.swap16()
+    return swapped.toString('utf16le')
+  }
+  return head.toString('latin1').replace(/^\uFEFF/u, '')
+}
+
+/**
+ * 按内容判断一个 `.doc` 到底是什么（P1-12）。判定顺序 = **确定性证据优先于猜测**：
+ *   ① OLE2 魔数（`D0CF11E0A1B11AE1`）→ 真 `.doc`（旧版 Word 二进制）；
+ *   ② RTF（`{\rtf`）→ 同为"另存为 .docx"一族；
+ *   ③ MIME 头（`Xxx: …` 起头 + 出现 `multipart/` / `mime-version` / `content-type: text/html`）
+ *      → MHTML 导出件；
+ *   ④ `<!doctype html>` / `<html>` / `<head>` / `<body>` → 裸 HTML 导出件；
+ *   ⑤ 其余 → `other`（仍按"另存为 .docx"拒绝）。
+ */
+export function sniffLegacyDoc(bytes: Buffer): LegacyDocKind {
+  const head = bytes.subarray(0, HEAD_PROBE_BYTES)
+  if (
+    head.length >= 8 &&
+    head[0] === 0xd0 &&
+    head[1] === 0xcf &&
+    head[2] === 0x11 &&
+    head[3] === 0xe0 &&
+    head[4] === 0xa1 &&
+    head[5] === 0xb1 &&
+    head[6] === 0x1a &&
+    head[7] === 0xe1
+  ) {
+    return 'ole2'
+  }
+  if (startsWith(head, '{\\rtf')) return 'rtf'
+
+  const text = probeHeadText(head)
+  if (
+    /^[A-Za-z][A-Za-z0-9-]*:\s*.+$/mu.test(text) &&
+    /(multipart\/|mime-version|content-type:\s*text\/html)/iu.test(text)
+  ) {
+    return 'mhtml'
+  }
+  if (/<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/iu.test(text)) return 'html'
+  return 'other'
+}
+
 /** 扩展名（小写，无点）；没有扩展名时返回 `null` */
 function extensionOf(fileName: string): string | null {
   const base = fileName.split(/[\\/]/u).pop() ?? fileName
@@ -210,13 +272,20 @@ export interface FormatProfile<T extends string> {
   mimeByExtension: Readonly<Record<T, readonly string[]>>
   /** **无二进制签名**时允许落在这几个扩展名上（纯文本格式；其余会被判成"内容与扩展名不符"） */
   textExtensions: readonly T[]
+  /**
+   * 是否对 `.doc` 做**按内容嗅探**（P1-12）：命中 HTML/MHTML 时放行、按网页文本解析；
+   * 未开（缺省）则维持历史行为（见 `.doc` 即拒）。只有知识库文档画像开它 ——
+   * 对话附件的白名单与下游（`kind`/`mime`）不含 `html`，故刻意不开。
+   */
+  sniffLegacyDoc?: boolean
 }
 
-/** 知识库文档的格式画像（历史行为，逐字不变） */
+/** 知识库文档的格式画像（历史行为 + P1-12：`.doc` 按内容嗅探放行网页导出件） */
 export const DOCUMENT_FORMAT_PROFILE: FormatProfile<UploadExtension> = {
   extensions: UPLOAD_EXTENSIONS,
   mimeByExtension: MIME_BY_EXTENSION,
   textExtensions: ['md', 'txt'],
+  sniffLegacyDoc: true,
 }
 
 /** 对话附件的格式画像（P1-4 补：额外支持 json / csv 两种纯文本；知识库口径不受影响） */
@@ -240,8 +309,10 @@ export interface FormatProbeInput {
  * 判定格式并做三道前置校验（扩展名 / MIME / 文件头）。不合法即抛 `AppError.validation`（400）。
  *
  * @throws {AppError} `VALIDATION`(400) —— 扩展名不支持 / `.doc` / MIME 与扩展名不符 / 内容与扩展名不符
+ *
+ * 返回类型是 `ParseFormat`：`.doc` 命中 HTML/MIME 内容嗅探时返回 `'html'`（P1-12）。
  */
-export function detectFormat(input: FormatProbeInput): UploadExtension
+export function detectFormat(input: FormatProbeInput): ParseFormat
 export function detectFormat<T extends string>(input: FormatProbeInput, profile: FormatProfile<T>): T
 export function detectFormat(input: FormatProbeInput, profile: FormatProfile<string> = DOCUMENT_FORMAT_PROFILE): string {
   const extension = extensionOf(input.fileName)
@@ -251,9 +322,16 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
     )
   }
 
-  // ① `.doc` 单独拦：它要的是"另存为 .docx"这句**可操作**的提示，
-  //    混进下面那句"扩展名不支持"里等于什么都没说（决策 10 的验收要点就是这句话）
+  // ① `.doc`：**按内容嗅探**（P1-12），而非"见到就拒"。存量 `.doc` 大量是 HTML/MIME 导出件
+  //    （Confluence / Word 另存为网页 / 邮件导出），它们本可正常抽文本。故：
+  //      · 命中 HTML / MHTML → 放行（返回解析格式 `'html'`，交给 `parseHtml`）；
+  //      · 真 OLE2 / RTF / 其它 → 仍拒，且保留"另存为 .docx"这句**可操作**的提示
+  //        （混进下面那句"扩展名不支持"里等于什么都没说 —— 决策 10 的验收要点）。
   if (extension === LEGACY_DOC_EXTENSION) {
+    if (profile.sniffLegacyDoc === true) {
+      const kind = sniffLegacyDoc(input.bytes)
+      if (kind === 'html' || kind === 'mhtml') return 'html'
+    }
     throw AppError.validation(`暂不支持 .doc（旧版 Word 二进制格式），${LEGACY_DOC_HINT}`)
   }
   // ② 白名单
@@ -318,11 +396,11 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
  * 按格式分发到具体解析器（四个解析器对外同一形状，见 `types.ts`）。
  * 这是流水线上"格式差异"的**唯一**出口：P0-1-18 之后的下游只认 {@link ParseResult}。
  *
- * `options` 决定是否抽取图片（由流水线按文档的 `imageMode` 传下来）；默认不抽，
+ * `options` 决定是否抽取图片（由流水线按文档的图片开关传下来）；默认不抽，
  * 与历史行为一致。独立图片文件（png/…）本身即内容，无论 `options` 都产出该图片。
  */
 export async function parseDocument(
-  format: UploadExtension,
+  format: ParseFormat,
   bytes: Buffer,
   options: ParseOptions = DEFAULT_PARSE_OPTIONS,
 ): Promise<ParseResult> {
@@ -335,6 +413,9 @@ export async function parseDocument(
       return parseMd(bytes, options)
     case 'txt':
       return parseTxt(bytes)
+    // `.doc` 命中 HTML/MIME 嗅探（P1-12）后由 `detectFormat` 归一成 `'html'`
+    case 'html':
+      return parseHtml(bytes, options)
     case 'png':
     case 'jpg':
     case 'jpeg':
@@ -346,6 +427,6 @@ export async function parseDocument(
 }
 
 /** 是否是独立图片文件格式（供服务层校验"图片文件必须选解析方式"） */
-export function isImageFormat(format: UploadExtension): boolean {
+export function isImageFormat(format: ParseFormat): boolean {
   return isImageUploadExtension(format)
 }

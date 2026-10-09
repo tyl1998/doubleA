@@ -36,7 +36,6 @@ import {
   type AttachmentItem,
   type ChatAttachmentExtension,
   type ChatAttachmentKind,
-  type UploadExtension,
 } from '@doubulea/shared'
 import { z } from 'zod'
 
@@ -49,6 +48,7 @@ import {
   DEFAULT_PARSE_OPTIONS,
   detectFormat,
   parseDocument,
+  type ParseFormat,
 } from '../pipeline/parse/index.js'
 
 /** 对话附件里**直接按 UTF-8 当文本**的格式（P1-4 补：json / csv 无结构解析，原文即内容） */
@@ -236,7 +236,7 @@ export async function resolveChatAttachments(
         throw AppError.validation(`附件「${row.name}」是空文件，没有可读取的内容`)
       }
     } else {
-      const parsed = await parseDocument(format as UploadExtension, bytes, DEFAULT_PARSE_OPTIONS)
+      const parsed = await parseDocument(format as ParseFormat, bytes, DEFAULT_PARSE_OPTIONS)
       if (parsed.meta.charCount === 0) {
         throw AppError.validation(`附件「${row.name}」里没有可读取的文字内容（可能是扫描件或空文件）`)
       }

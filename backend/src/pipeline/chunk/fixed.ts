@@ -15,10 +15,19 @@
  *
  * ⚠️ 代价：最后一块常常很短（`长度 % (chunkSize - overlap)` 的余数）。这是本档的固有形态，
  * 不是 bug —— 想避免请用 `hybrid`（它是默认值，`子方案①` §二 的 `split_strategy=hybrid`）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 表格块仍保持原子（与"不做结构假设"不矛盾）
+ * ─────────────────────────────────────────────────────────────────────
+ * 解析层已把 docx/md 的表格收成 `kind='table'` 块（那不是"假设"出来的结构，是解析得到的事实），
+ * 故本策略对表单元整块保留、超长按行切并重复表头（`parse/table.ts`）；只有文本单元才走定长滑窗。
+ * 纯文本文档（无表块）的行为与本策略引入表处理前**逐字一致**。
  */
 
 import type { ParseResult } from '../parse/types.js'
+import { splitTableText } from '../parse/table.js'
 import {
+  atomicUnits,
   blockSpans,
   locateBlock,
   metaOf,
@@ -31,8 +40,8 @@ export const fixedStrategy: ChunkStrategy = {
   name: 'fixed',
 
   split(source: ParseResult, options: ChunkOptions): Chunk[] {
-    const chars = [...source.text]
-    if (chars.length === 0) return []
+    const units = atomicUnits(source.blocks)
+    if (units.length === 0) return []
 
     const size = Math.max(1, options.chunkSize)
     // 步长 = 块长 - 重叠 ⇒ 相邻两块正好重叠 `chunkOverlap` 个字符。
@@ -41,17 +50,31 @@ export const fixedStrategy: ChunkStrategy = {
     //    但本函数是纯函数、可能被直接调用（验收就在直接调），故这里再兜一道。
     const step = Math.max(1, size - Math.max(0, options.chunkOverlap))
     const spans = blockSpans(source.blocks)
-
     const chunks: Chunk[] = []
-    for (let start = 0; start < chars.length; start += step) {
-      chunks.push({
-        seq: chunks.length,
-        content: chars.slice(start, start + size).join(''),
-        meta: metaOf(locateBlock(spans, start)),
-        offset: start,
-      })
-      // 已经取到结尾（或越过）就停：否则会再产出一个纯重叠的尾块
-      if (start + size >= chars.length) break
+
+    for (const unit of units) {
+      if (unit.kind === 'table') {
+        for (const piece of splitTableText(unit.text, size)) {
+          chunks.push({
+            seq: chunks.length,
+            content: piece,
+            meta: metaOf(locateBlock(spans, unit.start)),
+            offset: unit.start,
+          })
+        }
+        continue
+      }
+      const chars = [...unit.text]
+      for (let start = 0; start < chars.length; start += step) {
+        chunks.push({
+          seq: chunks.length,
+          content: chars.slice(start, start + size).join(''),
+          meta: metaOf(locateBlock(spans, unit.start + start)),
+          offset: unit.start + start,
+        })
+        // 已经取到结尾（或越过）就停：否则会再产出一个纯重叠的尾块
+        if (start + size >= chars.length) break
+      }
     }
     return chunks
   },

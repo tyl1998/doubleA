@@ -17,12 +17,19 @@
  * 它的用途只有两个 —— 字符计数（§五 的空文本检测）与人工排查（把解析结果打出来看）。
  */
 
-/** 支持的格式（= `UPLOAD_EXTENSIONS`，但本层不依赖 upload 侧的写法，保持独立） */
+/**
+ * 支持的格式（= `UPLOAD_EXTENSIONS`，但本层不依赖 upload 侧的写法，保持独立）。
+ *
+ * ⚠️ **`html` 不是上传白名单里的扩展名**：它只由 `detectFormat` 对**扩展名为 `.doc`、
+ * 内容实为 HTML / MIME（MHTML）导出件**的按内容嗅探产出（P1-12）。也就是说 `.doc`
+ * 仍是唯一入口，`html` 是"这份 `.doc` 到底是什么"的解析结论，不是新增的可上传格式。
+ */
 export const PARSE_FORMATS = [
   'pdf',
   'docx',
   'md',
   'txt',
+  'html',
   'png',
   'jpg',
   'jpeg',
@@ -32,9 +39,9 @@ export const PARSE_FORMATS = [
 ] as const
 export type ParseFormat = (typeof PARSE_FORMATS)[number]
 
-/** 解析选项（由流水线按文档的 `imageMode` 传下来；默认不抽图，见 {@link DEFAULT_PARSE_OPTIONS}） */
+/** 解析选项（由流水线按文档的图片开关传下来；默认不抽图，见 {@link DEFAULT_PARSE_OPTIONS}） */
 export interface ParseOptions {
-  /** 是否抽取文档内图片（`imageMode != NONE` 时为 true） */
+  /** 是否抽取文档内图片（文档三个图片开关任一为真时为 true） */
   extractImages: boolean
   /** 单张图片上限（字节）；超过则跳过该图并告警，不因一张大图拖垮整篇 */
   maxImageBytes: number
@@ -70,7 +77,36 @@ export interface ParsedImage {
    * `null`/缺省 = 位置未知，调用方按"追加到末尾"处理。
    */
   anchor?: number | null
+  /**
+   * VLM 描述（P1-11，轨道二）—— 由 `describe-images` 阶段写入，`null`/缺省 = 未产出。
+   *
+   * ⚠️ 这是**能力增量**、不是解析层的产物：解析器**一律不写它**。OCR 模式下它会被
+   * `ocrImagesStage` 追加进对应的 OCR 文本块；`MULTIMODAL` 模式下由 `buildImageChunks`
+   * 并进图片块的 `content`（图注 + 描述）。
+   */
+  description?: string
+  /**
+   * 图片类型（`flowchart` / `chart` / `diagram` / `photo` / `text` / `unknown`）——
+   * 由 VLM 判定，落 `chunks.meta.imageKind`（便于检索过滤 / 前端区分渲染）。
+   */
+  imageKind?: string
+  /**
+   * 低清防护：短边过小、**未做识别**的图片标记为 `true`。
+   *   · VLM 侧（`IMAGE_CAPTION_MIN_PX`，P1-11）：不产出图结构描述（避免幻觉）；
+   *   · OCR 侧（`IMAGE_OCR_MIN_PX`）：不跑本地 OCR（低清只会是噪声）。
+   * 它只影响"要不要识别"，**不影响图注、也不影响图片向量化**（向量化与识别正交）。
+   */
+  unreliable?: boolean
 }
+
+/**
+ * 段落级结构块的种类。
+ *
+ * · `text`（缺省）：普通段落/标题/列表项。
+ * · `table`：一张表格的**结构化序列化**（Markdown 管道表）。分块层据此把它当**原子单元**处理
+ *   —— 不参与句末回退、不从行中间切开（见 `chunk/strategy.ts` 的 `atomicUnits`）。
+ */
+export type ParsedBlockKind = 'text' | 'table'
 
 /** 段落级结构块 */
 export interface ParsedBlock {
@@ -85,6 +121,11 @@ export interface ParsedBlock {
   headingPath: string[]
   /** 页码（1 起）；非分页格式（md/docx/txt）恒为 `null` */
   page: number | null
+  /**
+   * 块种类（可省，缺省视为 `text`）。表格块由 docx/md 解析器产出，`text` 是它序列化后的
+   * Markdown 管道表；分块层读它做原子切分。
+   */
+  kind?: ParsedBlockKind
 }
 
 /** 解析元数据（`子方案①` §五 的空文本检测读这里，不重新数一遍字符） */

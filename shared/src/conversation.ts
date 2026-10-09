@@ -250,6 +250,35 @@ export const recallConversationResultSchema = z.object({
 })
 export type RecallConversationResult = z.infer<typeof recallConversationResultSchema>
 
+/**
+ * `POST /api/conversations/:id/auto-approve` 的请求体 —— **会话级自动审批开关**。
+ *
+ * 打开后，本会话内危险的 MCP 工具（以及服务端反向 elicitation）**不再逐次弹确认卡**，
+ * 由编排层直接按"确认"放行（`orchestrator/sse.ts#awaitConfirm` 读这个开关后短路）。
+ *
+ * ⚠️ 它是**会话级、运行时**的开关（存 Redis，不落库）：只影响这一个会话、且是安全默认
+ * ——键缺失/读取失败一律回到"要确认"，绝不会因为读不到而放行。
+ */
+export const setConversationAutoApproveBodySchema = z.object({
+  enabled: z.boolean({
+    required_error: '缺少 enabled（true = 本会话自动审批，false = 恢复逐次确认）',
+    invalid_type_error: 'enabled 必须是布尔值',
+  }),
+})
+export type SetConversationAutoApproveBody = z.infer<typeof setConversationAutoApproveBodySchema>
+
+/**
+ * `POST /api/conversations/:id/auto-approve` 的响应。
+ *
+ * 回带 `autoApprove`（= 落定后的值），调用方据此对齐本地开关状态 —— 与 `/stop` 的
+ * `signaled` 同款："把请求原样确认一遍"，而不是让客户端自己猜服务端是否真的写进去了。
+ */
+export const setConversationAutoApproveResultSchema = z.object({
+  id: z.string(),
+  autoApprove: z.boolean(),
+})
+export type SetConversationAutoApproveResult = z.infer<typeof setConversationAutoApproveResultSchema>
+
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 
 /**
@@ -276,12 +305,17 @@ export const conversationActiveSnapshotSchema = z.object({
 export type ConversationActiveSnapshot = z.infer<typeof conversationActiveSnapshotSchema>
 
 /**
- * `GET /api/conversations/:id/active` 的响应：快照 + **派生**的 `streaming`。
+ * `GET /api/conversations/:id/active` 的响应：快照 + **派生**的 `streaming` + `autoApprove`。
  * 无流时（Redis 里没有那个键）恒为 `{streaming: false, queuedPosition: null, currentTool: null, startedAt: null}`
  * —— 这正是 `06` P0-1-25 的验收原文。
+ *
+ * ⚠️ `autoApprove`（会话级自动审批开关）**不是**活跃流快照的一部分（它存在另一个键
+ * `chat.autoapprove:{id}`、与"有没有流在跑"无关），由 {@link getConversationActive} 一起读出来
+ * —— 于是对话页只需这一个只读端点就能同时拿到进度与开关当前值。
  */
 export const conversationActiveSchema = conversationActiveSnapshotSchema.extend({
   streaming: z.boolean(),
+  autoApprove: z.boolean(),
 })
 export type ConversationActive = z.infer<typeof conversationActiveSchema>
 

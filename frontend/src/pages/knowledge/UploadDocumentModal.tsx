@@ -15,11 +15,14 @@
  * 前端也照同一个思路做。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ② `.doc` / 多选 / 空文件在**发请求之前**拦下（验收原文："选 .doc 立即提示且不发请求"）
+ * ② 多选 / 空文件 / 真 `.doc` 在**发请求之前**拦下
  * ─────────────────────────────────────────────────────────────────────
- * 判据是纯函数 `screenPickedFiles`（`knowledgeModel.ts`）。两处细节值得点名：
+ * 判据是纯函数 `screenPickedFiles`（`knowledgeModel.ts`）。三处细节值得点名：
  *   · `accept` 里**故意含 `.doc`**（否则系统文件选择器把它过滤掉，用户根本选不中，
- *     那句"请另存为 .docx 后重传"永远不会出现，见 `UPLOAD_ACCEPT_ATTRIBUTE`）；
+ *     见 `UPLOAD_ACCEPT_ATTRIBUTE`）；
+ *   · ⚠️ **P1-12 起 `.doc` 不再只看扩展名**：它可能是 HTML/MIME（MHTML）导出件、本可正常
+ *     解析 ⇒ 选中后读**文件头**（`sniffLegacyDocHead` 镜像后端 `detectFormat` 的嗅探），
+ *     命中 HTML/MHTML 放行、真 OLE2/RTF 才拦下并给"请另存为 .docx"；
  *   · 用 `beforeUpload` **返回 `false`** 阻止 AntD 自己上传，再拿 `fileList`（完整列表）
  *     判多选 —— 本仓上传端点只接受**一个** `file` 字段，多选不是"排队传"而是 413。
  *
@@ -27,25 +30,35 @@
  *    （表格每 2s 自动刷新）。这句提示必须给，否则"传完了搜不到"会被当成 bug。
  */
 
-import { Alert, Button, Modal, Radio, Upload } from 'antd'
+import { Alert, Button, Checkbox, Modal, Radio, Upload } from 'antd'
 import {
-  IMAGE_MODE_LABELS,
+  DEFAULT_DOCUMENT_IMAGE_OPTIONS,
+  hasAnyImageOption,
+  IMAGE_RECOGNITION_LABELS,
+  IMAGE_RECOGNITIONS,
+  IMAGE_VECTORIZE_LABEL,
+  LEGACY_DOC_EXTENSION,
   REUPLOAD_UNCHANGED_HINT,
   UPLOAD_EXTENSIONS,
+  type DocumentImageOptions,
   type DocumentItem,
-  type ImageMode,
+  type ImageRecognition,
 } from '@doubulea/shared'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
 import { useReuploadDocument, useUploadDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
+  LEGACY_DOC_PROBE_BYTES,
   UPLOAD_ACCEPT_ATTRIBUTE,
-  imageModeOptions,
+  extensionOf,
   isImageFile,
+  isRecognitionAllowed,
+  screenLegacyDocContent,
   screenPickedFiles,
   type FileScreenResult,
+  type ImageOptionCapabilities,
 } from './knowledgeModel.js'
 
 export interface UploadDocumentModalProps {
@@ -54,34 +67,49 @@ export interface UploadDocumentModalProps {
   doc: DocumentItem | null
   open: boolean
   onClose: () => void
-  /** 该库所选 embedding 模型是否支持多模态（决定「多模态向量化」是否可选） */
+  /** 该库所选 embedding 模型是否支持多模态（决定「图片向量化」是否可选） */
   multimodalSupported: boolean
+  /** 该库是否已选「图片描述模型」（决定「图片含义识别」是否可选） */
+  describeSupported: boolean
 }
 
 /** 只有 `reject` 这一支会被渲染成提示条 */
 type Rejection = Extract<FileScreenResult, { kind: 'reject' }>
 
-export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSupported }: UploadDocumentModalProps) {
+export function UploadDocumentModal({
+  kbId,
+  doc,
+  open,
+  onClose,
+  multimodalSupported,
+  describeSupported,
+}: UploadDocumentModalProps) {
   const feedback = useFeedback()
   const upload = useUploadDocument(kbId)
   const reupload = useReuploadDocument(kbId)
 
   const [picked, setPicked] = useState<File | null>(null)
-  const [imageMode, setImageMode] = useState<ImageMode>('NONE')
+  const [options, setOptions] = useState<DocumentImageOptions>(DEFAULT_DOCUMENT_IMAGE_OPTIONS)
   const [rejection, setRejection] = useState<Rejection | null>(null)
   const [errorText, setErrorText] = useState<string | null>(null)
+  // `.doc` 的文件头判定是异步的：用户连选两个文件时，只认**最后一次**选择的结果
+  const pickSeq = useRef(0)
 
   const reuploading = doc !== null
-  const modes = imageModeOptions(multimodalSupported)
-  // 用户选了图片文件却没开解析：发送前拦下（后端也会 400，这里省一次往返并当场说清）
-  const imageModeMissing = picked !== null && isImageFile(picked.name) && imageMode === 'NONE'
+  const caps: ImageOptionCapabilities = { multimodalSupported, describeSupported }
+  // 用户选了图片文件却既没选识别方式也没开向量化：发送前拦下（后端也会 400，这里省一次往返并当场说清）
+  const imageOptionMissing = picked !== null && isImageFile(picked.name) && !hasAnyImageOption(options)
 
   // 每次打开都清空：上一次选中的文件不能跟着弹窗留到下一次（否则会"上传了两遍"
-  // 而用户只记得选过一次）。图片解析方式默认沿用被重传文档的当前方式。
+  // 而用户只记得选过一次）。图片选项默认沿用被重传文档的当前选择。
   useEffect(() => {
     if (!open) return
     setPicked(null)
-    setImageMode(doc?.imageMode ?? 'NONE')
+    setOptions(
+      doc === null
+        ? DEFAULT_DOCUMENT_IMAGE_OPTIONS
+        : { imageRecognize: doc.imageRecognize, imageVectorize: doc.imageVectorize },
+    )
     setRejection(null)
     setErrorText(null)
   }, [open, doc])
@@ -96,7 +124,7 @@ export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSuppor
 
     if (doc === null) {
       upload.mutate(
-        { file: picked, imageMode },
+        { file: picked, options },
         {
           onSuccess: (result) => {
             feedback.ok(
@@ -113,7 +141,7 @@ export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSuppor
     }
 
     reupload.mutate(
-      { docId: doc.id, file: picked, imageMode },
+      { docId: doc.id, file: picked, options },
       {
         onSuccess: (result) => {
           feedback.ok(
@@ -143,7 +171,7 @@ export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSuppor
           key="ok"
           type="primary"
           loading={mutating}
-          disabled={picked === null || rejection !== null || imageModeMissing}
+          disabled={picked === null || rejection !== null || imageOptionMissing}
           onClick={submit}
         >
           {reuploading ? '开始重传' : '开始上传'}
@@ -162,15 +190,44 @@ export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSuppor
           showUploadList={false}
           accept={UPLOAD_ACCEPT_ATTRIBUTE}
           beforeUpload={(_file, fileList) => {
-            const result = screenPickedFiles(fileList.map((item) => ({ name: item.name, size: item.size })))
+            const seq = pickSeq.current + 1
+            pickSeq.current = seq
+            const item = fileList[0]
+
+            const result = screenPickedFiles(fileList.map((f) => ({ name: f.name, size: f.size })))
             if (result.kind === 'reject') {
               setRejection(result)
               setPicked(null)
-            } else {
-              setRejection(null)
-              setErrorText(null)
-              setPicked(fileList[0] ?? null)
+              return false
             }
+            setRejection(null)
+            setErrorText(null)
+
+            // ⚠️ P1-12：`.doc` 可能是 HTML/MIME 导出件 ⇒ 读文件头判内容（镜像后端嗅探）。
+            // 命中 HTML/MHTML 放行；真 OLE2/RTF 拦下并给"请另存为 .docx"。读失败不拦死，
+            // 交给后端 `detectFormat` 定夺（它才是权威）。
+            if (item && extensionOf(item.name) === LEGACY_DOC_EXTENSION && item.size > 0) {
+              setPicked(null)
+              void item
+                .slice(0, LEGACY_DOC_PROBE_BYTES)
+                .arrayBuffer()
+                .then((buffer) => {
+                  if (pickSeq.current !== seq) return // 已被更晚的一次选择取代
+                  const verdict = screenLegacyDocContent(item.name, new Uint8Array(buffer))
+                  if (verdict.kind === 'reject') {
+                    setRejection(verdict)
+                    setPicked(null)
+                  } else {
+                    setPicked(item)
+                  }
+                })
+                .catch(() => {
+                  if (pickSeq.current === seq) setPicked(item)
+                })
+              return false
+            }
+
+            setPicked(item ?? null)
             // 关键：阻止 AntD 自己发上传请求 —— 上传走 api 层（`useUploadDocument`）。
             // 返回 `false` 也让组件**不出现**自己的上传列表（我们只显示自己选的这个文件）。
             return false
@@ -190,23 +247,37 @@ export function UploadDocumentModal({ kbId, doc, open, onClose, multimodalSuppor
         )}
 
         <div className="stack stack--tight">
-          <p className="ratio">文档内图片怎么处理：</p>
+          <p className="ratio">图片识别方式（三选一）：</p>
           <Radio.Group
-            value={imageMode}
-            onChange={(event) => setImageMode(event.target.value as ImageMode)}
-            options={modes.map((mode) => ({
-              value: mode.value,
-              label: IMAGE_MODE_LABELS[mode.value],
-              disabled: mode.disabled,
+            value={options.imageRecognize}
+            onChange={(event) =>
+              setOptions((previous) => ({ ...previous, imageRecognize: event.target.value as ImageRecognition }))
+            }
+            options={IMAGE_RECOGNITIONS.map((recognition) => ({
+              value: recognition,
+              label: IMAGE_RECOGNITION_LABELS[recognition],
+              disabled: !isRecognitionAllowed(recognition, caps),
             }))}
           />
+          <Checkbox
+            checked={options.imageVectorize}
+            disabled={!multimodalSupported}
+            onChange={(event) =>
+              setOptions((previous) => ({ ...previous, imageVectorize: event.target.checked }))
+            }
+          >
+            {IMAGE_VECTORIZE_LABEL}
+          </Checkbox>
           <p className="ratio">
-            {multimodalSupported
-              ? '「多模态向量化」需要向量模型支持图片输入；「OCR 转文字」在本机离线识别。'
-              : '当前知识库的向量模型不支持多模态，只能选「不解析图片」或「OCR 转文字」。'}
+            「文字识别」在本机离线 OCR 出图上文字；「含义识别」用知识库选定的图片描述模型读图
+            （摘要 / 流程图转 Mermaid / 关键标签）——区别是识别方式，二者互斥、同时只需选一个。
+            「向量化」把图片编码进向量空间（视觉语义），可与任一识别方式并存、也可单独开。
+            独立上传的图片文件至少选一项。
+            {!multimodalSupported && ' 当前知识库向量模型不支持多模态，不能选「图片向量化」。'}
+            {!describeSupported && ' 当前知识库未选「图片描述模型」，不能选「图片含义识别（大模型）」。'}
           </p>
-          {imageModeMissing && (
-            <Alert type="warning" showIcon message="这是图片文件，请选择一种图片解析方式后上传。" />
+          {imageOptionMissing && (
+            <Alert type="warning" showIcon message="这是图片文件，请至少选择一种图片处理方式后上传。" />
           )}
         </div>
 

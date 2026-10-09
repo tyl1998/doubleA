@@ -174,12 +174,31 @@ export const knowledgeBaseItemSchema = z.object({
    * （`api:<模型名>` / `local:<目录名>`）。它是 `子方案①` §八「换模型重建路径」的判据。
    */
   embeddingModel: z.string(),
+  /**
+   * **当前**选定模型的 `EmbeddingProvider.name()`（`api:<模型名>`）—— `embeddingModelId` 指向的模型
+   * **此刻**的名字；模型被删 / 未绑定 / Provider 停用时为 `null`。
+   *
+   * 与 {@link embeddingModel} 的区别（P1-5 补）：后者是"**库里已有向量由谁产出**"的快照，换模型或
+   * 在模型池改名后**刻意不变**，要等整库重建完成才刷新。两者不同 = {@link embeddingModelChanged}，
+   * 详情页据此把标题显示成 `旧 → 新`，避免"模型都改了、界面还显示旧名"的困惑。
+   */
+  embeddingModelCurrent: z.string().nullable(),
   /** 建库时**选定**的模型 id（模型池里 `type=EMBEDDING` 的模型）；老库为 `null` */
   embeddingModelId: z.string().nullable(),
   /**
+   * 图片"含义"理解（VLM 描述，P1-11）选定的 vision 对话模型 id（模型池里 `type=CHAT` 的模型）；
+   * 未配置为 `null`（= 该库不产出图片描述）。
+   */
+  captionModelId: z.string().nullable(),
+  /**
+   * 该描述模型的**当前**名字（`Model.label`）；未配置 / 模型被删 / Provider 停用时为 `null`。
+   * 仅供界面展示（"这个库用哪个模型读图"）。
+   */
+  captionModelName: z.string().nullable(),
+  /**
    * 该库所选 embedding 模型是否**支持多模态**（`Model.embeddingMultimodal`）。
    *
-   * 上传文档时若选"多模态向量化"解析图片，前端据此**提前**禁用/提示（后端仍会再校验一次，
+   * 上传文档时若选"图片向量化（多模态）"，前端据此**提前**禁用/提示（后端仍会再校验一次，
    * 见 `MULTIMODAL_MODEL_REQUIRED_HINT`）；`embeddingModelId` 为空（老库）时恒为 `false`。
    */
   embeddingMultimodal: z.boolean(),
@@ -193,6 +212,17 @@ export const knowledgeBaseItemSchema = z.object({
    * "探测与告警要在 P0 就位，否则换模型时会静默出错"。
    */
   embeddingModelChanged: z.boolean().nullable(),
+  /**
+   * 该库是否**必须整库重建**才能继续向量处理（P1-5 的强制闸门）。
+   *
+   * 比 {@link embeddingModelChanged} 更严：除"模型被删/停用/改名"外，还覆盖**型号没变但维度变了**
+   * （`选模型的 embeddingDim` 与库快照不一致）。为 `true` 时后端会把该库的**入库 / 重试 / 覆盖重传**
+   * 一律 **409** 拒绝 —— 否则单篇入库会写出与旧 chunk 不同维度的向量、把库变成"半迁移"
+   * （旧文档被向量路按维度过滤、只剩全文），这才是真正该被挡住的操作。
+   *
+   * 详情页据此显示常驻告警 + 唯一的「重建整库索引」入口；重建成功（维度/名字快照刷新）后转 `false`。
+   */
+  needsRebuild: z.boolean(),
   chunkSize: z.number().int(),
   chunkOverlap: z.number().int(),
   /** 已补全默认值的完整形状（读出来一定是 6 键齐备，见 {@link normalizeRetrievalConfig}） */
@@ -320,6 +350,11 @@ export const createKnowledgeBaseBodySchema = z.object({
   embeddingModelId: z
     .string({ required_error: '请选择 embedding 模型' })
     .uuid('embeddingModelId 不是合法 UUID'),
+  /**
+   * 可选：图片"含义"理解（VLM 描述）用的 vision 对话模型 id（P1-11）。
+   * `null` 与省略同义（都表示"不启用图片描述"）。设置时后端会校验它是 `CHAT` 且 `supportsVision`。
+   */
+  captionModelId: z.string().uuid('captionModelId 不是合法 UUID').nullish(),
   chunkSize: chunkSizeSchema.optional(),
   chunkOverlap: chunkOverlapSchema.optional(),
   /** 局部覆盖：只给 `{topK: 10, score: 0.5}` 也行，其余键取默认值 */
@@ -356,6 +391,11 @@ export const updateKnowledgeBaseBodySchema = z
     retrievalConfig: retrievalConfigInputSchema.optional(),
     /** 更换该库的向量模型（`models` 里 `type=EMBEDDING` 的 id）；换完需重建索引 */
     embeddingModelId: z.string().uuid('embeddingModelId 不是合法 UUID').optional(),
+    /**
+     * 图片描述模型（P1-11）**三态**：**不带 = 不动** / `null` = **清除（不启用图片描述）** /
+     * uuid = 设置。设置时后端校验它是 `CHAT` 且 `supportsVision`（{@link CAPTION_MODEL_MUST_SUPPORT_VISION_HINT}）。
+     */
+    captionModelId: z.string().uuid('captionModelId 不是合法 UUID').nullable().optional(),
   })
   .refine(
     (body) =>
@@ -365,7 +405,8 @@ export const updateKnowledgeBaseBodySchema = z
       body.chunkSize !== undefined ||
       body.chunkOverlap !== undefined ||
       body.retrievalConfig !== undefined ||
-      body.embeddingModelId !== undefined,
+      body.embeddingModelId !== undefined ||
+      body.captionModelId !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
 export type UpdateKnowledgeBaseBody = z.infer<typeof updateKnowledgeBaseBodySchema>
@@ -393,6 +434,13 @@ export const removeKnowledgeBaseResultSchema = z.object({
   deletedDocuments: z.number().int().min(0),
   /** 连带删除的 S3 对象数（≤ `deletedDocuments`） */
   deletedObjects: z.number().int().min(0),
+  /**
+   * 连带**自动解绑**的智能体数（`agent_components` 里指向本库的 `KNOWLEDGE` 组件，删除后为零）。
+   *
+   * 删库**不再因为"被智能体绑定"而 409**（2026-10-08 需求）：绑定随删除一起解除，
+   * 界面在确认弹窗里据此明示"会解绑 N 个智能体"，成功提示里也可以带上。
+   */
+  unboundAgents: z.number().int().min(0),
 })
 export type RemoveKnowledgeBaseResult = z.infer<typeof removeKnowledgeBaseResultSchema>
 
@@ -418,6 +466,26 @@ export const REBUILD_SEARCHABLE_HINT =
  */
 export const EMBEDDING_MODEL_CHANGE_REBUILD_HINT =
   '更换向量模型后需要重建整库索引才能恢复向量检索（旧向量与当前模型不在同一空间）；重建前全文检索仍可用'
+
+/**
+ * 图片描述模型必须**支持视觉**的提示（P1-11）。
+ *
+ * 它由后端在建/改知识库时对 `captionModelId` 校验抛出（`400`）：所选模型若不是 `type=CHAT`
+ * 或未勾选 `supportsVision`，图片描述阶段会把它当普通文本模型用、必然失败或产出无意义结果，
+ * 故**在保存那一刻就拦掉**、并指向模型池里那个开关。
+ */
+export const CAPTION_MODEL_MUST_SUPPORT_VISION_HINT =
+  '图片描述模型必须是「对话」类型且支持视觉的模型：请到「模型池」编辑该模型，勾选「支持图片」（supportsVision）后再选它'
+
+/**
+ * 知识库处于 {@link knowledgeBaseItemSchema} 的 `needsRebuild` 状态时，拒绝单篇入库操作（P1-5）的错误文案。
+ *
+ * 由后端 `uploadDocument` / `reuploadDocument` / `retryDocument` 在**入队前**抛出（`409`）——
+ * 这几个动作一次只向量化一篇，会让库出现"新旧维度/模型混合"的半迁移状态、且向量检索会出问题，
+ * 必须整库重建。详情页在 `needsRebuild` 时把这三个入口禁用，并给出「重建整库索引」按钮，与本文案一致。
+ */
+export const KNOWLEDGE_BASE_NEEDS_REBUILD_HINT =
+  '该知识库的向量模型已变更（已有向量与当前模型不一致），必须整库重建索引后才能继续入库 / 重试 / 覆盖重传；请在知识库详情页点「重建整库索引」'
 
 /**
  * `POST /api/knowledge-bases/:id/rebuild` 的响应（P1-5）。

@@ -52,7 +52,7 @@
  *   · 没有终帧（断线 / 停止超时）⇒ 按条数让位（那一条，是对齐动作的一部分）。
  */
 
-import { Button, Drawer, Select, Tag } from 'antd'
+import { Button, Drawer, Select, Switch, Tag } from 'antd'
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
@@ -64,7 +64,9 @@ import { useAgent } from '../../api/agents.js'
 import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
 import {
   conversationMessagesQueryKey,
+  fetchConversationActive,
   flattenMessagePages,
+  setConversationAutoApprove,
   useConversationMessages,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
@@ -193,6 +195,31 @@ export function ChatPage() {
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
   const [confirmPending, setConfirmPending] = useState(false)
+
+  /**
+   * 会话级自动审批开关（本地镜像）。打开后本会话内危险的 MCP 工具不再逐次弹确认卡
+   * —— 面向"一个场景里连续调很多次 MCP"的用法（真值在服务端 Redis，见 `api/conversations.ts`）。
+   * 切换会话时**先重置为关**（安全默认），再问服务端要当前值（`/active` 一并回带 `autoApprove`）。
+   */
+  const [autoApprove, setAutoApprove] = useState(false)
+  /** 开关在飞（保存中禁用 + 转圈） */
+  const [autoApprovePending, setAutoApprovePending] = useState(false)
+  useEffect(() => {
+    setAutoApprove(false)
+    if (conversationId === undefined) return
+    let cancelled = false
+    void fetchConversationActive(conversationId)
+      .then((active) => {
+        if (!cancelled) setAutoApprove(active.autoApprove)
+      })
+      .catch(() => {
+        // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
+        // 它与断线对齐共用，失败不影响本轮对话。
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [conversationId])
   /** 窄屏下的产物抽屉开关（第三列被 CSS 藏在 ≥1280 才显示，窄屏用抽屉给入口，见 `ArtifactPanel` 那段） */
   const [artifactDrawerOpen, setArtifactDrawerOpen] = useState(false)
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
@@ -607,6 +634,33 @@ export function ChatPage() {
     [conversationId, feedback],
   )
 
+  /**
+   * 切换会话级自动审批。请求成功后才用服务端回带的值对齐本地开关（不乐观更新）：
+   * 这是一个"会放行破坏性操作"的模式，宁可慢一拍，也不要让界面显示"已开启"而服务端其实没写进去。
+   */
+  const handleToggleAutoApprove = useCallback(
+    (next: boolean): void => {
+      if (conversationId === undefined) return
+      setAutoApprovePending(true)
+      void setConversationAutoApprove(conversationId, next)
+        .then((result) => {
+          setAutoApprove(result.autoApprove)
+          feedback.ok(
+            result.autoApprove
+              ? '已开启自动审批：本会话内危险工具不再逐次确认'
+              : '已关闭自动审批：恢复逐次确认',
+          )
+        })
+        .catch((error: unknown) => {
+          feedback.fail(error, '自动审批开关没有保存')
+        })
+        .finally(() => {
+          setAutoApprovePending(false)
+        })
+    },
+    [conversationId, feedback],
+  )
+
   // ── 侧栏（P0-1-34）的三个动作 ──────────────────────────────────────────────
 
   /** 切到某个会话。用 `push`（不是 `replace`）：这**是**一次导航，后退该能回到上一个会话 */
@@ -720,6 +774,22 @@ export function ChatPage() {
               </p>
             </div>
             <div className="chat__head-right">
+              {/* 会话级自动审批：开启后本会话内危险工具（含服务端 elicitation）不再逐次弹确认卡。
+                  `conversationId` 未建（新会话态）时禁用 —— 开关是挂在会话上的。 */}
+              <Switch
+                size="small"
+                checked={autoApprove}
+                loading={autoApprovePending}
+                disabled={conversationId === undefined}
+                checkedChildren="自动审批"
+                unCheckedChildren="逐次确认"
+                onChange={handleToggleAutoApprove}
+                title={
+                  conversationId === undefined
+                    ? '发送第一条消息后可用'
+                    : '开启后本会话内危险工具不再逐次弹确认卡（会话级，仅本会话生效）'
+                }
+              />
               {/* 模型选择器（模型池特性）：池里有 2 个及以上模型时才给选择器；否则只有默认模型、
                   没有可选项，用上面的文字标签展示即可。选了非默认模型时随发送透传给后端
                   （`POST /:id/chat` 的 modelId），后端校验它是该智能体模型池成员。 */}

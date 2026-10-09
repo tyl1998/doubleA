@@ -427,7 +427,13 @@ const MODEL_MANAGE_SELECT = {
   // 只算**在线**智能体（未软删）：软删的智能体删除时已把 model_id 置空、不再占用模型；
   // 但为兼容历史软删行（迁移前置空逻辑上线前留下的），这里显式过滤 deletedAt: null，
   // 保证"删了智能体、模型就不再显示被绑定"（删智能体自动解绑）。
-  _count: { select: { agents: { where: { deletedAt: null } } } },
+  _count: {
+    select: {
+      agents: { where: { deletedAt: null } },
+      // 有多少知识库把它当 embedding 用（编辑被引用的向量模型时要提示这些库需重建）
+      knowledgeBases: true,
+    },
+  },
 } as const
 
 /** {@link MODEL_MANAGE_SELECT} 的产物形态 */
@@ -446,7 +452,7 @@ interface ModelRow {
   createdAt: Date
   updatedAt: Date
   provider: { name: string; enabled: boolean }
-  _count: { agents: number }
+  _count: { agents: number; knowledgeBases: number }
 }
 
 /** 可选列表的查询字段（`GET /api/models/available`）：只要下拉需要的，管理字段一律不带 */
@@ -493,6 +499,7 @@ function toModelItem(row: ModelRow): ModelItem {
     supportsReasoning: row.supportsReasoning,
     enabled: row.enabled,
     agentCount: row._count.agents,
+    knowledgeBaseCount: row._count.knowledgeBases,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }

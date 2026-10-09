@@ -136,16 +136,17 @@ enum DocumentStatus {
   @@map("document_status")
 }
 
-/// 文档内图片的处理方式（上传/覆盖重建时选定；与 `shared/src/document.ts#IMAGE_MODES` 逐字一致）。
-/// · NONE —— 不解析图片（历史行为）；
-/// · OCR —— 抽取图片后本地 OCR 成文字，作为普通文本块进分块/向量化；
-/// · MULTIMODAL —— 抽取图片转 base64，作为 content part 交给多模态 embedding 模型直接向量化。
-enum ImageMode {
+/// 文档内图片的识别方式（上传/覆盖重建时选择；与 `shared/src/document.ts#IMAGE_RECOGNITIONS` 逐字一致）。
+/// OCR 与大模型识别**互斥**（三选一）；图片向量化是另一个正交的开关（见 `Document.imageVectorize`）。
+/// · NONE —— 不识别图片；
+/// · OCR  —— 本地 OCR 出文字（文本块）；
+/// · LLM  —— 大模型识别：用该库选定的「图片描述模型」生成含义/描述（P1-11，文本块）。
+enum ImageRecognition {
   NONE
   OCR
-  MULTIMODAL
+  LLM
 
-  @@map("image_mode")
+  @@map("image_recognition")
 }
 
 /// MCP server 的注册方式（`02` §三：`auth_type(NONE|OAUTH)`）。
@@ -284,6 +285,8 @@ model Model {
   agentPool AgentModel[]
   /// 把本模型用作 embedding 的知识库（`KnowledgeBase.embeddingModelId`）
   knowledgeBases KnowledgeBase[] @relation("KnowledgeBaseEmbeddingModel")
+  /// 把本模型用作"图片描述（VLM 描述）"的知识库（`KnowledgeBase.captionModelId`，P1-11）
+  captionKnowledgeBases KnowledgeBase[] @relation("KnowledgeBaseCaptionModel")
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -504,6 +507,10 @@ model KnowledgeBase {
   /// 该库 embedding 向量的维度快照（建库时**探测**该模型输出后写入）。
   /// `chunks.embedding` 自本批起是**无固定维度**的 `vector`，检索按此维度收窄。
   embeddingDim   Int?     @map("embedding_dim")
+  /// 图片"含义"理解（VLM 描述，P1-11）用的 vision 对话模型（模型池里 `type=CHAT` 且 `supportsVision`）。
+  /// 可空 = 该库不产出图片描述（no-op）；模型被删/停用时置空（之后的文档不再描述，已入库内容不变）。
+  /// 与 `embeddingModelId` 是**两件事**：这个只影响"图片含义"这一步，不影响向量化/检索。
+  captionModelId String?  @map("caption_model_id") @db.Uuid
   chunkSize      Int      @default(512) @map("chunk_size")
   chunkOverlap   Int      @default(64) @map("chunk_overlap")
   /// 形状见 `子方案①` §二：`{topK, score, mode, splitStrategy, rrfK, weights:{vector,fulltext}}`
@@ -514,6 +521,8 @@ model KnowledgeBase {
   documents Document[]
   /// 选定的 embedding 模型（删模型时不删库，只把引用置空 ⇒ 该库退化为纯全文检索，需重建）
   embeddingModelRef Model? @relation("KnowledgeBaseEmbeddingModel", fields: [embeddingModelId], references: [id], onDelete: SetNull)
+  /// 选定的图片描述模型（P1-11）：删模型时置空 ⇒ 之后的文档不再产出图片描述（不影响入库）
+  captionModelRef Model? @relation("KnowledgeBaseCaptionModel", fields: [captionModelId], references: [id], onDelete: SetNull)
 
   @@map("knowledge_bases")
 }
@@ -539,8 +548,11 @@ model Document {
   chunkCount  Int            @default(0) @map("chunk_count")
   errorMsg    String?        @map("error_msg") @db.Text
   contentHash String         @map("content_hash") @db.VarChar(64)
-  /// 图片处理方式（上传/覆盖重建时选定）。`NONE` = 历史行为。见 {@link ImageMode}
-  imageMode   ImageMode      @default(NONE) @map("image_mode")
+  /// 图片的**处理选项**（上传/覆盖重建时选定，见 `shared/src/document.ts#DocumentImageOptions`）。
+  /// · imageRecognize —— 识别方式**三选一**（NONE / OCR / LLM；见 {@link ImageRecognition}）
+  /// · imageVectorize —— 图片走多模态向量（要求该库向量模型支持多模态端点），与识别方式**正交**
+  imageRecognize ImageRecognition @default(NONE) @map("image_recognize")
+  imageVectorize Boolean          @default(false) @map("image_vectorize")
   createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt   DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
 

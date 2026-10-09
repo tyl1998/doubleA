@@ -27,13 +27,17 @@
  * ② **每一块都是 `parsed.text` 的逐字子串**。整条链上只做"取连续区间"，从不拼接
  *    新内容（重叠也是取前一块的尾部，不是新造的句子）⇒ P0-1-20 的"引用片段与原文逐字一致"
  *    在本层就已成立，不必等检索层去补救。
+ *    ⚠️ **唯一的例外是"超长表格的续片"**：表格作为原子单元，超过 `chunk_size` 时按行切开、
+ *    每片前面重复表头（`parse/table.ts` 的 `splitTableText`）—— 续片因此不是逐字子串。
+ *    这是刻意取舍：表格不重复表头就完全不可读、也不可检索。触发条件仅"表格块自身超长"，
+ *    普通文本块与未超长的表格块仍逐字成立。
  * ③ **块的 `headingPath` / `page` 取自"该块起点落在哪个段"**，不是"该块属于哪个 Section"：
  *    一个 Section 可能跨页（PDF），此时"整块都用 Section 首页"会把页码全部说成第 1 页。
  */
 
 import type { SplitStrategy } from '@doubulea/shared'
 
-import type { ParseResult, ParsedBlock } from '../parse/types.js'
+import type { ParsedBlock, ParsedBlockKind, ParseResult } from '../parse/types.js'
 
 /** 块内结构元数据 —— 落 `chunks.meta`（§4-2 第 4 条、§4-4）。`seq` 不在这里：它是独立列。 */
 export interface ChunkMeta {
@@ -41,6 +45,11 @@ export interface ChunkMeta {
   headingPath: string[]
   /** 页码（1 起）；非分页格式为 `null` */
   page: number | null
+  /**
+   * 图片类型（P1-11，仅 `MULTIMODAL` 图片块）：`flowchart` / `chart` / `diagram` / `photo` /
+   * `text` / `unknown`。由 VLM 判定，落 `chunks.meta` 供检索过滤 / 前端区分渲染。
+   */
+  imageKind?: string
 }
 
 /** 随块一起向量化的一张图片（`MULTIMODAL` 模式；由 embedding 层转成 content part） */
@@ -163,6 +172,54 @@ export function locateBlock(spans: readonly BlockSpan[], offset: number): BlockS
     found = span
   }
   return found ?? spans[0]
+}
+
+/**
+ * 原子单元：**连续的非表格块**合成一个文本单元（保持原样逐字），**每个表格块**各自独立成表单元。
+ *
+ * 存在的意义：表格必须在分块时保持完整 —— 文本单元内部可自由按字符切，表单元则整块保留
+ * （超过 `chunk_size` 时按行切并重复表头，见 `parse/table.ts`）。`fixed` 直接用本函数；
+ * `hybrid` 因为还要按标题切 Section，在自己的 Section 内做等价的合并（见 `hybrid.ts`）。
+ *
+ * `start` 是块首在 `parsed.text` 里的**码点**偏移（与 `blockSpans` 同一坐标系）。
+ */
+export interface ChunkUnit {
+  kind: ParsedBlockKind
+  start: number
+  text: string
+}
+
+export function atomicUnits(blocks: readonly ParsedBlock[]): ChunkUnit[] {
+  const units: ChunkUnit[] = []
+  let parts: string[] = []
+  let unitStart = 0
+  let cursor = 0
+
+  const flushText = (): void => {
+    if (parts.length > 0) {
+      units.push({ kind: 'text', start: unitStart, text: parts.join('\n\n') })
+      parts = []
+    }
+  }
+
+  for (const block of blocks) {
+    if (block.kind === 'table') {
+      flushText()
+      units.push({ kind: 'table', start: cursor, text: block.text })
+    } else {
+      if (parts.length === 0) unitStart = cursor
+      parts.push(block.text)
+    }
+    cursor += [...block.text].length + 2
+  }
+  flushText()
+
+  // 防御：调用方给了 text 却没有 blocks（手工构造的 ParseResult）时，整段当作文本单元
+  if (units.length === 0) {
+    const joined = blocks.map((block) => block.text).join('\n\n')
+    if (joined !== '') units.push({ kind: 'text', start: 0, text: joined })
+  }
+  return units
 }
 
 /** 由一段的元数据造块内 meta（统一口径：`headingPath` 拷贝一份，避免下游改到源数据） */

@@ -290,6 +290,32 @@ export function chatConfirmKey(conversationId: string): string {
  * ⚠️ 也不能短于一次轮询周期 —— 应答在消费方读到之前过期，用户就会看到"点了确认但没反应"。
  */
 export const CHAT_CONFIRM_TTL_SEC = 60
+
+/**
+ * `chat.autoapprove:{conversationId}` 键名 —— **会话级自动审批开关**。
+ *
+ * 打开后，本会话内危险的 MCP 工具（以及服务端反向 elicitation）在编排层
+ * (`orchestrator/sse.ts#awaitConfirm`) 被直接按"确认"放行，不再逐次弹确认卡。
+ *
+ * 三条口径：
+ *   · 值只认 `'1'`（开）；键不存在 = 关 —— **安全默认**：任何读取失败/键丢失都退回"要确认"；
+ *   · 它是**会话级、运行时**的模式开关，不落库、不参与断线重连快照，故**单独一个键**
+ *     （不塞进 `chat.active:{id}`：那个键的语义是"有没有流在跑"，混进去会让 409 判定多一个维度）；
+ *   · 主机制是**显式清除**（界面关掉 / 删除会话时 `removeConversation` 删键），TTL 只作兜底。
+ */
+export function chatAutoApproveKey(conversationId: string): string {
+  return `chat.autoapprove:${conversationId}`
+}
+
+/**
+ * 自动审批开关的 TTL（秒）。
+ *
+ * 与 {@link SANDBOX_TOKEN_TTL_SEC} 同一条推理：**主机制是显式清除**（用户关掉 / 删会话时删键），
+ * TTL 只为"模式被打开后彻底没人管"兜底。取 12 小时是刻意的：既足够覆盖"一个跑很久的自动化场景"，
+ * 又不会让一个被遗忘的"自动放行"在库里永久留存。
+ */
+export const CHAT_AUTO_APPROVE_TTL_SEC = 12 * 3600
+
 /**
  * 停止信号的 TTL（秒）—— `02` §5.2 明文规定 60s，不是随手取的数。
  *

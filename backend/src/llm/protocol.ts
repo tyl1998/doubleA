@@ -48,6 +48,11 @@
  *     `response.output_item.added` + 若干 `response.function_call_arguments.delta`。
  *     ⇒ 本文件把三者归一成同一种**分片**（{@link ToolCallChunk}），累积器
  *     （{@link absorbToolCalls} / {@link readToolCalls}）也是同一份。**绝不在第一片 parse**。
+ *     ⚠️ 累积器**不能只按 `index` 归段**：mimo（xiaomi）并行调用时每个调用都发 `index: 0`
+ *     （违反 OpenAI 规范），照 index 拼会把多次调用揉成非法 JSON —— 详见 {@link ToolCallBuffer}。
+ *     ⚠️ 还有更野的一手：mimo 会把参数的一部分**从 `content` 通道**以原生 XML
+ *     （`<tool_call><function=…><parameter=…>`）吐出，害得 `arguments` 只剩半截。恢复见
+ *     {@link parseTextToolCalls}（在 `client.ts` 收尾处调用）。
  *   · **工具结果回填的消息形态不同**（坑预判 2）：OpenAI 是 `role:'tool'` + `tool_call_id`；
  *     Anthropic 是**用户消息里的 `tool_result` 块**；Responses 是顶层
  *     `{type:'function_call_output', call_id}`。⇒ 全在各自的 `buildBody` 里映射，
@@ -352,28 +357,78 @@ interface ToolCallSegment {
  * 累积器。**半成品只活在 `client.ts` 的一个局部变量里**（它不认识工具、也不解析参数）。
  *
  * 用 `Map` 而不是数组：段的到达顺序**不保证**（网关可能把 index=1 的片先发出来），
- * 而 `Map` 既保插入序、又按键去重 —— 输出顺序因此是"上游给 index 的顺序"，
+ * 而 `Map` 既保插入序、又按键去重 —— 输出顺序因此是"上游给的顺序"，
  * 与 `06` 坑预判 4 的"一次多个 `tool_calls` 按顺序执行"对得上。
+ *
+ * ⚠️ **不能只按上游 `index` 归段**（2026-10-08 实测并修复）：mimo（xiaomi）在**并行**工具调用时
+ * **每个调用都发 `index: 0`**（只有首片带新 `id`），照 OpenAI 规范应递增 index。若按 index 归段，
+ * 多个调用的 `arguments` 分片会被拼进同一段 ⇒ 得到 `{"a":1}{"a":2}` 这种非法 JSON
+ * （症状：`工具调用失败：模型给出的参数不是合法 JSON`，且模型反复重试烧光轮数）。
+ * 因此这里改为**以"新 id"作为一次调用的边界**归段，`index` 只作为"无 id 的后续分片"的兜底索引。
  */
 export interface ToolCallBuffer {
+  /** 段键（**本模块自增分配**，不再等于上游 index）→ 段 */
   readonly segments: Map<number, ToolCallSegment>
+  /** 已见过的调用 `id` → 段键（重复出现的 id 归到同一次调用） */
+  readonly idToKey: Map<string, number>
+  /**
+   * 上游 `index` → **最近一次**以该 index 打开的段的键。无 id 的后续分片按它归位：
+   *   · 标准 OpenAI/Responses/Anthropic：每个调用的 index 唯一 ⇒ 精确命中自己的段；
+   *   · mimo 并行调用：所有调用 index 都是 0 ⇒ 命中的是**最近打开**的那次（正确）。
+   */
+  readonly indexToKey: Map<number, number>
+  /** 段键自增分配器 */
+  nextKey: number
 }
 
 export function createToolCallBuffer(): ToolCallBuffer {
-  return { segments: new Map() }
+  return { segments: new Map(), idToKey: new Map(), indexToKey: new Map(), nextKey: 0 }
 }
 
 /** 把一帧带来的分片并进累积器（**只做字符串拼接，不解析**） */
 export function absorbToolCalls(buffer: ToolCallBuffer, chunks: readonly ToolCallChunk[]): void {
   for (const chunk of chunks) {
-    const segment = buffer.segments.get(chunk.index) ?? { id: null, name: null, args: '' }
     // 空串按"这一片没带"处理（有的网关会先发一个 `id: ""` 的占位片，覆盖会把真 id 冲掉）
-    if (chunk.id !== undefined && chunk.id !== '') segment.id = chunk.id
+    const incomingId = chunk.id !== undefined && chunk.id !== '' ? chunk.id : null
+
+    // ── 决定这一段并进哪个 key ──
+    let key: number
+    if (incomingId !== null) {
+      const known = buffer.idToKey.get(incomingId)
+      if (known !== undefined) {
+        key = known
+      } else {
+        /**
+         * **新 id = 新一次调用**（见接口注释：不能用 chunk.index —— mimo 并行调用 index 恒为 0）。
+         *
+         * 分配新键前做两件防御（针对"不走标准协议"的上游，标准三家首片必带 id，用不到）：
+         *   · **收养**：该 index 上若已有一段"无主段"（参数先到、id 后到）⇒ 认领它，别把参数丢了；
+         *   · **跳过已占用键**：自增键绝不覆盖任何现有段（否则会静默吞掉另一个调用的参数）。
+         */
+        const mapped = buffer.indexToKey.get(chunk.index)
+        const raw = buffer.segments.get(chunk.index)
+        if (mapped === undefined && raw !== undefined && raw.id === null) {
+          key = chunk.index
+        } else {
+          key = buffer.nextKey
+          while (buffer.segments.has(key)) key += 1
+          buffer.nextKey = key + 1
+        }
+        buffer.idToKey.set(incomingId, key)
+      }
+      buffer.indexToKey.set(chunk.index, key)
+    } else {
+      // 无 id 的后续分片：按上游 index 找"最近以该 index 打开的段"，找不到再退回 index 本身
+      key = buffer.indexToKey.get(chunk.index) ?? chunk.index
+    }
+
+    const segment = buffer.segments.get(key) ?? { id: null, name: null, args: '' }
+    if (incomingId !== null) segment.id = incomingId
     if (chunk.name !== undefined && chunk.name !== '') segment.name = chunk.name
     if (chunk.argumentsDelta !== undefined) segment.args += chunk.argumentsDelta
     // 见 {@link ToolCallChunk.argumentsReplace}：只补"一片 delta 都没收到"的空档
     if (chunk.argumentsReplace !== undefined && segment.args === '') segment.args = chunk.argumentsReplace
-    buffer.segments.set(chunk.index, segment)
+    buffer.segments.set(key, segment)
   }
 }
 
@@ -433,6 +488,77 @@ export function parseToolArguments(raw: string): ToolArgumentsParse {
     return { ok: false, reason: '模型给出的参数不是 JSON 对象' }
   }
   return { ok: true, value: parsed as Record<string, unknown> }
+}
+
+/** {@link parseTextToolCalls} 的产出：从正文里捞出来的调用（**还没有 id**，由调用方补） */
+export interface TextToolCall {
+  name: string
+  arguments: string
+}
+
+/** 正文里的 mimo 原生调用块 */
+const TEXT_TOOL_CALL_BLOCK = /<tool_call\b[^>]*>([\s\S]*?)<\/tool_call\s*>/gi
+/** 块内的 `<function=NAME>…</function>` */
+const TEXT_FUNCTION_BLOCK = /<function\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\/function\s*>/i
+/** 函数内的 `<parameter=KEY>VALUE</parameter>`（可重复） */
+const TEXT_PARAMETER_BLOCK = /<parameter\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\/parameter\s*>/gi
+
+/** 常见 XML 实体解码（mimo 的参数值是纯文本，正常不会用到，做一层保险） */
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/** 把 XML 里的文本值还原成标量：`true`/`false`/`null`/数字 还原类型，其余保持字符串 */
+function coerceXmlScalar(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (trimmed === 'true') return true
+  if (trimmed === 'false') return false
+  if (trimmed === 'null') return null
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed)
+  return raw
+}
+
+/**
+ * 从**正文文本**里解析工具调用 —— 专治 mimo（xiaomi）的一个协议缺陷（2026-10-08 实测）。
+ *
+ * 缺陷是什么：mimo 在**流式**下发工具调用时，会把一部分参数**从 `content` 通道**以
+ * `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>` 的
+ * 原生 XML 形式吐出来，而 `delta.tool_calls[].function.arguments` **只有前半截**
+ * （实测参数值恰好落在 content 里）。结果：`tool_calls` 通道拼出来的 `arguments` 是
+ * `{"name": "…", "parentId": ` 这种**截断的非法 JSON**，而**完整内容其实在正文里**。
+ *
+ * 所以恢复办法是：**正文里的 XML 才是这次调用的完整信息来源**，按它重建 `{name, arguments}`。
+ * 只对本格式生效 —— 标准 OpenAI/Responses/Anthropic 不会把调用写进正文，解析结果为空、不影响。
+ *
+ * ⚠️ 值与键都按纯文本读；值做标量还原（数字/布尔/null），其余按字符串。**不猜测缺失字段**：
+ * 正文里没有的键就是没有，与 {@link parseToolArguments} 的"不猜"纪律一致。
+ */
+export function parseTextToolCalls(text: string): TextToolCall[] {
+  const calls: TextToolCall[] = []
+  if (!text.includes('<tool_call')) return calls
+  TEXT_TOOL_CALL_BLOCK.lastIndex = 0
+  let block: RegExpExecArray | null
+  while ((block = TEXT_TOOL_CALL_BLOCK.exec(text)) !== null) {
+    const fn = TEXT_FUNCTION_BLOCK.exec(block[1] ?? '')
+    if (fn === null) continue
+    const name = (fn[1] ?? '').trim()
+    if (name === '') continue
+    const args: Record<string, unknown> = {}
+    TEXT_PARAMETER_BLOCK.lastIndex = 0
+    let param: RegExpExecArray | null
+    while ((param = TEXT_PARAMETER_BLOCK.exec(fn[2] ?? '')) !== null) {
+      const key = (param[1] ?? '').trim()
+      if (key === '') continue
+      args[key] = coerceXmlScalar(decodeXmlEntities(param[2] ?? ''))
+    }
+    calls.push({ name, arguments: JSON.stringify(args) })
+  }
+  return calls
 }
 
 /**

@@ -432,7 +432,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
             }
 
       /**
-       * 内置工具（知识库）的反查：**认名字**（`knowledge_search` / `list_knowledge`）—— 它们
+       * 内置工具（知识库）的反查：**认名字**（`knowledge_search` / `list_knowledge` / `read_document`）—— 它们
        * 不是 MCP、没有 `alias`，判据只有"清单里下发过它"这一条（`resolverCatalog.builtins`）。
        * 认出来 ⇒ 卡片 `kind: BUILTIN` + 展示名"知识库"（与 ChatBot 路径同一个 kind）。
        */
@@ -662,7 +662,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     assistantText: round.assistantText,
     thinkingText: round.thinkingText,
     // TaskAgent **不发引用卡**（那一族是 ChatBot 的 rendering）：知识库走**内置工具卡**
-    // （`knowledge_search` / `list_knowledge` 经 `/api/sandbox/builtin/call`，见 `proxy.ts`），
+    // （`knowledge_search` / `list_knowledge` / `read_document` 经 `/api/sandbox/builtin/call`，见 `proxy.ts`），
     // 结果以 `tool_calls` 落库/展示 ⇒ `citations` 恒为空。这是刻意的口径，不是漏接。
     citations: [],
     toolRecords: round.toolRecords,

@@ -27,7 +27,13 @@
  */
 
 import { Button, Popconfirm, Table, Tooltip, type TableColumnsType } from 'antd'
-import { IMAGE_MODE_LABELS, isDocumentSearchable, type DocumentItem } from '@doubulea/shared'
+import {
+  describeImageOptions,
+  hasAnyImageOption,
+  KNOWLEDGE_BASE_NEEDS_REBUILD_HINT,
+  isDocumentSearchable,
+  type DocumentItem,
+} from '@doubulea/shared'
 
 import { saveDocumentFile, useRemoveDocument, useRetryDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -42,13 +48,18 @@ import {
 export interface DocumentTableProps {
   kbId: string
   documents: readonly DocumentItem[]
+  /**
+   * 该库处于"需整库重建"状态（`needsRebuild`）：此时**重试 / 覆盖重传**会被后端 409
+   * （单篇入库会写成混合维度）⇒ 这里直接禁用并说明，别让用户点了才被拒。
+   */
+  rebuildRequired?: boolean
   /** 打开「覆盖重传」弹窗（弹窗由页面持有，表格只发意图） */
   onReupload: (doc: DocumentItem) => void
   /** 打开「片段预览」抽屉（同上，抽屉由页面持有） */
   onPreviewChunks: (doc: DocumentItem) => void
 }
 
-export function DocumentTable({ kbId, documents, onReupload, onPreviewChunks }: DocumentTableProps) {
+export function DocumentTable({ kbId, documents, rebuildRequired = false, onReupload, onPreviewChunks }: DocumentTableProps) {
   const feedback = useFeedback()
   const retry = useRetryDocument(kbId)
   const remove = useRemoveDocument(kbId)
@@ -92,8 +103,8 @@ export function DocumentTable({ kbId, documents, onReupload, onPreviewChunks }: 
           <span className="kb-cell__name">{doc.fileName}</span>
           <span className="kb-cell__sub num">
             {documentExtensionLabel(doc.fileName)}
-            {/* 选了图片解析方式时补一个标记（默认 `NONE` 不显示，避免满屏噪音） */}
-            {doc.imageMode !== 'NONE' && ` · ${IMAGE_MODE_LABELS[doc.imageMode]}`}
+            {/* 勾了图片选项时补一个标记（全关不显示，避免满屏噪音） */}
+            {hasAnyImageOption(doc) && ` · ${describeImageOptions(doc)}`}
           </span>
         </div>
       ),
@@ -152,16 +163,25 @@ export function DocumentTable({ kbId, documents, onReupload, onPreviewChunks }: 
               下载
             </Button>
             {actions.canReupload && (
-              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => onReupload(doc)}>
-                覆盖重传
-              </Button>
-            )}
-            {actions.canRetry && (
-              <Tooltip title={actions.retryHint}>
+              <Tooltip title={rebuildRequired ? KNOWLEDGE_BASE_NEEDS_REBUILD_HINT : undefined}>
                 <Button
                   type="link"
                   size="small"
                   style={{ padding: 0 }}
+                  disabled={rebuildRequired}
+                  onClick={() => onReupload(doc)}
+                >
+                  覆盖重传
+                </Button>
+              </Tooltip>
+            )}
+            {actions.canRetry && (
+              <Tooltip title={rebuildRequired ? KNOWLEDGE_BASE_NEEDS_REBUILD_HINT : actions.retryHint}>
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ padding: 0 }}
+                  disabled={rebuildRequired}
                   loading={retry.isPending && retry.variables === doc.id}
                   onClick={() => doRetry(doc)}
                 >

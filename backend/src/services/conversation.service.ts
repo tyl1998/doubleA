@@ -106,7 +106,7 @@ import {
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma, type PrismaClientInstance } from '../infra/prisma.js'
-import { chatActiveKey, getRedis } from '../infra/redis.js'
+import { chatActiveKey, chatAutoApproveKey, getRedis } from '../infra/redis.js'
 import { getS3Client } from '../infra/s3.js'
 import type { LlmTarget } from '../llm/client.js'
 import { resolveChatAttachments, type ChatAttachmentContext } from './file.service.js'
@@ -357,11 +357,13 @@ export async function removeConversation(
   })
 
   // ② 活跃流锁：不删它会留到 TTL 过期（无害，但 Redis 里会积一批指向已删会话的键，
-  //    而 `/active` 对已删会话是 404 ⇒ 没人能发现它们是垃圾）
+  //    而 `/active` 对已删会话是 404 ⇒ 没人能发现它们是垃圾）。
+  //    同时清掉自动审批开关键（同一批"指向已删会话的垃圾"；不删它虽会 12h 后自行过期，
+  //    但会话都没了、开关留着没有任何意义）
   try {
-    await getRedis().del(chatActiveKey(id))
+    await getRedis().del(chatActiveKey(id), chatAutoApproveKey(id))
   } catch (error) {
-    getLogger().warn({ err: error, conversationId: id }, '活跃流锁清理失败（会话已删除，键会自行过期）')
+    getLogger().warn({ err: error, conversationId: id }, '活跃流锁/自动审批开关清理失败（会话已删除，键会自行过期）')
   }
 
   // ⚠️ ③ 产物**不删**（文件头 ⑥）：`conversation_id` 由外键自动置空、产物归"会话产物"，
@@ -559,8 +561,15 @@ export async function getConversationActive(
 ): Promise<ConversationActive> {
   await findMyConversation(id, viewer)
 
-  const raw = await getRedis().get(chatActiveKey(id))
-  if (raw === null) return { streaming: false, ...EMPTY_ACTIVE_SNAPSHOT }
+  // 两个键各读各的、互不相干：`chat.active:{id}` 决定 `streaming` 与进度快照，
+  // `chat.autoapprove:{id}` 是本会话的自动审批开关（与"有没有流在跑"无关，见 redis.ts）。
+  const [raw, autoApproveRaw] = await Promise.all([
+    getRedis().get(chatActiveKey(id)),
+    getRedis().get(chatAutoApproveKey(id)),
+  ])
+  // 只认 `'1'`；读失败/键缺失都当"关"（安全默认，与 `sse.ts#readAutoApprove` 同口径）
+  const autoApprove = autoApproveRaw === '1'
+  if (raw === null) return { streaming: false, autoApprove, ...EMPTY_ACTIVE_SNAPSHOT }
 
   const snapshot = parseActiveSnapshot(raw)
   if (snapshot.currentTool === null && snapshot.queuedPosition === null && snapshot.startedAt === null) {
@@ -568,7 +577,7 @@ export async function getConversationActive(
     // 但对读侧不构成失败：锁确实在，只是细节丢了。
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
-  return { streaming: true, ...snapshot }
+  return { streaming: true, autoApprove, ...snapshot }
 }
 
 // ═════════════════════════════════════════════════════════════════════

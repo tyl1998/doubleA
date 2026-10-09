@@ -92,7 +92,7 @@ const MCP_TOOL_KIND = 'MCP'
  * `kind` 的第三个取值（`shared#TOOL_CALL_KINDS`）：**平台内置工具**（当前只有知识库一族）。
  *
  * 判据与 MCP 同款 —— "**注入的解析器认出了它**"（它确实是本次会话下发的内置工具之一）。
- * 与 ChatBot 路径**同一个 kind**（`chatBot.ts` 给 `knowledge_search` / `list_knowledge` 发的就是它）。
+ * 与 ChatBot 路径**同一个 kind**（`chatBot.ts` 给 `knowledge_search` / `list_knowledge` / `read_document` 发的就是它）。
  */
 const BUILTIN_TOOL_KIND = 'BUILTIN'
 
@@ -272,7 +272,7 @@ export interface EngineMcpToolCard {
  */
 export interface EngineBuiltinToolCard {
   serverName: string
-  /** 内置工具的**注册名**（`knowledge_search` / `list_knowledge`，无前缀可还原） */
+  /** 内置工具的**注册名**（`knowledge_search` / `list_knowledge` / `read_document`，无前缀可还原） */
   toolName: string
 }
 
@@ -293,7 +293,7 @@ export interface EngineBuiltinToolCard {
 export interface EngineEventMapperOptions {
   resolveMcpTool?: (engineToolName: string) => EngineMcpToolCard | undefined
   /**
-   * 反查"这是不是一个**平台内置工具**"（当前只有 `knowledge_search` / `list_knowledge`）。
+   * 反查"这是不是一个**平台内置工具**"（当前有 `knowledge_search` / `list_knowledge` / `read_document`）。
    * 认出来 ⇒ `kind: BUILTIN` + 展示名（"知识库"）；认不出 ⇒ 照旧 `kind: SANDBOX`。
    * ⚠️ 在本层之外仍然**不碰 DB / Redis**：认哪几个名字由调用方注入（`taskAgent.ts`）。
    */

@@ -34,16 +34,17 @@
 
 import {
   AppError,
-  DEFAULT_IMAGE_MODE,
   documentParamsSchema,
-  IMAGE_MODES,
   knowledgeBaseIdParamsSchema,
   listDocumentChunksQuerySchema,
   listDocumentsQuerySchema,
+  IMAGE_RECOGNITIONS,
   ok,
-  UPLOAD_IMAGE_MODE_FIELD,
+  UPLOAD_IMAGE_RECOGNIZE_FIELD,
+  UPLOAD_IMAGE_VECTORIZE_FIELD,
+  type DocumentImageOptions,
   type DocumentParams,
-  type ImageMode,
+  type ImageRecognition,
   type KnowledgeBaseIdParams,
   type ListDocumentChunksQuery,
   type ListDocumentsQuery,
@@ -71,29 +72,37 @@ function fileTooLarge(fileName: string | undefined): Error {
   return error
 }
 
-/** 解析 multipart 里的图片处理方式字段（缺省 = `NONE`；非法值 400） */
-function parseImageMode(raw: string | undefined): ImageMode {
+/** 解析 multipart 里的布尔字段（`true`/`false`/`1`/`0`；缺省/空串 = `false`；非法值 400） */
+function parseBoolField(raw: string | undefined, label: string): boolean {
+  const value = (raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'false' || value === '0') return false
+  if (value === 'true' || value === '1') return true
+  throw AppError.validation(`${label} 只能是 true / false，收到「${raw}」`)
+}
+
+/** 解析 multipart 里的识别方式字段（缺省/空 = `NONE`；非法值 400） */
+function parseRecognition(raw: string | undefined): ImageRecognition {
   const value = (raw ?? '').trim().toUpperCase()
-  if (value === '') return DEFAULT_IMAGE_MODE
-  if ((IMAGE_MODES as readonly string[]).includes(value)) return value as ImageMode
-  throw AppError.validation(`imageMode 只能是 ${IMAGE_MODES.join(' / ')}，收到「${raw}」`)
+  if (value === '') return 'NONE'
+  if ((IMAGE_RECOGNITIONS as readonly string[]).includes(value)) return value as ImageRecognition
+  throw AppError.validation(`imageRecognize 只能是 ${IMAGE_RECOGNITIONS.join(' / ')}，收到「${raw}」`)
 }
 
 /**
- * 从 multipart 请求里取出唯一那个文件 + 图片处理方式字段（上传与覆盖重建共用，见文件头）。
+ * 从 multipart 请求里取出唯一那个文件 + 图片选项（上传与覆盖重建共用，见文件头）。
  *
- * 用 `request.parts()` 逐项消费而不是 `request.file()`：图片处理方式字段与文件字段的**顺序**
- * 由客户端决定（前端先选解析方式、后放文件，curl 则相反），`request.file()` 只能拿到它之前
+ * 用 `request.parts()` 逐项消费而不是 `request.file()`：图片选项字段与文件字段的**顺序**
+ * 由客户端决定（前端先选选项、后放文件，curl 则相反），`request.file()` 只能拿到它之前
  * 出现的字段。逐项消费与顺序无关。
  */
 async function readUploadedFile(request: FastifyRequest): Promise<{
   fileName: string
   declaredMime: string | undefined
   bytes: Buffer
-  imageMode: ImageMode
-}> {
+} & DocumentImageOptions> {
   let file: { fileName: string; declaredMime: string | undefined; bytes: Buffer } | undefined
-  let imageModeRaw: string | undefined
+  let recognizeRaw: string | undefined
+  let vectorizeRaw: string | undefined
 
   for await (const part of request.parts()) {
     if (part.type === 'file') {
@@ -107,7 +116,8 @@ async function readUploadedFile(request: FastifyRequest): Promise<{
       file = { fileName: part.filename, declaredMime: part.mimetype, bytes }
       continue
     }
-    if (part.fieldname === UPLOAD_IMAGE_MODE_FIELD) imageModeRaw = String(part.value)
+    if (part.fieldname === UPLOAD_IMAGE_RECOGNIZE_FIELD) recognizeRaw = String(part.value)
+    else if (part.fieldname === UPLOAD_IMAGE_VECTORIZE_FIELD) vectorizeRaw = String(part.value)
   }
 
   if (file === undefined) {
@@ -120,7 +130,8 @@ async function readUploadedFile(request: FastifyRequest): Promise<{
     // `fileName` 可能含路径（老式浏览器会把客户端全路径塞进来），服务层只按扩展名判定，
     // 原样存库供展示 —— 路径拼接交给前端（显示时只取 basename）
     ...file,
-    imageMode: parseImageMode(imageModeRaw),
+    imageRecognize: parseRecognition(recognizeRaw),
+    imageVectorize: parseBoolField(vectorizeRaw, UPLOAD_IMAGE_VECTORIZE_FIELD),
   }
 }
 

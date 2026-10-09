@@ -45,6 +45,7 @@ import {
   ok,
   regenerateConversationBodySchema,
   renameConversationBodySchema,
+  setConversationAutoApproveBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
   type ChatRequestBody,
@@ -55,11 +56,12 @@ import {
   type ListMessagesQuery,
   type RegenerateConversationBody,
   type RenameConversationBody,
+  type SetConversationAutoApproveBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { resolveChatProducer } from '../orchestrator/index.js'
-import { answerConfirm, signalStop, streamChatReply } from '../orchestrator/sse.js'
+import { answerConfirm, setAutoApprove, signalStop, streamChatReply } from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
   assertConversationRegenerable,
@@ -367,6 +369,34 @@ export function registerConversationRoutes(app: FastifyInstance): void {
       return ok(
         await answerConfirm(request.params.id, request.body, active.pendingConfirmId),
       )
+    },
+  )
+
+  /**
+   * 打开 / 关闭**会话级自动审批**。
+   *
+   * 打开后本会话内所有危险工具（以及服务端 elicitation）都不再弹确认卡，由
+   * `orchestrator/sse.ts#awaitConfirm` 直接按"确认"放行 —— 面向"一个场景里要连续调很多次
+   * MCP、不想逐次点确认"的用法。
+   *
+   * 判据复用 `/active` 读侧（**顺带完成"这不是我的会话就 404"**，与 `/stop` / `/confirm` 同款，
+   * 不另起一套所有权判定）。写失败**向上抛**（500）：用户点了"打开"，我们却回"已打开"而键没写进去
+   * 是不可接受的（一次会放行破坏性操作的模式被静默地认为生效了）。
+   *
+   * ⚠️ 开关是**运行时、会话级**的（Redis，不落库、不参与 `/active` 快照），
+   * 当前值随 `/active` 一并回带（`conversationActiveSchema.autoApprove`）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SetConversationAutoApproveBody }>(
+    '/api/conversations/:id/auto-approve',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: setConversationAutoApproveBodySchema },
+    },
+    async (request) => {
+      // 先过所有权（不是我的会话 ⇒ 404），再写开关 —— 顺序与 `/confirm` 一致
+      await getConversationActive(request.params.id, viewerOf(request))
+      await setAutoApprove(request.params.id, request.body.enabled)
+      return ok({ id: request.params.id, autoApprove: request.body.enabled })
     },
   )
 }

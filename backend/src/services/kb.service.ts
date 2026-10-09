@@ -38,6 +38,7 @@
 
 import {
   AppError,
+  CAPTION_MODEL_MUST_SUPPORT_VISION_HINT,
   DEFAULT_RETRIEVAL_CONFIG,
   normalizeRetrievalConfig,
   type CreateKnowledgeBaseBody,
@@ -82,11 +83,16 @@ const KB_SELECT = {
     select: {
       modelName: true,
       enabled: true,
-      // 是否支持多模态（上传文档选"多模态向量化"时前端据此提示/禁用）
+      // 是否支持多模态（上传文档选"图片向量化（多模态）"时前端据此提示/禁用）
       embeddingMultimodal: true,
+      // 当前模型输出维度（与库快照比对得出 `needsRebuild`，见下方 kbNeedsRebuild）
+      embeddingDim: true,
       provider: { select: { enabled: true } },
     },
   },
+  // 图片描述模型（P1-11）：只取展示需要的 label（模型被删时关系为 null ⇒ captionModelName 为 null）
+  captionModelId: true,
+  captionModelRef: { select: { label: true } },
 } as const
 
 type KnowledgeBaseRow = {
@@ -105,9 +111,38 @@ type KnowledgeBaseRow = {
     modelName: string
     enabled: boolean
     embeddingMultimodal: boolean
+    embeddingDim: number | null
+    provider: { enabled: boolean }
+  } | null
+  captionModelId: string | null
+  captionModelRef: { label: string } | null
+}
+
+/**
+ * 判定"漂移/需重建"所需的最小字段集（`KB_SELECT` 的超集）。
+ *
+ * 单独抽出来是为了让 `document.service` 的**入库前置闸门**（上传/重试/覆盖重传）复用**同一套判据** ——
+ * 判定逻辑只能有一份（`kbNeedsRebuild`），否则"详情页说不用重建、上传却被拒"这种不一致迟早出现。
+ */
+export interface KbDriftFields {
+  embeddingModel: string
+  embeddingDim: number | null
+  embeddingModelRef: {
+    modelName: string
+    enabled: boolean
+    embeddingDim: number | null
     provider: { enabled: boolean }
   } | null
 }
+
+/** {@link KbDriftFields} 的 Prisma `select`（`document.service` 直接用） */
+export const KB_DRIFT_SELECT = {
+  embeddingModel: true,
+  embeddingDim: true,
+  embeddingModelRef: {
+    select: { modelName: true, enabled: true, embeddingDim: true, provider: { select: { enabled: true } } },
+  },
+} as const
 
 /** Prisma 错误码鸭式判断（`instanceof` 跨包会失效，见 `user.service.ts` 同款） */
 function hasPrismaCode(error: unknown, code: string): boolean {
@@ -129,11 +164,27 @@ function hasPrismaCode(error: unknown, code: string): boolean {
  *   · 模型或其 Provider 被停用；
  *   · 模型的上游型号名变了（库内快照 `embeddingModel` 与当前 `api:<modelName>` 不一致）。
  */
-function embeddingModelChanged(row: KnowledgeBaseRow): boolean {
+function embeddingModelChanged(row: KbDriftFields): boolean {
   const ref = row.embeddingModelRef
   if (ref === null) return true
   if (!ref.enabled || !ref.provider.enabled) return true
   return row.embeddingModel !== apiEmbeddingName(ref.modelName)
+}
+
+/**
+ * 该库是否**必须整库重建**（P1-5 的强制闸门，比 {@link embeddingModelChanged} 更严）。
+ *
+ * = `embeddingModelChanged`（模型被删/停用/改名）**或**"型号没变但**维度**变了"
+ * （当前模型 `embeddingDim` 与库快照 `embeddingDim` 不一致）。
+ *
+ * 为什么维度也要算进去：维度一变，单篇入库写出的向量与旧 chunk 维度不同 —— 检索时旧文档会被
+ * `embedding_dim` 收窄过滤、库进入"半迁移"，用户却以为只是重试了一篇。所以入库/重试/覆盖重传
+ * 在 `true` 时必须被 409 挡住（文案 {@link KNOWLEDGE_BASE_NEEDS_REBUILD_HINT}），强制整库重建。
+ */
+export function kbNeedsRebuild(row: KbDriftFields): boolean {
+  if (embeddingModelChanged(row)) return true
+  const ref = row.embeddingModelRef
+  return ref !== null && ref.embeddingDim !== null && ref.embeddingDim !== row.embeddingDim
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -186,10 +237,19 @@ function toItem(
     name: row.name,
     description: row.description,
     embeddingModel: row.embeddingModel,
+    // "当前模型名"（= 选定的模型此刻的 name）；模型被删时关系为 null
+    embeddingModelCurrent:
+      row.embeddingModelRef === null ? null : apiEmbeddingName(row.embeddingModelRef.modelName),
     embeddingModelId: row.embeddingModelId,
     embeddingDim: row.embeddingDim,
     embeddingMultimodal: row.embeddingModelRef?.embeddingMultimodal ?? false,
+    // 图片描述模型（P1-11）：id + 展示名（模型被删时 ref 为 null ⇒ 名为 null，语义是"该库不再产出图片描述"）
+    captionModelId: row.captionModelId,
+    captionModelName: row.captionModelRef?.label ?? null,
     embeddingModelChanged: embeddingModelChanged(row),
+    // 空库没有"待重建的旧向量"，永远不算需重建 —— 否则"模型被删 + 0 文档"会死锁
+    // （上传被 409 挡、重建又因"没有文档"被 409 挡）；空库只需在编辑里重选一个模型即可。
+    needsRebuild: counts.documentCount > 0 && kbNeedsRebuild(row),
     chunkSize: row.chunkSize,
     chunkOverlap: row.chunkOverlap,
     // ⚠️ 唯一入口：库里可能是 `{}` 或缺键（老数据 / 局部写入 / 手工改库）
@@ -331,10 +391,49 @@ async function resolveEmbeddingSnapshot(modelId: string): Promise<EmbeddingSnaps
 }
 
 /**
+ * 校验并归一化建/改库时选定的"图片描述模型"（P1-11，轨道二）。
+ *
+ * `null`/`undefined` ⇒ `null`（不启用图片描述，阶段 no-op）。给了 id ⇒ 必须是 `CHAT` 且
+ * `supportsVision`（否则图片描述必然失败，不如在保存那一刻拦掉，文案 {@link CAPTION_MODEL_MUST_SUPPORT_VISION_HINT}），
+ * 且模型与 Provider 都启用。
+ *
+ * ⚠️ **刻意不要求 Provider 已配 Key**（与 embedding 的 `resolveEmbeddingTarget` 相反）：描述是
+ * 可选的增强，缺 Key 时 worker 在运行期**降级跳过**（不影响入库），没有理由因此不让人先配好选型。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `VALIDATION`(400) 非对话或非视觉模型
+ *   / `CONFLICT`(409) 模型或 Provider 停用
+ */
+async function resolveCaptionModelId(modelId: string | null | undefined): Promise<string | null> {
+  if (modelId === null || modelId === undefined) return null
+  const row = await getPrisma().model.findUnique({
+    where: { id: modelId },
+    select: {
+      id: true,
+      type: true,
+      enabled: true,
+      supportsVision: true,
+      label: true,
+      provider: { select: { enabled: true } },
+    },
+  })
+  if (row === null) throw AppError.notFound('所选图片描述模型不存在')
+  if (row.type !== 'CHAT' || !row.supportsVision) {
+    throw AppError.validation(CAPTION_MODEL_MUST_SUPPORT_VISION_HINT, {
+      fields: [{ path: 'body.captionModelId', message: CAPTION_MODEL_MUST_SUPPORT_VISION_HINT }],
+    })
+  }
+  if (!row.enabled) throw AppError.conflict(`所选图片描述模型「${row.label}」已停用，请先启用后再选它`)
+  if (!row.provider.enabled) {
+    throw AppError.conflict(`所选图片描述模型「${row.label}」所属的 Provider 已停用，请先启用`)
+  }
+  return row.id
+}
+
+/**
  * 建库（`POST /api/knowledge-bases`，登录即可）。
  *
- * 流程：取 embedding 快照（取不到直接 500，见文件头 ②）→ 快照环境默认值 →
- * 用请求体覆盖 → 校验跨字段约束 → 落库。
+ * 流程：取 embedding 快照（取不到直接 500，见文件头 ②）→ 校验可选的图片描述模型（P1-11）
+ * → 快照环境默认值 → 用请求体覆盖 → 校验跨字段约束 → 落库。
  *
  * **`chunk_overlap < chunk_size` 在服务层校验而不是 zod**：两者可只给其一
  * （省略的那个取环境默认值），zod 看不到"省略的那个会变成多少" —— 只有这里能算。
@@ -349,6 +448,8 @@ export async function createKnowledgeBase(
   // 解析建库时**选定**的 embedding 模型 → `{ embeddingModel, embeddingModelId, embeddingDim }`
   const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId)
   const { embeddingModel, embeddingDim } = snapshot
+  // 可选的图片描述模型（P1-11）：不选则 null（该库不产出图片描述）
+  const captionModelId = await resolveCaptionModelId(input.captionModelId)
 
   const chunkSize = input.chunkSize ?? defaults.chunkSize
   const chunkOverlap = input.chunkOverlap ?? defaults.chunkOverlap
@@ -364,6 +465,7 @@ export async function createKnowledgeBase(
       embeddingModel,
       embeddingModelId: snapshot.embeddingModelId,
       embeddingDim,
+      captionModelId,
       chunkSize,
       chunkOverlap,
       retrievalConfig,
@@ -372,7 +474,7 @@ export async function createKnowledgeBase(
   })
 
   getLogger().info(
-    { kbId: created.id, name: created.name, embeddingModel, embeddingDim, chunkSize, chunkOverlap },
+    { kbId: created.id, name: created.name, embeddingModel, embeddingDim, captionModelId, chunkSize, chunkOverlap },
     '已创建知识库',
   )
   // 刚建的库必然 0 文档 0 引用，不必再查库（也避免"建完立刻查"这一对多余的往返）
@@ -451,6 +553,13 @@ export async function updateKnowledgeBase(
     }
   }
 
+  // 图片描述模型（P1-11）三态：不带 = 不动 / `null` = 清除 / uuid = 设置（并校验）。与 embedding 无关，
+  // 不触发重建（已入库内容不因换描述模型而失效；之后的文档才用新模型描述）。
+  let captionPatch: { captionModelId?: string | null } = {}
+  if (input.captionModelId !== undefined) {
+    captionPatch = { captionModelId: await resolveCaptionModelId(input.captionModelId) }
+  }
+
   const updated = await db.knowledgeBase.update({
     where: { id },
     data: {
@@ -461,6 +570,7 @@ export async function updateKnowledgeBase(
       chunkOverlap,
       retrievalConfig,
       ...embeddingPatch,
+      ...captionPatch,
     },
     select: KB_SELECT,
   })
@@ -503,8 +613,12 @@ export async function updateKnowledgeBase(
  *
  * ⚠️ **不需要 chunks_v2 新表切换**：`chunks.embedding` 自 `20260930140000_kb_embedding_model`
  *    起是**无固定维度**的 `vector`，维度按行记在 `chunks.embedding_dim` ⇒ 换到任意维度的模型
- *    都能就地重建（旧表的 `子方案①` §八 双写/切表设计已被该迁移取代）。本函数只要求目标模型
- *    **现在可用**（否则投一批注定 FAILED 的 job）。
+ *    都能就地重建（旧表的 `子方案①` §八 双写/切表设计已被该迁移取代）。
+ *
+ * ⚠️ **必须先用当前模型的真实维度刷新 `knowledgeBase.embeddingDim`**：worker 构造 provider 读的
+ *    是**知识库**的维度快照（`worker.ts` 的 `row.kb.embeddingDim`），而模型池里那一行可能被改过
+ *    `model_name`/维度 —— 只换名字不刷维度就会"上游返回 N 维、期望 M 维"整库失败（用户实测）。
+ *    本函数因此先 `resolveEmbeddingSnapshot`（模型可用性 + 真实维度），把它写回快照再入队。
  *
  * @throws {AppError} `NOT_FOUND`(404) 库不存在 / `CONFLICT`(409) 库无文档、未记录
  *   embedding 模型/维度（早期建的库）、或目标模型不可用（停用/删除） /
@@ -538,21 +652,29 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
     throw AppError.conflict('该知识库还没有文档，无需重建索引')
   }
 
-  // ① 目标模型**现在就必须可用**：不存在 / 类型不符 / 模型或 Provider 停用都在这里 409
-  //    （`resolveEmbeddingTarget` 的既有判据）。不先探这一下，下面翻 PARSING + 入队只会
-  //    得到一整批注定 FAILED 的 job —— 用户看到的是"全库失败"，而根因其实一句话就能说清。
-  //    ⚠️ **任意维度都能重建**：`chunks.embedding` 自 `20260930140000_kb_embedding_model`
-  //    起是无固定维度的 `vector`、维度按行记在 `embedding_dim`，故这里不比对维度，
-  //    也不需要 chunks_v2 新表切换（那套设计已被该迁移取代）。
-  const target = await resolveEmbeddingTarget(kb.embeddingModelId)
+  // ① 解析**当前**模型（模型池里这一行可能被改过 `model_name` / 维度）—— 同时完成两件事：
+  //    · 校验模型存在/启用/类型正确（不存在或停用 ⇒ 这里 409，避免投一批注定 FAILED 的 job）；
+  //    · 拿到**真实的**维度与名字（`models.embedding_dim`，缺失时现场探测）。
+  //    ⚠️ 必须用它的维度、而不是 `kb.embeddingDim` 那个可能已过期的快照 —— 用户实测：
+  //    在模型池把 embedding 模型改名后，KB 快照仍是旧维度（2048），worker 拿它构造 provider，
+  //    上游返回 4096 维 ⇒ 每篇都报"上游返回 N 维与期望 M 维不一致"整库失败。
+  const snapshot = await resolveEmbeddingSnapshot(kb.embeddingModelId)
 
-  // ② 全库翻到 PARSING（理由见文件头 ①）—— 保留 chunkCount，不删旧 chunk（文件头 ②）
+  // ② **维度快照必须先刷新**（worker 读的就是它；见 `worker.ts` 的 `row.kb.embeddingDim`）。
+  //    放在入队之前，worker 取到 job 时用的就是新维度。任意维度都能重建：`chunks.embedding`
+  //    自 `20260930140000_kb_embedding_model` 起是无固定维度的 `vector`、维度按行记 `embedding_dim`，
+  //    不需要 chunks_v2 新表切换（那套设计已被该迁移取代）。
+  if (snapshot.embeddingDim !== kb.embeddingDim) {
+    await db.knowledgeBase.update({ where: { id }, data: { embeddingDim: snapshot.embeddingDim } })
+  }
+
+  // ③ 全库翻到 PARSING（理由见文件头 ①）—— 保留 chunkCount，不删旧 chunk（文件头 ②）
   await db.document.updateMany({
     where: { kbId: id },
     data: { status: 'PARSING', errorMsg: null },
   })
 
-  // ③ 逐篇入队。单篇失败不中断其余（部分成功比整体放弃更接近用户预期）
+  // ④ 逐篇入队。单篇失败不中断其余（部分成功比整体放弃更接近用户预期）
   let enqueued = 0
   for (const doc of kb.documents) {
     try {
@@ -570,20 +692,28 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
   const failed = kb.documents.length - enqueued
 
   if (enqueued === 0) {
+    // ⚠️ 此刻维度快照可能已刷新，但 `embeddingModel`（"需重建"判据）**故意没动** ⇒ 告警仍在，
+    //    用户再点一次即可恢复；不把"已换模型"的状态伪造成完成。
     throw AppError.internal('任务入队失败（队列不可用），整库重建未被受理，请稍后重试')
   }
 
-  // ④ 快照跟进：重建后库里的向量就由**当前**模型产出 ⇒ 把 `embedding_model` 快照刷成当前名字，
-  //    否则 `embeddingModelChanged` 会一直为 `true`（它比的是快照 vs 当前模型名），
-  //    界面那条"需重建"告警永不消失。维度用的是 `knowledgeBase.embeddingDim`（换模型时已更新）。
-  const embeddingModel = apiEmbeddingName(target.modelName)
-  if (embeddingModel !== kb.embeddingModel) {
-    await db.knowledgeBase.update({ where: { id }, data: { embeddingModel } })
+  // ⑤ 入队成功后才把 `embedding_model` 快照刷成**当前**模型名 —— 它是 `embeddingModelChanged`
+  //    （"需重建"告警）的判据：重建跑完前保持 `true` 让告警不消失，跑完后快照与当前一致、告警清除。
+  if (snapshot.embeddingModel !== kb.embeddingModel) {
+    await db.knowledgeBase.update({ where: { id }, data: { embeddingModel: snapshot.embeddingModel } })
   }
 
   logger.info(
-    { kbId: id, name: kb.name, total: kb.documents.length, enqueued, failed, embeddingModel },
-    '整库重建已受理（全库翻 PARSING 并批量入队，旧索引在逐篇完成前仍可检索）',
+    {
+      kbId: id,
+      name: kb.name,
+      total: kb.documents.length,
+      enqueued,
+      failed,
+      embeddingModel: snapshot.embeddingModel,
+      embeddingDim: snapshot.embeddingDim,
+    },
+    '整库重建已受理（维度/模型快照已刷新，全库翻 PARSING 并批量入队，旧索引在逐篇完成前仍可检索）',
   )
   return { id, total: kb.documents.length, enqueued, failed }
 }
@@ -599,7 +729,12 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
  * 删 `knowledge_base` → `documents` 与 `chunks` 全清）。**S3 原文件不在数据库管辖内**，
  * 由本函数在删行**之后**清（顺序理由见文件头 ⑤）。
  *
- * @throws {AppError} `NOT_FOUND`(404) 库不存在 / `CONFLICT`(409) 正被 Agent 绑定
+ * 被 Agent 绑定时**不再 409**（2026-10-08 需求）：`agent_components` 是多态引用、没有外键兜底
+ * （`02` §3.1），这里**随删除一起解绑**（与"删 Agent 自动把 `model_id` 置空"同族）——
+ * 否则要用户先去每个 Agent 里手动解绑，删一个库要跳好几个页面。事务里"删绑定 + 删库"原子完成，
+ * 不会留下孤儿绑定（那会在检索时才炸）。解绑的条数回给界面，由确认弹窗明示"会解绑 N 个智能体"。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 库不存在
  */
 export async function removeKnowledgeBase(id: string): Promise<RemoveKnowledgeBaseResult> {
   const db = getPrisma()
@@ -609,21 +744,19 @@ export async function removeKnowledgeBase(id: string): Promise<RemoveKnowledgeBa
   })
   if (target === null) throw AppError.notFound('知识库不存在')
 
-  // ⚠️ 多态引用没有外键兜底（`02` §3.1），必须自己拦 —— 否则留下孤儿绑定，检索时才炸
-  const boundAgents = await db.agentComponent.count({
-    where: { componentType: 'KNOWLEDGE', refId: id },
-  })
-  if (boundAgents > 0) {
-    throw AppError.conflict(
-      `该知识库正被 ${boundAgents} 个 Agent 绑定，无法删除。请先在那些 Agent 里解绑`,
-    )
-  }
-
   const fileKeys = target.documents.map((doc) => doc.fileKey)
 
+  // 事务：先删掉指向本库的组件绑定，再删库（顺序无关紧要，但要原子）
+  let unboundAgents: number
   try {
-    // 一条语句删库：documents / chunks 由外键 CASCADE 连带清除
-    await db.knowledgeBase.delete({ where: { id } })
+    unboundAgents = await db.$transaction(async (tx) => {
+      const { count } = await tx.agentComponent.deleteMany({
+        where: { componentType: 'KNOWLEDGE', refId: id },
+      })
+      // documents / chunks 由外键 CASCADE 连带清除
+      await tx.knowledgeBase.delete({ where: { id } })
+      return count
+    })
   } catch (error) {
     if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('知识库不存在')
     throw error
@@ -632,10 +765,10 @@ export async function removeKnowledgeBase(id: string): Promise<RemoveKnowledgeBa
   const deletedObjects = await removeDocumentObjects(fileKeys)
 
   getLogger().info(
-    { kbId: id, name: target.name, deletedDocuments: fileKeys.length, deletedObjects },
-    '已删除知识库',
+    { kbId: id, name: target.name, deletedDocuments: fileKeys.length, deletedObjects, unboundAgents },
+    '已删除知识库（含自动解绑）',
   )
-  return { id, name: target.name, deletedDocuments: fileKeys.length, deletedObjects }
+  return { id, name: target.name, deletedDocuments: fileKeys.length, deletedObjects, unboundAgents }
 }
 
 /**
