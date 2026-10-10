@@ -1649,3 +1649,20 @@
 }
 .msg__attachment-doc-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg__attachment-doc-size { color: var(--muted); }
+
+/* 用量统计页的时间区间工具条（P1-7）---------------------------------------------------- */
+.usage-range {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3);
+  margin-bottom: var(--sp-6);
+}
+.usage-range__sep { width: 1px; height: 20px; background: var(--rule); }
+.usage-range__field {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-sm); color: var(--ink-2);
+}
+.usage-range__field input[type='date'] {
+  padding: 4px var(--sp-2);
+  background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--r-sm);
+  color: var(--ink); font: inherit;
+}
+.usage-range__field input[type='date']:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }

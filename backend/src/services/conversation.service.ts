@@ -601,13 +601,16 @@ export async function getConversationActive(
 export const MESSAGE_CHRONO_ORDER = [{ createdAt: 'desc' }, { id: 'desc' }] as const
 
 /**
- * {@link toMessagePage} 的入参行 —— 只要求它真正读的四列（少给一列是编译错误，多给无所谓）。
+ * {@link toMessagePage} 的入参行 —— 只要求它真正读的几列（少给一列是编译错误，多给无所谓）。
  */
 export interface MessageRowForPage {
   id: string
   role: MessageItem['role']
   content: unknown
   createdAt: Date
+  /** 助手消息的上报 token（可空；P1-7 起透出，让刷新后仍能看到每轮用量） */
+  tokensIn: number | null
+  tokensOut: number | null
 }
 
 /**
@@ -641,6 +644,8 @@ export function toMessagePage(rows: MessageRowForPage[], limit: number): Message
       role: row.role,
       content: row.content,
       createdAt: row.createdAt.toISOString(),
+      tokensIn: row.tokensIn,
+      tokensOut: row.tokensOut,
     }))
   return {
     items,
@@ -723,7 +728,7 @@ export async function listMessages(
               { createdAt: before.createdAt, id: { lt: before.id } },
             ],
           },
-    select: { id: true, role: true, content: true, createdAt: true },
+    select: { id: true, role: true, content: true, createdAt: true, tokensIn: true, tokensOut: true },
     orderBy: [...MESSAGE_CHRONO_ORDER],
     take: query.limit + 1,
   })

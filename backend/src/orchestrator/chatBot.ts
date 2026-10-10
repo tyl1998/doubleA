@@ -37,16 +37,13 @@
  *    所以"检索失败"也不再是前置失败 —— 它发生在工具循环里，按"单条工具失败"回填给模型
  *    （整轮不因此失败，见下面的内置工具分支）。
  *
- * ③ **`usage_records` 表已上线，但 ChatBot 仍不写**（P0-3-12 起）：
- *    表本身在 **P0-3-12** 就落地了（`schema.prisma#UsageRecord`，按月分区）—— 因为
- *    `子方案③` §十 要求 **TaskAgent** 写它（`01` 决策 20），而 ChatBot 侧的口径是
- *    **"首版只打日志"**（`01` 决策 20「用量统计 P1 基础版」、`02` §6.2 ⑦、§七 待决事项 4）。
- *    两件事互不冲突：**别把"表上线了"顺手理解成"两边都开始写"**。
- *    本批做的是"计量**透传**"：`done.usage` 事件给前端 + 结束日志里带 `tokensIn/tokensOut`。
- *    ★ **接回点已就位**（P0-3-12 兑现了 P0-1-27 留下的那句"P1 建表后加一条 create"）：
- *    表已存在，落库口子也已存在 —— `persist.ts#PersistRoundInput.usageRecord`（TaskAgent 在传）。
- *    P1 要做的事只剩：在这里把 `usageRecord` 也传进去（`user_id`/`agent_id` 由 `persist.ts`
- *    从会话行读，无需在 `ChatProducerInput` 上加字段）。
+ * ③ **`usage_records` 表 P1-7 起 ChatBot 也写**：
+ *    表本身在 **P0-3-12** 就落地了（`schema.prisma#UsageRecord`，按月分区）—— 当时 `子方案③` §十
+ *    要求 **TaskAgent** 写它（`01` 决策 20），而 ChatBot 侧的口径是 **"首版只打日志"**
+ *    （`01` 决策 20「用量统计 P1 基础版」、`02` §6.2 ⑦）。**P1-7** 兑现了 P0-3-12 留的接回点：
+ *    收尾时把 `usageRecord` 一起交给 `persistRoundQuietly`（与消息**同一个事务**）⇒
+ *    "一行 = 一轮对话"从此对**两个编排器**都成立（报表不再只有任务型那一半数据）。
+ *    本批同时保留"计量**透传**"：`done.usage` 事件给前端（前端据此在收尾行显示每轮 token）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ④ 工具循环（P0-2-8）的三条判据
@@ -903,6 +900,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
         modelLabel: input.target.label,
       },
       usage: totalUsage,
+      // ── 计量行（P1-7）：ChatBot 也写 `usage_records` ──
+      // P0-3-12 留的接回点就是这里（见文件头 ③）。口径与 TaskAgent 一致：**这一轮真的发生过**
+      // 才写（前置失败 / 锁丢都在本函数之前抛出去了）；token 取不到就 `null`，不编 0；
+      // `rounds` = 本轮上游请求轮数（`upstreamRounds`，含工具循环）、`durationMs` = 本轮墙钟。
+      usageRecord: {
+        model: input.target.modelName,
+        tokensIn: totalUsage?.tokensIn ?? null,
+        tokensOut: totalUsage?.tokensOut ?? null,
+        durationMs: Date.now() - requestedAtMs,
+        rounds: upstreamRounds,
+        createdAt: new Date(),
+      },
       logger,
     })
 

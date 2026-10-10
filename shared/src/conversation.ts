@@ -777,9 +777,12 @@ export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>
  * 服务端一旦"按已知的三段过滤一遍"，那些段就在**刷新之后**消失（流里看得见、历史里没有），
  * 且没有任何报错 —— 前端只能靠肉眼发现。
  *
- * **刻意不带的列**：`conversationId`（同一个请求里的消息必然属于同一个会话，带上只是冗余）、
- * `tokensIn`/`tokensOut`（用量统计属 **P1**，届时会有专门的端点；这里多带两列等于
- * "悄悄扩大契约"，而 P0-1-22 起每个投影都有一条**键集合**断言在守这件事）。
+ * **刻意不带的列**：`conversationId`（同一个请求里的消息必然属于同一个会话，带上只是冗余）。
+ *
+ * ⚠️ **P1-7 契约增量：补上 `tokensIn` / `tokensOut`**（P0-1-28 当时写着"用量统计属 P1"）。
+ * 目的：让"每一轮用了多少 token"在**刷新之后**仍然看得见（流式那一份来自 `done.usage`，
+ * 落库那份在 `messages.tokens_in/out` 列上，一直写着、只是读取端没透出）。两列可空：
+ * 上游在流式阶段不报 usage 时就是 `null`（"不知道"），界面据此显示 `—` 而不是 `0`。
  */
 export const messageItemSchema = z.object({
   id: z.string(),
@@ -798,6 +801,10 @@ export const messageItemSchema = z.object({
   }),
   /** ISO 8601 */
   createdAt: z.string(),
+  /** 本轮**助手消息**的上报输入 token；`null` = 没上报（不是 0）。用户消息恒 `null`（P1-7） */
+  tokensIn: z.number().int().min(0).nullable(),
+  /** 本轮**助手消息**的上报输出 token；`null` = 没上报（不是 0）。用户消息恒 `null`（P1-7） */
+  tokensOut: z.number().int().min(0).nullable(),
 })
 export type MessageItem = z.infer<typeof messageItemSchema>
 

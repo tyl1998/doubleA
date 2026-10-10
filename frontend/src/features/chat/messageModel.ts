@@ -173,7 +173,7 @@ export interface ChatMessageView {
   status: 'complete' | 'streaming' | 'stopped' | 'error'
   /** 收尾原因（只有流式助手消息有；历史消息不存这个字段） */
   finishReason?: ChatFinishReason
-  /** token 用量（只有流式助手消息有，`done` 事件的 `usage`） */
+  /** token 用量：流式来自 `done` 事件的 `usage`、历史来自消息行 `tokensIn/Out`（P1-7） */
   usage?: SseDonePayload['usage']
   /** 流内错误卡的内容（`status === 'error'` 时才有） */
   error?: { code: string; message: string }
@@ -344,6 +344,22 @@ export function errorCodeLabel(errorCode: string | undefined): string | null {
 }
 
 /**
+ * 历史助手消息的上报 token → 视图的 `usage`（**P1-7**）。
+ *
+ * 落库那份一直在 `messages.tokens_in/out` 列上（`persist.ts` 写入），P1-7 起读取端透出
+ * ⇒ "每一轮用了多少 token"**刷新之后仍然看得见**（流式那一份来自 `done.usage`）。
+ * 两列都为空（用户消息、或上游没上报）⇒ 返回 `null`，收尾行就不显示 token（不编 0）。
+ *
+ * 逐字段收窄（同 {@link pickModel}）：历史是跨版本读的，老消息 / 测试夹具可能没有这两列。
+ */
+function usageOf(item: MessageItem): ChatMessageView['usage'] {
+  const tokensIn = typeof item.tokensIn === 'number' ? item.tokensIn : null
+  const tokensOut = typeof item.tokensOut === 'number' ? item.tokensOut : null
+  if (tokensIn === null && tokensOut === null) return null
+  return { tokensIn, tokensOut }
+}
+
+/**
  * 历史消息 → 视图模型。
  *
  * `SYSTEM` 角色：本仓不写入 SYSTEM 消息（`MESSAGE_ROLES` 有它是因为 DB 的取值域，
@@ -373,6 +389,8 @@ export function messageToView(item: MessageItem): ChatMessageView {
     model: pickModel(content),
     createdAt: item.createdAt,
     status: 'complete',
+    // 每轮 token（P1-7）：来自消息行本身（不是 content 段），刷新后收尾行据此显示
+    usage: usageOf(item),
   }
 }
 

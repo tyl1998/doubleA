@@ -21,6 +21,7 @@
 import {
   ApiOutlined,
   AppstoreOutlined,
+  BarChartOutlined,
   BookOutlined,
   DatabaseOutlined,
   HistoryOutlined,
@@ -61,6 +62,7 @@ const ICON_BY_CODE: Record<string, ReactNode> = {
   CR: <KeyOutlined />,
   US: <TeamOutlined />,
   ML: <DatabaseOutlined />,
+  UT: <BarChartOutlined />,
 }
 
 /** 头像上的字：中文名取首字，拉丁名取前两位（`design/*.html` 的 `avatar__face`） */

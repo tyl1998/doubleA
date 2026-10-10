@@ -14,8 +14,10 @@
  *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
  * P0-2-11：`/mcp` 与 `/settings/credentials` 换成真实的 MCP 管理页与我的凭据页
  *          （**至此 `03` §二 的 P0 十条路由全部落地**）。
- * P1-6：`/tasks` 换成真实的**任务中心（定时任务）**页 —— 本仓最后一个 P1 页面入口就位，
- *       `BatchPlaceholderPage` 只剩 `/admin/usage` 一条（属 P1-7）以及那个 `*` 未找到页。
+ * P1-6：`/tasks` 换成真实的**任务中心（定时任务）**页。
+ * P1-7：`/admin/usage` 换成真实的**用量统计**页（区间筛选 + 三张聚合表）——
+ *       `BatchPlaceholderPage` **至此全部退役**（路由表里只剩 `*` 未找到页），`03` §二 的路由
+ *       全部是真实页面。
  *          ⚠️ 我的凭据页**与 MCP 解耦**：路由从 `/mcp/credentials` 改为 `/settings/credentials`
  *          （个人设置族，与 `/settings/password` 同族），页面内容仍按 MCP server 分组。
  *
@@ -41,8 +43,9 @@ import { Route, Routes } from 'react-router-dom'
 import { AppLayout } from './AppLayout.js'
 import { RequireAdmin } from './RequireAdmin.js'
 import { RequireAuth } from './RequireAuth.js'
-import { BatchPlaceholderPage, NotFoundPage } from '../pages/NoticePage.js'
+import { NotFoundPage } from '../pages/NoticePage.js'
 import { ModelsPage } from '../pages/admin/ModelsPage.js'
+import { UsagePage } from '../pages/admin/UsagePage.js'
 import { UsersListPage } from '../pages/admin/UsersListPage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
@@ -92,20 +95,13 @@ export function App() {
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/settings/password" element={<PasswordPage />} />
 
-          {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见）。两页都在 P0-1-36 接上真页面 */}
+          {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见）。三页都是真页面：
+              `/admin/users`、`/admin/models`（P0-1-36）、`/admin/usage`（**P1-7**）。 */}
           <Route element={<RequireAdmin />}>
             <Route path="/admin/users" element={<UsersListPage />} />
             <Route path="/admin/models" element={<ModelsPage />} />
-            <Route
-              path="/admin/usage"
-              element={
-                <BatchPlaceholderPage
-                  serial="S-07c · 用量"
-                  title="用量统计"
-                  bullets={['按用户 / 模型 / 时间维度的 token 与费用统计']}
-                />
-              }
-            />
+            {/* S-07c · 用量统计（P1-7 接真页面）：区间筛选 + 按用户/智能体/模型三张聚合表。 */}
+            <Route path="/admin/usage" element={<UsagePage />} />
           </Route>
 
           <Route path="*" element={<NotFoundPage />} />

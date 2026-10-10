@@ -13,6 +13,8 @@ export const PASSWORD_PATH = '/settings/password'
 export const HOME_PATH = '/'
 export const ADMIN_USERS_PATH = '/admin/users'
 export const ADMIN_MODELS_PATH = '/admin/models'
+/** 用量统计（`03` §二：`/admin/usage`，**ADMIN**；P1-7 接真页面） */
+export const ADMIN_USAGE_PATH = '/admin/usage'
 
 /** 智能体（`03` §二：`/` 是列表、`/agents/new` 建、`/agents/:id/edit` 改） */
 export const AGENTS_NEW_PATH = '/agents/new'

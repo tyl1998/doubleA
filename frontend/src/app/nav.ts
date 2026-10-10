@@ -63,20 +63,21 @@ export const NAV_ITEMS: readonly NavItem[] = [
   // `/settings` 一族（个人设置族），排在个人项这一端，不跟在 `MC` 后面。
   { code: 'CR', label: '我的凭据', path: '/settings/credentials', serial: 'S-08b · 凭据' },
   /**
-   * 管理面**两条**（P0-1-36 落地）。
+   * 管理面**三条**（P0-1-36 落地两条 + **P1-7** 补用量统计）。
    *
    * `03` §三 的原话是「管理入口仅 ADMIN 可见（用户/模型池/用量）」—— 那是**三处目的地**。
    * P0-1-30~35 期间这里只有一个占位项 `AD → /admin/users`（因为两页都还没做，指向哪个都一样），
-   * 本批两页都落地了，于是把它拆成两条真实入口。
+   * P0-1-36 两页落地后拆成两条真实入口。
    *
    * ⚠️ 为什么必须拆而不是"留一条、另一条走头像菜单"：`serialForPath` 的读数来自 `matchNavItem`，
    * 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
    * **一个读数错了的仪表比没有仪表更容易误导**（`nav.ts` 的 `SERIAL_BY_PREFIX` 注释里已有
-   * 同款教训：`/agents/new` 那次）。用量统计是 P1，**不进来**（摆一个点进去是空壳的入口
-   * 比没有更差；「任务」同因在 P1-6 落地前也不进来，本批已落地 ⇒ 已加导航项）。
+   * 同款教训：`/agents/new` 那次）。用量统计（P1-7）此前**不进来**（摆一个点进去是空壳的入口
+   * 比没有更差）；本批 `/admin/usage` 已落地 ⇒ 补上导航项。
    */
   { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
   { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池', adminOnly: true },
+  { code: 'UT', label: '用量统计', path: '/admin/usage', serial: 'S-07c · 用量', adminOnly: true },
 ] as const
 
 /**

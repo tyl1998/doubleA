@@ -799,15 +799,22 @@ await it('E3 同一轮对话：流式渲染的形状 == 刷新后从库里读回
       citations: streamed.citations ?? undefined,
     },
     createdAt: '2026-09-23T10:00:03.000Z',
+    // P1-7：每轮 token 落库在消息行上（不是 content 段），读取端透出 ⇒ 刷新后收尾行仍显示
+    tokensIn: 5,
+    tokensOut: 6,
   })
 
   // **归一的三个字段必须逐字相等** —— 它们决定"渲染出哪些块、每块写什么"。
   for (const field of ['role', 'text', 'thinking', 'citations', 'tools', 'artifacts']) {
     assertDeepEqual(persisted[field], streamed[field], `同名字段 ${field}`)
   }
+  // ⚠️ `usage` 自 **P1-7** 起**两个来源都有**（流式来自 `done.usage`、历史来自消息行 `tokensIn/Out`）
+  // ⇒ 它不再属于"只属于刚发生的那一轮"的字段；这里断言两边对得上。
+  assertDeepEqual(persisted.usage, { tokensIn: 5, tokensOut: 6 }, '历史 token 用量（P1-7）')
+  assertDeepEqual(streamed.usage, { tokensIn: 5, tokensOut: 6 }, '流式 token 用量')
   // 刻意不同的字段（列出来是为了让"下次有人想统一它们"先想一想）：
   //   key / createdAt ⇒ 流的版本在落库前**还不存在**（没有 id 与时间）
-  //   status / finishReason / usage / persisted ⇒ 只属于"刚发生的那一轮"的元信息，历史不存
+  //   status / finishReason / persisted ⇒ 只属于"刚发生的那一轮"的元信息，历史不存
   assertEqual(persisted.key, 'msg-200', '历史的 key 是真实 id')
   assertEqual(streamed.key, 'stream:assistant', '流式的 key 带 stream: 前缀')
 })

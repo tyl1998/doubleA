@@ -33,6 +33,7 @@ import { registerMcpServerRoutes } from './routes/mcpServers.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerTaskRoutes } from './routes/tasks.js'
+import { registerUsageRoutes } from './routes/usage.js'
 import { registerUserRoutes } from './routes/users.js'
 
 /**
@@ -185,6 +186,11 @@ export function buildApp(): FastifyInstance {
   //    删 / 立即执行）。权限与会话同族（**仅本人**，`scheduled_tasks.user_id`）；
   //    到点自动派活的后台调度器是**进程级组件**，归 `index.ts` 生命周期，不在这里注册。
   registerTaskRoutes(app)
+
+  // ⑰ 用量统计（P1-7）：`GET /api/usage/summary`（**仅 ADMIN**，`(A)` 族）。
+  //    数据源 `usage_records`（P0-3-12 上线、P1-7 起 ChatBot 也写）。它是平台级报表，
+  //    与"会话/产物/任务仅本人"刻意相反 —— 普通用户看自己的 token 走消息历史。
+  registerUsageRoutes(app)
 
   return app
 }

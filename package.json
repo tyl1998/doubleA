@@ -35,6 +35,7 @@
     "verify:mcp-ui": "pnpm --filter @doubulea/frontend verify:mcp-ui",
     "verify:artifact-preview": "pnpm --filter @doubulea/frontend verify:artifact-preview",
     "verify:artifact-panel": "pnpm --filter @doubulea/frontend verify:artifact-panel",
+    "verify:usage-ui": "pnpm --filter @doubulea/frontend verify:usage-ui",
     "cron:regression": "pnpm --filter @doubulea/backend cron:regression",
     "notify:regression": "pnpm --filter @doubulea/backend notify:regression",
     "frame-bus:regression": "pnpm --filter @doubulea/backend frame-bus:regression",
