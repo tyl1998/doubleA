@@ -584,6 +584,14 @@ const envSchema = z
     /** 通知 webhook 的单次请求上限（毫秒）；企微/飞书都是即时返回，超时只记 warn（不拖垮那一轮） */
     NOTIFY_TIMEOUT_MS: intVar('NOTIFY_TIMEOUT_MS', 10_000, { min: 500, max: 120_000 }),
 
+    // ── 长期记忆（P1-8 / v2 P1-8a）──
+    /** 每个用户的记忆条目上限（达到后自动提取停止写入、显式添加也给提示，见 HCI §5.5） */
+    MEMORY_MAX_PER_USER: intVar('MEMORY_MAX_PER_USER', 500, { min: 1, max: 100_000 }),
+    /** USER 画像常驻注入上限的**默认/兜底**（v2 起每用户在 `users.memory_profile_max` 单独调，默认 10） */
+    MEMORY_INJECT_MAX: intVar('MEMORY_INJECT_MAX', 10, { min: 1, max: 100 }),
+    /** "待展示记忆提示"（toast 晚一拍）在 Redis 里的存活时长（秒） */
+    MEMORY_NOTICE_TTL_SEC: intVar('MEMORY_NOTICE_TTL_SEC', 3600, { min: 30, max: 86_400 }),
+
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
      * 「到响应头」的上限（连接 + TTFT）。流式路径**收到头就撤**（之后交给 LLM_STREAM_IDLE_TIMEOUT_MS），
@@ -924,6 +932,19 @@ export interface AppConfig {
     notifyTimeoutMs: number
   }
 
+  /**
+   * 长期记忆（P1-8）。开关本身存在 `users` 表上（每人一份），这里只有进程级参数。
+   * 消费方 = `services/memory.service.ts` / `orchestrator/memoryExtract.ts`。
+   */
+  memory: {
+    /** 每用户条目上限（见 `MEMORY_MAX_PER_USER`） */
+    maxPerUser: number
+    /** USER 画像常驻上限的默认/兜底（每用户实际值在 `users.memory_profile_max`；见 `MEMORY_INJECT_MAX`） */
+    injectMax: number
+    /** 待展示提示的 Redis TTL（秒，见 `MEMORY_NOTICE_TTL_SEC`） */
+    noticeTtlSec: number
+  }
+
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
   warnings: string[]
 }
@@ -1161,6 +1182,11 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxDuePerTick: vars.SCHEDULED_TASK_MAX_DUE_PER_TICK,
       notifyTimeoutMs: vars.NOTIFY_TIMEOUT_MS,
     },
+    memory: {
+      maxPerUser: vars.MEMORY_MAX_PER_USER,
+      injectMax: vars.MEMORY_INJECT_MAX,
+      noticeTtlSec: vars.MEMORY_NOTICE_TTL_SEC,
+    },
 
     warnings,
   }
@@ -1224,6 +1250,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     llm: value.llm,
     mcp: value.mcp,
     scheduledTask: value.scheduledTask,
+    memory: value.memory,
     limits: {
       uploadBodyLimit: `${value.limits.uploadBodyLimitRaw}（${value.limits.uploadBodyLimitBytes} 字节）`,
       ssePingIntervalSec: value.limits.ssePingIntervalSec,

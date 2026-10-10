@@ -16,6 +16,7 @@
     "doc:sniff": "node --import tsx scripts/doc-sniff-regression.ts",
     "cron:regression": "node --import tsx scripts/cron-regression.ts",
     "notify:regression": "node --import tsx scripts/notify-regression.ts",
+    "memory:regression": "node --import tsx scripts/memory-extract-regression.ts",
     "frame-bus:regression": "node --import tsx scripts/frame-bus-regression.ts",
     "build:shared": "pnpm --filter @doubulea/shared build",
     "typecheck": "pnpm run db:generate && tsc -p tsconfig.json --noEmit",

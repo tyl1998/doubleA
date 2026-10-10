@@ -316,6 +316,11 @@ export type ConversationActiveSnapshot = z.infer<typeof conversationActiveSnapsh
 export const conversationActiveSchema = conversationActiveSnapshotSchema.extend({
   streaming: z.boolean(),
   autoApprove: z.boolean(),
+  /**
+   * 会话级「不记入记忆」开关（**P1-8 契约增量**）：与 `autoApprove` 同款 —— 对话页只需这一个
+   * 只读端点，就能同时拿到活跃进度、自动审批开关、以及本会话的记忆豁免状态（会话头 `⋯` 菜单要用）。
+   */
+  memoryExcluded: z.boolean(),
 })
 export type ConversationActive = z.infer<typeof conversationActiveSchema>
 

@@ -42,6 +42,8 @@ import { ARTIFACT_EXEC_TIMEOUT_MS, SANDBOX_WORK_DIR } from '../sandbox/index.js'
 import { execInSandbox } from '../sandbox/docker.js'
 import { listConversationAttachments } from '../services/file.service.js'
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
+import { buildMemoryToc, buildUserProfileBlock } from '../services/memory.service.js'
+import { getSummariesFor } from '../services/memorySummary.service.js'
 import { textOfHistoryRow, type HistoryRow } from './chatContext.js'
 
 /** 记忆文档里一条产物要用的读数（**窄到不能再窄** —— 纯渲染函数只认这四项，不认 Prisma 模型） */
@@ -116,11 +118,44 @@ export async function buildMemoryDoc(conversationId: string): Promise<MemoryDocR
   //    附件本体同样在 S3 里、随容器走的是副本 ⇒ 容器重建后要把"有哪些、怎么取回"讲给 agent。
   const attachments = await listConversationAttachments(conversationId)
 
+  // ── L1 会话小结 + L2 长期记忆 v2（P1-8a）──
+  //    TaskAgent 没有 system 通道（`02` §六：只有一条 `prompt`）⇒ 长期记忆经**记忆文档**注入
+  //    （§4.5 的两条注入路径之一，与 ChatBot 的 system prompt 同源）。
+  //    ⚠️ v2：USER 画像常驻 + AGENT 记忆**只给极简目录 TOC**（不含正文）；细节由 agent 调
+  //    `recall_memory` 按需拉取（见 `子方案` §8.4/§8.4b）。
+  const conversation = await db.conversation.findUnique({
+    where: { id: conversationId },
+    select: { userId: true, agentId: true },
+  })
+  let profileBlock = ''
+  let tocBlock = ''
+  let summaryText: string | null = null
+  if (conversation !== null) {
+    profileBlock = (await buildUserProfileBlock({ userId: conversation.userId })).block
+    tocBlock = (await buildMemoryToc({ userId: conversation.userId, agentId: conversation.agentId })).block
+    summaryText = (await getSummariesFor([conversationId])).get(conversationId) ?? null
+  }
+
   // "有没有值得读的内容"与渲染同源：历史里有**非空正文**的消息，或有产物，或有附件
   const hasHistory = history.some((row) => textOfHistoryRow(row).trim() !== '')
   return {
-    markdown: renderMemoryDoc({ conversationId, history, artifacts, artifactTotal, attachments }),
-    hasContent: hasHistory || artifacts.length > 0 || attachments.length > 0,
+    markdown: renderMemoryDoc({
+      conversationId,
+      history,
+      artifacts,
+      artifactTotal,
+      attachments,
+      summaryText,
+      profileBlock,
+      tocBlock,
+    }),
+    hasContent:
+      hasHistory ||
+      artifacts.length > 0 ||
+      attachments.length > 0 ||
+      summaryText !== null ||
+      profileBlock !== '' ||
+      tocBlock !== '',
   }
 }
 
@@ -158,6 +193,12 @@ export function renderMemoryDoc(input: {
   artifacts: readonly MemoryDocArtifact[]
   artifactTotal: number
   attachments: readonly AttachmentItem[]
+  /** L1 会话小结正文（P1-8；`null` = 还没有小结） */
+  summaryText?: string | null
+  /** USER 画像常驻段（P1-8a；空串 = 无画像/未启用） */
+  profileBlock?: string
+  /** AGENT 记忆极简目录 TOC（P1-8a；空串 = 无可记内容/未启用） */
+  tocBlock?: string
 }): string {
   const lines: string[] = []
 
@@ -168,6 +209,33 @@ export function renderMemoryDoc(input: {
       '但这份文档会在每次派活前重新生成 —— 于是你（agent）**始终知道**这个会话聊过什么、产出过哪些文件。',
   )
   lines.push('')
+
+  // ── 会话小结（L1，P1-8）──
+  const summaryText = input.summaryText ?? null
+  if (summaryText !== null && summaryText.trim() !== '') {
+    lines.push('## 本会话小结')
+    lines.push('')
+    lines.push(summaryText.trim())
+    lines.push('')
+  }
+
+  // ── 用户画像（USER 常驻，P1-8a）──
+  const profileBlock = input.profileBlock ?? ''
+  if (profileBlock !== '') {
+    lines.push('## 用户画像（跨会话）')
+    lines.push('')
+    lines.push(profileBlock)
+    lines.push('')
+  }
+
+  // ── Agent 记忆目录（AGENT，P1-8a；只给主题线索，细节用 recall_memory 查）──
+  const tocBlock = input.tocBlock ?? ''
+  if (tocBlock !== '') {
+    lines.push('## 本 Agent 记忆目录')
+    lines.push('')
+    lines.push(tocBlock)
+    lines.push('')
+  }
 
   // ── 对话摘要 ──
   lines.push('## 最近的对话')

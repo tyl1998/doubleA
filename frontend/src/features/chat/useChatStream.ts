@@ -78,8 +78,14 @@ import type { RoundKind, StreamRound } from './roundReducer.js'
 export type SendOutcome = { ok: true } | { ok: false; error: unknown }
 
 export interface UseChatStreamOptions {
-  /** 新建会话成功后回调（页面据此把 id 写进 URL，刷新后仍定位到同一个会话） */
-  onConversationCreated?: (conversation: ConversationItem) => void
+  /**
+   * 新建会话成功后回调（页面据此把 id 写进 URL，刷新后仍定位到同一个会话）。
+   *
+   * ⚠️ **允许返回 `Promise`，hook 会 `await` 它**，且时机卡在"会话已建、流还没开"之间：
+   * 页面可借它把"新会话态下预置的会话级开关"（如自动审批）先写到服务端，从而覆盖**第一轮**。
+   * 纯同步的收尾（写 URL）照旧不 await 也没问题。
+   */
+  onConversationCreated?: (conversation: ConversationItem) => void | Promise<void>
   /**
    * 智能体类型。**只用于一件事**：断线对齐时要不要先问 `GET /active`
    * （`03` §4.1 只对 TaskAgent 要求"先查 /active 恢复进度视图，再拉历史"）。
@@ -344,7 +350,10 @@ export function useChatStream(
             return { ok: false, error }
           }
           targetId = created.id
-          onConversationCreatedRef.current?.(created)
+          // ⚠️ **await**：回调可能在开流前要落一步服务端写（如新会话态预置的自动审批，
+          //    见 `UseChatStreamOptions.onConversationCreated`）。放在 `performStream` 之前，
+          //    才能保证第一轮生效 —— 否则首轮的危险工具会先弹一次确认卡。
+          await onConversationCreatedRef.current?.(created)
         }
 
         // ⑤ 开一轮并读完流

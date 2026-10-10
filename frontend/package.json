@@ -16,6 +16,7 @@
     "verify:artifact-preview": "node --import tsx scripts/verify-artifact-preview.mjs",
     "verify:artifact-panel": "node --import tsx scripts/verify-artifact-panel.mjs",
     "verify:usage-ui": "node --import tsx scripts/verify-usage-ui.mjs",
+    "verify:memory-ui": "node --import tsx scripts/verify-memory-ui.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

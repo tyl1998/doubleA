@@ -563,13 +563,20 @@ export async function getConversationActive(
 
   // 两个键各读各的、互不相干：`chat.active:{id}` 决定 `streaming` 与进度快照，
   // `chat.autoapprove:{id}` 是本会话的自动审批开关（与"有没有流在跑"无关，见 redis.ts）。
-  const [raw, autoApproveRaw] = await Promise.all([
+  // ⚠️ P1-8 起同一次再读一行 `conversations.memory_excluded`（会话级「不记入记忆」）——
+  //    与 `autoApprove` 同款：对话页只靠本端点就能拿到它的当前值，不必另开一个端点。
+  const [raw, autoApproveRaw, conv] = await Promise.all([
     getRedis().get(chatActiveKey(id)),
     getRedis().get(chatAutoApproveKey(id)),
+    getPrisma().conversation.findFirst({
+      where: { id, userId: viewer.id },
+      select: { memoryExcluded: true },
+    }),
   ])
   // 只认 `'1'`；读失败/键缺失都当"关"（安全默认，与 `sse.ts#readAutoApprove` 同口径）
   const autoApprove = autoApproveRaw === '1'
-  if (raw === null) return { streaming: false, autoApprove, ...EMPTY_ACTIVE_SNAPSHOT }
+  const memoryExcluded = conv?.memoryExcluded ?? false
+  if (raw === null) return { streaming: false, autoApprove, memoryExcluded, ...EMPTY_ACTIVE_SNAPSHOT }
 
   const snapshot = parseActiveSnapshot(raw)
   if (snapshot.currentTool === null && snapshot.queuedPosition === null && snapshot.startedAt === null) {
@@ -577,7 +584,7 @@ export async function getConversationActive(
     // 但对读侧不构成失败：锁确实在，只是细节丢了。
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
-  return { streaming: true, autoApprove, ...snapshot }
+  return { streaming: true, autoApprove, memoryExcluded, ...snapshot }
 }
 
 // ═════════════════════════════════════════════════════════════════════

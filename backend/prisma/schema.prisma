@@ -210,6 +210,22 @@ enum NotifyType {
   @@map("notify_type")
 }
 
+/// 长期记忆条目类型（P1-8 / v2 P1-8a）。
+/// ⚠️ v2（2026-10-10）新语义：USER 作用域用 PROFILE/PREFERENCE/HABIT，AGENT 作用域用 HIGHLIGHT。
+/// `FACT` / `TASK` 是 v1 遗留值（PG 删枚举值成本高，刻意保留；迁移 `20261010141000` 已 backfill 到 v2）。
+/// 应用层取值域见 `shared#MEMORY_KINDS`（不含 FACT/TASK）。
+enum MemoryKind {
+  FACT
+  PREFERENCE
+  TASK
+  OTHER
+  PROFILE
+  HABIT
+  HIGHLIGHT
+
+  @@map("memory_kind")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -228,6 +244,14 @@ model User {
   role               UserRole   @default(MEMBER)
   status             UserStatus @default(ACTIVE)
   mustChangePassword Boolean    @default(true) @map("must_change_password")
+  /// 记忆总开关（P1-8）。false = 既不注入也不写入（既有条目保留、仍可在面板看到）
+  memoryEnabled      Boolean    @default(true) @map("memory_enabled")
+  /// 自动提取开关（P1-8）。false = 只有用户显式"记住"才写入
+  memoryAutoExtract  Boolean    @default(true) @map("memory_auto_extract")
+  /// 「全自动」开关（P1-8，HCI §5.2.2）。true = 偏好类不再逐条确认、直接写入（安全护栏不变）
+  memoryFullAuto     Boolean    @default(false) @map("memory_full_auto")
+  /// USER 画像常驻注入上限（P1-8a，每用户可调；默认 10，区间 [1,50] 由契约钳制）
+  memoryProfileMax   Int        @default(10) @map("memory_profile_max")
   createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -239,6 +263,7 @@ model User {
   artifacts      Artifact[]
   files          File[]
   scheduledTasks ScheduledTask[]
+  memories       Memory[]
 
   @@map("users")
 }
@@ -349,6 +374,7 @@ model Agent {
   conversations Conversation[]
   usageRecords  UsageRecord[]
   scheduledTasks ScheduledTask[]
+  memories      Memory[]
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
@@ -416,6 +442,8 @@ model Conversation {
   userId        String             @map("user_id") @db.Uuid
   topic         String?            @db.VarChar(255)
   status        ConversationStatus @default(ACTIVE)
+  /// 会话级「不记入记忆」（P1-8，HCI §5.2.1）。true = 本次对话不写入长期记忆（注入仍照常）
+  memoryExcluded Boolean           @default(false) @map("memory_excluded")
   lastMessageAt DateTime?          @map("last_message_at") @db.Timestamptz(3)
   createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -423,6 +451,8 @@ model Conversation {
   agent    Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
   user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
   messages Message[]
+  /// 本会话的滚动小结（P1-8 L1，1:1；删会话级联删行）
+  summary  ConversationSummary?
   /// 沙箱账本（P0-3-2）。⚠️ 删会话会**级联删掉这些行**，但容器不归数据库管 ——
   /// 孤儿回收器按 label 找容器、按"会话还在不在"判死（见 `backend/src/sandbox/reaper.ts`）。
   sandboxes Sandbox[]
@@ -1000,4 +1030,63 @@ model File {
   /// 「我的附件」列表与取内容时的归属校验扫描键
   @@index([uploaderId, createdAt(sort: Desc)])
   @@map("files")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 长期记忆两表（P1-8：L1 会话小结 / L2 用户记忆）
+//
+// 依据：`docs/子方案/TaskAgent会话持久化与长期记忆.md` §4.1（分层）/§4.3（L2 数据模型草案）/§5（HCI）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// conversation_summaries —— **L1 会话小结**（P1-8）。一个会话一行（1:1）。
+///
+/// ⚠️ **与 ChatBot 的滚动摘要（CB-2）共用同一张表**：L1 的"会话小结"就是"整段会话的滚动摘要"，
+/// 不是两份数据（设计 §三 CB-2 明写"与长期记忆 L1 共用"）。
+/// · `up_to_message_id` 是"小结覆盖到哪条消息"的游标（供将来增量更新；本批每轮整体重算并覆盖）；
+/// · `onDelete: Cascade` —— 会话没了，小结也随之消失（它是会话的**派生**物，不是独立资产）。
+model ConversationSummary {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  conversationId  String   @unique @map("conversation_id") @db.Uuid
+  text            String   @db.Text
+  upToMessageId   String?  @map("up_to_message_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("conversation_summaries")
+}
+
+/// memories —— **L2 用户记忆条目**（P1-8）。agent 跨会话引用的"关于你的一切"。
+///
+/// 三条口径：
+/// · **严格按 `user_id` 隔离**（唯一判据；ADMIN 无后门）。删账号级联删条目。
+/// · `agent_id` 是**可选细分**（`null` = 全体通用）；Agent 被硬删时置空（条目保留、降级为通用）。
+/// · `source_conversation_id` / `source_message_id` 是"这条从哪来"的锚点（设计 §4.4 审计要求）。
+///   ⚠️ **刻意不是外键**：来源会话/消息被删时**条目要保留**（HCI §5.5："来源会话被删 ⇒ 记忆保留、
+///   来源显示为『原会话已删除』"）。用外键 + SetNull 也能做，但那样"来源"与"会话 id"会被一起清掉
+///   ⇒ 面板连"原来来自哪个会话"都显示不出来。故存裸 uuid，读取端 join 会话表判断是否还存在。
+/// · `pinned` 是置顶（面板排序第一键）；`last_used_at` 记录最近一次被注入/被打开的时刻（衰减清理的判据）。
+model Memory {
+  id                   String     @id @default(uuid(7)) @db.Uuid
+  userId               String     @map("user_id") @db.Uuid
+  agentId              String?    @map("agent_id") @db.Uuid
+  kind                 MemoryKind
+  text                 String     @db.Text
+  sourceConversationId String?    @map("source_conversation_id") @db.Uuid
+  sourceMessageId      String?    @map("source_message_id") @db.Uuid
+  pinned               Boolean    @default(false)
+  createdAt            DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastUsedAt           DateTime?  @map("last_used_at") @db.Timestamptz(3)
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  /// 面板列表（本人、按创建时间倒序翻页）
+  @@index([userId, createdAt(sort: Desc)])
+  /// 注入时"置顶优先 + 类型过滤"的扫描键（`userId` + `pinned`）
+  @@index([userId, pinned, createdAt(sort: Desc)])
+  /// `recall_memory`（P1-8a）按"作用域(agent_id)/类型(kind) + 时间"扫描
+  @@index([userId, agentId, kind, createdAt(sort: Desc)])
+  @@map("memories")
 }

@@ -11,7 +11,7 @@
  */
 
 import { PlusOutlined } from '@ant-design/icons'
-import { Button, Pagination, Popconfirm, Table, Tag } from 'antd'
+import { Button, Pagination, Popconfirm, Table, Tabs, Tag } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -31,7 +31,12 @@ import { chatPath, HOME_PATH } from '../../app/paths.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TaskFormModal, type TaskFormValues } from './TaskFormModal.js'
+import { ActivityPanel } from './ActivityPanel.js'
+import { MemoryPanel } from './MemoryPanel.js'
 import { scheduleSummary, taskRunStatusLabel, taskRunStatusLed, notifySummary } from './taskModel.js'
+
+/** 「任务中心」的三个视图（P1-8 起：定时任务 + 活动时间线 + 记忆面板） */
+type TasksTabKey = 'tasks' | 'activity' | 'memory'
 
 function timeText(iso: string | null): string {
   return iso === null ? '—' : formatUpdatedAt(iso)
@@ -40,6 +45,7 @@ function timeText(iso: string | null): string {
 export function TasksPage() {
   const limit = TASKS_PAGE_LIMIT
   const [offset, setOffset] = useState(0)
+  const [tab, setTab] = useState<TasksTabKey>('tasks')
   const query = useScheduledTasks(offset, limit)
   const agentsQuery = useAgents({ limit: 100 })
   const feedback = useFeedback()
@@ -241,75 +247,95 @@ export function TasksPage() {
           <h1>任务中心</h1>
           <p className="page__lead">
             定时任务会按 cron 周期自动唤醒某个智能体（ChatBot 或 TaskAgent），把指令发给它执行。
-            到点后系统新建一个会话跑这一轮，过程和产物都在那个会话里。可以随时启停、立即执行或删除。
+            到点后系统新建一个会话跑这一轮，过程和产物都在那个会话里。下方还有「活动」与「记忆」两个视图。
           </p>
         </div>
-        <div className="page__head-actions">
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-            新建定时任务
-          </Button>
-        </div>
+        {tab === 'tasks' ? (
+          <div className="page__head-actions">
+            <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+              新建定时任务
+            </Button>
+          </div>
+        ) : null}
       </div>
 
-      {query.isError ? (
-        <ErrorState
-          title="定时任务没读出来"
-          error={query.error}
-          onRetry={() => {
-            void query.refetch()
-          }}
-          retrying={query.isFetching}
-        />
-      ) : query.isLoading ? (
-        <TableSkeleton />
-      ) : items.length === 0 ? (
-        <div className="card">
-          <EmptyState
-            title="还没有定时任务"
-            lead="建一个定时任务，让智能体按周期自动干活（例如每天 09:00 生成汇总表）。"
-            action={
-              agents.length === 0 ? (
-                <Link to={HOME_PATH}>
-                  <Button type="primary">先去建一个智能体</Button>
-                </Link>
-              ) : (
-                <Button type="primary" onClick={openCreate}>
-                  新建定时任务
-                </Button>
-              )
-            }
-          />
-        </div>
-      ) : (
-        <>
-          <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
-            共 <span className="num">{total}</span> 个定时任务
-          </p>
-          <div className="card" data-testid="scheduled-task-table">
-            <Table
-              rowKey="id"
-              columns={columns}
-              dataSource={items}
-              pagination={false}
-              size="middle"
-              scroll={{ x: 'max-content' }}
-            />
-          </div>
-          {total > limit ? (
-            <div className="row" style={{ marginTop: 'var(--sp-4)', justifyContent: 'flex-end' }}>
-              <Pagination
-                current={Math.floor(offset / limit) + 1}
-                pageSize={limit}
-                total={total}
-                showSizeChanger={false}
-                onChange={(page) => {
-                  setOffset((page - 1) * limit)
-                }}
-              />
-            </div>
-          ) : null}
-        </>
-      )}
+      <Tabs
+        activeKey={tab}
+        onChange={(key) => {
+          setTab(key as TasksTabKey)
+        }}
+        items={[
+          {
+            key: 'tasks',
+            label: '定时任务',
+            children: (
+              <>
+                {query.isError ? (
+                  <ErrorState
+                    title="定时任务没读出来"
+                    error={query.error}
+                    onRetry={() => {
+                      void query.refetch()
+                    }}
+                    retrying={query.isFetching}
+                  />
+                ) : query.isLoading ? (
+                  <TableSkeleton />
+                ) : items.length === 0 ? (
+                  <div className="card">
+                    <EmptyState
+                      title="还没有定时任务"
+                      lead="建一个定时任务，让智能体按周期自动干活（例如每天 09:00 生成汇总表）。"
+                      action={
+                        agents.length === 0 ? (
+                          <Link to={HOME_PATH}>
+                            <Button type="primary">先去建一个智能体</Button>
+                          </Link>
+                        ) : (
+                          <Button type="primary" onClick={openCreate}>
+                            新建定时任务
+                          </Button>
+                        )
+                      }
+                    />
+                  </div>
+                ) : (
+                  <>
+                    <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
+                      共 <span className="num">{total}</span> 个定时任务
+                    </p>
+                    <div className="card" data-testid="scheduled-task-table">
+                      <Table
+                        rowKey="id"
+                        columns={columns}
+                        dataSource={items}
+                        pagination={false}
+                        size="middle"
+                        scroll={{ x: 'max-content' }}
+                      />
+                    </div>
+                    {total > limit ? (
+                      <div className="row" style={{ marginTop: 'var(--sp-4)', justifyContent: 'flex-end' }}>
+                        <Pagination
+                          current={Math.floor(offset / limit) + 1}
+                          pageSize={limit}
+                          total={total}
+                          showSizeChanger={false}
+                          onChange={(page) => {
+                            setOffset((page - 1) * limit)
+                          }}
+                        />
+                      </div>
+                    ) : null}
+                  </>
+                )}
+              </>
+            ),
+          },
+          { key: 'activity', label: '活动', children: <ActivityPanel /> },
+          { key: 'memory', label: '记忆', children: <MemoryPanel /> },
+        ]}
+      />
 
       <TaskFormModal
         open={formOpen}

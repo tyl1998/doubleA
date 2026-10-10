@@ -21,6 +21,7 @@ import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
 import { registerAuthRoutes } from './routes/auth.js'
+import { registerActivityRoutes } from './routes/activity.js'
 import { registerAgentRoutes } from './routes/agents.js'
 import { registerArtifactRoutes } from './routes/artifacts.js'
 import { registerConversationRoutes } from './routes/conversations.js'
@@ -30,6 +31,7 @@ import { registerHealthRoutes } from './routes/health.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
 import { registerMcpServerRoutes } from './routes/mcpServers.js'
+import { registerMemoryRoutes } from './routes/memory.js'
 import { registerModelRoutes } from './routes/models.js'
 import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerTaskRoutes } from './routes/tasks.js'
@@ -191,6 +193,14 @@ export function buildApp(): FastifyInstance {
   //    数据源 `usage_records`（P0-3-12 上线、P1-7 起 ChatBot 也写）。它是平台级报表，
   //    与"会话/产物/任务仅本人"刻意相反 —— 普通用户看自己的 token 走消息历史。
   registerUsageRoutes(app)
+
+  // ⑱ 活动时间线（P1-8 · L0）：`GET /api/activity` + `GET /api/activity/search`。
+  //    权限与会话同族（**仅本人**）—— 复用 `conversations` / `messages` / `artifacts` / 小结，零新表。
+  registerActivityRoutes(app)
+
+  // ⑲ 长期记忆（P1-8 · L2）：`/api/memories` 系列（列表 / 增删改 / 开关 / 提示）+ 会话级
+  //    「不记入记忆」。同样**仅本人**（`memories.user_id`），与会话/产物/任务同族。
+  registerMemoryRoutes(app)
 
   return app
 }

@@ -53,7 +53,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { z } from 'zod'
 
-import { AppError, SEND_NOTIFICATION_TOOL_NAME } from '@doubulea/shared'
+import { AppError, RECALL_MEMORY_TOOL_NAME, REMEMBER_TOOL_NAME, SEND_NOTIFICATION_TOOL_NAME } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -64,6 +64,7 @@ import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
 import { executeSendNotification, getNotifyTarget, notifyBuiltinDescriptor } from '../notify/index.js'
 import { knowledgeListTool, knowledgeSearchTool, readDocumentTool, summarizeToolInput } from '../orchestrator/chatContext.js'
+import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from '../orchestrator/memoryTools.js'
 import {
   boundKnowledgeBaseIds,
   executeKnowledgeTool,
@@ -188,6 +189,8 @@ export async function buildSandboxMcpCatalog(
   // 与 ChatBot 同源（`knowledgeTools.ts`）；容器侧注册的商品名下不带 `mcp_` 前缀，
   // 执行时经 `/api/sandbox/builtin/call` 由后端代跑（凭据/库都不进容器）。见 `子方案③` §七。
   const builtins = knowledgeIds.length > 0 ? knowledgeBuiltinTools() : []
+  // 「记忆」内置工具（P1-8/P1-8a：remember 写入 + recall_memory 按需检索）：与知识库无关、**始终下发**
+  builtins.push(...memoryBuiltinDescriptors())
   // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行时下发
   if (getNotifyTarget(conversationId) !== undefined) builtins.push(notifyBuiltinDescriptor())
   catalog.builtins = builtins
@@ -214,6 +217,20 @@ export async function buildSandboxMcpCatalog(
  */
 export function knowledgeBuiltinTools(): SandboxBuiltinToolRef[] {
   return [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()].map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description ?? '',
+    inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
+  }))
+}
+
+/**
+ * 「记忆」内置工具（`remember` + `recall_memory`）在容器清单里的描述符（P1-8/P1-8a）。
+ *
+ * 与 {@link knowledgeBuiltinTools} 同源（**同一份定义** `orchestrator/memoryTools.ts`），
+ * 只是转成容器清单要的 `{name, description, inputSchema}` —— 执行仍走 `/api/sandbox/builtin/call`。
+ */
+export function memoryBuiltinDescriptors(): SandboxBuiltinToolRef[] {
+  return [rememberTool(), recallMemoryTool()].map((tool) => ({
     name: tool.function.name,
     description: tool.function.description ?? '',
     inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
@@ -430,8 +447,9 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     const body = parsed.data
 
     const isNotify = body.name === SEND_NOTIFICATION_TOOL_NAME
-    // 只认内置工具（知识库一族 + 通知）；其他名字不是这条端点的职责
-    if (!isKnowledgeToolName(body.name) && !isNotify) {
+    const isMemory = body.name === REMEMBER_TOOL_NAME || body.name === RECALL_MEMORY_TOOL_NAME
+    // 只认内置工具（知识库一族 + 通知 + 记忆）；其他名字不是这条端点的职责
+    if (!isKnowledgeToolName(body.name) && !isNotify && !isMemory) {
       return sendError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
     }
 
@@ -455,6 +473,24 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
         conversationId: auth.record.conversationId,
         arguments: JSON.stringify(body.arguments),
       })
+      return reply.send({ isError: outcome.isError, text: outcome.output })
+    }
+
+    // 记忆工具（P1-8/P1-8a）：执行体与 ChatBot 共用（`orchestrator/memoryTools.ts`），主语 = 令牌里的 userId
+    if (isMemory) {
+      const outcome =
+        body.name === RECALL_MEMORY_TOOL_NAME
+          ? await executeRecallMemoryTool({
+              userId: auth.record.userId,
+              agentId: auth.record.agentId,
+              arguments: JSON.stringify(body.arguments),
+            })
+          : await executeMemoryTool({
+              userId: auth.record.userId,
+              agentId: auth.record.agentId,
+              conversationId: auth.record.conversationId,
+              arguments: JSON.stringify(body.arguments),
+            })
       return reply.send({ isError: outcome.isError, text: outcome.output })
     }
 

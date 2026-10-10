@@ -71,6 +71,7 @@ import {
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { uploadChatFile } from '../../api/files.js'
+import { setConversationMemoryExcluded } from '../../api/memory.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -83,6 +84,7 @@ import { ChatInput } from '../../features/chat/ChatInput.js'
 import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/confirmModel.js'
 import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
+import { MemoryExclusionSwitch, MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
 import { MessageList } from '../../features/chat/MessageList.js'
 import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
 import {
@@ -158,9 +160,22 @@ export function ChatPage() {
     conversationId,
     {
       // 首条消息建出会话之后把 id 写进 URL（`replace`：不往历史里塞一步"空跳转"）
-      onConversationCreated: (created) => {
+      onConversationCreated: async (created) => {
         // 这是"新建会话"而不是"切换会话"：别让 reset effect 把用户此刻选的模型清掉
         preserveSelectionRef.current = true
+        // 新会话态下预置过自动审批 ⇒ 会话一建出来就先落地到服务端，再导航开流
+        // （顺序是关键：写在 `performStream` 之前，第一轮才吃得到）。
+        // 消费掉意图后立刻清，避免它被下一条新会话误用。
+        const preset = autoApprovePresetRef.current
+        autoApprovePresetRef.current = false
+        if (preset) {
+          try {
+            await setConversationAutoApprove(created.id, true)
+          } catch (error: unknown) {
+            // 落不下就如实说，但**不拦发送**：这一轮退回逐次确认即可，用户仍能继续聊
+            feedback.fail(error, '自动审批开关没有保存')
+          }
+        }
         navigate(chatPath(agentId, created.id), { replace: true })
       },
       ...(agentQuery.data === undefined ? {} : { agentType: agentQuery.data.type }),
@@ -208,13 +223,34 @@ export function ChatPage() {
   const [autoApprove, setAutoApprove] = useState(false)
   /** 开关在飞（保存中禁用 + 转圈） */
   const [autoApprovePending, setAutoApprovePending] = useState(false)
+  /**
+   * 新会话态下用户**预置**的自动审批意图（P1 增量）。
+   *
+   * 开关挂在会话上（真值 Redis `chat.autoapprove:{id}`），而会话要等首条消息才建出来。
+   * 于是新会话态点开关时**先记在这里、不发请求**；`onConversationCreated` 拿到新会话 id 后、
+   * 开流之前把它写到服务端 —— 这样**第一轮**的危险工具也不会先弹一次确认卡。
+   */
+  const autoApprovePresetRef = useRef(false)
+  /**
+   * 会话级「不记入记忆」（本地镜像，P1-8）。与会话级自动审批同款：真值在服务端
+   * （`conversations.memory_excluded`），随 `/active` 一并回带；切换会话时先重置为"记入"（默认）。
+   */
+  const [memoryExcluded, setMemoryExcluded] = useState(false)
+  const [memoryExcludedPending, setMemoryExcludedPending] = useState(false)
   useEffect(() => {
     setAutoApprove(false)
-    if (conversationId === undefined) return
+    setMemoryExcluded(false)
+    if (conversationId === undefined) {
+      // 回到新会话态：清掉上一条会话残留的"预置自动审批"意图（否则下条新会话会被它带偏）
+      autoApprovePresetRef.current = false
+      return
+    }
     let cancelled = false
     void fetchConversationActive(conversationId)
       .then((active) => {
-        if (!cancelled) setAutoApprove(active.autoApprove)
+        if (cancelled) return
+        setAutoApprove(active.autoApprove)
+        setMemoryExcluded(active.memoryExcluded)
       })
       .catch(() => {
         // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
@@ -226,6 +262,14 @@ export function ChatPage() {
   }, [conversationId])
   /** 窄屏下的产物抽屉开关（第三列被 CSS 藏在 ≥1280 才显示，窄屏用抽屉给入口，见 `ArtifactPanel` 那段） */
   const [artifactDrawerOpen, setArtifactDrawerOpen] = useState(false)
+  /**
+   * 记忆提示刷新键（P1-8）：每轮结束/开始时 +1 ⇒ `MemoryNoticeStack` 拉一次"待展示提示"
+   * （兑现 HCI §5.3 的"toast 晚一拍"：自动写入发生在 `done` 之后，提示只能在下一拍出现）。
+   */
+  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0)
+  useEffect(() => {
+    setMemoryRefreshKey((key) => key + 1)
+  }, [streamingId])
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
   const frameRef = useRef<HTMLDivElement>(null)
   /**
@@ -644,7 +688,13 @@ export function ChatPage() {
    */
   const handleToggleAutoApprove = useCallback(
     (next: boolean): void => {
-      if (conversationId === undefined) return
+      // 新会话态（会话还没建）：开关挂在会话上，没法写服务端 ⇒ 先记意图、只改本地，
+      // 等首条消息建出会话、开流前再落地（见 `onConversationCreated` / `autoApprovePresetRef`）。
+      if (conversationId === undefined) {
+        autoApprovePresetRef.current = next
+        setAutoApprove(next)
+        return
+      }
       setAutoApprovePending(true)
       void setConversationAutoApprove(conversationId, next)
         .then((result) => {
@@ -660,6 +710,29 @@ export function ChatPage() {
         })
         .finally(() => {
           setAutoApprovePending(false)
+        })
+    },
+    [conversationId, feedback],
+  )
+
+  /**
+   * 切换会话级「不记入记忆」（P1-8，HCI §5.2.1）。与自动审批同款：请求成功后才对齐本地开关
+   * （不乐观更新）—— 让界面显示的状态与服务端真正落库的状态一致。
+   */
+  const handleToggleMemoryExcluded = useCallback(
+    (next: boolean): void => {
+      if (conversationId === undefined) return
+      setMemoryExcludedPending(true)
+      void setConversationMemoryExcluded(conversationId, next)
+        .then((result) => {
+          setMemoryExcluded(result.memoryExcluded)
+          feedback.ok(result.memoryExcluded ? '本次对话不记入记忆' : '本次对话恢复记入记忆')
+        })
+        .catch((error: unknown) => {
+          feedback.fail(error, '记忆开关没有保存')
+        })
+        .finally(() => {
+          setMemoryExcludedPending(false)
         })
     },
     [conversationId, feedback],
@@ -779,20 +852,27 @@ export function ChatPage() {
             </div>
             <div className="chat__head-right">
               {/* 会话级自动审批：开启后本会话内危险工具（含服务端 elicitation）不再逐次弹确认卡。
-                  `conversationId` 未建（新会话态）时禁用 —— 开关是挂在会话上的。 */}
+                  新会话态也能开（先把意图记在本地，建出会话后、开流前落地）—— 否则第一轮必弹确认卡。 */}
               <Switch
                 size="small"
                 checked={autoApprove}
                 loading={autoApprovePending}
-                disabled={conversationId === undefined}
                 checkedChildren="自动审批"
                 unCheckedChildren="逐次确认"
                 onChange={handleToggleAutoApprove}
                 title={
                   conversationId === undefined
-                    ? '发送第一条消息后可用'
+                    ? '开启后本会话内危险工具不再逐次弹确认卡（发送第一条消息时生效）'
                     : '开启后本会话内危险工具不再逐次弹确认卡（会话级，仅本会话生效）'
                 }
+              />
+              {/* 会话级「不记入记忆」（P1-8）：关闭后本次对话不写入长期记忆（已有记忆仍作背景）。
+                  `conversationId` 未建（新会话态）时禁用 —— 开关挂在会话上。 */}
+              <MemoryExclusionSwitch
+                conversationId={conversationId}
+                excluded={memoryExcluded}
+                loading={memoryExcludedPending}
+                onToggle={handleToggleMemoryExcluded}
               />
               {/* 模型选择器（模型池特性）：池里有 2 个及以上模型时才给选择器；否则只有默认模型、
                   没有可选项，用上面的文字标签展示即可。选了非默认模型时随发送透传给后端
@@ -852,6 +932,10 @@ export function ChatPage() {
           {disconnect === null ? null : (
             <DisconnectBanner extra={disconnect.extra} aligning={aligning} onAlign={handleAlign} />
           )}
+
+          {/* 长期记忆提示（P1-8，toast 晚一拍）：自动写入可撤销 / 偏好建议可记住。
+              只在有提示时渲染；由 `MemoryNoticeStack` 自己按会话/聚焦/每轮拉取。 */}
+          <MemoryNoticeStack conversationId={conversationId} refreshKey={memoryRefreshKey} />
 
           {/* 排队提示（`queued` 事件）：沙箱并发满时的位次。**P0 阶段恒不出现**
               （产生方是沙箱并发闸，属 P0-3）。 */}

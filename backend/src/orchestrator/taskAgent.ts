@@ -116,6 +116,7 @@ import {
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
+import { getPrisma } from '../infra/prisma.js'
 import { sumUsages, type ChatUsage } from '../llm/protocol.js'
 import {
   closeSandboxRpc,
@@ -146,14 +147,17 @@ import {
   KNOWLEDGE_TOOL_SERVER_NAME,
   KNOWLEDGE_USAGE_RULES,
   ATTACHMENT_CONTEXT_NOTE,
+  MEMORY_TOOL_RULES,
   RETRIEVAL_RULES,
   attachmentItemsOf,
   formatKnowledgeCatalog,
 } from './chatContext.js'
 import { taskAttachmentPromptBlock, writeAttachmentFiles } from './attachmentFiles.js'
 import { boundKnowledgeBaseIds, loadKnowledgeCatalog } from './knowledgeTools.js'
+import { runMemoryExtraction } from './memoryExtract.js'
 import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
+import { getMemorySettings } from '../services/memory.service.js'
 import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
 
 /**
@@ -378,6 +382,23 @@ export const taskAgentProducer: ChatProducer = async (input) => {
           { err: error, conversationId, agentId },
           '知识库概览注入失败（本轮 agent 可能不知道绑定了哪些库；工具注册与派活不受影响）',
         )
+      }
+
+      // ★ 长期记忆工具说明 + 反幻觉（P1-8a）：启用记忆时把 remember/recall_memory 的用法与
+      //   "未命中不得编造"拼进发给引擎的 prompt。⚠️ 只改 engineContent（落库仍是用户原文）。
+      try {
+        const memoryConv = await getPrisma().conversation.findUnique({
+          where: { id: conversationId },
+          select: { userId: true },
+        })
+        if (memoryConv !== null) {
+          const memorySettingsForTurn = await getMemorySettings(memoryConv.userId)
+          if (memorySettingsForTurn.enabled) {
+            engineContent = `${MEMORY_TOOL_RULES}\n\n${engineContent}`
+          }
+        }
+      } catch (error) {
+        logger.warn({ err: error, conversationId }, '记忆工具说明注入失败（不影响派活）')
       }
 
       // ★ 附件（P1-4，2026-10-01 修订）—— 两件事，且**都必须在拍基线之前**：
@@ -688,6 +709,33 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     usageRecord,
     logger,
   })
+
+  // ── 长期记忆提取（P1-8）：落库之后、与 bot 类型无关（见 `memoryExtract.ts`）──
+  //    TaskAgent 的显式"记住"、偏好建议、显式"忘掉"都在这里发生；失败只 warn（本轮不受影响）。
+  try {
+    const conversationRow = await getPrisma().conversation.findUnique({
+      where: { id: conversationId },
+      select: { userId: true, memoryExcluded: true },
+    })
+    if (conversationRow !== null) {
+      const memorySettings = await getMemorySettings(conversationRow.userId)
+      await runMemoryExtraction({
+        conversationId,
+        userId: conversationRow.userId,
+        agentId,
+        userText: content,
+        assistantText: round.assistantText,
+        enabled: memorySettings.enabled,
+        autoExtract: memorySettings.autoExtract,
+        fullAuto: memorySettings.fullAuto,
+        conversationExcluded: conversationRow.memoryExcluded,
+        // 画像模型归一用它解析上游目标（与本轮对话同一个模型）
+        modelId: input.target.modelId,
+      })
+    }
+  } catch (error) {
+    logger.warn({ err: error, conversationId }, '长期记忆提取失败（已忽略，不影响本轮）')
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // ⑦ 用户停止 ⇒ 收沙箱（P0-3-8；`子方案③` §九 5 第 4 条：容器与具名卷一并回收）

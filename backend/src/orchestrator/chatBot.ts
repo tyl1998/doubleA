@@ -77,6 +77,9 @@
 import {
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
+  MEMORY_TOOL_SERVER_NAME,
+  RECALL_MEMORY_TOOL_NAME,
+  REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
   type CitationItem,
   type ErrorCode,
@@ -106,6 +109,7 @@ import {
 } from '../mcp/client.js'
 import { executeMcpToolCall, resolveMcpToolCatalog } from '../services/mcpCall.service.js'
 import { MESSAGE_CHRONO_ORDER } from '../services/conversation.service.js'
+import { buildMemoryToc, buildUserProfileBlock, getMemorySettings } from '../services/memory.service.js'
 import { executeSendNotification, getNotifyTarget, notifyOpenAiTool, NOTIFY_TOOL_SERVER_NAME } from '../notify/index.js'
 import {
   KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
@@ -133,6 +137,8 @@ import {
   type ToolOutcome,
 } from './chatContext.js'
 import { executeKnowledgeTool, isKnowledgeToolName, loadKnowledgeCatalog } from './knowledgeTools.js'
+import { runMemoryExtraction } from './memoryExtract.js'
+import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from './memoryTools.js'
 import { persistRoundQuietly } from './persist.js'
 import { createSemaphore } from './semaphore.js'
 import {
@@ -201,6 +207,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
 
   try {
     const db = getPrisma()
+
+    // ── ②″ 会话行（owner + 会话级「不记入记忆」；长期记忆注入与收尾提取都要用）──
+    const conversationRow = await db.conversation.findUnique({
+      where: { id: conversationId },
+      select: { userId: true, memoryExcluded: true },
+    })
+    if (conversationRow === null) throw AppError.notFound('会话不存在')
+    // 长期记忆 v2（P1-8a）：② USER 画像**常驻** + ③ AGENT 记忆**极简目录 TOC**（不含正文）；
+    //    AGENT 记忆细节由 agent 按需调 `recall_memory`（见 `memoryTools.ts`）。两段在总开关关掉时为空。
+    const memorySettings = await getMemorySettings(conversationRow.userId)
+    const userProfile = await buildUserProfileBlock({ userId: conversationRow.userId })
+    const memoryToc = await buildMemoryToc({ userId: conversationRow.userId, agentId })
 
     // ── ② 智能体与它绑定的知识库 / MCP server ──
     const agent = await db.agent.findFirst({
@@ -281,6 +299,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 排在 MCP 工具**前面**：让模型先看到它们，与系统提示里"知识库优先"的顺序一致。
      */
     const builtinTools = kbIds.length === 0 ? [] : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()]
+    // 「记住」+「按需检索记忆」内置工具（P1-8/P1-8a）：与知识库无关、**始终下发** —— 记忆是平台级能力
+    builtinTools.push(rememberTool(), recallMemoryTool())
     // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行（含"立即执行"）时下发
     if (getNotifyTarget(conversationId) !== undefined) builtinTools.push(notifyOpenAiTool())
     const tools = [...builtinTools, ...catalog.tools]
@@ -301,7 +321,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
     })
     historyRows.reverse() // 上面是倒序取的（要"最近的 N 条"），还原成时间正序再组装
     const messages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt(agent.systemPrompt, knowledgeCatalog) },
+      {
+        role: 'system',
+        content: buildSystemPrompt(agent.systemPrompt, knowledgeCatalog, {
+          userProfileBlock: userProfile.block,
+          memoryTocBlock: memoryToc.block,
+          memoryRules: memorySettings.enabled,
+        }),
+      },
       ...selectHistoryMessages(historyRows as HistoryRow[], rounds),
       // 本轮用户消息 + 附件（P1-4）：图片→多模态 part、文本类→拼进正文（见 `buildUserChatMessage`）
       buildUserChatMessage(content, input.attachments),
@@ -562,6 +589,62 @@ export const chatBotProducer: ChatProducer = async (input) => {
             await input.updateSnapshot({ currentTool: call.name })
             // 执行体在 `notify/index.ts`（**唯一实现**）：TaskAgent 经沙箱代理调的是同一个函数
             const outcome = await executeSendNotification({ conversationId, arguments: call.arguments })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const finished = { ...base, status, inputSummary, output: outcome.output }
+            emitToolCard(finished)
+            toolRecords.push({ ...finished, arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
+            continue
+          }
+
+          // ── 内置「记住」工具（P1-8）：与知识库同属内置族，按名字分流 ──
+          if (call.name === REMEMBER_TOOL_NAME) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: MEMORY_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+            // 主语（user_id）来自**会话行**（现查），不从模型参数取（见 `memoryTools.ts`）
+            const outcome = await executeMemoryTool({
+              userId: conversationRow.userId,
+              agentId,
+              conversationId,
+              arguments: call.arguments,
+            })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const finished = { ...base, status, inputSummary, output: outcome.output }
+            emitToolCard(finished)
+            toolRecords.push({ ...finished, arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
+            continue
+          }
+
+          // ── 内置「按需检索记忆」工具（P1-8a）：与 remember 同族，按名字分流 ──
+          if (call.name === RECALL_MEMORY_TOOL_NAME) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: MEMORY_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+            const outcome = await executeRecallMemoryTool({
+              userId: conversationRow.userId,
+              agentId,
+              arguments: call.arguments,
+            })
             const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
             const finished = { ...base, status, inputSummary, output: outcome.output }
             emitToolCard(finished)
@@ -917,6 +1000,22 @@ export const chatBotProducer: ChatProducer = async (input) => {
 
     if (emitFailure !== undefined) throw emitFailure
     if (fatal) throw failure
+
+    // ── 长期记忆提取（P1-8）：**落库之后**、与 bot 类型无关（见 `memoryExtract.ts`）──
+    // 只对正常/被停止的一轮做（`fatal` 已抛出去）：显式"记住"、偏好建议、显式"忘掉"都在这里发生。
+    await runMemoryExtraction({
+      conversationId,
+      userId: conversationRow.userId,
+      agentId,
+      userText: content,
+      assistantText,
+      enabled: memorySettings.enabled,
+      autoExtract: memorySettings.autoExtract,
+      fullAuto: memorySettings.fullAuto,
+      conversationExcluded: conversationRow.memoryExcluded,
+      // 画像模型归一用它解析上游目标（与本轮对话同一个模型）
+      modelId: input.target.modelId,
+    })
 
     const finishReason = interrupted ? 'STOPPED' : 'COMPLETE'
     if (!interrupted && summary !== null && summary.rawFinishReason !== null && summary.rawFinishReason !== 'stop') {
