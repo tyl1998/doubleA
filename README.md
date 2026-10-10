@@ -1532,6 +1532,7 @@ bash infra/scripts/egress-down.sh             # 收工（只删代理容器，�
 | `docs/子方案/沙箱与引擎集成.md` | 引擎定案 Pi（直连 `pi --mode rpc`）/ 容器生命周期 / 事件映射 / 产物收集 / MCP 后端代理 | ✅ 已完成（2026-09-25，P0-3-0a） |
 | `docs/子方案/文件预览.md` | MD/HTML/图片/CSV/PDF 五格式预览 + 安全处理（两条出口：下载 `attachment` / 预览 `inline`；**六条安全判据** + 逐格式落法） | ✅ 已完成（2026-09-26，P0-3-0b） |
 | `docs/子方案/Code模式工作区.md` | **Code 模式**：人机共享工作区（共享 FS + DB 版本索引 + S3 冷备）/ agent 文件 I/O 中介 / 四层并发防护（串行 · claim · CAS · 三方合并）/ CodeMirror 6 前端 | 📝 设计讨论稿（2026-10-08） |
+| `docs/子方案/沙箱多机部署.md` | **沙箱多机部署（路线 A）**：每机一实例 + 按会话路由（`SANDBOX_INSTANCE_ID` 实例身份 / `Sandbox.instanceId` 归属列 / 三处对账按本机过滤 / 队列键按实例隔离 / Redis 会话→实例目录 / 路由网关） | 📝 设计稿（2026-10-10） |
 
 ### 缺陷与踩坑归档
 
