@@ -1,37 +1,34 @@
 /**
- * 产物收集（P0-3-7）—— 「工作卷扫 → 对象存储 → `artifacts` 行 → `artifact` 事件」的四段链
+ * 产物收集（P0-3-7 建；P1-9 · R4 把判据换成「产物 = 工作区变更集视图」）
  *
  * 依据：`docs/子方案/沙箱与引擎集成.md` §十一（产物收集与交付，全文）+ §九 1（"产物立刻出容器"）、
- *      `docs/02-后端设计.md` §三（`artifacts` 表）/ §5.2（"done 时整条落库，含 artifacts 结构"）、
- *      `docs/06-实施计划.md` §五 P0-3-7 行
+ *      `docs/子方案/Code模式工作区.md` §五 6 / §十三 已决 6（**产物 = 工作区变更集视图**）+
+ *      §七 5（轮末变更集）、`docs/02-后端设计.md` §三（`artifacts` 表）/ §5.2（"done 时整条落库"）。
  *
  * ```
- * 编排层（taskAgent.ts）在本轮的两端各调一次本模块：
- *   派活之前    snapshotWorkFiles()   → 拍基线（P0-3-6 详规传下来的口径 ②：
- *                                      基线必须**在派活之前**拍，不许收尾之后补）
- *   agent_settled collectRoundArtifacts() → 对照 → 过滤 → 传对象 → 建行
- *                                      → 把建好的行交回编排层发 `artifact` 事件
- * 保留期        reapExpiredArtifacts() → 周期清理（挂在对账器同一轮里，§十一 4）
+ * 编排层（taskAgent.ts）在本轮的两端各调一次工作区/产物：
+ *   派活之前    reconcileWorkspaceOnce() + recordWorkspaceRoundStart()  → 对账 setup 写 + 记窗口起点
+ *   agent_settled reconcileWorkspaceOnce() + collectRoundArtifacts()    → 取本轮变更集 → 过滤 → 传对象 → 建行
+ * 保留期        reapExpiredArtifacts()                                 → 周期清理（挂在对账器同一轮里，§十一 4）
  * ```
  *
  * ═══════════════════════════════════════════════════════════════════════
- * ★ 判据一：扫描的是「**这一轮**新出现或修改的」（§十一 1）
+ * ★ 判据一（P1-9 · R4）：产物 = **本轮工作区变更集**，不再是容器快照 diff
  * ═══════════════════════════════════════════════════════════════════════
- * 基线**每一轮拍**（派活之前），不是子方案原文写的"容器启动时拍一次"——那是 P0-3-6 详规
- * 传下来的修正口径：复用容器跑第二轮时，"启动时的基线"会让第一轮的产物**再报一次**
- * （症状：产物列表里同一个文件两份、时间还不一样）。改成"每轮派活之前拍"，第二轮的
- * 基线天然是上一轮的收尾态，多轮语义自动成立，且**不需要任何跨轮的进程内状态**
- * （后端重启、容器换血都不会留脏账）。
+ * P0-3-7 的原始口径是"派活前拍 `/work` 快照（size+mtime）、收尾对照取本轮新出现/修改的"。R4 把判据
+ * 换成**工作区变更集**（`workspace_events` 在轮次窗口内按路径折叠，`shared#foldWorkspaceEvents`，见
+ * `artifactChanges.ts`）—— 单一真相是工作区（§二），产物只是它的**交付视图**：
+ *   · `git clone` 等初始填充 / 依赖安装若发生在轮次窗口**之前**（setup 步），天然不算产物；
+ *   · 窗口**之后**人再改的也不进本轮产物（窗口 = `[轮次起点, now]`，同「撤销本轮」的时间口径）；
+ *   · `.git`、记忆文档（`.doubulea/`）由"隐藏路径"规则排除，`node_modules` 由显式名单排除。
+ * ⚠️ 时效性由编排层在收产物前 `reconcileWorkspaceOnce` 保证：`bash` / 原生工具的**未中介写**必须先
+ *    进工作区索引与事件（`workspace/watcher.ts`），否则这一轮它看不到。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ★ 判据二：过滤规则**全部要留痕**（§十一 2 —— "都要有日志，不静默丢"）
  * ═══════════════════════════════════════════════════════════════════════
- *   · 隐藏文件/目录（路径任一段以 `.` 开头）⇒ 跳过（引擎自己的 dotfile 全在这一条里，
- *     如 pi 的 `.pi` —— 不需要为它们单列黑名单）；
- *   · `ARTIFACT_EXCLUDED_DIRS`（见下方）⇒ 跳过（引擎/依赖的工作目录，显式列出、
- *     一处定义 —— 子方案要求"名单显式列在配置里，不要写死一串 magic path"）；
- *   · 单文件超过 `ARTIFACT_MAX_FILE_MB` ⇒ 跳过 + **warn**；
- *   · 总数超过 `ARTIFACT_SCAN_MAX_FILES` ⇒ **截断** + warn（防引擎写一万个小文件打爆上传）。
+ * 过滤逻辑（隐藏 / 显式名单 / 截断）在 `artifactChanges.ts#filterArtifactPaths`（纯函数，可单测）；
+ * 单文件超过 `ARTIFACT_MAX_FILE_MB` ⇒ 跳过 + **warn**（在按实际读到的字节判，一处判据）。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ★ 判据三：顺序不能反 —— **先传对象、再建行**（§十一 3）
@@ -45,170 +42,37 @@
  *   · **产物不跟会话/Agent 的删除走**（`TaskAgent记忆与产物` 块 3 起**字面成立**）：
  *     schema 的 `Artifact.conversationId` 是可空 + `onDelete: SetNull` —— 删会话只把
  *     `conversation_id` 置空、产物行保留（归"会话产物"，按 `user_id` 可查，可在
- *     「会话产物」页主动删除）；文件与行的**过期收口只有保留期清理器**
- *     （`02` §三"消息与产物都不删"的完整语义）。
+ *     「会话产物」页主动删除）；文件与行的**过期收口只有保留期清理器**。
  *   · **收集失败 ≠ 这一轮失败**：编排层对本模块的一切异常都 catch + warn 后继续收尾
  *     （产物是本轮的**赠品**，不是交付物本体；正文已经流出去了）。
  */
 
 import { randomUUID } from 'node:crypto'
 
-import type { ArtifactItem } from '@doubulea/shared'
+import { type ArtifactItem, type WorkspaceChangeEntry } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { ensureBucket, getS3Client } from '../infra/s3.js'
-import { execInSandbox } from './docker.js'
-import { SANDBOX_WORK_DIR } from './spec.js'
-
-/**
- * 扫描排除的**顶层相对目录**（`子方案③` §十一 2 的"引擎自身的工作文件"名单）。
- *
- * ⚠️ **显式列出、一处定义**（不写死散落）：加名字只改这一处；隐藏目录（`.` 开头）
- * 由那条通用规则单独覆盖、不进本名单（两套规则混写就会出现"删了规则忘了名单"的分叉）。
- * - `node_modules`：镜像刻意不装包管理器，但工具运行期（pandas/jq 等）可能解出依赖目录 ——
- *   那是**环境**不是**产物**，且动辄几千个小文件，只会打爆 `ARTIFACT_SCAN_MAX_FILES`。
- */
-export const ARTIFACT_EXCLUDED_DIRS: readonly string[] = ['node_modules']
-
-/**
- * 单条 `docker exec` 的时限（代码常量，不进 env —— 与 `map.ts` 两个数值常量同款取舍：
- * 它不是"行为窗口"，改它不改变契约）。扫描（find）与读文件（cat，最大 50MB）都够用。
- */
-export const ARTIFACT_EXEC_TIMEOUT_MS = 60_000
+import { resolveWorkspacePath } from '../workspace/paths.js'
+import { ensureWorkspace } from '../workspace/service.js'
+import { readWorkspaceBytes, workspaceFileSize } from '../workspace/store.js'
+import { ARTIFACT_EXCLUDED_DIRS, artifactChangePaths } from './artifactChanges.js'
 
 /**
  * 一个产物文件在对象存储里的键前缀（与 `kb/` 平级的命名空间 —— 两类对象永不混淆）。
  */
 const ARTIFACT_KEY_PREFIX = 'artifacts'
 
-/** work 卷快照里一个文件的三个读数（路径 → 这三项） */
-export interface WorkFileStat {
-  /** 字节数（`find -printf %s`） */
-  size: number
-  /** mtime 的十进制秒（`find -printf %T@`，GNU 格式含小数）—— 只用于比对，不落库 */
-  mtime: string
-}
-
 /**
- * work 卷快照：相对路径 → `{size, mtime}`。
- * `Map` 而不是数组：对照侧按路径点查，线性扫会把过滤逻辑写成 O(²)。
- */
-export type WorkSnapshot = Map<string, WorkFileStat>
-
-/**
- * 派活之前拍基线：`find /work` 一把抓「相对路径 + 大小 + mtime」。
+ * 单条 `docker exec` 的时限（代码常量，不进 env —— 与 `map.ts` 两个数值常量同款取舍：
+ * 它不是"行为窗口"，改它不改变契约）。
  *
- * ⚠️ **失败即放弃本轮收集**（返回 `undefined` 而不是"当空基线"）：空基线会把
- * 复用容器里**上一轮的产物全部再报一次**（判据一的症状），比"这一轮少收了产物"糟。
- * 调用方（`taskAgent.ts`）对 `undefined` 的处置 = 跳过收集 + warn。
+ * ⚠️ 产物收集自 P1-9 · R4 起改走**宿主工作区 FS**、不再用它；保留导出是因为
+ * `memoryDoc.ts` / `attachmentFiles.ts` 写容器（记忆文档 / 附件）时复用它作 exec 超时。
  */
-export async function snapshotWorkFiles(containerId: string): Promise<WorkSnapshot | undefined> {
-  let result
-  try {
-    result = await execInSandbox(
-      containerId,
-      ['find', SANDBOX_WORK_DIR, '-type', 'f', '-printf', '%P\t%s\t%T@\n'],
-      { timeoutMs: ARTIFACT_EXEC_TIMEOUT_MS },
-    )
-  } catch (error) {
-    getLogger().warn({ err: error, containerId }, '产物基线扫描失败：本轮跳过产物收集（避免把旧产物再报一次）')
-    return undefined
-  }
-  if (result.exitCode !== 0) {
-    getLogger().warn(
-      { containerId, exitCode: result.exitCode, stderr: result.stderr.toString('utf8').slice(0, 500) },
-      '产物基线扫描未成功（find 非 0 退出）：本轮跳过产物收集',
-    )
-    return undefined
-  }
-  return parseFindOutput(result.stdout)
-}
-
-/**
- * 解析 `find -printf '%P\t%s\t%T@\n'` 的输出（导出为纯函数是为了核查矩阵可以不连 Docker）。
- *
- * 三条解析纪律：
- *   · 含 `\n` / `\r` / `\t` 的路径**没法用这个格式无歧义表达** ⇒ 当场跳过并 warn
- *     （不静默丢；这类文件名几乎总是引擎在捣乱，不是用户的产物）；
- *   · 大小/时刻列不是合法数字 ⇒ 跳过并 warn；
- *   · 空行直接忽略（输出尾部惯例性的换行）。
- */
-export function parseFindOutput(stdout: Buffer): WorkSnapshot {
-  const snapshot: WorkSnapshot = new Map()
-  const text = stdout.toString('utf8')
-  const lines = text.split('\n')
-  const skipped: string[] = []
-  for (const line of lines) {
-    if (line === '') continue
-    const tab1 = line.indexOf('\t')
-    const tab2 = line.indexOf('\t', tab1 + 1)
-    if (tab1 < 0 || tab2 < 0) {
-      skipped.push(line)
-      continue
-    }
-    const path = line.slice(0, tab1)
-    const size = Number(line.slice(tab1 + 1, tab2))
-    const mtime = line.slice(tab2 + 1)
-    if (path === '' || !Number.isInteger(size) || size < 0 || mtime === '') {
-      skipped.push(line)
-      continue
-    }
-    snapshot.set(path, { size, mtime })
-  }
-  if (skipped.length > 0) {
-    getLogger().warn(
-      { count: skipped.length, sample: skipped.slice(0, 5) },
-      '基线扫描：部分文件名的路径含换行/制表符或读数不合法，已跳过（不静默丢，留痕于此）',
-    )
-  }
-  return snapshot
-}
-
-/**
- * 基线对照（纯函数）：**这一轮新出现或修改的**文件。
- * 修改的判据 = `size` 或 `mtime` 与基线不一致（`find` 的 `%T@` 精度足以区分"重写过"）。
- */
-export function diffWorkFiles(baseline: WorkSnapshot, current: WorkSnapshot): string[] {
-  const changed: string[] = []
-  for (const [path, stat] of current) {
-    const before = baseline.get(path)
-    if (before === undefined || before.size !== stat.size || before.mtime !== stat.mtime) {
-      changed.push(path)
-    }
-  }
-  return changed
-}
-
-/**
- * 过滤规则（§十一 2，全部带日志）。
- * 返回按路径排序后的**可上传清单**（顺序稳定 ⇒ 截断与日志在两次运行之间可比较）。
- * ⚠️ 单文件**大小**不在这里判（它依赖 `find` 的读数，而读数在"扫描 → 读出"之间可能失效）
- * —— 统一挪到 `collectRoundArtifacts` 里按实际读到的字节复核，一处判据。
- */
-export function filterChangedFiles(paths: readonly string[], scanMaxFiles: number): string[] {
-  const logger = getLogger()
-  const accepted: string[] = []
-  for (const path of paths) {
-    // ① 隐藏文件 / 隐藏目录：路径里**任一段**以 `.` 开头都算（`out/.hidden` 与 `.cache/x` 同罪）
-    if (path.split('/').some((segment) => segment.startsWith('.'))) continue
-    // ② 引擎/依赖工作目录（顶层相对名，见 ARTIFACT_EXCLUDED_DIRS 的说明）
-    const head = path.split('/')[0] ?? ''
-    if (ARTIFACT_EXCLUDED_DIRS.includes(head)) continue
-    accepted.push(path)
-  }
-  // ③ 单轮数量上限：超出即截断 + warn（防引擎写一万个小文件打爆上传）
-  const limited = accepted.slice(0, scanMaxFiles)
-  if (limited.length < accepted.length) {
-    logger.warn(
-      { changed: accepted.length, kept: limited.length, scanMaxFiles },
-      '产物扫描：变化的文件数超过单轮上限，已截断（防引擎写一万个小文件打爆上传；其余文件留待下轮对照）',
-    )
-  }
-  limited.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-  return limited
-}
+export const ARTIFACT_EXEC_TIMEOUT_MS = 60_000
 
 /**
  * 产物 `mime` 的判定（扫描时定一次，之后**所有人只读 `artifacts.mime`** —— `子方案④` §四）。
@@ -258,77 +122,79 @@ function safeKeySegment(fileName: string): string {
 }
 
 /**
- * 收一轮产物：对照 → 过滤 → 逐个「读出文件 → 传对象 → 建行」。
+ * 收一轮产物：**本轮工作区变更集 → 过滤 → 逐个「读字节 → 传对象 → 建行」**（P1-9 · R4）。
  *
  * **尽力而为**：单个文件失败只 warn 并跳过（继续传其余），整体抛错由调用方决定是否吞掉
  * （编排层会吞）。**建行成功之前不对外可见** —— `artifact` 事件由编排层拿着返回值发，
  * 顺序天然满足"先传对象、再建行、最后发事件"。
  *
+ * 字节来源 = **工作区宿主 FS**（`WORKSPACE_ROOT/{conversationId}`，即 bind 进容器 `/work` 的那份
+ * canonical 字节）—— 不再走 `docker exec` 扫容器：单一真相是工作区，容器只是它的一次性运行时。
+ *
+ * @param changes 本轮工作区变更集（`listWorkspaceChanges(conversationId, 轮次起点)` 的 `items`；
+ *                内容事件之外的（`claim`/`release`）与 `deleted` 由本模块筛掉）
  * @returns 建好的行（形状 = `shared#artifactItemSchema`，可直接当 `artifact` 事件 payload
  *          与消息 `content.artifacts` 段用）
  */
 export async function collectRoundArtifacts(input: {
   conversationId: string
-  containerId: string
-  /** 派活之前拍的基线（`snapshotWorkFiles` 的返回值；`undefined` 时调用方不该调本函数） */
-  baseline: WorkSnapshot
+  changes: readonly WorkspaceChangeEntry[]
 }): Promise<ArtifactItem[]> {
-  const { conversationId, containerId, baseline } = input
+  const { conversationId, changes } = input
   const logger = getLogger()
 
   // 建行要写 `user_id`（`TaskAgent记忆与产物` 块 3：删除会话后产物行靠它归回给用户）。
   // 从会话行查一次（不信任任何传入值 —— 归属**只能**来自会话的 owner 列）。
-  // ⚠️ 查不到 = 会话已经被删：产物无处归属，这一轮**整轮跳过**（比"每行都建失败再补偿删对象"
-  //    干净 —— 那不是一次两次的偶发，而是结构性的事）。
+  // ⚠️ 查不到 = 会话已经被删：产物无处归属，这一轮**整轮跳过**。
   const owner = await getPrisma().conversation.findFirst({
     where: { id: conversationId },
     select: { userId: true },
   })
   if (owner === null) {
-    logger.warn({ conversationId, containerId }, '产物收集时会话已不存在，本轮产物跳过（无法确定归属用户）')
+    logger.warn({ conversationId }, '产物收集时会话已不存在，本轮产物跳过（无法确定归属用户）')
     return []
   }
 
-  const current = await snapshotWorkFiles(containerId)
-  if (current === undefined) return []
-
-  const changed = filterChangedFiles(diffWorkFiles(baseline, current), config.limits.artifactScanMaxFiles)
+  const changed = artifactChangePaths(changes, {
+    excludedDirs: ARTIFACT_EXCLUDED_DIRS,
+    maxFiles: config.limits.artifactScanMaxFiles,
+    onTruncate: (accepted, kept, maxFiles) => {
+      logger.warn(
+        { conversationId, changed: accepted, kept, maxFiles },
+        '产物扫描：本轮变更的工作区文件数超过单轮上限，已截断（防引擎写一万个小文件打爆上传；其余文件留待下轮对账）',
+      )
+    },
+  })
   if (changed.length === 0) return []
 
+  // 工作区根（宿主 canonical 目录；`ensureWorkspace` 幂等，顺带带上冷备恢复）
+  const handle = await ensureWorkspace(conversationId)
   const bucket = config.s3.bucket
   const maxFileBytes = config.limits.artifactMaxFileMb * 1024 * 1024
   const items: ArtifactItem[] = []
 
   for (const path of changed) {
-    const stat = current.get(path)
-    if (stat === undefined) continue
-    // ③ 大小上限放行前判一次（find 的读数），读出后再按实际字节数复核（见下方）
-    if (stat.size > maxFileBytes) {
-      logger.warn(
-        { conversationId, containerId, path, sizeMb: Math.round(stat.size / (1024 * 1024)) },
-        '产物超过单文件上限，已跳过（文件仍在容器里，只是不收进产物面板）',
-      )
-      continue
-    }
-
     try {
-      const read = await execInSandbox(
-        containerId,
-        ['cat', '--', `${SANDBOX_WORK_DIR}/${path}`],
-        { timeoutMs: ARTIFACT_EXEC_TIMEOUT_MS },
-      )
-      if (read.exitCode !== 0) {
+      const { absolute } = resolveWorkspacePath(handle.rootPath, path)
+      // ⓪ 大小上限放行前判一次（先 `stat`，避免把超大文件整个读进内存）
+      const size = await workspaceFileSize(absolute)
+      if (size === undefined) {
+        logger.warn({ conversationId, path }, '产物收集时工作区文件已不在盘上（本轮内被删/改名），已跳过')
+        continue
+      }
+      if (size > maxFileBytes) {
         logger.warn(
-          { conversationId, containerId, path, exitCode: read.exitCode, stderr: read.stderr.toString('utf8').slice(0, 300) },
-          '产物读出失败，已跳过该文件',
+          { conversationId, path, sizeMb: Math.round(size / (1024 * 1024)) },
+          '产物超过单文件上限，已跳过（文件仍在工作区里，只是不收进产物面板）',
         )
         continue
       }
-      const bytes = read.stdout
-      if (bytes.length !== stat.size) {
+
+      const bytes = await readWorkspaceBytes(absolute)
+      if (bytes.length !== size) {
         logger.warn(
-          { conversationId, path, findSize: stat.size, actualSize: bytes.length },
-          '产物大小在读出前后不一致（文件在扫描与读取之间被改动），按实际读到的字节继续',
+          { conversationId, path, statSize: size, actualSize: bytes.length },
+          '产物大小在统计与读出之间不一致（文件在两步之间被改动），按实际读到的字节继续',
         )
       }
       if (bytes.length > maxFileBytes) {
@@ -376,13 +242,13 @@ export async function collectRoundArtifacts(input: {
         logger.warn({ err: rowError, conversationId, path }, '产物行创建失败，已跳过该文件（对象已补偿删除）')
       }
     } catch (error) {
-      logger.warn({ err: error, conversationId, containerId, path }, '产物收集单文件失败，已跳过（其余文件继续）')
+      logger.warn({ err: error, conversationId, path }, '产物收集单文件失败，已跳过（其余文件继续）')
     }
   }
 
   if (items.length > 0) {
     logger.info(
-      { conversationId, containerId, collected: items.length, changed: changed.length },
+      { conversationId, collected: items.length, changed: changed.length },
       '本轮产物收集完成',
     )
   }

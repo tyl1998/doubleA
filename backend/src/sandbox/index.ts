@@ -12,7 +12,7 @@
  * |--------|--------|
  * | `index.ts`（进程入口） | `reconcileOnBoot` / `startSandboxReaper` / `stopSandboxReaper` / `getSandboxStats` / `startSandboxListener` / `stopSandboxListener` / `closeAllSandboxRpcs`（退出时拆桥） |
  * | P0-3-6 的编排层 | `ensureSandbox`（拿沙箱）/ `getSandboxRpc`（拿引擎桥）/ `runTurn`（派活 + 等 `agent_settled`）/ `touchSandbox`（引擎事件刷活跃）/ **`createEngineEventMapper`**（引擎事件 → 我方 SSE 事件） |
- * | P0-3-7 的编排层 | `snapshotWorkFiles`（派活之前拍基线）/ `collectRoundArtifacts`（对照 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
+ * | P0-3-7 的编排层（P1-9 · R4 起判据 = 工作区变更集） | `collectRoundArtifacts`（本轮变更集 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
  * | ✅ P0-3-9b 的编排层（`taskAgent.ts`） | `ensureSandboxMcpCatalog`（预热工具清单，反查 `serverId` 的唯一依据）+ `resolveSandboxMcpTool`（引擎工具名 → 这个工具是谁）+ `type SandboxMcpCatalog` |
  * | ✅ P0-3-9b 的 listener（`listener.ts`，**它直接 `import './proxy.js'`** —— 那条链要碰 SSE/Prisma，不该被人人都在 import 的本桶拖上） | `registerSandboxProxyRoutes` |
  * | ✅ P0-3-8 的停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（先拆连接）/ `recycleSandbox`（再杀容器与具名卷） |
@@ -76,24 +76,27 @@ export {
   type EngineUsage,
 } from './map.js'
 
-// 产物收集（P0-3-7）：工作卷基线与对照扫描 → 对象存储 → `artifacts` 行
-// ｜ P0-3-6 的编排层 | `snapshotWorkFiles`（派活之前拍基线）+ `collectRoundArtifacts`（收尾对照）
+// 产物收集（P0-3-7 建；P1-9 · R4 判据改为「产物 = 工作区变更集视图」）：
+// 本轮工作区变更集 → 过滤 → 读宿主工作区字节 → 对象存储 → `artifacts` 行
+// ｜ P0-3-6 的编排层 | `collectRoundArtifacts`（收尾：传对象 + 建行，返回值即 `artifact` 事件 payload）
 // ｜ 进程入口（reaper 的那一轮） | `reapExpiredArtifacts`（保留期清理，挂在对账器 tick 里）
-// 纯函数（`parseFindOutput` / `diffWorkFiles` / `filterChangedFiles` / `artifactMimeOf`）也导出：
-// 它们可以**不连 Docker、不连 S3** 地逐条核对（核查口径与 `map.ts` 同款）。
+// 纯函数 `artifactMimeOf`（产物 MIME 名单）也导出，可**不连 S3** 地逐条核对。
 export {
   artifactMimeOf,
   collectRoundArtifacts,
-  diffWorkFiles,
-  filterChangedFiles,
-  parseFindOutput,
   reapExpiredArtifacts,
-  snapshotWorkFiles,
-  ARTIFACT_EXCLUDED_DIRS,
   ARTIFACT_EXEC_TIMEOUT_MS,
-  type WorkFileStat,
-  type WorkSnapshot,
 } from './artifacts.js'
+
+// 产物路径判据（P1-9 · R4，**纯函数**零 config/DB/Docker 依赖）：工作区变更集 → 可上传的产物路径
+// ｜ 编排层/收产物 | `collectRoundArtifacts` 内部消费
+// ｜ 诊断 / 纯函数核对 | `artifactChangePaths` / `filterArtifactPaths` / `ARTIFACT_EXCLUDED_DIRS`
+export {
+  artifactChangePaths,
+  filterArtifactPaths,
+  ARTIFACT_EXCLUDED_DIRS,
+  type ArtifactPathFilterOptions,
+} from './artifactChanges.js'
 
 // 对账（启动对账 + 周期回收 + 空闲回收 + work 卷体量巡检），由进程入口驱动
 export {
@@ -160,6 +163,24 @@ export {
 
 // 排队（位次可观测；编排层把位次变成 `queued` 事件）
 export { sandboxQueueDepth, sandboxQueueKey, sandboxQueuePosition } from './queue.js'
+
+// 多机归属（P1-14；P1-9 · R9 复用）：会话→实例目录 + 实例在线注册表 + 实例心跳
+// ｜ 进程入口（`index.ts`） | `claimInstanceIdentity`（启动同名自检）/ `startInstanceHeartbeat` / `stopInstanceHeartbeat`
+// ｜ 编排层（`manager.ts`） | `registerSandboxOwner` / `clearSandboxOwner`
+// ｜ 工作区（`workspace/service.ts` / `routes/conversations.ts`） | `ensureWorkspaceOwner`（寿命跟随工作区）
+// ｜ 诊断 / 纯函数核对 | `instanceAdvertiseAddr` / `workspaceOwnerTtlSec` / `instanceRegistrationTtlSec`
+export {
+  claimInstanceIdentity,
+  clearSandboxOwner,
+  ensureWorkspaceOwner,
+  instanceAdvertiseAddr,
+  instanceRegistrationTtlSec,
+  readSandboxOwner,
+  registerSandboxOwner,
+  startInstanceHeartbeat,
+  stopInstanceHeartbeat,
+  workspaceOwnerTtlSec,
+} from './owner.js'
 
 // 名字与标签契约（纯函数；"哪些容器是我们的"**只**由它们回答）
 export {

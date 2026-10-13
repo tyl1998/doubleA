@@ -47,11 +47,9 @@ import {
   listArtifactsQuerySchema,
   listMyArtifactsQuerySchema,
   ok,
-  previewKindOf,
   type ArtifactIdParams,
   type ConversationIdParams,
   type ListArtifactsQuery,
-  type PreviewKind,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
@@ -64,6 +62,7 @@ import {
   openArtifactSource,
 } from '../services/artifact.service.js'
 import { buildContentDisposition } from '../services/document.service.js'
+import { previewHeadersFor } from '../services/previewHeaders.js'
 
 /**
  * 取调用者 —— **只取 `id`**（会话族不按角色判权，见 `conversation.service.ts` 文件头 ①）。
@@ -75,72 +74,6 @@ function userIdOf(request: FastifyRequest): string {
   return requireAuthContext(request).user.id
 }
 
-/**
- * ★ HTML / SVG 的隔离头：`子方案④` §六 判据 ① 的**第一道**（iframe 属性只是第二道）。
- *
- * 为什么必须是**响应头**：iframe 的 `sandbox=""` 只在"被嵌进 iframe 时"生效 —— 用户在预览弹层里
- * 右键"在新标签页打开"、或直接把 `/content` 贴进地址栏，那份文档就**不在 iframe 里**了，
- * 此时唯一还在生效的就是这一行。CSP `sandbox` 对 standalone document 同样生效，
- * 而且它**不支持 `<meta>`**（MDN 明文）⇒ 只可能来自响应头 —— 这也是产物预览走**后端代理**
- * 而不是签名 URL 的那条决定性理由（签名 URL 的响应由对象存储直发，我们一个头都加不上）。
- *
- * `default-src 'none'` + `img-src data:` + `style-src 'unsafe-inline'`：
- * 不给脚本、不给网络（连同源的 `/api/...` 都不给，`default-src 'none'` 已经封死），
- * 只留内嵌图片与内联样式（HTML 产物里最常见、且无害的两种）。
- */
-const HTML_PREVIEW_CSP = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
-
-/** 预览响应的 `Content-Disposition` 形态（`子方案④` §四 2 的最后一列） */
-type PreviewDisposition = 'inline' | 'attachment'
-
-/** 预览响应头里"随形态变化"的那三样（其余头两条端点完全一样） */
-interface PreviewHeaders {
-  contentType: string
-  disposition: PreviewDisposition
-  /** 只有 HTML/SVG 那一路有值（PDF **刻意不加**，见 {@link HTML_PREVIEW_CSP} 的对照说明） */
-  csp: string | null
-}
-
-/** 取 `mime` 的主类型（`text/html; charset=utf-8` → `text/html`）—— 拼 `; charset=utf-8` 之前要先剥参数 */
-function baseMimeOf(mime: string): string {
-  const raw = mime.trim().toLowerCase()
-  const semicolon = raw.indexOf(';')
-  return (semicolon === -1 ? raw : raw.slice(0, semicolon)).trim()
-}
-
-/**
- * 预览响应的**响应头分派**：按 `artifacts.mime` 一处判据上不同的头（`子方案④` §四 2 的表）。
- *
- * 三条要点（都是"不写就会静默出错"的）：
- *
- *   ① ★ **`text` 一律回 `text/plain`**，不回它声明的类型：这样"有人把 `/content` URL 直接贴进
- *      地址栏"看到的是**源码**，而不是被浏览器当 `text/html` 渲染（前端取文本用 `fetch().text()`，
- *      与响应头无关，所以这个收窄对预览**没有代价**）；
- *   ② **PDF 刻意不加 CSP `sandbox`**：MDN 明确说 sandbox "prevents the execution of plugins"，
- *      而 PDF 的浏览器内置 viewer 属这一类 ⇒ 加了会**渲染不出来**（症状是空框或直接触发下载，
- *      看起来像"我们的 PDF 坏了"）。这一路的安全边界另写在 `子方案④` §五 6 —— 它是全方案
- *      **唯一一处把安全交给浏览器**的地方，写在此处而不是藏在代码注释里；
- *   ③ **`none`（zip / docx / 未知类型）当作下载处理**（`attachment` + `octet-stream`）：
- *      这个端点理论上不会被前端调用（前端不显示「预览」按钮），但 URL 是可以手敲的
- *      ⇒ 给它一份"不会被浏览器解释"的响应，而不是一份带 `inline` 的未知类型。
- */
-function previewHeadersFor(mime: string): PreviewHeaders {
-  const kind: PreviewKind = previewKindOf(mime)
-  switch (kind) {
-    case 'html':
-      // SVG 归这一路（`previewKindOf` 已定案）：它是能带 `<script>` 的文档
-      return { contentType: `${baseMimeOf(mime)}; charset=utf-8`, disposition: 'inline', csp: HTML_PREVIEW_CSP }
-    case 'image':
-      // `<img>` 上下文不执行脚本 ⇒ 不需要 CSP；但 `nosniff` 照样要（调用方统一加）
-      return { contentType: baseMimeOf(mime), disposition: 'inline', csp: null }
-    case 'pdf':
-      return { contentType: 'application/pdf', disposition: 'inline', csp: null }
-    case 'text':
-      return { contentType: 'text/plain; charset=utf-8', disposition: 'inline', csp: null }
-    default:
-      return { contentType: 'application/octet-stream', disposition: 'attachment', csp: null }
-  }
-}
 
 export function registerArtifactRoutes(app: FastifyInstance): void {
   /**

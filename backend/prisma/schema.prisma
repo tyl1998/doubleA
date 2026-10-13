@@ -226,6 +226,19 @@ enum MemoryKind {
   @@map("memory_kind")
 }
 
+/// 工作区参与者（P1-9）：一次写入是谁做的。
+/// · `AGENT` —— 引擎（pi）的工具写（中介写 + watcher 兜底的 bash 写）；
+/// · `USER` —— 浏览器侧保存；
+/// · `SYSTEM` —— 冷备恢复 / 保留期清理 / 未归属的宿主侧改动。
+/// 应用层取值域见 `shared#WORKSPACE_ACTORS`。
+enum WorkspaceActor {
+  AGENT
+  USER
+  SYSTEM
+
+  @@map("workspace_actor")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -264,6 +277,7 @@ model User {
   files          File[]
   scheduledTasks ScheduledTask[]
   memories       Memory[]
+  gitCredentials GitCredential[]
 
   @@map("users")
 }
@@ -444,6 +458,10 @@ model Conversation {
   status        ConversationStatus @default(ACTIVE)
   /// 会话级「不记入记忆」（P1-8，HCI §5.2.1）。true = 本次对话不写入长期记忆（注入仍照常）
   memoryExcluded Boolean           @default(false) @map("memory_excluded")
+  /// 会话级 **Code 模式**（P1-9 §六 4）：true = 本会话的工作区走**人机共享可编辑**形态
+  /// （派活时给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`，pi 的 read/write/edit 走版本中介）。
+  /// ⚠️ **持久列**（不是 Redis）：沙箱创建时要读到它；且它决定 `/work` 的语义，必须跨实例一致。
+  codeMode      Boolean            @default(false) @map("code_mode")
   lastMessageAt DateTime?          @map("last_message_at") @db.Timestamptz(3)
   createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -461,6 +479,10 @@ model Conversation {
   artifacts Artifact[]
   /// 把本会话当作"最近一次运行"的定时任务（P1-6；删会话置空，不级联删任务）
   scheduledTaskRuns ScheduledTask[] @relation("ScheduledTaskLastRun")
+  /// Code 模式工作区（P1-9，1:1）。⚠️ 删会话级联删**索引行**，但宿主目录上的字节由
+  /// workspace reaper 另行清理（与产物"行保留、对象由保留期收口"是两条不同的纪律：
+  /// 工作区是会话的**派生计算目录**，会话没了它就没有归属，故行随会话走）
+  workspace Workspace?
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -784,6 +806,10 @@ model Sandbox {
   conversationId String        @map("conversation_id") @db.Uuid
   /// 容器 id（`CREATING` 期间为 `NULL`）。⚠️ 留痕/排障用，**不是**归属判据（见上方）
   containerId    String?       @map("container_id") @db.VarChar(128)
+  /// **哪台实例建的**（P1-14 沙箱多机部署）。对账按它过滤（每实例只清自己名下的行）；
+  /// 建行时由本实例**显式写入**（同 `createdAt`/`lastActiveAt` 的纪律，不用 DB 默认值）。
+  /// ⚠️ 存量行（单机时代）回填为约定默认 id `default`（P1-14 §七）。
+  instanceId     String        @map("instance_id") @db.VarChar(120)
   status         SandboxStatus @default(CREATING)
   /// 创建时用的镜像名（= `SANDBOX_IMAGE`）。留痕：换过镜像后仍能看出某个会话跑在哪一版上
   image          String        @db.VarChar(255)
@@ -802,6 +828,8 @@ model Sandbox {
   @@index([conversationId, status])
   /// 空闲回收的扫描键：`status = RUNNING AND last_active_at < 阈值`
   @@index([status, lastActiveAt])
+  /// 归属过滤的扫描键（P1-14）：三处对账都带 `instance_id = ?`（`reaper.ts`）
+  @@index([instanceId, status])
   @@map("sandboxes")
 }
 
@@ -1089,4 +1117,170 @@ model Memory {
   /// `recall_memory`（P1-8a）按"作用域(agent_id)/类型(kind) + 时间"扫描
   @@index([userId, agentId, kind, createdAt(sort: Desc)])
   @@map("memories")
+}
+
+// ═════════════════════════════ Code 模式工作区（P1-9） ═════════════════════════════
+
+/// workspaces —— Code 模式工作区（P1-9）。一个会话一份。
+///
+/// ★ 三层职责（`子方案` §二 2）：**canonical 字节在宿主 FS**（bind mount 进容器 `/work`），
+///   本表只存"这份工作区的元数据"（`rootPath` = 宿主目录、`headVersion` = 事件序号）。
+///   **不存文件内容** —— 大字段与热点更新都留在 FS/S3（§三 的"为什么不在表里存内容"）。
+///
+/// ⚠️ `headVersion` 是**工作区级单调修订号**（事件序号 / 断线补发游标），只增不减；用 `BigInt`
+///   与 `Message` 同款考量。读取端一律 `Number()` 后再进 JSON（见 `backend/src/workspace/service.ts`）。
+/// ⚠️ `rootPath` 是**宿主绝对路径**（默认 `WORKSPACE_ROOT/{conversationId}`）；多机时为本机本地盘，
+///   换机从 S3 冷备恢复（§四 1 / §十六）。
+model Workspace {
+  conversationId String   @id @map("conversation_id") @db.Uuid
+  /// 宿主 canonical 目录（绝对路径）。⚠️ 不是容器内路径（那恒为 `/work`）
+  rootPath       String   @map("root_path") @db.Text
+  /// 工作区级单调修订号（事件序号 / 断线补发游标）
+  headVersion    BigInt   @default(0) @map("head_version")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  files        WorkspaceFile[]
+  claims       WorkspaceClaim[]
+  events       WorkspaceEvent[]
+
+  @@map("workspaces")
+}
+
+/// workspace_files —— 工作区文件**索引**（P1-9）。
+///
+/// ⚠️ **只是索引**：字节在宿主 FS（热路径）与 S3（冷备），**不在这里**（§三）。
+/// 用途：文件树（`GET .../workspace`）、版本 CAS 的 base、审计。
+///
+/// ⚠️ 软删（墓碑）：删除写 `deletedAt` 而**保留 `version`** —— 合并时要回答"对方是不是把它删了"
+///   （§二 2 tombstone）。索引查询一律过滤 `deletedAt IS NULL`。
+model WorkspaceFile {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  conversationId String         @map("conversation_id") @db.Uuid
+  /// 归一化相对路径（锁死在 root 内；判据 = `shared#normalizeWorkspacePath`）
+  path           String         @db.VarChar(1024)
+  size           BigInt
+  mime           String         @db.VarChar(255)
+  /// sha256（判"内容是否真变"；mtime 不可靠）
+  contentHash    String         @map("content_hash") @db.VarChar(64)
+  /// 每文件单调版本（CAS 的 base）
+  version        Int            @default(1)
+  /// 冷备对象键（内容寻址；P5 落地，P0 阶段恒 NULL）
+  s3Key          String?        @map("s3_key") @db.VarChar(512)
+  updatedBy      WorkspaceActor @map("updated_by")
+  /// userId（USER）/ turnId（AGENT）/ 可空（SYSTEM）
+  updatedById    String?        @map("updated_by_id") @db.VarChar(128)
+  /// 墓碑（软删）；索引查询一律排除
+  deletedAt      DateTime?      @map("deleted_at") @db.Timestamptz(3)
+  updatedAt      DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  workspace Workspace              @relation(fields: [conversationId], references: [conversationId], onDelete: Cascade)
+  versions  WorkspaceFileVersion[]
+
+  @@unique([conversationId, path])
+  @@index([conversationId, path])
+  @@map("workspace_files")
+}
+
+/// workspace_file_versions —— 文件历史（P1-9；diff / 三方合并 / 审计）。
+/// ⚠️ 与 `workspace_files` 是**两件事**：前者是"当前态"（每路径一行），这里是"历史"（每版本一行）。
+model WorkspaceFileVersion {
+  id          String         @id @default(uuid(7)) @db.Uuid
+  fileId      String         @map("file_id") @db.Uuid
+  version     Int
+  contentHash String         @map("content_hash") @db.VarChar(64)
+  s3Key       String?        @map("s3_key") @db.VarChar(512)
+  actor       WorkspaceActor
+  actorId     String?        @map("actor_id") @db.VarChar(128)
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  file WorkspaceFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, version])
+  @@map("workspace_file_versions")
+}
+
+/// workspace_claims —— 文件级软锁（悲观层，§七 1 第 ② 层）。
+/// TTL + 心跳防死锁；同一个 `(conversationId, path, holder)` 唯一（USER 与 AGENT 可各持一份）。
+model WorkspaceClaim {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  conversationId String         @map("conversation_id") @db.Uuid
+  path           String         @db.VarChar(1024)
+  holder         WorkspaceActor
+  holderId       String         @map("holder_id") @db.VarChar(128)
+  /// agent 侧：哪个 turn 声明的
+  turnId         String?        @map("turn_id") @db.VarChar(128)
+  expiresAt      DateTime       @map("expires_at") @db.Timestamptz(3)
+  heartbeatAt    DateTime       @map("heartbeat_at") @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [conversationId], references: [conversationId], onDelete: Cascade)
+
+  @@unique([conversationId, path, holder])
+  @@index([conversationId, expiresAt])
+  @@map("workspace_claims")
+}
+
+/// workspace_events —— 工作区事件日志（P1-9；SSE 断线补发 + 审计）。
+/// ⚠️ 实时 SSE 通道另走**进程内事件总线**（watcher 所在进程）；本表是**补发与审计**的落点。
+/// `version` 对内容事件 = 当时文件版本；`claim`/`release` 为 NULL。
+model WorkspaceEvent {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  conversationId String         @map("conversation_id") @db.Uuid
+  /// created / updated / deleted / renamed / claim / release（取值域见 `shared#WORKSPACE_EVENT_TYPES`）
+  type           String         @db.VarChar(48)
+  path           String         @db.VarChar(1024)
+  version        Int?
+  actor          WorkspaceActor
+  actorId        String?        @map("actor_id") @db.VarChar(128)
+  at             DateTime       @default(now()) @map("at") @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [conversationId], references: [conversationId], onDelete: Cascade)
+
+  @@index([conversationId, at])
+  @@map("workspace_events")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// git_credentials（P1-9 · R11）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// git 凭据类型（`shared/src/gitCredential.ts#GIT_CREDENTIAL_KINDS`）。
+enum GitCredentialKind {
+  /// 一把私钥：落容器 tmpfs `$HOME/.ssh/id_ed25519`（0600），随容器销毁
+  SSH_KEY
+  /// 一个 PAT：**不落盘**，只进容器 env（`GIT_CONFIG_*`）
+  HTTPS_TOKEN
+
+  @@map("git_credential_kind")
+}
+
+/// git_credentials —— 用户级 git 凭据（P1-9 · R11；`子方案/Code模式工作区.md` §五 7）。
+///
+/// 一行 = 一个用户的一条凭据（一把私钥 / 一个 PAT）。**用户级、不绑 server**（与 MCP 凭据刻意不同）。
+///   · `secretEnc` 是 **AES-256-GCM 密文**（`infra/crypto.ts`），AAD = `userId:kind:label`（见 §7.2）；
+///     列名带 `_enc` 是刻意的（与 `mcp_credentials.values_enc` 同纪律）：让"这一列是密文"在**库结构层面**
+///     就看得出来。它只在 `services/gitCredential.service.ts` 读写；日志侧另有 `LOG_REDACT_PATHS` 兜底。
+///   · 权限收窄**全在 `user_id` 上**（同 MCP 凭据，ADMIN 也没有后门）；越权一律 404。
+///   · `label` 是人的可读名（用户内唯一）—— 它同时进 AAD，所以**改 label 要重加密**（服务层处理）。
+model GitCredential {
+  id        String            @id @default(uuid(7)) @db.Uuid
+  userId    String            @map("user_id") @db.Uuid
+  kind      GitCredentialKind
+  /// 人可读名，如 "github-work"（用户内唯一；进 AAD）
+  label     String            @db.VarChar(128)
+  /// 限定用途主机（github.com）；空 = 不限
+  host      String?           @db.VarChar(255)
+  /// 加密载荷：`{ payload: "v1.<iv>.<tag>.<ct>" }`，明文 = `GitCredentialSecretInput` 的 JSON。
+  /// ⚠️ 用 `JsonB` 而不是 `Text`：与 `mcp_credentials.values_enc` 同一形态（换字段不用改列）。
+  secretEnc Json              @default("{}") @map("secret_enc") @db.JsonB
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// ⚠️ `Cascade` 是兜底而不是活路径：本仓用户没有硬删除入口（只改 status）
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, label])
+  @@index([userId])
+  @@map("git_credentials")
 }

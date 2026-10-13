@@ -2,7 +2,7 @@
 
 > 上游基准：`01-整体需求与实施步骤.md`（TaskAgent / 产物交付 / 沙箱安全）、`02-后端设计.md`（§七 TaskAgent 编排、§4.8 产物、§十 安全）、`03-前端设计.md`（对话页与产物面板）、`子方案/沙箱与引擎集成.md`（容器生命周期、引擎桥、产物收集）。
 > 定位：在现有 **TaskAgent + 沙箱 + 产物** 之上，新增「**人机共享、可实时编辑、可并发、可持久**」的工作区能力，即 **Code 模式**。
-> 状态：**设计讨论稿**（2026-10-08 立项；**2026-10-10 完成一轮设计讨论定案**——部署形态、轮末变更集、保留期、多用户、产物口径、轮级撤销，见 §十三「已决」；仅落设计，未动代码）。
+> 状态：**设计讨论稿**（2026-10-08 立项；**2026-10-10 完成一轮设计讨论定案**——部署形态、轮末变更集、保留期、多用户、产物口径、轮级撤销，见 §十三「已决」；**2026-10-12 补 git 凭据与出网口径**，见 §五 7、§十三「已决」8；仅落设计，未动代码）。
 > 本文**新增一个产品能力**（不是纯实现细则），因此它同时是 `01/02/03/06` 的**需求增量候选**；落地前需按需求变更流程回写上游四份文档。
 
 ---
@@ -245,6 +245,10 @@ enum WorkspaceActor {
 - **恢复时机**：容器/宿主重建且 `rootPath` 缺失时，从 S3 按最新版本重建目录。
 - **GC**：孤儿 blob（无任何 `WorkspaceFile`/`_versions` 引用）与超保留期对象由 workspace reaper 清理。
 
+> ✅ **S3 冷备 / 恢复已落地（2026-10-12，R3；施工记录见 `06` §五·补 P1-9 · P5 R3）**：对象键内容寻址 `workspaces/{conversationId}/blobs/{sha256}`（`backend/src/workspace/cold.ts`，键/恢复计划纯函数在 `coldModel.ts`）——**写后异步去抖上行**（热路径不等跨网络）+ 上行成功回填 `s3_key`；**恢复 = 目录缺失/为空时**从 S3 按每路径最新内容重建（**目录有内容时绝不触发**）；孤儿会话的冷备由 reaper **按前缀整体删**。⚠️ **未做**：**blob GC / 超保留期清理**（GC 只覆盖"孤儿会话"，**R5**）、artifact 集成（**R4**）。当前同步/恢复时机收敛为"**每次内容版本落盘后**去抖上行"（人保存与 agent 工具写都经此路径；watcher 捕获的 `/work` 外部改动也会 stash→上行），"空闲兜底"未单列。
+>
+> ✅ **R4（artifact 集成）与 R5（保留期清理）已落地（2026-10-12；施工记录见 `06` §五·补 P1-9 · P5 R4 / R5）**：R4 把收产物判据换成**本轮工作区变更集**（上条"未做"里的 artifact 集成已销）；R5 补上**"存活会话超期即整份收"**——`backend/src/workspace/reaper.ts#reapExpiredWorkspaceDirs`（判据 `workspaces.updated_at < now - ARTIFACT_RETENTION_DAYS`，已决 4）+ 周期清理器；到期 = **本地目录 + 本地历史字节 + S3 冷备 + DB 行一起收**（§八），**有活体容器则跳过**；同时补了**孤儿本地历史字节目录 GC**。⇒ §四 4「GC」一条（孤儿 blob + 超保留期对象）**已兑现**。
+
 ---
 
 ## 五、Agent 侧集成（成败关键）
@@ -264,7 +268,8 @@ pi 已有扩展机制（现成例证：`infra/sandbox/base/pi-agent/extensions/m
 workspace.read(path)                         → { content, version }
 workspace.write(path, content, baseVersion)  → CAS：索引版本 ≠ baseVersion ⇒ 返回错误给模型：
                                                "文件已被用户修改（vN），请重新读取后再写"
-workspace.edit(path, old, new, baseVersion)  → CAS + 应用补丁
+workspace.edit(path, edits[], baseVersion)   → CAS + 应用补丁（每处 oldText 对着原文件唯一匹配、两两不重叠；
+                                               形状 = `[{ oldText, newText }]`，与 pin 0.87.1 内置 `edit` 同形，R8 复核后对齐）
 ```
 
 - 工具写前向 Workspace Service 声明 **AGENT claim**（TTL + 心跳）。
@@ -295,13 +300,123 @@ pi 的 `bash` 能绕过工具中介直接写文件：
 - **主动（可选，机制已确认可用）**：watcher 检测到 `USER` 写且该轮 agent 正在跑 ⇒ 用 pi RPC 的 **`steer`** 命令注入 `"用户修改了 path（vN），请重新读取后再继续"`。
   - ✅ **通道已确认（2026-10-08，见 §十五）**：pi RPC 有 `steer` 命令，语义是「agent 运行中排队一条消息，**在它当前这一轮的工具调用执行完之后、下一次 LLM 调用之前投递**」；`prompt` 也支持 `streamingBehavior: "steer" | "followUp"`。投递粒度是**助手 turn 边界**（不是逐工具即时），这正是需要的粒度。
   - ⚠️ 与现有桥的关系：`bridge.ts` 目前只发一次 `prompt` + 等 `agent_settled`；要加 `steer` 需在桥上开一条「运行中发命令」的通道（`abort` 已经是同类命令）。仍保留 `clear_queue` / `abort` 作为降级手段。
+  - ✅ **已落地（2026-10-12，R1；施工记录见 `06` §五·补 P1-9 · P4 R1）**：`bridge#steer` 通道 + `chat.steer:{id}` **列表**信号（无消费方不消费）+ `ChatProducerInput#onSteer` + TaskAgent **两源**（人主动插话 + 工作区 `USER` 写主动感知）+ `POST /api/conversations/:id/steer` + 前端「边跑边插话」入口。命令形状已在 pin `0.87.1` 上**运行时原型复核**（见 §十五）。
 
 ### 6. 产物口径：产物 = 工作区变更集视图（clone 不算产物，2026-10-10 定案）
 
 - **语义**：产物**不是**目录树快照，而是"**人认可的交付 / 变更子集**"（回归 §二 三层职责：工作区是真相，产物是交付视图）。**`git clone` 拉下来的整棵树属「工作区内容」，不算产物**。
-- **现状会误伤**：产物判据是**每轮 diff**（`artifacts.ts#diffWorkFiles`）——派活前拍基线、收尾对照取"本轮新出现或修改的"。clone 发生在某一轮里 ⇒ 整棵树都是"本轮新出现" ⇒ 全进候选；仅靠 `.` 隐藏规则（吃掉 `.git/`）+ `ARTIFACT_EXCLUDED_DIRS=['node_modules']` + 单文件 50MB + 单轮 200 上限截断兜底（`artifacts.ts`）。**那是上限截断的巧合，不是语义**。
+- **现状会误伤（⚠️ 以下为 P1-9 · R4 之前的判据；R4 已改为「产物 = 工作区变更集视图」，见本节末 ✅）**：产物判据是**每轮 diff**（`artifacts.ts#diffWorkFiles`）——派活前拍基线、收尾对照取"本轮新出现或修改的"。clone 发生在某一轮里 ⇒ 整棵树都是"本轮新出现" ⇒ 全进候选；仅靠 `.` 隐藏规则（吃掉 `.git/`）+ `ARTIFACT_EXCLUDED_DIRS=['node_modules']` + 单文件 50MB + 单轮 200 上限截断兜底（`artifacts.ts`）。**那是上限截断的巧合，不是语义**。
 - **落地口径**：clone / 初始化应在**基线之前**完成（作为 setup 步），使本轮 diff 天然不含它；若允许**运行中** `git clone`，须区分"本轮初始填充"与"其后改动"，或改为 agent **显式声明交付物**（产物 = 被声明的子集，而非"所有变化"）。
 - **忽略规则扩容**：`.git`（隐藏已覆盖）/ `node_modules`（已列）之外，补 `dist/ build/ target/ *.lock` 等生成物（与 §十三 待决 10 同条）。
+
+> ✅ **已落地（2026-10-12，R4；施工记录见 `06` §五·补 P1-9 · P5 R4）**：收产物判据由"每轮 `/work` 快照 diff（size+mtime）"改为**本轮工作区变更集**（`shared#foldWorkspaceEvents` 折叠窗口 `[轮次起点, now]` 内的 `workspace_events`）。落点：`backend/src/sandbox/artifactChanges.ts`（**新增**纯函数：`artifactChangePaths` = 只认内容事件、丢弃 `deleted`、`renamed` 取新路径 → `filterArtifactPaths` 做隐藏段 / `ARTIFACT_EXCLUDED_DIRS` / 截断 / 排序）+ `sandbox/artifacts.ts#collectRoundArtifacts`（入参 `{conversationId, changes}`，字节改从**宿主工作区 FS** 读，先传对象再建行）+ `orchestrator/taskAgent.ts`（轮次起点**前**先 `reconcileWorkspaceOnce` 落定记忆文档/附件等 setup 写 ⇒ 落在窗口之外，收产物**前**再对账补进未中介写）。**快照基线与 `docker exec` 扫容器退役**。⚠️ 忽略规则扩容（`dist/ build/ target/ *.lock`）**未做**（仍只有 `.` 隐藏 + `node_modules`）。
+
+### 7. git 凭据：平台配置 + 容器内注入（2026-10-12 新增）
+
+> 背景：§十三 已决 7 把 git 定为「**agent 的普通工具**」（clone/commit/branch 都由 agent 在 `bash` 里跑，后端不做 git-aware 端点）。但"**agent 拿什么身份 clone 私有仓库**"是那条定案**没回答**的问题 —— 本节补上：凭据从哪来、放哪、怎么消失。
+
+**一句话**：凭据按用户**加密存平台**（复用 MCP 凭据那套 `infra/crypto.ts`），**每次 `ensureSandbox` 时解密注入到容器 tmpfs `$HOME/.ssh` / env**，随容器销毁而消失；**绝不写进 `/work`**。
+
+> ✅ **已落地（2026-10-12，P1-9 · R11；施工记录见 `06` §五·补 P1-9 · R11 落地记录）**：契约 `shared/src/gitCredential.ts` + 迁移 `20261012130000_git_credentials`（`git_credentials`）+ `services/gitCredential.service.ts`（AAD = `${userId}:${kind}:${label}`，`hasValue` 出口，条数闸门 `GIT_CREDENTIAL_MAX_PER_USER`）+ `routes/gitCredentials.ts` 四条（仅本人）+ `sandbox/gitCredential.ts`（`gitCredentialEnv` / `gitCredentialFiles`）+ `sandbox/tar.ts`（手写 ustar）+ `docker.ts#putArchive` + `manager.ts`（派活注入 env 与 tmpfs `$HOME`）+ `config.SANDBOX_EGRESS_ALLOW_HOSTS=*` + `egress-up.sh` + 前端 `/settings/git-credentials`。⚠️ **出网强制点在 egress 代理侧**（`egress-up.sh` 读 `.env`）；HTTPS(443) 走代理天然生效、SSH(22) 不经 HTTP 代理（本期取"直接放行"口径）；**"平台配置 + 实时注入"仍为后置演进项**（§十三 待决 12）。
+
+#### 7.1 三条铁律
+
+| # | 铁律 | 理由 |
+|---|------|------|
+| G1 | **凭据只存后端、永不下发前端** | 与 MCP 凭据同族（`services/mcpCredential.service.ts` 文件头 ①②）：出参只有 `hasValue`，连掩码都不给（git 凭据是"每个人自己的令牌"，下发掩码收益为零） |
+| G2 | **注入目标只能是 tmpfs，不能是 `/work`** | `/work` 是共享 FS 且 **`.git` 进 S3 冷备**（§十三 已决 7）⇒ 写进工作区的密钥会进冷备、进产物候选、被人和 agent 同时看见。`$HOME`（=`/home/agent`）是 **tmpfs**（`spec.ts:557`，容器回收即消失），是唯一正确的落点 |
+| G3 | **明文只在两处出现**：解密服务 + `buildSandboxContainerSpec` | 与 `sandboxLlmEnv` / `sandboxProxyEnv` 同一条纪律（`02` §九「密钥零下发」）：不许打日志、不许落库、不许拼进错误消息（`LOG_REDACT_PATHS` 已含 `*_enc`） |
+
+#### 7.2 存储（Prisma 草案）
+
+复用 `infra/crypto.ts` 的 `encryptSecret` / `decryptSecret`（AES-256-GCM，主密钥只从 `CREDENTIAL_MASTER_KEY` env 来），与 `McpCredential` 同族但**不绑 server** —— git 凭据是**用户级**资源：
+
+```prisma
+/// 用户级 git 凭据（P1-9）。一行 = 一个用户的一条凭据（一把私钥 / 一个 PAT）。
+model GitCredential {
+  id        String            @id @default(uuid(7)) @db.Uuid
+  userId    String            @map("user_id") @db.Uuid
+  kind      GitCredentialKind
+  label     String            @db.VarChar(128)   // 人可读名，如 "github-work"
+  host      String?           @db.VarChar(255)   // 限定用途主机（github.com）；空 = 不限
+  /// 加密载荷 `{ ... }`（AAD = userId + kind + label，见下）。
+  /// ⚠️ 列名带 `_enc` 是刻意的（与 `mcp_credentials.values_enc` 同纪律）：
+  ///    让"这一列是密文"在**库结构层面**就看得出来。
+  secretEnc Json              @default("{}") @map("secret_enc") @db.JsonB
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, label])
+  @@index([userId])
+  @@map("git_credentials")
+}
+
+enum GitCredentialKind {
+  SSH_KEY       // { privateKey, knownHosts? }
+  HTTPS_TOKEN   // { token, username? }
+  @@map("git_credential_kind")
+}
+```
+
+- **值有进无出**：`secretEnc` 只在新增的 `gitCredential.service.ts` 读写；出参只有 `{ id, label, kind, host, hasValue }`。
+- **权限收窄全在 `user_id`**（同 MCP 凭据，ADMIN 无后门）；越权一律 404。
+- **清空 = 删行**（不存空密文 —— 结构合法的空密文会让"已配置"永远为真，理由同 `mcpCredential.service.ts` 文件头 ④）。
+- **AAD 绑定**：`decryptSecret(payload, `${userId}:${kind}:${label}`)` —— 解不开就当"没有值"降级、**绝不 500**（坑同 MCP 凭据 ③）。
+
+#### 7.3 注入时序（每次执行）
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant FE as 前端(我的凭据)
+    participant SV as gitCredential.service
+    participant M as manager.ensureSandbox
+    participant C as 容器($HOME=tmpfs)
+
+    U->>FE: 填私钥 / PAT
+    FE->>SV: PUT（明文，HTTPS）
+    SV->>SV: encryptSecret + 落库（密文）
+    Note over M: 每次建容器（含回收后重建 / P1-14 换机重建）
+    M->>SV: 取该用户的 git 凭据（解密）
+    M->>C: putArchive 写 $HOME/.ssh（id_* 0600 / known_hosts 0644，属主 10001）
+    M->>C: 注入 GIT_SSH_COMMAND / git config（见 §7.4）
+    C-->>U: agent 直接 `git clone git@github.com:...`
+    Note over C: 容器回收 ⇒ tmpfs 消失，密钥不留痕
+```
+
+- **落盘原语**：§十四 已把「`execInSandbox` 加 stdin / `putArchive`」列为待加原语（`docker.ts:535`），本节直接是它的**第一个消费方** —— **不另造写文件通道**。
+- **注入时机与 `sandboxLlmEnv` / `sandboxProxyEnv` 同处**（`manager.ts` 组装 `buildSandboxContainerSpec` 时）；**每次建容器都注**，不做"建一次留一辈子"。
+- **uid 对齐**：写进 tmpfs 的文件属主必须是 `SANDBOX_AGENT_UID`（10001），否则以非 root agent 跑起来的容器读不到自己的私钥（`spec.ts:75/82`，与 §五 1 uid 对齐同条）。
+
+#### 7.4 让 agent 无感：两种凭据的接法
+
+| 类型 | 注入物 | 接法 |
+|------|--------|------|
+| **SSH_KEY** | `$HOME/.ssh/id_ed25519`(0600) + `known_hosts`(0644) | env `GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"`（或写入 `$HOME/.gitconfig` 的 `core.sshCommand`）。⚠️ **不用 `--global`、不写工作区** |
+| **HTTPS_TOKEN** | **不落盘**（最干净） | env `GIT_CONFIG_COUNT` + `credential.helper` 或 `http.<host>.extraheader=Authorization: Basic …`；token 只在 env，与 `sandboxLlmEnv` 的明文 Key 同款 |
+
+- `accept-new` 而非 `StrictHostKeyChecking=no`：首次可连、之后锁定，避免中间人；需严格 pin 时用落盘的 `known_hosts`。
+- 用户配了多条凭据时**按 `host` 匹配**（`github.com` 用 A、`gitlab.internal` 用 B）；无匹配则不加 `GIT_SSH_COMMAND`（退回系统默认，行为不变）。
+- **优先 HTTPS_TOKEN**：token 不落盘、可细粒度 scope、易轮换；SSH 仅在必要时用（私钥落 tmpfs 仍比 token 敏感）。
+
+#### 7.5 出网（2026-10-12 用户定案：先默认放行）
+
+现状是**默认拒绝**：容器在 internal bridge 上**没有到公网的路由**，出公网只可能经 egress 代理，而代理只放行模型池 baseURL（`network.ts:4/15`、`config.ts:490`、`spec.ts:222`）。git clone 到 github/gitlab 因此走不通。
+
+- **本期口径**：**出网默认放行**（git 主机 + 所需端口 22/443 过白名单）。理由：Code 模式的可用性优先，先让 clone/commit 跑起来，安全收敛后置 —— 与 §五 6「clone 属常规操作、不是特例」同调。
+- ⚠️ **SSH(22) 与 HTTPS(443) 的治理路径不同**：HTTPS 走 egress 代理（`HTTP(S)_PROXY`）⇒ 白名单 / 实时策略可落在**代理侧**；**SSH 不经 HTTP 代理** ⇒ 要么直接给容器放行 22、要么走 `ProxyCommand` / 跳板。这条差异决定 §7.6 的实时配置能做到哪一步。
+- **后续（演进项，已记入 §十三 待决 12）**：把出网收敛成**平台上的一个配置项**（按用户 / 会话 / 主机），并支持**实时注入** —— 改配置**不重建容器**即生效。
+  - 可行路径：**HTTPS 面走现有 egress 代理**（策略在代理侧，改配置天然实时，无需动容器）；**SSH 面**需给容器加一条**可热更新的出口**（跳板 `ProxyCommand` / 带策略的 SSH 代理），或在"实时"与"SSH"之间取舍（例如实时策略只管 HTTPS，SSH 仍走建容器时的静态放行）。
+
+#### 7.6 落到分期（§十二）
+
+| 阶段 | 增量 |
+|------|------|
+| **P2b**（§十二） | 凭据存储 + 注入（`$HOME/.ssh` / env）+ 出网默认放行；验收：配一把只读 deploy key，agent 能 `git clone` 私有仓库，且容器回收后 `$HOME` 里无密钥残留 |
+| P3 | 前端「我的凭据」页复用 MCP 凭据交互（`pages/mcp/McpCredentialsPage.tsx` 的按项配置 + 未配置置顶） |
+| 后置 | 出网平台化 + 实时注入（§十三 待决 12）。本节全部事项已登记为 `06` §五·补 P1-9 剩余清单 **R11** |
 
 ---
 
@@ -439,6 +554,8 @@ flowchart LR
 | 二进制 | 只读预览 / 下载，编辑器只开文本 |
 | 越权 | 所有端点按会话归属判权，他人一律 404（与产物同族） |
 | 密钥 | 工作区不跨用户可见；日志脱敏沿用 `LOG_REDACT_PATHS` |
+| **git 凭据** | 按用户加密存平台（AAD 绑 `userId:kind:label`）；**只注入 tmpfs `$HOME/.ssh` / env，绝不写 `/work`**（否则进 S3 冷备与产物）；明文只在解密服务与建 spec 时出现（§五 7） |
+| **出网** | 本期 git 主机（22/443）**默认放行**；后续收敛为平台配置 + **实时注入**（§五 7.5、§十三 待决 12） |
 | 注入 | 路径参数进 `docker exec` / FS 操作前必须校验（现状 `execInSandbox` 用数组 form 防注入，新写路径要维持同一纪律） |
 
 ---
@@ -461,12 +578,16 @@ flowchart LR
 | `WORKSPACE_ROOT` | `/var/lib/doubulea/workspaces` | 路径 | 宿主 canonical 目录根；多主机指向共享存储挂载点 |
 | `WORKSPACE_MAX_FILE_MB` | **10** | MB | 单文件上限（编辑器只开这以下的文本；更大只读 / 下载） |
 | `WORKSPACE_MAX_FILES` | **2000** | 个 | 单会话文件数上限（防爆） |
+| `WORKSPACE_MAX_ROWS` | **20000** | 个 | 单会话**行数**上限（含墓碑；P6 · R6 更严的数量闸门）⚠️ 必须 ≥ `WORKSPACE_MAX_FILES` |
 | `WORKSPACE_MAX_TOTAL_MB` | **512** | MB | 单会话总字节上限 |
+| `WORKSPACE_WRITE_PER_MIN` | **600** | 次/分 | 单会话写入限流（固定窗口 1 分钟；`0` = 关闭；超限回 `BUSY`/429）—— P6 · R6 |
 | `WORKSPACE_CLAIM_TTL_SEC` | **120** | 秒 | 文件 claim 存活期（心跳续期） |
 | `WORKSPACE_EVENT_DEBOUNCE_MS` | **300** | ms | watcher 事件去抖窗口（**代码常量**） |
 | `WORKSPACE_BACKUP_DEBOUNCE_MS` | **2000** | ms | 人保存后冷备去抖窗口（**代码常量**） |
 | `WORKSPACE_RETENTION_DAYS` | **7** | 天 | 工作区保留期（**2026-10-10 定案：与 `ARTIFACT_RETENTION_DAYS` 共用同一值**，见 §十三 已决 4） |
 | `WORKSPACE_TEXT_INLINE_MAX_MB` | **2** | MB | 读接口内联返回的文本上限（超过改走流式 / 只读下载） |
+| `SANDBOX_EGRESS_ALLOW_HOSTS` | **`*`（本期全放行）** | 主机列表 | Code 模式 git 出网（22/443）；`*` = 默认放行，后续收敛为平台配置 + 实时注入（§五 7.5） |
+| `GIT_CREDENTIAL_MAX_PER_USER` | **5** | 条 | 单用户 git 凭据条数上限（§五 7.2） |
 
 > **代码常量不进 env** 的取舍同 `PI_RPC_STDIO_MAX_BYTES` / `ACTIVITY_TOUCH_INTERVAL_MS`。
 
@@ -479,10 +600,11 @@ flowchart LR
 | P0 | Workspace Service 骨架：共享挂载 + DB 索引 + watcher + 事件总线 | 在宿主手工改文件，SSE 收到事件；容器 `read` 看到同一内容 |
 | P1 | 人侧读写 API + 版本 CAS + 路径安全 | 浏览器可建 / 读 / 写；并发写返回 409 |
 | P2 | pi workspace 扩展（read/write/edit 中介）+ claim + 冲突回喂模型 | agent 写到人改过的文件时被拒并重读，不静默覆盖 |
-| P3 | 实时 SSE + CodeMirror 前端 + 会话开关 | 完整可编辑形态；agent 改动实时上屏 |
+| **P2b** | **git 凭据：平台配置 + 容器注入 + 出网默认放行**（§五 7） | 配一把只读 deploy key，agent 能 `git clone` 私有仓库；容器回收后 `$HOME` 无密钥残留；密钥不进 `/work` / 冷备 / 产物 |
+| P3 | 实时 SSE + CodeMirror 前端 + 会话开关 | 完整可编辑形态；agent 改动实时上屏。**SSE + 会话开关 + 面板已落地（2026-10-12）**；**CodeMirror 编辑器（R7）已落地（2026-10-12）** —— P3 时编辑器先用原生 `<textarea>`（零依赖落地功能主线），R7 升级为 CodeMirror 6 |
 | P4 | 中途注入 / abort+重派 + 轮末 diff 审阅 + **「撤销本轮」**（轮级变更集回滚，§七 5） | 主动感知 + 变更集审阅 + **一键回滚整轮** |
-| P5 | S3 冷备 / 恢复 + artifact 集成 + workspace reaper | 容器回收后工作区仍在；宿主迁移后从 S3 重建 |
-| P6 | 配额 / 二进制 / 多用户协作（可选 Yjs） | 硬化与协同 |
+| P5 | S3 冷备 / 恢复 + artifact 集成 + workspace reaper | 容器回收后工作区仍在；宿主迁移后从 S3 重建。**R3（S3 冷备/恢复）已落地（2026-10-12）**；**R4（artifact 集成：产物 = 工作区变更集视图）已落地（2026-10-12）**；**R5（保留期清理：存活会话超期）已落地（2026-10-12）—— P5 三项全部落地** |
+| P6 | 配额 / 二进制 / 多用户协作（可选 Yjs） | 硬化与协同。**R6（配额/二进制硬化：二进制嗅探 + 更严的大小/数量/类型闸门 + 写入限流）已落地（2026-10-12）**；多用户协作（Yjs）为可分期的后续项 |
 
 每阶段需配套：`shared` 契约增量、验证脚本（对齐本仓 `verify:*` 文化）、README / `02` / `03` / `06` 回写。
 
@@ -509,6 +631,7 @@ flowchart LR
 | 5 | 多用户协作 / CRDT | **不做**。会话单归属，每人只在自己对话内编辑；无 `workspace_collaborators`、无 Yjs（§七 4 降为非目标） |
 | 6 | `artifacts` 与工作区的关系 | **产物收敛为「工作区变更集视图」**：产物 = 交付 / 变更子集，非目录树快照；`git clone` 等初始填充**不算产物**（§五 6） |
 | 7 | **git 的定位** | **git = agent 的普通工具**：clone/commit/branch 由 agent 在 `bash` 里跑，后端**不做 git-aware 端点 / UI**；`.git` 属**工作区内容**（保留）、**不进产物**（变更集永远排除 `.git/*`）、**进冷备**（否则换机重建丢历史）；**不预设"工作区 = 一个 repo"**，clone 是常规操作不是特例 |
+| 8 | **git 凭据与出网（2026-10-12）** | 凭据**按用户加密存平台**（复用 `infra/crypto.ts` + MCP 凭据同族纪律），**每次建容器时注入 tmpfs `$HOME/.ssh` / env**，随容器销毁；**绝不写 `/work`**（不进冷备 / 产物）。**出网本期默认放行**（git 22/443）；"平台配置 + 实时注入"为演进项（详见 §五 7、待决 12） |
 
 ### 待决（需用户拍板）
 
@@ -519,6 +642,7 @@ flowchart LR
 | 9 | **无中介写（bash）的代码库忽略规则** | `.lock` / `dist` / 生成物反复冲突，需显式忽略名单（与 §五 6 忽略规则扩容同条） |
 | 10 | 与 P1-8 记忆文档的接缝 | 共享工作区里记忆文件（`.doubulea/memory.md`）与"单一真相"如何合流，避免被当工作区文件误改 |
 | 11 | **工作区「钉机记录」的载体与寿命** | Redis 长 TTL vs `Workspace.instanceId` 列（P1-14 用 Redis）；决定 §十六 C 的落地形态 |
+| 12 | **出网策略的平台化与实时注入** | 本期默认放行、静态生效；目标是把出网收敛为平台配置项（按用户 / 会话 / 主机）且**改配置不重建容器**。HTTPS 面可落在现有 egress 代理侧（天然实时）；**SSH(22) 不经 HTTP 代理**，需另设可热更新的出口或取舍（§五 7.5）。决定 egress 代理与网络层的改造范围 |
 
 ---
 
@@ -529,7 +653,7 @@ flowchart LR
 | 工作目录 / 卷命名 | `backend/src/sandbox/spec.ts`（`SANDBOX_WORK_DIR:64`、`workVolumeName:117`） |
 | 容器创建 / 回收 | `backend/src/sandbox/manager.ts`（`createSandbox`、`recycleSandbox:487`） |
 | 容器内执行 / 写文件原语 | `backend/src/sandbox/docker.ts`（`execInSandbox:535`，需加 stdin 或 `putArchive`） |
-| 产物扫描 / diff / 收集 | `backend/src/sandbox/artifacts.ts`（`snapshotWorkFiles` / `diffWorkFiles` / `collectRoundArtifacts`） |
+| 产物扫描 / diff / 收集 | `backend/src/sandbox/artifacts.ts`（P1-9 · R4 起：`collectRoundArtifacts` 判据 = 本轮工作区变更集 + `artifactChanges.ts`；`snapshotWorkFiles` / `diffWorkFiles` 已退役） |
 | 编排循环 | `backend/src/orchestrator/taskAgent.ts`（派活前 rehydrate、轮末 syncback） |
 | 记忆 / prompt | `backend/src/orchestrator/memoryDoc.ts` |
 | 活跃流锁 / SSE | `backend/src/orchestrator/sse.ts` |
@@ -539,6 +663,11 @@ flowchart LR
 | 产物路由 / 预览头 | `backend/src/routes/artifacts.ts` |
 | 数据模型 | `backend/prisma/schema.prisma`（`Artifact`、`Sandbox`、`Conversation`） |
 | 前端面板 / 预览 | `frontend/src/features/chat/ArtifactPanel.tsx`、`components/ArtifactPreview/*`、`api/artifacts.ts`、`pages/chat/ChatPage.tsx` |
+| git 凭据加解密 / 存储 | `backend/src/infra/crypto.ts`（`encryptSecret`/`decryptSecret`，已有）、新增 `services/gitCredential.service.ts`、`routes/gitCredentials.ts` |
+| git 凭据注入容器 | `backend/src/sandbox/spec.ts`（`$HOME` tmpfs / env）、`manager.ts#ensureSandbox`、`docker.ts`（`putArchive`，§十四 待加原语） |
+| git 凭据数据模型 | `backend/prisma/schema.prisma`（新增 `GitCredential`，挂 `User`） |
+| 出网代理 / 白名单 | `backend/src/sandbox/network.ts`、`spec.ts#sandboxEgressEnv`、`config.ts`（`SANDBOX_EGRESS_PROXY_URL` / 新增 `SANDBOX_EGRESS_ALLOW_HOSTS`） |
+| 凭据页复用 | `frontend/src/pages/mcp/McpCredentialsPage.tsx`、`frontend/src/api/mcp.ts`（交互参照） |
 
 ---
 
@@ -562,6 +691,8 @@ flowchart LR
 - §五 5 的「主动注入」**从"若引擎支持"升级为"用 `steer` 实现"**；粒度是助手 turn 边界，**不是逐工具即时**——这正好匹配"agent 在工具间歇读到你的改动"的预期。
 - **bash 仍绕过**：`bash` 是能执行任意命令的原生工具，无法逐条拦截其内部写；watcher 兜底（§五 3）与轮末对账**继续保留**。
 - **剩余动作（唯一）**：在 pin 版 `0.87.1` 容器里做一个**最小原型** —— 注册一个同名 `read` 覆盖、发一条 `steer`，确认行为与 `main` 文档一致。这是**复核**不是**可行性验证**。
+- ✅ **复核结论 · `steer`（2026-10-12）**：在 `doubulea/sandbox-toolkit:5`（pi `0.87.1`）里对 `pi --mode rpc --no-approve` 发 `{"id":"r2","type":"steer","message":"hello from probe"}`，回 `{"id":"r2","type":"response","command":"steer","success":true}`，且流上出现 `{"type":"queue_update","steering":["hello from probe"],"followUp":[]}`（**入队确认**）；`get_state` 回 `steeringMode:"one-at-a-time"`。命令形状与 `docs/rpc-commands.md#steer` 逐字一致 ⇒ **R1 已落地**（`06` §五·补 P1-9 · P4 R1）。
+- ✅ **复核结论 · 同名工具覆盖（R8，2026-10-12）**：在 pin `0.87.1` 容器里 `DOUBULEA_WORKSPACE_MEDIATION=1` 起 pi、用假上游逼模型调一次 `write`/`edit`，**同名覆盖确认生效**（发给 LLM 的 `tools` 里 `read`/`write`/`edit` 是本扩展的定义，不是内置；工具真的执行、写真的经 `/api/sandbox/workspace/*` 带 `baseVersion` 走 CAS、`CONFLICT` 文案作为失败结果回喂模型）。复核同时校正两处**实现与 pin 的偏差**：①内置 `edit` 的形状是 `{ path, edits: [{ oldText, newText }] }`（**不是** Claude 系的 `old_string`/`new_string`）⇒ 本扩展与代理端点按 `0.87.1` 对齐（`edit.ts#applyWorkspaceEdits` 原子多改）；②覆盖内置工具时若不给 `promptSnippet`/`promptGuidelines`，会**连带丢掉**内置工具在系统提示里的条目与用法提示 ⇒ 三个工具都补上（并补 `constrainedSampling`）。⚠️ 复核还当场发现宿主 `toolkit:5` 里**根本没有该扩展**（P2 加文件却漏升层版本）⇒ 本批升到 `6` 并重建。详见 `06` §五·补 P1-9 · P2 R8 落地记录。
 
 ---
 
@@ -577,7 +708,7 @@ flowchart LR
 | **D** | P1-14 §三 3 已定"每实例只清自己的账本行" | P1-9 的 workspace reaper **同口径**：只清本实例名下的工作区（本地目录 + DB 行 + S3 一起收）。⚠️ 不是"A 跨机操作 B 的目录"（它看不见），而是"A 用**全局查询**会误删 B 的**共享元数据 / S3**，而文件系统动作落在 A 本盘、毫无意义" |
 | **E** | P1-14 §六 2"owner 宕机 ⇒ 新实例重建容器" | 与 P1-9"宿主迁移从 S3 重建"**是同一事件，合并执行**：容器重建 + 工作区从 S3 重建。也正因此 **冷备要含 `.git`**（§十三 已决 7） |
 | **F** | P1-9 §四 1 原写"多机 = `rootPath` 指向共享盘" | 已改为**路线 A**（§四 1）：钉机器 + 本地盘 + S3 重建；共享 FS 降为备选 |
-| **G** | 排期 | P1-14 在 P1-9 之后；P1-9 先落单机（单机下 P1-14 增量退化为无操作），只需**预留 A–F 的钩子** |
+| **G** | 排期 | P1-14 在 P1-9 之后；P1-9 先落单机（单机下 P1-14 增量退化为无操作），只需**预留 A–F 的钩子**。✅ **2026-10-12（R9）**：钩子**已兑现**——A–F 的落地为 `shared/src/router.ts`（路由分类）+ `backend/src/sandbox/owner.ts`（会话→实例目录，容器 TTL vs **工作区 TTL**）+ `backend/src/router/*`（自研 Fastify 网关，`/workspace*` 全部纳入粘性、SSE 流式透传）+ `workspace/{service,reaper}.ts`（钉机早于建容器 / 只清本实例名下）+ `Sandbox.instanceId` 列与三处对账按 `instanceId=self` 过滤（P1-14 核心）。单实例下仍退化为无操作 |
 
 **对 P1-14 的回写需求**：`子方案/沙箱多机部署.md` §三 6 路由分类表把**工作区读 / 写 / 树 / 事件**列为**粘性**；§三 5 补"钉机记录需早于建容器、且寿命跟随工作区（长于容器 TTL）"。
 

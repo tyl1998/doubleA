@@ -222,6 +222,41 @@ export async function listConversationsForAgent(
   }
 }
 
+/**
+ * **我**的全部会话列表（`GET /api/conversations`，跨智能体）。
+ *
+ * 「聊天为主页」的取数出口（产品改造 2026-10）：主页不再"先选智能体再进对话"，左栏直接列出
+ * 本人所有会话。与 {@link listConversationsForAgent} 的口径**逐条相同**（不过滤
+ * `agents.deleted_at`、带 `userId` 过滤、`nulls: 'first'` 排序、{@link toItem} 同一投影），
+ * 唯一差别是**不按 `agentId` 收窄** —— 于是这里没有"智能体不存在"的 404：空列表就是
+ * "你还没聊过"（与按智能体那条要 404 的判据不同，因为那条的入参是一个具体智能体 id）。
+ */
+export async function listMyConversations(
+  query: ListConversationsQuery,
+  viewer: ConversationViewer,
+): Promise<ConversationListResult> {
+  const db = getPrisma()
+
+  const where = { userId: viewer.id } as const
+  const [rows, total] = await db.$transaction([
+    db.conversation.findMany({
+      where,
+      select: CONVERSATION_SELECT,
+      orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'first' } }, { createdAt: 'desc' }, { id: 'desc' }],
+      skip: query.offset,
+      take: query.limit,
+    }),
+    db.conversation.count({ where }),
+  ])
+
+  return {
+    items: rows.map((row) => toItem(row as ConversationRow)),
+    total,
+    offset: query.offset,
+    limit: query.limit,
+  }
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // 建
 // ═════════════════════════════════════════════════════════════════════
@@ -570,13 +605,14 @@ export async function getConversationActive(
     getRedis().get(chatAutoApproveKey(id)),
     getPrisma().conversation.findFirst({
       where: { id, userId: viewer.id },
-      select: { memoryExcluded: true },
+      select: { memoryExcluded: true, codeMode: true },
     }),
   ])
   // 只认 `'1'`；读失败/键缺失都当"关"（安全默认，与 `sse.ts#readAutoApprove` 同口径）
   const autoApprove = autoApproveRaw === '1'
   const memoryExcluded = conv?.memoryExcluded ?? false
-  if (raw === null) return { streaming: false, autoApprove, memoryExcluded, ...EMPTY_ACTIVE_SNAPSHOT }
+  const codeMode = conv?.codeMode ?? false
+  if (raw === null) return { streaming: false, autoApprove, memoryExcluded, codeMode, ...EMPTY_ACTIVE_SNAPSHOT }
 
   const snapshot = parseActiveSnapshot(raw)
   if (snapshot.currentTool === null && snapshot.queuedPosition === null && snapshot.startedAt === null) {
@@ -584,7 +620,27 @@ export async function getConversationActive(
     // 但对读侧不构成失败：锁确实在，只是细节丢了。
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
-  return { streaming: true, autoApprove, memoryExcluded, ...snapshot }
+  return { streaming: true, autoApprove, memoryExcluded, codeMode, ...snapshot }
+}
+
+/**
+ * 打开 / 关闭**会话级 Code 模式**（P1-9 · P3）—— 持久列 `conversations.code_mode`。
+ *
+ * ⚠️ 与 `setAutoApprove`（Redis）不同：这是**落库**的，因为派活创建沙箱时要读到它来决定
+ * 是否注入 `DOUBULEA_WORKSPACE_MEDIATION=1`（`sandbox/manager.ts`），且要跨实例一致。
+ * 归属判据落在 `where`（`id + userId`）：不是我的会话 ⇒ 404（与 `/active` 同款）。
+ */
+export async function setConversationCodeMode(
+  id: string,
+  viewer: ConversationViewer,
+  enabled: boolean,
+): Promise<boolean> {
+  const updated = await getPrisma().conversation.updateMany({
+    where: { id, userId: viewer.id },
+    data: { codeMode: enabled },
+  })
+  if (updated.count === 0) throw AppError.notFound('会话不存在')
+  return enabled
 }
 
 // ═════════════════════════════════════════════════════════════════════

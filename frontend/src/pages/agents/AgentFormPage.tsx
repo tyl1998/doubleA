@@ -78,7 +78,7 @@ import { useMcpServers, useMyCredentials } from '../../api/mcp.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
-import { HOME_PATH, chatPath, credentialsPath } from '../../app/paths.js'
+import { AGENTS_PATH, chatPath, credentialsPath } from '../../app/paths.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import {
@@ -303,7 +303,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
             <Link to={chatPath(initialItem.id)}>
               <Button type="primary">用这个智能体开一个会话</Button>
             </Link>
-            <Link to={HOME_PATH}>
+            <Link to={AGENTS_PATH}>
               <Button>返回列表</Button>
             </Link>
           </div>
@@ -402,7 +402,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
     }
 
     feedback.ok(initialItem === undefined ? '智能体已创建' : '已保存')
-    navigate(HOME_PATH)
+    navigate(AGENTS_PATH)
   }
 
   // ───────────────────────── 渲染 ─────────────────────────
@@ -852,7 +852,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                   ` · 未保存区块：${dirtySections.map((section) => AGENT_SECTION_LABEL[section]).join('、')}`}
               </span>
               <div className="row u-right" style={{ gap: 'var(--sp-3)' }}>
-                <Link to={HOME_PATH}>
+                <Link to={AGENTS_PATH}>
                   <Button type="text">取消</Button>
                 </Link>
                 <Button type="primary" htmlType="submit" loading={saving}>
@@ -906,7 +906,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
       <DeleteAgentModal
         agent={deleteOpen && item !== undefined ? item : null}
         onClose={() => setDeleteOpen(false)}
-        onDeleted={() => navigate(HOME_PATH)}
+        onDeleted={() => navigate(AGENTS_PATH)}
       />
     </>
   )

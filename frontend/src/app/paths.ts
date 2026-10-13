@@ -10,13 +10,27 @@ import type { Location } from 'react-router-dom'
 
 export const LOGIN_PATH = '/login'
 export const PASSWORD_PATH = '/settings/password'
+/**
+ * 首页 = **聊天主页**（P1-15 · 以聊天为主页）。
+ *
+ * ⚠️ P1-15 之前 `HOME_PATH` 是**智能体列表**；改造后 `/` 是聊天主页（跨智能体会话历史 +
+ * 当前会话），智能体列表搬到 {@link AGENTS_PATH}。凡"回智能体列表"的动线要显式用
+ * `AGENTS_PATH`，别再用 `HOME_PATH` 兜 —— 否则会把用户丢回聊天主页。
+ */
 export const HOME_PATH = '/'
 export const ADMIN_USERS_PATH = '/admin/users'
 export const ADMIN_MODELS_PATH = '/admin/models'
-/** 用量统计（`03` §二：`/admin/usage`，**ADMIN**；P1-7 接真页面） */
+/** 用量统计（`03` §二：`/admin/usage`；P1-7 接真页面；**P1-15 起登录即可**，见 §八） */
 export const ADMIN_USAGE_PATH = '/admin/usage'
 
-/** 智能体（`03` §二：`/` 是列表、`/agents/new` 建、`/agents/:id/edit` 改） */
+/**
+ * 智能体列表（**管理页**；P1-15 从 `/` 搬到这里）。
+ *
+ * `03` §二 原表把列表放在 `/`；P1-15 把 `/` 让给聊天主页 ⇒ 列表成为「管理」目的地之一。
+ */
+export const AGENTS_PATH = '/agents'
+
+/** 智能体（`/agents/new` 建、`/agents/:id/edit` 改；列表见 {@link AGENTS_PATH}） */
 export const AGENTS_NEW_PATH = '/agents/new'
 
 /** 知识库列表（`03` §二：`/knowledge`，登录即可 —— 与模型池相反，**不是** ADMIN） */
@@ -31,6 +45,7 @@ export const MCP_PATH = '/mcp'
  * ⚠️ 它是**个人凭据页**，与 MCP 解耦 —— 「代表你调用工具」是个人设置，
  * 归入 `/settings` 一族（与 `/settings/password` 同族），后续可扩展别的凭据类型。
  * 页面**内容**仍是按 MCP server 分组的表单，后端端点也仍是 `/api/mcp/credentials`。
+ * Git 凭据（P1-9 · R11）不再是独立路由，作为本页内嵌的 `GitCredentialsSection` 区块呈现。
  */
 export const CREDENTIALS_PATH = '/settings/credentials'
 
@@ -78,18 +93,72 @@ export function agentEditPath(agentId: string): string {
 }
 
 /**
- * 与某智能体对话（`03` §二 的 `/chat/:agentId`，`conversationId` 可选定位）。
+ * 定位某个会话（P1-15 的规范路径：`/c/:conversationId`）。
  *
- * `conversationId` 省略 = **新会话态**（`03` §4.1：展示开场白，首条消息发送时才创建会话）；
- * 带上 = 定位到那个会话。P0-1-32 起"发第一条消息"会把它写进 URL（`replace`），
- * 于是**刷新后仍停在同一会话**、历史用同一套组件重画 —— 这是本批验"刷新后形态一致"的前提。
+ * `agentId` 由会话数据自带（`ConversationItem.agentId` / `agentName` / `agentType` 已是快照），
+ * 故路径里**不再带**它 —— 一个会话只可能属于一个智能体，重复放在 URL 里就有了第二份真值。
+ */
+export function conversationPath(conversationId: string): string {
+  return `/c/${encodeURIComponent(conversationId)}`
+}
+
+/**
+ * 与某智能体的**新会话态**（P1-15：`/new/:agentId`）。
  *
- * ⚠️ 侧栏、新建/重命名/删除会话属 **P0-1-34**：本批只有"URL 里带着的那个会话"，
- * 没有"在会话之间切换"的入口（从列表页进来永远是**新会话态**）。
+ * 只展示开场白 + 引导问题，**不建会话**（`03` §4.1：首条消息发送时才建）。
+ */
+export function newConversationPath(agentId: string): string {
+  return `/new/${encodeURIComponent(agentId)}`
+}
+
+/**
+ * 进入某智能体的对话：有会话 id ⇒ 定位它（`/c/:id`），没有 ⇒ 新会话态（`/new/:agentId`）。
+ *
+ * ⚠️ 这是全仓"跳去对话"的**唯一构造点**（列表页、任务页、产物页、编辑页都用它）。
+ * P1-15 起它产出的是规范路径；老地址 `/chat/:agentId[/:conversationId]` 由 `App.tsx` 里的
+ * `LegacyChatRedirect` 内部重定向到这两条 —— 旧书签 / 文档里的链接仍然有效，不做 404。
+ *
+ * `encodeURIComponent` 与 {@link agentEditPath} 同款：不是防注入（调用方给的都是服务端 uuid），
+ * 而是让"这个 id 不该出现在路径里"这类错误尽早表现为查不到的地址。
  */
 export function chatPath(agentId: string, conversationId?: string): string {
-  const base = `/chat/${encodeURIComponent(agentId)}`
-  return conversationId === undefined ? base : `${base}/${encodeURIComponent(conversationId)}`
+  return conversationId === undefined ? newConversationPath(agentId) : conversationPath(conversationId)
+}
+
+/**
+ * 当前路径是否属于**聊天视图**（统一外壳 `AppShell` 用它决定主区形态）。
+ *
+ * 聊天视图覆盖：`/`（欢迎态）、`/c/:conversationId`（定位会话）、`/new/:agentId`（新会话态），
+ * 以及老深链 `/chat/:agentId[/:conversationId]`（重定向途中也会经过这里）。
+ * 其余路径（智能体 / 知识库 / MCP / 任务 / 产物 / 凭据 / 用量 / ADMIN 两页）走**同一外壳的页面形态**：
+ * 会话栏仍在左，右侧主区换成「顶栏面包屑 + `.page`」。**两个形态共用一个外壳**，
+ * 切换功能时左侧会话栏不重挂载、不换样（P1-15 修订：管理跟会话走，外壳统一）。
+ */
+export function isChatHomePath(pathname: string): boolean {
+  return (
+    pathname === HOME_PATH ||
+    pathname.startsWith('/c/') ||
+    pathname.startsWith('/new/') ||
+    pathname === '/chat' ||
+    pathname.startsWith('/chat/')
+  )
+}
+
+/**
+ * 从路径里还原当前会话 id —— 只有规范路径 `/c/:conversationId` 带它（其余返回 `undefined`）。
+ *
+ * 与 {@link conversationPath} 的 `encodeURIComponent` 对称（这里负责解开）。
+ * 外层外壳拿它给 `ConvRail` 高亮当前会话；解不开时退回原串（高亮不到，但不至于抛错）。
+ */
+export function conversationIdFromPath(pathname: string): string | undefined {
+  if (!pathname.startsWith('/c/')) return undefined
+  const raw = pathname.slice('/c/'.length).split('/')[0]
+  if (raw === undefined || raw === '') return undefined
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
 }
 
 /** 登录页的两种视图（`docs/03` §二：`/login` 是"登录（含首登改密）"，两态同屏） */

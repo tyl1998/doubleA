@@ -373,6 +373,49 @@ export const stopConversationResultSchema = z.object({
 })
 export type StopConversationResult = z.infer<typeof stopConversationResultSchema>
 
+// ───────────────────────────── 中途插话（steer，P1-9 · P4 · R1）─────────────────────────────
+
+/**
+ * 一条「中途插话」的长度上限 —— **与用户消息同一个上限**（{@link MAX_CHAT_CONTENT_CHARS}）。
+ *
+ * 为什么复用而不是另取一个数：steer 与 `prompt` 最终都变成**同一条发给模型的用户消息**
+ * （pi `docs/rpc-commands.md#steer`：投递到助手 turn 边界，与下一条 prompt 同族），
+ * 两处各写一个上限必然先腐烂一处（`docs/06` §六 第 ⑰ 条）。
+ */
+export const STEER_MESSAGE_MAX_CHARS = MAX_CHAT_CONTENT_CHARS
+
+/**
+ * `POST /api/conversations/:id/steer` 请求体（**P1-9 · P4 · R1**）—— 向**运行中**的 agent 插一句话。
+ *
+ * 「用户改了 path（vN），请重读后再继续」是本端点的典型内容（人机共享工作区的主动感知），
+ * 但契约本身**不含任何工作区字段**：它就是一句普通文本，由后端在助手 turn 边界投给引擎
+ * （pi RPC `steer`，pin `0.87.1` 已复核 —— 见 `docs/子方案/Code模式工作区.md` §十五）。
+ */
+export const steerConversationBodySchema = z.object({
+  message: z
+    .string({
+      required_error: '请输入插话内容',
+      invalid_type_error: '插话内容必须是文本',
+    })
+    .trim()
+    .min(1, '插话内容不能为空')
+    .max(STEER_MESSAGE_MAX_CHARS, `插话内容最多 ${STEER_MESSAGE_MAX_CHARS} 个字符`),
+})
+export type SteerConversationBody = z.infer<typeof steerConversationBodySchema>
+
+/**
+ * `POST /api/conversations/:id/steer` 的响应。
+ *
+ * **幂等**（与 `/stop` 同款）：`accepted:false` = "当前没有正在生成的回答"（流刚好结束的竞态码必然存在），
+ * **不是错误** —— 做成 4xx 只会让用户看到一条没有信息量的报错。
+ * `accepted:true` = 这条插话确实写给了**一个正在跑的流**（它会在下一个助手 turn 边界读到）。
+ */
+export const steerConversationResultSchema = z.object({
+  id: z.string(),
+  accepted: z.boolean(),
+})
+export type SteerConversationResult = z.infer<typeof steerConversationResultSchema>
+
 // ───────────────────────────── 确认应答（P0-2-10）─────────────────────────────
 
 /**

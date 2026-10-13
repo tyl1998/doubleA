@@ -47,6 +47,7 @@ import type {
   RemoveConversationResult,
   SetConversationAutoApproveResult,
   SseEvent,
+  SteerConversationResult,
   StopConversationResult,
 } from '@doubulea/shared'
 
@@ -90,6 +91,43 @@ export function useMyConversationCount(agentId: string | undefined) {
  * `listConversationsQuerySchema`）。
  */
 export const CONVERSATIONS_PAGE_LIMIT_MAX = 100
+
+// ───────────────────────────── 我的全部会话（跨智能体，P1-15） ─────────────────────────────
+
+/**
+ * 「我的全部会话」的缓存键（P1-15 · 聊天主页的会话栏）。
+ *
+ * ⚠️ **独立于** {@link agentConversationsQueryKey}（那是"我在某个智能体名下"的分栏）：
+ * 主页一屏要看**跨智能体**的历史，按智能体拼多次请求会把"服务端一次给全"的排序口径
+ * 撕成几段（`子方案/聊天主页与信息架构改造.md` §九：客户端**不合并多次请求**）。
+ */
+export const MY_CONVERSATIONS_QUERY_KEY = ['conversations', 'mine'] as const
+
+/** 主页会话栏一次取多少条（与 {@link CONVERSATIONS_PAGE_LIMIT_MAX} 同口径：一次取满、客户端不再分页） */
+export const MY_CONVERSATIONS_PAGE_LIMIT_MAX = CONVERSATIONS_PAGE_LIMIT_MAX
+
+/**
+ * 读"我的全部会话"（`GET /api/conversations`，P1-15；后端已落）。
+ *
+ * 与 {@link useAgentConversations} **同口径**（服务端同一段查询、只是不按 `agentId` 收窄），
+ * 差别只在缓存键 —— 一次消息落库要同时让"跨智能体列表"与"某智能体列表"过期，
+ * 故两处 `invalidateQueries` 都要带上（见 {@link invalidateMyConversations}）。
+ */
+export function useMyConversations(params: { offset?: number; limit?: number } = {}) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? MY_CONVERSATIONS_PAGE_LIMIT_MAX
+  const search = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  return useQuery({
+    queryKey: [...MY_CONVERSATIONS_QUERY_KEY, offset, limit] as const,
+    queryFn: () => request<ConversationListResult>(`/api/conversations?${search.toString()}`),
+    placeholderData: keepPreviousData,
+  })
+}
+
+/** 失效「我的全部会话」（改名 / 删除 / 撤回 / 每轮 `done` 都要调；见文件头"两份列表"） */
+export function invalidateMyConversations(queryClient: ReturnType<typeof useQueryClient>): void {
+  void queryClient.invalidateQueries({ queryKey: MY_CONVERSATIONS_QUERY_KEY })
+}
 
 /**
  * 侧栏列表的缓存键。
@@ -141,6 +179,7 @@ export function useRenameConversation(agentId: string) {
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+      invalidateMyConversations(queryClient)
     },
   })
 }
@@ -163,6 +202,7 @@ export function useRemoveConversation(agentId: string) {
       request<RemoveConversationResult>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+      invalidateMyConversations(queryClient)
     },
   })
 }
@@ -183,6 +223,7 @@ export function useRecallLastRound(agentId: string) {
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+      invalidateMyConversations(queryClient)
     },
   })
 }
@@ -276,8 +317,26 @@ export function stopConversation(conversationId: string): Promise<StopConversati
   )
 }
 
-// ───────────────────────────── 活跃流快照（P0-1-33 起用于断线对齐） ─────────────────────────────
+// ───────────────────────────── 中途插话（steer，P1-9 · P4 · R1） ─────────────────────────────
 
+/**
+ * 向**运行中**的 agent 插一句话（`POST /api/conversations/:id/steer`）。
+ *
+ * 典型内容是"用户改了 X，请重读"，但契约就是一句普通文本（见 `shared#steerConversationBodySchema`）：
+ * 服务端把它写进 `chat.steer:{id}`，由那条流投给引擎的 `steer` 命令（**助手 turn 边界**投递）。
+ *
+ * 与 {@link stopConversation} **同款语义**：**幂等** —— 没有在跑的流时返回
+ * `{ accepted: false }`，**同样是 200**（"流刚好结束"的竞态必然存在，做成 4xx 只会是一条
+ * 没有信息量的报错）。`accepted: true` = 这条插话确实写给了一个正在跑的流。
+ */
+export function steerConversation(conversationId: string, message: string): Promise<SteerConversationResult> {
+  return request<SteerConversationResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/steer`,
+    { method: 'POST', body: { message } },
+  )
+}
+
+// ───────────────────────────── 活跃流快照（P0-1-33 起用于断线对齐） ─────────────────────────────
 /**
  * 读"这个会话现在有没有流在跑"（`GET /api/conversations/:id/active`，P0-1-25 落地）。
  *

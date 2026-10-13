@@ -15,8 +15,10 @@
  *   · **文本类**：解析出的正文拼进 prompt（直接可读）+ 原文件落盘（可被工具处理）；
  *   · **图片**：作为 `images` 发给模型 + 原文件落盘（可被工具处理）。
  *
- * ★ **落盘位置在 `/work/attachments/`、且在拍产物基线之前**：这样它们落在基线里，
- *   **不会**被当成本轮的"agent 新产物"（`filterChangedFiles` 只报基线之后新增/变化的）。
+ * ★ **落盘位置在 `/work/attachments/`、且在记「轮次起点」之前对账**：TaskAgent 写盘后会先
+ *   `reconcileWorkspaceOnce` 把它们落进工作区索引/事件、**再**记轮次起点 ⇒ 它们的变更事件落在
+ *   产物窗口 `[起点, now]` 之外，**不会**被当成本轮的"agent 新产物"（`artifactChangePaths` 只认
+ *   窗口内的内容事件）。
  *
  * ⚠️ **文件名由我们重命名**（`01-<安全名>`）：用户可能传两个同名文件，或名字里带路径分隔符 /
  *   控制字符 —— 落盘名必须是我们可控的（同名会互相覆盖、路径注入会写到目录外）。
@@ -26,7 +28,7 @@ import { getLogger } from '../infra/logger.js'
 import { ARTIFACT_EXEC_TIMEOUT_MS, SANDBOX_WORK_DIR } from '../sandbox/index.js'
 import { execInSandbox } from '../sandbox/docker.js'
 
-/** 附件在容器里的目录（`/work` 之下；非隐藏 —— 在基线之前写入即不会被当产物，见文件头） */
+/** 附件在容器里的目录（`/work` 之下；非隐藏 —— 在记轮次起点之前写盘并对其对账即不会被当产物，见文件头） */
 export const ATTACHMENT_FILE_DIR = `${SANDBOX_WORK_DIR}/attachments`
 
 /** 一个附件落盘所需的最小信息（与 `file.service.ts#ChatAttachmentContext` 结构兼容） */

@@ -8,6 +8,10 @@
  *      §二 路由表的引注（"从 Agent 编辑页 / 工具失败卡片跳转时携带"）、
  *      `shared/src/mcp.ts`（凭据三端点与 `McpCredentialField` 的口径）、`design/mcp.html` `#credentials`。
  *
+ * ⚠️ 本页是**个人凭据的唯一入口**：MCP 工具凭据（下面按 server 分组）之后，还内嵌 Git 凭据区块
+ *    （`GitCredentialsSection`，原 `/settings/git-credentials` 独立页，P1-9 · R11）—— 左侧栏不再单列
+ *    「Git 凭据」项。两个区块各自出一级小标题，页面级 `h1` 仍只有一个。
+ *
  * ─────────────────────────────────────────────────────────────────────
  * ① 表单是**只写**的：界面上没有"当前值"这个东西
  * ─────────────────────────────────────────────────────────────────────
@@ -57,6 +61,7 @@ import {
   type CredentialDraftRow,
 } from './mcpModel.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { GitCredentialsSection } from '../settings/GitCredentialsSection.js'
 import { MCP_PATH } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
 
@@ -113,30 +118,40 @@ export function McpCredentialsPage() {
   }, [query.data, items, searchParams])
 
   const head = (
-    <>
-      <div className="page__head">
-        <div>
-          <h1>我的凭据</h1>
-          <p className="page__lead">
-            凭据仅用于代表你<strong>调用</strong>工具，不会展示给他人，也不会出现在会话记录里。
-            列表接口永不返回明文或掩码 —— 保存之后界面上只剩一个「已配置」标记。
-          </p>
-        </div>
-        <div className="page__head-actions">
-          {unconfigured.length === 0 ? (
-            <Tag className="tag--ok">全部已配置</Tag>
-          ) : (
-            <Tag className="tag--warn">{unconfigured.length} 个未配置</Tag>
-          )}
-        </div>
+    <div className="page__head">
+      <div>
+        <h1>我的凭据</h1>
+        <p className="page__lead">
+          这里集中管理<strong>你个人</strong>的凭据：MCP 工具凭据（代表你调用工具）与 Git 凭据
+          （Code 模式下 agent 在容器里 <code>git clone</code> 私有仓库）。凭据不会展示给他人，
+          也不会出现在会话记录里；列表接口永不返回明文或掩码 —— 保存之后界面上只剩一个「已配置」标记。
+        </p>
       </div>
-    </>
+    </div>
+  )
+
+  // MCP 凭据区块头（与下面的 Git 凭据区块并列，各出一级小标题）
+  const mcpHead = (
+    <div className="admin-section__head">
+      <div>
+        <h2 className="card__title">MCP 工具凭据</h2>
+        <p className="page__lead">
+          凭据仅用于代表你<strong>调用</strong>该工具，不会展示给他人，也不会出现在会话记录里。
+        </p>
+      </div>
+      {unconfigured.length === 0 ? (
+        <Tag className="tag--ok">全部已配置</Tag>
+      ) : (
+        <Tag className="tag--warn">{unconfigured.length} 个未配置</Tag>
+      )}
+    </div>
   )
 
   if (query.isError) {
     return (
       <>
         {head}
+        {mcpHead}
         <ErrorState
           title="凭据清单加载失败"
           error={query.error}
@@ -145,6 +160,8 @@ export function McpCredentialsPage() {
             void query.refetch()
           }}
         />
+
+        <GitCredentialsSection />
       </>
     )
   }
@@ -153,7 +170,10 @@ export function McpCredentialsPage() {
     return (
       <>
         {head}
+        {mcpHead}
         <TableSkeleton rows={4} />
+
+        <GitCredentialsSection />
       </>
     )
   }
@@ -162,6 +182,7 @@ export function McpCredentialsPage() {
     return (
       <>
         {head}
+        {mcpHead}
         <div className="card">
           <EmptyState
             title="还没有任何 MCP server"
@@ -173,6 +194,8 @@ export function McpCredentialsPage() {
             }
           />
         </div>
+
+        <GitCredentialsSection />
       </>
     )
   }
@@ -180,6 +203,7 @@ export function McpCredentialsPage() {
   return (
     <>
       {head}
+      {mcpHead}
 
       {unconfigured.length > 0 && (
         <Alert
@@ -318,6 +342,8 @@ export function McpCredentialsPage() {
           )
         })}
       </div>
+
+      <GitCredentialsSection />
     </>
   )
 }

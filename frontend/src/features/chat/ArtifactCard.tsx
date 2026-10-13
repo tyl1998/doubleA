@@ -40,6 +40,7 @@
 import { Button, Popconfirm } from 'antd'
 import { useState } from 'react'
 
+import { formatBytes } from '../../app/format.js'
 import { useArtifactDownload } from '../../components/ArtifactPreview/useArtifactDownload.js'
 import { previewAvailability } from '../../components/ArtifactPreview/artifactPreview.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
@@ -61,13 +62,6 @@ export interface ArtifactCardProps {
   onDelete?: () => Promise<void> | void
 }
 
-/** 文件大小（`artifact.size` 是字节数）—— 人类可读，1 位小数 */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
-
 /** 卡片左侧的方框里写什么：取扩展名（大写、最多 4 字符），没有扩展名就写 `FILE` */
 function kindOf(fileName: string): string {
   const dot = fileName.lastIndexOf('.')
@@ -84,7 +78,7 @@ export function ArtifactCard({ artifact, timeText = null, onDelete }: ArtifactCa
   // 而不是渲染一个置灰的：`none` 与"超大"是两件不同的事，但结论相同（只有下载）。
   const canPreview = previewAvailability(artifact).available
 
-  const meta = timeText === null ? formatSize(artifact.size) : `${formatSize(artifact.size)} · ${timeText}`
+  const meta = timeText === null ? formatBytes(artifact.size) : `${formatBytes(artifact.size)} · ${timeText}`
 
   return (
     <div className="artifact" data-testid="artifact-card">

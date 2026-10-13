@@ -13,9 +13,13 @@
  *  ③ onEvent(map.ts)                 → 引擎事件 ⇒ `delta` / `thinking` / `tool_call{kind:SANDBOX}`
  *  ③.4 写会话记忆 + 前置阅读指令   → `memoryDoc.ts`（块 1）：写 /work/.doubulea/memory.md，
  *                                     有内容时在这轮 prompt 前加一句"先读它"（落库仍是用户原文）
- *  ③.5 snapshotWorkFiles(...)        → **派活之前**拍产物基线（P0-3-7；必须排在写记忆之后）
+ *  ③.4 写会话记忆 + 前置阅读指令   → `memoryDoc.ts`（块 1）：写 /work/.doubulea/memory.md，
+ *                                     有内容时在这轮 prompt 前加一句"先读它"（落库仍是用户原文）
+ *  ③.5 reconcile + 记轮次起点        → 把 setup 写（记忆文档 / 附件）对账进工作区索引，再记窗口起点
+ *                                     （P1-9 · R4：产物判据 = 本轮工作区变更集，起点 = 窗口左界）
  *  ④ runTurn(content, {signal})      → 派活 + 等 **`agent_settled`**（不是 `agent_end`，见 `bridge.ts`）
- *  ④.5 collectRoundArtifacts(...)    → 对照基线 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（P0-3-7）
+ *  ④.5 reconcile + collectRoundArtifacts(...) → 取本轮变更集 ⇒ 传对象 + 建行 ⇒ `artifact` 事件（R4）
+ *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
  *  ⑤ 冲刷帧队列 + 清 `/active`       → 帧必须写完再落库（顺序即"事件即真相"）
  *  ⑥ persistRoundQuietly + 计量（`usage_records`）+ done{usage}
  *  ⑦ 用户停止 ⇒ 收沙箱              → closeSandboxRpc + recycleSandbox（容器与具名卷一并回收，P0-3-8）
@@ -126,14 +130,12 @@ import {
   getSandboxRpc,
   recycleSandbox,
   resolveSandboxMcpTool,
-  snapshotWorkFiles,
   type SandboxAcquireFailure,
   type SandboxHandle,
   type SandboxMcpCatalog,
   type SandboxRpc,
   type TurnFailureReason,
   type TurnOutcome,
-  type WorkSnapshot,
 } from '../sandbox/index.js'
 import {
   createEngineEventMapper,
@@ -158,6 +160,14 @@ import { runMemoryExtraction } from './memoryExtract.js'
 import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
 import { getMemorySettings } from '../services/memory.service.js'
+import {
+  recordWorkspaceRoundEnd,
+  recordWorkspaceRoundStart,
+  listWorkspaceChanges,
+  reconcileWorkspaceOnce,
+  subscribeWorkspaceEvents,
+  workspaceEditSteerMessage,
+} from '../workspace/index.js'
 import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
 
 /**
@@ -282,6 +292,14 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   let sandbox: SandboxHandle | null = null
   let bridge: SandboxRpc | null = null
   let unsubscribe: (() => void) | null = null
+  /**
+   * 中途插话（P1-9 · P4 · R1）的两条订阅，都必须在 `finally` 退订（桥/通道活得比一轮久）。
+   *   · {@link unsubscribeSteer} —— **用户主动插话**（`POST /:id/steer` → Redis → 通道 → 这里）；
+   *   · {@link unsubscribeWorkspaceEdits} —— **工作区主动感知**（人在 agent 跑的时候改了文件
+   *     ⇒ 投一句"用户修改了 X（vN），请重读后再继续"）。见下方挂载处的注释。
+   */
+  let unsubscribeSteer: (() => void) | null = null
+  let unsubscribeWorkspaceEdits: (() => void) | null = null
   let outcome: TurnOutcome | null = null
   let failure: unknown = null
   /**
@@ -292,11 +310,14 @@ export const taskAgentProducer: ChatProducer = async (input) => {
    */
   let engineStarted = false
   /**
-   * 产物基线（③.5 拍、④.5 用）。`undefined` = 没拍成（`snapshotWorkFiles` 内部已 warn）
-   * ⇒ 收集整轮跳过：**宁可不收，不重复收**（拿空基线当对照会把复用容器里上一轮的产物
-   * 全部再报一次 —— `子方案③` §十一 1 点名的症状）。
+   * 本轮**工作区窗口起点**（③.5 记、④.5 用；P1-9 · R4）。产物判据 = **本轮工作区变更集**
+   * （`listWorkspaceChanges(conversationId, roundStartedAt)`，`shared#foldWorkspaceEvents` 折叠），
+   * `null` = 没走到派活（拿不到沙箱等）⇒ 不收产物。
+   *
+   * ⚠️ 必须排在**记忆文档 / 附件写盘之后**：它们是"本轮基线"的一部分，不该成为本轮产物 ——
+   * 起点之前先 `reconcileWorkspaceOnce` 把它们的索引事件落定，起点才干净（见挂载处注释）。
    */
-  let baseline: WorkSnapshot | undefined
+  let roundStartedAt: Date | null = null
   /**
    * **发给引擎**的这一轮消息（默认 = 用户原文）。记忆文档有内容时会被前置一条"先读记忆"的指令
    * （`TaskAgent记忆与产物` 块 1 的读取触发点；见 `memoryDoc.ts#memoryDocReadInstruction`）。
@@ -335,6 +356,27 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       bridge = await getSandboxRpc(conversationId, handle.containerId)
       // 桥建立返回 = 引擎已就绪（`openSandboxRpc` 内部那条预热命令已经确认它能对话）
       enqueue([{ name: 'status', data: { text: '引擎已就绪，正在准备…' } }])
+
+      // ═════════════════════════════════════════════════════════════
+      // ②.5 中途插话（P1-9 · P4 · R1）—— 运行中向引擎投递消息（pi RPC `steer`）
+      // ═════════════════════════════════════════════════════════════
+      // 两条来源、同一条投递路径（`engine.steer`，落到**助手 turn 边界**）：
+      //   · **人主动插话**：`input.onSteer`（`POST /:id/steer` → `chat.steer:{id}` → 通道轮询）。
+      //   · **工作区主动感知**（`子方案` §五 5）：这一轮在跑时，人在工作区里改了文件
+      //     ⇒ 投一句"用户修改了 X（vN），请重读后再继续"。**只认 `USER` 的内容事件**
+      //     （agent 自己的写是 `AGENT`、watcher 兜底是 `SYSTEM`，都不该回喂给模型），
+      //     且**只在这一轮内订阅**（人机共享编辑只在 agent 跑的时候需要它知道）。
+      // ⚠️ 两条都**尽力而为**：`bridge.steer` 自己吞掉失败并只记 debug（见 `bridge.ts`）——
+      //   插话是锦上添花，投不进去不该把已经跑起来的一轮搞成故障。
+      // ⚠️ **注册必须早于派活**（与 ③ 的订阅同一条纪律）：晚一秒，那段窗口里的插话会漏。
+      const engine = bridge
+      unsubscribeSteer = input.onSteer((message) => {
+        void engine.steer(message)
+      })
+      unsubscribeWorkspaceEdits = subscribeWorkspaceEvents(conversationId, (event) => {
+        const steerMessage = workspaceEditSteerMessage(event)
+        if (steerMessage !== null) void engine.steer(steerMessage)
+      })
 
       // ═════════════════════════════════════════════════════════════
       // ③ 订阅（判据 ①：**必须早于派活**）
@@ -420,8 +462,6 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       }
       const attachmentBlock = taskAttachmentPromptBlock(input.attachments, attachmentPaths, ATTACHMENT_CONTEXT_NOTE)
       if (attachmentBlock !== '') engineContent = `${attachmentBlock}\n\n${engineContent}`
-
-      baseline = await snapshotWorkFiles(handle.containerId)
 
       // ═════════════════════════════════════════════════════════════
       // ③.4 MCP 工具清单（P0-3-9b）—— 反查 `tool_call.serverId` 的唯一依据
@@ -523,6 +563,16 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ═════════════════════════════════════════════════════════════
       // ④ 派活（`runTurn` 内部：先挂 `agent_settled` 等待者，再 `send(prompt)`）
       // ═════════════════════════════════════════════════════════════
+      // ★ 工作区**轮次起点**（P1-9 · P4 · R2 + P1-9 · R4）：在派活这一刻记下"本轮从何时起" ——
+      //   ① 「撤销本轮」（`POST .../workspace/revert`）据此把窗口圈定为**这一轮**；
+      //   ② R4 的产物收集据此取"本轮工作区变更集"。
+      //   ⚠️ 必须排在**记忆文档 / 附件写盘之后**（那些是"本轮基线"，不该被算成这一轮 agent 的改动）；
+      //   且**先对账再记起点** —— `reconcileWorkspaceOnce` 把刚才的 setup 写落进工作区索引与事件，
+      //   否则它们会落在 `[起点, now]` 窗口里、被当成本轮产物收上去。
+      //   收尾（`finally`）记终点。
+      await reconcileWorkspaceOnce(conversationId)
+      roundStartedAt = new Date()
+      await recordWorkspaceRoundStart(conversationId, roundStartedAt)
       engineStarted = true // 计量判据（见收尾处）：从这一行起，token 就已经可能花出去了
       enqueue([{ name: 'status', data: { text: '任务运行中…' } }])
       // 图片附件（P1-4）：走 pi RPC `prompt.images` 原生字段（引擎模型需支持图片输入，闸门已拦）。
@@ -543,6 +593,12 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     } finally {
       // 退订必须做：桥活得比这一轮久（复用容器），不退就是每一轮多一个监听器 + 多一份泄漏的引用
       unsubscribe?.()
+      // 中途插话的两条订阅（P1-9 · P4 · R1）：同款理由 —— 通道与工作区事件总线都活得比一轮久
+      unsubscribeSteer?.()
+      unsubscribeWorkspaceEdits?.()
+      // 工作区**轮次终点**（P1-9 · P4 · R2）：圈定本轮窗口右界（含异常/被停止的轮）。
+      // ⚠️ 即便起点没记成（Redis 失败），这里也照记 —— 端点会据"无起点"报明确错误，不会误撤。
+      await recordWorkspaceRoundEnd(conversationId)
     }
   }
 
@@ -557,19 +613,18 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   const roundUsage: EngineUsage | null = toEngineUsage(round.usageTotal)
 
   // ═══════════════════════════════════════════════════════════════════
-  // ④.5 收产物（P0-3-7）
+  // ④.5 收产物（P0-3-7 起；P1-9 · R4 判据 = 「本轮工作区变更集」）
   // ═══════════════════════════════════════════════════════════════════
   // 排在⑤冲刷**之前** ⇒ `artifact` 帧与内容帧同一条串行队列，顺序天然正确（先过程、后产物、最后 done）。
-  // **中断/故障的轮也照收**（`子方案③` §九 5：用户点停止通常正是因为他已经拿到想要的东西了）；
-  // 引擎挂了的那轮会因容器已死而在扫描处自然失败为空集。
+  // **中断/故障的轮也照收**（`子方案③` §九 5：用户点停止通常正是因为他已经拿到想要的东西了）。
   // ⚠️ 收集失败 ≠ 这一轮失败：产物是本轮的赠品，任何异常只 warn、不进 `error` 帧（见 `artifacts.ts` 文件头）。
-  if (sandbox !== null && baseline !== undefined) {
+  if (sandbox !== null && roundStartedAt !== null) {
     try {
-      const collected = await collectRoundArtifacts({
-        conversationId,
-        containerId: sandbox.containerId,
-        baseline,
-      })
+      // 先把 agent 的**未中介写**（`bash` / 原生工具）对账进工作区索引与事件 —— 否则这一轮它看不到。
+      await reconcileWorkspaceOnce(conversationId)
+      // 本轮窗口 = `[起点, now]`：起点之后动过的路径，按路径折叠成变更集（`shared#foldWorkspaceEvents`）。
+      const { items: changes } = await listWorkspaceChanges(conversationId, roundStartedAt.toISOString())
+      const collected = await collectRoundArtifacts({ conversationId, changes })
       artifactItems.push(...collected)
       if (collected.length > 0) {
         enqueue(collected.map((item) => ({ name: 'artifact', data: item } as const satisfies SseEvent)))

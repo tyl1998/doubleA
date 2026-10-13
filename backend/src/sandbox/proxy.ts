@@ -50,7 +50,7 @@
  * ⇒ 本文件用 {@link withConversationSerial} 按会话串行化**危险那一段**（非危险调用不占队）。
  */
 
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 
 import { AppError, RECALL_MEMORY_TOOL_NAME, REMEMBER_TOOL_NAME, SEND_NOTIFICATION_TOOL_NAME } from '@doubulea/shared'
@@ -85,8 +85,7 @@ import {
   type SandboxMcpCatalog,
   type SandboxMcpToolRef,
 } from './mcpMap.js'
-import { SANDBOX_TOKEN_HEADER } from './spec.js'
-import { resolveSandboxToken, type SandboxTokenRecord } from './token.js'
+import { authenticateSandboxProxy, sandboxTokenFromHeader, sendSandboxProxyError } from './proxyAuth.js'
 
 // ───────────────────────────── 算清单（唯一要查库的那一步）─────────────────────────────
 
@@ -320,8 +319,8 @@ const sandboxBuiltinCallBodySchema = z.object({
  */
 export function registerSandboxProxyRoutes(app: FastifyInstance): void {
   app.get('/api/sandbox/mcp/tools', async (request, reply) => {
-    const auth = await authenticate(tokenFromHeader(request.headers))
-    if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+    const auth = await authenticateSandboxProxy(sandboxTokenFromHeader(request.headers))
+    if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
     const catalog = await ensureSandboxMcpCatalog(auth.record.conversationId, auth.record.agentId)
     const payload: SandboxMcpToolsResponse = {
@@ -356,12 +355,12 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
   })
 
   app.post('/api/sandbox/mcp/call', async (request, reply) => {
-    const auth = await authenticate(tokenFromHeader(request.headers))
-    if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+    const auth = await authenticateSandboxProxy(sandboxTokenFromHeader(request.headers))
+    if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
     const parsed = sandboxMcpCallBodySchema.safeParse(request.body)
     if (!parsed.success) {
-      return sendError(
+      return sendSandboxProxyError(
         reply,
         400,
         'VALIDATION',
@@ -373,7 +372,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     // 清单必须已经下发过 —— 没下发过说明"这次调用不是从我们给的工具来的"
     const catalog = await readSandboxMcpCatalog(auth.record.conversationId)
     if (catalog === null) {
-      return sendError(
+      return sendSandboxProxyError(
         reply,
         409,
         'CONFLICT',
@@ -384,7 +383,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     // ── ② 别名 → 工具（顺带回答"这个工具真的下发过吗"）──
     const toolRef = findOfferedTool(catalog, body.serverAlias, body.toolName)
     if (toolRef === undefined) {
-      return sendError(
+      return sendSandboxProxyError(
         reply,
         404,
         'NOT_FOUND',
@@ -409,7 +408,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
         },
         '沙箱请求调用一个**未绑定在本次 Agent 上**的 MCP server ⇒ 已拒绝（越权）',
       )
-      return sendError(reply, 403, 'FORBIDDEN', '这个 MCP server 不属于当前智能体，已拒绝调用。')
+      return sendSandboxProxyError(reply, 403, 'FORBIDDEN', '这个 MCP server 不属于当前智能体，已拒绝调用。')
     }
 
     const result = await callToolViaProxy({
@@ -432,12 +431,12 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
    * 执行（库/文档全部在后端查，容器侧只有一个工具名与参数）。
    */
   app.post('/api/sandbox/builtin/call', async (request, reply) => {
-    const auth = await authenticate(tokenFromHeader(request.headers))
-    if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+    const auth = await authenticateSandboxProxy(sandboxTokenFromHeader(request.headers))
+    if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
     const parsed = sandboxBuiltinCallBodySchema.safeParse(request.body)
     if (!parsed.success) {
-      return sendError(
+      return sendSandboxProxyError(
         reply,
         400,
         'VALIDATION',
@@ -450,12 +449,12 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     const isMemory = body.name === REMEMBER_TOOL_NAME || body.name === RECALL_MEMORY_TOOL_NAME
     // 只认内置工具（知识库一族 + 通知 + 记忆）；其他名字不是这条端点的职责
     if (!isKnowledgeToolName(body.name) && !isNotify && !isMemory) {
-      return sendError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
+      return sendSandboxProxyError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
     }
 
     const catalog = await readSandboxMcpCatalog(auth.record.conversationId)
     if (catalog === null) {
-      return sendError(
+      return sendSandboxProxyError(
         reply,
         409,
         'CONFLICT',
@@ -464,7 +463,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     }
     // 清单必须**确实下发过**这个内置工具（与 MCP 的 findOfferedTool 同一条判据）
     if (!catalog.builtins.some((tool) => tool.name === body.name)) {
-      return sendError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器。`)
+      return sendSandboxProxyError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器。`)
     }
 
     // 通知工具：执行体与 ChatBot 共用（`notify/index.ts`），渠道从本次运行的会话登记表取
@@ -528,11 +527,11 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
   app.get<{ Params: { artifactId: string } }>(
     '/api/sandbox/artifacts/:artifactId',
     async (request, reply) => {
-      const auth = await authenticate(tokenFromHeader(request.headers))
-      if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+      const auth = await authenticateSandboxProxy(sandboxTokenFromHeader(request.headers))
+      if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
       const parsedId = z.string().uuid().safeParse(request.params.artifactId)
-      if (!parsedId.success) return sendError(reply, 400, 'VALIDATION', '产物 ID 不是合法 UUID')
+      if (!parsedId.success) return sendSandboxProxyError(reply, 400, 'VALIDATION', '产物 ID 不是合法 UUID')
 
       try {
         const source = await openArtifactSourceForConversation({
@@ -553,7 +552,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
       } catch (error) {
         // 产物不存在 / 不属于这个会话 ⇒ 404（与 `/mcp/call` 的"4xx = 协议层拒绝"同族）。
         // 其余（S3 不可用等）照常向上抛，由 listener 的默认错误处理收口。
-        if (error instanceof AppError) return sendError(reply, error.status, error.code, error.message)
+        if (error instanceof AppError) return sendSandboxProxyError(reply, error.status, error.code, error.message)
         throw error
       }
     },
@@ -578,11 +577,11 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
   app.get<{ Params: { fileId: string } }>(
     '/api/sandbox/attachments/:fileId',
     async (request, reply) => {
-      const auth = await authenticate(tokenFromHeader(request.headers))
-      if (!auth.ok) return sendError(reply, 401, 'UNAUTHORIZED', auth.message)
+      const auth = await authenticateSandboxProxy(sandboxTokenFromHeader(request.headers))
+      if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
       const parsedId = z.string().uuid().safeParse(request.params.fileId)
-      if (!parsedId.success) return sendError(reply, 400, 'VALIDATION', '附件 ID 不是合法 UUID')
+      if (!parsedId.success) return sendSandboxProxyError(reply, 400, 'VALIDATION', '附件 ID 不是合法 UUID')
 
       try {
         const source = await openFileSourceForConversation({
@@ -603,7 +602,7 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
           .send(source.body)
       } catch (error) {
         // 附件不存在 / 不属于这个会话 ⇒ 404（与产物下载同族：4xx = 协议层拒绝）。
-        if (error instanceof AppError) return sendError(reply, error.status, error.code, error.message)
+        if (error instanceof AppError) return sendSandboxProxyError(reply, error.status, error.code, error.message)
         throw error
       }
     },
@@ -808,44 +807,4 @@ function findOfferedTool(
 /** 「没执行」的统一形态（**`isError: true`** —— 模型要能看出这次没干成） */
 function notExecuted(text: string): SandboxMcpCallResponse {
   return { isError: true, text }
-}
-
-/**
- * 令牌校验（两件事合成一个结论）：**头在不在** + **Redis 认不认**。
- *
- * ⚠️ 失败路径**不区分**"没带令牌" / "令牌不认" / "已过期"（统一一句 401 文案）：
- * 对攻击者区分它们只会多给一个信息位；对排障，真正的线索在**后端日志**里
- * （`resolveSandboxToken` 的调用点与警告），而不是回给容器的这句话里。
- * ⚠️ Redis 抛错时**向上抛**（→ 500）：那说明"我们查不了"，与"令牌是错的"必须分得开
- * （见 `token.ts#resolveSandboxToken` 的注释）。
- */
-async function authenticate(
-  raw: string | undefined,
-): Promise<{ ok: true; record: SandboxTokenRecord } | { ok: false; message: string }> {
-  const record = await resolveSandboxToken(raw)
-  if (record === undefined) {
-    getLogger().warn(
-      { hasToken: raw !== undefined && raw.trim() !== '' },
-      '沙箱代理端点上收到一个无效令牌 ⇒ 401（分辨"没带"与"带了但不认"只为日志）',
-    )
-    return { ok: false, message: '沙箱代理令牌无效或已过期。' }
-  }
-  return { ok: true, record }
-}
-
-/** 统一的错误响应（**不套信封**，见文件头） */
-function sendError(reply: FastifyReply, status: number, code: string, message: string): FastifyReply {
-  return reply.code(status).send({ error: { code, message } })
-}
-
-/**
- * 从请求头里取令牌。
- *
- * ⚠️ `request.headers[...]` 的类型是 `string | string[] | undefined`（**同名头出现多次时是数组**）
- * ⇒ 归一成"第一个值或 `undefined`"。刻意**不**把数组拼成一个串：那会凭空造出一个永远不认的
- * 令牌，而日志里看不出这件事是怎么发生的。
- */
-function tokenFromHeader(headers: NodeJS.Dict<string | string[]>): string | undefined {
-  const raw = headers[SANDBOX_TOKEN_HEADER]
-  return Array.isArray(raw) ? raw[0] : raw
 }

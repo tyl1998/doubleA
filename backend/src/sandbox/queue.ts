@@ -39,9 +39,17 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { ensureRedisConnected } from '../infra/redis.js'
 
-/** 当前生效的队列键（`SANDBOX_QUEUE_KEY`，默认 `sandbox:queue`） */
+/**
+ * 当前生效的队列键 —— `` `${SANDBOX_QUEUE_KEY}:${SANDBOX_INSTANCE_ID}` ``（P1-14 §三 4）。
+ *
+ * ⚠️ **语义已从 P1-14 起变为"基名 + 自动加实例后缀"**：名额册（`registry.ts`）是**进程内**的，
+ * 而排队队列在**共享 Redis** —— 多实例共用一个键时 `claimSandboxQueueHead` 会**串台**
+ * （B 把 A 的排队者认领走）。加后缀后每台只认领自己队里的。
+ * 显式配了 `SANDBOX_QUEUE_KEY` 也一样加后缀（`子方案` §十 4 定案：**代码自动加**，不再靠人手配）；
+ * 单实例下后缀恒为同一个值 ⇒ 行为不变。
+ */
 export function sandboxQueueKey(): string {
-  return config.sandbox.queueKey
+  return `${config.sandbox.queueKey}:${config.sandbox.instanceId}`
 }
 
 /**

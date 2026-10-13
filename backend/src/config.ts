@@ -17,6 +17,7 @@
  */
 
 import { existsSync } from 'node:fs'
+import { hostname } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -501,6 +502,23 @@ const envSchema = z
      */
     SANDBOX_EGRESS_PROXY_URL: optionalUrl('SANDBOX_EGRESS_PROXY_URL', ['http', 'https']),
     /**
+     * 沙箱出公网**允许的主机白名单**（P1-9 · R11；`子方案/Code模式工作区.md` §五 7.5）。
+     *
+     * 逗号分隔：`host` / `host:port` / `*.host` / `*`。**默认 `*` = 本期全放行**（设计定案：
+     * Code 模式的可用性优先，先让 git clone/commit 跑起来，安全收敛后置）。
+     *
+     * ⚠️ **强制点不在后端进程里，而在 egress 代理侧**：沙箱挂在 `internal` bridge 上没有公网路由，
+     * 出公网只可能经 egress 代理（`SANDBOX_EGRESS_PROXY_URL`）。本项是**平台声明的策略**，
+     * 由 `infra/scripts/egress-up.sh` 读 `.env` 里的它、拼进代理白名单（`EGRESS_ALLOW`/热更新文件）；
+     * HTTPS(443) 走代理天然生效；SSH(22) 不经 HTTP 代理 ⇒ 见 §7.5 的取舍（本期取"直接放行"口径）。
+     */
+    SANDBOX_EGRESS_ALLOW_HOSTS: defaultedVar(z.string().trim().min(1), '*'),
+    /**
+     * 单用户 git 凭据条数上限（P1-9 · R11；§五 7.2）。
+     * 上限存在是因为凭据会**解密注入到每个新容器** —— 没上限时一次注入几百条私钥是自伤。
+     */
+    GIT_CREDENTIAL_MAX_PER_USER: intVar('GIT_CREDENTIAL_MAX_PER_USER', 5, { min: 1, max: 100 }),
+    /**
      * **容器眼里**"后端沙箱代理"的地址（`子方案③` §四 3 出口②；P0-3-3 落地）。
      *
      * 默认（不设）= 由专用 bridge 的**网关地址**（从 Docker 里读出来，`sandbox/network.ts`）
@@ -530,6 +548,40 @@ const envSchema = z
      * 症状不是报错而是"验收时好时坏"。可换键 = 可隔离消费方。
      */
     SANDBOX_QUEUE_KEY: defaultedVar(z.string().trim().min(1), 'sandbox:queue'),
+    /**
+     * 本实例的**稳定唯一 id**（P1-14 沙箱多机部署；P1-9 · R9 复用）。
+     *
+     * 默认取 `os.hostname()`，可 env 覆盖成 `a` / `b` / `c` 这类部署别名（`子方案/沙箱多机部署.md` §八 2）。
+     * 它进：`Sandbox.instanceId`（账本归属列）、会话→实例目录的取值、队列键后缀、在线注册表。
+     * ⚠️ **唯一性是硬约束**：两台实例同名 ⇒ 对账会把对方的行当自己的（看起来正常、实际错杀）
+     * ⇒ 启动时用 `sandbox:instance:{id}` 做一次"同名抢注"自检（`sandbox/owner.ts#claimInstanceIdentity`），
+     * 抢不到即拒绝启动（§五 1）。
+     */
+    SANDBOX_INSTANCE_ID: defaultedVar(z.string().trim().min(1).max(120), hostname()),
+    /**
+     * 别的组件 / 网关**回连本实例**的地址（`host:port`，P1-14 §四）。
+     * 默认不设 ⇒ 由 `os.hostname() + BACKEND_PORT` 拼出（`sandbox/owner.ts#instanceAdvertiseAddr`）。
+     * 既是网关转发的目标，也是在线注册表里记的值。
+     */
+    SANDBOX_INSTANCE_ADVERTISE_ADDR: optionalText,
+    /**
+     * 会话→实例目录（`sandbox:owner:*`）的键前缀（P1-14 §三 5）。
+     * 与 `SANDBOX_QUEUE_KEY` 同族：可换键 = 可隔离消费方（同机多套部署共用一个 Redis 时不串台）。
+     */
+    SANDBOX_OWNER_KEY_PREFIX: defaultedVar(z.string().trim().min(1), 'sandbox:owner'),
+    /**
+     * 目录键存活期（秒，P1-14 §四；默认 2h）。
+     * ⚠️ **必须 > `SANDBOX_IDLE_TTL_MIN × 60`**（否则容器还在、目录已过期 ⇒ 会话被重钉到别的实例）
+     * —— 这条跨字段约束写在下面的 `superRefine` 里。
+     * ⚠️ 它只覆盖**容器寿命**；工作区（寿命按天计）另有一份更长的钉机记录（`workspace/owner`），
+     * 见 `sandbox/owner.ts#ensureWorkspaceOwner`（§十六 B/C）。
+     */
+    SANDBOX_OWNER_TTL_SEC: intVar('SANDBOX_OWNER_TTL_SEC', 7200, { min: 60, max: 2_592_000 }),
+    /**
+     * 实例心跳续期间隔（秒，P1-14 §八 4）。**仅开启 Redis 注册时生效**，注册键 TTL = **3×** 本值；
+     * `0` = 关闭自动发现（网关退化为静态 `ROUTER_UPSTREAMS`）。进程退出时 `DEL`，崩溃靠 TTL 摘除。
+     */
+    SANDBOX_INSTANCE_HEARTBEAT_SEC: intVar('SANDBOX_INSTANCE_HEARTBEAT_SEC', 30, { min: 0, max: 3600 }),
     /**
      * 排队项的存活时长（秒，P0-3-2）。**两个语义共用一个数，是刻意的**：
      *   ① 它是"这条排队项什么时候算孤儿"（对应它的那条 SSE 流已经断了）；
@@ -591,6 +643,39 @@ const envSchema = z
     MEMORY_INJECT_MAX: intVar('MEMORY_INJECT_MAX', 10, { min: 1, max: 100 }),
     /** "待展示记忆提示"（toast 晚一拍）在 Redis 里的存活时长（秒） */
     MEMORY_NOTICE_TTL_SEC: intVar('MEMORY_NOTICE_TTL_SEC', 3600, { min: 30, max: 86_400 }),
+
+    // ── Code 模式工作区（P1-9；参数总表 = 子方案 §十一）──
+    /**
+     * 宿主 canonical 工作区根目录。一个会话一份：`{WORKSPACE_ROOT}/{conversationId}`，
+     * bind mount 进容器 `/work`（§四 1）。多机形态下指向本机本地盘（路线 A，§十六），不共享。
+     */
+    WORKSPACE_ROOT: defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/workspaces'),
+    /** 单文件上限（MB）。编辑器只内联打开这以下；超限只读/下载（§九 配额） */
+    WORKSPACE_MAX_FILE_MB: intVar('WORKSPACE_MAX_FILE_MB', 10, { min: 1, max: 4096 }),
+    /** 单会话文件数上限（防爆，§九） */
+    WORKSPACE_MAX_FILES: intVar('WORKSPACE_MAX_FILES', 2000, { min: 1, max: 1_000_000 }),
+    /**
+     * 单会话**行数**上限（含墓碑；P1-9 · P6 · R6，更严的数量闸门）。
+     * `workspace_files` 唯一键是 `(会话, 路径)` ⇒ agent "建了删、建了删"不同路径时活文件数
+     * 永远是 0、墓碑行却无限涨；这一条把**存活 + 墓碑的总行数**也钉住。
+     * ⚠️ 必须 ≥ `WORKSPACE_MAX_FILES`（否则永远填不满活文件上限；下面的 superRefine 守着）。
+     */
+    WORKSPACE_MAX_ROWS: intVar('WORKSPACE_MAX_ROWS', 20000, { min: 1, max: 10_000_000 }),
+    /** 单会话总字节上限（MB，§九） */
+    WORKSPACE_MAX_TOTAL_MB: intVar('WORKSPACE_MAX_TOTAL_MB', 512, { min: 1, max: 1_048_576 }),
+    /**
+     * 单会话**写入限流**：固定窗口（1 分钟）内允许的内容写次数；`0` = 关闭限流（P1-9 · P6 · R6）。
+     * 挡"失控 agent 每秒几百次写"把 PG / FS / S3 打满；超限回 `BUSY`（429）。
+     */
+    WORKSPACE_WRITE_PER_MIN: intVar('WORKSPACE_WRITE_PER_MIN', 600, { min: 0, max: 100_000 }),
+    /** 文件级软锁存活期（秒，心跳续期；§七 1 第 ② 层） */
+    WORKSPACE_CLAIM_TTL_SEC: intVar('WORKSPACE_CLAIM_TTL_SEC', 120, { min: 5, max: 86_400 }),
+    /**
+     * 读接口**内联返回文本**的上限（MB）。
+     * 超过它改走字节出口（`/workspace/file/raw`），避免把大文件塞进 JSON（§十一）。
+     * ⚠️ 必须 ≤ `WORKSPACE_MAX_FILE_MB`（下面的 superRefine 守着）。
+     */
+    WORKSPACE_TEXT_INLINE_MAX_MB: intVar('WORKSPACE_TEXT_INLINE_MAX_MB', 2, { min: 1, max: 1024 }),
 
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
@@ -738,6 +823,40 @@ const envSchema = z
           '宽限期若短于检查周期，正在创建的沙箱会被对账器判成孤儿',
       })
     }
+    // 目录键存活期必须**罩住**容器空闲 TTL（P1-14 §四）：反过来的话容器还在、目录先过期 ⇒
+    // 下一次 `/chat` 查不到 owner 而被重钉到**别的实例**，于是"容器在 A、账本指向 B"
+    // （症状与"孤儿容器"同族，但更隐蔽：容器没被删，只是一直没人用）。
+    if (env.SANDBOX_OWNER_TTL_SEC <= env.SANDBOX_IDLE_TTL_MIN * 60) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SANDBOX_OWNER_TTL_SEC'],
+        message:
+          `必须大于 SANDBOX_IDLE_TTL_MIN × 60（当前 ${env.SANDBOX_OWNER_TTL_SEC} <= ${env.SANDBOX_IDLE_TTL_MIN * 60}）：` +
+          '目录键若比容器空闲回收更早过期，会话会被重新钉到别的实例',
+      })
+    }
+    // 内联文本上限必须 ≤ 单文件上限（P1-9）：反过来的话"能打开的文件永远读不全"
+    // （超过单文件上限的文件本来就不该进编辑器，而这个不等式保证内联闸门不会比它更宽）。
+    if (env.WORKSPACE_TEXT_INLINE_MAX_MB > env.WORKSPACE_MAX_FILE_MB) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['WORKSPACE_TEXT_INLINE_MAX_MB'],
+        message:
+          `不能大于 WORKSPACE_MAX_FILE_MB（当前 ${env.WORKSPACE_TEXT_INLINE_MAX_MB} > ${env.WORKSPACE_MAX_FILE_MB}）：` +
+          '内联闸门比"可打开"的上限还宽，等于对超限文件也会尝试内联',
+      })
+    }
+    // 行数上限必须 ≥ 文件数上限（P1-9 · P6 · R6）：行数（含墓碑）是活文件数的超集，
+    // 反过来的话"文件数还没到上限，行数先到了"—— 活文件上限永远填不满，且现象极难联想。
+    if (env.WORKSPACE_MAX_ROWS < env.WORKSPACE_MAX_FILES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['WORKSPACE_MAX_ROWS'],
+        message:
+          `不能小于 WORKSPACE_MAX_FILES（当前 ${env.WORKSPACE_MAX_ROWS} < ${env.WORKSPACE_MAX_FILES}）：` +
+          '行数含墓碑、是活文件数的超集，比它小会让"活文件上限"永远填不满',
+      })
+    }
   })
 
 type EnvVars = z.infer<typeof envSchema>
@@ -819,6 +938,11 @@ export interface AppConfig {
      * （内部网络上没有它 ⇒ 引擎必然调不到模型池）。
      */
     egressProxyUrl: string | undefined
+    /**
+     * 出网允许的主机白名单（P1-9 · R11；见 `SANDBOX_EGRESS_ALLOW_HOSTS`）。
+     * 后端只声明策略，强制点在 egress 代理侧（`infra/scripts/egress-up.sh` 读 `.env` 消费）。
+     */
+    egressAllowHosts: string
     /** 容器眼里的后端沙箱代理地址；未定时由专用 bridge 的网关地址 + `callbackPort` 算出（P0-3-3） */
     backendUrl: string | undefined
     /** 沙箱代理 listener 的绑定地址；未定时绑专用 bridge 的网关地址（P0-3-3） */
@@ -831,6 +955,19 @@ export interface AppConfig {
     reapIntervalSec: number
     /** `CREATING` 行的宽限期（秒，P0-3-2）；恒 > `reapIntervalSec` */
     createGraceSec: number
+    /**
+     * 本实例唯一 id（P1-14 多机部署；P1-9 · R9）：写 `Sandbox.instanceId`、目录取值、
+     * 队列键后缀、在线注册表都用它。默认 `os.hostname()`。
+     */
+    instanceId: string
+    /** 网关回连本实例的地址（`host:port`）；未配置 = `os.hostname() + BACKEND_PORT`（`sandbox/owner.ts`） */
+    instanceAdvertiseAddr: string | undefined
+    /** 会话→实例目录（`sandbox:owner:*`）的键前缀（P1-14 §三 5） */
+    ownerKeyPrefix: string
+    /** 目录键存活期（秒，跟容器；恒 > `idleTtlMin × 60`，schema 里守着） */
+    ownerTtlSec: number
+    /** 实例心跳续期间隔（秒；`0` = 关闭自动发现、退化为静态列表） */
+    instanceHeartbeatSec: number
     /** 单容器限额。`cpu` 是浮点（1.5 核），其余是整数 */
     limits: { memMb: number; cpu: number; pids: number; workVolumeMb: number; tmpfsMb: number }
   }
@@ -943,6 +1080,43 @@ export interface AppConfig {
     injectMax: number
     /** 待展示提示的 Redis TTL（秒，见 `MEMORY_NOTICE_TTL_SEC`） */
     noticeTtlSec: number
+  }
+
+  /**
+   * Code 模式工作区（P1-9）。参数总表 = `子方案/Code模式工作区.md` §十一。
+   * 消费方 = `backend/src/workspace/`（工作区服务、watcher、reaper）。
+   */
+  workspace: {
+    /** 宿主 canonical 根目录（见 `WORKSPACE_ROOT`） */
+    root: string
+    /** 单文件上限（MB，见 `WORKSPACE_MAX_FILE_MB`） */
+    maxFileMb: number
+    /** 单会话文件数上限（见 `WORKSPACE_MAX_FILES`） */
+    maxFiles: number
+    /** 单会话行数上限，含墓碑（见 `WORKSPACE_MAX_ROWS`；P1-9 · P6 · R6） */
+    maxRows: number
+    /** 单会话总字节上限（MB，见 `WORKSPACE_MAX_TOTAL_MB`） */
+    maxTotalMb: number
+    /** 单会话每分钟写次数上限；`0` = 关闭（见 `WORKSPACE_WRITE_PER_MIN`；P1-9 · P6 · R6） */
+    writePerMin: number
+    /** 文件级软锁存活期（秒，见 `WORKSPACE_CLAIM_TTL_SEC`） */
+    claimTtlSec: number
+    /**
+     * 工作区保留期（天）。⚠️ **与 `limits.artifactRetentionDays` 同值**（已决 4）：
+     * 两者由同一个 env（`ARTIFACT_RETENTION_DAYS`）驱动，此处只做别名，不新开一个来源。
+     */
+    retentionDays: number
+    /** 读接口内联文本上限（MB，见 `WORKSPACE_TEXT_INLINE_MAX_MB`） */
+    textInlineMaxMb: number
+  }
+
+  /**
+   * git 凭据（P1-9 · R11）。消费方 = `services/gitCredential.service.ts`（建凭据时的条数闸门）
+   * 与 `sandbox/manager.ts`（派活时按用户解密注入容器 tmpfs/env）。
+   */
+  gitCredential: {
+    /** 单用户凭据条数上限（见 `GIT_CREDENTIAL_MAX_PER_USER`） */
+    maxPerUser: number
   }
 
   /** 非致命告警：配置「能用但可能不对」，启动时打 warn（不阻塞开工） */
@@ -1114,12 +1288,18 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       tokenLen: vars.SANDBOX_TOKEN_LEN,
       proxyTimeoutSec: vars.SANDBOX_PROXY_TIMEOUT_SEC,
       egressProxyUrl: vars.SANDBOX_EGRESS_PROXY_URL,
+      egressAllowHosts: vars.SANDBOX_EGRESS_ALLOW_HOSTS,
       backendUrl: vars.SANDBOX_BACKEND_URL,
       listenHost: vars.SANDBOX_LISTEN_HOST,
       queueKey: vars.SANDBOX_QUEUE_KEY,
       queueTtlSec: vars.SANDBOX_QUEUE_TTL_SEC,
       reapIntervalSec: vars.SANDBOX_REAP_INTERVAL_SEC,
       createGraceSec: vars.SANDBOX_CREATE_GRACE_SEC,
+      instanceId: vars.SANDBOX_INSTANCE_ID,
+      instanceAdvertiseAddr: vars.SANDBOX_INSTANCE_ADVERTISE_ADDR,
+      ownerKeyPrefix: vars.SANDBOX_OWNER_KEY_PREFIX,
+      ownerTtlSec: vars.SANDBOX_OWNER_TTL_SEC,
+      instanceHeartbeatSec: vars.SANDBOX_INSTANCE_HEARTBEAT_SEC,
       limits: {
         memMb: vars.SANDBOX_MEM_LIMIT_MB,
         cpu: vars.SANDBOX_CPU_LIMIT,
@@ -1187,6 +1367,22 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       injectMax: vars.MEMORY_INJECT_MAX,
       noticeTtlSec: vars.MEMORY_NOTICE_TTL_SEC,
     },
+    workspace: {
+      root: vars.WORKSPACE_ROOT,
+      maxFileMb: vars.WORKSPACE_MAX_FILE_MB,
+      maxFiles: vars.WORKSPACE_MAX_FILES,
+      maxRows: vars.WORKSPACE_MAX_ROWS,
+      maxTotalMb: vars.WORKSPACE_MAX_TOTAL_MB,
+      writePerMin: vars.WORKSPACE_WRITE_PER_MIN,
+      claimTtlSec: vars.WORKSPACE_CLAIM_TTL_SEC,
+      // ⚠️ **别名**，不是独立来源（已决 4：工作区与产物共用保留期）
+      retentionDays: vars.ARTIFACT_RETENTION_DAYS,
+      textInlineMaxMb: vars.WORKSPACE_TEXT_INLINE_MAX_MB,
+    },
+
+    gitCredential: {
+      maxPerUser: vars.GIT_CREDENTIAL_MAX_PER_USER,
+    },
 
     warnings,
   }
@@ -1235,6 +1431,8 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       imageBase: value.sandbox.imageBase ?? null,
       // egress 代理是**地址**，不脱敏（不含凭据）；未配置就如实报 null（P0-3-3 定案前它本来可以空着）
       egressProxyUrl: value.sandbox.egressProxyUrl ?? null,
+      // 出网白名单是**策略**不是凭据，原样打印（运维要靠它看"这台到底放行了什么"）
+      egressAllowHosts: value.sandbox.egressAllowHosts,
       backendUrl: value.sandbox.backendUrl ?? null,
       listenHost: value.sandbox.listenHost ?? null,
       callbackPort: value.sandbox.callbackPort,
@@ -1245,12 +1443,20 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       queueTtlSec: value.sandbox.queueTtlSec,
       reapIntervalSec: value.sandbox.reapIntervalSec,
       createGraceSec: value.sandbox.createGraceSec,
+      // 多机（P1-14）：实例 id / 目录前缀不脱敏（不含凭据，运维要靠日志看"这台是哪台"）
+      instanceId: value.sandbox.instanceId,
+      instanceAdvertiseAddr: value.sandbox.instanceAdvertiseAddr ?? null,
+      ownerKeyPrefix: value.sandbox.ownerKeyPrefix,
+      ownerTtlSec: value.sandbox.ownerTtlSec,
+      instanceHeartbeatSec: value.sandbox.instanceHeartbeatSec,
       limits: value.sandbox.limits,
     },
     llm: value.llm,
     mcp: value.mcp,
     scheduledTask: value.scheduledTask,
     memory: value.memory,
+    workspace: value.workspace,
+    gitCredential: value.gitCredential,
     limits: {
       uploadBodyLimit: `${value.limits.uploadBodyLimitRaw}（${value.limits.uploadBodyLimitBytes} 字节）`,
       ssePingIntervalSec: value.limits.ssePingIntervalSec,

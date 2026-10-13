@@ -279,6 +279,25 @@ export const setConversationAutoApproveResultSchema = z.object({
 })
 export type SetConversationAutoApproveResult = z.infer<typeof setConversationAutoApproveResultSchema>
 
+/**
+ * 打开 / 关闭**会话级 Code 模式**（P1-9 · P3）的请求体。
+ * 与自动审批同款（一个布尔），故复用同一形状（`enabled`）。
+ */
+export const setConversationCodeModeBodySchema = z.object({
+  enabled: z.boolean({
+    required_error: '缺少 enabled（true = 本会话走 Code 模式，false = 普通模式）',
+    invalid_type_error: 'enabled 必须是布尔值',
+  }),
+})
+export type SetConversationCodeModeBody = z.infer<typeof setConversationCodeModeBodySchema>
+
+/** `POST /api/conversations/:id/code-mode` 的响应（回带落定值） */
+export const setConversationCodeModeResultSchema = z.object({
+  id: z.string(),
+  codeMode: z.boolean(),
+})
+export type SetConversationCodeModeResult = z.infer<typeof setConversationCodeModeResultSchema>
+
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 
 /**
@@ -321,6 +340,12 @@ export const conversationActiveSchema = conversationActiveSnapshotSchema.extend(
    * 只读端点，就能同时拿到活跃进度、自动审批开关、以及本会话的记忆豁免状态（会话头 `⋯` 菜单要用）。
    */
   memoryExcluded: z.boolean(),
+  /**
+   * 会话级 **Code 模式** 开关（**P1-9 契约增量**）：true = 工作区走人机共享可编辑形态
+   * （派活时给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`）。与 `memoryExcluded` 同款 ——
+   * 由同一个 `/active` 端点回带，前端据此决定是否显示工作区面板。
+   */
+  codeMode: z.boolean(),
 })
 export type ConversationActive = z.infer<typeof conversationActiveSchema>
 

@@ -55,13 +55,20 @@ import {
   isNonRootImageUser,
   piRpcArgv,
   readSandboxLabels,
+  SANDBOX_AGENT_HOME,
   sandboxEgressEnv,
-  sandboxLabels,
   sandboxProxyEnv,
   workVolumeName,
+  workspaceMediationEnv,
 } from './spec.js'
+import { gitCredentialEnv, gitCredentialFiles, gitCredentialTarEntries } from './gitCredential.js'
+import { buildTar } from './tar.js'
 import { bindSandboxToken, revokeSandboxToken } from './token.js'
 import { clearSandboxMcpMap } from './mcpMap.js'
+import { clearSandboxOwner, registerSandboxOwner } from './owner.js'
+import { ensureWorkspace } from '../workspace/service.js'
+import { startWorkspaceWatcher } from '../workspace/watcher.js'
+import { decryptUserGitCredentials } from '../services/gitCredential.service.js'
 
 /**
  * 排队等待的轮询间隔（**代码常量**，不进 env）。
@@ -234,6 +241,9 @@ export async function ensureSandbox(
             '复用已有沙箱时名额册已满：计数与容器实际数短暂不一致（按"容器为准"继续）',
           )
         }
+        // ★ P1-14：复用路径也要确认目录仍指向本实例（目录可能已过 TTL 而容器还活着）。
+        //   `SET NX` 不会抢走别的实例的目录；单实例下恒为同一值。
+        await registerSandboxOwner(conversationId)
         return {
           ok: true,
           sandbox: {
@@ -261,6 +271,11 @@ export async function ensureSandbox(
     const waited = await waitForSlot(conversationId, options)
     if (!waited.ok) return waited
   }
+
+  // ★ P1-14 §六 1：**抢锁之后、建容器之前**写会话→实例目录（`SET NX`，先到先得）。
+  //   此刻 `chat.active:{id}` 已由编排层持有 ⇒ 并发首个 `/chat` 只可能有一个赢家；
+  //   写在这里把"网关查不到 owner"的窗口压到最小（窗口内的误投由那把锁兜底）。
+  await registerSandboxOwner(conversationId)
 
   try {
     return {
@@ -377,7 +392,16 @@ async function createSandbox(
   //    JS 侧边界，所以这两列必须落在 JS 侧空间里 —— 否则 `SANDBOX_CREATE_GRACE_SEC` 实际会
   //    被放大成 `grace + 8h`（症状：崩在半途的 `CREATING` 行 8 小时内不会被判死）。
   const row = await prisma.sandbox.create({
-    data: { conversationId, status: 'CREATING', image, lastActiveAt: startedAt, createdAt: startedAt },
+    data: {
+      conversationId,
+      status: 'CREATING',
+      image,
+      // ★ P1-14：本实例**显式写入**归属列（同 `createdAt`/`lastActiveAt` 的纪律：不用 DB 默认值）。
+      //   对账的三处查询都带 `instanceId = self`，这一列就是"每实例只清自己"的判据。
+      instanceId: config.sandbox.instanceId,
+      lastActiveAt: startedAt,
+      createdAt: startedAt,
+    },
     select: { id: true, createdAt: true },
   })
 
@@ -394,10 +418,41 @@ async function createSandbox(
           '--cap-drop ALL 对 root 进程的意义要小得多 ⇒ 拒绝启动。请用 pnpm sandbox:build 重建镜像。',
       )
     }
-    await docker.createSandboxVolume({
-      name: volumeName,
-      labels: sandboxLabels({ conversationId, startedAt, modelId: llm.modelId }),
+    /**
+     * ★ P1-9：工作区从**具名卷**改成**宿主 bind mount**（`{WORKSPACE_ROOT}/{conversationId}` → `/work`）。
+     * 这样容器里的 pi 与浏览器侧编辑的是**同一批字节**（Code 模式的核心）。
+     *
+     * ⚠️ 三件顺序上的事：
+     *   ① 目录**必须在这里建好**（`ensureWorkspaceDir`）：Docker bind 不会替我们建源目录，
+     *      源不存在时它**静默**建一个空的 0600 目录并挂进去（症状：容器里 `/work` 是空的、
+     *      宿主上却找不到你写的文件）；
+     *   ② 属主对齐（`alignAgentOwnership`，以 root 运行时才 chown 到 `SANDBOX_AGENT_UID`）；
+     *   ③ **不再建具名卷**（`createSandboxVolume` 本批退役）——旧的补偿/回收路径仍会尝试删卷，
+     *      那是幂等的空操作（`removeSandboxVolume` 吞 404），留给历史遗留卷。
+     *
+     * ★ P1-9 · R3：走 `ensureWorkspace` 而不是裸建目录 —— 它额外带**冷备恢复**
+     *   （目录缺失/为空时从 S3 按最新版本重建）⇒ 换机 / 宿主重建后的首轮派活前自动 rehydrate。
+     */
+    const { rootPath: workspacePath } = await ensureWorkspace(conversationId)
+    // ★ P1-9 · P3：本会话是否开了 Code 模式 ⇒ 决定是否给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`
+    //   （pi 的 read/write/edit 走版本中介）。持久列，派活时读一次即可（容器即会话）。
+    const conversationRow = await prisma.conversation.findUnique({
+      where: { id: conversationId },
+      select: { codeMode: true },
     })
+    const codeMode = conversationRow?.codeMode ?? false
+    /**
+     * ★ P1-9 · R11：解密该用户的 git 凭据（明文**只在本进程与容器注入物里出现**，见服务文件头 ②）。
+     *    env 必须在 `buildSandboxContainerSpec` 之前定（`Env` 建容器时定死），
+     *    文件在容器起来后 `putArchive`（tmpfs `$HOME/.ssh`）。两条都只做**一次**（每次建容器）。
+     */
+    const gitCredentials = await decryptUserGitCredentials(owner.userId)
+    const gitEnv = gitCredentialEnv(gitCredentials)
+    const gitFiles = gitCredentialFiles(gitCredentials)
+    // ★ 开始监听这个会话的工作区：捕获**未中介写**（agent 的 `bash`、宿主手工改）并补版本/事件。
+    // ⚠️ 监听寿命**跟随工作区、不随容器回收而停**（§八）⇒ 这里只启动，回收路径不 stop；
+    //    进程退出时由 `index.ts` 统一 `stopAllWorkspaceWatchers()`。
+    startWorkspaceWatcher(conversationId)
     /**
      * ★ P0-3-9b：签发 per-container 代理令牌。
      *
@@ -413,6 +468,8 @@ async function createSandbox(
         image,
         conversationId,
         volumeName,
+        // ★ P1-9：Code 模式工作区 = 宿主 bind mount（人与 agent 同字节）；见上方注释
+        workspacePath,
         startedAt,
         // ★ 模型 id 进标签（P0-3-4）：**复用前比对的唯一判据**（`ensureSandbox` 里那一段）。
         //   为什么不用 `sandboxes` 表存：表里的行是"账本"，而模型变更是**容器属性**的问题 ——
@@ -434,10 +491,31 @@ async function createSandbox(
           ...sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
           ...llm.env,
           ...sandboxProxyEnv({ token, proxyTimeoutSec: config.sandbox.proxyTimeoutSec }),
+          // ★ P1-9 · P3：Code 模式才注入（普通会话一个都不加，扩展默认关闭）
+          ...workspaceMediationEnv(codeMode),
+          // ★ P1-9 · R11：该用户的 git 凭据 env（HTTPS token 只在 env；SSH 另走 putArchive 落盘）
+          ...gitEnv,
         },
       }),
     )
     await docker.startSandboxContainer(containerId)
+    /**
+     * ★ P1-9 · R11：把 SSH 私钥 / `known_hosts` 解到容器 tmpfs `$HOME/.ssh`（`putArchive`，§7.3）。
+     * ⚠️ 只解到 **tmpfs**（`/home/agent`，容器回收即消失），**绝不写 `/work`**（会进 S3 冷备 / 产物）。
+     * ⚠️ 失败只 **warn**（不让"凭据没注进去"变成"容器建不出来"）：后端一切正常、只是 agent 的
+     *    `git clone` 会退回系统默认身份 —— 这类"能继续干活"的降级不该把整轮派活打死。
+     */
+    if (gitFiles.length > 0) {
+      const archive = buildTar(gitCredentialTarEntries(gitFiles))
+      await docker
+        .putArchive(containerId, SANDBOX_AGENT_HOME, archive)
+        .catch((injectError: unknown) => {
+          getLogger().warn(
+            { err: injectError, conversationId, fileCount: gitFiles.length },
+            'git 凭据注入容器失败（容器仍可用，agent 的 git 将退回系统默认身份）',
+          )
+        })
+    }
     const updated = await prisma.sandbox.updateMany({
       where: { id: row.id, status: 'CREATING' },
       data: { containerId, status: 'RUNNING' },
@@ -447,7 +525,15 @@ async function createSandbox(
       throw new Error('容器已启动，但账本行已不是 CREATING（并发回收？）')
     }
     getLogger().info(
-      { conversationId, sandboxId: row.id, containerId, image, slots: `${slots.size}/${slots.limit}` },
+      {
+        conversationId,
+        sandboxId: row.id,
+        containerId,
+        image,
+        slots: `${slots.size}/${slots.limit}`,
+        // ★ P1-9 · R11：这一轮容器是在哪套出网策略下起的（`*` = 全放行）—— 排障 git clone 走不通时看它
+        egressAllowHosts: config.sandbox.egressAllowHosts,
+      },
       '沙箱容器已就绪',
     )
     return { sandboxId: row.id, conversationId, containerId, volumeName, image, createdAt: row.createdAt, reused: false }
@@ -486,8 +572,21 @@ async function createSandbox(
  */
 export async function recycleSandbox(conversationId: string, reason: string): Promise<boolean> {
   const prisma = getPrisma()
+  // ★ P1-14 §三 3：**只回收 `instanceId === self` 的行**（宁可报错也不动别人的容器）。
+  //   多机下对账/空闲回收都可能扫到"别人的会话"，而本机没有它的容器 ⇒ 误删账本行会把
+  //   "B 上还在跑的沙箱"标成 RECYCLED（同 §三 3 的 `container-missing` 错杀）。
+  // 本实例从未建过这个会话的容器 ⇒ **整段回收都不做**（连令牌/别名映射也不动 ——
+  // 它们可能属于持有该会话的那台实例）。这条比"按行过滤"更靠前，因为下面的
+  // `revokeSandboxToken`/`clearSandboxMcpMap`/`clearSandboxOwner` 是**无条件**的。
+  const anyOwned = await prisma.sandbox.count({
+    where: { conversationId, instanceId: config.sandbox.instanceId },
+  })
+  if (anyOwned === 0) {
+    getLogger().debug({ conversationId, reason }, '该会话在本实例没有沙箱账本 ⇒ 回收不做（P1-14：不跨机清理）')
+    return false
+  }
   const rows = await prisma.sandbox.findMany({
-    where: { conversationId, status: { in: ['CREATING', 'RUNNING'] } },
+    where: { conversationId, status: { in: ['CREATING', 'RUNNING'] }, instanceId: config.sandbox.instanceId },
     select: { id: true, containerId: true, status: true },
   })
 
@@ -498,6 +597,9 @@ export async function recycleSandbox(conversationId: string, reason: string): Pr
       changed = true
     }
     // ★ 第二步必须显式删具名卷：`docker rm -v` 删不掉它（P0-3-2 实测，见文件头顺序问题 3）
+    // ⚠️ **P1-9 起工作区是宿主 bind mount、不再有具名卷** ⇒ 这一段通常一次都不命中（空集合）；
+    //    它对**历史遗留卷**仍然有效。★ Code 模式的关键：**回收容器绝不删工作区目录**（§八：
+    //    工作区不再跟容器同生共死），目录的寿命由 workspace reaper 按保留期单独收口。
     for (const volume of await docker.listVolumesOf(conversationId)) {
       if (volume.Name !== undefined) {
         await docker.removeSandboxVolume(volume.Name)
@@ -520,6 +622,9 @@ export async function recycleSandbox(conversationId: string, reason: string): Pr
   //   ⚠️ 两者都幂等、失败只 warn（各自模块内部处理），不会把"回收"变成"抛出"。
   await revokeSandboxToken(conversationId)
   await clearSandboxMcpMap(conversationId)
+  // ★ P1-14 §六 4：回收成功后 `DEL sandbox:owner:{id}`（失败留给 TTL）。
+  //   清目录后新的一轮 `/chat` 可自由落在任意实例并重新登记 —— 这是"owner 宕机降级"的兑现点。
+  await clearSandboxOwner(conversationId)
 
   if (slots.remove(conversationId)) changed = true
   if (changed) {
@@ -544,7 +649,12 @@ export async function destroySandboxVolume(name: string): Promise<void> {
 export async function markSandboxRowsRecycled(conversationIds: readonly string[]): Promise<number> {
   if (conversationIds.length === 0) return 0
   const updated = await getPrisma().sandbox.updateMany({
-    where: { conversationId: { in: [...conversationIds] }, status: { in: ['CREATING', 'RUNNING'] } },
+    where: {
+      conversationId: { in: [...conversationIds] },
+      status: { in: ['CREATING', 'RUNNING'] },
+      // ★ P1-14：只收本实例名下的行（跨机清理不存在）
+      instanceId: config.sandbox.instanceId,
+    },
     data: { status: 'RECYCLED' },
   })
   return updated.count

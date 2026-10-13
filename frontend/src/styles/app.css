@@ -30,39 +30,66 @@
    ========================================================================== */
 
 /* =========================== 应用外壳 ====================================== */
-/* 记忆点 ①：左侧栏 —— 承载全部导航项（图标 + 文字）与状态灯、序列号。
-   默认展开（`shell--rail-open`），可收起到仅图标（回到 `--rail-w`）。 */
-.shell {
+/* 记忆点 ①：左侧栏 —— P1-15 修订后它是**会话栏**（`ConvRail`）**常驻**：聊天与各管理页共用同一列，
+   切换功能不再换外壳。`.app-shell` = [会话栏 | 主区]，会话栏默认展开（`--convrail-w`），
+   可收起到图标条（`--rail-w`）。 */
+.app-shell {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: var(--rail-w) minmax(0, 1fr);
-  min-height: 100vh;
+  grid-template-columns: var(--convrail-w) minmax(0, 1fr);
+  height: 100vh;
+  min-height: 0;
+  background: var(--paper);
 }
 
-/* 左侧栏展开：让出图标 + 文字的宽度（收起时 `.shell` 用 `--rail-w`） */
-.shell--rail-open { grid-template-columns: var(--rail-open-w) minmax(0, 1fr); }
+/* 会话栏**整体隐藏**（点击主区左上角那枚浮层按钮切换）：单列铺满，主区占全宽 */
+.app-shell--rail-hidden { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.app-shell--rail-hidden .convrail { display: none; }
 
-.rail {
-  position: sticky;
-  top: 0;
-  z-index: 20;
+/* 主区：一列 —— 聊天视图整块铺满（`.chat-home__main`），页面视图是「顶栏 + 可滚动的 `.page`」 */
+.app-shell__main {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-4);
-  height: 100vh;
-  padding: var(--sp-4) var(--sp-3);
-  background: var(--surface);
-  border-right: 1px solid var(--rule-strong);
-  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
 }
+.app-shell__main > .chat-home__main { flex: 1; min-height: 0; }
+/* 页面视图：顶栏不吃缩放（`.page` 才是那根伸缩轴），面包屑长名时也不被压扁 */
+.app-shell__main > .topbar { flex: 0 0 auto; }
 
-/* 顶部：品牌字标 + 收起 / 展开切换 */
-.rail__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-2);
+/* 会话栏开关：主区左上角的**浮层**按钮（不占布局，低调常驻、悬停/聚焦显形）。
+   ⚠️ 它骑在 `chat__head` / `topbar` 的左上角 ⇒ 那两条栏各自让出左侧留白（`padding-left: 52px`）。
+   ⚠️ **尺寸 / 纵向位置与标题栏的智能体 chip 对齐**（用户反馈：两者不整齐）：chip 高 32px、
+   `chat__head` 上内边距 `--sp-3`，故这里同高 32、`top: --sp-3`，两者垂直居中对齐；
+   左留白 = 12(左) + 32(按钮) + 8(间隙) = 52px。 */
+.app-shell__toggle {
+  position: absolute;
+  top: var(--sp-3);
+  left: var(--sp-3);
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-md);
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity var(--dur-micro) ease-out, color var(--dur-micro) ease-out,
+    background var(--dur-micro) ease-out, border-color var(--dur-micro) ease-out;
+}
+.app-shell__toggle:hover,
+.app-shell__toggle:focus-visible {
+  opacity: 1;
+  color: var(--ink);
+  background: var(--surface);
+  border-color: var(--rule);
 }
 
 .rail__mark {
@@ -80,117 +107,6 @@
 }
 .rail__mark:hover { background: var(--accent); }
 
-.rail__toggle {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  color: var(--muted);
-  cursor: pointer;
-  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
-    border-color var(--dur-micro) ease-out;
-}
-.rail__toggle:hover {
-  color: var(--ink);
-  background: var(--surface-2);
-  border-color: var(--rule);
-}
-
-.rail__rule {
-  width: 22px;
-  height: 1px;
-  background: var(--rule-strong);
-}
-
-.rail__nav {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-/* 导航项 = 图标 + 文字（文字来自 `nav.ts` 的标签，与顶栏曾是同一份来源） */
-.rail__btn {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  height: 38px;
-  padding: 0 var(--sp-3);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  color: var(--muted);
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
-    border-color var(--dur-micro) ease-out;
-}
-.rail__btn:hover {
-  color: var(--ink);
-  background: var(--surface-2);
-  border-color: var(--rule);
-}
-.rail__btn[aria-current="page"] {
-  color: var(--accent);
-  background: var(--accent-wash);
-  border-color: var(--accent-rule);
-}
-.rail__icon {
-  display: inline-flex;
-  font-size: var(--fs-md);
-  line-height: 1;
-}
-.rail__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* 收起态：整条退回仅图标的窄轨（与改版前的宽度一致） */
-.rail--collapsed {
-  align-items: center;
-  padding: var(--sp-4) 0;
-}
-.rail--collapsed .rail__head {
-  flex-direction: column;
-  gap: var(--sp-2);
-}
-.rail--collapsed .rail__nav { align-items: center; }
-.rail--collapsed .rail__btn {
-  width: 34px;
-  height: 34px;
-  justify-content: center;
-  gap: 0;
-  padding: 0;
-}
-.rail--collapsed .rail__label { display: none; }
-.rail--collapsed .rail__status { align-items: center; }
-
-.rail__status {
-  margin-top: auto;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--sp-3);
-}
-
-/* 序列号：**展开态横排**（跟文字导航同向），**收起态竖排**（仪器读数式的窄轨记忆点） */
-.rail__serial {
-  font-family: var(--font-mono);
-  font-size: var(--fs-2xs);
-  color: var(--muted-2);
-}
-.rail--collapsed .rail__serial {
-  writing-mode: vertical-rl;
-  letter-spacing: 0.28em;
-}
-
 /* =========================== 顶栏 ========================================== */
 .topbar {
   position: sticky;
@@ -200,90 +116,22 @@
   align-items: center;
   gap: var(--sp-5);
   height: var(--topbar-h);
-  padding: 0 var(--sp-6) 0 var(--sp-5);
+  padding: 0 var(--sp-6) 0 52px;
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--rule-strong);
 }
 
-.topbar__brand {
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp-2);
-  font-family: var(--font-display);
-  font-size: var(--fs-md);
-  font-weight: 800;
-  letter-spacing: -0.035em;
-  color: var(--ink);
-}
-.topbar__brand span { color: var(--muted-2); font-weight: 600; }
-
-.nav {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.nav__item {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  height: 30px;
-  padding: 0 var(--sp-3);
-  border-radius: var(--r-sm);
-  color: var(--ink-2);
-  font-size: var(--fs-sm);
-  cursor: pointer;
-  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out;
-}
-.nav__item:hover { color: var(--ink); background: var(--surface-2); text-decoration: none; }
-.nav__item[aria-current="page"] { color: var(--ink); font-weight: 600; }
-/* 悬停：下划线从左扫过，比"变亮"更有指向性 */
-.nav__item::after {
-  content: "";
-  position: absolute;
-  left: var(--sp-3);
-  right: var(--sp-3);
-  bottom: 3px;
-  height: 1.5px;
-  background: var(--accent);
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform var(--dur-base) var(--ease-out);
-}
-.nav__item:hover::after,
-.nav__item[aria-current="page"]::after { transform: scaleX(1); }
-
-.nav__badge {
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  display: grid;
-  place-items: center;
-  background: var(--danger);
-  color: #fff;
-  border-radius: var(--r-full);
-  font-family: var(--font-mono);
-  font-size: var(--fs-2xs);
-  font-variant-numeric: tabular-nums;
-}
-
-.topbar__right {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  margin-left: auto;
-}
-
 /* =========================== 页面骨架 ====================================== */
+/* `.page` 是**页面视图**的主区滚动容器（聊天视图不走这里）。留白放在滚动容器上，
+   可读宽度（1440）下移到 `.page__body`，宽屏下滚动条仍贴视口右缘。 */
 .page {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   padding: var(--sp-6) var(--sp-6) var(--sp-8);
-  max-width: 1440px;
 }
+.page__body { max-width: 1440px; }
 
 .page__head {
   display: flex;
@@ -401,7 +249,7 @@
 }
 
 /* =========================== 首帧等待 / 会话读取失败 ====================== */
-/* 这两个态出现在**外壳之外**（`RequireAuth` 还没放行，没有 `.shell` 可依附）
+/* 这两个态出现在**外壳之外**（`RequireAuth` 还没放行，没有 `.app-shell` 可依附）
    ⇒ 自己撑满视口居中，纸张底由 body 提供，蓝图网格由 body.blueprint 铺。
    原型里没有这一段：静态 HTML 不存在"登录态还没问到"的那个瞬间。 */
 .boot {
@@ -842,56 +690,306 @@
   .split--form { grid-template-columns: minmax(0, 1fr); }
   .aside-card { position: static; }
   .page { padding: var(--sp-5) var(--sp-5) var(--sp-8); }
-  /* 对话页的一屏高跟着 `.page` 的 padding 一起变（见对话页段的注释）：`sp-6` → `sp-5`。
-     漏了这一条的后果不是"少一点高度"，而是底部永远露出一条滚动条（下一条命令就能看出来）。 */
-  .chat { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8)); }
-  /* 侧栏在窄屏收窄，但**不隐藏**：它是这个页面唯一的"在会话之间切换"的入口
-     （藏掉它就等于把用户锁在当前会话里 —— `03` §三 说的"导航孤岛"在这里会以另一种形式出现）。
-     268px 在 1024px 宽的窗口里会把消息流挤到 700px 以下，而那正是消息流的最小舒适宽度。 */
-  .chat { grid-template-columns: 208px minmax(0, 1fr); }
-  .topbar { padding: 0 var(--sp-5) 0 var(--sp-3); gap: var(--sp-3); }
-  .nav--collapse { display: none; }
+  /* 会话栏在 1024 以下收窄（但**不隐藏** —— 它是唯一的"在会话之间切换"入口，
+     藏掉它等于把用户锁在当前会话里）。268px 会把主区挤到 700px 以下。 */
+  .app-shell { grid-template-columns: 208px minmax(0, 1fr); }
+  /* 已隐藏态要重申一次：本条媒体查询在后面，同特指度会盖掉基线的单列规则 */
+  .app-shell--rail-hidden { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+  .topbar { padding: 0 var(--sp-5) 0 52px; gap: var(--sp-3); }
 }
 
 @media (max-width: 720px) {
-  /* 移动端答案：左侧栏转为底部横条，不硬塞侧边 */
-  .shell,
-  .shell--rail-open { grid-template-columns: minmax(0, 1fr); padding-bottom: 56px; }
-  /* 对话页现在也带这条底部横条（改版后不再有"专注布局"）：一屏高要**多扣掉 56px**，
-     否则底部那条横条会盖住输入区、并多出一条滚动条。 */
-  .chat { height: calc(100vh - var(--topbar-h) - var(--sp-5) - var(--sp-8) - 56px); }
-  .rail,
-  .rail--collapsed {
-    position: fixed;
-    inset: auto 0 0 0;
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-around;
-    gap: 0;
-    height: 56px;
-    padding: 0 var(--sp-2);
-    border-right: 0;
-    border-top: 1px solid var(--rule-strong);
-    overflow: visible;
-  }
-  /* 底部横条只留图标：品牌字标与收起开关没有意义 */
-  .rail__head, .rail__rule, .rail__serial { display: none; }
-  .rail__nav,
-  .rail--collapsed .rail__nav { flex-direction: row; gap: var(--sp-1); align-items: center; }
-  .rail__btn,
-  .rail--collapsed .rail__btn {
-    width: auto;
-    height: 44px;
-    padding: 0 var(--sp-3);
-    justify-content: center;
-  }
-  .rail__label,
-  .rail--collapsed .rail__label { display: none; }
-  .rail__status,
-  .rail--collapsed .rail__status { margin-top: 0; align-items: center; }
+  /* 移动端答案：外壳转单列，会话栏在上、主区在下（会话栏给一个上限高度，只保证可用） */
+  .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 40vh) minmax(0, 1fr); }
+  .app-shell--rail-hidden { grid-template-rows: minmax(0, 1fr); }
+  .app-shell .convrail { border-right: 0; border-bottom: 1px solid var(--rule-strong); }
   .page__head { flex-direction: column; align-items: flex-start; }
   .page__head-actions { margin-left: 0; }
 }
+
+/* =========================== 聊天视图主区（P1-15） ========================= */
+/* `.chat-home__main` 是**聊天视图**的主区（外壳是 `AppShell` 的 `.app-shell`）：
+   当前会话 / 欢迎态铺满主区；会话栏由外壳常驻左列，不再归这里。 */
+.chat-home__main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* 当前会话 / 欢迎态都要占满主区（`.chat` 自己不再算 100vh —— 外壳已经给了高度） */
+.chat-home__main > * { flex: 1; min-height: 0; }
+.chat-home__welcome {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-6);
+}
+
+/* ── 会话栏（ConvRail）── */
+.convrail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--rule-strong);
+}
+.convrail__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+}
+.convrail__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-xs);
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: var(--fs-sm);
+  flex: 0 0 auto;
+}
+.convrail__brand { font-family: var(--font-display); font-weight: 800; letter-spacing: -0.02em; }
+.convrail__new { flex: 0 0 auto; padding: 0 var(--sp-4) var(--sp-3); }
+.convrail__new-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 34px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--accent-rule);
+  border-radius: var(--r-sm);
+  background: var(--accent-wash);
+  color: var(--accent-ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.convrail__new-btn:hover { background: var(--accent); color: var(--paper); }
+/* 欢迎态里那枚按钮是内联的、不占整行 */
+.chat-home__welcome .convrail__new-btn { width: auto; min-height: 38px; padding: 0 var(--sp-4); }
+.convrail__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+.convrail__hint { margin: 0; color: var(--muted); font-size: var(--fs-sm); }
+.convrail__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--sp-2);
+  list-style: none;
+}
+.convrail__group-list { margin: 0; padding: 0; list-style: none; }
+.convrail__group {
+  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.12em;
+  color: var(--muted-2);
+}
+/* 智能体徽标：跨智能体列表的关键读数（紧凑，不抢标题行） */
+.conv__agent {
+  margin: 0;
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+  padding: 0 4px;
+}
+.convrail__foot {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--rule);
+  padding: var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.convrail__manage {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 32px;
+  padding: 0 var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.convrail__manage:hover { background: var(--surface-2); border-color: var(--rule); }
+.convrail__manage-caret { margin-left: auto; font-size: 10px; color: var(--muted-2); }
+.convrail__user {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  justify-content: space-between;
+}
+/* ★ 会话栏的收起/展开已**移出会话栏**（P1-15 R3）：按钮是主区左上角的浮层 `.app-shell__toggle`，
+   点击整体隐藏/唤回（`.app-shell--rail-hidden`）。故这里不再有图标条收起态。 */
+
+/* ── 「管理」popover（管理跟会话走）── */
+.rail-menu__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  min-width: 200px;
+}
+.rail-menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  color: var(--ink-2);
+  text-decoration: none;
+  font-size: var(--fs-sm);
+}
+.rail-menu__item:hover { background: var(--surface-2); color: var(--ink); text-decoration: none; }
+.rail-menu__icon { display: inline-flex; color: var(--muted); }
+.rail-menu__note { margin: var(--sp-2) 0 0; padding: 0 var(--sp-3); color: var(--muted-2); font-size: var(--fs-2xs); }
+
+/* ── 智能体选择器（AgentPicker）── */
+.agent-pick { width: 320px; max-width: 92vw; display: flex; flex-direction: column; gap: var(--sp-2); }
+.agent-pick__scroll { max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: var(--sp-2); }
+.agent-pick__hint { margin: 0; padding: var(--sp-2); color: var(--muted); font-size: var(--fs-sm); }
+.agent-pick__group-label {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-1) var(--sp-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.12em;
+  color: var(--muted-2);
+}
+.agent-pick__item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.agent-pick__item:hover { border-color: var(--accent-rule); background: var(--accent-wash); }
+.agent-pick__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 输入框下方的会话控件（R4：图标按钮条，不再是标题栏 popover / 内联文字开关）── */
+.composer__controls { display: flex; align-items: center; flex-wrap: wrap; min-width: 0; }
+.composer-controls { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); min-width: 0; }
+/* 模型是**文字选择器**（R5：用户要一眼看到当前模型）⇒ 它可能比图标宽，给它设上限并在
+   窄列（专注工作区）里可收缩，免得把控件条撑出横向滚动。 */
+.composer-model { max-width: min(200px, 100%); }
+.composer-model .ant-select-selection-item { overflow: hidden; text-overflow: ellipsis; }
+/* 池里只有 1 个模型时的只读文字读数（与 Select 高度观感一致） */
+.composer-model-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: min(200px, 100%);
+}
+.composer-control {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-md);
+  cursor: pointer;
+  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
+    border-color var(--dur-micro) ease-out, transform var(--dur-micro) ease-out;
+}
+.composer-control:hover { color: var(--ink); background: var(--surface-2); }
+.composer-control:active { transform: scale(0.86); }
+.composer-control:focus-visible { outline: none; border-color: var(--rule-control); color: var(--ink); }
+.composer-control.is-active {
+  color: var(--accent-ink);
+  background: var(--accent-wash);
+  border-color: var(--accent-rule);
+}
+.composer-control.is-danger { color: var(--danger); }
+.composer-control.is-busy { opacity: 0.6; cursor: progress; }
+.composer-control:disabled { cursor: not-allowed; }
+/* 点击弹动：`is-pop` 由组件在 `animationend` 摘掉 ⇒ 每次点击都重放 */
+.composer-control.is-pop { animation: composer-control-pop var(--dur-base) var(--ease-out); }
+@keyframes composer-control-pop {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.22); }
+  100% { transform: scale(1); }
+}
+/* 产物 / 工作区抽屉入口只在窄屏（宽屏第三列常驻，不需要重复入口；与 1280 断点同口径） */
+.composer-control--narrow { display: none; }
+@media (max-width: 1280px) {
+  .composer-control--narrow { display: inline-grid; }
+}
+
+/* 对话标题栏的智能体 chip（点开 = 换智能体）
+   ⚠️ **定高 32px**（与主区左上角的会话栏浮层按钮 `.app-shell__toggle`、右侧设置图标
+   `.chat__settings` 同高）：用户反馈"浮层开关与 chip 大小 / 位置不整齐"。chip 高度不确定
+   （内嵌 AntD `Tag` 高度随字号变）会让浮层按钮对不齐 ⇒ 这里钉死 32，三者成一条基线。 */
+.chat__agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 32px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+.chat__agent-chip:hover { border-color: var(--accent-rule); background: var(--accent-wash); }
+.chat__agent-name { margin: 0; font-family: var(--font-display); font-weight: 700; }
+.chat__agent-type { color: var(--muted); font-size: var(--fs-2xs); font-family: var(--font-mono); }
+
+/* 标题栏右侧的**设置图标**（R4：直接进编辑智能体；不再是齿轮 popover） */
+.chat__settings {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: var(--fs-md);
+  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
+    border-color var(--dur-micro) ease-out;
+}
+.chat__settings:hover { color: var(--ink); background: var(--surface-2); border-color: var(--rule); }
 
 /* =========================== 对话页（P0-1-32；P0-1-34 加侧栏；P0-3-11 第三列） = */
 /* 原型（`design/chat.html`）是「会话侧栏 + 消息流 + 产物面板」三栏（`03` §4.1）。
@@ -902,15 +1000,22 @@
    让 ChatBot 平白少 312px 的消息流宽度，而这"看起来只是窄了一点"、不报任何错。 */
 .chat {
   display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  /* 一屏高：视口减去顶栏与 `.page` 的上下留白。少扣一项的症状是"对话页永远比视口高一点"
-     —— 底部那条滚动条会一直露着，输入区永远压不到屏幕底边。
-     ⚠️ `.page` 的 padding 在 1024px 断点里变了（`sp-6` → `sp-5`），那里的覆盖见文件末的断点块。 */
-  height: calc(100vh - var(--topbar-h) - var(--sp-6) - var(--sp-8));
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+  /* 高度由聊天主页外壳（`.chat-home__main`）给足，这里占满即可（P1-15）。 */
+  height: 100%;
 }
 
-/* TaskAgent 的三栏（`design/styles/components.css` 的 `.chat--with-panel` 逐字一致） */
-.chat--with-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w); }
+/* TaskAgent 的第三列（`design/styles/components.css` 的 `.chat--with-panel` 同款；P1-15 去掉侧栏列） */
+.chat--with-panel { grid-template-columns: minmax(0, 1fr) var(--panel-w); }
+
+/* Code 模式「专注」（P1-15 · §七 3）：工作区占主区、消息流收成窄条；或反过来收起工作区。 */
+.chat--focus-workspace { grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); }
+.chat--focus-chat { grid-template-columns: minmax(0, 1fr); }
+.chat--focus-chat .panel { display: none; }
+/* 专注工作区：对话列被压到 360~420px ⇒ 标题栏 / 输入区收紧内边距，别让控件挤成一团 */
+.chat--focus-workspace .chat__head { padding-right: var(--sp-3); }
+.chat--focus-workspace .composer { padding-left: var(--sp-3); padding-right: var(--sp-3); }
 
 /* ── 产物面板（P0-3-11；原型 `design/styles/components.css` 的 `.panel*`）────────
    与 `.sidebar` 同构（头 + 可滚动的体），只是贴在右边。 */
@@ -920,6 +1025,8 @@
   min-height: 0;
   background: var(--surface);
   border-left: 1px solid var(--rule-strong);
+  /* 拖拽把手（`.ws-resizer`）绝对定位在左缘（P1-9 · R12），需要定位上下文 */
+  position: relative;
 }
 .panel__head { padding: var(--sp-4); border-bottom: 1px solid var(--rule); }
 .panel__body {
@@ -931,53 +1038,278 @@
   gap: var(--sp-3);
 }
 
+/* ── 工作区 IDE 面板（P1-9 · R12）────────────────────────────────────────────────
+   Code 模式第三列由"竖排堆叠"改成 **VS Code 式**：头 + [资源管理器 | 多标签编辑器 + 状态栏]。
+   `.panel` 只是外壳（宽度来自 grid 的 `--panel-w`，拖拽把手在左缘）；内部全走 `.ws*`。
+   面板宽度经 CSS 变量注入（`ChatPage`），**不写内联 grid** —— 否则会盖掉 <1280px 的媒体查询。 */
+.ws-resizer {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 6;
+  touch-action: none;
+}
+.ws-resizer:hover,
+.ws-resizer.is-active { background: var(--accent-rule); }
+
+.ws {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface);
+}
+.ws__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+}
+.ws__title { font-weight: 600; font-size: var(--fs-sm); }
+.ws__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font-size: var(--fs-2xs);
+}
+.ws__icon-btn:hover { background: var(--surface-3); color: var(--ink); }
+.ws__icon-btn.is-on { color: var(--accent-ink); border-color: var(--accent-rule); }
+.ws__explorer-actions { display: inline-flex; align-items: center; gap: 2px; }
+.ws__count { font-size: var(--fs-2xs); color: var(--muted-2); }
+
+.ws__body { flex: 1; min-height: 0; display: flex; }
+
+/* 资源管理器 */
+.ws__explorer {
+  flex: 0 0 224px;
+  width: 224px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--rule);
+  background: var(--surface-2);
+  transition: width var(--dur-micro) ease-out, flex-basis var(--dur-micro) ease-out;
+}
+/* 折叠成 44px 图标条（P1-15 · §七 2）：只留文件夹 / 文件图标，把宽度让给编辑器 */
+.ws__explorer--collapsed { flex: 0 0 44px; width: 44px; }
+.ws__explorer--collapsed .ws__explorer-title,
+.ws__explorer--collapsed .ws__explorer-actions,
+.ws__explorer--collapsed .ws__count,
+.ws__explorer--collapsed .ws__tree-name,
+.ws__explorer--collapsed .ws__tree-size,
+.ws__explorer--collapsed .ws__recent { display: none; }
+.ws__explorer--collapsed .ws__explorer-head { justify-content: center; }
+.ws__explorer--collapsed .ws__tree-row { justify-content: center; padding-left: 0; padding-right: 0; }
+/* 文件树行内尺寸（P1-15）：等宽、右对齐，与状态栏同口径 */
+.ws__tree-size { margin-left: auto; flex: 0 0 auto; color: var(--muted-2); font-size: var(--fs-2xs); }
+.ws__explorer-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.ws__tree-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-1) 0; }
+.ws__hint { margin: 0; padding: var(--sp-2) var(--sp-3); font-size: var(--fs-2xs); color: var(--muted); }
+
+.ws__tree { list-style: none; margin: 0; padding: 0; }
+.ws__tree .ws__tree { padding-left: 12px; }
+.ws__tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  text-align: left;
+  padding: 2px var(--sp-3);
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  line-height: 20px;
+}
+.ws__tree-row:hover { background: var(--surface-3); }
+.ws__tree-row.is-active { background: var(--accent-wash); color: var(--accent-ink); }
+.ws__tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws__chevron { display: inline-flex; width: 12px; color: var(--muted-2); font-size: 10px; }
+.ws__glyph { display: inline-flex; }
+
+/* 最近变更（折叠在资源管理器底部） */
+.ws__recent { flex: 0 0 auto; max-height: 40%; overflow: auto; border-top: 1px solid var(--rule); }
+.ws__recent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.ws__recent-head:hover { color: var(--ink); }
+.ws__recent-list { list-style: none; margin: 0; padding: 0 0 var(--sp-2); }
+.ws__recent-list li { display: flex; align-items: center; gap: 6px; padding: 2px var(--sp-3); font-size: var(--fs-2xs); }
+.ws__recent-path {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--ink-2);
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.ws__recent-path:hover { color: var(--accent-ink); text-decoration: underline; }
+.ws__recent-actor { color: var(--muted-2); }
+
+/* 编辑器区：标签条 / 工具栏 / 编辑面 / 状态栏 */
+.ws__editor { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+.ws__tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--rule);
+}
+.ws__tab { display: flex; align-items: center; border-right: 1px solid var(--rule); }
+.ws__tab.is-active { background: var(--surface); box-shadow: inset 0 2px 0 var(--accent); }
+.ws__tab-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 6px 4px 6px var(--sp-3);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  color: var(--muted);
+}
+.ws__tab.is-active .ws__tab-name { color: var(--ink); }
+.ws__tab-label { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.ws__tab-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.ws__tab-close {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted-2);
+  padding: 6px 8px 6px 2px;
+  font-size: 10px;
+}
+.ws__tab-close:hover { color: var(--danger); }
+
+.ws__toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+}
+.ws__crumb {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws__banner { flex: 0 0 auto; padding: var(--sp-2) var(--sp-3); }
+.ws__editor-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ws__placeholder {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  text-align: center;
+}
+.ws__image {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+}
+.ws__image img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+.ws__status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 3px var(--sp-3);
+  border-top: 1px solid var(--rule);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.ws__status--dirty { color: var(--accent-ink); font-weight: 600; }
+.ws__status--conflict { color: var(--warn); font-weight: 600; }
+
 /* ⚠️ 这条断点**必须住在这里**（base 规则之后），不能搬去文件前面那个「响应式」块：
    CSS 里同特异度的两条规则**由源码顺序**决定谁赢，而那个块在对话页段**之前** ⇒
    搬过去就会被上面的 `.chat--with-panel` 覆盖掉（静默、不报错、只在窄屏看得出）。
-   —— 这个文件里已经有一处同样的坑（`@media (max-width:1024px)` 块里那两条 `.chat`，
-   它们的 `height` 与 `grid-template-columns` 如今被后面 base 规则盖住了），此处不重复它。
-   ≥1280px 才配第三列（原型 `design/styles/components.css` 同款）：窄屏上产物面板会把消息流
-   挤到 700px 以下。⚠️ 「能预览产物」这条能力**没有消失** —— 消息流里的产物卡仍然带
-   [预览][下载]（它们就在这一页上），并且头部多一枚 `chat__panel-toggle` 按钮（只在此断点显示）
-   打开一个承载同一个 `ArtifactPanel` 的抽屉 ⇒ **产物列表始终有入口**。 */
-.chat__panel-toggle { display: none; }
+   ≥1280px 才配第三列：窄屏上产物 / 工作区面板会把消息流挤到 700px 以下。
+   ⚠️ **P1-15**：「能预览产物 / 打开工作区」这条能力**没有消失** —— 消息流里的产物卡仍带
+   [预览][下载]，窄屏入口在输入框下方控件条里（`.composer-control--narrow`，同一断点）。
+   ⚠️ **R6（用户反馈）**：**Code 模式的工作区不再在窄屏藏起来** —— 用户要"一边看文件一边
+   和 agent 聊天"，若收成抽屉，展开就盖住对话列、每次都得开关。故 Code 模式下第三列
+   改为**常驻并排**（工作区按视口比例收窄，仍能看文件树 / 编辑器）；专注对话仍是显式收起。
+   产物面板（非 Code）维持原样：窄屏收成抽屉入口，能力不消失。 */
 
 @media (max-width: 1280px) {
-  .chat--with-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+  /* 非 Code（产物面板）：窄屏收起第三列，走输入框下方的抽屉入口 */
+  .chat--with-panel { grid-template-columns: minmax(0, 1fr); }
   .chat--with-panel .panel { display: none; }
-  /* 第三列被藏的同一段宽度里，把产物入口按钮显示出来（同一个断点，单一口径） */
-  .chat__panel-toggle { display: inline-flex; }
+
+  /* Code 模式：第三列常驻并排（不再藏）；工作区按比例收窄，对话列仍可用 */
+  .chat--code.chat--with-panel { grid-template-columns: minmax(0, 1fr) minmax(0, 44%); }
+  .chat--code.chat--with-panel .panel { display: flex; }
+  /* 窄屏下宽度改由比例决定 ⇒ 横向拖拽把手没有意义，藏掉（避免"拖不动"的迷惑） */
+  .chat--code.chat--with-panel .ws-resizer { display: none; }
+  /* 专注对话：显式收起工作区（特异度要压过上面的并排规则） */
+  .chat--code.chat--with-panel.chat--focus-chat { grid-template-columns: minmax(0, 1fr); }
+  .chat--code.chat--with-panel.chat--focus-chat .panel { display: none; }
+  /* 专注工作区：对话列压到窄条，工作区占主区 */
+  .chat--code.chat--with-panel.chat--focus-workspace {
+    grid-template-columns: minmax(260px, 38%) minmax(0, 1fr);
+  }
 }
 
 /* ── 会话侧栏（P0-1-34）───────────────────────────────────────────────────── */
-/* 结构与 `design/chat.html` 的 `.sidebar` 一致：头部一个「+ 新会话」，下面是分组列表。
-   ⚠️ 行的可点区域是一个**真 `<button>`**（`.conv__open`），操作按钮（✎ / ✕）是它的**兄弟**
+/* ── 会话行（`.conv*`）─────────────────────────────────────────────────────
+   ⚠️ P1-15：外壳的 `.sidebar` 已被 `ConvRail` 的 `.convrail*` 取代（旧单智能体侧栏已删），
+   但**行这一套 `.conv*` 原样复用**（会话栏与 `ConvRail` 用同一套行的判据与外观）。 */
+/* 行的可点区域是一个**真 `<button>`**（`.conv__open`），操作按钮（✎ / ✕）是它的**兄弟**
    而不是子节点 —— 按钮里嵌按钮是非法 HTML，而且点击会被外层吞掉
    （症状："点了删除却切到了那个会话"）。 */
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  background: var(--surface);
-  border-right: 1px solid var(--rule-strong);
-}
-.sidebar__head { padding: var(--sp-4); border-bottom: 1px solid var(--rule); }
-.sidebar__body { padding: var(--sp-3); overflow-y: auto; }
-.sidebar__list {
-  flex: 1;
-  overflow-y: auto;
-  margin: 0;
-  padding: var(--sp-2);
-  list-style: none;
-}
-.sidebar__group-list { margin: 0; padding: 0; list-style: none; }
-.sidebar__group {
-  padding: var(--sp-3) var(--sp-2) var(--sp-1);
-  font-family: var(--font-mono);
-  font-size: var(--fs-2xs);
-  letter-spacing: 0.12em;
-  color: var(--muted-2);
-}
 
 .conv {
   position: relative;
@@ -1079,8 +1411,10 @@
 .chat__head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-5);
+  /* 左侧给主区左上角那枚会话栏浮层按钮（`.app-shell__toggle`）让位 */
+  padding: var(--sp-3) var(--sp-5) var(--sp-3) 52px;
   background: var(--surface);
   border-bottom: 1px solid var(--rule);
 }
@@ -1098,6 +1432,18 @@
   gap: var(--sp-2);
   /* 窄屏控件多（模型选择器 / 产物入口 / 编辑）⇒ 允许换行，别横向溢出把入口挤出可视区 */
   flex-wrap: wrap;
+}
+
+/* 只读保留会话（Agent 已软删）：输入区位置换成一句说明（不能再发消息） */
+.chat__readonly {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-5);
+  background: var(--surface-2);
+  border-top: 1px solid var(--rule);
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
 }
 
 /* 消息流：内部滚动（输入区固定在页面底部，不随消息滚走） */
@@ -1465,7 +1811,7 @@
 }
 .guide-chip:hover { border-color: var(--accent-rule); color: var(--accent); }
 
-.composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }.composer__inner { width: min(760px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
+.composer { padding: var(--sp-4) var(--sp-5) var(--sp-5); background: var(--paper); }.composer__inner { width: min(760px, 100%); min-width: 0; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-2); }
 .composer__box {
   display: flex;
   align-items: flex-end;
@@ -1483,6 +1829,7 @@
    覆盖 AntD 组件外观才需要 `:root` 前缀；本节没有任何 `.ant-*` 选择器。 */
 .composer textarea {
   flex: 1;
+  min-width: 0;
   max-height: 180px;
   min-height: 34px;
   padding: var(--sp-2) 0;
@@ -1499,6 +1846,7 @@
 .composer__hint {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--sp-3);
   font-family: var(--font-mono);
   font-size: var(--fs-2xs);

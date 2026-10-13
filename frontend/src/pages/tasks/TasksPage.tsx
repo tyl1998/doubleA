@@ -27,7 +27,7 @@ import {
 } from '../../api/tasks.js'
 import { useAgents } from '../../api/agents.js'
 import { useFeedback } from '../../app/feedback.js'
-import { chatPath, HOME_PATH } from '../../app/paths.js'
+import { AGENTS_PATH, chatPath } from '../../app/paths.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TaskFormModal, type TaskFormValues } from './TaskFormModal.js'
@@ -288,7 +288,7 @@ export function TasksPage() {
                       lead="建一个定时任务，让智能体按周期自动干活（例如每天 09:00 生成汇总表）。"
                       action={
                         agents.length === 0 ? (
-                          <Link to={HOME_PATH}>
+                          <Link to={AGENTS_PATH}>
                             <Button type="primary">先去建一个智能体</Button>
                           </Link>
                         ) : (

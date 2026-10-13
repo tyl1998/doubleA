@@ -85,8 +85,14 @@ export const TOOLKIT_IMAGE_NAME = 'doubulea/sandbox-toolkit'
  * ⚠️ **P0-3-14 后续为 `5`**：同批给 base/toolkit 的 `apt` / `npm` 步骤加了 **BuildKit 缓存挂载**
  * （`--mount=type=cache`，见两个 Dockerfile 的注释）。它改的是**构建**行为、也轻微改了只读层内容
  * （apt 的 lists 不再落镜像）⇒ 按"改内容就 +1"的纪律升到 `5`，免得宿主上留着同 tag 的旧层。
+ *
+ * ⚠️ **P1-9 R8 起为 `6`**：只读层里多了 `extensions/workspace/index.ts`（P1-9 · P2 加的文件）。
+ * **这正是这条纪律的活标本**：P2 加了扩展与 `Dockerfile` 断言，却漏了 +1 ⇒ 宿主上的
+ * `doubulea/sandbox-toolkit:5` 里**根本没有这个扩展**（`exec pi` 只加载 mcp-bridge），
+ * 症状是"开了 Code 模式，agent 的文件读写完全没走中介"，而后端一条错都没有。R8 的最小原型
+ * 复核在真实 `:5` 镜像里当场撞见（该文件缺失）⇒ 本批 +1 并重建，让扩展真的进镜像。
  */
-export const BASE_LAYER_VERSION = '5'
+export const BASE_LAYER_VERSION = '6'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -102,8 +108,11 @@ export const BASE_LAYER_VERSION = '5'
  * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向旧 base。
  *
  * ⚠️ **P0-3-14 后续为 `5`**：同一条理由 —— 本层自己与 base 的 Dockerfile 都加了缓存挂载。
+ *
+ * ⚠️ **P1-9 R8 起为 `6`**：同一条理由 —— base 层换了（多了 workspace 扩展），
+ * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向旧 base（扩展根本没进镜像）。
  */
-export const TOOLKIT_LAYER_VERSION = '5'
+export const TOOLKIT_LAYER_VERSION = '6'
 
 /** `doubulea/sandbox-base:<ver>` —— toolkit 的 `FROM` 与 `.env` 的 `SANDBOX_IMAGE_BASE` 都用它 */
 export const baseImageRef = () => `${BASE_IMAGE_NAME}:${BASE_LAYER_VERSION}`

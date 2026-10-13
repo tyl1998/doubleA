@@ -43,7 +43,9 @@ import {
   abortReasonOf,
   acquireConversationLock,
   ChatStoppedError,
+  clearSteerSignal,
   clearStopSignal,
+  drainSteerSignals,
   readStopSignal,
   releaseConversationLock,
   updateActiveSnapshot,
@@ -106,16 +108,33 @@ export async function runScheduledTaskTurn(input: {
   }
   openRun(conversationId)
 
+  // ★ 中途插话（P1-9 · P4 · R1）：headless 运行**没有 `SseChannel`**，所以插话要在这里自己消费
+  //   —— 否则 `POST /:id/steer` 会 `accepted:true`（本运行确实持锁、`streaming` 为真）却永远没人读，
+  //   症状是"插了话、界面说已送达、agent 却不知道"（静默丢弃，最难查的一类）。
+  //   机制与通道同款：producer 注册监听器（TaskAgent 转投引擎 `steer`），心跳里 `LPOP` 派发。
+  const steerListeners = new Set<(message: string) => void>()
+  // 残留插话（上一轮没消费完的）先清掉，别被这一轮读到（与 `streamChatReply` ② 同款）
+  await clearSteerSignal(conversationId)
+
   /**
-   * 心跳：两件事一起做 —— ①续锁（`updateActiveSnapshot` 的 `SET ... EX` 顺带刷新 TTL，
+   * 心跳：三件事一起做 —— ①续锁（`updateActiveSnapshot` 的 `SET ... EX` 顺带刷新 TTL，
    * 否则长静默期里锁会过期、`/active` 会误报"没有流在跑"）；②消费停止信号（这样页面上的
-   * 「停止」对定时运行**也生效** —— `signalStop` 写 `chat.stop:{id}`，这里读到就中断）。
+   * 「停止」对定时运行**也生效** —— `signalStop` 写 `chat.stop:{id}`，这里读到就中断）；
+   * ③消费中途插话（P1-9 · P4 · R1）—— 没有监听器时不消费（消息留在列表里）。
    */
   const heartbeat = setInterval(() => {
     void updateActiveSnapshot(conversationId, startedAt, {}).catch(() => undefined)
     void readStopSignal(conversationId)
       .then((stopped) => {
         if (stopped) controller.abort(new ChatStoppedError('user', '用户停止了本次运行'))
+      })
+      .catch(() => undefined)
+    void drainSteerSignals(conversationId)
+      .then((messages) => {
+        if (messages.length === 0 || steerListeners.size === 0) return
+        for (const message of messages) {
+          for (const listener of [...steerListeners]) listener(message)
+        }
       })
       .catch(() => undefined)
   }, config.limits.ssePingIntervalSec * 1000)
@@ -140,6 +159,13 @@ export async function runScheduledTaskTurn(input: {
       },
       // ② 危险工具按任务配置处置（见文件头 ②）：`autoApprove` ⇒ 自动按"已确认"放行
       awaitConfirm: async () => (input.autoApprove ? 'CONFIRMED' : 'REJECTED'),
+      // ③ 中途插话（P1-9 · P4 · R1）：TaskAgent 注册后，心跳里的 `drainSteerSignals` 把插话派过来
+      onSteer: (listener) => {
+        steerListeners.add(listener)
+        return () => {
+          steerListeners.delete(listener)
+        }
+      },
     })
     // ★ 终帧：观察者靠它收口（否则会永远停在"运行中"，用户实测即此）。
     //   交互式那条路由出口层 `SseChannel#finish` 发 `done`；headless 绕过了出口层 ⇒ 自己发。
@@ -168,6 +194,8 @@ export async function runScheduledTaskTurn(input: {
     clearTimeout(timeoutTimer)
     clearInterval(heartbeat)
     await clearStopSignal(conversationId).catch(() => undefined)
+    await clearSteerSignal(conversationId).catch(() => undefined)
+    steerListeners.clear()
     await releaseConversationLock(conversationId, startedAt).catch(() => undefined)
     closeRun(conversationId)
   }

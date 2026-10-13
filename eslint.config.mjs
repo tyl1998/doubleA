@@ -73,4 +73,12 @@ export default tseslint.config(
     ],
     rules: { 'no-console': 'off' },
   },
+
+  {
+    // ★ 路由网关（P1-14，`backend/src/router/**`）是**独立小进程**，与业务后端不同进程：
+    //   它的 stdout 就是运维接口（启动横幅、上游表、转发告警、降级日志），没有 requestId，
+    //   也不该被业务后端的 pino 装配拖住 ⇒ 与上面那组 CLI 同款，放开 `no-console`。
+    files: ['backend/src/router/**/*.ts'],
+    rules: { 'no-console': 'off' },
+  },
 )

@@ -23,6 +23,8 @@
 
 import { randomBytes } from 'node:crypto'
 
+import { sandboxInstanceKey, sandboxOwnerKey as buildSandboxOwnerKey } from '@doubulea/shared'
+
 import { Redis } from 'ioredis'
 
 import { config } from '../config.js'
@@ -328,6 +330,86 @@ export const CHAT_AUTO_APPROVE_TTL_SEC = 12 * 3600
 export const CHAT_STOP_TTL_SEC = 60
 
 /**
+ * `chat.steer:{conversationId}` 键名 —— **中途插话信号**（P1-9 · P4 · R1）。
+ *
+ * 与 {@link chatStopKey} 是**同族但形态不同**：
+ *   · 停止信号回答"有没有"（布尔、单值），而插话要带**内容**，且可能连着来几条
+ *     ⇒ 用**列表**（`RPUSH` 入、消费方 `LPOP` 取），顺序 = 用户点击顺序；
+ *   · 生产方（路由 `POST /:id/steer`）与消费方（{@link SseChannel} 的轮询）在**不同进程**里
+ *     （多实例 / 定时任务）⇒ 必须过 Redis，不能像 `askConversation` 那样只查进程内注册表。
+ *
+ * ⚠️ **消费只有一个出口**：`orchestrator/sse.ts` 的通道轮询 `LPOP` 交给 producer 注册的
+ * steer 监听器（TaskAgent 把它投给引擎的 `steer` 命令）。没有监听器时**不消费**（消息留在列表里），
+ * 于是"流还没接上 steer"这段窗口里的插话不会丢。
+ */
+export function chatSteerKey(conversationId: string): string {
+  return `chat.steer:${conversationId}`
+}
+
+/**
+ * 插话信号的 TTL（秒）。与 {@link CHAT_STOP_TTL_SEC} **同一条推理**：
+ * 主机制是收尾时显式 `DEL`，TTL 只为"键写了、流却已经死了"兜底。
+ * ⚠️ 不能短于一次轮询周期，否则插话在消费方读到之前就过期（用户看到"发了没反应"）。
+ */
+export const CHAT_STEER_TTL_SEC = 60
+
+/**
+ * `workspace.round.start:{conversationId}` —— 工作区**本轮起点**标记（P1-9 · P4 · R2）。
+ *
+ * 依据：`docs/子方案/Code模式工作区.md` §七 5（"每轮 agent 开始时记录…"）。TaskAgent 一轮开始
+ * （派活 `runTurn` 之前）写入 ISO 时刻；「撤销本轮」（`POST .../workspace/revert`）读它作为窗口左界。
+ *
+ * ⚠️ 与 {@link chatActiveKey} 不同：那是"有没有流在跑"的是非题（锁语义），这里是"上一轮从何时起"的
+ *    时间戳，且**只在工作区能力里被消费** ⇒ 单独一个键。缺省时「撤销本轮」返回明确错误（无标记 = 无从定义本轮）。
+ */
+export function workspaceRoundStartKey(conversationId: string): string {
+  return `workspace.round.start:${conversationId}`
+}
+
+/**
+ * `workspace.round.end:{conversationId}` —— 工作区**本轮终点**标记（P1-9 · P4 · R2）。
+ *
+ * 存在的理由：只记起点会让"轮末之后、下一次派活之前"的人为改动也落进窗口。有了终点，
+ * 撤销窗口 = `[start, end]`；终点缺失（轮在跑 / 崩了）时退化到"start 到此刻"。
+ */
+export function workspaceRoundEndKey(conversationId: string): string {
+  return `workspace.round.end:${conversationId}`
+}
+
+/**
+ * 工作区轮次标记的 TTL（秒）—— 7 天。
+ *
+ * 它只用于「撤销本轮」这一个事后动作（不需要跨进程实时性），故取一个**宽松**的值：
+ * 让人在一天后回来仍能撤销上一轮；又不至于让过期会话的标记永久留存。主机制是每轮起点覆盖写。
+ */
+export const WORKSPACE_ROUND_TTL_SEC = 7 * 24 * 3600
+
+/**
+ * `workspace.write:{conversationId}:{windowStart}` —— 工作区**写入限流**计数键（P1-9 · P6 · R6）。
+ *
+ * 依据：`子方案/Code模式工作区.md` §九（配额「超限拒绝并留痕」）+ §十二 P6（硬化）。挡"失控
+ * agent 每秒几百次写"把 PG / FS / S3 打满。
+ *
+ * 两条口径（与 {@link loginFailKey} 同款推理，但**固定窗口**而非滑动窗口）：
+ *   · **窗口起点进键名**（`Math.floor(now / 1min)`）：时间一到键名就翻新 ⇒ 天然"过窗即清零"，
+ *     不必读改写；旧键由 TTL 自然回收；
+ *   · **计数方是 `workspace/rateLimit.ts`**（`INCR` + 首次 `EXPIRE`）—— "超限了怎么办"是**领域**
+ *     语义（抛 `BUSY` / 留痕），不是 Redis 客户端的事，故这里只放键名与常量。
+ *
+ * ⚠️ 只在**跨进程**（多实例 / 沙箱代理与公网路由分属不同 listener）才有意义：工作区路由本就
+ *    要求粘性（§十六 A），故它主要服务"公网路由 + 沙箱代理"两条入口的合并计数。
+ */
+export function workspaceWriteRateKey(conversationId: string, windowStartMs: number): string {
+  return `workspace.write:${conversationId}:${windowStartMs}`
+}
+
+/**
+ * 写入限流计数键的 TTL（秒）。**必须 ≥ 一个窗口**（60s）—— 短于窗口的话计数会在窗口内过期、
+ * 限流形同虚设。取 120s：覆盖窗口本身 + 一点跨边界的容差；旧键最多多留一个窗口。
+ */
+export const WORKSPACE_WRITE_RATE_TTL_SEC = 120
+
+/**
  * 新建会话并返回 `sid`。
  *
  * `sid` **由本函数生成**（而不是由调用方传入）：会话 ID 是安全令牌，
@@ -535,6 +617,31 @@ export const SANDBOX_TOKEN_TTL_SEC = 12 * 3600
 
 /** `sandbox.mcp:{id}` 的 TTL（秒）。与令牌**同一条推理**，同取 12 小时 */
 export const SANDBOX_MCP_MAP_TTL_SEC = 12 * 3600
+
+// ═══════════════════════════ 沙箱多机归属（P1-14；P1-9 · R9 复用）═══════════════════════════
+//
+// 两张表（键名构造在 `shared/src/router.ts`，判据只有一处）：
+//
+//   sandbox:owner:{conversationId}   → `{instanceId}`       会话**钉在哪台**（路由的唯一事实来源）
+//   sandbox:instance:{instanceId}    → `{advertiseAddr,…}`   哪几台**在线**（网关实例表 + 同名自检）
+//
+// ⚠️ 为什么 owner 目录**不能**用 `hash(conversationId) % N` 替代（`子方案` §三 5）：哈希把落点
+//    钉死成"会话 id 的函数"，一旦某台宕机，它名下的会话**没法在别的机器重建**（哈希还指向那台）。
+//    目录法把落点当**运行期事实**记录，天然支持"换机重建"。
+//
+// ⚠️ 取值**不设** `SET NX` 失败即冲突：并发首个 `/chat` 已由 `chat.active:{id}` 锁串行化，
+//    登记只可能有一个赢家；输家读回已有值即可。写目录的时机是"抢锁之后、建容器之前"。
+
+/** `sandbox:owner:{conversationId}` —— 会话→实例目录（值 = instanceId；前缀走 `SANDBOX_OWNER_KEY_PREFIX`） */
+export function sandboxOwnerKey(conversationId: string): string {
+  return buildSandboxOwnerKey(config.sandbox.ownerKeyPrefix, conversationId)
+}
+
+/**
+ * `sandbox:instance:{instanceId}` —— 在线实例注册表（复用 §五 1 的同一个键）。
+ * 值与 TTL 由 `sandbox/owner.ts` 管理（`SET NX EX` + 周期续期 + 退出 `DEL`）。
+ */
+export { sandboxInstanceKey }
 
 // ═══════════════════════════ 登录限速（P0-1-7）═══════════════════════════
 //

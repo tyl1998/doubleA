@@ -170,15 +170,18 @@ export async function reconcileOnBoot(): Promise<ReconcileReport | undefined> {
     // ② 队列整表清空（**只在这里做**：运行期清空会连正常排队的等待者一起清掉）
     report.queueCleared = await clearSandboxQueue()
 
-    // ③ 账本回落：容器已被我们全清 ⇒ 所有"活着"的行都不再对应真实对象
+    // ③ 账本回落：容器已被我们全清 ⇒ 所有"活着"的行都不再对应真实对象。
+    //   ★ P1-14 §三 3（**最大冲突点**）：必须只动 `instanceId = self` 的行 ——
+    //   不加这条过滤时，A 重启会把 B/C 上正在跑的沙箱行全标成 `RECYCLED`
+    //   （容器还在跑、账本已死，而 Docker 与日志都不会报错）。
     const prisma = getPrisma()
     const running = await prisma.sandbox.updateMany({
-      where: { status: 'RUNNING' },
+      where: { status: 'RUNNING', instanceId: config.sandbox.instanceId },
       data: { status: 'RECYCLED' },
     })
     report.runningRowsRecycled = running.count
     const creating = await prisma.sandbox.updateMany({
-      where: { status: 'CREATING' },
+      where: { status: 'CREATING', instanceId: config.sandbox.instanceId },
       data: { status: 'FAILED', errorMsg: '创建未完成（后端已重启，容器已随启动对账清掉）' },
     })
     report.danglingCreatingRows = creating.count
@@ -190,6 +193,7 @@ export async function reconcileOnBoot(): Promise<ReconcileReport | undefined> {
   getLogger().info(
     {
       dockerVersion,
+      instanceId: config.sandbox.instanceId,
       containers: `${report.removedContainers}/${report.containers}`,
       volumes: `${report.removedVolumes}/${report.volumes}`,
       queueCleared: report.queueCleared,
@@ -231,7 +235,8 @@ export async function reapOrphans(): Promise<ReapReport | undefined> {
   //    JS 侧写入（见 `manager.ts#createSandbox` 的注释与 `docs/02` 的"已知问题：timestamptz 时区"）。
   const staleCutoff = new Date(Date.now() - graceSec * 1000)
   const stale = await prisma.sandbox.updateMany({
-    where: { status: 'CREATING', createdAt: { lt: staleCutoff } },
+    // ★ P1-14：只判本实例的 `CREATING`（别人的行不归我动）
+    where: { status: 'CREATING', createdAt: { lt: staleCutoff }, instanceId: config.sandbox.instanceId },
     data: { status: 'FAILED', errorMsg: '创建未完成（超过宽限期未见容器就绪）' },
   })
   report.staleCreatingRows = stale.count
@@ -305,7 +310,9 @@ export async function reapIdleSandboxes(): Promise<number> {
 
   const cutoff = new Date(Date.now() - config.sandbox.idleTtlMin * 60_000)
   const stale = await getPrisma().sandbox.findMany({
-    where: { status: 'RUNNING', lastActiveAt: { lt: cutoff } },
+    // ★ P1-14 §三 3：空闲回收也**只扫本实例的行** —— 否则会对 B 的会话调 `recycleSandbox`，
+    //   本机没有它的容器 ⇒ 走 `container-missing` 错杀（把别人正在跑的沙箱账本标死）。
+    where: { status: 'RUNNING', lastActiveAt: { lt: cutoff }, instanceId: config.sandbox.instanceId },
     select: { conversationId: true, lastActiveAt: true },
   })
   if (stale.length === 0) return 0
@@ -338,7 +345,9 @@ export async function reapIdleSandboxes(): Promise<number> {
  */
 export async function auditWorkVolumes(): Promise<WorkVolumeAudit | undefined> {
   const limitMb = config.sandbox.limits.workVolumeMb
-  const running = await getPrisma().sandbox.count({ where: { status: 'RUNNING' } })
+  const running = await getPrisma().sandbox.count({
+    where: { status: 'RUNNING', instanceId: config.sandbox.instanceId },
+  })
   if (running === 0) {
     lastVolumeAudit = undefined
     return undefined
@@ -471,7 +480,12 @@ async function collectLiveConversations(graceSec: number): Promise<Set<string>> 
   const prisma = getPrisma()
   const cutoff = new Date(Date.now() - graceSec * 1000)
   const rows = await prisma.sandbox.findMany({
-    where: { OR: [{ status: 'RUNNING' }, { status: 'CREATING', createdAt: { gte: cutoff } }] },
+    // ★ P1-14 §三 3：活体集合**限定本实例名下的行** —— 本机容器只与本机账本比对。
+    //   不加过滤时 A 会把属于 B 的活沙箱判成孤儿（拿不到 B 的容器 ⇒ 误删账本行）。
+    where: {
+      instanceId: config.sandbox.instanceId,
+      OR: [{ status: 'RUNNING' }, { status: 'CREATING', createdAt: { gte: cutoff } }],
+    },
     select: { conversationId: true },
     distinct: ['conversationId'],
   })

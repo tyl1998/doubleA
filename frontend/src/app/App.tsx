@@ -1,48 +1,38 @@
 /**
- * 路由表（P0-1-30 建表；P0-1-31 接上智能体三条）
+ * 路由表（P0-1-30 建表；P0-1-31 接上智能体三条；**P1-15 改为"以聊天为主页"的信息架构**）
  *
- * 依据：`docs/03-前端设计.md` §二 的 14 条路由与权限列。
+ * 依据：`docs/03-前端设计.md` §二 的路由与权限列 + `子方案/聊天主页与信息架构改造.md` §二
+ *      （新信息架构：`/` = 聊天主页、`/c/:conversationId` 定位会话、`/new/:agentId` 新会话态）。
  *
- * ## 已落地的链路
+ * ## 单一外壳（P1-15 修订 R2）
  *
- * P0-1-30：登录 → 首登强制改密 → 进首页，加上 `/settings/password`。
- * P0-1-31：`/`（智能体列表）、`/agents/new`、`/agents/:id/edit` 换成真实页面。
- * P0-1-32：`/chat/:agentId/:conversationId?` 换成真实的对话页（SSE 客户端 + 消息流七种卡片）。
- * P0-1-35：`/knowledge` 与 `/knowledge/:id` 换成真实的知识库列表与详情页
- *          （文档上传 / 覆盖重传 / 重试 / 下载 / 删除 + 检索测试抽屉 + 状态轮询）。
- * P0-1-36：`/admin/users` 与 `/admin/models` 换成真实的用户管理与模型池管理
- *          （ADMIN 专属；两级路由的守卫顺序仍然是 `RequireAuth` 在外、`RequireAdmin` 在内）。
- * P0-2-11：`/mcp` 与 `/settings/credentials` 换成真实的 MCP 管理页与我的凭据页
- *          （**至此 `03` §二 的 P0 十条路由全部落地**）。
- * P1-6：`/tasks` 换成真实的**任务中心（定时任务）**页。
- * P1-7：`/admin/usage` 换成真实的**用量统计**页（区间筛选 + 三张聚合表）——
- *       `BatchPlaceholderPage` **至此全部退役**（路由表里只剩 `*` 未找到页），`03` §二 的路由
- *       全部是真实页面。
- *          ⚠️ 我的凭据页**与 MCP 解耦**：路由从 `/mcp/credentials` 改为 `/settings/credentials`
- *          （个人设置族，与 `/settings/password` 同族），页面内容仍按 MCP server 分组。
+ * **所有受保护路由都挂在同一个外壳** {@link AppShell} 下：左列永远是会话栏（`ConvRail`），
+ * 只有右侧主区随路由换形态（聊天视图 / 页面视图，判据 `isChatHomePath`）。
+ * —— 首版曾把聊天与管理拆成两种外壳，导致"点管理功能就跳回旧版 rail 页"，本次修订取消。
+ * 管理入口（智能体 / 知识库 / … / 用量）收在会话栏底部的 popover 里（设计 I3：管理跟会话走），
+ * 不再有独立的常驻导航列。
  *
- * 其余路由**按 `03` §二 全部登记**，但指向 {@link BatchPlaceholderPage} —— 写清"属哪一批、会包含什么"。
+ * ## P1-15 的路径变化
  *
- * 为什么不是先只登记已实现的路由：`03` §二 的路由表是**产品结构**，导航项的多寡本身就是
- * 验收内容（"ADMIN 与非 ADMIN 的导航项差异正确"）；而且一个能点进去、明说"属 P0-1-35"的入口，
- * 比一个 404 或一个消失的入口好得多。占位页**不接任何后端**，不会污染任何验收。
- *
- * ⚠️ `/chat/:agentId/:conversationId?` 里的**可选段**是本批加的（P0-1-32）：
- * `03` §二 写的就是 `:conversationId? 可选定位`，而"刷新后历史还能重画"这件事
- * **只有 URL 能承载**（会话 id 放在组件 state 里，刷新就没了 ⇒ 验收里的"刷新后形态一致"
- * 根本验不了）。侧栏（在会话之间切换）仍属 P0-1-34。
+ * - `/` 从"智能体列表"变成"聊天主页"；智能体列表搬到 `/agents`（管理目的地之一）。
+ * - `chatPath(agentId[, conversationId])` 产出 `/new/:agentId` 或 `/c/:conversationId`（规范路径）。
+ * - ⚠️ **老深链 `/chat/:agentId/:conversationId?` 保留并重定向**（旧书签、文档里的地址仍有效）：
+ *   有 `conversationId` ⇒ `/c/:id`；没有 ⇒ `/new/:agentId`。**不做 404**。
  *
  * ## 守卫的嵌套顺序不是随意的
  *
  * `RequireAuth` 在外、`RequireAdmin` 在内：外层的等待（`/auth/me`）必须先完成，
  * 内层才有"这个人是谁"可判。反过来会让未登录用户在刷新时看到一次"没有权限"。
+ * ⚠️ **P1-15：`/admin/usage` 移出 `RequireAdmin`**（用量统计登录即可，`子方案` §八）——
+ * 这是有意的产品放宽，别当成漏写。
  */
 
-import { Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes, useParams } from 'react-router-dom'
 
-import { AppLayout } from './AppLayout.js'
+import { AppShell } from './AppShell.js'
 import { RequireAdmin } from './RequireAdmin.js'
 import { RequireAuth } from './RequireAuth.js'
+import { conversationPath, newConversationPath } from './paths.js'
 import { NotFoundPage } from '../pages/NoticePage.js'
 import { ModelsPage } from '../pages/admin/ModelsPage.js'
 import { UsagePage } from '../pages/admin/UsagePage.js'
@@ -50,7 +40,7 @@ import { UsersListPage } from '../pages/admin/UsersListPage.js'
 import { AgentCreatePage, AgentEditPage } from '../pages/agents/AgentFormPage.js'
 import { AgentsListPage } from '../pages/agents/AgentsListPage.js'
 import { ArtifactCollectionPage } from '../pages/artifacts/ArtifactCollectionPage.js'
-import { ChatPage } from '../pages/chat/ChatPage.js'
+import { ChatHomePage } from '../pages/chat/ChatHomePage.js'
 import { KnowledgeDetailPage } from '../pages/knowledge/KnowledgeDetailPage.js'
 import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
 import { LoginPage } from '../pages/login/LoginPage.js'
@@ -59,49 +49,58 @@ import { McpServersPage } from '../pages/mcp/McpServersPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 import { TasksPage } from '../pages/tasks/TasksPage.js'
 
+/** 老深链 `/chat/:agentId/:conversationId?` ⇒ 重定向到规范路径（见文件头） */
+function LegacyChatRedirect() {
+  const { agentId, conversationId } = useParams<{ agentId?: string; conversationId?: string }>()
+  if (conversationId !== undefined) return <Navigate to={conversationPath(conversationId)} replace />
+  if (agentId !== undefined) return <Navigate to={newConversationPath(agentId)} replace />
+  return <Navigate to="/" replace />
+}
+
 export function App() {
   return (
     <Routes>
       {/* 公开路由：不带应用外壳（`design/login.html` 的构成） */}
       <Route path="/login" element={<LoginPage />} />
 
-      {/* 受保护路由：先登录态，再 ADMIN，最后才是页面 */}
+      {/* 受保护路由：先登录态，最后才是页面；**全部走同一个 AppShell**（单一外壳） */}
       <Route element={<RequireAuth />}>
-        <Route element={<AppLayout />}>
-          {/* S-02 · 智能体：首页就是列表（`03` §二：`/` = 智能体列表，登录即可看全部） */}
-          <Route index element={<AgentsListPage />} />
+        <Route element={<AppShell />}>
+          {/* ── 聊天视图（会话栏常驻；主区是消息流 / 欢迎态，不带全局顶栏）── */}
+          {/* `/`：进站即聊天主页（跨智能体会话历史 + 当前会话；无选中时是欢迎态） */}
+          <Route index element={<ChatHomePage />} />
+          {/* `/c/:conversationId`：定位某个会话（`agentId` 由会话数据自带，路径里不带） */}
+          <Route path="/c/:conversationId" element={<ChatHomePage />} />
+          {/* `/new/:agentId`：新会话态（展示开场白 + 引导问题，**不建会话**） */}
+          <Route path="/new/:agentId" element={<ChatHomePage />} />
+          {/* 老深链兼容：`/chat/:agentId[/:conversationId]` 重定向到上面两条（不做 404） */}
+          <Route path="/chat/:agentId/:conversationId?" element={<LegacyChatRedirect />} />
+
+          {/* ── 页面视图（同一外壳；主区换成「顶栏面包屑 + `.page`」）── */}
+          {/* S-02 · 智能体（P1-15 从 `/` 搬来）：登录即可看全部 */}
+          <Route path="/agents" element={<AgentsListPage />} />
           <Route path="/agents/new" element={<AgentCreatePage />} />
           <Route path="/agents/:id/edit" element={<AgentEditPage />} />
-          {/* S-04 · 对话（P0-1-32 接真页面）。`:conversationId?` 可选：**省略即新会话态**
-              （`03` §4.1：展示开场白，首条消息发送时才创建会话、并把 id 写进 URL）——
-              于是"刷新"这件事能定位到同一个会话，历史与流式走同一套组件重画。 */}
-          <Route path="/chat/:agentId/:conversationId?" element={<ChatPage />} />
-          {/* S-05 · 知识库（P0-1-35 接真页面）。列表与详情**都是登录即可**：
-              知识库没有 owner 列，是全员共享资源（`docs/02` §4.6 的权限口径与模型池相反）。 */}
+          {/* S-05 · 知识库：列表与详情**都是登录即可**（知识库没有 owner 列，是全员共享资源） */}
           <Route path="/knowledge" element={<KnowledgeListPage />} />
           <Route path="/knowledge/:id" element={<KnowledgeDetailPage />} />
-          {/* S-06 · MCP（P0-2-11 接真页面）。**两条都是登录即可**：`mcp_servers` 没有 owner 列
-              ⇒ 人人可改可删（第五族，`02` §4.7）；凭据那一族的收窄在 `user_id` 上、只在服务端，
-              界面上没有任何"别人的凭据"可看。 */}
+          {/* S-06 · MCP：登录即可（`mcp_servers` 没有 owner 列） */}
           <Route path="/mcp" element={<McpServersPage />} />
-          {/* S-08b · 我的凭据（P0-2-11 接真页面）。它是**个人凭据页、与 MCP 解耦**：
-              归入 `/settings` 一族（与 `/settings/password` 同族），后端端点仍是 `/api/mcp/credentials`。 */}
+          {/* S-08b · 我的凭据（个人设置族，与 MCP 解耦；Git 凭据内嵌为区块） */}
           <Route path="/settings/credentials" element={<McpCredentialsPage />} />
-          {/* S-10 · 会话产物：跨会话汇总**本人**全部产物（含删除会话后保留的那些），
-              登录即可、**仅本人可见**（服务端按 `user_id` 过滤）。可预览 / 下载 / 删除。 */}
+          {/* S-10 · 会话产物：跨会话汇总**本人**全部产物，登录即可、仅本人可见 */}
           <Route path="/artifacts" element={<ArtifactCollectionPage />} />
-          {/* S-09 · 任务中心（P1-6 接真页面：**定时任务**管理）。登录即可、**仅本人**
-              （服务端按 `scheduled_tasks.user_id` 收窄）。 */}
+          {/* S-09 · 任务中心（定时任务管理）：登录即可、仅本人 */}
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/settings/password" element={<PasswordPage />} />
 
-          {/* ADMIN 专属（`03` §三：管理入口仅 ADMIN 可见）。三页都是真页面：
-              `/admin/users`、`/admin/models`（P0-1-36）、`/admin/usage`（**P1-7**）。 */}
+          {/* S-07c · 用量统计（P1-7）：**P1-15 起登录即可**（移出 `RequireAdmin`，见文件头） */}
+          <Route path="/admin/usage" element={<UsagePage />} />
+
+          {/* ADMIN 专属（`03` §三：这两页仅 ADMIN 可见） */}
           <Route element={<RequireAdmin />}>
             <Route path="/admin/users" element={<UsersListPage />} />
             <Route path="/admin/models" element={<ModelsPage />} />
-            {/* S-07c · 用量统计（P1-7 接真页面）：区间筛选 + 按用户/智能体/模型三张聚合表。 */}
-            <Route path="/admin/usage" element={<UsagePage />} />
           </Route>
 
           <Route path="*" element={<NotFoundPage />} />

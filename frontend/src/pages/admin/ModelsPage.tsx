@@ -52,7 +52,7 @@ import {
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH } from '../../app/paths.js'
+import { AGENTS_PATH } from '../../app/paths.js'
 import { DeleteProviderModal } from './DeleteProviderModal.js'
 import { ModelFormModal } from './ModelFormModal.js'
 import { ProviderFormModal } from './ProviderFormModal.js'
@@ -340,7 +340,7 @@ export function ModelsPage() {
                   <>
                     {blocked}
                     <br />
-                    <Link to={HOME_PATH}>去智能体列表改绑 →</Link>
+                    <Link to={AGENTS_PATH}>去智能体列表改绑 →</Link>
                   </>
                 }
                 okText="删除"

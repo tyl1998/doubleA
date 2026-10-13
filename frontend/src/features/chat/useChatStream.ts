@@ -60,6 +60,8 @@ import {
   createConversation,
   fetchConversationActive,
   flattenMessagePages,
+  invalidateMyConversations,
+  steerConversation,
   stopConversation,
   streamChat,
   streamRegenerate,
@@ -76,6 +78,14 @@ import type { RoundKind, StreamRound } from './roundReducer.js'
 
 /** `send` 的结果：`ok: false` 时调用方应当**把正文还给输入框**（前置失败不留痕迹） */
 export type SendOutcome = { ok: true } | { ok: false; error: unknown }
+
+/**
+ * `steer`（中途插话，P1-9 · P4 · R1）的结果。
+ *
+ * `accepted: false` **不是错误**（幂等）：当前没有在跑的流 —— 与 `stopConversation` 的
+ * `signaled: false` 同款。`ok: false` 才是真失败（网络 / 信封错误），调用方给一句提示并把正文还回输入框。
+ */
+export type SteerOutcome = { ok: true; accepted: boolean } | { ok: false; error: unknown }
 
 export interface UseChatStreamOptions {
   /**
@@ -133,6 +143,14 @@ export interface UseChatStreamResult {
   regenerate: (userText: string, modelId?: string) => Promise<SendOutcome>
   /** 点「停止」（时序见 `stopController.ts`）；返回值供页面决定说什么 */
   stop: () => Promise<StopOutcome>
+  /**
+   * 中途插话（P1-9 · P4 · R1）：向**运行中**的 agent 插一句话（`POST /:id/steer`）。
+   *
+   * ⚠️ 只对 **TaskAgent** 会话有意义（沙箱）：ChatBot 链路的 producer 不注册 steer 监听器
+   * ⇒ 插话不会被消费。前端据此把它只对 TaskAgent 会话放出（`agentType` 判据在页面）。
+   * 返回 `{ ok:true, accepted:false }` = 流刚好结束（**幂等，不是错误**）。
+   */
+  steer: (message: string) => Promise<SteerOutcome>
   /**
    * 拉取历史对齐（`03` §4.1："点击黄条 = 立即拉取历史对齐"）。
    * 返回值是**对齐的结论**（服务端存下来了 / 没有这一轮 / 服务端还在生成），页面据此提示；
@@ -305,6 +323,9 @@ export function useChatStream(
         // 放在 `finally` 而不是 `done` 那一支：中断/断线的一轮**也可能落库**，
         // 而"没落库"时多拉一次列表的代价只是一次几十行的查询（`03` §五 的 `done` 行是下限，不是上限）。
         void queryClient.invalidateQueries({ queryKey: agentConversationsQueryKey(agentId) })
+        // 聊天主页（P1-15）的会话栏看的是**跨智能体**那一份，与上面那份是两棵树 ⇒ 两处都失效。
+        // 漏了这一行，主页左栏的标题 / 相对时间会停在"还没有消息"，而排序也不会把它推到最前。
+        invalidateMyConversations(queryClient)
         // 产物面板（P0-3-11）也是"这一轮真的发生过 ⇒ 库里可能多了几行"。它**没有**
         // `last_message_at` 那种排序副作用，但面板上那一条要从"刚生成"变成真正的时刻读数
         // （`artifactPanelModel#artifactTimeText` 的 `live` 那一档），靠的就是这份列表重取回来。
@@ -500,13 +521,39 @@ export function useChatStream(
     }
   }, [stopController])
 
+  /**
+   * 中途插话（P1-9 · P4 · R1）。**纯前端闸门 + 一次普通请求**（不走 `stopController` 那套时序）：
+   * 与 `send` / `stop` 共用"本会话正在流式"这条判据，但**不参与流收口** —— 插话只是塞一句话进去，
+   * 这一轮的 `done` / `error` 照旧由那条 SSE 流收尾（前端不做任何额外状态）。
+   *
+   * ⚠️ 只在"本会话正 streaming"时发（`round.status === 'streaming' && streamFor === targetId`）：
+   * 流刚好结束时的插话会得到 `accepted:false`（幂等），这里提前拦一下省一次必然落空的请求。
+   */
+  const steer = useCallback(async (message: string): Promise<SteerOutcome> => {
+    const text = message.trim()
+    if (text === '') return { ok: true, accepted: false }
+    const targetId = conversationIdRef.current
+    if (targetId === undefined) {
+      return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法插话', 0) }
+    }
+    const state = useChatStreamStore.getState()
+    if (state.round === null || state.round.status !== 'streaming' || state.streamFor !== targetId) {
+      return { ok: true, accepted: false }
+    }
+    try {
+      const result = await steerConversation(targetId, text)
+      return { ok: true, accepted: result.accepted }
+    } catch (error) {
+      return { ok: false, error }
+    }
+  }, [])
+
   /** 点黄条：对齐历史，然后把黄条收掉（无论对齐结论是什么 —— 用户点它就表示"以服务端为准"） */
   const alignAndClear = useCallback(async (): Promise<AlignOutcome | null> => {
     const outcome = await align()
     useChatStreamStore.getState().clearDisconnect()
     return outcome
   }, [align])
-
   // 卸载：中断在飞的流 + 清空这一轮。
   //
   // ⚠️ **刻意不依赖 `conversationId`**（早先写成依赖它，会导致一个很难查的 bug）：
@@ -544,6 +591,7 @@ export function useChatStream(
     send,
     regenerate,
     stop,
+    steer,
     align: alignAndClear,
   }
 }

@@ -203,6 +203,21 @@ compute_allow_csv() {
     add_allow "$extra"
   done
 
+  # P1-9 · R11：平台声明的出网白名单（`infra/.env` 的 `SANDBOX_EGRESS_ALLOW_HOSTS`）。
+  #   · `*` ⇒ 关白名单（全放行，设计对 Code 模式 git 出网的默认口径）；
+  #   · 逗号列表 ⇒ 逐项追加（host / host:port / *.host）；
+  #   · **未设（空）⇒ 不改变既有行为**（仍只放行模型池 + --allow）—— 免得老部署"升上来就全通"。
+  local env_allow env_item
+  env_allow="$(env_value SANDBOX_EGRESS_ALLOW_HOSTS)"
+  if [ "$env_allow" = '*' ]; then
+    ALLOW_ALL=1
+  elif [ -n "$env_allow" ]; then
+    IFS=',' read -r -a env_items <<< "$env_allow"
+    for env_item in ${env_items[@]+"${env_items[@]}"}; do
+      add_allow "$(printf '%s' "$env_item" | tr -d '[:space:]')"
+    done
+  fi
+
   if [ "$ALLOW_ALL" -eq 1 ]; then
     ALLOW_CSV='*'
     if [ -z "$quiet" ]; then

@@ -84,9 +84,16 @@ it('作用域标签（全局记忆 / Agent 记忆）', () => {
 
 console.log('── M3 源码级守门（契约接线）──')
 it('对话页接了记忆开关与提示组件', () => {
+  // ⚠️ R4（2026-10-13）：会话级记忆开关从 AntD `Switch` 改为**输入框下方的图标按钮**
+  // （`ConversationSettings` 里的「记入记忆」控制，`BulbOutlined` + `onToggleMemoryExcluded`）。
+  // 守门分两处读：提示栈在 ChatPage、开关在 ConversationSettings。
   const chat = readFileSync(join(here, '../src/pages/chat/ChatPage.tsx'), 'utf8')
-  if (!chat.includes('MemoryExclusionSwitch') || !chat.includes('MemoryNoticeStack')) {
-    throw new Error('ChatPage 未接入 MemoryExclusionSwitch / MemoryNoticeStack')
+  const settings = readFileSync(join(here, '../src/features/chat/ConversationSettings.tsx'), 'utf8')
+  if (!chat.includes('MemoryNoticeStack') || !chat.includes('ConversationSettings')) {
+    throw new Error('ChatPage 未接入 ConversationSettings / MemoryNoticeStack')
+  }
+  if (!settings.includes('BulbOutlined') || !settings.includes('onToggleMemoryExcluded')) {
+    throw new Error('ConversationSettings 未接入会话记忆开关（图标按钮）')
   }
 })
 it('任务中心挂了「活动」「记忆」两个 tab', () => {

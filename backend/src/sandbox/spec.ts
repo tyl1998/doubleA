@@ -176,6 +176,17 @@ export interface SandboxContainerSpecInput {
   image: string
   conversationId: string
   volumeName: string
+  /**
+   * ★ P1-9：工作区**宿主目录绝对路径**（`WORKSPACE_ROOT/{conversationId}`）。
+   *
+   * 给了它就挂 **bind mount**（`{workspacePath} → /work`），容器里的 pi 与浏览器编辑器看到
+   * **同一批字节**（Code 模式的核心，`子方案/Code模式工作区.md` §二 1）；
+   * 不给则退回**具名卷**（P1-9 之前的行为，供手工 run / 旧路径复用）。
+   *
+   * ⚠️ 目录**必须已存在**（Docker bind 不会替你建，且会静默挂出一个 0600 空目录）——
+   * 由调用方（`manager.ts#createSandbox`）先 `ensureWorkspaceDir`。
+   */
+  workspacePath?: string
   startedAt: Date
   /**
    * 这一轮模型（`agents.model_id`，P0-3-4）⇒ 写进标签 {@link SANDBOX_LABEL_MODEL}。
@@ -262,6 +273,25 @@ export function sandboxProxyEnv(input: { token: string; proxyTimeoutSec: number 
     [SANDBOX_TOKEN_ENV]: input.token,
     [SANDBOX_PROXY_TIMEOUT_ENV]: String(Math.round(input.proxyTimeoutSec * 1000)),
   }
+}
+
+/**
+ * 工作区中介开关的容器环境变量名（P1-9 · P3）。
+ *
+ * ⚠️ **跨边界契约**：容器内 pi 扩展 `infra/sandbox/base/pi-agent/extensions/workspace/index.ts`
+ * 用**同一个字面量**判断"要不要同名覆盖 read/write/edit"（它是预烘焙的 TS，不 import 本文件）。
+ * 改一处必须同步改另一处 —— 对不上的症状是"开了 Code 模式但中介没生效"，且容器侧不报错。
+ */
+export const WORKSPACE_MEDIATION_ENV = 'DOUBULEA_WORKSPACE_MEDIATION'
+
+/**
+ * Code 模式要注入的容器 env（**纯函数**）。
+ *
+ * 只有 `conversations.code_mode = true` 的会话才注入 `DOUBULEA_WORKSPACE_MEDIATION=1`；
+ * 普通会话**一个都不注入**（扩展默认关闭，行为不变）—— 见 `子方案/Code模式工作区.md` §六 4。
+ */
+export function workspaceMediationEnv(codeMode: boolean): Record<string, string> {
+  return codeMode ? { [WORKSPACE_MEDIATION_ENV]: '1' } : {}
 }
 
 // ───────────────────────────── LLM 注入（P0-3-4）─────────────────────────────
@@ -528,17 +558,25 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
         '/tmp': `rw,nosuid,nodev,noexec,size=${input.limits.tmpfsMb}m`,
         [SANDBOX_AGENT_HOME]: `${tmpfsOpts},uid=${SANDBOX_AGENT_UID},gid=${SANDBOX_AGENT_UID},mode=0755`,
       },
-      // 具名卷 → `/work`。⚠️ 写在 `HostConfig.Mounts` 而不是 `Config.Binds`：
-      // `--mount` 的语义更明确（不会像 `-v` 那样在宿主上"顺手"建出不存在的目录、
-      // 也不会把名字里带 `/` 的东西解释成路径），且类型上就是它的家
-      // （Docker inspect 里它也确实落在 `HostConfig.Mounts`）。
+      // work 目录 → `/work`。★ P1-9：Code 模式工作区用**宿主 bind mount**（人与 agent 同一批字节），
+      // 无 workspacePath 时退回具名卷（P1-9 之前的行为）。⚠️ 写在 `HostConfig.Mounts` 而不是
+      // `Config.Binds`：`--mount` 的语义更明确（不会像 `-v` 那样在宿主上"顺手"建出不存在的目录、
+      // 也不会把名字里带 `/` 的东西解释成路径），且类型上就是它的家。
       Mounts: [
-        {
-          Type: 'volume',
-          Source: input.volumeName,
-          Target: SANDBOX_WORK_DIR,
-          ReadOnly: false,
-        },
+        input.workspacePath === undefined
+          ? {
+              Type: 'volume',
+              Source: input.volumeName,
+              Target: SANDBOX_WORK_DIR,
+              ReadOnly: false,
+            }
+          : {
+              Type: 'bind',
+              // bind 的 Source 必须是**绝对路径**（宿主目录）；目录属主要匹配容器内 agent uid
+              Source: input.workspacePath,
+              Target: SANDBOX_WORK_DIR,
+              ReadOnly: false,
+            },
       ],
       // ⚠️ P0-3-3 刻意**没有** StorageOpt：理由见函数头上方那段（实测三条）。work 卷的体量
       //    改由「周期巡检 + 超限告警」看着，不假装有硬配额。

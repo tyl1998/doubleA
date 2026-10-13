@@ -1253,6 +1253,44 @@ await it('H10 `elsewhere` 的优先级排在 `sending` **之后**（顺序即正
   assertEqual(streaming.primary.action, 'stop', '主按钮仍是停止')
 })
 
+await it('H11 「插话」入口（P1-9 · P4 · R1）：只在沙箱 streaming 且草稿非空时露出，且不改主按钮', () => {
+  // 非沙箱（`steerable` 缺省 false）⇒ 永不露出：ChatBot 的 producer 不消费插话，
+  // 放出入口只会得到一个"点了没反应"的按钮
+  const chatBot = composeState({
+    round: roundOf({ status: 'streaming' }),
+    sending: true,
+    stopping: false,
+    draft: '边跑边说',
+  })
+  assertEqual(chatBot.steer.visible, false, 'ChatBot 会话不露出插话入口')
+
+  // 沙箱 + streaming + **空草稿** ⇒ 不露出（没内容可插）
+  const emptyDraft = composeState({
+    round: roundOf({ status: 'streaming' }),
+    sending: true,
+    stopping: false,
+    draft: '',
+    steerable: true,
+  })
+  assertEqual(emptyDraft.steer.visible, false, '空草稿不露出')
+
+  // 沙箱 + streaming + 非空草稿 ⇒ 露出、可点，且**主按钮仍是停止**（插话是**并列**动作，不替换停止）
+  const sandbox = composeState({
+    round: roundOf({ status: 'streaming' }),
+    sending: true,
+    stopping: false,
+    draft: '先别删那个文件',
+    steerable: true,
+  })
+  assertEqual(sandbox.steer.visible, true, '露出')
+  assertEqual(sandbox.steer.disabled, false, '可点')
+  assertEqual(sandbox.primary.action, 'stop', '主按钮不受影响（仍是停止）')
+
+  // 空闲态 ⇒ 即使 steerable 也不露出（空闲时正常发送即可，不需要"插话"这个并行入口）
+  const idle = composeState({ round: null, sending: false, stopping: false, draft: '你好', steerable: true })
+  assertEqual(idle.steer.visible, false, '空闲态不露出')
+})
+
 
 // ═════════════════════════════ I 组：停止时序（P0-1-33） ═════════════════════════
 
@@ -1923,13 +1961,14 @@ await it('K9 **坑预判守门**：流结束时必须失效会话列表（否则
   )
 })
 
-await it('K10 侧栏**不许自己排序**（排序口径只有服务端那一份）', () => {
-  // 在侧栏里再排一次 = 出现了第二份排序口径，而它与服务端的 offset/limit 分页会打架
+await it('K10 会话栏**不许自己排序**（排序口径只有服务端那一份）', () => {
+  // 在会话栏里再排一次 = 出现了第二份排序口径，而它与服务端的 offset/limit 分页会打架
   // （症状："翻到第二页时同一条又出现一次 / 某一条永远看不到"）。分组只切归属，不动顺序。
+  // ⚠️ P1-15：会话栏从 `ConversationSidebar`（单智能体）换成 `ConvRail`（跨智能体）—— 守门跟着搬。
   const source = stripComments(
-    readFileSync(new URL('../src/features/chat/ConversationSidebar.tsx', import.meta.url), 'utf8'),
+    readFileSync(new URL('../src/features/chat/ConvRail.tsx', import.meta.url), 'utf8'),
   )
-  assert(!source.includes('.sort('), '侧栏源码里不该出现 `.sort(`')
+  assert(!source.includes('.sort('), '会话栏源码里不该出现 `.sort(`')
 })
 
 // ───────────────────────────── 复原桩 ─────────────────────────────

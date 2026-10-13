@@ -45,6 +45,7 @@ import { config } from '../config.js'
 import { logger as pinoLogger } from '../infra/logger.js'
 import { describeSandboxNetwork, ensureSandboxNetwork } from './network.js'
 import { registerSandboxProxyRoutes } from './proxy.js'
+import { registerWorkspaceProxyRoutes } from '../workspace/proxy.js'
 
 /** 沙箱代理 listener 的运行态（日志 / 排障 / 将来的 `/api/tasks` 用） */
 export interface SandboxListenerStats {
@@ -88,6 +89,9 @@ export async function startSandboxListener(): Promise<boolean> {
     //   ⚠️ 只挂在这一个实例上 —— 公网 listener（`app.ts`）上没有它们，
     //   于是"容器能摸到业务 API"在结构上不成立，而不是靠 iptables（本机根本验不了 iptables）。
     registerSandboxProxyRoutes(app)
+    // ★ P1-9 · P2：工作区代理端点（容器内 pi 扩展 → 后端工作区服务；读 / 写 CAS / 局部编辑）。
+    //   同样只挂在这个实例上 —— 容器能摸到的只有 `/api/sandbox/*`。
+    registerWorkspaceProxyRoutes(app)
     // 统一信封的 404：路径写错（不是 `/api/sandbox/mcp/*` 里的那两条）应当是**看得懂的一句话**，
     // 而不是 Fastify 默认的 "Route GET:/api/sandbox/mcp/call not found"。
     app.setNotFoundHandler((request, reply) => {

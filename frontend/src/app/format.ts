@@ -28,3 +28,27 @@ export function formatUpdatedAt(iso: string): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
+
+/**
+ * 字节数 → 人类可读（`512 B` / `2.0 KB` / `5.0 MB` / `1.2 GB`）。
+ *
+ * ⚠️ **P1-15：全仓唯一的体积口径**。此前有两份实现 —— `features/chat/workspaceModel.ts` 的
+ * `formatBytes`（到 GB）与 `features/chat/ArtifactCard.tsx` 的 `formatSize`（只到 MB）——
+ * 同一份字节数在两个页面显示**不一样**（1.5 GB 的产物在消息流里显示成 1536.0 MB）。
+ * 两份实现必然先烂一处，故收成这一份：`workspaceModel` 改为**重导出**（原有 import 不动），
+ * `ArtifactCard` 直接 import 这里。
+ *
+ * 判据（与原先的 `formatBytes` 逐字一致，`verify-workspace-ui` 的 W6 是安全网）：
+ * `< 1024` 原样显示 B；往上每 1024 一档，最多到 GB，保留 1 位小数。
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toFixed(1)} ${units[unit]}`
+}

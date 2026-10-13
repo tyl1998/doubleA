@@ -28,6 +28,7 @@ import { registerConversationRoutes } from './routes/conversations.js'
 import { registerDocumentRoutes } from './routes/documents.js'
 import { registerFileRoutes } from './routes/files.js'
 import { registerHealthRoutes } from './routes/health.js'
+import { registerGitCredentialRoutes } from './routes/gitCredentials.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
 import { registerMcpServerRoutes } from './routes/mcpServers.js'
@@ -37,6 +38,7 @@ import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerTaskRoutes } from './routes/tasks.js'
 import { registerUsageRoutes } from './routes/usage.js'
 import { registerUserRoutes } from './routes/users.js'
+import { registerWorkspaceRoutes } from './routes/workspace.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -201,6 +203,16 @@ export function buildApp(): FastifyInstance {
   // ⑲ 长期记忆（P1-8 · L2）：`/api/memories` 系列（列表 / 增删改 / 开关 / 提示）+ 会话级
   //    「不记入记忆」。同样**仅本人**（`memories.user_id`），与会话/产物/任务同族。
   registerMemoryRoutes(app)
+
+  // ⑳ Code 模式工作区（P1-9 · P1）：`/api/conversations/:id/workspace*` 六条（树 / 读 / 字节出口 /
+  //    写（CAS）/ 建 / 移 / 删）。权限与会话同族（**仅本人**，`conversations.user_id`）。
+  //    ⚠️ `/file/raw` 是**不套信封**的字节出口（本仓第四个，同产物下载/预览）；⚠️ 多机下全部粘性。
+  registerWorkspaceRoutes(app)
+
+  // ㉑ git 凭据（P1-9 · R11）：`/api/git-credentials` 四条（列表 / 建 / 改 / 删）。权限与会话同族
+  //    （**仅本人**，`git_credentials.user_id`，ADMIN 无后门）；凭据按用户加密存平台、派活时解密
+  //    注入容器 tmpfs `$HOME` / env（见 `services/gitCredential.service.ts`）。
+  registerGitCredentialRoutes(app)
 
   return app
 }

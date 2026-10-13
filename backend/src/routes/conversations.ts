@@ -46,6 +46,8 @@ import {
   regenerateConversationBodySchema,
   renameConversationBodySchema,
   setConversationAutoApproveBodySchema,
+  setConversationCodeModeBodySchema,
+  steerConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
   type ChatRequestBody,
@@ -57,6 +59,8 @@ import {
   type RegenerateConversationBody,
   type RenameConversationBody,
   type SetConversationAutoApproveBody,
+  type SetConversationCodeModeBody,
+  type SteerConversationBody,
   type SseEvent,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -68,11 +72,14 @@ import {
   answerConfirm,
   serializeSseFrame,
   setAutoApprove,
+  signalSteer,
   signalStop,
   SSE_RESPONSE_HEADERS,
   streamChatReply,
 } from '../orchestrator/sse.js'
 import { requireAuthContext } from '../plugins/session.js'
+import { ensureWorkspaceOwner } from '../sandbox/owner.js'
+import { getLogger } from '../infra/logger.js'
 import {
   assertConversationOwner,
   assertConversationRegenerable,
@@ -81,9 +88,11 @@ import {
   getConversationActive,
   listConversationsForAgent,
   listMessages,
+  listMyConversations,
   recallLastRound,
   removeConversation,
   renameConversation,
+  setConversationCodeMode,
   type ConversationViewer,
 } from '../services/conversation.service.js'
 
@@ -114,6 +123,22 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     },
     async (request) =>
       ok(await listConversationsForAgent(request.params.id, request.query, viewerOf(request))),
+  )
+
+  /**
+   * **我**的全部会话（跨智能体；「聊天为主页」左栏的取数出口，产品改造 2026-10）。
+   *
+   * 与上一条按智能体的列表**同口径、不同粒度**：不带 `agentId` 收窄 ⇒ 没有 404，
+   * 空列表就是"还没聊过"。路径 `/api/conversations` 与 `/api/agents/:id/conversations`
+   * 是不同前缀，Fastify 按段匹配，不冲突。
+   */
+  app.get<{ Querystring: ListConversationsQuery }>(
+    '/api/conversations',
+    {
+      preHandler: app.requireAuth,
+      schema: { querystring: listConversationsQuerySchema },
+    },
+    async (request) => ok(await listMyConversations(request.query, viewerOf(request))),
   )
 
   /**
@@ -400,6 +425,35 @@ export function registerConversationRoutes(app: FastifyInstance): void {
   )
 
   /**
+   * 中途插话（`POST /api/conversations/:id/steer`，**P1-9 · P4 · R1**）。
+   *
+   * 向**运行中**的 agent 插一句话（典型："用户改了 X，请重读"）—— 用户侧是输入区的「边跑边插话」，
+   * 服务端把它写进 `chat.steer:{id}`（列表），由那条流轮询取出、投给引擎的 `steer` 命令
+   * （**助手 turn 边界**投递，见 `子方案` §十五 pin `0.87.1` 复核）。
+   *
+   * 判据与 `/stop` **同款**（先读 `/active`，顺带完成"这不是我的会话就 404"；再写信号）：
+   *   · `accepted:false` = 当前没有在跑的流 —— **不是错误**（"流刚好结束"的竞态必然存在，
+   *     做成 4xx 只会让用户看到一条没有信息量的报错）；
+   *   · `accepted:true` = 这条插话确实写给了一个正在跑的流。
+   *
+   * ⚠️ 对 **ChatBot** 会话（非沙箱）本端点同样会 `accepted:true`（它也在跑流），但那条链路的
+   * producer 不注册 steer 监听器 ⇒ 插话**不会被消费**（留在列表里直到 TTL）。前端据此把入口
+   * 只对 TaskAgent 会话放出（`agentType` 判据在页面）；后端不必为此分叉（写成 4xx 反而更糟）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SteerConversationBody }>(
+    '/api/conversations/:id/steer',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: steerConversationBodySchema },
+    },
+    async (request) => {
+      const active = await getConversationActive(request.params.id, viewerOf(request))
+      if (!active.streaming) return ok({ id: request.params.id, accepted: false })
+      return ok({ id: request.params.id, accepted: await signalSteer(request.params.id, request.body.message) })
+    },
+  )
+
+  /**
    * 确认 / 取消一次挂起中的确认（`02` §4.5 的第九条路由；P0-2-10，`docs/02` §9.10）。
    *
    * 它是 `confirm` 事件的**唯一应答口**：流在"危险工具 / 服务端 elicitation"处挂起
@@ -464,6 +518,36 @@ export function registerConversationRoutes(app: FastifyInstance): void {
       await getConversationActive(request.params.id, viewerOf(request))
       await setAutoApprove(request.params.id, request.body.enabled)
       return ok({ id: request.params.id, autoApprove: request.body.enabled })
+    },
+  )
+
+  /**
+   * 打开 / 关闭**会话级 Code 模式**（P1-9 · P3）。
+   *
+   * 打开后本会话的工作区走"人机共享可编辑"形态：派活创建沙箱时给容器注入
+   * `DOUBULEA_WORKSPACE_MEDIATION=1`（`sandbox/manager.ts`），pi 的 `read`/`write`/`edit`
+   * 走版本中介（P2）；人与 agent 编辑同一批字节（P0 的 bind mount）。
+   *
+   * ⚠️ 与 `auto-approve` 的差别：本开关是**持久列**（`conversations.code_mode`），不是 Redis ——
+   * 沙箱创建时要读到它。归属判据在服务层 `where`（不是我的会话 ⇒ 404）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SetConversationCodeModeBody }>(
+    '/api/conversations/:id/code-mode',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: setConversationCodeModeBodySchema },
+    },
+    async (request) => {
+      const codeMode = await setConversationCodeMode(request.params.id, viewerOf(request), request.body.enabled)
+      // ★ P1-9 · R9 / §十六 B：开启 Code 模式 = "首次 code 触达" ⇒ **提前钉机**（寿命跟随工作区）。
+      //   于是紧接着的 `/workspace*`（粘性）会命中本实例，人与 agent 编辑的是同一台机器上的字节。
+      //   尽力而为：钉机失败只 warn（单实例下无影响；多实例下由首次 `/workspace` 触达再补钉）。
+      if (codeMode) {
+        await ensureWorkspaceOwner(request.params.id).catch((error: unknown) => {
+          getLogger().warn({ err: error, conversationId: request.params.id }, '开启 Code 模式时钉机失败（已忽略）')
+        })
+      }
+      return ok({ id: request.params.id, codeMode })
     },
   )
 }

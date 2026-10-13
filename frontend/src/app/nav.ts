@@ -16,7 +16,7 @@
 
 import type { UserRole } from '@doubulea/shared'
 
-import { HOME_PATH } from './paths.js'
+import { AGENTS_PATH, HOME_PATH } from './paths.js'
 
 export interface NavItem {
   /** 导航项的稳定标识（本仓用它映射图标；原型里是左侧栏上的等宽字形） */
@@ -48,36 +48,36 @@ export interface NavItem {
  * - 「任务」P1-6 已落地（`03` §4.7 的**定时任务**管理），本批进导航（此前因"点进去是空壳"而刻意不进）。
  */
 export const NAV_ITEMS: readonly NavItem[] = [
-  // 已落地 ⇒ 不带 `batch`（P0-1-31 起把首页换成真实的智能体列表；编辑页不带导航项，
-  // 它由列表与摘要卡进入，屏号在 `SERIAL_BY_PREFIX` 里）
-  { code: 'AG', label: '智能体', path: '/', serial: 'S-02 · 智能体' },
+  // 已落地 ⇒ 不带 `batch`。⚠️ **P1-15 起 `/` 是聊天主页**，智能体列表搬到这里（管理目的地之一）；
+  // 对话从聊天主页进，不再从列表进 —— 列表页仍保留「对话」入口（直达新会话态）。
+  { code: 'AG', label: '智能体', path: AGENTS_PATH, serial: 'S-02 · 智能体' },
   // 已落地 ⇒ 不带 `batch`（P0-1-35 把知识库列表与详情换成真实页面）
   { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页换成真实页面）
   { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
-  // 已落地 ⇒ 不带 `batch`（会话产物：跨会话汇总本人全部产物，登录即可、可预览/下载/删除）
-  { code: 'AH', label: '会话产物', path: '/artifacts', serial: 'S-10 · 会话产物' },
   // 已落地 ⇒ 不带 `batch`（P1-6 把任务中心占位页换成真页面：**定时任务**管理）
   { code: 'TK', label: '任务', path: '/tasks', serial: 'S-09 · 任务中心' },
+  // 已落地 ⇒ 不带 `batch`（会话产物：跨会话汇总本人全部产物，登录即可、可预览/下载/删除）
+  { code: 'AH', label: '会话产物', path: '/artifacts', serial: 'S-10 · 会话产物' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把凭据页换成真实页面）。⚠️ **与 MCP 解耦**：路由归入
   // `/settings` 一族（个人设置族），排在个人项这一端，不跟在 `MC` 后面。
+  // ⚠️ Git 凭据（P1-9 · R11）**不单列导航项**：它是本页内嵌的一个区块（`GitCredentialsSection`），
+  // 「我的凭据」是个人凭据的唯一入口。
   { code: 'CR', label: '我的凭据', path: '/settings/credentials', serial: 'S-08b · 凭据' },
   /**
-   * 管理面**三条**（P0-1-36 落地两条 + **P1-7** 补用量统计）。
+   * 用量统计（P1-7 落地；**P1-15 起登录即可**）。
    *
-   * `03` §三 的原话是「管理入口仅 ADMIN 可见（用户/模型池/用量）」—— 那是**三处目的地**。
-   * P0-1-30~35 期间这里只有一个占位项 `AD → /admin/users`（因为两页都还没做，指向哪个都一样），
-   * P0-1-36 两页落地后拆成两条真实入口。
-   *
-   * ⚠️ 为什么必须拆而不是"留一条、另一条走头像菜单"：`serialForPath` 的读数来自 `matchNavItem`，
-   * 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
-   * **一个读数错了的仪表比没有仪表更容易误导**（`nav.ts` 的 `SERIAL_BY_PREFIX` 注释里已有
-   * 同款教训：`/agents/new` 那次）。用量统计（P1-7）此前**不进来**（摆一个点进去是空壳的入口
-   * 比没有更差）；本批 `/admin/usage` 已落地 ⇒ 补上导航项。
+   * `03` §三 的原话是「管理入口仅 ADMIN 可见（用户/模型池/用量）」，但 **P1-15 的产品口径
+   * 把用量放开**（`子方案/聊天主页与信息架构改造.md` §八）：这是**有意的放宽**，不是漏写
+   * `adminOnly` —— 放开的是"平台级用量报表"这一份共享事实，与会话/凭据那类私有资源无关。
+   * 故它从"管理三条"移到普通分组（放在 `CR` 之后、ADMIN 两条之前）。
    */
+  { code: 'UT', label: '用量统计', path: '/admin/usage', serial: 'S-07c · 用量' },
+  // 管理面**两条**（P0-1-36 落地；仅 ADMIN）。
+  // ⚠️ 为什么必须拆而不是"留一条、另一条走头像菜单"：`serialForPath` 的读数来自 `matchNavItem`，
+  // 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
   { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
   { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池', adminOnly: true },
-  { code: 'UT', label: '用量统计', path: '/admin/usage', serial: 'S-07c · 用量', adminOnly: true },
 ] as const
 
 /**
@@ -89,9 +89,11 @@ export const NAV_ITEMS: readonly NavItem[] = [
  * —— 一个读数错了的仪表比没有仪表更容易误导（原型上这里写的是 `S-03 · 编辑`）。
  */
 const SERIAL_BY_PREFIX: readonly (readonly [string, string])[] = [
-  ['/agents', 'S-03 · 智能体编辑'],
-  // `/chat` 不进导航项（`03` §二：它是从智能体列表/列表页进入的页面，不是导航目的地），
-  // 但左侧栏底部那行"第几屏"照样要读对 —— P0-1-32 起这是真页面了
+  // P1-15 起对话不再是"从列表进的二级页"，而是聊天主页的两态（`/c/:id` 定位、`/new/:agentId` 新会话）。
+  // 它们不占导航项（对话不是"管理目的地"），但左侧栏底部那行"第几屏"照样要读对。
+  // 老深链 `/chat/...` 只是重定向入口，也会经过这里，一并登记。
+  ['/c/', 'S-04 · 对话'],
+  ['/new/', 'S-04 · 对话'],
   ['/chat', 'S-04 · 对话'],
   ['/settings/password', 'S-08 · 改密'],
   ['/login', 'S-01 · 登录'],
@@ -155,16 +157,6 @@ export function crumbBaseForPath(pathname: string): CrumbSegment[] {
     return trail
   }
   // 不在导航里的页面
-  if (pathname.startsWith('/agents')) {
-    trail.push({ label: '智能体', to: HOME_PATH })
-    return trail
-  }
-  if (pathname.startsWith('/chat')) {
-    // 对话页归在「智能体」之下：面包屑是 `工作台 / 智能体 / <智能体名>`，
-    // 智能体名由 `ChatPage` 用 `usePageCrumb` 上报。
-    trail.push({ label: '智能体', to: HOME_PATH })
-    return trail
-  }
   if (pathname.startsWith('/settings/password')) {
     trail.push({ label: '修改密码' })
     return trail

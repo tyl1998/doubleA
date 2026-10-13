@@ -104,10 +104,12 @@ import { getLogger } from '../infra/logger.js'
 import {
   CHAT_AUTO_APPROVE_TTL_SEC,
   CHAT_CONFIRM_TTL_SEC,
+  CHAT_STEER_TTL_SEC,
   CHAT_STOP_TTL_SEC,
   chatActiveKey,
   chatAutoApproveKey,
   chatConfirmKey,
+  chatSteerKey,
   chatStopKey,
   ensureRedisConnected,
   getRedis,
@@ -255,6 +257,75 @@ export async function readStopSignal(conversationId: string): Promise<boolean> {
     return (await getRedis().get(chatStopKey(conversationId))) !== null
   } catch {
     return false
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 中途插话（steer，P1-9 · P4 · R1）：路由/producer 写入、通道轮询消费
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 写一条插话信号，返回"是否确实有一个正在跑的流"。
+ *
+ * 调用方（路由）已经用 `/active` 判过一遍 `streaming`，这里再判一次 `EXISTS` 是**刻意的重复**
+ * （与 {@link signalStop} 同一条理由）：键的消失只可能是"流刚结束"，那样写进去就是一条
+ * **没人消费的残留**（`RPUSH` 后没人 `LPOP`，要等 TTL 才清）。
+ */
+export async function signalSteer(conversationId: string, message: string): Promise<boolean> {
+  const redis = await ensureRedisConnected()
+  const exists = await redis.exists(chatActiveKey(conversationId))
+  if (exists === 0) return false
+  const key = chatSteerKey(conversationId)
+  // 值放 JSON（message + 入队时刻）：`redis-cli LRANGE` 一眼能看出"谁在什么时候插的话"
+  await redis.rpush(key, JSON.stringify({ message, at: new Date().toISOString() }))
+  // 每次入队都续期：列表活得比单条信号久，TTL 只兜"流死了、键没人清"
+  await redis.expire(key, CHAT_STEER_TTL_SEC)
+  return true
+}
+
+/**
+ * 清掉插话信号键。**与停止信号同款的两个调用点**：
+ *   · **新流启动时**（`streamChatReply` ②）：防上一轮残留的插话被这一轮读到（症状同"秒停"）；
+ *   · **本条流收尾时**（finally，且在释放锁**之前**）。
+ */
+export async function clearSteerSignal(conversationId: string): Promise<void> {
+  try {
+    await getRedis().del(chatSteerKey(conversationId))
+  } catch (error) {
+    getLogger().warn({ err: error, conversationId }, '清除插话信号失败（残留会在 TTL 后自愈）')
+  }
+}
+
+/**
+ * 取走该会话**当前积压**的全部插话（`LPOP` 到空）。
+ *
+ * ⚠️ **只在"有 steer 监听器"时调用**（见 {@link SseChannel} 的 `#pollSteering`）—— 没有消费者时
+ * 消息要留在列表里，否则"流还没接上 steer"这段窗口里的插话会被白白取走丢掉。
+ * 解析失败（值坏）**跳过该条**（不抛错）：坏值不该让整轮插话失效。
+ */
+export async function drainSteerSignals(conversationId: string): Promise<string[]> {
+  const redis = await ensureRedisConnected()
+  const key = chatSteerKey(conversationId)
+  const messages: string[] = []
+  // 有上界：一次最多取 50 条，防止"有人刷了一万条"在一帧里全投进引擎
+  for (let i = 0; i < 50; i += 1) {
+    const raw = await redis.lpop(key)
+    if (raw === null) break
+    const text = parseSteerSignal(raw)
+    if (text !== null) messages.push(text)
+  }
+  return messages
+}
+
+/** 解析一条插话信号（**不抛错**：坏值返回 `null`，调用方跳过） */
+function parseSteerSignal(raw: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const message = (parsed as { message?: unknown }).message
+    return typeof message === 'string' && message.trim() !== '' ? message : null
+  } catch {
+    return null
   }
 }
 
@@ -651,6 +722,21 @@ export interface ChatProducerInput {
    * 要的"一个共同的挂起原语"。
    */
   awaitConfirm: (question: ConfirmQuestion) => Promise<ConfirmDecision>
+  /**
+   * 注册一个"运行中收到插话（steer）"的监听器（**P1-9 · P4 · R1**）。返回退订函数。
+   *
+   * 与 {@link ChatProducerInput.awaitConfirm} 的关系：那个是"编排层**主动挂起**等用户答一次"，
+   * 这个是"用户（或工作区 watcher）**主动**塞一句话进来、编排层在合适时机转投给引擎"。
+   * 通道负责轮询 Redis 与派发；producer 只负责"收到这句话之后怎么处理"
+   * （TaskAgent = 投给 pi 的 `steer` 命令，落到**助手 turn 边界**）。
+   *
+   * ⚠️ **没有监听器时消息不消费**（留在 Redis 列表里）：这正是"桥还没建好就有人插话"
+   * 不丢消息的机制（见 `drainSteerSignals`）。注册必须**早于派活**，否则那之前的插话要等到
+   * 下一帧轮询才派发。
+   * ⚠️ 回调是**同步**的（与 `emit` 的异步不同）：producer 自己决定要不要 `await`
+   * （TaskAgent 用 `void bridge.steer(...)` 尽力而为 —— 投不进去只记日志，不中断这一轮）。
+   */
+  onSteer: (listener: (message: string) => void) => () => void
 }
 
 /** 编排循环（P0-1-27）要实现的形状；本批的占位实现见 `orchestrator/index.ts` */
@@ -676,6 +762,12 @@ class SseChannel {
   #closed = false
   /** 已写出的帧数（按事件名计数）—— 收尾日志用它，也是"这条流到底发生了什么"的唯一线索 */
   readonly #frameCounts = new Map<SseEventName, number>()
+  /**
+   * 中途插话（steer）的监听器（P1-9 · P4 · R1）。由 producer 通过
+   * {@link ChatProducerInput.onSteer} 注册（TaskAgent 把它转投给引擎）。
+   * **空集合 = 没人消费** ⇒ {@link #pollSteering} 不 `LPOP`（消息留在 Redis 列表里，见其注释）。
+   */
+  readonly #steerListeners = new Set<(message: string) => void>()
 
   constructor(raw: ServerResponse, conversationId: string, startedAt: string) {
     this.#raw = raw
@@ -718,6 +810,19 @@ class SseChannel {
   /** 帧数统计（日志用；`Map` 转成普通对象更好读） */
   frameCounts(): Record<string, number> {
     return Object.fromEntries(this.#frameCounts)
+  }
+
+  /**
+   * 注册中途插话（steer）监听器（P1-9 · P4 · R1）。返回退订函数。
+   *
+   * 一经注册，{@link #pollSteering} 就会在每次轮询把积压的插话派发过来。producer 在
+   * 收尾的 `finally` 里必须退订（与 {@link SandboxRpc.onEvent} 同款纪律：桥/通道活得比一轮久）。
+   */
+  onSteer(listener: (message: string) => void): () => void {
+    this.#steerListeners.add(listener)
+    return () => {
+      this.#steerListeners.delete(listener)
+    }
   }
 
   /**
@@ -812,6 +917,9 @@ class SseChannel {
 
     this.#stopTimer = setInterval(() => {
       void this.#pollStopSignal()
+      // 中途插话（P1-9 · P4 · R1）与停止信号**共用同一个节拍**（`signalPollIntervalMs` 的注释
+      // 说"两类信号时效要求完全一样"，插话是第三类，同一条推理）。
+      void this.#pollSteering()
     }, signalPollIntervalMs())
     this.#stopTimer.unref()
   }
@@ -858,6 +966,46 @@ class SseChannel {
       this.abort('user', '用户已停止生成')
     } catch (error) {
       getLogger().warn({ err: error, conversationId: this.#conversationId }, '读取停止信号失败（本轮跳过，下轮再试）')
+    }
+  }
+
+  /**
+   * 轮询中途插话（steer）并派发给监听器（P1-9 · P4 · R1）。
+   *
+   * 三条判据：
+   *   · **没有监听器 ⇒ 不消费**（`drainSteerSignals` 不调）：消息留在列表里等着被接上
+   *     —— 这是"桥还没建好就有人插话"不丢消息的机制；
+   *   · **流已收尾 / 被中断 ⇒ 不消费**：收尾路径会清掉那个键，这里再判一次，避免在
+   *     "清键"与"下一次轮询"之间把一条本该丢弃的插话读出来；
+   *   · 单个监听器抛错**只忽略该监听器本次回调**（与 `emit` 的订阅者同款）——
+   *     producer 的 bug 不该把通道带走。
+   */
+  async #pollSteering(): Promise<void> {
+    if (this.#closed || this.#controller.signal.aborted) return
+    if (this.#steerListeners.size === 0) return
+    let messages: string[]
+    try {
+      messages = await drainSteerSignals(this.#conversationId)
+    } catch (error) {
+      getLogger().warn({ err: error, conversationId: this.#conversationId }, '读取插话信号失败（本轮跳过，下轮再试）')
+      return
+    }
+    if (messages.length === 0) return
+    getLogger().info(
+      { conversationId: this.#conversationId, count: messages.length },
+      '收到中途插话，转交给本轮编排（投给运行中的引擎）',
+    )
+    for (const message of messages) {
+      for (const listener of [...this.#steerListeners]) {
+        try {
+          listener(message)
+        } catch (error) {
+          getLogger().warn(
+            { err: error, conversationId: this.#conversationId },
+            '中途插话监听器抛错（只忽略该监听器本次回调）',
+          )
+        }
+      }
     }
   }
 
@@ -1308,6 +1456,9 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
   try {
     // ② 残留停止信号：两道防线里的第二道（第一道在 `/stop` 侧的 EXISTS，见 `signalStop`）
     await clearStopSignal(conversationId)
+    // ②″ 残留插话（P1-9 · P4 · R1）：同款第二道防线 —— 上一轮没被消费完的插话绝不能被本轮读到
+    //     （症状同"秒停"：刚发出去的一条消息被一句"用户修改了 X"顶掉）。
+    await clearSteerSignal(conversationId)
 
     // ②′ 锁已就绪的准备动作（**P1-3 重新生成**：先撤掉上一轮再跑全新的流）。
     //     位置见 `StreamChatReplyInput#onLockAcquired`：必须在锁之后（否则会删掉别人的历史）、
@@ -1372,6 +1523,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
         emit: (event) => channel?.emit(event) ?? Promise.resolve(),
         updateSnapshot: (patch) => channel?.updateSnapshot(patch) ?? Promise.resolve(),
         awaitConfirm: (question) => activeChannel.awaitConfirm(question),
+        onSteer: (listener) => activeChannel.onSteer(listener),
       })
       // ⚠️ producer **正常返回**不等于"流正常结束"：锁在生成过程中丢掉时，producer 可能压根没察觉
       //    （占位实现就只是等 abort；真实的编排循环也可能把中断吞在某个 `catch` 里）。
@@ -1421,6 +1573,8 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
       //    把新流刚拿到的停止信号删掉，症状是"点了停止但停不下来"。
       //    （另一侧"新流启动时也清一次"在 ② —— 两道防线各挡一种残留。）
       await clearStopSignal(conversationId)
+      // 插话信号同款：清在释放锁之前（同一把锁还在手上 ⇒ 这个键只可能是写给我们的）
+      await clearSteerSignal(conversationId)
       logger.info(
         {
           conversationId,

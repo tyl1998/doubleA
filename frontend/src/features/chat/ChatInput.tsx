@@ -24,7 +24,7 @@
 
 import { Button } from 'antd'
 import { useEffect, useRef } from 'react'
-import type { ChangeEvent, KeyboardEvent } from 'react'
+import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react'
 
 import { CHAT_ATTACHMENT_MAX_COUNT } from '@doubulea/shared'
 
@@ -106,6 +106,20 @@ export interface ChatInputProps {
   onPickFiles: (files: FileList) => void
   /** 移除一个附件 */
   onRemoveAttachment: (fileId: string) => void
+  /**
+   * 本会话是否支持**中途插话**（P1-9 · P4 · R1）。判据在页面（沙箱会话 / Code 模式）；
+   * 这里只把它交给状态机（`composeState`），**不自己判**。
+   */
+  steerable: boolean
+  /** 点「插话」：把当前草稿插给运行中的 agent（页面负责发请求与清草稿） */
+  onSteer: () => void
+  /** 插话请求在飞（按钮置 loading，防连点） */
+  steerPending: boolean
+  /**
+   * 输入框下方的一排控件（R4：模型 / 自动审批 / 记忆 / Code 模式 / 专注 / 产物入口）。
+   * 由页面（`ConversationSettings`）给，本组件只负责摆到 `.composer__box` 正下方。
+   */
+  controls?: ReactNode
 }
 
 export function ChatInput({
@@ -123,8 +137,12 @@ export function ChatInput({
   uploading,
   onPickFiles,
   onRemoveAttachment,
+  steerable,
+  onSteer,
+  steerPending,
+  controls,
 }: ChatInputProps) {
-  const view = composeState({ round, sending, stopping, elsewhere, draft })
+  const view = composeState({ round, sending, stopping, elsewhere, draft, steerable })
 
   /**
    * 输入框高度**跟着正文走**（`app.css` 里 `.composer textarea` 的 `min-height`/`max-height`）。
@@ -134,13 +152,34 @@ export function ChatInput({
    * 而不是替代品：超过它才该内滚。所以这里每帧把 `height` 先归零再读 `scrollHeight`（不归零
    * 读到的是当前被撑开的高度，缩不回短内容；清空草稿时也靠这一步回到一行）。
    * `max-height` 仍由 CSS 兜底 ⇒ 这里不必再判上限。
+   *
+   * ⚠️ **只在 `draft` 变化时重算是不够的**：进入 / 退出「专注工作区」会把对话列压窄 / 放宽
+   * （`app.css` 的 `.chat--focus-workspace`），**同样的文字**在新宽度下换行成更多 / 更少行，
+   * 而 `draft` 没变 ⇒ 这个 effect 不重跑，textarea 就带着按**旧宽度**算出的高度：
+   * 窄了内容溢出、冒出滚动条（用户报的"专注工作区模式下输入框又有滚动条"）。故再挂一个
+   * `ResizeObserver`，宽度一变就重算（高度变化不触发重算，避免自激循环）。
    */
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const widthRef = useRef(0)
   useEffect(() => {
     const textarea = textareaRef.current
     if (textarea === null) return
-    textarea.style.height = 'auto'
-    textarea.style.height = `${textarea.scrollHeight}px`
+    const resize = (): void => {
+      textarea.style.height = 'auto'
+      textarea.style.height = `${textarea.scrollHeight}px`
+    }
+    resize()
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0
+      // 只在**宽度**变化时重算：设 `height` 也会触发本回调，宽度不变就跳过（否则反复读 layout）
+      if (Math.abs(width - widthRef.current) < 0.5) return
+      widthRef.current = width
+      resize()
+    })
+    observer.observe(textarea)
+    return () => {
+      observer.disconnect()
+    }
   }, [draft])
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -255,6 +294,21 @@ export function ChatInput({
             onKeyDown={handleKeyDown}
           />
 
+          {/* 插话（P1-9 · P4 · R1）：仅沙箱会话 streaming 且草稿非空时出现。
+              与主按钮（停止）并列 —— 它**不打断**当前一轮，只是把草稿塞给运行中的 agent
+              （服务端投到助手 turn 边界）。是否出现由状态机的 `view.steer` 决定，本组件不判。 */}
+          {view.steer.visible ? (
+            <Button
+              htmlType="button"
+              data-testid="composer-steer"
+              disabled={view.steer.disabled || steerPending}
+              loading={steerPending}
+              onClick={onSteer}
+            >
+              插话
+            </Button>
+          ) : null}
+
           {view.primary.action === 'stop' ? (
             // 流式中：按钮变 [停止]（`03` §4.1）。用 `danger` 是因为它会中断一次已经在跑的生成
             <Button
@@ -282,6 +336,9 @@ export function ChatInput({
             </Button>
           )}
         </div>
+
+        {/* 输入框下方的会话控件（R4）：模型 / 自动审批 / 记忆 / Code 模式 / 专注 / 产物入口 */}
+        {controls === undefined ? null : <div className="composer__controls">{controls}</div>}
 
         <div className="composer__hint">
           <span>

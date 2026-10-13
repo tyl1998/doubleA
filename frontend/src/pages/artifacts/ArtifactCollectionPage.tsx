@@ -28,7 +28,7 @@ import { Link } from 'react-router-dom'
 
 import { ARTIFACTS_PAGE_LIMIT, deleteArtifact, useMyArtifacts } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH } from '../../app/paths.js'
+import { AGENTS_PATH } from '../../app/paths.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
 import { ArtifactCard } from '../../features/chat/ArtifactCard.js'
@@ -94,7 +94,7 @@ export function ArtifactCollectionPage() {
           title="还没有会话产物"
           lead="派一个任务型智能体干活，它在沙箱里生成的文件会汇总到这里。"
           action={
-            <Link to={HOME_PATH}>
+            <Link to={AGENTS_PATH}>
               <Button type="primary">回到智能体列表</Button>
             </Link>
           }

@@ -40,6 +40,7 @@ import {
   CONVERSATION_UNTITLED_HINT,
   CONVERSATION_TOPIC_MAX_CHARS,
   isConversationReadOnly,
+  type AgentType,
   type ConversationItem,
 } from '@doubulea/shared'
 
@@ -54,6 +55,16 @@ export interface ConversationListItemView {
   state: string
   /** 时间读数（"2 分钟前" / "昨天 18:20" / "还没有消息"） */
   time: string
+  /**
+   * 会话所属智能体的**快照**（P1-15 跨智能体会话栏要显示徽标）。
+   *
+   * 来自 `ConversationItem` 自带的 `agentId/agentName/agentType`（服务端投影，Agent 被软删也有）
+   * —— 单智能体侧栏（`ConversationSidebar`）不读它们，但跨智能体的 `ConvRail` 靠它一屏分清
+   * "这条会话是谁的"。不再多打一次 `/api/agents/:id`：同一份事实只有一处来源。
+   */
+  agentId: string
+  agentName: string
+  agentType: AgentType
 }
 
 /** 一个分组标题 + 它的条目（顺序即渲染顺序） */
@@ -139,16 +150,17 @@ export function conversationItemView(
   streamingId: string | null,
 ): ConversationListItemView {
   const title = item.topic === null || item.topic.trim() === '' ? CONVERSATION_UNTITLED_HINT : item.topic
+  const snapshot = { agentId: item.agentId, agentName: item.agentName, agentType: item.agentType }
 
   if (item.id === streamingId) {
-    return { id: item.id, title, led: 'run', state: '生成中', time: describeConversationTime(item.lastMessageAt, now) }
+    return { id: item.id, title, led: 'run', state: '生成中', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
   }
   if (isConversationReadOnly(item.status)) {
     // `FINISHED` 只由"Agent 被软删"产生 ⇒ 文案直接说结果，比"已结束"更可操作
     //（`docs/02` §4.4："会话转只读**保留**"）
-    return { id: item.id, title, led: 'warn', state: '只读保留', time: describeConversationTime(item.lastMessageAt, now) }
+    return { id: item.id, title, led: 'warn', state: '只读保留', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
   }
-  return { id: item.id, title, led: 'idle', state: '可继续', time: describeConversationTime(item.lastMessageAt, now) }
+  return { id: item.id, title, led: 'idle', state: '可继续', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
 }
 
 /**

@@ -1,11 +1,19 @@
 /**
- * 对话页（P0-1-32：骨架 + SSE 客户端 + 消息流渲染；P0-1-33：输入区状态机 + 停止 + 断线对齐；
- * P0-1-34：**会话侧栏**）
+ * 对话页（"某一个会话的视图"；P0-1-32 骨架 + SSE + 消息流；P0-1-33 输入区/停止/断线；P0-3-11 第三列）
  *
- * 依据：`docs/03-前端设计.md` §二（`/chat/:agentId`，`:conversationId?` 可选定位）、
- *      §4.1（对话页详设：**会话侧栏** / 头部 / 消息流 / **输入区状态机** / 首条消息才建会话 /
+ * ⚠️ **P1-15 的信息架构变更**：本组件**不再读路由参数、不再渲染会话栏**。
+ *   · `agentId` / `conversationId` 由外壳（`ChatHomePage`）注入 —— `/c/:id` 的 `agentId` 要从
+ *     会话数据反查，页面自己拿不到；
+ *   · 跨智能体会话栏在 `ConvRail`（属外壳），导航（选会话 / 新对话 / 删除后去向）也归外壳；
+ *   · 头部 = **智能体 chip + 设置图标**（`AgentPicker` + 进编辑智能体）；会话控件（模型 / 自动审批 /
+ *     记忆 / Code / 专注 / 产物入口）在**输入框下方**（`ConversationSettings` 作为 `ChatInput` 的 `controls`，
+ *     **R4 起不再用齿轮 popover / 标题栏内联**，见 `子方案` §六 / §十五 / §十六）；
+ *   · Code 模式列宽 / 专注 / 尺寸口径统一见 §七（常量在 `workspaceModel.ts`）。
+ *   · **R3**：只读保留会话（Agent 软删）也能打开（历史可看、输入区换成只读说明），见 `readOnly` 分支。
+ *
+ * 依据：`docs/03-前端设计.md` §4.1（对话页详设：头部 / 消息流 / **输入区状态机** / 首条消息才建会话 /
  *      **停止时序** / **断线黄条**）、§五（事件 → UI 映射）、§六（单一渲染路径）、
- *      §七（键盘约定、文案词表、删除分级确认）。
+ *      §七（键盘约定、文案词表、删除分级确认）、`子方案/聊天主页与信息架构改造.md`（P1-15）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 本批做到哪、哪些刻意留给后面一批（`docs/06` P0-1-35/36、P0-3）
@@ -16,18 +24,15 @@
  *    **停止按钮**的完整时序（`POST /stop` → 等 `done{STOPPED}` → 5s 未收口才 abort → 拉历史对齐，
  *    `stopController.ts`）、**顶部黄条**与"点击对齐历史"（`DisconnectBanner` + `alignHistory.ts`）、
  *    `CONFLICT` 的**专用 toast**（`streamErrors.ts`）、同标签页重复发送的同步闸门。
- * ✅ P0-1-34：**会话侧栏**（新建 / 切换 / 行内重命名 / 分级删除，`ConversationSidebar.tsx`）
- *    —— 侧栏的判据全在 `conversationList.ts`（零依赖纯逻辑，有断言）；
- *    **全屏布局**在 `AppLayout`（`docs/03` §三：保留 Logo 与头像菜单，其余导航收进「工作台」下拉）。
  * ✅ P0-3-11：**第三列 = 产物面板**（`ArtifactPanel.tsx`，只对 TaskAgent 加 `chat--with-panel`）
  *    + **预览弹层**（`ArtifactPreviewDrawer`，谁在预览住在 `stores/artifactPreview.ts`）。
  *    清单由 `mergeArtifactPanelItems` 一处合流：服务端列表（刷新后还在）+ 本轮 `artifact` 事件
  *    （此刻就在手上）—— 见 `artifactPanelModel.ts` 的文件头（顺序与去重口径都写在那里）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 侧栏带来的那一件事：**切会话时不动 store**
+ * 切会话带来的那一件事：**不动 store**
  * ─────────────────────────────────────────────────────────────────────
- * 用户完全可以在流式期间切到另一个会话（这正是侧栏让它变得容易的动作）。此时：
+ * 用户完全可以在流式期间切到另一个会话（会话栏让它变得容易）。此时：
  *   · 旧流的帧还在往 store 里灌（fetch 没被中断）；
  *   · 页面正在渲染**新会话**的历史。
  * 不串台靠 `stores/chatStream.ts` 的 `streamFor` 守卫 —— `useChatStream` 只在
@@ -52,13 +57,14 @@
  *   · 没有终帧（断线 / 停止超时）⇒ 按条数让位（那一条，是对齐动作的一部分）。
  */
 
-import { Button, Drawer, Select, Switch, Tag } from 'antd'
+import { DownOutlined, SettingOutlined } from '@ant-design/icons'
+import { Button, Drawer, Tag, Tooltip } from 'antd'
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import type { ReactNode, RefObject } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import type { CSSProperties, ReactNode, RefObject } from 'react'
 import { CHAT_ATTACHMENT_MAX_COUNT, HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
-import type { RecallConversationResult, RemoveConversationResult } from '@doubulea/shared'
+import type { AgentItem, RecallConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
 import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
@@ -66,25 +72,31 @@ import {
   conversationMessagesQueryKey,
   fetchConversationActive,
   flattenMessagePages,
+  invalidateMyConversations,
   setConversationAutoApprove,
   useConversationMessages,
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { uploadChatFile } from '../../api/files.js'
 import { setConversationMemoryExcluded } from '../../api/memory.js'
+import { setConversationCodeMode } from '../../api/workspace.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
-import { HOME_PATH, agentEditPath, chatPath } from '../../app/paths.js'
+import { AGENTS_PATH, agentEditPath, conversationPath, newConversationPath } from '../../app/paths.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
 import { TableSkeleton } from '../../components/ListStates.js'
+import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
+import { AgentPicker } from '../../features/chat/AgentPicker.js'
 import { ArtifactPanel } from '../../features/chat/ArtifactPanel.js'
 import { mergeArtifactPanelItems, showArtifactPanel } from '../../features/chat/artifactPanelModel.js'
 import { ChatInput } from '../../features/chat/ChatInput.js'
 import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/confirmModel.js'
-import { ConversationSidebar } from '../../features/chat/ConversationSidebar.js'
+import { ConversationSettings, type CodeFocus } from '../../features/chat/ConversationSettings.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
-import { MemoryExclusionSwitch, MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
+import { MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
+import { WorkspacePanel } from '../../features/chat/WorkspacePanel.js'
+import { useWorkspacePanelResize } from '../../features/chat/useWorkspacePanelResize.js'
 import { MessageList } from '../../features/chat/MessageList.js'
 import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
 import {
@@ -100,6 +112,31 @@ import { useChatStream } from '../../features/chat/useChatStream.js'
 import { useConversationWatch } from '../../features/chat/useConversationWatch.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
 import { useChatStreamStore } from '../../stores/chatStream.js'
+
+/**
+ * 对话页（P0-1-32 起是"某一个会话的视图"）。
+ *
+ * ⚠️ **P1-15 起它不再读路由参数**：`agentId` / `conversationId` 由外壳（`ChatHomePage`）注入
+ * —— `/c/:id` 的 `agentId` 要从会话数据反查，页面自己拿不到。这样它也彻底**不渲染侧栏**
+ * （跨智能体会话栏在 `ConvRail`，属外壳）；导航（选会话 / 新对话 / 删除后去向）也归外壳。
+ */
+export interface ChatPageProps {
+  agentId: string
+  /** `undefined` = **新会话态**（展示开场白 + 引导问题，首条消息才建会话） */
+  conversationId: string | undefined
+  /**
+   * 会话所属智能体名 / 类型的**快照**（来自会话列表项，见 `shared#conversationItemSchema`）。
+   * ⚠️ Agent 被软删时 `GET /api/agents/:id` 是 404，`agent` 取不到，但会话转**只读保留** ——
+   * 头部仍要显示"这是谁的对话"，靠这两个快照兜。无会话（新会话态）时为 `undefined`。
+   */
+  agentName?: string
+  agentType?: AgentItem['type']
+  /**
+   * 只读保留：`true` 时（会话 `status !== 'ACTIVE'`，即其 Agent 已被软删）**能看历史、不能发消息**。
+   * 此时即便 `useAgent` 404 也照常渲染（不再报"打不开这个对话"，见 §3 用户反馈）。
+   */
+  readOnly?: boolean
+}
 
 /** 消息流的外框（三态共用，避免切换时布局跳动） */
 function StreamFrame({
@@ -131,10 +168,13 @@ function StreamFrame({
   )
 }
 
-export function ChatPage() {
-  const params = useParams<{ agentId: string; conversationId?: string }>()
-  const agentId = params.agentId ?? ''
-  const conversationId = params.conversationId
+export function ChatPage({
+  agentId,
+  conversationId,
+  agentName: agentNameSnapshot,
+  agentType: agentTypeSnapshot,
+  readOnly = false,
+}: ChatPageProps) {
   const navigate = useNavigate()
   const feedback = useFeedback()
   const queryClient = useQueryClient()
@@ -155,7 +195,7 @@ export function ChatPage() {
    */
   const preserveSelectionRef = useRef(false)
 
-  const { round, sending, stopping, disconnect, streamingId, send, regenerate, stop, align } = useChatStream(
+  const { round, sending, stopping, disconnect, streamingId, send, regenerate, stop, steer, align } = useChatStream(
     agentId,
     conversationId,
     {
@@ -176,7 +216,35 @@ export function ChatPage() {
             feedback.fail(error, '自动审批开关没有保存')
           }
         }
-        navigate(chatPath(agentId, created.id), { replace: true })
+        // 新会话态下预置过 Code 模式 ⇒ 同样在开流前落地（容器 env 在建沙箱时注入，
+        // 晚于开流就赶不上第一轮派活）。消费后立刻清，避免被下一条新会话误用。
+        const codePreset = codeModePresetRef.current
+        codeModePresetRef.current = false
+        if (codePreset) {
+          try {
+            await setConversationCodeMode(created.id, true)
+          } catch (error: unknown) {
+            // 落不下就如实说，但**不拦发送**：这一轮退回普通模式即可，用户仍能继续聊
+            feedback.fail(error, 'Code 模式开关没有保存')
+          }
+        }
+        // 新会话态下预置过「不记入记忆」⇒ 同样在开流前落地（否则第一轮就被写进长期记忆）。
+        // 消费后立刻清，避免被下一条新会话误用。
+        const memoryPreset = memoryExcludedPresetRef.current
+        memoryExcludedPresetRef.current = false
+        if (memoryPreset) {
+          try {
+            await setConversationMemoryExcluded(created.id, true)
+          } catch (error: unknown) {
+            // 落不下就如实说，但**不拦发送**：这一轮可能仍会被记入记忆，用户可在记忆面板删掉
+            feedback.fail(error, '记忆开关没有保存')
+          }
+        }
+        // 导航到规范会话路径 `/c/:id`；`state.agentId` 是给外壳的兜底（跨智能体列表要等这一轮
+        // 结束才失效重取，中间窗口里查不到这条 —— 见 `ChatHomePage` 文件头 ⚠️ ②）。
+        navigate(conversationPath(created.id), { replace: true, state: { agentId } })
+        // 让会话栏尽快出现这条新会话（不必等这一轮 `done` 才失效；`done` 那次失效仍保留）
+        invalidateMyConversations(queryClient)
       },
       ...(agentQuery.data === undefined ? {} : { agentType: agentQuery.data.type }),
     },
@@ -214,6 +282,8 @@ export function ChatPage() {
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
   const [confirmPending, setConfirmPending] = useState(false)
+  /** 中途插话请求在飞（P1-9 · P4 · R1；防连点，同 `confirmPending`） */
+  const [steerPending, setSteerPending] = useState(false)
 
   /**
    * 会话级自动审批开关（本地镜像）。打开后本会话内危险的 MCP 工具不再逐次弹确认卡
@@ -237,12 +307,45 @@ export function ChatPage() {
    */
   const [memoryExcluded, setMemoryExcluded] = useState(false)
   const [memoryExcludedPending, setMemoryExcludedPending] = useState(false)
+  /**
+   * 新会话态下用户**预置**的「不记入记忆」意图（与自动审批 / Code 模式同款）。
+   *
+   * 开关挂在会话上（真值 `conversations.memory_excluded`），而会话要等首条消息才建出来
+   * ⇒ 新会话态点开关时**先记在这里、不发请求**；`onConversationCreated` 拿到新会话 id 后、
+   * 开流之前把它写到服务端 —— 这样**第一轮**就不会被记入长期记忆。
+   */
+  const memoryExcludedPresetRef = useRef(false)
+  /**
+   * 会话级 **Code 模式**（P1-9 · P3）：true = 工作区走人机共享可编辑形态（第三列换成工作区面板）。
+   * 与 `memoryExcluded` 同款 —— 由 `/active` 一并回带；切会话时先重置为关（安全默认）。
+   */
+  const [codeMode, setCodeMode] = useState(false)
+  const [codeModePending, setCodeModePending] = useState(false)
+  /**
+   * Code 模式专注态（P1-15 · §七 3）：`none`（常规）/ `workspace`（消息流收窄）/ `chat`（收起工作区）。
+   * 纯客户端选择（不进 store、不落库）：它不改变任何共享事实，只是"这一屏怎么摆"。
+   */
+  const [codeFocus, setCodeFocus] = useState<CodeFocus>('none')
+  /**
+   * 新会话态下用户**预置**的 Code 模式意图（与会话级自动审批同款）。
+   *
+   * `code_mode` 是会话列，会话要等首条消息才建出来 ⇒ 新会话态点开关时**先记在这里、
+   * 不发请求**；`onConversationCreated` 拿到新会话 id 后、开流之前把它写到服务端 ——
+   * 这样**第一轮**派活时容器就已按 Code 模式注入中介 env。
+   */
+  const codeModePresetRef = useRef(false)
   useEffect(() => {
     setAutoApprove(false)
     setMemoryExcluded(false)
+    setCodeMode(false)
+    // 专注态是"这一屏怎么摆"，切会话回到常规（否则下条会话莫名收着工作区）
+    setCodeFocus('none')
     if (conversationId === undefined) {
-      // 回到新会话态：清掉上一条会话残留的"预置自动审批"意图（否则下条新会话会被它带偏）
+      // 回到新会话态：清掉上一条会话残留的"预置自动审批 / 不记入记忆 / Code 模式"意图
+      // （否则下条新会话会被它带偏）
       autoApprovePresetRef.current = false
+      memoryExcludedPresetRef.current = false
+      codeModePresetRef.current = false
       return
     }
     let cancelled = false
@@ -251,6 +354,7 @@ export function ChatPage() {
         if (cancelled) return
         setAutoApprove(active.autoApprove)
         setMemoryExcluded(active.memoryExcluded)
+        setCodeMode(active.codeMode)
       })
       .catch(() => {
         // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
@@ -262,6 +366,12 @@ export function ChatPage() {
   }, [conversationId])
   /** 窄屏下的产物抽屉开关（第三列被 CSS 藏在 ≥1280 才显示，窄屏用抽屉给入口，见 `ArtifactPanel` 那段） */
   const [artifactDrawerOpen, setArtifactDrawerOpen] = useState(false)
+  /**
+   * Code 模式第三列（IDE 面板）的宽度拖拽（P1-9 · R12）。
+   * ⚠️ 宽度经 CSS 变量 `--panel-w` 注入（见下面的 `style`）——**不能直接写 `grid-template-columns`**：
+   * 内联样式会盖掉 <1280px 断点里"收成两栏并藏面板"的那条媒体查询（`app.css`），窄屏就会硬留一列。
+   */
+  const wsPanel = useWorkspacePanelResize(codeMode && conversationId !== undefined, conversationId)
   /**
    * 记忆提示刷新键（P1-8）：每轮结束/开始时 +1 ⇒ `MemoryNoticeStack` 拉一次"待展示提示"
    * （兑现 HCI §5.3 的"toast 晚一拍"：自动写入发生在 `done` 之后，提示只能在下一拍出现）。
@@ -288,19 +398,16 @@ export function ChatPage() {
   }, [])
 
   const agent = agentQuery.data
-  const agentName = agent?.name ?? '智能体'
+  // 只读保留会话里 Agent 已软删（`useAgent` 404）⇒ 用会话列表项的快照兜名字/类型
+  const agentName = agent?.name ?? agentNameSnapshot ?? '智能体'
+  const agentTypeLabel =
+    agent !== undefined
+      ? AGENT_TYPE_LABEL[agent.type]
+      : agentTypeSnapshot !== undefined
+        ? AGENT_TYPE_LABEL[agentTypeSnapshot]
+        : ''
   // 面包屑（顶栏）里这一页的细节段 = 智能体名 ⇒ `工作台 / 智能体 / <名称>`（加载中只到「智能体」）
-  usePageCrumb(agent?.name ?? null)
-  /**
-   * 头部副标题里显示的模型名：**跟随本会话当前选中/正在用的模型**，而不是永远显示默认模型
-   * （产品反馈 2026-09-29：选了 flash 后副标题还停在 pro）。`selectedModelId` 为
-   * `undefined`（未选 / 回落到默认）时显示默认模型；选中的模型已不在池里（被删/停用）
-   * 时 `find` 落空 ⇒ 照样回落默认标签。
-   */
-  const activeModelLabel =
-    agent?.models.find((m) => m.modelId === (selectedModelId ?? agent.modelId))?.modelLabel ??
-    agent?.modelLabel ??
-    null
+  usePageCrumb(agent?.name ?? agentNameSnapshot ?? null)
 
   /**
    * 历史（正序）→ 视图；流式轮次 → 视图；两者**同一形状**（单一渲染路径）。
@@ -421,7 +528,9 @@ export function ChatPage() {
   //    而不是"有没有产物"—— 理由在 `artifactPanelModel.ts` 的文件头（类型在创建时定死、
   //    "有没有产物"不是 ⇒ 后者会让面板在第一次派活之前不存在、之后凭空出现）。
   //    `agent` 还没到时按"不显示"处理：三栏的 `grid-template-columns` 变一次会让中栏跳一下。
-  const showPanel = showArtifactPanel(agent?.type)
+  // 第三列判据：Agent 类型。⚠️ 只读保留会话里 Agent 已软删 ⇒ 用会话项的类型快照兜，
+  // 这样 TaskAgent 的只读会话仍能看产物 / 工作区（历史不该因为 Agent 被删就消失）。
+  const showPanel = showArtifactPanel(agent?.type ?? agentTypeSnapshot)
 
   /**
    * 产物列表：**"刷新后产物还在"的唯一出口**（`artifact` 事件只发一次、
@@ -569,6 +678,8 @@ export function ChatPage() {
   }, [])
 
   const submit = useCallback(async (): Promise<void> => {
+    // 只读保留会话（Agent 已软删）：不发消息（输入区在界面上已被只读提示替换，这里再兜一道）
+    if (readOnly) return
     const text = draft.trim()
     if (text === '') return
     // 先清空输入框（体感"发出去了"），失败时再还回来 —— 见下面的 `setDraft(text)`。
@@ -585,7 +696,7 @@ export function ChatPage() {
       setAttachments(sentAttachments)
       feedback.fail(outcome.error, '发送失败')
     }
-  }, [attachments, draft, feedback, send, selectedModelId])
+  }, [attachments, draft, feedback, readOnly, send, selectedModelId])
 
   /**
    * 点「停止」（`03` §4.1 的时序在 `useChatStream` → `stopController`，这里只报告结果）。
@@ -601,6 +712,36 @@ export function ChatPage() {
       }
     })
   }, [feedback, stop])
+
+  /**
+   * 点「插话」（P1-9 · P4 · R1）：把**当前草稿**插给运行中的 agent，**不打断**这一轮。
+   *
+   * 三种结局都如实说：
+   *   · `ok:true, accepted:true` —— 已投递（agent 在助手 turn 边界读到）⇒ 清草稿 + 轻提示；
+   *   · `ok:true, accepted:false` —— 流刚好结束（幂等）⇒ **保留草稿**，提示"没送到"；
+   *   · `ok:false` —— 网络/信封错误 ⇒ 报错，草稿照样保留。
+   */
+  const handleSteer = useCallback((): void => {
+    const text = draft.trim()
+    if (text === '') return
+    setSteerPending(true)
+    void steer(text)
+      .then((outcome) => {
+        if (!outcome.ok) {
+          feedback.fail(outcome.error, '插话失败')
+          return
+        }
+        if (outcome.accepted) {
+          setDraft('')
+          feedback.ok('已插话：agent 会在当前步骤跑完后读到')
+        } else {
+          feedback.note('这一轮刚好结束了，插话没送到（内容已保留在输入框）')
+        }
+      })
+      .finally(() => {
+        setSteerPending(false)
+      })
+  }, [draft, feedback, steer])
 
   /**
    * 点「重新生成」（P1-3）：**重跑最新一轮的问题、替换当前回答**。
@@ -721,7 +862,13 @@ export function ChatPage() {
    */
   const handleToggleMemoryExcluded = useCallback(
     (next: boolean): void => {
-      if (conversationId === undefined) return
+      // 新会话态（会话还没建）：开关挂在会话上，没法写服务端 ⇒ 先记意图、只改本地，
+      // 等首条消息建出会话、开流前再落地（见 `onConversationCreated` / `memoryExcludedPresetRef`）。
+      if (conversationId === undefined) {
+        memoryExcludedPresetRef.current = next
+        setMemoryExcluded(next)
+        return
+      }
       setMemoryExcludedPending(true)
       void setConversationMemoryExcluded(conversationId, next)
         .then((result) => {
@@ -738,42 +885,34 @@ export function ChatPage() {
     [conversationId, feedback],
   )
 
-  // ── 侧栏（P0-1-34）的三个动作 ──────────────────────────────────────────────
-
-  /** 切到某个会话。用 `push`（不是 `replace`）：这**是**一次导航，后退该能回到上一个会话 */
-  const handleSelectConversation = useCallback(
-    (id: string): void => {
-      navigate(chatPath(agentId, id))
-    },
-    [agentId, navigate],
-  )
-
   /**
-   * 「+ 新会话」⇒ 回到**不带 conversationId** 的地址（`03` §4.1：进入对话页只展示开场白，
-   * 首条消息发送时才真的建会话）。
-   *
-   * `push` 同样是对的：翻回上一个会话是用户会做的动作。
+   * 切换会话级 **Code 模式**（P1-9 · P3）。与「不记入记忆」同款：请求成功后才对齐本地开关
+   * （不乐观更新）—— 界面显示的状态与服务端落库状态一致。
+   * ⚠️ 开关**下次派活生效**（容器 env 在创建沙箱时注入，见 `sandbox/manager.ts`）。
    */
-  const handleNewConversation = useCallback((): void => {
-    navigate(chatPath(agentId))
-  }, [agentId, navigate])
-
-  /**
-   * 删除成功之后的收尾（两件，判断依据都是"删掉的是不是**我正在看/正在跑**的那一条"）。
-   *
-   * ① **删的正是 URL 里那个会话** ⇒ 立刻导航去新会话态。不导航的后果很具体：
-   *    页面停在一个已经不存在的会话上，历史查询下一次重取就是 404，屏幕上是一段
-   *    "历史没有读出来"，而用户明明刚刚亲手删掉了它。
-   * ② **那一轮还在本地流着** ⇒ 就地收掉渲染状态。**刻意不 abort fetch**：`AbortController`
-   *    在 `useChatStream` 内部（abort 是停止时序的一环，页面越权调它会把"停止"的两条路
-   *    搅成三条）。此后到达的帧会因为 `round === null` 被 `apply` 静默丢掉（store 既有行为）。
-   */
-  const handleConversationDeleted = useCallback(
-    (removed: RemoveConversationResult): void => {
-      if (removed.id === conversationId) navigate(chatPath(agentId), { replace: true })
-      if (removed.id === streamingId) useChatStreamStore.getState().reset()
+  const handleToggleCodeMode = useCallback(
+    (next: boolean): void => {
+      // 新会话态（会话还没建）：`code_mode` 是会话列，没法写服务端 ⇒ 先记意图、只改本地，
+      // 等首条消息建出会话、开流前再落地（见 `onConversationCreated` / `codeModePresetRef`）。
+      if (conversationId === undefined) {
+        codeModePresetRef.current = next
+        setCodeMode(next)
+        return
+      }
+      setCodeModePending(true)
+      void setConversationCodeMode(conversationId, next)
+        .then((result) => {
+          setCodeMode(result.codeMode)
+          feedback.ok(result.codeMode ? '已开启 Code 模式（下次派活生效）' : '已关闭 Code 模式')
+        })
+        .catch((error: unknown) => {
+          feedback.fail(error, 'Code 模式开关没有保存')
+        })
+        .finally(() => {
+          setCodeModePending(false)
+        })
     },
-    [agentId, conversationId, navigate, streamingId],
+    [conversationId, feedback],
   )
 
   // ── 撤回 / 修改重发最新一轮（产品优化 2026-09-29）──────────────────────────────
@@ -806,8 +945,10 @@ export function ChatPage() {
     [conversationId, queryClient],
   )
 
-  // ── 智能体本身取不到（不存在 / 已软删 / 链接里的 id 不对）：给一条能回去的路
-  if (agentQuery.isError) {
+  // ── 智能体取不到（不存在 / 已软删 / 链接里的 id 不对）：给一条能回去的路。
+  // ⚠️ **只读保留的会话除外**（`readOnly`）：Agent 被软删后会话转只读保留（`02` §4.4），
+  //    此时 `useAgent` 必然 404，但历史看得见、只是不能再发消息 —— 不该报"打不开这个对话"。
+  if (agentQuery.isError && !readOnly) {
     return (
       <div className="page__head">
         <div>
@@ -816,7 +957,7 @@ export function ChatPage() {
           <p className="page__lead">智能体取不到（可能已被删除，或链接里的 id 不对）。</p>
         </div>
         <div className="page__head-actions">
-          <Link to={HOME_PATH}>
+          <Link to={AGENTS_PATH}>
             <Button type="primary">回智能体列表</Button>
           </Link>
         </div>
@@ -825,103 +966,52 @@ export function ChatPage() {
   }
 
   return (
-    // `.chat` 的完整形态（`03` §4.1 / `design/chat.html` 的 `.chat--with-panel`）是**三栏**：
-    // 会话侧栏 + 消息流 +（TaskAgent 的）产物面板。前两栏在 P0-1-34 就位，
-    // 第三栏是 **P0-3-11**（产物收集/列表/预览齐了才可能出现真内容）。
-    // ⚠️ 第三列**不是常驻的空占位**：只对 TaskAgent 加 `chat--with-panel`，
-    // 否则"消息流到底占多宽"会变成一个看不出来的问题（ChatBot 会永远少 312px）。
+    // `.chat` 的形态（`03` §4.1）：**消息流 +（TaskAgent 的）产物 / 工作区面板**。
+    // ⚠️ P1-15 起**会话栏不在这一层**了 —— 它是聊天主页外壳（`ChatHomePage` → `ConvRail`）的一列，
+    // 因为它是**跨智能体**的历史（与"当前会话属于谁"无关）。这里只剩消息流与第三列。
     <>
-      <div className={showPanel ? 'chat chat--with-panel' : 'chat'}>
-        <ConversationSidebar
-          agentId={agentId}
-          conversationId={conversationId}
-          streamingId={streamingId}
-          onSelect={handleSelectConversation}
-          onNew={handleNewConversation}
-          onDeleted={handleConversationDeleted}
-        />
+      <div
+        className={`chat${showPanel ? ' chat--with-panel' : ''}${codeMode ? ' chat--code' : ''}${codeMode && codeFocus !== 'none' ? ` chat--focus-${codeFocus}` : ''}`}
+        style={
+          codeMode && conversationId !== undefined
+            ? ({ '--panel-w': `${wsPanel.width}px` } as CSSProperties)
+            : undefined
+        }
+      >
         <main className="chat__main" aria-label="当前会话">
           <div className="chat__head">
-            <div>
-              <h1 className="chat__title">{agentName}</h1>
-              <p className="ratio">
-                {agent === undefined
-                  ? '正在读取智能体…'
-                  : `${agent.type} · ${activeModelLabel ?? '未绑定模型'}`}
-              </p>
-            </div>
+            {/* 智能体 chip：点开 = 换智能体 ⇒ 进入它的**新会话态**（不建会话）。
+                只读保留会话里 Agent 已删，chip 仍显示名字快照（点开可换到别的智能体开新对话）。 */}
+            <AgentPicker
+              trigger={
+                <>
+                  <Tag className="chat__agent-name">{agentName}</Tag>
+                  <span className="chat__agent-type">{agentTypeLabel}</span>
+                  <DownOutlined />
+                </>
+              }
+              triggerClassName="chat__agent-chip"
+              triggerTitle="切换智能体（进入新会话）"
+              onPick={(nextAgentId) => navigate(newConversationPath(nextAgentId))}
+            />
+            {/* 只读保留（Agent 被软删）：明确告知历史可看、但不能再发消息 */}
+            {readOnly ? (
+              <Tag
+                className="tag--warn"
+                title="该智能体已被删除，此会话只读保留：历史可查看，但不能再发送消息"
+              >
+                只读保留
+              </Tag>
+            ) : null}
+
+            {/* 标题栏右侧只留一枚**设置图标**（R4 / 用户反馈：直接进编辑智能体） */}
             <div className="chat__head-right">
-              {/* 会话级自动审批：开启后本会话内危险工具（含服务端 elicitation）不再逐次弹确认卡。
-                  新会话态也能开（先把意图记在本地，建出会话后、开流前落地）—— 否则第一轮必弹确认卡。 */}
-              <Switch
-                size="small"
-                checked={autoApprove}
-                loading={autoApprovePending}
-                checkedChildren="自动审批"
-                unCheckedChildren="逐次确认"
-                onChange={handleToggleAutoApprove}
-                title={
-                  conversationId === undefined
-                    ? '开启后本会话内危险工具不再逐次弹确认卡（发送第一条消息时生效）'
-                    : '开启后本会话内危险工具不再逐次弹确认卡（会话级，仅本会话生效）'
-                }
-              />
-              {/* 会话级「不记入记忆」（P1-8）：关闭后本次对话不写入长期记忆（已有记忆仍作背景）。
-                  `conversationId` 未建（新会话态）时禁用 —— 开关挂在会话上。 */}
-              <MemoryExclusionSwitch
-                conversationId={conversationId}
-                excluded={memoryExcluded}
-                loading={memoryExcludedPending}
-                onToggle={handleToggleMemoryExcluded}
-              />
-              {/* 模型选择器（模型池特性）：池里有 2 个及以上模型时才给选择器；否则只有默认模型、
-                  没有可选项，用上面的文字标签展示即可。选了非默认模型时随发送透传给后端
-                  （`POST /:id/chat` 的 modelId），后端校验它是该智能体模型池成员。 */}
-              {agent !== undefined && agent.modelId !== null && agent.models.length >= 2 ? (
-                <Select
-                  size="small"
-                  value={selectedModelId ?? agent.modelId}
-                  style={{ minWidth: 160 }}
-                  onChange={(next: string) => setSelectedModelId(next)}
-                  options={agent.models.map((m) => ({
-                    value: m.modelId,
-                    label: m.available ? m.modelLabel : `${m.modelLabel}（已停用）`,
-                    disabled: !m.available,
-                  }))}
-                  title="选择本会话使用的模型（来自该智能体的模型池）"
-                />
-              ) : null}
-              {agent?.modelId === null ? (
-                // 未绑定模型（多因所属模型商被删除而自动解绑）⇒ 发消息会被后端 409 拦下。
-                // 提前说清并指向出路（编辑页重新绑定）。
-                <Tag className="tag--danger" title="该智能体未绑定模型，请到编辑页重新绑定后再对话">
-                  未绑定模型
-                </Tag>
-              ) : agent?.modelAvailable === false ? (
-                // 绑定模型被停用 ⇒ 发消息会被后端 409 拦下（`shared/src/agent.ts` 的 `modelAvailable`
-                // 是服务端投影，前端**照抄**，不自己判角色/不自己看模型池）。提前说，省一次失败。
-                <Tag className="tag--danger" title="绑定的模型或其 Provider 已停用，发送会被拒绝">
-                  绑定模型不可用
-                </Tag>
-              ) : null}
-              {/* 窄屏产物入口：第三列在 <1280px 被 CSS 藏起来（`app.css` 的 1280 断点），
-                  这枚按钮只在窄屏显示（同款断点），点开一个抽屉承载同一个 `ArtifactPanel`。
-                  宽屏下按钮被 CSS 隐藏、第三列常驻 ⇒ 不重复。 */}
-              {showPanel ? (
-                <Button
-                  size="small"
-                  className="chat__panel-toggle"
-                  onClick={() => setArtifactDrawerOpen(true)}
-                  title="查看产物列表"
-                >
-                  产物
-                  {artifactItems.length > 0 ? ` · ${artifactItems.length}` : ''}
-                </Button>
-              ) : null}
               {agent === undefined ? null : (
-                <Link to={agentEditPath(agent.id)}>
-                  <Button size="small">编辑智能体</Button>
-                </Link>
+                <Tooltip title="编辑智能体">
+                  <Link to={agentEditPath(agent.id)} className="chat__settings" aria-label="编辑智能体">
+                    <SettingOutlined />
+                  </Link>
+                </Tooltip>
               )}
             </div>
           </div>
@@ -1026,28 +1116,63 @@ export function ChatPage() {
             </div>
           ) : null}
 
-          {/* ── 输入区：状态机 / 停止 / 确认卡全在 `ChatInput` 里（本页只提供数据与回调） ── */}
-          <ChatInput
-            round={round}
-            sending={sending}
-            stopping={stopping}
-            // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
-            // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
-            // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
-            elsewhere={streamingId !== null && streamingId !== conversationId}
-            draft={draft}
-            onDraftChange={setDraft}
-            onSubmit={() => {
-              void submit()
-            }}
-            onStop={handleStop}
-            onConfirmAnswer={handleConfirmAnswer}
-            confirmPending={confirmPending}
-            attachments={attachments}
-            uploading={uploading}
-            onPickFiles={handlePickFiles}
-            onRemoveAttachment={handleRemoveAttachment}
-          />
+          {/* ── 输入区：状态机 / 停止 / 确认卡全在 `ChatInput` 里（本页只提供数据与回调）。
+              只读保留会话（Agent 已软删）**不给输入区** —— 换成一句说明（不能再发消息）。 ── */}
+          {readOnly ? (
+            <div className="chat__readonly" role="note">
+              <Tag className="tag--warn">只读保留</Tag>
+              <span>该智能体已被删除，此会话只保留历史记录，不能再发送消息。</span>
+            </div>
+          ) : (
+            <ChatInput
+              round={round}
+              sending={sending}
+              stopping={stopping}
+              // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
+              // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
+              // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
+              elsewhere={streamingId !== null && streamingId !== conversationId}
+              draft={draft}
+              onDraftChange={setDraft}
+              onSubmit={() => {
+                void submit()
+              }}
+              onStop={handleStop}
+              onConfirmAnswer={handleConfirmAnswer}
+              confirmPending={confirmPending}
+              attachments={attachments}
+              uploading={uploading}
+              onPickFiles={handlePickFiles}
+              onRemoveAttachment={handleRemoveAttachment}
+              // 中途插话（P1-9 · P4 · R1）：只对**沙箱（TaskAgent）**会话放出 —— ChatBot 的
+              // producer 不消费插话，放出入口只会得到一个静默无效的按钮（判据在状态机里）。
+              steerable={agent?.type === 'TASK_AGENT'}
+              onSteer={handleSteer}
+              steerPending={steerPending}
+              // R4：会话控件（模型 / 自动审批 / 记忆 / Code 模式 / 专注 / 产物入口）摆到输入框下方
+              controls={
+                <ConversationSettings
+                  agent={agent}
+                  conversationId={conversationId}
+                  selectedModelId={selectedModelId}
+                  onSelectModel={setSelectedModelId}
+                  autoApprove={autoApprove}
+                  autoApprovePending={autoApprovePending}
+                  onToggleAutoApprove={handleToggleAutoApprove}
+                  memoryExcluded={memoryExcluded}
+                  memoryExcludedPending={memoryExcludedPending}
+                  onToggleMemoryExcluded={handleToggleMemoryExcluded}
+                  codeMode={codeMode}
+                  codeModePending={codeModePending}
+                  onToggleCodeMode={handleToggleCodeMode}
+                  showPanel={showPanel}
+                  onOpenPanel={() => setArtifactDrawerOpen(true)}
+                  codeFocus={codeFocus}
+                  onChangeCodeFocus={setCodeFocus}
+                />
+              }
+            />
+          )}
         </main>
 
         {/* ── 第三列：产物面板（P0-3-11，**只有 TaskAgent 有**）─────────────────────
@@ -1061,15 +1186,29 @@ export function ChatPage() {
             ⚠️ `streaming` 用 `round?.status === 'streaming'`（**当前会话**的那一轮）：
             别的会话在跑时本列不该亮灯 —— 它列出的是**这个**会话的产物。 */}
         {showPanel ? (
-          <ArtifactPanel
-            items={artifactItems}
-            total={artifactsQuery.data?.total}
-            listFailed={artifactsQuery.isError}
-            onRetry={() => {
-              void artifactsQuery.refetch()
-            }}
-            streaming={round?.status === 'streaming'}
-          />
+          codeMode && conversationId !== undefined ? (
+            // Code 模式：第三列换成**工作区面板**（P1-9 · P3）—— 人机共享可编辑（§六 4）
+            <aside className="panel" aria-label="工作区面板">
+              <div
+                className={`ws-resizer${wsPanel.dragging ? ' is-active' : ''}`}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="调整工作区面板宽度"
+                onPointerDown={wsPanel.onPointerDown}
+              />
+              <WorkspacePanel conversationId={conversationId} codeMode={codeMode} />
+            </aside>
+          ) : (
+            <ArtifactPanel
+              items={artifactItems}
+              total={artifactsQuery.data?.total}
+              listFailed={artifactsQuery.isError}
+              onRetry={() => {
+                void artifactsQuery.refetch()
+              }}
+              streaming={round?.status === 'streaming'}
+            />
+          )
         ) : null}
       </div>
 
@@ -1086,11 +1225,13 @@ export function ChatPage() {
         onClose={closePreview}
       />
 
-      {/* 产物列表抽屉（窄屏入口，见头部那枚 `chat__panel-toggle`）。⚠️ 与第三列共用同一个
-          `ArtifactPanel`：数据（`items` / `total` / 失败与重试 / 流式）全在这一页算好，
-          面板只是换一种摆法。AntD `Drawer` 默认**首次打开才挂载**子节点 ⇒ 宽屏下不产生第二个
-          `useMinuteTick` 节拍器。 */}
-      {showPanel ? (
+      {/* 产物列表抽屉（窄屏入口 = 输入框下方控件条那枚 `.composer-control--narrow`，
+          仅**非 Code** 的 TaskAgent 会发出该入口；Code 模式工作区窄屏已常驻并排，不开抽屉
+          —— 故这里也只渲染产物面板）。
+          ⚠️ 与第三列共用同一个 `ArtifactPanel`：数据（`items` / `total` / 失败与重试 / 流式）
+          全在这一页算好，面板只是换一种摆法。AntD `Drawer` 默认**首次打开才挂载**子节点 ⇒
+          宽屏下不产生第二个 `useMinuteTick` 节拍器。 */}
+      {showPanel && !codeMode ? (
         <Drawer
           title="产物"
           placement="right"

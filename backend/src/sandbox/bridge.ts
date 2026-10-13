@@ -196,6 +196,12 @@ export interface SandboxRpc {
   runTurn(message: string, options?: RunTurnOptions): Promise<TurnOutcome>
   /** 中断当前运行（P0-3-8 的停止路径）。⚠️ 只发中断，**不杀容器** */
   abort(): Promise<void>
+  /**
+   * 中途插话（**P1-9 · P4 · R1**）：向运行中的引擎排队一条消息（pi RPC `steer`）。
+   * 投递发生在**助手 turn 边界**（当前 turn 的工具调用执行完之后、下一次 LLM 调用之前）。
+   * ⚠️ 只投递、不等待它被模型读到 —— "成功"这件事由下一轮 `read` 拿到的版本体现。
+   */
+  steer(message: string): Promise<void>
   /** 拆掉连接（不关容器；幂等 —— 收尾路径与进程退出路径各会调一次） */
   close(reason?: string): void
   /** 脱敏后的 stderr 尾巴（排障用：引擎抱怨了什么，看这里） */
@@ -409,6 +415,26 @@ class SandboxRpcSession implements SandboxRpc {
     // 不该变成一个异常）。真正的判据是"`agent_settled` 有没有来"。
     await this.send({ type: 'abort' }).catch((error: unknown) => {
       getLogger().debug({ err: error, conversationId: this.conversationId }, '发中断命令失败（继续等 agent_settled）')
+    })
+  }
+
+  /**
+   * 中途插话（P1-9 · P4 · R1）—— 向运行中的引擎排队一句话（pi RPC `steer`）。
+   *
+   * 与 {@link abort} 同款"尽力而为"：投不进去（桥已关 / 引擎没在跑 / 被拒）只记 debug，
+   * **不抛异常**。理由：插话是"锦上添花"（`子方案` §五 5），一次投递失败不该把已经跑起来的
+   * 那一轮搞成故障；真正的兜底是写入口的 CAS 冲突回喂模型与轮末变更集（人工审阅）。
+   *
+   * ⚠️ **pin 版复核（2026-10-12）**：pi `0.87.1` 的 `docs/rpc-commands.md#steer` 与
+   * `dist/modes/rpc/rpc-mode.js` 的 `case "steer"` 都确认命令形状是
+   * `{type:'steer', message}`、应答 `{type:'response', command:'steer', success:true}`；
+   * 语义 = "运行中排队，在**当前助手 turn 的工具调用执行完之后、下一次 LLM 调用之前**投递"
+   * （`子方案` §十五 的复核结论）。空闲时也收下（排队），不报错。
+   */
+  async steer(message: string): Promise<void> {
+    if (!this.#alive) return
+    await this.send({ type: 'steer', message }).catch((error: unknown) => {
+      getLogger().debug({ err: error, conversationId: this.conversationId }, '发中途插话失败（尽力而为，忽略）')
     })
   }
 

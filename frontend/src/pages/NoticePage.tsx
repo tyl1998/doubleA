@@ -40,8 +40,8 @@ export function NoticePage({ serial, title, lead, tag, bullets, actions }: Notic
   // 顶栏渲染成 `工作台 / <title>`（占位页 / 未找到没有独立的模块段）。
   usePageCrumb(title)
 
-  // ⚠️ 这里**不套 `.page`**：页面级留白与 `<main>` 地标由 AppLayout 统一提供
-  // （登录页不走 AppLayout，它自带 `.auth` 两栏，故不在此约定内）。
+  // ⚠️ 这里**不套 `.page`**：页面级留白与 `<main>` 地标由 AppShell 统一提供
+  // （登录页不走 AppShell，它自带 `.auth` 两栏，故不在此约定内）。
   return (
     <>
       <div className="page__head">

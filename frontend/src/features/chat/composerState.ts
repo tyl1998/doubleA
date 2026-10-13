@@ -76,6 +76,14 @@ export interface ComposerView {
   /** `confirm` 到达 ⇒ 整个输入区被占用（渲染层据此把 textarea 置灰 + 显示确认卡） */
   locked: boolean
   primary: ComposerPrimary
+  /**
+   * 「边跑边插话」入口的可见性（**P1-9 · P4 · R1**）。
+   *
+   * 只有"本会话是沙箱（TaskAgent）+ 正在 streaming + 草稿非空"时才 `visible` ——
+   * 此时输入框里那句还没发出去的话可以**不打断当前一轮**地插给运行中的 agent
+   * （服务端投到**助手 turn 边界**）。其余状态一律隐藏（`disabled:true`）。
+   */
+  steer: ComposerSteer
   placeholder: string
   /** 主按钮下方那行提示（与 `placeholder` 同源，避免"按钮说停止、提示说发送"） */
   hint: string
@@ -84,6 +92,15 @@ export interface ComposerView {
   /** `.composer__state` 那行显示的状态名（端测/截图时的可读锚点） */
   label: ComposerState
 }
+
+/** 「边跑边插话」入口（P1-9 · P4 · R1）的可见性/可用性 */
+export interface ComposerSteer {
+  visible: boolean
+  disabled: boolean
+}
+
+/** 非 streaming 态的插话入口（隐藏 + 禁用）—— 一处定义，六处引用，避免各写一份 */
+const HIDE_STEER: ComposerSteer = Object.freeze({ visible: false, disabled: true })
 
 export interface ComposerInput {
   /** 当前会话进行中的那一轮（`null` = 空闲）。**必须是"属于当前会话"的那一个**（防串台） */
@@ -106,6 +123,12 @@ export interface ComposerInput {
    * （多流要把 store 改成 `Map`，属后续批次），故这里把它显式说出来而不是让它静默发生。
    */
   elsewhere: boolean
+  /**
+   * 本会话是否支持**中途插话**（P1-9 · P4 · R1）：**只有沙箱（TaskAgent）会话**为 `true`。
+   * 判据在页面（`agentType === 'TASK_AGENT'`）；缺省 `false` ⇒ 与引入前逐字一致
+   * （ChatBot 的 producer 不消费插话，放出入口只会得到一个静默无效的按钮）。
+   */
+  steerable?: boolean
 }
 
 /** 各状态的文案。**一处定义**：placeholder / hint / 按钮 label 全从这里取 */
@@ -154,7 +177,7 @@ const TEXT = {
  * 真正拦住那次发送的是 `useChatStream.send` 里的闸门（返回 `BUSY` + 一句能照着做的话）。
  */
 export function composeState(input: ComposerInput): ComposerView {
-  const { round, sending, stopping, draft, elsewhere } = input
+  const { round, sending, stopping, draft, elsewhere, steerable = false } = input
 
   // ① confirm：锁输入（优先级最高）
   if (round !== null && round.confirm !== null) {
@@ -164,6 +187,7 @@ export function composeState(input: ComposerInput): ComposerView {
       canSend: false,
       locked: true,
       primary: { kind: 'busy', label: '等待确认', disabled: true, action: null },
+      steer: HIDE_STEER,
       ...TEXT.confirm,
       led: 'warn',
       label: 'confirm',
@@ -178,13 +202,15 @@ export function composeState(input: ComposerInput): ComposerView {
       canSend: false,
       locked: false,
       primary: { kind: 'busy', label: '停止中…', disabled: true, action: null },
+      steer: HIDE_STEER,
       ...TEXT.stopping,
       led: 'warn',
       label: 'stopping',
     }
   }
 
-  // ③ streaming：按钮变 [停止]；**输入不禁**（`03` §4.1："streaming 中允许继续输入但发送禁用"）
+  // ③ streaming：按钮变 [停止]；**输入不禁**（`03` §4.1："streaming 中允许继续输入但发送禁用"）。
+  //    ★ P1-9 · P4 · R1：沙箱会话在此态下，草稿非空时额外露出「插话」入口（不打断当前一轮）。
   if (round !== null && round.status === 'streaming') {
     return {
       state: 'streaming',
@@ -192,6 +218,7 @@ export function composeState(input: ComposerInput): ComposerView {
       canSend: false,
       locked: false,
       primary: { kind: 'stop', label: '停止', disabled: false, action: 'stop' },
+      steer: { visible: steerable && draft.trim() !== '', disabled: false },
       ...TEXT.streaming,
       led: 'run',
       label: 'streaming',
@@ -206,6 +233,7 @@ export function composeState(input: ComposerInput): ComposerView {
       canSend: false,
       locked: false,
       primary: { kind: 'busy', label: '发送中…', disabled: true, action: null },
+      steer: HIDE_STEER,
       ...TEXT.sending,
       led: 'run',
       label: 'sending',
@@ -221,6 +249,7 @@ export function composeState(input: ComposerInput): ComposerView {
       canSend: false,
       locked: false,
       primary: { kind: 'busy', label: '别的会话生成中', disabled: true, action: null },
+      steer: HIDE_STEER,
       ...TEXT.elsewhere,
       led: 'warn',
       label: 'elsewhere',
@@ -236,6 +265,7 @@ export function composeState(input: ComposerInput): ComposerView {
     canSend,
     locked: false,
     primary: { kind: 'send', label: '发送', disabled: !canSend, action: 'send' },
+    steer: HIDE_STEER,
     ...TEXT.idle,
     led: 'idle',
     label: 'idle',

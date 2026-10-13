@@ -619,6 +619,32 @@ function sleep(ms: number): Promise<void> {
   })
 }
 
+// ───────────────────────────── 归档写入（P1-9 · R11）─────────────────────────────
+
+/**
+ * 把一个 **tar 归档**解到容器内的某个目录（`docker cp` 的 API 形态，`docker.ts:535` 早已列为待加原语）。
+ *
+ * ★ P1-9 · R11 是它的**第一个消费方**：把解密后的 git 凭据（私钥 + `known_hosts`）写进
+ * 容器 tmpfs `$HOME/.ssh`（§7.3 明写"不另造写文件通道"）。
+ *
+ * ⚠️ 三条形状约束：
+ *   · **归档由调用方构造**（`sandbox/tar.ts#buildTar`）：本函数不碰"里面是什么"，
+ *     于是"注哪些文件、什么权限、谁的属主"这条判据只有一处（`sandbox/gitCredential.ts`）。
+ *   · **`path` 是解包目标目录**（tar 里的相对路径落在它下面）：`putArchive` 不会替我们建
+ *     目标目录之外的父层，故归档里要自带目录条目。
+ *   · **`await` 到请求完成**：dockerode 的 modem 在响应结束才 resolve ⇒ 直接 await 即代表"已落盘"。
+ *
+ * @throws Error docker 报错（`describeDockerFailure` 已翻过人话）
+ */
+export async function putArchive(containerId: string, targetDir: string, archive: Buffer): Promise<void> {
+  const container = getDocker().getContainer(containerId)
+  try {
+    await container.putArchive(archive, { path: targetDir })
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
 /** 诊断用：当前 Docker 的简述（启动日志里打一行，"沙箱到底有没有接上 Docker"一眼可判） */
 export async function describeDocker(): Promise<{ reachable: boolean; version?: string; error?: string }> {
   try {
