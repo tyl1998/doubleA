@@ -45,7 +45,9 @@ WATCH_PID_FILE="$REPO_ROOT/.pids/egress-watch.pid"
 if [ -f "$WATCH_PID_FILE" ]; then
   WATCH_PID="$(cat "$WATCH_PID_FILE" 2>/dev/null || true)"
   if [ -n "$WATCH_PID" ] && kill -0 "$WATCH_PID" 2>/dev/null; then
-    kill "$WATCH_PID" 2>/dev/null && ok "已停白名单同步（pid $WATCH_PID）" || warn "停同步失败（pid $WATCH_PID）"
+    # ⚠️ `$WATCH_PID` 后面紧跟全角字符时必须写成 `${WATCH_PID}`：bash 3.2（macOS `/bin/bash`）
+    #    会把多字节字符的第一个字节当成变量名的一部分 ⇒ `WATCH_PID?: unbound variable`。
+    kill "$WATCH_PID" 2>/dev/null && ok "已停白名单同步（pid ${WATCH_PID}）" || warn "停同步失败（pid ${WATCH_PID}）"
   else
     info "同步进程本来就不在（幂等）"
   fi

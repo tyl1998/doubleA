@@ -1,23 +1,26 @@
 /**
- * 沙箱**运行时组件目录 + 组合**（P1-17a）—— 契约层：UI 能勾什么、组合怎么规范化。
+ * 沙箱**运行时：语言 + 版本**（P1-17a）—— 契约层：UI 能勾哪些语言、版本怎么规范化成变体 id。
  *
- * 依据：`docs/子方案/Code模式工作区.md` §五之二 2。**2026-10-14 定案（用户）**：
- *   · 运行时 = **语言 + 版本** 的**组件集合**（如 Python 3.10 + Node 22），**不写死成枚举**；
- *   · **不在前端写死"可选运行时"** —— 由后端探测本机镜像得到"已经有哪些"；
- *   · **用户选了本机没有的组合 ⇒ 后端按需 `docker build`**（不再要求运维预先猜组合）。
+ * 依据：`docs/子方案/Code模式工作区.md` §五之二 2。演进：
+ *   · 2026-10-14：运行时 = 组件（语言+版本）的集合，组件来自**有限目录** `SANDBOX_RUNTIME_COMPONENTS`；
+ *   · **2026-10-15（用户定案）：不再枚举版本** —— UI 只列**语言**，勾选语言后在输入框里**填版本号**；
+ *     后端按 `语言=版本` 组合按需 `docker build`（各语言的任意版本由 `runtime/install-*.sh` 负责装）。
+ *   · 仍然：**不在前端写死"可选运行时"** —— 已就绪的运行时由后端探测本机镜像得到（有就提供）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三个概念，别混
  * ─────────────────────────────────────────────────────────────────────
- *   · **组件（component）**：一门语言的**一个版本**，id 如 `python310` / `node22` / `go`。
- *     目录 = `SANDBOX_RUNTIME_COMPONENTS`（**有限**：每条都要 `runtime/Dockerfile` 知道怎么装）。
- *   · **变体（variant）**：一个**组件集合**的规范化 id，如 `node22-python310`（按目录顺序排序、`-` 连接；
- *     空集合 = `none`）。它是 **`Conversation.runtime` 的值**、也是镜像 tag 的可读部分。
- *   · **镜像**：`<repo>:<variant>-v<层版本>`，由变体构建而来。
+ *   · **选择项（selection）**：`{ language, version }`，如 `{ language: 'python', version: '3.12' }`。
+ *   · **组件 id**：`语言 + 版本`（**无分隔符**，版本保留 `.`），如 `python3.12` / `node20` / `go1.22`。
+ *     语言名之间互不为前缀 ⇒ 可由 id 反解回 `{ language, version }`（见 {@link parseSandboxComponentId}）。
+ *   · **变体（variant）**：一组选择项的规范化 id —— 按 `SANDBOX_RUNTIME_LANGUAGES` 顺序、每语言取一个版本、
+ *     组件 id 用 `-` 连接（空集合 = `none`），如 `node20-python3.12`。它是 `Conversation.runtime` 的值、
+ *     也是镜像 tag 的可读部分：`<repo>:<variant>-v<层版本>`。
  *
  * ⚠️ **规范化规则是唯一的、且必须与构建侧一致**（`infra/sandbox/versions.mjs` 有一份等价实现）：
- *   排序按 `SANDBOX_RUNTIME_LANGUAGES` 的顺序、同语言按目录出现顺序；`-` 连接。
+ *   按 `SANDBOX_RUNTIME_LANGUAGES` 顺序排序、每语言一个版本、`-` 连接。
  *   两处不一致 ⇒ "建出来的 tag"与"选出来的 tag"对不上（症状：明明建了却说没有、反复重建）。
+ * ⚠️ **版本里不能含 `-`**（会与变体分隔符冲突）—— 见 {@link sandboxComponentId}。
  */
 
 import { z } from 'zod'
@@ -26,37 +29,40 @@ import { z } from 'zod'
 export const SANDBOX_RUNTIME_LANGUAGES = ['node', 'python', 'go', 'java', 'rust'] as const
 export type SandboxRuntimeLanguage = (typeof SANDBOX_RUNTIME_LANGUAGES)[number]
 
-/** 目录里的一个组件（语言的一个版本） */
-export interface SandboxRuntimeComponent {
+/** 一个选择项：某语言的某个版本 */
+export interface SandboxRuntimeSelection {
   language: SandboxRuntimeLanguage
-  /** 语言版本字符串；`default` = 该语言在基础镜像里的默认版本（如 go / rust） */
+  /** 版本字符串（如 `3.12` / `20` / `1.22` / `stable`）；**不得含 `-`** */
   version: string
-  /** 组件 id（tag 安全、无 `-`）：变体 id 用它拼 */
-  id: string
-  /** 界面显示名 */
-  label: string
 }
 
 /**
- * **组件目录**（有限、可预烘焙）—— 决定 UI 能给用户勾什么、`Dockerfile` 要能装什么。
+ * 一门语言的**元信息**（UI 勾选语言后据此渲染版本输入框）—— 与 `versions.mjs#RUNTIME_LANGUAGE_SPECS` 一致。
  *
- * ⚠️ 加一条 = 确认 `runtime/Dockerfile` 能装这门语言的这个版本（python 走 `install-python-version.sh`；
- *    go/java/rust 走 apt；node 由 base 提供）。**不需要**预先构建镜像 —— 用户选到就按需构建。
- * ⚠️ node 目前只有 22（= base 镜像自带的版本）：换 node 版本要换 base 镜像，本层不支持。
+ * ⚠️ 这里**不再枚举"支持哪些版本"**：`defaultVersion` 只是输入框预填、`suggestions` 只是候选提示；
+ *    用户可填任意版本，能否装上由 `runtime/Dockerfile` 的装法与构建结果决定（构建失败会在任务里回显）。
  */
-export const SANDBOX_RUNTIME_COMPONENTS: readonly SandboxRuntimeComponent[] = [
-  { language: 'node', version: '22', id: 'node22', label: 'Node.js 22' },
-  { language: 'python', version: '3.11', id: 'python311', label: 'Python 3.11' },
-  { language: 'python', version: '3.10', id: 'python310', label: 'Python 3.10' },
-  { language: 'python', version: '3.8', id: 'python38', label: 'Python 3.8' },
-  { language: 'go', version: 'default', id: 'go', label: 'Go' },
-  { language: 'java', version: '17', id: 'java17', label: 'Java 17' },
-  { language: 'rust', version: 'default', id: 'rust', label: 'Rust' },
-]
+export interface SandboxRuntimeLanguageSpec {
+  language: SandboxRuntimeLanguage
+  /** 界面显示名（如 `Python`） */
+  label: string
+  /** 勾选后版本输入框的**预填**值 */
+  defaultVersion: string
+  /** 常见版本候选（前端做输入建议，不强制） */
+  suggestions: readonly string[]
+  /** 版本输入提示（格式） */
+  hint: string
+  /** base/toolkit 里**自带**的版本（有则系统命令名指它，其它版本用带版本号的命令名）；无则省略 */
+  baseVersion?: string
+}
 
-const COMPONENT_BY_ID: ReadonlyMap<string, SandboxRuntimeComponent> = new Map(
-  SANDBOX_RUNTIME_COMPONENTS.map((component) => [component.id, component]),
-)
+export const SANDBOX_RUNTIME_LANGUAGE_SPECS: readonly SandboxRuntimeLanguageSpec[] = [
+  { language: 'node', label: 'Node.js', defaultVersion: '22', suggestions: ['22', '20', '18'], hint: '大版本，如 20', baseVersion: '22' },
+  { language: 'python', label: 'Python', defaultVersion: '3.11', suggestions: ['3.13', '3.12', '3.11', '3.10', '3.9', '3.8'], hint: '如 3.12', baseVersion: '3.11' },
+  { language: 'go', label: 'Go', defaultVersion: '1.22', suggestions: ['1.23', '1.22', '1.21'], hint: '如 1.22' },
+  { language: 'java', label: 'Java', defaultVersion: '17', suggestions: ['21', '17', '11', '8'], hint: '大版本，如 21' },
+  { language: 'rust', label: 'Rust', defaultVersion: 'stable', suggestions: ['stable', '1.80', '1.79'], hint: '如 1.80 或 stable' },
+]
 
 /** 语言在排序里的序号（未知语言排最后） */
 function languageOrder(language: string): number {
@@ -64,58 +70,93 @@ function languageOrder(language: string): number {
   return index < 0 ? SANDBOX_RUNTIME_LANGUAGES.length : index
 }
 
+const LANGUAGE_SET: ReadonlySet<string> = new Set(SANDBOX_RUNTIME_LANGUAGES)
+
 /** 空集合的变体 id（= 只有 toolkit，不额外装语言运行时） */
 export const SANDBOX_VARIANT_EMPTY = 'none'
 
-/** 基础镜像里已经有的语言版本（选它等于"什么都不装"）——用于给用户提示，不参与构建决策 */
-export const SANDBOX_BASE_NODE_VERSION = '22'
-export const SANDBOX_BASE_PYTHON_VERSION = '3.11'
-
-/**
- * 组件 id 集合 → **规范变体 id**（按语言顺序排序、`-` 连接；空集合 = `none`）。
- * ⚠️ 未知 id 一律丢弃（不抛）：变体 id 只由目录里的组件构成。
- */
-export function sandboxVariantIdFromComponents(ids: readonly string[]): string {
-  const known = [...new Set(ids)].filter((id) => COMPONENT_BY_ID.has(id))
-  if (known.length === 0) return SANDBOX_VARIANT_EMPTY
-  known.sort((a, b) => {
-    const ca = COMPONENT_BY_ID.get(a) as SandboxRuntimeComponent
-    const cb = COMPONENT_BY_ID.get(b) as SandboxRuntimeComponent
-    const byLang = languageOrder(ca.language) - languageOrder(cb.language)
-    if (byLang !== 0) return byLang
-    return SANDBOX_RUNTIME_COMPONENTS.indexOf(ca) - SANDBOX_RUNTIME_COMPONENTS.indexOf(cb)
-  })
-  return known.join('-')
+/** 语言显示名（未知回退原串） */
+export function sandboxLanguageLabel(language: string): string {
+  return SANDBOX_RUNTIME_LANGUAGE_SPECS.find((spec) => spec.language === language)?.label ?? language
 }
 
-/** 变体 id → 组件 id 列表（`none` → `[]`；含未知 id ⇒ `undefined`，表示"不是本目录的组合"） */
-export function sandboxComponentsFromVariantId(variant: string): string[] | undefined {
-  if (variant === SANDBOX_VARIANT_EMPTY || variant === '') return []
-  const ids = variant.split('-').filter((piece) => piece !== '')
-  return ids.every((id) => COMPONENT_BY_ID.has(id)) ? ids : undefined
+/** 版本串规范化（去首尾空白） */
+function normalizeVersion(version: string): string {
+  return version.trim()
 }
 
-/** 组件 id 集合 → 给 `runtime/Dockerfile` 的 `COMPONENTS` 串（`lang=ver,…`，按语言顺序） */
-export function sandboxComponentsArg(ids: readonly string[]): string {
-  const known = [...new Set(ids)].filter((id) => COMPONENT_BY_ID.has(id))
-  known.sort((a, b) => {
-    const ca = COMPONENT_BY_ID.get(a) as SandboxRuntimeComponent
-    const cb = COMPONENT_BY_ID.get(b) as SandboxRuntimeComponent
-    return languageOrder(ca.language) - languageOrder(cb.language)
-  })
-  return known.map((id) => {
-    const component = COMPONENT_BY_ID.get(id) as SandboxRuntimeComponent
-    return `${component.language}=${component.version}`
-  }).join(',')
+/** 版本是否可用于组件 id（非空、且不含 `-`） */
+function isUsableVersion(version: string): boolean {
+  return version !== '' && !version.includes('-')
 }
 
-/** 变体 id → 显示名（用组件 label 拼成「Node.js 22 + Python 3.10」；未知回退原串） */
+/** `(language, version)` → **组件 id**（`语言+版本`，无分隔符）；非法版本 ⇒ 抛 */
+export function sandboxComponentId(language: string, version: string): string {
+  const normalized = normalizeVersion(version)
+  if (!isUsableVersion(normalized)) throw new Error(`非法版本：${version}（不能为空或含 -）`)
+  return `${language}${normalized}`
+}
+
+/** 组件 id → `{ language, version }`（按语言前缀反解；认不出 ⇒ `undefined`） */
+export function parseSandboxComponentId(id: string): SandboxRuntimeSelection | undefined {
+  for (const language of SANDBOX_RUNTIME_LANGUAGES) {
+    if (!id.startsWith(language)) continue
+    const version = id.slice(language.length)
+    if (version !== '') return { language, version }
+  }
+  return undefined
+}
+
+/** 选择项集合 → **规范变体 id**（每语言取一个版本、按语言顺序、`-` 连接；空 = `none`） */
+export function sandboxVariantIdFromSelection(selection: readonly SandboxRuntimeSelection[]): string {
+  const byLanguage = new Map<string, SandboxRuntimeSelection>()
+  for (const item of selection) {
+    if (!LANGUAGE_SET.has(item.language)) continue
+    const version = normalizeVersion(item.version)
+    if (!isUsableVersion(version)) continue
+    byLanguage.set(item.language, { language: item.language, version })
+  }
+  if (byLanguage.size === 0) return SANDBOX_VARIANT_EMPTY
+  return [...byLanguage.values()]
+    .sort((a, b) => languageOrder(a.language) - languageOrder(b.language))
+    .map((item) => sandboxComponentId(item.language, item.version))
+    .join('-')
+}
+
+/** 变体 id → 选择项列表（`none`/空 → `[]`；含无法反解的片段 ⇒ `undefined`，表示"不是我们的组合"） */
+export function sandboxSelectionFromVariantId(variant: string): SandboxRuntimeSelection[] | undefined {
+  if (variant === '' || variant === SANDBOX_VARIANT_EMPTY) return []
+  const pieces = variant.split('-').filter((piece) => piece !== '')
+  const result: SandboxRuntimeSelection[] = []
+  for (const piece of pieces) {
+    const parsed = parseSandboxComponentId(piece)
+    if (parsed === undefined) return undefined
+    result.push(parsed)
+  }
+  return result
+}
+
+/** 选择项集合 → 给 `runtime/Dockerfile` 的 `COMPONENTS` 串（`lang=ver,…`，按语言顺序） */
+export function sandboxComponentsArg(selection: readonly SandboxRuntimeSelection[]): string {
+  const byLanguage = new Map<string, SandboxRuntimeSelection>()
+  for (const item of selection) {
+    if (!LANGUAGE_SET.has(item.language)) continue
+    const version = normalizeVersion(item.version)
+    if (!isUsableVersion(version)) continue
+    byLanguage.set(item.language, { language: item.language, version })
+  }
+  return [...byLanguage.values()]
+    .sort((a, b) => languageOrder(a.language) - languageOrder(b.language))
+    .map((item) => `${item.language}=${item.version}`)
+    .join(',')
+}
+
+/** 变体 id → 显示名（拼成「Node.js 20 + Python 3.12」；未知回退原串） */
 export function sandboxVariantLabel(variant: string): string {
-  const ids = sandboxComponentsFromVariantId(variant)
-  if (ids === undefined) return variant
-  if (ids.length === 0) return '无（仅基础工具）'
-  const labels = ids.map((id) => (COMPONENT_BY_ID.get(id) as SandboxRuntimeComponent).label)
-  return labels.join(' + ')
+  const selection = sandboxSelectionFromVariantId(variant)
+  if (selection === undefined) return variant
+  if (selection.length === 0) return '无（仅基础工具）'
+  return selection.map((item) => `${sandboxLanguageLabel(item.language)} ${item.version}`).join(' + ')
 }
 
 // ───────────────────────────── 接口契约 ─────────────────────────────
@@ -131,14 +172,23 @@ export const sandboxRuntimeSchema = z.object({
 })
 export type SandboxRuntimeItem = z.infer<typeof sandboxRuntimeSchema>
 
+/** `GET /api/sandbox/runtimes` 响应里的一项：一门语言（UI 勾选 + 填版本） */
+export const sandboxRuntimeLanguageSchema = z.object({
+  language: z.enum(SANDBOX_RUNTIME_LANGUAGES),
+  label: z.string(),
+  defaultVersion: z.string(),
+  suggestions: z.array(z.string()),
+  hint: z.string(),
+  baseVersion: z.string().nullable(),
+})
+export type SandboxRuntimeLanguageInfo = z.infer<typeof sandboxRuntimeLanguageSchema>
+
 /** `GET /api/sandbox/runtimes` 的响应 */
 export const listSandboxRuntimesResultSchema = z.object({
   /** 本机**已就绪**的运行时（有镜像才算） */
   runtimes: z.array(sandboxRuntimeSchema),
-  /** **组件目录**（UI 据此渲染"可勾选的组件"；勾完的组合若不在 runtimes 里 ⇒ 可按需构建） */
-  components: z.array(
-    z.object({ id: z.string(), language: z.string(), version: z.string(), label: z.string() }),
-  ),
+  /** **语言清单**（UI 据此渲染"勾选语言 + 填版本"；勾完的组合若不在 runtimes 里 ⇒ 可按需构建） */
+  languages: z.array(sandboxRuntimeLanguageSchema),
   /** 回退镜像（会话 runtime 找不到对应镜像时用它）；未配置为 `null` */
   fallbackImage: z.string().nullable(),
   /** 后端能否**按需构建**（构建上下文存在 + docker 可用）；`false` 时前端只让选已就绪的 */
@@ -146,12 +196,18 @@ export const listSandboxRuntimesResultSchema = z.object({
 })
 export type ListSandboxRuntimesResult = z.infer<typeof listSandboxRuntimesResultSchema>
 
-/** `POST /api/sandbox/runtimes/build` 的请求体：要构建的**组件 id 集合** */
+/** `POST /api/sandbox/runtimes/build` 的请求体：要构建的**语言 + 版本**列表 */
 export const buildSandboxRuntimeBodySchema = z.object({
   components: z
-    .array(z.string().min(1).max(64), { required_error: '缺少 components（组件 id 列表）' })
-    .min(1, '至少选一个组件')
-    .max(8, '组件过多'),
+    .array(
+      z.object({
+        language: z.enum(SANDBOX_RUNTIME_LANGUAGES),
+        version: z.string().trim().min(1, '版本不能为空').max(32, '版本过长'),
+      }),
+      { required_error: '缺少 components（语言+版本列表）' },
+    )
+    .min(1, '至少选一个语言')
+    .max(8, '语言过多'),
 })
 export type BuildSandboxRuntimeBody = z.infer<typeof buildSandboxRuntimeBodySchema>
 

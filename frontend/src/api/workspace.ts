@@ -15,8 +15,11 @@ import type {
   SetConversationCodeModeResult,
   SetConversationRuntimeResult,
   WorkspaceChangesResult,
+  WorkspaceDeleteDirResult,
+  WorkspaceFileDiff,
   WorkspaceFileEntry,
   WorkspaceFileRead,
+  WorkspaceGitResult,
   WorkspaceRevertResult,
   WorkspaceTreeResult,
 } from '@doubulea/shared'
@@ -35,11 +38,70 @@ export function fetchWorkspaceTree(conversationId: string): Promise<WorkspaceTre
   return request<WorkspaceTreeResult>(`/api/conversations/${encodeURIComponent(conversationId)}/workspace`)
 }
 
+/** 工作区 git 概况的 query key（`["workspace-git", conversationId]`） */
+export function workspaceGitQueryKey(conversationId: string): readonly [string, string] {
+  return ['workspace-git', conversationId]
+}
+
+/**
+ * 工作区 git 概况（有哪些仓库 + 各自当前分支；`repos: []` = 这个工作区没有 git）。
+ *
+ * 服务端只读 `.git/HEAD`（不调 git 二进制），所以这里**不会**有 ahead/behind / 脏不脏。
+ */
+export function fetchWorkspaceGit(conversationId: string): Promise<WorkspaceGitResult> {
+  return request<WorkspaceGitResult>(`/api/conversations/${encodeURIComponent(conversationId)}/workspace/git`)
+}
+
+/**
+ * 工作区 git 概况（react-query）。
+ *
+ * 分支只在"有人动了工作区"时才可能变（`git checkout` 会写 `.git/HEAD` ⇒ 工作区事件）⇒
+ * {@link WorkspacePanel} 在工作区事件到达时与文件树**一并失效**它，这里只给一个不刷屏的
+ * `staleTime`（免得每次挂载都打一次这个"锦上添花"的端点）。
+ */
+export function useWorkspaceGit(
+  conversationId: string | undefined,
+  enabled: boolean,
+): UseQueryResult<WorkspaceGitResult> {
+  return useQuery({
+    queryKey: workspaceGitQueryKey(conversationId ?? ''),
+    queryFn: () => fetchWorkspaceGit(conversationId ?? ''),
+    enabled: enabled && conversationId !== undefined,
+    staleTime: 10_000,
+  })
+}
+
 /** 轮末变更集（`?since=<iso>` 只看该时刻后；缺省 = 全量），按时间倒序、各路径一条（P4） */
 export function fetchWorkspaceChanges(conversationId: string, since?: string): Promise<WorkspaceChangesResult> {
   const query = since === undefined ? '' : `?${new URLSearchParams({ since }).toString()}`
   return request<WorkspaceChangesResult>(
     `/api/conversations/${encodeURIComponent(conversationId)}/workspace/changes${query}`,
+  )
+}
+
+/** 文件差异的 react-query key（按会话 + 路径 + 基线版本；`0` = 缺省基线） */
+export function workspaceFileDiffQueryKey(
+  conversationId: string,
+  path: string,
+  baseVersion?: number,
+): readonly [string, string, string, number] {
+  return ['workspace-diff', conversationId, path, baseVersion ?? 0]
+}
+
+/**
+ * 文件**行级差异**（旧版本 → 当前；P1-9 · 验收标记）。
+ * `stats:true` 只取 `+N −M` 计数（列表徽标用，不带逐行内容）；缺省基线 = 当前版本的前一版。
+ */
+export function fetchWorkspaceFileDiff(
+  conversationId: string,
+  path: string,
+  options: { baseVersion?: number; stats?: boolean } = {},
+): Promise<WorkspaceFileDiff> {
+  const params = new URLSearchParams({ path })
+  if (options.baseVersion !== undefined) params.set('baseVersion', String(options.baseVersion))
+  if (options.stats === true) params.set('stats', '1')
+  return request<WorkspaceFileDiff>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/diff?${params.toString()}`,
   )
 }
 
@@ -115,6 +177,18 @@ export function deleteWorkspaceFile(conversationId: string, path: string): Promi
   const query = new URLSearchParams({ path }).toString()
   return request<{ path: string }>(
     `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file?${query}`,
+    { method: 'DELETE' },
+  )
+}
+
+/**
+ * 删除文件夹（递归）：该目录下所有文件一起软删 + 墓碑，目录整份落盘删除。
+ * 回 `{ path, deleted }`（`deleted` = 实际软删的文件数；空目录为 0）。
+ */
+export function deleteWorkspaceDirectory(conversationId: string, path: string): Promise<WorkspaceDeleteDirResult> {
+  const query = new URLSearchParams({ path }).toString()
+  return request<WorkspaceDeleteDirResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace/dir?${query}`,
     { method: 'DELETE' },
   )
 }

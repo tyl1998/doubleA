@@ -79,6 +79,24 @@ const explicitAptMirror = aptMirrorIndex >= 0 ? argv[aptMirrorIndex + 1] : proce
 const aptMirror =
   explicitAptMirror ?? (npmRegistry.includes('npmmirror') ? 'mirrors.tuna.tsinghua.edu.cn' : '')
 
+// Node 发行站（装 node 18/20 时用；见 `runtime/install-node-version.sh`）。
+// 优先级：`SANDBOX_NODE_DIST_MIRROR` 环境变量 > 按 npm 源推断 > 官方。
+// 换源的理由同 apt/npm：本机内网直连 nodejs.org 可能慢/不通，而 npmmirror 有 node 二进制镜像。
+const nodeDistMirror =
+  process.env.SANDBOX_NODE_DIST_MIRROR ??
+  (npmRegistry.includes('npmmirror')
+    ? 'https://registry.npmmirror.com/-/binary/node'
+    : 'https://nodejs.org/dist')
+
+// Rust 发行站（装 rust 时用；见 `runtime/install-rust-version.sh`）。
+// ⚠️ 官方 `static.rust-lang.org` 在本机实测被限速到 **几十 KB/s**（rust 包 ~345MB ⇒ 会挂很久），
+//    而 USTC 镜像 ~2.3MB/s ⇒ 内网构建务必换镜像。优先级：`SANDBOX_RUST_DIST_MIRROR` > 按 npm 源推断 > 官方。
+const rustDistMirror =
+  process.env.SANDBOX_RUST_DIST_MIRROR ??
+  (npmRegistry.includes('npmmirror')
+    ? 'https://mirrors.ustc.edu.cn/rust-static/dist'
+    : 'https://static.rust-lang.org/dist')
+
 if (flags.has('--help') || flags.has('-h')) {
   console.log(
     '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--runtime <name[,name]>|--registry <url>|--apt-mirror <host>|--dry-run|--prune]\n' +
@@ -108,7 +126,7 @@ for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] !== '--runtime') continue
   const value = argv[i + 1]
   if (value === undefined || value.startsWith('--')) {
-    console.error('--runtime 后面要跟运行时名（可逗号分隔 / 重复给）：' + SANDBOX_RUNTIMES.join('/'))
+    console.error('--runtime 后面要跟变体名（语言+版本，可逗号分隔 / 重复给）：如 node20-python3.12')
     process.exit(2)
   }
   for (const piece of value.split(',')) {
@@ -117,10 +135,14 @@ for (let i = 0; i < argv.length; i += 1) {
   }
   i += 1
 }
-const unknownRuntimes = requestedRuntimes.filter((name) => !SANDBOX_RUNTIMES.includes(name))
-if (unknownRuntimes.length > 0) {
-  console.error(`未知的 --runtime ${unknownRuntimes.join('/')}（应为 ${SANDBOX_RUNTIMES.join('/')}）`)
-  process.exit(2)
+// `--runtime` 接受**任意可解析的变体 id**（2026-10-15 起不再枚举版本）—— 用构建侧的解析器试一下即可。
+for (const name of requestedRuntimes) {
+  try {
+    variantToComponentsArg(name)
+  } catch (error) {
+    console.error(`未知的 --runtime ${name}：${error instanceof Error ? error.message : String(error)}`)
+    process.exit(2)
+  }
 }
 // 去重 + 保持传入顺序；空 = 全部
 const selectedRuntimes = [...new Set(requestedRuntimes)]
@@ -238,6 +260,8 @@ info(`Debian 源：${aptMirror === '' ? '官方 deb.debian.org' : aptMirror}`)
 if (aptMirror !== '') {
   info('（换源：本机实测官方源只 ~0.4MB/s，清华源 ~6MB/s —— 两个 Dockerfile 的 apt 步骤是大头）')
 }
+info(`Node 发行站：${nodeDistMirror}`)
+info(`Rust 发行站：${rustDistMirror}`)
 info(`base 标签：${baseImageRef()} ｜ toolkit 标签：${toolkitImageRef()}`)
 info(`运行时标签：${SANDBOX_RUNTIMES.map((r) => runtimeImageRef(r)).join('、')}`)
 
@@ -312,6 +336,10 @@ if (!baseOnly) {
       `COMPONENTS=${variantToComponentsArg(runtime)}`,
       '--build-arg',
       `APT_MIRROR=${aptMirror}`,
+      '--build-arg',
+      `NODE_DIST_MIRROR=${nodeDistMirror}`,
+      '--build-arg',
+      `RUST_DIST_MIRROR=${rustDistMirror}`,
     ]
     if (noCache) args.push('--no-cache')
     args.push(join(SANDBOX_DIR, 'runtime'))

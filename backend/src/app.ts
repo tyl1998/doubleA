@@ -29,6 +29,7 @@ import { registerDocumentRoutes } from './routes/documents.js'
 import { registerFileRoutes } from './routes/files.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerGitCredentialRoutes } from './routes/gitCredentials.js'
+import { registerGitIdentityRoutes } from './routes/gitIdentity.js'
 import { registerEgressPolicyRoutes } from './routes/egressPolicy.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
@@ -216,6 +217,7 @@ export function buildApp(): FastifyInstance {
   //    （**仅本人**，`git_credentials.user_id`，ADMIN 无后门）；凭据按用户加密存平台、派活时解密
   //    注入容器 tmpfs `$HOME` / env（见 `services/gitCredential.service.ts`）。
   registerGitCredentialRoutes(app)
+  registerGitIdentityRoutes(app)
 
   // ㉒ 沙箱出网策略（egress 黑白名单）：`/api/admin/egress-policy` 两条（读 / 整替换）。
   //    权限 **仅 ADMIN**（平台级配置，与 `/api/model-providers` 同族 —— 不是"每个人自己的东西"）。

@@ -11,7 +11,7 @@
 
 import { create } from 'zustand'
 
-import { nextActiveOnClose, renameOpenTab, toggleExpandedDir, withOpenedTab } from '../features/chat/workspaceModel.js'
+import { nextActiveOnClose, renameOpenTab, toggleExpandedDir, unionExpandedDirs, withOpenedTab } from '../features/chat/workspaceModel.js'
 
 /** 一个会话的标签态 */
 export interface WorkspaceTabs {
@@ -73,6 +73,11 @@ interface WorkspaceState {
   renameFile: (conversationId: string, from: string, to: string) => void
   /** 展开 / 折叠一个目录（`WorkspaceTree` 用） */
   toggleExpanded: (conversationId: string, path: string) => void
+  /**
+   * 把一批目录并进"已展开"（**只展开、不折叠**）—— agent 改了某文件时自动展开其所在目录，
+   * 否则深处的新文件因"默认全折叠"而看不见（用户反馈："agent 改过的文件没有展示"）。
+   */
+  expandDirs: (conversationId: string, paths: readonly string[]) => void
   /** 关闭某会话的所有标签 */
   closeAll: (conversationId: string) => void
   /** 会话被删除：整份回收（避免 `tabsByConversation` 无限增长） */
@@ -126,6 +131,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
         ...state.expandedByConversation,
         [conversationId]: toggleExpandedDir(state.expandedByConversation[conversationId] ?? [], path),
       }
+      writeStoredExpanded(expandedByConversation)
+      return { expandedByConversation }
+    }),
+  expandDirs: (conversationId, paths) =>
+    set((state) => {
+      const current = state.expandedByConversation[conversationId] ?? []
+      const next = unionExpandedDirs(current, paths)
+      // 没有新增（全都已展开 / paths 为空）⇒ 返回同一 `state`，不触发重渲染
+      if (next.length === current.length) return state
+      const expandedByConversation = { ...state.expandedByConversation, [conversationId]: next }
       writeStoredExpanded(expandedByConversation)
       return { expandedByConversation }
     }),

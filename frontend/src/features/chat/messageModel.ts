@@ -75,6 +75,15 @@ export interface ToolCallView {
   textOffset?: number
   output?: string
   /**
+   * 工具**执行中**的实时输出快照（`tool_output` 事件；**覆盖**语义）。
+   *
+   * ⚠️ **天生易失、只存在于流式**：它不在 `toolCallRecordSchema` 里（历史永远没有这个字段），
+   * 也不落库、不进上下文（见 `shared#sseToolOutputPayloadSchema` 与 `map.ts` 文件头）。
+   * 终态帧（`tool_call{SUCCESS/ERROR}`）到达后它就不再是唯一来源 —— 卡片优先显示权威的
+   * `output`（见 `ToolCard`）。
+   */
+  liveOutput?: string
+  /**
    * 失败时的错误码（`shared/src/errors.ts` 的取值域，**不是 HTTP 状态码**）。
    * ⚠️ 前端从 `output` 那句人话里认不出"这是缺凭据"，只能靠这个**结构化**的信号
    * —— 它正是"失败卡带『去配置』跳转"能成立的前提（`02` §9.3）。

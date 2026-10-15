@@ -26,7 +26,7 @@
  * 而日志里也什么都没有"（本仓最难查的一类）。
  *
  * ═══════════════════════════════════════════════════════════════════════
- * 四类**刻意不发**（每一条都有反例，别顺手补上）
+ * 三类**刻意不发**（每一条都有反例，别顺手补上）
  * ═══════════════════════════════════════════════════════════════════════
  *   ① **`agent_end`** —— `子方案③` §六 4 坑 2：它之后还可能跟自动重试 / 溢出恢复 / 上下文压缩 /
  *      跟进动作，拿它当收尾会**提前落库**（症状："回答少了一截，但历史里看着是完整的"）。
@@ -34,10 +34,22 @@
  *   ② **`message_update` 的 `toolcall_*` 子类型** —— 它是"模型**打算**调这个工具"，
  *      而卡片表达的是"这个工具**正在跑**"（`tool_execution_*`）。两处都发会造出**两张卡**，
  *      且它们的 `callId` 相同 ⇒ 前端按 id upsert 时状态来回跳。
- *   ③ **`tool_execution_update`（`partialResult`）** —— 卡片的取值域是"一进一出"的三态
- *      （`RUNNING` → `SUCCESS`/`ERROR`，见 `shared#toolCallRecordSchema`），没有"中间进度"这一态。
- *   ④ **会话内部状态类**（`queue_update` / `thinking_level_changed` / `session_info_changed` /
+ *   ③ **会话内部状态类**（`queue_update` / `thinking_level_changed` / `session_info_changed` /
  *      `entry_appended`）—— 界面上没有对应的卡。
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * ★ `tool_execution_update`（`partialResult`）—— **自本批起不再"刻意不发"**
+ * ═══════════════════════════════════════════════════════════════════════
+ * 早先它列在上面那张"刻意不发"表里，理由是"卡片的取值域只有 `RUNNING` → `SUCCESS`/`ERROR` 三态、
+ * 没有'中间进度'这一态"。**该理由对卡片成立、但对用户不成立**：`bash` 装依赖 / 构建动辄几十秒，
+ * 界面只有一张 `RUNNING` 卡、没有任何进展 ⇒ 用户"不知道有没有在执行，太呆了"。
+ * ⇒ 现在把它映射成 **`tool_output`**（`shared#sseToolOutputPayloadSchema`）：**覆盖语义**的整体
+ * 快照，**不落库、不进上下文、刷新后不恢复**（所以卡片的取值域**一个字没改**）。
+ *   · **不额外节流**：引擎侧已按 `BASH_UPDATE_THROTTLE_MS`(100ms) 合并（pi `dist/core/tools/bash.js`），
+ *     本层只负责翻形状；
+ *   · **转发前必截断**（{@link TOOL_OUTPUT_VIEW_MAX_CHARS}）：快照最长 50KB
+ *     （pi `DEFAULT_MAX_BYTES`），原样透 SSE 会把一条流打爆；
+ *   · **空快照不发**（引擎启动那次 `onUpdate` 的 `content` 是空数组）——发空帧会把卡片的实时区闪没。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ⚠️ 三件**不属于本层**的事（别在这里找）
@@ -125,6 +137,21 @@ export const TOOL_SUMMARY_MEMO_LIMIT = 200
 export const TOOL_RESULT_NO_ERROR_DETAIL = '（工具执行失败，但没有返回原因）'
 
 /**
+ * `tool_output` 单帧文本的**展示上限**（字符，按码点）。
+ *
+ * 为什么需要：引擎给的快照最长 50KB（pi `DEFAULT_MAX_BYTES`，`dist/core/tools/bash.js`），
+ * 而它每 100ms 就覆盖一次 ⇒ 原样透 SSE 是"一条流打爆前端"。这里到的是**尾部**（用户关心的是
+ * "最后写出来什么"），与引擎自己的 `truncateTail` 口径一致。
+ *
+ * ⚠️ 刻意是**代码常量而不是配置项**：它只影响"实时那一眼看多少"，与落库 / 上下文无关
+ * （那两处走的是 `tool_execution_end` 的 `truncateToolResult`，另一个上界）。
+ */
+export const TOOL_OUTPUT_VIEW_MAX_CHARS = 6000
+
+/** 尾部截断的省略标记（前缀，与 {@link toolOutputViewOf} 同址维护） */
+const TOOL_OUTPUT_VIEW_TAIL_MARK = '…（更早的输出已省略）\n'
+
+/**
  * 引擎事件名 → 我们**认识**（= 映射表里有条目，含"刻意不发"）。
  *
  * 来源 = pi `docs/json.md` 的各张表逐行，外加 `session`（JSON 模式的首行 session header；
@@ -198,6 +225,7 @@ const KNOWN_ASSISTANT_EVENT_TYPES: ReadonlySet<string> = new Set([
 /** 引擎事件名 → 增量类型（`message_update` 的顶层判别） */
 const ENGINE_MESSAGE_UPDATE = 'message_update'
 const ENGINE_TOOL_EXECUTION_START = 'tool_execution_start'
+const ENGINE_TOOL_EXECUTION_UPDATE = 'tool_execution_update'
 const ENGINE_TOOL_EXECUTION_END = 'tool_execution_end'
 
 /**
@@ -497,6 +525,33 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
     }
   }
 
+  function mapToolExecutionUpdate(event: PiSessionEvent): EngineEventMapping {
+    const callId = stringOf(event.toolCallId)
+    if (callId === null) {
+      return {
+        events: [],
+        usage: null,
+        known: true,
+        anomaly: 'tool_execution_update 缺少 toolCallId（无法定位卡片）',
+      }
+    }
+
+    // `partialResult` 形状与 `tool_execution_end.result` 同为 `{content:(Text|Image)[], details?}`
+    // ⇒ 复用同一个取文本的纯函数（`toolResultText`）。
+    const text = toolOutputViewOf(toolResultText(event.partialResult))
+    // 空快照不发：引擎启动那次 `onUpdate({content:[]})` 是空数组，发空帧会把卡片的实时区闪没
+    //（覆盖语义下"空"就等于"清空"）。
+    if (text === '') {
+      return { events: [], usage: null, known: true }
+    }
+
+    return {
+      events: [{ name: 'tool_output', data: { callId, text } }],
+      usage: null,
+      known: true,
+    }
+  }
+
   function mapToolExecutionEnd(event: PiSessionEvent): EngineEventMapping {
     const callId = stringOf(event.toolCallId)
     const toolName = stringOf(event.toolName)
@@ -554,6 +609,8 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
           return mapMessageUpdate(event)
         case ENGINE_TOOL_EXECUTION_START:
           return mapToolExecutionStart(event)
+        case ENGINE_TOOL_EXECUTION_UPDATE:
+          return mapToolExecutionUpdate(event)
         case ENGINE_TOOL_EXECUTION_END:
           return mapToolExecutionEnd(event)
         default:
@@ -629,4 +686,16 @@ function toolResultText(result: unknown): string {
     if (typeof text === 'string') parts.push(text)
   }
   return parts.join('\n')
+}
+
+/**
+ * 工具**执行中**的输出快照 → `tool_output` 帧上那一份文本（**尾部**截断，见 {@link TOOL_OUTPUT_VIEW_MAX_CHARS}）。
+ *
+ * 按**码点**截尾（不用 `String.prototype.slice(-n)`：它按 UTF-16 码元切会把代理对劈成两半，
+ * 产出非法字符串 —— 同 `chatContext#truncateChars` 的老坑）。
+ */
+function toolOutputViewOf(text: string): string {
+  if (text.length <= TOOL_OUTPUT_VIEW_MAX_CHARS) return text
+  const budget = TOOL_OUTPUT_VIEW_MAX_CHARS - TOOL_OUTPUT_VIEW_TAIL_MARK.length
+  return `${TOOL_OUTPUT_VIEW_TAIL_MARK}${[...text].slice(-budget).join('')}`
 }

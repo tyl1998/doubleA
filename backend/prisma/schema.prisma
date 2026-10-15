@@ -288,6 +288,11 @@ model User {
   memoryFullAuto     Boolean    @default(false) @map("memory_full_auto")
   /// USER 画像常驻注入上限（P1-8a，每用户可调；默认 10，区间 [1,50] 由契约钳制）
   memoryProfileMax   Int        @default(10) @map("memory_profile_max")
+  /// git 提交身份（P1-20）：派活时经 `GIT_CONFIG_*` 注入容器 git 的 `user.name`/`user.email`。
+  /// 空 = 不注入（agent 自行处理）。用户级（同 git 凭据）、**不落盘容器**、不进工作区。
+  gitName            String?    @map("git_name") @db.VarChar(128)
+  /// 见 `gitName`；邮箱格式由契约（`shared/src/gitIdentity.ts`）与设置页校验
+  gitEmail           String?    @map("git_email") @db.VarChar(255)
   createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 

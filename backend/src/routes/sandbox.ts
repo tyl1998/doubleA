@@ -19,7 +19,7 @@ import {
   buildSandboxRuntimeResultSchema,
   listSandboxRuntimesResultSchema,
   ok,
-  SANDBOX_RUNTIME_COMPONENTS,
+  SANDBOX_RUNTIME_LANGUAGE_SPECS,
   sandboxBuildJobSchema,
   type BuildSandboxRuntimeBody,
 } from '@doubulea/shared'
@@ -43,11 +43,13 @@ export function registerSandboxRoutes(app: FastifyInstance): void {
     ok(
       listSandboxRuntimesResultSchema.parse({
         runtimes: await listAvailableSandboxRuntimes(),
-        components: SANDBOX_RUNTIME_COMPONENTS.map((component) => ({
-          id: component.id,
-          language: component.language,
-          version: component.version,
-          label: component.label,
+        languages: SANDBOX_RUNTIME_LANGUAGE_SPECS.map((spec) => ({
+          language: spec.language,
+          label: spec.label,
+          defaultVersion: spec.defaultVersion,
+          suggestions: [...spec.suggestions],
+          hint: spec.hint,
+          baseVersion: spec.baseVersion ?? null,
         })),
         fallbackImage: config.sandbox.image ?? null,
         canBuild: await canBuildSandboxRuntime(),

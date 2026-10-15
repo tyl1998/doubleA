@@ -486,6 +486,8 @@ sequenceDiagram
 ## 五之二、执行环境：运行时与依赖（2026-10-14 定案，✅ 已落地 2026-10-14 · P1-17）
 
 > 背景：**Code 模式即执行模式**（**不区分"执行档 / 默认档"**；不想执行的用户直接用非 Code 模式，见 §五 7.5b 的注）。"让 agent 跑起来验证"（`npm test` / `pytest` / `go build`）需要**语言运行时 + 项目依赖**，而依赖是**任意的、无法预先枚举**（2026-10-14 用户定案：**依赖不能白名单**）。本节定"环境从哪来"，是 §五 7.5b「注册表专用代理」的**消费方**。
+>
+> ★ **2026-10-15 修订（用户定案）**：**运行时版本也不再枚举** —— UI 只列**语言**，用户勾选后**填版本号**（如 Java 21 / Python 3.12 / Go 1.22）；后端按 `语言=版本` 组合按需构建，各语言的任意版本由 `infra/sandbox/runtime/install-*-version.sh` 装（见 §十一参数表的 `Conversation.runtime` 行与 §十二 P8 的注）。⚠️ 这**不违反** §2 的"运行时是有限集合 ⇒ 可预烘焙"：**语言**仍是白名单（有限），放开的只是每门语言的**版本号**；版本装法固定、镜像按需构建、构建失败会在任务里回显。
 
 ### 1. 两条不能混的事：运行时 vs 依赖
 
@@ -541,6 +543,7 @@ sequenceDiagram
 | POST | `/api/conversations/:id/workspace/file` | 新建 |
 | POST | `/api/conversations/:id/workspace/move` | 改名 / 移动 |
 | DELETE | `/api/conversations/:id/workspace/file?path=` | 删除（软删 + 墓碑） |
+| DELETE | `/api/conversations/:id/workspace/dir?path=` | 删除**文件夹（递归）**：该目录下所有文件一起软删 + 墓碑 + 各一条 `deleted` 事件，目录整份落盘删除；回 `{path, deleted}`（空目录为 0） |
 | GET | `/api/conversations/:id/workspace/events` | SSE：实时工作区事件 |
 
 - 响应头复用 `routes/artifacts.ts#previewHeadersFor` 的分派与隔离头；`text` 一律压 `text/plain`（同现有口径）。
@@ -687,9 +690,9 @@ flowchart LR
 |------|--------|------|------|
 | `WORKSPACE_ROOT` | `/var/lib/doubulea/workspaces` | 路径 | 宿主 canonical 目录根；多主机指向共享存储挂载点 |
 | `WORKSPACE_MAX_FILE_MB` | **10** | MB | 单文件上限（编辑器只开这以下的文本；更大只读 / 下载） |
-| `WORKSPACE_MAX_FILES` | **2000** | 个 | 单会话文件数上限（防爆） |
-| `WORKSPACE_MAX_ROWS` | **20000** | 个 | 单会话**行数**上限（含墓碑；P6 · R6 更严的数量闸门）⚠️ 必须 ≥ `WORKSPACE_MAX_FILES` |
-| `WORKSPACE_MAX_TOTAL_MB` | **512** | MB | 单会话总字节上限 |
+| `WORKSPACE_MAX_FILES` | **20000** | 个 | 单会话文件数上限（防爆）。★ **2026-10-15 放开 2000 → 20000**：索引把 `.git/**` 也算内容，真实仓库 clone 后易顶爆 2000（见 §十三 待决 7 已决） |
+| `WORKSPACE_MAX_ROWS` | **100000** | 个 | 单会话**行数**上限（含墓碑；P6 · R6 更严的数量闸门）⚠️ 必须 ≥ `WORKSPACE_MAX_FILES` |
+| `WORKSPACE_MAX_TOTAL_MB` | **2048** | MB | 单会话总字节上限。★ **2026-10-15 放开 512 → 2048**（真实仓库含 `.git` 常超 512MB） |
 | `WORKSPACE_WRITE_PER_MIN` | **600** | 次/分 | 单会话写入限流（固定窗口 1 分钟；`0` = 关闭；超限回 `BUSY`/429）—— P6 · R6 |
 | `WORKSPACE_CLAIM_TTL_SEC` | **120** | 秒 | 文件 claim 存活期（心跳续期） |
 | `WORKSPACE_EVENT_DEBOUNCE_MS` | **300** | ms | watcher 事件去抖窗口（**代码常量**） |
@@ -704,7 +707,7 @@ flowchart LR
 | `SANDBOX_RUNTIME_REPO` | **`doubulea/sandbox-runtime`** | 仓库名前缀 | **P1-17a**：后端扫本机镜像（tag 约定 `<repo>:<变体>-v<层版本>`）得到"有哪些运行时"，前端据它渲染。★ **2026-10-14 定案 B：运行时集合来自"本机镜像探测" + 用户选到没有的组合时后端按需构建** |
 | `SANDBOX_RUNTIME_BUILD_CONTEXT` | **自动推断**（`infra/sandbox/runtime`；推断不出 = 不可构建） | 目录 | **P1-17a · B**：按需构建时的 `docker build` 上下文（含 `Dockerfile` + 脚本）。生产镜像里通常没有这份源码 ⇒ `canBuild=false` |
 | `SANDBOX_DOCKER_BIN` | **`docker`** | 可执行文件 | **P1-17a · B**：按需构建用的 docker CLI |
-| `Conversation.runtime` | **`node22`** | 自由字符串 | **P1-17a**：会话运行时**变体 id**（组件集合规范化，如 `node22-python310`；组件目录 `shared/src/runtime.ts`）；派活时按它在探测结果里选镜像（找不到回退 `SANDBOX_IMAGE`）+ 写 `doubulea.runtime` 标签。**依赖不在这里**（运行期拉）。要加组件/版本 = 改 `shared/src/runtime.ts` + `infra/sandbox/versions.mjs`（两处一致） |
+| `Conversation.runtime` | **`node22`** | 自由字符串 | **P1-17a**：会话运行时**变体 id**（`语言+版本` 规范化，如 `node20-python3.12`）；派活时按它在探测结果里选镜像（找不到回退 `SANDBOX_IMAGE`）+ 写 `doubulea.runtime` 标签。**依赖不在这里**（运行期拉）。**2026-10-15 起版本不再枚举** ⇒ 加/换版本只需改各语言安装脚本的装法（`infra/sandbox/runtime/install-*.sh`），**不再需要改目录**；只有"新增一门语言"才要动 `shared/src/runtime.ts` + `infra/sandbox/versions.mjs`（两处一致） |
 | 依赖目录名单 | **`node_modules` / `venv` / `.venv` / `target` / `dist` / `__pycache__` …** | 名单 | **P1-17b**：`workspace/dependencyModel.ts`（**一处定义**；任一段命中即算）。**不进索引 / 产物 / 冷备、不算源码配额、写/移闸门拒**；依赖字节单独计量（`scanWorkspaceTree.dependencyBytes`）。⚠️ **刻意不收 `build`/`out`**（易撞用户源码目录） |
 | 执行相键 TTL | **43200**（12h） | 秒 | **P1-17c**：`sandbox:credphase:{id}` 的 TTL（主机制是显式清除；TTL 只兜底） |
 
@@ -714,7 +717,8 @@ flowchart LR
 >
 > ⚠️ **P1-17（执行环境：运行时 + 依赖，✅ 已落地 2026-10-14，§五之二）的新参数**（`SANDBOX_RUNTIME_REPO` / `Conversation.runtime` / 依赖目录名单 / 执行相键 TTL）**已并入本表**。**P1-16b（注册表专用代理）已关闭（不做）** ⇒ 不并入其"镜像地址 / 包清单"参数；`REGISTRY` 以主机级放行为准（见上两行）。
 > ★ **2026-10-14 修订（用户定案，重要）**：运行时**不做成写死的枚举** —— 可用运行时**由后端扫本机镜像探测**（`GET /api/sandbox/runtimes`，tag 约定 `<repo>:<变体>-v<层版本>`），前端据它渲染，**有就提供、没有就不提供**。`Conversation.runtime` 相应改为**自由字符串**（默认 `node22`），旧枚举 `conversation_runtime` 已在迁移 `20261015100000_conversation_runtime_text` 删除。
-> ★ **2026-10-14 定案 B（按需构建）**：用户选了**本机没有的组合**（如 Python 3.10 + Node 22）时，**后端自动 `docker build`** 该组合（`POST /api/sandbox/runtimes/build`；串行 + 同 tag 去重，组合键即 tag ⇒ 第二次命中缓存）—— **不再要求运维预先猜组合、也不必为每个组合手改镜像**。运行时 = **组件目录**（语言+版本，`shared/src/runtime.ts`）的**组合**；变体 id = 组件按语言顺序排序后用 `-` 连接（如 `node22-python310`）。`runtime/Dockerfile` 已从"写死 `RUNTIME` 分支"泛化为接受 `COMPONENTS=lang=ver,…`。**组件目录两处必须一致**：`shared/src/runtime.ts` 与 `infra/sandbox/versions.mjs`。
+> ★ **2026-10-14 定案 B（按需构建）**：用户选了**本机没有的组合**时，**后端自动 `docker build`** 该组合（`POST /api/sandbox/runtimes/build`；串行 + 同 tag 去重，组合键即 tag ⇒ 第二次命中缓存）—— **不再要求运维预先猜组合、也不必为每个组合手改镜像**。`runtime/Dockerfile` 已从"写死 `RUNTIME` 分支"泛化为接受 `COMPONENTS=lang=ver,…`。
+> ★ **2026-10-15 修订（用户定案，重要）：版本不再枚举 —— "勾语言 + 填版本号"**。UI 只列**语言**（`shared/src/runtime.ts#SANDBOX_RUNTIME_LANGUAGE_SPECS`：显示名 / 默认版本 / 候选 / 提示），用户勾选语言后在后面的**输入框填版本**；后端按 `语言=版本` 组合按需构建。**组件 id = `语言+版本`**（无分隔符、版本保留 `.`，如 `python3.12` / `node20` / `go1.22`），**变体 id = 组件 id 按语言顺序用 `-` 连接**（如 `node20-python3.12`；空 = `none`）—— 语言名互不为前缀 ⇒ 可由 id 反解回 `{language, version}`。各语言的**任意版本装法**落在 `infra/sandbox/runtime/install-{node,python,go,java,rust}-version.sh`（node=官方发行站、python=uv、go=go.dev、java=Adoptium/Temurin、rust=rust-lang standalone）。⚠️ node / python 有 base/toolkit 必须保留的固定版本（pi 用 node 22、pandas 挂 python 3.11）⇒ 非自带版本用带版本号命令名（`node20` / `python3.12`）；go / java / rust 本层独占 ⇒ 用系统命令名。**语言顺序两处必须一致**：`shared/src/runtime.ts` 与 `infra/sandbox/versions.mjs`。
 
 ---
 
@@ -766,7 +770,7 @@ flowchart LR
 
 | # | 待决 | 影响 |
 |---|------|------|
-| 7 | **工作区配额是否与产物 / 冷备分层** | `WORKSPACE_MAX_FILES`(2000) / `WORKSPACE_MAX_TOTAL_MB`(512) 与真实仓库（含 `.git`）冲突；决定 §十一 参数 |
+| 7 | **工作区配额是否与产物 / 冷备分层**（2026-10-15 已决） | ✅ **已结（2026-10-15）**：`WORKSPACE_MAX_FILES` / `WORKSPACE_MAX_TOTAL_MB` 与真实仓库（含 `.git`）冲突 ⇒ **放开默认**：文件数 `2000 → 20000`、行数 `20000 → 100000`、总字节 `512MB → 2048MB`（§十一 参数表 + `backend/src/config.ts` + `infra/.env.example`）。**不把 `.git` 从索引/配额里剔除**（`.git` 属工作区内容、只是不进产物），仍保留"防爆闸门"，只是给真实仓库留出空间；并新增**删除文件夹（递归）**入口便于清理（§六 1）。 |
 | 8 | **存储迁移的批次范围** | 具名卷 → bind mount 连带 `recycleSandbox` / reaper / 对账账本 / uid 对齐（`SANDBOX_AGENT_UID=10001`）需一起改，宜单列子阶段 |
 | 9 | **无中介写（bash）的代码库忽略规则** | `.lock` / `dist` / 生成物反复冲突，需显式忽略名单（与 §五 6 忽略规则扩容同条） |
 | 10 | 与 P1-8 记忆文档的接缝 | 共享工作区里记忆文件（`.doubulea/memory.md`）与"单一真相"如何合流，避免被当工作区文件误改 |

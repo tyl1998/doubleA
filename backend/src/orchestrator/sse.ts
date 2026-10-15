@@ -840,7 +840,8 @@ class SseChannel {
   /**
    * 写一帧。三条保证：
    *   ① 先过 payload schema（失败抛出 ⇒ 由收尾逻辑变成 `error` 帧，并留下 zod 明细）；
-   *   ② 已关闭（客户端断开 / 流已收尾）时**静默丢弃**（不抛：producer 收尾时的收尾帧不该让它失败）；
+   *   ② 已关闭（客户端断开 / 流已收尾）时**不再写这条连接**（静默丢弃、不抛：producer 收尾时的
+   *      收尾帧不该让它失败）—— 但**仍然广播给观察者**（帧总线与这条连接无关，见下面 ⚠️）；
    *   ③ 背压：`write()` 返回 false 时等到 `drain`（或连接关闭）再返回。
    */
   async emit(event: SseEvent): Promise<void> {
@@ -857,13 +858,20 @@ class SseChannel {
       )
     }
 
-    // 连接已经没了 ⇒ 静默丢弃，**不要**再尝试写（`write()` 在已销毁的 socket 上会异步抛
+    // 广播给"订阅了这个会话的观察者"（P1-6 方案 A：后台/他处运行可被实时看到）。
+    //
+    // ⚠️ **必须在 `#closed` 判断之前**：本连接断开（用户刷新 / 关页）时这条流会被
+    //    `abort('client')` ⇒ `#closed = true`，但这一轮**仍会收尾**（落库 + `done`/`error`）。
+    //    观察者（另一个连接 / **刷新后的新页面**）正是靠这条**终帧**才知道"该拉历史对齐了"
+    //    （`useConversationWatch` 只在 `done`/`error` 上重取落库历史并清掉观察轮次）。
+    //    少了它，刷新后的页面会停在观察轮次上、永远不重取 ⇒ 落库的那一轮在界面上"消失"，
+    //    切走再切回（换了 query key、重新拉历史）才回来。
+    //    `publishFrame` 只进进程内总线、与 `#raw` 无关 ⇒ 与"能不能写回这条连接"解耦。
+    publishFrame(this.conversationId, event)
+
+    // 连接已经没了 ⇒ 静默丢弃**写**，不要再尝试写（`write()` 在已销毁的 socket 上会异步抛
     // `ERR_STREAM_DESTROYED`，那是个没有调用方能接的 'error' 事件；见 {@link #waitDrain}）
     if (this.#closed || this.#raw.destroyed) return
-
-    // 广播给"订阅了这个会话的观察者"（P1-6 方案 A：后台/他处运行可被实时看到）。
-    // 放在"连接还在"之后：连接断了这条流会被 abort，再广播没有意义。
-    publishFrame(this.conversationId, event)
 
     try {
       const flushed = this.#raw.write(serializeSseFrame(event))
@@ -996,6 +1004,15 @@ class SseChannel {
       '收到中途插话，转交给本轮编排（投给运行中的引擎）',
     )
     for (const message of messages) {
+      // ★ 先让界面**看得见**这条插话（P1-20，产品反馈："发出去了但聊天界面上看不到，像丢消息"）：
+      //   发一帧 `steer`（进本连接 SSE 流 + 帧总线），前端在消息流里补一条用户气泡；
+      //   **再**派发给编排层（TaskAgent 投引擎 / ChatBot 在下一次上游调用前注入）。
+      //   ⚠️ 顺序是刻意的：先发帧，即便随后的投递失败（尽力而为），用户也已经看到"我插了这句话"。
+      try {
+        await this.emit({ name: 'steer', data: { message, at: new Date().toISOString() } })
+      } catch (error) {
+        getLogger().warn({ err: error, conversationId: this.#conversationId }, '插话事件发帧失败（不影响投递）')
+      }
       for (const listener of [...this.#steerListeners]) {
         try {
           listener(message)

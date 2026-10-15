@@ -28,7 +28,8 @@
  * ─────────────────────────────────────────────────────────────────────
  * `design/chat.html` 上写着「生成中 / 已完成 / 已失败 / 已停止」四种。落到本项目只有三种
  * 有**数据来源**：
- *   · `run`  —— 正在生成：来源是流 store 的 `streamFor`（唯一能证明"这一轮在跑"的东西）；
+ *   · `run`  —— 正在生成：来源是流 store 里**正在生成**的会话 id 集合（唯一能证明"这一轮在跑"
+ *     的东西；P1-19 多流后可能同时有多个）；
  *   · `warn` —— 只读保留：`status === 'FINISHED'`（只由"Agent 被软删"产生，`02` §4.4）；
  *   · `idle` —— 其余（正常可继续）。
  * 「已失败」「已停止」是**单轮回答**的结局，不是会话的状态 —— `conversations` 表里没有这个列，
@@ -140,19 +141,20 @@ export function describeConversationTime(lastMessageAt: string | null, now: Date
  * 一行会话 → 视图。三个输入决定三个字段，没有别的分支：
  *   · `title` —— `topic` 为 `null` 时回落 `CONVERSATION_UNTITLED_HINT`（**唯一**的回落点，
  *     组件里不许再写一次 `?? '新会话'`，否则改口径要全仓搜）；
- *   · `led` / `state` —— 见文件头"状态灯取值域"；`streamingId` 是流 store 的 `streamFor`，
- *     只有它等于这一条时才可能是"生成中"（**不能**用 `status` 去猜：`conversations` 表里
- *     没有"正在生成"这个状态，真值只在 Redis 的锁上）。
+ *   · `led` / `state` —— 见文件头"状态灯取值域"；`streamingIds` 是流 store 里**正在生成**的会话 id
+ *     集合（**P1-19 多流**后可能同时有多个，早先是一个 `streamFor` 单值），只有这一条在集合里
+ *     时才可能是"生成中"（**不能**用 `status` 去猜：`conversations` 表里没有"正在生成"这个状态，
+ *     真值只在 Redis 的锁上）。
  */
 export function conversationItemView(
   item: ConversationItem,
   now: Date,
-  streamingId: string | null,
+  streamingIds: ReadonlySet<string>,
 ): ConversationListItemView {
   const title = item.topic === null || item.topic.trim() === '' ? CONVERSATION_UNTITLED_HINT : item.topic
   const snapshot = { agentId: item.agentId, agentName: item.agentName, agentType: item.agentType }
 
-  if (item.id === streamingId) {
+  if (streamingIds.has(item.id)) {
     return { id: item.id, title, led: 'run', state: '生成中', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
   }
   if (isConversationReadOnly(item.status)) {
@@ -176,7 +178,7 @@ export function conversationItemView(
 export function groupConversationViews(
   items: readonly ConversationItem[],
   now: Date,
-  streamingId: string | null,
+  streamingIds: ReadonlySet<string>,
 ): ConversationGroup[] {
   const today: ConversationListItemView[] = []
   const earlier: ConversationListItemView[] = []
@@ -185,7 +187,7 @@ export function groupConversationViews(
     const reference = item.lastMessageAt ?? item.createdAt
     const at = new Date(reference)
     const isToday = Number.isNaN(at.getTime()) || calendarDayDiff(now, at) <= 0
-    ;(isToday ? today : earlier).push(conversationItemView(item, now, streamingId))
+    ;(isToday ? today : earlier).push(conversationItemView(item, now, streamingIds))
   }
 
   const groups: ConversationGroup[] = []

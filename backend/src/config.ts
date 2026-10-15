@@ -683,17 +683,26 @@ const envSchema = z
     WORKSPACE_ROOT: defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/workspaces'),
     /** 单文件上限（MB）。编辑器只内联打开这以下；超限只读/下载（§九 配额） */
     WORKSPACE_MAX_FILE_MB: intVar('WORKSPACE_MAX_FILE_MB', 10, { min: 1, max: 4096 }),
-    /** 单会话文件数上限（防爆，§九） */
-    WORKSPACE_MAX_FILES: intVar('WORKSPACE_MAX_FILES', 2000, { min: 1, max: 1_000_000 }),
+    /**
+     * 单会话文件数上限（防爆，§九）。
+     *
+     * ★ **2026-10-15 放开（待决 7 定案）**：原默认 2000 会顶爆**真实仓库** —— 索引把 `.git/**`
+     *   也算作工作区内容（`.git` 属内容、只是不进产物），一次 `git clone` 后 loose objects /
+     *   hooks / refs 很容易把活文件数推到 2000，于是"新建/上传任何文件"都回
+     *   `工作区文件数已达上限（2000）`。默认提到 20000（依赖目录仍不进索引，故 node_modules 不计）。
+     *   ⚠️ 仍可经 env 调小/调大（防爆闸门本身保留，只是给真实仓库留出空间）。
+     */
+    WORKSPACE_MAX_FILES: intVar('WORKSPACE_MAX_FILES', 20000, { min: 1, max: 1_000_000 }),
     /**
      * 单会话**行数**上限（含墓碑；P1-9 · P6 · R6，更严的数量闸门）。
      * `workspace_files` 唯一键是 `(会话, 路径)` ⇒ agent "建了删、建了删"不同路径时活文件数
      * 永远是 0、墓碑行却无限涨；这一条把**存活 + 墓碑的总行数**也钉住。
      * ⚠️ 必须 ≥ `WORKSPACE_MAX_FILES`（否则永远填不满活文件上限；下面的 superRefine 守着）。
+     * ★ 2026-10-15 随 `WORKSPACE_MAX_FILES` 放开同比提到 100000（仍是活文件上限的 5 倍，留出墓碑余量）。
      */
-    WORKSPACE_MAX_ROWS: intVar('WORKSPACE_MAX_ROWS', 20000, { min: 1, max: 10_000_000 }),
-    /** 单会话总字节上限（MB，§九） */
-    WORKSPACE_MAX_TOTAL_MB: intVar('WORKSPACE_MAX_TOTAL_MB', 512, { min: 1, max: 1_048_576 }),
+    WORKSPACE_MAX_ROWS: intVar('WORKSPACE_MAX_ROWS', 100000, { min: 1, max: 10_000_000 }),
+    /** 单会话总字节上限（MB，§九）。★ 2026-10-15 放开：512 → 2048（真实仓库含 `.git` 常超 512MB） */
+    WORKSPACE_MAX_TOTAL_MB: intVar('WORKSPACE_MAX_TOTAL_MB', 2048, { min: 1, max: 1_048_576 }),
     /**
      * 单会话**写入限流**：固定窗口（1 分钟）内允许的内容写次数；`0` = 关闭限流（P1-9 · P6 · R6）。
      * 挡"失控 agent 每秒几百次写"把 PG / FS / S3 打满；超限回 `BUSY`（429）。

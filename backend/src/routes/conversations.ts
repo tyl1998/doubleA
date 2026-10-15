@@ -439,9 +439,9 @@ export function registerConversationRoutes(app: FastifyInstance): void {
    *     做成 4xx 只会让用户看到一条没有信息量的报错）；
    *   · `accepted:true` = 这条插话确实写给了一个正在跑的流。
    *
-   * ⚠️ 对 **ChatBot** 会话（非沙箱）本端点同样会 `accepted:true`（它也在跑流），但那条链路的
-   * producer 不注册 steer 监听器 ⇒ 插话**不会被消费**（留在列表里直到 TTL）。前端据此把入口
-   * 只对 TaskAgent 会话放出（`agentType` 判据在页面）；后端不必为此分叉（写成 4xx 反而更糟）。
+   * ★ **P1-20 起两种会话都消费插话**：TaskAgent 投给沙箱 pi 引擎（bridge `steer` 命令）；
+   * ChatBot 由 producer 注册 steer 监听器，在**下一次上游调用前**注入（见 `chatBot.ts`）。
+   * 出口层还会回发一帧 `steer` ⇒ 界面看得到这条插话（用户反馈："看不到，像丢消息"）。
    */
   app.post<{ Params: ConversationIdParams; Body: SteerConversationBody }>(
     '/api/conversations/:id/steer',

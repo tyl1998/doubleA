@@ -44,6 +44,12 @@
 #   Ctrl+C 只停同步循环，代理容器照常跑（策略停在最后一次一致状态）。
 #   ⚠️ 不跑 `--watch` 的话是"启动时抓一次"的语义 —— 平台改完要重跑本脚本或起 `--watch`。
 #
+# 【模型端点隧道空闲上限】策略文件里额外带一份 `modelHosts`（= 模型池主机），代理对**这些目标**
+#   在隧道建成后仍留一个空闲上限（`infra/.env` 的 `SANDBOX_EGRESS_MODEL_IDLE_TIMEOUT_MS`，默认 180s）。
+#   目的：上游"回了响应头、正文长时间没数据"（实测出现过静默 356s）时把隧道掐掉，让容器里的引擎
+#   收到流错误、走它自己的 `auto_retry`（只重发这一次 provider 请求，不重跑整轮工具）。
+#   非模型目标（registry / git）不受影响 —— npm/pytest 本来就可能长时间静默。
+#
 # 停止：bash infra/scripts/egress-down.sh
 # =====================================================================
 
@@ -108,7 +114,7 @@ while [ $# -gt 0 ]; do
     --daemon)    DAEMON=1; WATCH=1 ;;
     --watch-interval) shift; WATCH_INTERVAL_SEC="${1:-30}" ;;
     --)          : ;;   # `pnpm egress:up -- --write-env` 会把孤立 -- 传进来
-    -h|--help)   sed -n '2,48p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,54p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
   shift
@@ -254,7 +260,13 @@ csv_to_array() {
       [ -n "$item" ] && out+=("$item")
     done
   fi
-  eval "$name=(\"\${out[@]}\")"
+  # ⚠️ bash 3.2（macOS `/bin/bash`）+ `set -u`：**空数组**的 `"${out[@]}"` 会报
+  #    `out[@]: unbound variable` ⇒ 必须分开写（`${out[@]+…}` 在这里也救不了，因为它是 eval 出去的赋值语句）。
+  if [ "${#out[@]}" -gt 0 ]; then
+    eval "$name=(\"\${out[@]}\")"
+  else
+    eval "$name=()"
+  fi
 }
 
 # 重算策略 → 填 ALLOW / DENY / MODEL / ALLOW_ALL（再由 write_policy_file 落成 JSON）。
@@ -361,14 +373,16 @@ json_host_array() {
 }
 
 # 原子写策略文件（临时文件 + mv：代理轮询读的是路径，mv 后立即可见新内容）
-# ⚠️ 形状 = 代理认识的 `{allow,deny}`（scope 已在 `compute_policy` 解析进这两张表）。
+# ⚠️ 形状 = 代理认识的 `{allow,deny,modelHosts}`（scope 已在 `compute_policy` 解析进 allow/deny；
+#    `modelHosts` 不参与放行判定，只用来给"模型端点隧道"挂空闲上限 —— 见代理文件头 ★）。
 write_policy_file() {
   mkdir -p "$ALLOW_DIR_HOST"
   local tmp="$POLICY_FILE_HOST.tmp"
-  local allow_json='[]' deny_json='[]'
+  local allow_json='[]' deny_json='[]' model_json='[]'
   [ "${#ALLOW[@]}" -gt 0 ] && allow_json="$(json_host_array "${ALLOW[@]}")"
   [ "${#DENY[@]}" -gt 0 ] && deny_json="$(json_host_array "${DENY[@]}")"
-  printf '{"allow":%s,"deny":%s}\n' "$allow_json" "$deny_json" > "$tmp"
+  [ "${#MODEL[@]}" -gt 0 ] && model_json="$(json_host_array "${MODEL[@]}")"
+  printf '{"allow":%s,"deny":%s,"modelHosts":%s}\n' "$allow_json" "$deny_json" "$model_json" > "$tmp"
   mv "$tmp" "$POLICY_FILE_HOST"
 }
 
@@ -390,7 +404,15 @@ for skipped in ${SKIPPED_LOOPBACK[@]+"${SKIPPED_LOOPBACK[@]}"}; do
 done
 
 # 策略落盘（挂进容器；代理轮询它做热更新）
-info "出网策略已写入 ${POLICY_FILE_HOST}（代理挂载 + 热更新）"
+info "出网策略已写入 ${POLICY_FILE_HOST}（代理挂载 + 热更新；含 modelHosts ${#MODEL[@]} 条）"
+
+# -- 1.5 模型端点隧道空闲上限（★ 掐掉"只回头、不回正文"的模型流，交给引擎 auto_retry）------
+# 为什么只对模型端点设：非模型目标（registry / git / 长下载）本来就可能长时间静默，
+# 设了会误杀；模型流正常时是**持续吐 delta** 的，静默到这么久基本等于死链。
+# 来源：infra/.env 的 SANDBOX_EGRESS_MODEL_IDLE_TIMEOUT_MS（默认 180000；0 = 关）。
+MODEL_IDLE_TIMEOUT_MS="$(env_value SANDBOX_EGRESS_MODEL_IDLE_TIMEOUT_MS)"
+[ -n "$MODEL_IDLE_TIMEOUT_MS" ] || MODEL_IDLE_TIMEOUT_MS=180000
+info "模型端点空闲上限：${MODEL_IDLE_TIMEOUT_MS}ms（0 = 关；只对 modelHosts 命中目标生效）"
 
 # -- 2. 起容器（公网腿）------------------------------------------------
 
@@ -405,6 +427,7 @@ fi
   --network bridge --restart unless-stopped \
   -e "EGRESS_PORT=${PORT}" \
   -e "EGRESS_POLICY_FILE=${POLICY_FILE_CONTAINER}" \
+  -e "EGRESS_MODEL_IDLE_TIMEOUT_MS=${MODEL_IDLE_TIMEOUT_MS}" \
   -v "$PROXY_SRC:/app/egress-proxy.mjs:ro" \
   -v "$ALLOW_DIR_HOST:/egress-allow:ro" \
   "$IMAGE" node /app/egress-proxy.mjs >/dev/null || fail "容器起不来（$DOCKER_BIN logs $NAME 看原因）"

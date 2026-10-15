@@ -77,12 +77,6 @@ export interface ChatInputProps {
   sending: boolean
   /** 点了停止、正在 5s 窗口里等收口 */
   stopping: boolean
-  /**
-   * **另一个**会话正在生成（P0-1-34）。判据在页面里：
-   * `streamingId !== null && streamingId !== conversationId`（见 `useChatStream` 的
-   * `streamingId`）—— 这里只负责把它交给状态机，**不自己判**。
-   */
-  elsewhere: boolean
   draft: string
   onDraftChange: (text: string) => void
   /** 提交（发送）。**是否真的发**由状态机的 `canSend` 决定，这里不再判一次 */
@@ -126,7 +120,6 @@ export function ChatInput({
   round,
   sending,
   stopping,
-  elsewhere,
   draft,
   onDraftChange,
   onSubmit,
@@ -142,7 +135,7 @@ export function ChatInput({
   steerPending,
   controls,
 }: ChatInputProps) {
-  const view = composeState({ round, sending, stopping, elsewhere, draft, steerable })
+  const view = composeState({ round, sending, stopping, draft, steerable })
 
   /**
    * 输入框高度**跟着正文走**（`app.css` 里 `.composer textarea` 的 `min-height`/`max-height`）。

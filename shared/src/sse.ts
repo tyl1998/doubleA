@@ -9,7 +9,7 @@
  * ① 归一化的意义：两条链路 → 同一套事件
  * ─────────────────────────────────────────────────────────────────────
  * ChatBot 走"后端 RAG 编排 + MCP 工具"，TaskAgent 走"沙箱 ACP 引擎 + bash/read/write 工具"
- * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 **11 个**事件 ——
+ * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 **13 个**事件 ——
  * 于是前端只有一套渲染路径，将来接新引擎也不必动前端。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -82,6 +82,15 @@ export const SSE_EVENT_NAMES = [
   'thinking',
   /** 工具调用卡片（同一 callId 多次推送 = 状态机流转） */
   'tool_call',
+  /**
+   * 工具**执行中**的输出快照（同一 `callId` 多次推送 = **整体覆盖**）。
+   *
+   * ⚠️ 与 `tool_call` 是**两件事**：后者是"这张卡的状态机"（`RUNNING`/`SUCCESS`/`ERROR`，要落库、
+   * 刷新后要能恢复）；本事件是"这张卡此刻**滚动的输出**"——**纯展示、天生易失**：不落库、
+   * 不进模型上下文、刷新后不恢复（刷新后只剩 `tool_call{SUCCESS}` 的 `output`）。
+   * 形状与取值域见 {@link sseToolOutputPayloadSchema}。
+   */
+  'tool_output',
   /** elicitation：弹确认卡，流挂起等 `/confirm` */
   'confirm',
   /** 本轮知识库引用 */
@@ -92,6 +101,14 @@ export const SSE_EVENT_NAMES = [
   'queued',
   /** 本轮生命周期中间态（沙箱就绪 / 引擎启动 / 引擎就绪…；TaskAgent 专属） */
   'status',
+  /**
+   * 一条**已投递给运行中 agent 的用户插话**（`steer`，P1-9 · P4 · R1）。
+   *
+   * ⚠️ 它**不是**动作、是**结果**：编排层把它派给引擎（TaskAgent）/ 在下一次上游调用前注入
+   * （ChatBot）时，由出口层发这一帧 —— 于是用户**看得见自己插的话**。产品反馈：插话发出去了、
+   * agent 也像收到了，但聊天界面上看不到 ⇒ "像丢消息"。前端据此在消息流里补一条用户气泡。
+   */
+  'steer',
   /** 心跳（空闲期保活；前端静默忽略） */
   'ping',
   /** 流结束 */
@@ -118,7 +135,7 @@ export type ChatFinishReason = (typeof CHAT_FINISH_REASONS)[number]
 /** SSE 响应的 Content-Type（含 charset —— 中文增量必须明确编码，否则有的客户端按 latin-1 解） */
 export const SSE_CONTENT_TYPE = 'text/event-stream; charset=utf-8'
 
-// ───────────────────────────── 11 个事件的 payload ─────────────────────────────
+// ───────────────────────────── 13 个事件的 payload ─────────────────────────────
 
 /** `delta`：助手回答文本增量 */
 export const sseDeltaPayloadSchema = z.object({ text: z.string() })
@@ -140,6 +157,29 @@ export type SseThinkingPayload = z.infer<typeof sseThinkingPayloadSchema>
  */
 export const sseToolCallPayloadSchema = toolCallRecordSchema.omit({ arguments: true })
 export type SseToolCallPayload = z.infer<typeof sseToolCallPayloadSchema>
+
+/**
+ * `tool_output`：工具**执行中**的输出快照（TaskAgent 的沙箱工具，典型是 `bash` 跑长命令）。
+ *
+ * 解决的问题：一轮里 `bash` 跑几十秒（装依赖 / 构建 / 下载）时，界面只有一张 `RUNNING` 卡、
+ * 看不到任何进展，像卡死了（产品反馈）。本事件把引擎的**实时输出**透出来。
+ *
+ * ⚠️ **刻意极简、且绝不落库**（与 `toolCallRecordSchema` 无关，不进 `messages.content.tool_calls`）：
+ *   · **覆盖语义**：`text` 是"到目前为止的**整体快照**"，不是增量 ⇒ 前端直接整体替换（不做 diff）。
+ *     来源（引擎 `tool_execution_update.partialResult`）本身就是"latest partial result"，
+ *     并且**已按尾部截断**（pi 侧 `DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`）；编排层再截一道
+ *     （见 `sandbox/map.ts#TOOL_OUTPUT_VIEW_MAX_CHARS`）⇒ 单帧体积有硬上限。
+ *   · **天生易失**：刷新 / 断线重连后不再有它（`shared/src/sse.ts` 文件头 ② 的"不做 SSE 重放"），
+ *     历史里只剩 `tool_call{SUCCESS}.output`。这是**设计**而不是缺陷 —— 落到库里就等于把
+ *     长命令的原始输出**留进上下文**，正是要避免的。
+ */
+export const sseToolOutputPayloadSchema = z.object({
+  /** 对应哪张工具卡（= `tool_call` 的 `callId`） */
+  callId: z.string().min(1),
+  /** "到目前为止"的输出快照（尾部截断后的当前全文；空串 = 无可见输出） */
+  text: z.string(),
+})
+export type SseToolOutputPayload = z.infer<typeof sseToolOutputPayloadSchema>
 
 /**
  * 确认请求的**来源**（P0-2-10；`02` §9.10）。
@@ -213,10 +253,12 @@ export type SseQueuedPayload = z.infer<typeof sseQueuedPayloadSchema>
  * `status`：本轮生命周期的**中间态**（P0-3-13；TaskAgent 专属 —— ChatBot 恒不发）。
  *
  * 解决的问题：TaskAgent 一轮的"无输出期"很长（建沙箱 → 起引擎 → 跑任务，首字可能几十秒），
- * 没有它用户只能看到"正在等待上游响应…"的占位，分不清到底在干什么、是不是卡了。
- * 编排层在**每个阶段切换点**发一条，前端把它显示成助手消息里的一行小字；
+ * 没有它用户只能看到一个**光秃秃的打字光标**，分不清到底在干什么、是不是卡了。
+ * 编排层在**每个阶段切换点**发一条，前端把它显示成助手消息里的一行小字（`StreamingStatusLine`）；
  * 一旦真实内容（`delta` / `thinking` / `tool_call`）到达，归约层就会清掉它 ——
  * 状态行只是"还没内容时"的进度指示，不追求跟真实内容同时存在。
+ * ⚠️ 它是**流式期唯一的那条提示**：无输出期的占位**只留打字光标**，不再另写一句"等待"文案
+ * （产品反馈题 3：两条提示叠在一起像两件事）。
  *
  * ⚠️ 它是**进度语**不是数据：不落库（`done` 时整条落库只含正文/工具/引用/产物）、
  * 不参与断线重连（`/active` 快照有自己的 `queuedPosition` / `currentTool`），
@@ -224,6 +266,16 @@ export type SseQueuedPayload = z.infer<typeof sseQueuedPayloadSchema>
  */
 export const sseStatusPayloadSchema = z.object({ text: z.string() })
 export type SseStatusPayload = z.infer<typeof sseStatusPayloadSchema>
+
+/**
+ * `steer`：一条**已投递给运行中 agent 的用户插话**（P1-9 · P4 · R1）。
+ *
+ * `message` = 插话正文原文（与 `POST /api/conversations/:id/steer` 的请求体一致）；
+ * `at` = 出口层派发这一刻（ISO 8601，前端当用户气泡的时间）。⚠️ 它是**一次性事件**、不落库：
+ * 插话是"投给引擎的一句话"，落库属另一件事（`done` 时整条落库不含它，见 `status` 的同款说明）。
+ */
+export const sseSteerPayloadSchema = z.object({ message: z.string(), at: z.string() })
+export type SseSteerPayload = z.infer<typeof sseSteerPayloadSchema>
 
 /**
  * `ping`：心跳。
@@ -277,11 +329,13 @@ export const SSE_PAYLOAD_SCHEMAS = {
   delta: sseDeltaPayloadSchema,
   thinking: sseThinkingPayloadSchema,
   tool_call: sseToolCallPayloadSchema,
+  tool_output: sseToolOutputPayloadSchema,
   confirm: sseConfirmPayloadSchema,
   citations: sseCitationsPayloadSchema,
   artifact: sseArtifactPayloadSchema,
   queued: sseQueuedPayloadSchema,
   status: sseStatusPayloadSchema,
+  steer: sseSteerPayloadSchema,
   ping: ssePingPayloadSchema,
   done: sseDonePayloadSchema,
   error: sseErrorPayloadSchema,

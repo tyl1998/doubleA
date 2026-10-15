@@ -3,21 +3,24 @@
  *
  * 依据：`docs/子方案/Code模式工作区.md` §五之二 2；**2026-10-14 用户定案 B**：
  *   · 已就绪的运行时由后端**探测本机镜像**得到（有就提供）；
- *   · 用户选了本机没有的组合 ⇒ **后端按需 `docker build`**（本组件负责"选组件 → 构建 → 选用"）。
+ *   · 用户选了本机没有的组合 ⇒ **后端按需 `docker build`**。
  *
  * ★ 2026-10-14 修订：构建是**长任务** —— 启动拿 `buildId`、**轮询进度**（进度条 + 阶段文案）、
  *   **可取消**。见 `api/sandbox.ts` 与后端 `sandbox/runtimeBuild.ts`。
+ *
+ * ★ **2026-10-15 修订（用户定案）：不再枚举版本** —— 弹窗只列**语言**，勾选语言后在后面的**输入框填版本号**
+ *   （带常见版本候选）；组合规范化与后端/构建侧共用 `@doubulea/shared` 的纯函数。
  *
  * ⚠️ 选运行时 = **建容器时用哪份镜像**（`ensureSandbox`），**下次派活生效**；镜像是**构建期预烘焙**，
  *    不是运行期"装/合并"；**依赖**才在容器里运行期拉（P1-17b）。
  */
 
 import { PlusOutlined } from '@ant-design/icons'
-import { Button, Checkbox, Modal, Progress, Select, Space, Tag, Tooltip, Typography, message } from 'antd'
+import { AutoComplete, Button, Checkbox, Modal, Progress, Select, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
-import { sandboxVariantIdFromComponents, sandboxVariantLabel } from '@doubulea/shared'
-import type { SandboxBuildJob } from '@doubulea/shared'
+import { sandboxVariantIdFromSelection, sandboxVariantLabel } from '@doubulea/shared'
+import type { SandboxBuildJob, SandboxRuntimeSelection } from '@doubulea/shared'
 
 import {
   cancelSandboxBuildJob,
@@ -45,7 +48,10 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
   const query = useSandboxRuntimes()
   const queryClient = useQueryClient()
   const [pickerOpen, setPickerOpen] = useState(false)
-  const [picked, setPicked] = useState<string[]>([])
+  /** 勾选了哪些语言（`language → true/false`） */
+  const [checked, setChecked] = useState<Record<string, boolean>>({})
+  /** 各语言输入框里的版本（未填时回退到该语言的默认版本） */
+  const [versions, setVersions] = useState<Record<string, string>>({})
   /** 正在构建的任务 id；`null` = 没有正在构建的任务 */
   const [buildId, setBuildId] = useState<string | null>(null)
   /** 已启动构建的目标变体（用于"构建完成自动选用"与标题展示） */
@@ -55,7 +61,7 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
 
   const data = query.data
   const runtimes = data?.runtimes ?? []
-  const components = data?.components ?? []
+  const languages = data?.languages ?? []
   const canBuild = data?.canBuild === true
 
   const options = useMemo(() => {
@@ -68,7 +74,21 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
     return base
   }, [runtimes, runtime])
 
-  const pickedVariant = sandboxVariantIdFromComponents(picked)
+  // 勾选的语言 + 填写的版本 → 选择项（未填版本回退到该语言默认版本；空版本忽略）
+  const selection: SandboxRuntimeSelection[] = useMemo(
+    () =>
+      languages
+        .filter((lang) => checked[lang.language] === true)
+        .map((lang) => ({ language: lang.language, version: (versions[lang.language] ?? lang.defaultVersion).trim() }))
+        .filter((sel) => sel.version !== ''),
+    [languages, checked, versions],
+  )
+  const pickedVariant = sandboxVariantIdFromSelection(selection)
+
+  const resetPicker = (): void => {
+    setChecked({})
+    setVersions({})
+  }
 
   /**
    * 构建任务状态轮询：**只在有活动任务时**开启（`buildId !== null`），终态后自动停。
@@ -93,7 +113,7 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
       message.success(`运行时已就绪：${job.label}`)
       void queryClient.invalidateQueries({ queryKey: sandboxRuntimesQueryKey })
       setPickerOpen(false)
-      setPicked([])
+      resetPicker()
       setBuildId(null)
       setBuildingVariant(null)
       // 刚构建完 ⇒ 这份组合现在**已就绪**（ready=true）
@@ -110,9 +130,9 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
   }, [job, onSelect, queryClient])
 
   const doBuild = (): void => {
-    if (picked.length === 0 || starting) return
+    if (selection.length === 0 || starting) return
     setStarting(true)
-    startSandboxBuild(picked)
+    startSandboxBuild(selection)
       .then((started) => {
         // 已就绪直接命中 ⇒ 后端回的也是 `succeeded`（这里同样走终态收口去选用 + 刷新）
         setBuildingVariant(started.variant)
@@ -152,7 +172,7 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
         title="会话运行时：建容器（派活）时用哪份镜像。只装运行时、不装依赖；依赖运行期安装。下次派活生效"
       />
       {canBuild ? (
-        <Tooltip title={runtimes.length === 0 ? '还没有环境镜像？点这里选组件，后端按需构建' : '组合本机还没有？选组件，后端按需构建（首次较慢，之后命中缓存）'}>
+        <Tooltip title={runtimes.length === 0 ? '还没有环境镜像？点这里勾语言填版本，后端按需构建' : '组合本机还没有？勾语言填版本，后端按需构建（首次较慢，之后命中缓存）'}>
           <Button size="small" icon={<PlusOutlined />} onClick={() => setPickerOpen(true)} />
         </Tooltip>
       ) : null}
@@ -174,7 +194,7 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
         }}
         onOk={doBuild}
         okText={starting ? '启动中…' : '构建并选用'}
-        okButtonProps={{ disabled: picked.length === 0 || starting || building }}
+        okButtonProps={{ disabled: selection.length === 0 || starting || building }}
         cancelButtonProps={{ disabled: building }}
         confirmLoading={starting}
         maskClosable={!building}
@@ -211,27 +231,47 @@ export function RuntimeSelect({ runtime, pending, onSelect }: RuntimeSelectProps
         ) : (
           <>
             <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-              勾选这个项目需要的语言与版本；后端会按这份组合构建运行时镜像（本机已有组合则直接命中缓存）。
+              勾选这个项目需要的语言，并在后面填版本号；后端会按这份组合构建运行时镜像（本机已有组合则直接命中缓存）。
               <br />
               ⚠️ 版本由镜像**构建期**固定；**依赖**在运行期安装（不在这一步）。
             </Typography.Paragraph>
-            {components.map((component) => (
-              <div key={component.id} style={{ marginBottom: 4 }}>
-                <Checkbox
-                  checked={picked.includes(component.id)}
-                  onChange={(event) =>
-                    setPicked((prev) =>
-                      event.target.checked ? [...prev, component.id] : prev.filter((id) => id !== component.id),
-                    )
-                  }
-                >
-                  {component.label}
-                </Checkbox>
-              </div>
-            ))}
+            {languages.map((lang) => {
+              const on = checked[lang.language] === true
+              return (
+                <div key={lang.language} style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Checkbox
+                    style={{ minWidth: 92 }}
+                    checked={on}
+                    onChange={(event) => {
+                      const next = event.target.checked
+                      setChecked((prev) => ({ ...prev, [lang.language]: next }))
+                      // 首次勾选时把输入框预填成该语言的默认版本（之后不再覆盖用户输入）
+                      setVersions((prev) => (prev[lang.language] === undefined ? { ...prev, [lang.language]: lang.defaultVersion } : prev))
+                    }}
+                  >
+                    {lang.label}
+                  </Checkbox>
+                  {on ? (
+                    <AutoComplete
+                      size="small"
+                      style={{ width: 160 }}
+                      value={versions[lang.language] ?? lang.defaultVersion}
+                      options={lang.suggestions.map((value) => ({ value }))}
+                      placeholder={lang.hint}
+                      onChange={(value: string) => setVersions((prev) => ({ ...prev, [lang.language]: value }))}
+                    />
+                  ) : (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {lang.hint}
+                      {lang.baseVersion !== null ? `（自带 ${lang.baseVersion}）` : ''}
+                    </Typography.Text>
+                  )}
+                </div>
+              )
+            })}
             <div style={{ marginTop: 12 }}>
               将构建：<Tag color="blue">{sandboxVariantLabel(pickedVariant)}</Tag>
-              {picked.length === 0 ? <Typography.Text type="secondary">（还没选组件）</Typography.Text> : null}
+              {selection.length === 0 ? <Typography.Text type="secondary">（还没选语言）</Typography.Text> : null}
             </div>
           </>
         )}

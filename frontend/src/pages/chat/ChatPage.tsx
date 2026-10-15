@@ -85,7 +85,7 @@ import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
 import { AGENTS_PATH, agentEditPath, conversationPath, newConversationPath } from '../../app/paths.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
-import { TableSkeleton } from '../../components/ListStates.js'
+import { EmptyState, TableSkeleton } from '../../components/ListStates.js'
 import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
 import { AgentPicker } from '../../features/chat/AgentPicker.js'
 import { ArtifactPanel } from '../../features/chat/ArtifactPanel.js'
@@ -111,7 +111,7 @@ import { chatErrorTitle, shouldToastChatError } from '../../features/chat/stream
 import { useChatStream } from '../../features/chat/useChatStream.js'
 import { useConversationWatch } from '../../features/chat/useConversationWatch.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
-import { useChatStreamStore } from '../../stores/chatStream.js'
+import { roundOf, useChatStreamStore } from '../../stores/chatStream.js'
 
 /**
  * 对话页（P0-1-32 起是"某一个会话的视图"）。
@@ -200,7 +200,7 @@ export function ChatPage({
    */
   const preserveSelectionRef = useRef(false)
 
-  const { round, sending, stopping, disconnect, streamingId, send, regenerate, stop, steer, align } = useChatStream(
+  const { round, sending, stopping, disconnect, send, regenerate, stop, steer, align } = useChatStream(
     agentId,
     conversationId,
     {
@@ -426,7 +426,9 @@ export function ChatPage({
   const [memoryRefreshKey, setMemoryRefreshKey] = useState(0)
   useEffect(() => {
     setMemoryRefreshKey((key) => key + 1)
-  }, [streamingId])
+    // 这个会话这一轮的**状态**变了（开始 / 结束）就刷一次。P1-19 多流后按"当前会话"的状态算
+    //（早先依赖全局的 `streamingId`；那个单值在多流下已经没有意义）。
+  }, [round?.status])
   // 滚动容器（`.stream`）—— 新内容到达时把视口推到底部，见下面的 effect
   const frameRef = useRef<HTMLDivElement>(null)
   /**
@@ -628,9 +630,9 @@ export function ChatPage({
     // ⚠️ 用 `allHistory`（**未收起**）：重新生成期间渲染用的 `history` 把整个最新一轮都收掉了
     // （包括刚落库的新回答）⇒ 用它会永远匹配不到，流式版本永远不让位。
     if (allHistory.some((view) => view.key === messageId)) {
-      useChatStreamStore.getState().reset()
+      if (conversationId !== undefined) useChatStreamStore.getState().reset(conversationId)
     }
-  }, [round, allHistory])
+  }, [round, allHistory, conversationId])
 
   /**
    * 重新生成**失败** ⇒ 收掉这一轮的流式版本，让历史重新呈现服务端真实状态（P1-3）。
@@ -646,8 +648,8 @@ export function ChatPage({
    */
   useEffect(() => {
     if (round === null || round.kind !== 'regenerate' || round.status !== 'error') return
-    useChatStreamStore.getState().reset()
-  }, [round])
+    if (conversationId !== undefined) useChatStreamStore.getState().reset(conversationId)
+  }, [round, conversationId])
 
   /**
    * **贴底跟随**：流式期间每一帧都会长高，不跟随的话新内容长在视口外 —— 而"看着回答长出来"
@@ -856,7 +858,7 @@ export function ChatPage({
    */
   const handleConfirmAnswer = useCallback(
     (accepted: boolean): void => {
-      const confirm = useChatStreamStore.getState().round?.confirm
+      const confirm = roundOf(useChatStreamStore.getState(), conversationId)?.confirm ?? null
       if (confirm === undefined || confirm === null) return
       if (conversationId === undefined) return
 
@@ -875,7 +877,7 @@ export function ChatPage({
         })
         .finally(() => {
           setConfirmPending(false)
-          useChatStreamStore.getState().clearConfirm()
+          if (conversationId !== undefined) useChatStreamStore.getState().clearConfirm(conversationId)
         })
     },
     [conversationId, feedback],
@@ -1045,17 +1047,18 @@ export function ChatPage({
   //    此时 `useAgent` 必然 404，但历史看得见、只是不能再发消息 —— 不该报"打不开这个对话"。
   if (agentQuery.isError && !readOnly) {
     return (
-      <div className="page__head">
-        <div>
-          <p className="kicker">S-04 · 对话</p>
-          <h1>打不开这个对话</h1>
-          <p className="page__lead">智能体取不到（可能已被删除，或链接里的 id 不对）。</p>
-        </div>
-        <div className="page__head-actions">
-          <Link to={AGENTS_PATH}>
-            <Button type="primary">回智能体列表</Button>
-          </Link>
-        </div>
+      // 居中空态（与聊天主页「找不到这个会话」同一副面孔）：`.chat-home__welcome` 把内容在主区
+      // 居中，`EmptyState` 内部再水平居中 —— 不再是靠左的标题栏。
+      <div className="chat-home__welcome" data-testid="chat-agent-error">
+        <EmptyState
+          title="打不开这个对话"
+          lead="智能体取不到（可能已被删除，或链接里的 id 不对）。"
+          action={
+            <Link to={AGENTS_PATH}>
+              <Button type="primary">回智能体列表</Button>
+            </Link>
+          }
+        />
       </div>
     )
   }
@@ -1221,10 +1224,6 @@ export function ChatPage({
               round={round}
               sending={sending}
               stopping={stopping}
-              // "另一个会话在生成"（P0-1-34）：本批前端只有一个轮次槽，切到别的会话再发
-              // 会把那一轮覆盖掉并造成串台 ⇒ 输入区显示第六个状态、由 `send` 里的闸门拦住。
-              // 判据：有流在跑、且**不是**这个会话（`conversationId` 为 `undefined` 时必然成立）
-              elsewhere={streamingId !== null && streamingId !== conversationId}
               draft={draft}
               onDraftChange={setDraft}
               onSubmit={() => {
@@ -1237,9 +1236,10 @@ export function ChatPage({
               uploading={uploading}
               onPickFiles={handlePickFiles}
               onRemoveAttachment={handleRemoveAttachment}
-              // 中途插话（P1-9 · P4 · R1）：只对**沙箱（TaskAgent）**会话放出 —— ChatBot 的
-              // producer 不消费插话，放出入口只会得到一个静默无效的按钮（判据在状态机里）。
-              steerable={agent?.type === 'TASK_AGENT'}
+              // 中途插话（P1-9 · P4 · R1；P1-20 起**两种会话都支持**）：TaskAgent 投给 pi 引擎，
+              // ChatBot 在**下一次上游调用前**注入（producer 已注册 steer 监听器）。是否出现由状态机的
+              // `view.steer` 决定（仅在"正在生成 + 草稿非空"时放出），本组件不另判。
+              steerable
               onSteer={handleSteer}
               steerPending={steerPending}
               // R4：会话控件（模型 / 自动审批 / 记忆 / Code 模式 / 专注）摆到输入框下方

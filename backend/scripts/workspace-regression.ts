@@ -16,7 +16,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 
@@ -31,6 +31,8 @@ import {
 } from '@doubulea/shared'
 
 import { resolveWorkspacePath } from '../src/workspace/paths.js'
+import { parseGitDirFile, parseGitHead, scanGitReposUnder } from '../src/workspace/git.js'
+import { writeWorkspaceBytes } from '../src/workspace/store.js'
 import { applyWorkspaceEdit, applyWorkspaceEdits } from '../src/workspace/edit.js'
 import { workspaceEditSteerMessage } from '../src/workspace/steerMessage.js'
 import { serializeWorkspaceSseEvent } from '../src/workspace/sse.js'
@@ -45,6 +47,11 @@ import { ARTIFACT_EXCLUDED_DIRS, artifactChangePaths, filterArtifactPaths } from
 import { filterGitCleanPaths, parsePorcelainPaths } from '../src/sandbox/gitArtifacts.js'
 import { isWorkspaceExpired, workspaceRetentionCutoff } from '../src/workspace/reapModel.js'
 import {
+  lineDiffWorkspace,
+  splitWorkspaceDiffLines,
+  WORKSPACE_DIFF_CONTEXT_LINES,
+} from '../src/workspace/diff.js'
+import {
   decideWorkspaceQuota,
   isWorkspaceWriteRateExceeded,
   looksBinaryWorkspaceContent,
@@ -52,6 +59,7 @@ import {
   WORKSPACE_BINARY_SAMPLE_BYTES,
   WORKSPACE_WRITE_RATE_WINDOW_MS,
 } from '../src/workspace/quotaModel.js'
+import { isWorkspacePathInDir, selectWorkspaceDirPaths, workspaceDirPrefix } from '../src/workspace/dirModel.js'
 
 let passed = 0
 let failed = 0
@@ -583,6 +591,191 @@ it('N9 写入限流：`count > limit` 才算超；`limit<=0` = 关闭限流（�
   eq(isWorkspaceWriteRateExceeded(601, 600), true, '超 1 次 ⇒ 拒')
   eq(isWorkspaceWriteRateExceeded(999999, 0), false, 'limit=0 ⇒ 关闭限流，永不算超')
   eq(isWorkspaceWriteRateExceeded(999999, -1), false, 'limit<0 ⇒ 同上放行')
+})
+
+console.log('── O 行级差异（workspace/diff，P1-9 · 验收标记）──')
+it('O1 splitWorkspaceDiffLines：统一换行 / 空文本 / 末尾换行不产生空行', () => {
+  eq(splitWorkspaceDiffLines('a\nb\n').join(','), 'a,b', '末尾换行不算额外一行')
+  eq(splitWorkspaceDiffLines('a\r\nb\r\n').join(','), 'a,b', 'CRLF 归一')
+  eq(splitWorkspaceDiffLines('').length, 0, '空文本 = 空数组（不是 [\'\']）')
+  eq(splitWorkspaceDiffLines('a').join(','), 'a', '无末尾换行')
+})
+it('O2 相同内容 ⇒ 零增删（全 context，长段折成 gap）', () => {
+  const body = Array.from({ length: 20 }, (_, i) => `line ${i}`).join('\n')
+  const d = lineDiffWorkspace(body, body)
+  eq(d.added, 0, '无新增')
+  eq(d.removed, 0, '无删除')
+  eq(d.truncated, false, '未截断')
+  assert(d.lines.some((line) => line.type === 'gap'), '长未变段折成 gap（否则 20 行全展示）')
+})
+it('O3 新建（旧为空）⇒ 整篇新增', () => {
+  const d = lineDiffWorkspace('', 'a\nb\nc\n')
+  eq(d.added, 3, '新增 3 行')
+  eq(d.removed, 0, '无删除')
+  eq(d.lines.every((line) => line.type === 'add'), true, '全是 add')
+  eq(d.lines.map((line) => line.newLine).join(','), '1,2,3', '新行号 1..3')
+  eq(d.lines.every((line) => line.oldLine === null), true, '新增行无旧行号')
+})
+it('O4 删除（新为空）⇒ 整篇删除', () => {
+  const d = lineDiffWorkspace('a\nb\n', '')
+  eq(d.added, 0, '无新增')
+  eq(d.removed, 2, '删除 2 行')
+  eq(d.lines.every((line) => line.type === 'del'), true, '全是 del')
+  eq(d.lines.map((line) => line.oldLine).join(','), '1,2', '旧行号 1..2')
+})
+it('O5 单行改动 ⇒ 1 add + 1 del，且带上下文行号', () => {
+  const d = lineDiffWorkspace('a\nb\nc\n', 'a\nB\nc\n')
+  eq(d.added, 1, '增 1')
+  eq(d.removed, 1, '删 1')
+  eq(d.lines.length, 4, '上下文(3) + 改动(1)：a / del b / add B / c')
+  const del = d.lines.find((line) => line.type === 'del')
+  const add = d.lines.find((line) => line.type === 'add')
+  eq(del?.text, 'b', '删除行文本')
+  eq(del?.oldLine, 2, '删除行旧行号')
+  eq(add?.text, 'B', '新增行文本')
+  eq(add?.newLine, 2, '新增行新行号')
+})
+it('O6 中段小改 ⇒ 只保留两端各 3 行上下文，中间折成 gap', () => {
+  const oldText = Array.from({ length: 30 }, (_, i) => `l${i}`).join('\n')
+  const lines = oldText.split('\n')
+  lines[15] = 'CHANGED'
+  const d = lineDiffWorkspace(oldText, lines.join('\n'))
+  eq(d.added, 1, '增 1')
+  eq(d.removed, 1, '删 1')
+  const gaps = d.lines.filter((line) => line.type === 'gap')
+  // 改动前 15 行未变、改动后 14 行未变 ⇒ 两段各自折成一个 gap（各留首尾 3 行上下文）
+  eq(gaps.length, 2, '前后各一个 gap')
+  eq(
+    gaps.reduce((sum, line) => sum + (line.gap ?? 0), 0),
+    15 - 6 + (14 - 6),
+    'gap 合计 = 两段未变行各去掉 3+3 行上下文',
+  )
+  eq(
+    d.lines.filter((line) => line.type === 'context').length,
+    WORKSPACE_DIFF_CONTEXT_LINES * 4,
+    '上下文 = 改动处前后各 3 行 × 2 段',
+  )
+})
+it('O7 超行数上限 ⇒ truncated（计数只反映已处理部分）', () => {
+  const big = Array.from({ length: 50 }, (_, i) => `x${i}`).join('\n')
+  const d = lineDiffWorkspace('', big, { maxLines: 10 })
+  eq(d.truncated, true, '被截断')
+  eq(d.added, 10, '只处理前 10 行')
+})
+it('O8 大改动量退化路径仍给出正确计数（LCS 超上限 ⇒ 整段删+增）', () => {
+  const a = Array.from({ length: 600 }, (_, i) => `old-${i}`).join('\n')
+  const b = Array.from({ length: 600 }, (_, i) => `new-${i}`).join('\n')
+  const d = lineDiffWorkspace(a, b)
+  eq(d.added, 600, '600 行全新增')
+  eq(d.removed, 600, '600 行全删除')
+  eq(d.truncated, false, '未截断（退化不等于截断）')
+})
+
+console.log('── P 工作区写保留权限位（P1-20，"g.sh 丢执行权限"修复）──')
+// 顶层准备（`it` 同步，先把异步 FS 做完）：一个已有 0755 的脚本走一次覆盖写；一个新建
+const modeRoot = await mkdtemp(join(tmpdir(), 'ws-mode-'))
+const modeScript = join(modeRoot, 'g.sh')
+const modeFresh = join(modeRoot, 'plain.txt')
+await writeFile(modeScript, 'echo old\n', { mode: 0o755 })
+await writeWorkspaceBytes(modeScript, Buffer.from('echo new\n'))
+await writeWorkspaceBytes(modeFresh, Buffer.from('hi\n'))
+const scriptMode = (await stat(modeScript)).mode & 0o777
+const freshMode = (await stat(modeFresh)).mode & 0o777
+await rm(modeRoot, { recursive: true, force: true })
+it('P1 writeWorkspaceBytes 覆盖已有文件 ⇒ 保留原权限位（不再被打回 0644）', () => {
+  eq(scriptMode, 0o755, '已有 0755 ⇒ 覆盖后仍 0755')
+})
+it('P2 writeWorkspaceBytes 新建文件 ⇒ 默认 0644', () => {
+  eq(freshMode, 0o644, '新建默认 0644')
+})
+
+// ───────────────────────────── Q 文件夹递归删除判据 ─────────────────────────────
+
+console.log('── Q 文件夹递归删除判据（workspace/dirModel）──')
+it('Q1 workspaceDirPrefix：补一个尾斜杠（幂等）', () => {
+  eq(workspaceDirPrefix('out'), 'out/', '补斜杠')
+  eq(workspaceDirPrefix('a/b'), 'a/b/', '多段')
+  eq(workspaceDirPrefix('a/'), 'a/', '已有斜杠不重复补')
+})
+it('Q2 isWorkspacePathInDir：只认"该目录之下"，同前缀不误伤', () => {
+  eq(isWorkspacePathInDir('out/report.csv', 'out'), true, '直接子文件')
+  eq(isWorkspacePathInDir('out/a/b.txt', 'out'), true, '深层子文件')
+  eq(isWorkspacePathInDir('outsider.txt', 'out'), false, '同前缀文件（无斜杠边界）')
+  eq(isWorkspacePathInDir('out2/report.csv', 'out'), false, '同前缀目录')
+  eq(isWorkspacePathInDir('other/x', 'out'), false, '别的目录')
+})
+it('Q3 selectWorkspaceDirPaths：只挑该目录下的活文件（保序）', () => {
+  eq(selectWorkspaceDirPaths('out', ['out/a', 'out/b/c', 'out2/d', 'root.txt', 'outsider']), ['out/a', 'out/b/c'], '过滤')
+  eq(selectWorkspaceDirPaths('out', []), [], '空输入')
+})
+
+// ───────────────────────────── R git 概况判据（workspace/git） ─────────────────────────────
+// ⚠️ 本节的 `scanGitReposUnder` 用例**不用 git 二进制**：手搭 `.git/HEAD` 的两种形态即可 ——
+//    这正是被测对象的本意（"分支展示"不该给宿主加一条 git 依赖）。
+
+console.log('── R git 概况判据（workspace/git；读 .git/HEAD，不调 git）──')
+it('R1 parseGitHead：分支名 / detached 短 SHA / 认不出回 null（不猜）', () => {
+  eq(parseGitHead('ref: refs/heads/master\n'), { branch: 'master', detached: false }, '普通分支')
+  eq(
+    parseGitHead('ref: refs/heads/feature/a-b_c\n'),
+    { branch: 'feature/a-b_c', detached: false },
+    '含斜杠 / 连字符 / 下划线的分支名',
+  )
+  eq(
+    parseGitHead('9F1C0D2aB3c4D5e6F708192A3B4C5D6E7F809101\n'),
+    { branch: '9f1c0d2', detached: true },
+    'detached：给 7 位**小写**短 SHA',
+  )
+  eq(parseGitHead('ref: refs/tags/v1.0.0\n'), { branch: null, detached: false }, 'tag 不是分支 ⇒ 不冒充分支名')
+  eq(parseGitHead('ref: refs/heads/\n'), { branch: null, detached: false }, '空分支名 ⇒ null')
+  eq(parseGitHead('   \n'), { branch: null, detached: false }, '空 HEAD ⇒ null')
+})
+it('R2 parseGitDirFile：相对 gitdir 按仓库根解析；绝对原样；认不出回 null', () => {
+  eq(parseGitDirFile('gitdir: ../.git/worktrees/wt\n', '/w/repo'), '/w/.git/worktrees/wt', '相对路径按仓库根解析')
+  eq(parseGitDirFile('gitdir: /abs/.git/worktrees/wt\n', '/w/repo'), '/abs/.git/worktrees/wt', '绝对路径原样')
+  eq(parseGitDirFile('nonsense\n', '/w/repo'), null, '没有 `gitdir:` 行 ⇒ null')
+})
+
+const gitScanRoot = await mkdtemp(join(tmpdir(), 'ws-githead-'))
+// ① 根就是仓库：`.git` 是**目录**；② `qatt-platform-qa/` 是 worktree：`.git` 是**文件** + `gitdir:` 相对路径；
+// ③ `node_modules/` 与 `.hidden/` 里各塞一个假 `.git` —— 它们**不该**出现在结果里（候选过滤的证据）；
+// ④ `real/.git` 是目录但**没有 HEAD** ⇒ 也不该被当成仓库（半截仓库不猜）。
+await mkdir(join(gitScanRoot, '.git'), { recursive: true })
+await writeFile(join(gitScanRoot, '.git', 'HEAD'), 'ref: refs/heads/master\n')
+await mkdir(join(gitScanRoot, 'qatt-platform-qa'), { recursive: true })
+await writeFile(join(gitScanRoot, 'qatt-platform-qa', '.git'), 'gitdir: ../real/.git/worktrees/wt\n')
+await mkdir(join(gitScanRoot, 'real', '.git', 'worktrees', 'wt'), { recursive: true })
+await writeFile(join(gitScanRoot, 'real', '.git', 'worktrees', 'wt', 'HEAD'), 'ref: refs/heads/feat-x\n')
+await mkdir(join(gitScanRoot, 'node_modules', 'dep', '.git'), { recursive: true })
+await writeFile(join(gitScanRoot, 'node_modules', 'dep', '.git', 'HEAD'), 'ref: refs/heads/should-not-appear\n')
+await mkdir(join(gitScanRoot, '.hidden', '.git'), { recursive: true })
+await writeFile(join(gitScanRoot, '.hidden', '.git', 'HEAD'), 'ref: refs/heads/also-hidden\n')
+const scannedRepos = await scanGitReposUnder(gitScanRoot)
+await rm(gitScanRoot, { recursive: true, force: true })
+
+it('R3 scanGitReposUnder：两种 `.git` 形态都认；跳过依赖/隐藏目录与半截仓库', () => {
+  eq(
+    scannedRepos.map((repo) => repo.path),
+    ['', 'qatt-platform-qa'],
+    '根优先、再按名字序；node_modules/.hidden 不进候选，real（有 .git 没 HEAD）不当仓库',
+  )
+  eq(scannedRepos[0], { path: '', branch: 'master', detached: false }, '根仓库：读 `.git/HEAD`')
+  eq(
+    scannedRepos[1],
+    { path: 'qatt-platform-qa', branch: 'feat-x', detached: false },
+    '`.git` 是文件（worktree）⇒ 顺着 `gitdir:` 读到那个 HEAD',
+  )
+})
+
+const noGitDir = await mkdtemp(join(tmpdir(), 'ws-nogit-'))
+await mkdir(join(noGitDir, 'src'), { recursive: true })
+const noGitRepos = await scanGitReposUnder(noGitDir)
+const missingRepos = await scanGitReposUnder(join(tmpdir(), 'ws-does-not-exist-12345'))
+await rm(noGitDir, { recursive: true, force: true })
+
+it('R4 scanGitReposUnder：没有 git / 目录不存在 ⇒ 空数组（**不抛错** —— 面板不该因此报错）', () => {
+  eq(noGitRepos, [], '普通目录（只有 src/）')
+  eq(missingRepos, [], '目录不存在（新会话还没派过活）')
 })
 
 console.log('')

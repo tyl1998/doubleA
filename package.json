@@ -21,6 +21,7 @@
     "dev:stop": "bash infra/scripts/dev-stop.sh",
     "egress:up": "bash infra/scripts/egress-up.sh",
     "egress:down": "bash infra/scripts/egress-down.sh",
+    "egress:idle-smoke": "node infra/scripts/egress-idle-smoke.mjs",
     "relay:up": "bash infra/scripts/relay-up.sh",
     "relay:down": "bash infra/scripts/relay-down.sh",
     "dev:backend": "pnpm --filter @doubulea/backend dev",

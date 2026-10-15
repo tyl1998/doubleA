@@ -22,14 +22,17 @@ import { join } from 'node:path'
 
 import {
   AppError,
+  WORKSPACE_CONTENT_EVENT_TYPES,
   foldWorkspaceEvents,
   isWorkspaceTextMime,
   planWorkspaceRevert,
   workspaceMimeOf,
   type WorkspaceActor,
   type WorkspaceChangesResult,
+  type WorkspaceDeleteDirResult,
   type WorkspaceEventItem,
   type WorkspaceFileEntry,
+  type WorkspaceFileDiff,
   type WorkspaceFileRead,
   type WorkspaceRevertEntry,
   type WorkspaceRevertResult,
@@ -41,16 +44,19 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { putWorkspaceBlob, readWorkspaceBlob } from './blob.js'
 import { restoreWorkspaceFromCold, scheduleWorkspaceBlobBackup } from './cold.js'
+import { lineDiffWorkspace } from './diff.js'
 import { publishWorkspaceEventItem, toWorkspaceEventItem, workspaceEventCreateData } from './events.js'
 import { resolveWorkspacePath, workspaceDirOf } from './paths.js'
 import { readWorkspaceRoundWindow } from './round.js'
 import { ensureWorkspaceOwner } from '../sandbox/owner.js'
 import { decideWorkspaceQuota } from './quotaModel.js'
 import { isWorkspaceDependencyPath } from './dependencyModel.js'
+import { workspaceDirPrefix } from './dirModel.js'
 import {
   ensureWorkspaceDir,
   moveWorkspaceFile as fsMove,
   readWorkspaceBytes,
+  removeWorkspaceDir as fsRemoveDir,
   removeWorkspaceFile as fsRemove,
   workspaceContentIsBinary,
   workspaceDirIsEmpty,
@@ -273,11 +279,111 @@ export const WORKSPACE_EVENT_REPLAY_MAX = 500
  */
 export async function listWorkspaceChanges(conversationId: string, since?: string): Promise<WorkspaceChangesResult> {
   const rows = await getPrisma().workspaceEvent.findMany({
-    where: { conversationId, ...(since === undefined ? {} : { at: { gte: new Date(since) } }) },
+    where: {
+      conversationId,
+      // ★ 只认**内容事件**（`created`/`updated`/`deleted`/`renamed`；P1-20）：`claim`/`release`
+      //   是文件级软锁的取放，**不改变字节**。它们在折叠里会成为某条路径的"最新状态"，
+      //   把真正的 `updated` 顶掉 ⇒「最近变更」显示成一条中性的锁事件（看起来像"没改"）。
+      type: { in: [...WORKSPACE_CONTENT_EVENT_TYPES] },
+      ...(since === undefined ? {} : { at: { gte: new Date(since) } }),
+    },
     orderBy: { at: 'asc' },
     select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
   })
   return { items: foldWorkspaceEvents(rows.map(toWorkspaceEventItem)) }
+}
+
+/**
+ * 一个文件"旧版本 → 当前"的**行级差异**（P1-9 · 验收标记）。
+ *
+ * 旧字节走**历史字节存储**（`blob.ts`：覆盖 / 删除前自动存档，§七 5）；当前字节走宿主 FS。
+ * 基线缺省 = 当前版本的前一版（新建时 `null` = 整篇新增；软删墓碑取**保留的那个版本** = 整篇删除）。
+ *
+ * 二进制 / 无历史字节 / 超体积 ⇒ `available:false` + `message`，**不编造**差异。
+ *
+ * @param statsOnly `true` = 不回逐行内容（只给 `+N −M` 徽标用的计数）——「最近变更」每行一个徽标时用，
+ *        避免为一个列表把多份大文件的逐行差异都传回浏览器。
+ */
+export async function getWorkspaceFileDiff(
+  conversationId: string,
+  rawPath: unknown,
+  baseVersion: number | undefined,
+  statsOnly: boolean,
+): Promise<WorkspaceFileDiff> {
+  const handle = await ensureWorkspace(conversationId)
+  const { relative, absolute } = resolveWorkspacePath(handle.rootPath, rawPath)
+  const row = await findRow(conversationId, relative)
+  const currentDeleted = row === null || row.deletedAt !== null
+  const currentVersion = currentDeleted ? null : (row as FileRow).version
+
+  // 基线版本：
+  //   · 显式给了就用它；否则——当前存在 ⇒ 前一版（v1 = 新建，前一版为 null）；
+  //     当前是墓碑 ⇒ **保留的那个版本**（= 被删那一刻的内容，整篇都算删除）。
+  const base =
+    baseVersion ??
+    (row === null ? null : row.deletedAt !== null ? row.version : row.version > 1 ? row.version - 1 : null)
+
+  let oldText = ''
+  if (base !== null) {
+    const hash = await versionHashOf(conversationId, relative, base)
+    if (hash === null) {
+      return diffUnavailable(relative, base, currentVersion, `基线版本 v${base} 无索引（可能早于本功能）`)
+    }
+    const bytes = await readWorkspaceBlob(config.workspace.root, conversationId, hash)
+    if (bytes === null) {
+      return diffUnavailable(relative, base, currentVersion, `基线版本 v${base} 的字节缺失（冷备前的历史）`)
+    }
+    if (workspaceContentIsBinary(bytes)) {
+      return diffUnavailable(relative, base, currentVersion, '二进制文件不支持逐行差异')
+    }
+    oldText = bytes.toString('utf8')
+  }
+
+  let newText = ''
+  if (!currentDeleted) {
+    try {
+      const bytes = await readWorkspaceBytes(absolute)
+      if (workspaceContentIsBinary(bytes)) {
+        return diffUnavailable(relative, base, currentVersion, '二进制文件不支持逐行差异')
+      }
+      newText = bytes.toString('utf8')
+    } catch {
+      // 盘上读不到（刚被删 / 权限）⇒ 当作"当前为空"，不编造内容
+      newText = ''
+    }
+  }
+
+  const result = lineDiffWorkspace(oldText, newText)
+  return {
+    path: relative,
+    baseVersion: base,
+    currentVersion,
+    added: result.added,
+    removed: result.removed,
+    available: true,
+    ...(result.truncated ? { message: '文件较大，仅显示前部分差异' } : {}),
+    truncated: result.truncated,
+    ...(statsOnly ? {} : { lines: result.lines }),
+  }
+}
+
+/** 差异不可用时的统一形状（`available:false`；`lines` 省略） */
+function diffUnavailable(
+  path: string,
+  baseVersion: number | null,
+  currentVersion: number | null,
+  message: string,
+): WorkspaceFileDiff {
+  return {
+    path,
+    baseVersion,
+    currentVersion,
+    added: 0,
+    removed: 0,
+    available: false,
+    message,
+    truncated: false,
+  }
 }
 
 /** 撤销者身份（`SYSTEM` —— 它既不是 agent 也不是"此刻的人"，是平台代人执行的回退） */
@@ -603,6 +709,74 @@ export async function deleteWorkspaceFile(
   })
   publishWorkspaceEventItem(conversationId, event)
   return { path: relative }
+}
+
+/**
+ * 删除**文件夹（递归）**：把该目录下所有已索引文件一次软删（墓碑 + 各一条 `deleted` 事件），
+ * 再把目录整份落盘删除（含未索引的残留，如依赖目录 / `.git`）。空目录 / 不存在的目录按幂等成功回 `0`。
+ *
+ * ⚠️ **目录不是索引里的一行**（树由文件路径派生）：所以"删文件夹"= 挑出所有以 `dir/` 开头的
+ *    活文件路径，逐个走**与单文件删除同一套**处理（先存历史字节 → 落盘删 → 落墓碑 + 事件）。
+ * ⚠️ `headVersion` 按事件**条数**递增（N 条事件 ⇒ +N）—— 断线补发游标依赖这个恒等式（见 `events.ts`）。
+ * @throws AppError(VALIDATION) 路径非法 / 该路径其实是一个**文件**（该走单文件删除）
+ */
+export async function deleteWorkspaceDirectory(
+  conversationId: string,
+  rawPath: unknown,
+  author: WorkspaceWriteActor,
+): Promise<WorkspaceDeleteDirResult> {
+  const handle = await ensureWorkspace(conversationId)
+  const { relative, absolute } = resolveWorkspacePath(handle.rootPath, rawPath)
+
+  // 目标若是个文件 ⇒ 走错端点了（前端只对"目录行"提供本操作，见 `WorkspacePanel`）
+  if ((await workspaceFileSize(absolute)) !== undefined) {
+    throw AppError.validation('该路径是一个文件，请使用「删除文件」')
+  }
+
+  const prefix = workspaceDirPrefix(relative)
+  const rows = await getPrisma().workspaceFile.findMany({
+    where: { conversationId, deletedAt: null, path: { startsWith: prefix } },
+    orderBy: { path: 'asc' },
+    select: { path: true, version: true },
+  })
+
+  // 删前把每个文件的**当前内容**存进历史字节（撤销/还原用）—— 与单文件删除同口径
+  for (const row of rows) {
+    await stashCurrentFileIfAny(conversationId, join(handle.rootPath, row.path))
+  }
+  // 盘上整份删（含未索引残留，如依赖目录 / `.git`）；目录缺失时 no-op（幂等）
+  await fsRemoveDir(absolute)
+
+  if (rows.length === 0) return { path: relative, deleted: 0 }
+
+  const now = new Date()
+  const events = await getPrisma().$transaction(async (tx) => {
+    await tx.workspaceFile.updateMany({
+      where: { conversationId, deletedAt: null, path: { startsWith: prefix } },
+      data: { deletedAt: now, updatedBy: author.actor, updatedById: author.actorId ?? null },
+    })
+    const created: WorkspaceEventItem[] = []
+    for (const row of rows) {
+      const event = await tx.workspaceEvent.create({
+        data: workspaceEventCreateData({
+          conversationId,
+          type: 'deleted',
+          path: row.path,
+          version: row.version,
+          actor: author.actor,
+          actorId: author.actorId ?? null,
+          at: now,
+        }),
+        select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
+      })
+      created.push(toWorkspaceEventItem(event))
+    }
+    // ⚠️ headVersion = 事件条数：N 条事件 ⇒ +N（断线补发游标恒等式，见 `events.ts`）
+    await tx.workspace.updateMany({ where: { conversationId }, data: { headVersion: { increment: rows.length } } })
+    return created
+  })
+  for (const event of events) publishWorkspaceEventItem(conversationId, event)
+  return { path: relative, deleted: rows.length }
 }
 
 /** 改名 / 移动：落盘 `rename` + 索引**换路径**（保留版本号递增）+ `renamed` 事件（`path` = 新路径） */

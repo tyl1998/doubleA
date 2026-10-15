@@ -142,62 +142,69 @@ export const TOOLKIT_LAYER_VERSION = '8'
  *
  * 同 base/toolkit 的那条纪律：不 +1 ⇒ 宿主上留着旧 tag 的运行时镜像，会话选的运行时
  * **静默地**还是上一版（例如 python 运行时里没有 pip）。tag 形态 `<变体>-v<ver>`。
+ *
+ * ⚠️ **2026-10-15 起为 `3`**：运行时模型改为**"勾语言 + 填版本"**（不再枚举组件目录）——
+ *    `runtime/Dockerfile` 的 `COMPONENTS` 分派随之重写（node/python/go/java/rust 各走"任意版本"装法：
+ *    node/python 下载或 uv、go 从 go.dev、java 从 Adoptium、rust 用 rustup），新增 `install-{node,go,java,rust}-version.sh`
+ *    ⇒ 只读层内容变了。不 +1 的症状：宿主上留着 `-v2` 的旧镜像，选到新组合时后端按 tag 找不到 ⇒ 回退 toolkit
+ *    （"选了 python 3.12 却是空环境"）。
  */
-export const RUNTIME_LAYER_VERSION = '2'
+export const RUNTIME_LAYER_VERSION = '3'
 
 /**
- * **组件目录的构建侧镜像**（必须与 `shared/src/runtime.ts#SANDBOX_RUNTIME_COMPONENTS` **逐条一致**）。
+ * **语言顺序**（变体 id 里组件的排序键；必须与 `shared/src/runtime.ts#SANDBOX_RUNTIME_LANGUAGES` 一致）。
  *
- * ⚠️ 这是本仓第二处"同一份词汇写两遍"（第一处是 `shared` 与 Prisma 的枚举）—— 因为构建侧是 JS、
- *    后端/前端是 TS，无法直接共享。**两处不一致的症状**：后端算出的变体 id 与构建出的 tag 对不上
- *    ⇒"明明建了却说没有、反复重建"。加组件时**两处一起改**。
+ * ⚠️ 这是本仓"同一份词汇写两遍"的一处（构建侧是 JS、后端/前端是 TS，无法直接共享）。
+ *    **两处不一致的症状**：后端算出的变体 id 与构建出的 tag 对不上 ⇒"明明建了却说没有、反复重建"。
  *
- * 组件 id：`node22` / `python311` / `python310` / `python38` / `go` / `java17` / `rust`。
- * 变体 id = 组件 id 按 `LANGUAGE_ORDER` 排序后用 `-` 连接（空集合 = `none`）。
+ * ── 组件 id / 变体 id（2026-10-15：不再枚举版本，改为"语言 + 版本"）──────────────
+ *   · **组件 id** = `语言 + 版本`（无分隔符，版本保留 `.`），如 `python3.12` / `node20` / `go1.22`；
+ *     语言名之间互不为前缀 ⇒ 可由 id 反解回 `{ language, version }`（见 {@link parseComponentId}）。
+ *   · **变体 id** = 组件 id 按 `RUNTIME_LANGUAGE_ORDER` 排序、用 `-` 连接（空集合 = `none`），
+ *     如 `node20-python3.12`；镜像 tag = `<变体>-v<层版本>`。
+ *   · ⚠️ 版本里不能含 `-`（会与变体分隔符冲突）。
  */
 const RUNTIME_LANGUAGE_ORDER = ['node', 'python', 'go', 'java', 'rust']
-export const RUNTIME_COMPONENTS = [
-  { language: 'node', version: '22', id: 'node22' },
-  { language: 'python', version: '3.11', id: 'python311' },
-  { language: 'python', version: '3.10', id: 'python310' },
-  { language: 'python', version: '3.8', id: 'python38' },
-  { language: 'go', version: 'default', id: 'go' },
-  { language: 'java', version: '17', id: 'java17' },
-  { language: 'rust', version: 'default', id: 'rust' },
-]
 
 /**
- * `pnpm sandbox:build` **默认预构建**的变体（常用组合；不是"白名单"，按需构建仍可建任意组合）。
+ * `pnpm sandbox:build` **默认预构建**的变体（常用组合；**不是白名单**，按需构建可建任意 `语言=版本`）。
  * 顺序即构建顺序。`none` = 空集合（只有 toolkit）。
+ *
+ * ⚠️ 默认全建会逐份下载语言运行时（node/python/go/java 联网），较慢 ⇒ 日常用
+ *    `--runtime <variant[,variant]>` 只建改过的那几份（`--runtime` 现在接受**任意**可解析的变体 id）。
  */
 export const SANDBOX_RUNTIMES = [
   'none',
   'node22',
-  'python311',
-  'go',
+  'node20',
+  'python3.11',
+  'python3.12',
+  'python3.10',
+  'go1.22',
   'java17',
-  'rust',
-  'python310',
-  'python38',
-  'node22-python310',
-  'node22-python38',
+  'ruststable',
+  'node22-python3.10',
+  'node20-python3.12',
 ]
 
-/** 组件 id → 目录项（构建侧解析变体用） */
-const COMPONENT_BY_ID = new Map(RUNTIME_COMPONENTS.map((component) => [component.id, component]))
+/** 组件 id（`语言+版本`）→ `{ language, version }`；认不出语言前缀 ⇒ 抛 */
+export function parseComponentId(id) {
+  for (const language of RUNTIME_LANGUAGE_ORDER) {
+    if (!id.startsWith(language)) continue
+    const version = id.slice(language.length)
+    if (version !== '') return { language, version }
+  }
+  throw new Error(`无法识别的运行时组件 id：${id}（应为 语言+版本，如 python3.12）`)
+}
 
 /**
  * 变体 id → 给 `runtime/Dockerfile` 的 `COMPONENTS` 串（`lang=ver,…`，按语言顺序）。
- * `none` / 空 ⇒ `''`（不装语言运行时）。含未知 id ⇒ 抛（构建侧宁可红，也别烤出一个空壳）。
+ * `none` / 空 ⇒ `''`（不装语言运行时）。含无法反解的片段 ⇒ 抛（构建侧宁可红，也别烤出一个空壳）。
  */
 export function variantToComponentsArg(variant) {
   if (variant === '' || variant === 'none') return ''
-  const ids = variant.split('-').filter((piece) => piece !== '')
-  const components = ids.map((id) => {
-    const component = COMPONENT_BY_ID.get(id)
-    if (component === undefined) throw new Error(`未知的运行时组件 id：${id}（变体 ${variant}）`)
-    return component
-  })
+  const pieces = variant.split('-').filter((piece) => piece !== '')
+  const components = pieces.map(parseComponentId)
   components.sort((a, b) => RUNTIME_LANGUAGE_ORDER.indexOf(a.language) - RUNTIME_LANGUAGE_ORDER.indexOf(b.language))
   return components.map((component) => `${component.language}=${component.version}`).join(',')
 }

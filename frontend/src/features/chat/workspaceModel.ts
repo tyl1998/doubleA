@@ -13,9 +13,11 @@ import {
   WORKSPACE_CONTENT_EVENT_TYPES,
   isWorkspaceTextMime,
   isWorkspaceHiddenPath,
+  type WorkspaceChangeEntry,
   type WorkspaceEventItem,
   type WorkspaceFileEntry,
   type WorkspaceFileRead,
+  type WorkspaceRevertAction,
   type WorkspaceRevertResult,
 } from '@doubulea/shared'
 
@@ -217,6 +219,23 @@ export function toggleExpandedDir(expanded: readonly string[], path: string): st
   return expanded.includes(path) ? expanded.filter((item) => item !== path) : [...expanded, path]
 }
 
+/**
+ * 把一批目录并进"已展开"集合（去重、保持既有顺序、新目录追加到末尾）—— 纯函数，给 store 用。
+ *
+ * 用于"agent 改了某个文件 ⇒ 自动展开它所在的目录"（`WorkspacePanel` 的 SSE 处理里调）：
+ * 文件树默认全部折叠，不展开就看不见深处的新文件。已在集合里的目录**不动**（不重排，稳定）。
+ */
+export function unionExpandedDirs(existing: readonly string[], paths: readonly string[]): string[] {
+  const seen = new Set(existing)
+  const out = [...existing]
+  for (const path of paths) {
+    if (path === '' || seen.has(path)) continue
+    seen.add(path)
+    out.push(path)
+  }
+  return out
+}
+
 /** 文件树里按名字取末段（标签文字用） */
 export function workspaceBaseName(path: string): string {
   const segments = path.split('/')
@@ -227,6 +246,70 @@ export function workspaceBaseName(path: string): string {
 export function workspaceParentDir(path: string): string {
   const index = path.lastIndexOf('/')
   return index === -1 ? '' : path.slice(0, index)
+}
+
+/**
+ * 容器内的工作区挂载点（`/work`）—— 工作区绝对路径的**根**。
+ *
+ * ⚠️ 这是**容器里**的路径，不是宿主路径：它正是 agent 看到的那个（`bash` / 编辑器 / 我写的代码
+ * 都在 `/work/<相对路径>`），而且与部署无关 —— 宿主路径随机器而变，复制出去对谁都不可用。
+ * （挂载点由 `backend/src/sandbox/spec.ts` 的 bind mount 决定；两处是同一件事的两种说法。）
+ */
+export const WORKSPACE_CONTAINER_ROOT = '/work'
+
+/** 右键「复制」的三种口径（见 {@link workspaceCopyValue}） */
+export type WorkspaceCopyKind = 'relative' | 'absolute' | 'name'
+
+/**
+ * 右键「复制」要写进剪贴板的那条字符串（**纯函数**）。
+ *
+ *   · `relative` ⇒ `Demo/debug/debug_demo.py`（工作区相对路径，唯一无歧义的那种）
+ *   · `absolute` ⇒ `/work/Demo/debug/debug_demo.py`（容器内绝对路径；见 {@link WORKSPACE_CONTAINER_ROOT}）
+ *   · `name`     ⇒ `debug_demo.py`（末段名字；文件与目录同款）
+ */
+export function workspaceCopyValue(kind: WorkspaceCopyKind, path: string): string {
+  if (kind === 'name') return workspaceBaseName(path)
+  if (kind === 'absolute') return `${WORKSPACE_CONTAINER_ROOT}/${path}`
+  return path
+}
+
+/**
+ * 菜单里三种口径的文案（与 {@link workspaceCopyValue} **一一对应**，顺序也用这一份 ——
+ * 免得"菜单写着一套、复制出来另一套"这种只有用户点了才知道的错位）。
+ */
+export const WORKSPACE_COPY_ITEMS: readonly { key: WorkspaceCopyKind; label: string }[] = [
+  { key: 'relative', label: '相对路径' },
+  { key: 'absolute', label: `绝对路径（${WORKSPACE_CONTAINER_ROOT}）` },
+  { key: 'name', label: '名称' },
+]
+
+/**
+ * git 分支 chip 上显示的文本（**纯函数**）。
+ *
+ * 分支名直显；detached HEAD 时 `branch` 里装的是短 SHA ⇒ 显成 `detached@<短SHA>`（一眼看出不是分支）；
+ * `branch === null`（HEAD 形状不认识 / 读不到）⇒ `未知分支`，**不猜**。
+ */
+export function workspaceGitChipLabel(repo: { branch: string | null; detached: boolean }): string {
+  if (repo.branch === null) return '未知分支'
+  return repo.detached ? `detached@${repo.branch}` : repo.branch
+}
+
+/** git chip 的 `title`（鼠标悬停的完整口径：仓库位置 + detached 说明） */
+export function workspaceGitChipTitle(repo: { path: string; branch: string | null; detached: boolean }): string {
+  const where = repo.path === '' ? '工作区根' : repo.path
+  const what = workspaceGitChipLabel(repo)
+  return repo.detached ? `${where} · ${what}（detached HEAD，不在任何分支上）` : `${where} · 当前分支 ${what}`
+}
+
+/**
+ * `path` 是否落在目录 `dir` **之下**（含任意深）—— 删除文件夹时用它筛"该关掉哪些标签 / 清哪些草稿"。
+ *
+ * ⚠️ 尾斜杠是判据的关键：`'out'` 只匹配 `'out/…'`，不误伤同前缀的 `'outsider.txt'` / `'out2/x'`。
+ *   （后端同一判据在 `backend/src/workspace/dirModel.ts`，两处口径一致。）
+ */
+export function isWorkspacePathInDir(path: string, dir: string): boolean {
+  const prefix = dir.endsWith('/') ? dir : `${dir}/`
+  return path.startsWith(prefix)
 }
 
 /**
@@ -426,6 +509,77 @@ export function changeTagColor(type: string): string {
     default:
       return 'default'
   }
+}
+
+/**
+ * 一条文件路径的**所有祖先目录**（`a/b/c.ts` ⇒ `['a', 'a/b']`；根层文件 ⇒ `[]`）。
+ *
+ * 给"agent 改了某个文件 ⇒ 自动展开它所在的目录"用：文件树**默认全部折叠**（`WorkspaceTree`），
+ * 于是 agent 深处的改动不展开就看不见（用户反馈："agent 新增/编辑过的文件没有展示"）。纯函数。
+ */
+export function workspaceAncestorDirs(path: string): string[] {
+  const segments = path.split('/')
+  const dirs: string[] = []
+  let prefix = ''
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index] ?? ''
+    prefix = prefix === '' ? segment : `${prefix}/${segment}`
+    dirs.push(prefix)
+  }
+  return dirs
+}
+
+/**
+ * 把**服务端变更集**（刷新 / 初次进入会话时拉的那份，已是"按路径折叠后的最新状态"）与
+ * **实时 SSE 事件**合并成展示用的「最近变更」清单（**纯函数**，前后端同用 `foldWorkspaceEvents` 的口径）。
+ *
+ * 口径：
+ *   · 同一路径只留**最后一条**（`at` 最大；`at` 相同以实时事件胜）；
+ *   · **只认内容事件**（`created`/`updated`/`deleted`/`renamed`）—— `claim`/`release` 不改变字节，
+ *     混进来会把真正的改动顶掉（看起来像"改的是锁、不是文件"）；
+ *   · 结果按 `at` 倒序（最近动的在前）。
+ *
+ * ⚠️ 为什么要有它：面板原来**只**累积实时 SSE 事件 ⇒ 刷新 / 刚进会话时列表是空的
+ * （服务端那份变更集从未被拉取），于是"最近变更"看起来永远不出现。
+ */
+export function mergeWorkspaceChanges(
+  serverChanges: readonly WorkspaceChangeEntry[],
+  liveEvents: readonly WorkspaceEventItem[],
+): WorkspaceChangeEntry[] {
+  const byPath = new Map<string, WorkspaceChangeEntry>()
+  for (const change of serverChanges) {
+    if (!isContentEvent(change)) continue
+    byPath.set(change.path, change)
+  }
+  for (const event of liveEvents) {
+    if (!isContentEvent(event)) continue
+    const current = byPath.get(event.path)
+    if (current === undefined || event.at >= current.at) {
+      byPath.set(event.path, {
+        path: event.path,
+        type: event.type,
+        version: event.version,
+        actor: event.actor,
+        actorId: event.actorId,
+        at: event.at,
+      })
+    }
+  }
+  return [...byPath.values()].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+}
+
+/** 撤销落点动作 → 人读文案（「撤销本轮」报告用；纯展示） */
+const REVERT_ACTION_LABELS: Record<WorkspaceRevertAction, string> = {
+  restored: '已还原',
+  deleted: '已删除',
+  skipped: '跳过',
+  conflict: '冲突',
+  unavailable: '缺历史',
+  unsupported: '不支持',
+}
+
+export function revertActionLabel(action: WorkspaceRevertAction): string {
+  return REVERT_ACTION_LABELS[action]
 }
 
 /**

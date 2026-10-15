@@ -845,7 +845,7 @@ await it('I6 确认应答走 `POST /:id/confirm`，且**收卡**由 store 的一
   const store = sourceFiles().find(({ name }) => name === 'stores/chatStream.ts')
   assertIncludes(store.source, 'clearConfirm', 'store 上要有收卡的动作（服务端不会为此发事件）')
   const page = sourceFiles().find(({ name }) => name === 'pages/chat/ChatPage.tsx')
-  assertIncludes(page.source, 'clearConfirm()', '页面在答复之后必须调它')
+  assertIncludes(page.source, 'clearConfirm(', '页面在答复之后必须调它')
 })
 
 await it('I7 工具卡的「去配置凭据」用**那一个**路径构造点（不手拼字符串）', () => {

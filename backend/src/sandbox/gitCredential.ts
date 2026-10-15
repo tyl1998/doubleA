@@ -28,7 +28,7 @@
  * 这样"挑哪条凭据 / 回什么形状"能在不连库、不连 Docker 的情况下逐条自证。
  */
 
-import type { GitCredentialKind, GitCredentialSecretInput } from '@doubulea/shared'
+import { gitIdentityConfigEntries, type GitCredentialKind, type GitCredentialSecretInput, type GitIdentity } from '@doubulea/shared'
 
 /** 一条**解密后**的凭据（明文只在本进程内存里出现；唯一出口是 `decryptUserGitCredentials`） */
 export interface GitCredentialPlain {
@@ -67,19 +67,31 @@ export const GIT_SSH_HELPER_PATH = '/opt/sandbox-git/git-ssh-doubulea.mjs'
  *     helper —— 否则镜像/系统里若有别的 helper 会先跑、并且可能弹提示；
  *   · `GIT_SSH_COMMAND` 指向 SSH 包装器（无 SSH 凭据时它原样 exec `ssh`，行为不变）。
  *
- * ⚠️ 这一份 env **每次建容器都原样注入**（与"该用户有没有配凭据"无关）：凭据是**运行期**由 helper
- *    回调取回的 ⇒ 用户后来新配/改了凭据，**不用重建容器**就能生效（这正是"按需拉取"的收益）。
+ * ★ P1-20：`identity`（用户级 git 提交身份）**也走这张 `GIT_CONFIG_*` 表**（`user.name`/`user.email`），
+ *   于是容器里 `git commit` 直接署上正确的人、agent 不必自己猜、也不必写仓库本地 config。
+ *   ⚠️ **必须与凭据 helper 在同一处拼装**：`GIT_CONFIG_COUNT`+`KEY_i/VALUE_i` 是一张**扁平**表，
+ *   分成两份 env 去 spread 会互相覆盖 `GIT_CONFIG_COUNT`（只生效一份）。
+ *
+ * ⚠️ 这一份 env **每次建容器都原样注入**（与"该用户有没有配凭据/身份"无关）：凭据是**运行期**由
+ *     helper 回调取回的 ⇒ 用户后来新配/改了凭据，**不用重建容器**就能生效（这正是"按需拉取"的收益）。
+ *     身份是公开信息、随 env 定死，改了身份要等下次重建容器（可接受：改署名不常见）。
  */
-export function gitCredentialHelperEnv(): Record<string, string> {
-  return {
+export function gitCredentialHelperEnv(identity: GitIdentity = { name: null, email: null }): Record<string, string> {
+  const entries = [
+    { key: 'credential.helper', value: '' },
+    { key: 'credential.helper', value: GIT_CREDENTIAL_HELPER_PATH },
+    ...gitIdentityConfigEntries(identity),
+  ]
+  const env: Record<string, string> = {
     GIT_TERMINAL_PROMPT: '0',
-    GIT_CONFIG_COUNT: '2',
-    GIT_CONFIG_KEY_0: 'credential.helper',
-    GIT_CONFIG_VALUE_0: '',
-    GIT_CONFIG_KEY_1: 'credential.helper',
-    GIT_CONFIG_VALUE_1: GIT_CREDENTIAL_HELPER_PATH,
+    GIT_CONFIG_COUNT: String(entries.length),
     GIT_SSH_COMMAND: GIT_SSH_HELPER_PATH,
   }
+  entries.forEach((entry, index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = entry.key
+    env[`GIT_CONFIG_VALUE_${index}`] = entry.value
+  })
+  return env
 }
 
 // ───────────────────────── 挑选凭据（纯判据）─────────────────────────

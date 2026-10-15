@@ -156,7 +156,7 @@ const conv = (patch) => ({
 })
 
 it('B1 视图带上智能体快照（跨智能体列表靠它一屏分清"这条是谁的"）', () => {
-  const view = conversationItemView(conv({ agentName: '周报生成', agentType: 'TASK_AGENT' }), NOW, null)
+  const view = conversationItemView(conv({ agentName: '周报生成', agentType: 'TASK_AGENT' }), NOW, new Set())
   eq(view.agentId, 'agent-1', 'agentId 快照')
   eq(view.agentName, '周报生成', 'agentName 快照（Agent 软删后仍有）')
   eq(view.agentType, 'TASK_AGENT', 'agentType 快照')
@@ -168,7 +168,7 @@ it('B2 分组契约不变：拼接各组 = 入参原序（一列都不动）', (
     conv({ id: 'today', lastMessageAt: '2026-10-12T12:00:00', agentId: 'a3' }),
     conv({ id: 'earlier', lastMessageAt: '2026-10-10T11:02:00', agentId: 'a4' }),
   ]
-  const groups = groupConversationViews(list, NOW, 'today')
+  const groups = groupConversationViews(list, NOW, new Set(['today']))
   const flat = groups.flatMap((group) => group.items.map((item) => item.id))
   eq(flat.join('|'), list.map((item) => item.id).join('|'), '拼接顺序 = 入参顺序')
   eq(groups[0].label, '今天', '第一组是今天')
@@ -361,7 +361,7 @@ it('F8 新会话态开 Code 模式：第三列 = 空工作区占位（不回落�
   const chatPage = read('../src/pages/chat/ChatPage.tsx')
   // 新会话态（conversationId 尚未生成）第三列必须是工作区占位，而不是 ArtifactPanel
   includes(chatPage, 'WorkspacePanelPlaceholder', 'ChatPage 引用空工作区占位组件')
-  includes(chatPage, '<WorkspacePanelPlaceholder />', '新会话态渲染空工作区占位')
+  includes(chatPage, '<WorkspacePanelPlaceholder', '新会话态渲染空工作区占位')
   // 占位与真面板同壳：`.ws` + 标题「工作区」+ 空态说明
   const panel = read('../src/features/chat/WorkspacePanel.tsx')
   includes(panel, 'export function WorkspacePanelPlaceholder', '导出 WorkspacePanelPlaceholder')
@@ -373,7 +373,11 @@ it('F9 非 Code 的产物面板可收起 / 展开（第三列开关）', () => {
   const chatPage = read('../src/pages/chat/ChatPage.tsx')
   // 收起时摘掉 `chat--with-panel`（消息流占满整宽）；第三列渲染由 panelVisible 决定
   includes(chatPage, 'panelOpen', 'ChatPage 持有产物面板展开态')
-  includes(chatPage, 'const panelVisible = showPanel && panelOpen', '第三列可见性 = showPanel ∩ panelOpen')
+  includes(
+    chatPage,
+    'const panelVisible = showPanel && (codeMode || panelOpen)',
+    '第三列可见性 = showPanel ∩ (codeMode ∪ panelOpen)',
+  )
   includes(chatPage, "panelVisible ? ' chat--with-panel'", '收起时摘掉 chat--with-panel')
   includes(chatPage, 'onTogglePanel={setPanelOpen}', '把开关接到会话控件')
   const settings = read('../src/features/chat/ConversationSettings.tsx')

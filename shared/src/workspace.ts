@@ -156,12 +156,41 @@ export type WorkspaceFileEntry = z.infer<typeof workspaceFileEntrySchema>
  *
  * ⚠️ **目录不单独作为行**（DB 索引里只有文件）：前端从 `path` 的 `/` 段自建目录层级 ——
  * 空目录在工作区模型里不存在（与 git 一致：一个没有文件的目录不是"内容"）。
- * 也不分页：`WORKSPACE_MAX_FILES`（默认 2000）就是单会话上界，一次给全量比翻页更省事。
+ * 也不分页：`WORKSPACE_MAX_FILES`（默认 20000）就是单会话上界，一次给全量比翻页更省事。
  */
 export const workspaceTreeResultSchema = z.object({
   items: z.array(workspaceFileEntrySchema),
 })
 export type WorkspaceTreeResult = z.infer<typeof workspaceTreeResultSchema>
+
+/**
+ * 工作区里的**一个 git 仓库**（`GET /api/conversations/:id/workspace/git` 的 `repos[]`）。
+ *
+ * 为什么要有：工作区里 clone 下来的项目，用户第一眼想知道的往往是"我现在在哪个分支"。
+ * 判据只读仓库自己的 `.git/HEAD`（**不调 git 二进制** —— 宿主上不保证有，且没必要），
+ * 所以这里只给"分支名"，不给 ahead/behind / 脏不脏（那些要跑 git；留待需要时再说）。
+ */
+export const workspaceGitRepoSchema = z.object({
+  /** 仓库根**相对工作区**的路径（`''` = 工作区根就是仓库；否则如 `qatt-platform-qa`） */
+  path: z.string(),
+  /**
+   * 当前分支名（如 `master`）；**detached HEAD** 时给短 SHA（7 位）；
+   * `.git/HEAD` 读不到 / 形状不认识时 `null`（前端按"未知"显示，不猜）。
+   */
+  branch: z.string().nullable(),
+  /** 是否处于 detached HEAD（`branch` 那一栏装的是短 SHA） */
+  detached: z.boolean(),
+})
+export type WorkspaceGitRepo = z.infer<typeof workspaceGitRepoSchema>
+
+/**
+ * 工作区 git 概况（`repos` 按"工作区根 → 一层子目录"的顺序，**空数组 = 这个工作区没有 git**）。
+ * 只探两层：`/work` 里的常见形态就两种 —— 根是仓库，或 clone 到某个子目录（如 `qatt-platform-qa/`）。
+ */
+export const workspaceGitResultSchema = z.object({
+  repos: z.array(workspaceGitRepoSchema),
+})
+export type WorkspaceGitResult = z.infer<typeof workspaceGitResultSchema>
 
 /**
  * 读文件（`GET /api/conversations/:id/workspace/file?path=`）。
@@ -210,6 +239,21 @@ export type WorkspaceMoveBody = z.infer<typeof workspaceMoveBodySchema>
 /** 路径查询参数（读 / 写 / 删共用：`?path=out/report.csv`） */
 export const workspacePathQuerySchema = z.object({ path: workspacePathSchema })
 export type WorkspacePathQuery = z.infer<typeof workspacePathQuerySchema>
+
+/**
+ * 删除文件夹（`DELETE /api/conversations/:id/workspace/dir?path=`）的结果。
+ *
+ * 语义 = **递归删除该目录下的所有已索引文件**：逐个软删（墓碑）+ 各落一条 `deleted` 事件，
+ * 再把目录整份落盘删除（含未索引的残留，如依赖目录）。空目录 / 命中 0 个也按幂等成功回 `0`。
+ *
+ * ⚠️ 与单文件删除同族：**删前把每个文件的当前内容存进历史字节**（保留期内仍可在历史里找回）。
+ */
+export const workspaceDeleteDirResultSchema = z.object({
+  path: z.string(),
+  /** 实际软删（转墓碑）的文件数；目录为空 / 不存在时为 `0` */
+  deleted: z.number().int().min(0),
+})
+export type WorkspaceDeleteDirResult = z.infer<typeof workspaceDeleteDirResultSchema>
 
 // ═════════════════════════════ 事件 schema（SSE 断线补发 + 审计） ═════════════════════════════
 
@@ -272,6 +316,101 @@ export const workspaceChangesQuerySchema = z.object({
   since: z.string().datetime({ offset: true }).optional(),
 })
 export type WorkspaceChangesQuery = z.infer<typeof workspaceChangesQuerySchema>
+
+// ═════════════════════════════ 文件差异（P1-9 · 验收标记） ═════════════════════════════
+
+/**
+ * 逐行差异的一行。
+ *   · `context` = 未变的行（两侧都有行号）；
+ *   · `add` = 新增行（只有新行号）；`del` = 删除行（只有旧行号）；
+ *   · `gap` = **被折叠的一长段未变行**（`gap` 记行数）—— 让长文件里"改在末尾"也能一眼看到改动。
+ */
+export const WORKSPACE_DIFF_LINE_TYPES = ['context', 'add', 'del', 'gap'] as const
+export type WorkspaceDiffLineType = (typeof WORKSPACE_DIFF_LINE_TYPES)[number]
+
+export const workspaceDiffLineSchema = z.object({
+  type: z.enum(WORKSPACE_DIFF_LINE_TYPES),
+  /** 旧文件行号（1-based）；`add` / `gap` 为 `null` */
+  oldLine: z.number().int().min(1).nullable(),
+  /** 新文件行号（1-based）；`del` / `gap` 为 `null` */
+  newLine: z.number().int().min(1).nullable(),
+  /** 行文本（`gap` 时为空串） */
+  text: z.string(),
+  /** 仅 `gap`：被折叠的未变行数 */
+  gap: z.number().int().min(0).optional(),
+})
+export type WorkspaceDiffLine = z.infer<typeof workspaceDiffLineSchema>
+
+/**
+ * 一个文件"旧版本 → 当前"的行级差异（P1-9 · 验收）。
+ *
+ * 旧字节来自**历史字节存储**（`workspace/blob.ts`，覆盖/删除前自动存档）；当前字节来自宿主 FS。
+ * 二进制 / 缺历史字节 / 超体积时 `available:false` 且 `lines` 为空，`message` 给一句人话原因。
+ */
+export const workspaceFileDiffSchema = z.object({
+  path: z.string(),
+  /** 对比的基线版本；`null` = 该文件在基线时不存在（= 新建，整篇都是新增） */
+  baseVersion: z.number().int().min(1).nullable(),
+  /** 当前版本；`null` = 当前已删除 / 不存在（整篇都是删除） */
+  currentVersion: z.number().int().min(1).nullable(),
+  /** 新增 / 删除行数（用于列表徽标 `+N −M`） */
+  added: z.number().int().min(0),
+  removed: z.number().int().min(0),
+  /** 能否给出逐行差异（二进制 / 无历史字节时为 `false`） */
+  available: z.boolean(),
+  /** 不可用时的一句人话原因（`available:false` 才有） */
+  message: z.string().optional(),
+  /** 逐行差异因超上限被截断（`added`/`removed` 仍是完整计数） */
+  truncated: z.boolean(),
+  /** 逐行差异；`?stats=1` 时**省略**（只取徽标计数，不传逐行内容） */
+  lines: z.array(workspaceDiffLineSchema).optional(),
+})
+export type WorkspaceFileDiff = z.infer<typeof workspaceFileDiffSchema>
+
+/** 文件差异查询（`GET .../workspace/file/diff?path=…&baseVersion=…&stats=1`） */
+export const workspaceFileDiffQuerySchema = z.object({
+  path: z.string().min(1),
+  /** 显式指定基线版本；缺省 = 当前版本的前一版（新建时为 `null`） */
+  baseVersion: z.coerce.number().int().min(1).optional(),
+  /** `1` = 只回计数（徽标用），不返回逐行差异 */
+  stats: z.coerce.number().int().optional(),
+})
+export type WorkspaceFileDiffQuery = z.infer<typeof workspaceFileDiffQuerySchema>
+
+/**
+ * 把"旧 → 新"的逐行差异**折叠长段未变行**（纯函数，前后端共用）。
+ *
+ * ⚠️ 后端在 `workspace/diff.ts` 里已有等价实现（它产出带行号的序列）；本函数只负责把**已有的
+ * `context` 长段**折成 `context(3) + gap + context(3)`，便于渲染端与回归脚本共用同一口径。
+ */
+export function collapseWorkspaceDiffContext(
+  lines: readonly WorkspaceDiffLine[],
+  contextLines = 3,
+): WorkspaceDiffLine[] {
+  const out: WorkspaceDiffLine[] = []
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (line === undefined) break
+    if (line.type !== 'context') {
+      out.push(line)
+      index += 1
+      continue
+    }
+    let end = index
+    while (end < lines.length && lines[end]?.type === 'context') end += 1
+    const run = end - index
+    if (run <= contextLines * 2 + 1) {
+      for (let cursor = index; cursor < end; cursor += 1) out.push(lines[cursor] as WorkspaceDiffLine)
+    } else {
+      for (let cursor = index; cursor < index + contextLines; cursor += 1) out.push(lines[cursor] as WorkspaceDiffLine)
+      out.push({ type: 'gap', oldLine: null, newLine: null, text: '', gap: run - contextLines * 2 })
+      for (let cursor = end - contextLines; cursor < end; cursor += 1) out.push(lines[cursor] as WorkspaceDiffLine)
+    }
+    index = end
+  }
+  return out
+}
 
 /**
  * 把一串工作区事件**按路径折叠**成变更集（**纯函数，前后端共用**）。

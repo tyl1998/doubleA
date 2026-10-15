@@ -7,13 +7,15 @@
 #   症状就是"派活时模型写 `npm test` → 失败 → 一条含糊的引擎 stderr"（前端看不到）。
 #
 # 【参数】$1 = COMPONENTS（`lang=ver,lang=ver,…`，与 Dockerfile 的 build-arg 同形）
-#   空 = 不装语言运行时（只有 toolkit），仅做公共自检 + 负向断言"没有 pip"。
+#   空 = 不装语言运行时（只有 toolkit），仅做公共自检。
+#   ⚠️ node / python 有 base/toolkit 自带的固定版本 ⇒ 非自带版本用带版本号的命令名（`node20` / `python3.12`）；
+#      go / java / rust 在本层独占 ⇒ 用系统命令名（`go` / `java` / `rustc`）。
 #
 # 【跑在什么身份下】runtime/Dockerfile 里是 `USER agent` 之后才跑它 —— 顺带验非 root 可用。
 #
 # 【在活容器里怎么重跑】
 #   docker run --rm -it --entrypoint /opt/sandbox-runtime-selfcheck.sh \
-#     doubulea/sandbox-runtime:python=3.10,node=22-v2 'python=3.10,node=22'
+#     doubulea/sandbox-runtime:node20-python312-v3 'node=20,python=3.12'
 # =====================================================================
 
 set -uo pipefail
@@ -55,8 +57,15 @@ else
     ver="${component#*=}"
     case "${lang}" in
       node)
-        check "node 可跑（${component}）" bash -c 'node --version'
-        check "npm 可跑（${component}）" bash -c 'npm --version'
+        if [ "${ver}" = "22" ]; then
+          # 22 = base 自带（系统 node/npm）
+          check "node 可跑（${component}）" bash -c 'node --version'
+          check "npm 可跑（${component}）" bash -c 'npm --version'
+        else
+          # 18 / 20 = install-node-version.sh 装的版本化发行版，命令名带版本号
+          check "node${ver} 可跑（${component}）" bash -c "node${ver} --version"
+          check "npm${ver} 可跑（${component}）" bash -c "npm${ver} --version"
+        fi
         ;;
       python)
         if [ "${ver}" = "3.11" ]; then
@@ -68,6 +77,7 @@ else
         fi
         ;;
       go)
+        # go 在本层独占 ⇒ 系统命令名（install-go-version.sh 装的）
         check "go 可跑（${component}）" bash -c 'go version'
         ;;
       java)

@@ -153,6 +153,14 @@ export interface StreamRound {
    * `delta` / `thinking` / `tool_call` 一到达就清掉（真实进度已经可见）。
    */
   statusText: string | null
+  /**
+   * 本轮**投递给运行中 agent 的用户插话**（`steer` 事件，P1-9 · P4 · R1；P1-20 起发帧）。
+   *
+   * ⚠️ 存在的唯一理由：**让插话在聊天界面看得见**。产品反馈："插话发出去后 agent 像收到了，
+   * 但聊天界面看不到这条插话（像丢消息）"。每条插话在消息流里渲染成一条用户气泡
+   * （见 `roundToViews`），于是"我插了这句话"与 agent 的后续回答对得上。
+   */
+  interjections: { text: string; at: string }[]
 }
 
 /** 开一轮（用户按下发送、且流已经成功建立时调用） */
@@ -178,12 +186,28 @@ export function beginRound(
     confirm: null,
     queuedPosition: null,
     statusText: null,
+    interjections: [],
   }
 }
 
 /** 是否已经收口（`done` / `error` 都算）—— 收口后不再接受内容事件 */
 export function isSettled(round: StreamRound): boolean {
   return round.status !== 'streaming'
+}
+
+/**
+ * 往这一轮追加一条**用户插话**（P1-20）。**按正文去重**：前端在 `POST /:id/steer` 成功后**乐观**
+ * 插入一条，稍后出口层（若那一轮真的轮询到了）再回一帧 `steer` —— 两者是同一条，别显示两遍。
+ *
+ * ⚠️ 为什么要有**乐观**插入这条路：出口层那一帧依赖"通道轮询在轮次结束前取到插话"。插话常常
+ *    就发生在最后一两秒（用户看着回答快完了才补一句），轮询还没到点、这一轮就结束了 ⇒
+ *    `clearSteerSignal` 把积压清掉 ⇒ 既没投给模型、也没发帧 ⇒ 界面上"插话直接消失了"。
+ *    所以**展示以本地为准**（用户说过的话一定要看得见），出口层那一帧只当"确认送达"的第二次来源。
+ */
+export function withInterjection(round: StreamRound, item: { text: string; at: string }): StreamRound {
+  if (isSettled(round)) return round
+  if (round.interjections.some((existing) => existing.text === item.text)) return round
+  return { ...round, interjections: [...round.interjections, item] }
 }
 
 /**
@@ -240,6 +264,19 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
       return { ...round, statusText: null, assistant: { ...round.assistant, tools } }
     }
 
+    case 'tool_output': {
+      // 工具**执行中**的输出快照（覆盖语义）：按 `callId` 找到那张卡、**整体替换**实时输出。
+      // ⚠️ 找不到卡就**忽略**（不为它凭空造一张没有名字/状态的卡）——正常情况下 start 那帧先到。
+      // ⚠️ 不落库、不进历史（`liveOutput` 是流式专有字段）；终态帧到达后用权威 `output` 覆盖显示。
+      const index = round.assistant.tools.findIndex((tool) => tool.callId === event.data.callId)
+      if (index === -1) return round
+      const previous = round.assistant.tools[index]
+      if (previous === undefined) return round
+      const tools = [...round.assistant.tools]
+      tools[index] = { ...previous, liveOutput: event.data.text }
+      return { ...round, assistant: { ...round.assistant, tools } }
+    }
+
     case 'citations':
       // 空数组按"没有引用"处理：与 `messageToView` 的口径一致，避免渲染一张空引用卡
       return {
@@ -269,6 +306,12 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
 
     case 'status':
       return { ...round, statusText: event.data.text }
+
+    case 'steer':
+      // 中途插话（P1-20）：**追加**一条用户插入（不清 `statusText`、不动助手内容）——
+      // 它由出口层在"把插话投递给 agent"时发来，是"用户确实插了这句话"的第二重证据；
+      // 与前端乐观插入的那条**按正文去重**（见 `withInterjection`）。
+      return withInterjection(round, { text: event.data.message, at: event.data.at })
 
     case 'done':
       return {
@@ -308,7 +351,7 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
   }
 }
 
-/** 一轮对话 → 消息列表（**两条**：用户 + 助手），顺序与流里出现的顺序一致 */
+/** 一轮对话 → 消息列表（**用户 + 本轮插话 + 助手**），顺序与流里出现的顺序一致 */
 export function roundToViews(round: StreamRound): ChatMessageView[] {
   return [
     {
@@ -323,6 +366,22 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       createdAt: null,
       status: 'complete',
     },
+    // 中途插话（P1-20）：每条渲染成一条用户气泡 ⇒ 用户看得见"我插了这句话"（不再像丢消息）。
+    // ⚠️ 放在主用户消息之后、助手消息之前：它们是**本轮运行中**陆续插入的，但助手正文在这里是
+    //    一坨整篇（`round.assistant.text`）⇒ 无法按时刻插进它内部；排在它前面是"这轮我先后说了
+    //    这几句，然后它给了回答"的可读近似。
+    ...round.interjections.map((item, index) => ({
+      key: `stream:steer:${index}`,
+      role: 'USER' as const,
+      text: item.text,
+      thinking: '',
+      citations: null,
+      tools: [],
+      artifacts: [],
+      attachments: [],
+      createdAt: item.at,
+      status: 'complete' as const,
+    })),
     {
       key: 'stream:assistant',
       role: 'ASSISTANT',

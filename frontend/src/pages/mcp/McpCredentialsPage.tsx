@@ -62,6 +62,7 @@ import {
 } from './mcpModel.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { GitCredentialsSection } from '../settings/GitCredentialsSection.js'
+import { GitIdentitySection } from '../settings/GitIdentitySection.js'
 import { MCP_PATH } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
 
@@ -344,6 +345,7 @@ export function McpCredentialsPage() {
       </div>
 
       <GitCredentialsSection />
+      <GitIdentitySection />
     </>
   )
 }

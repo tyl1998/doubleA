@@ -57,11 +57,12 @@ import { pathToFileURL } from 'node:url'
 
 import {
   sandboxComponentsArg,
-  sandboxVariantIdFromComponents,
+  sandboxVariantIdFromSelection,
   sandboxVariantLabel,
   SANDBOX_BUILD_PHASE_LABELS,
   type SandboxBuildJob,
   type SandboxBuildPhase,
+  type SandboxRuntimeSelection,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -321,8 +322,10 @@ function finishJob(job: BuildJobState, status: 'succeeded' | 'failed' | 'cancele
  *
  * 口径：见文件头。**立刻返回快照**（不阻塞在 `docker build` 上）。
  */
-export async function startSandboxRuntimeBuild(components: readonly string[]): Promise<SandboxBuildJob> {
-  const variant = sandboxVariantIdFromComponents(components)
+export async function startSandboxRuntimeBuild(
+  components: readonly SandboxRuntimeSelection[],
+): Promise<SandboxBuildJob> {
+  const variant = sandboxVariantIdFromSelection(components)
   const label = sandboxVariantLabel(variant)
 
   const versions = await loadRuntimeVersions()
@@ -339,7 +342,7 @@ export async function startSandboxRuntimeBuild(components: readonly string[]): P
       error: '本机未配置按需构建上下文（SANDBOX_RUNTIME_BUILD_CONTEXT / 仓库 infra 不在），请运维先构建运行时镜像',
     })
   }
-  // 全部组件都没认出来（空集合 = none 除外）⇒ 拒绝（避免给一个"什么都没装"的镜像）
+  // 全部选择项都没认出来（空集合 = none 除外）⇒ 拒绝（避免给一个"什么都没装"的镜像）
   if (components.length > 0 && variant === 'none') {
     return settleImmediately({
       variant,
@@ -349,7 +352,7 @@ export async function startSandboxRuntimeBuild(components: readonly string[]): P
       phase: 'done',
       progress: 1,
       image: null,
-      error: '没有可识别的组件（组件 id 不在目录里）',
+      error: '没有可识别的语言+版本（语言或版本不合法）',
     })
   }
 
@@ -404,7 +407,11 @@ export async function startSandboxRuntimeBuild(components: readonly string[]): P
 }
 
 /** 真正跑 `docker build`（在串行链上被调用）；返回的 promise 在进程收尾时 resolve */
-function runBuildProcess(job: BuildJobState, context: string, components: readonly string[]): Promise<void> {
+function runBuildProcess(
+  job: BuildJobState,
+  context: string,
+  components: readonly SandboxRuntimeSelection[],
+): Promise<void> {
   return new Promise<void>((resolvePromise) => {
     if (job.status !== 'running') {
       // 排在链上期间被取消了 ⇒ 直接收尾
@@ -425,6 +432,10 @@ function runBuildProcess(job: BuildJobState, context: string, components: readon
       `COMPONENTS=${componentsArg}`,
       '--build-arg',
       `APT_MIRROR=${process.env.SANDBOX_APT_MIRROR ?? ''}`,
+      '--build-arg',
+      `NODE_DIST_MIRROR=${process.env.SANDBOX_NODE_DIST_MIRROR ?? ''}`,
+      '--build-arg',
+      `RUST_DIST_MIRROR=${process.env.SANDBOX_RUST_DIST_MIRROR ?? ''}`,
       context,
     ]
     getLogger().info({ buildId: job.buildId, variant: job.variant, tag: job.tag, components: componentsArg }, '按需构建运行时镜像开始（P1-17a）')

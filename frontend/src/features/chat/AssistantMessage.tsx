@@ -116,12 +116,10 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
       {empty ? (
         <p className="ratio" data-testid="assistant-placeholder">
           {view.status === 'streaming' ? (
-            // 流式但**一个字都还没到**：占位。具体的生命周期文案（`status` 事件）已由上面的
-            // `StreamingStatusLine` 呈现，这里只留一句中性的"等待"与打字光标。
-            <>
-              正在等待上游响应…
-              <span className="caret" aria-hidden="true" />
-            </>
+            // 流式但**一个字都还没到**：**只留打字光标**。生命周期文案（`status` 事件）已由上面的
+            // `StreamingStatusLine`（"模型正在思考… · 已用时 Ns"）呈现 —— 这里再写一句"正在等待上游响应…"
+            // 就是**两条提示叠一起**，用户看起来像两件事（产品反馈题 3：只保留上面那一条）。
+            <span className="caret" aria-hidden="true" />
           ) : view.status === 'stopped' ? (
             '已停止：本轮没有产生内容'
           ) : (

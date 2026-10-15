@@ -133,6 +133,7 @@ import {
   type SandboxAcquireFailure,
   type SandboxHandle,
   type SandboxMcpCatalog,
+  type PiSessionEvent,
   type SandboxRpc,
   type TurnFailureReason,
   type TurnOutcome,
@@ -182,6 +183,14 @@ import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
  *   `UPSTREAM_TIMEOUT`(504) 引擎长时间不响应 —— **已生成的内容照样落库**后才抛
  * @returns 正常 / 中断都以 `done` 收尾（`finishReason` = `COMPLETE` | `STOPPED`）
  */
+/**
+ * ★ 模型相位静默看门狗的**提示间隔**（ms）。
+ *
+ * 处于「等模型」相位且这么久没有任何引擎事件 ⇒ 推一条 `status` 帧（**只提示、不中止**）。
+ * 判据、相位划分与取舍见 `taskAgentProducer` 里那段注释。
+ */
+const MODEL_SILENCE_NOTICE_MS = 60_000
+
 export const taskAgentProducer: ChatProducer = async (input) => {
   const logger = getLogger()
   const { conversationId, agentId, content, signal, startedAt } = input
@@ -270,6 +279,72 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       .catch((error: unknown) => {
         frameFailure ??= error
       })
+  }
+
+  /**
+   * ★ 模型相位静默看门狗（**可见性，不中止**）。
+   *
+   * 为什么：引擎在容器里直连模型端点，平台侧只有事件流。一次真跑中上游"回了响应头、
+   * 正文 356s 一个字节都没有"，整轮 `ttftMs≈468s`（几乎等于总耗时），界面表现是
+   * 「一直转圈、毫无反馈」。出网代理侧已对模型端点加了空闲上限（掐断后交给引擎自己的
+   * `auto_retry` 重发那一次 provider 请求）；这里补的是**可见性**：处于「等模型」相位且
+   * 长时间没有任何引擎事件时，推一条 `status` 帧，让用户知道还在等、不是死了。
+   *
+   * ⚠️ **必须分相位**：只有「等模型」才算静默异常（正常模型流会持续吐 delta）；工具相位
+   *    （`bash` 跑 npm/pytest）本来就可能长时间零输出 ⇒ **不提示、更不中止**。
+   * ⚠️ `turn_start` 起是「等模型」，`tool_execution_*` / `turn_end` 起离开该相位 —— 不能用
+   *    "整轮静默"当判据，那会把长工具误判成卡死。
+   */
+  let inModelPhase = false
+  let silenceTimer: ReturnType<typeof setInterval> | null = null
+  let silenceSinceMs: number | null = null
+
+  const stopSilenceWatchdog = (): void => {
+    if (silenceTimer !== null) clearInterval(silenceTimer)
+    silenceTimer = null
+    silenceSinceMs = null
+  }
+
+  /** 引擎事件到达：更新相位并重置静默计时（任何事件都算"有活动"） */
+  const noteEnginePhase = (event: PiSessionEvent): void => {
+    switch (event.type) {
+      case 'turn_start':
+        inModelPhase = true
+        break
+      case 'message_start': {
+        const message = event.message
+        const role =
+          message !== null && typeof message === 'object'
+            ? (message as { role?: unknown }).role
+            : undefined
+        inModelPhase = role === 'assistant'
+        break
+      }
+      case 'tool_execution_start':
+      case 'tool_execution_update':
+      case 'tool_execution_end':
+      case 'turn_end':
+      case 'agent_end':
+      case 'agent_settled':
+        inModelPhase = false
+        break
+      default:
+        break
+    }
+    stopSilenceWatchdog()
+    if (!inModelPhase) return
+    silenceSinceMs = Date.now()
+    silenceTimer = setInterval(() => {
+      if (!inModelPhase || silenceSinceMs === null) return
+      const waitedSec = Math.round((Date.now() - silenceSinceMs) / 1000)
+      enqueue([
+        {
+          name: 'status',
+          data: { text: `上游模型已 ${waitedSec}s 无响应，仍在等待（连接超时后会自动重试）…` },
+        },
+      ])
+    }, MODEL_SILENCE_NOTICE_MS)
+    silenceTimer.unref()
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -525,6 +600,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
 
       const mapper = createEngineEventMapper({ resolveMcpTool, resolveBuiltinTool })
       unsubscribe = bridge.onEvent((event) => {
+        // ★ 先记相位与静默看门狗（只读这一条事件的类型/角色，不影响下面的映射）
+        noteEnginePhase(event)
         const mapped = mapper.map(event)
         // ── 工具卡**内联定位**：给 `tool_call` 帧（进 SSE 流）与 `toolRecord`（进库）各补一份
         //   `textOffset`。同一 `callId` 的 start/end 两帧共用同一偏移（追踪器记忆）⇒ 卡片流转不跳位置；
@@ -626,6 +703,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     } finally {
       // 退订必须做：桥活得比这一轮久（复用容器），不退就是每一轮多一个监听器 + 多一份泄漏的引用
       unsubscribe?.()
+      // ★ 静默看门狗同理：桥比一轮久，定时器必须在这一轮结束时收掉
+      stopSilenceWatchdog()
       // 中途插话的两条订阅（P1-9 · P4 · R1）：同款理由 —— 通道与工作区事件总线都活得比一轮久
       unsubscribeSteer?.()
       unsubscribeWorkspaceEdits?.()
@@ -654,13 +733,27 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   if (sandbox !== null && roundStartedAt !== null) {
     try {
       // 先把 agent 的**未中介写**（`bash` / 原生工具）对账进工作区索引与事件 —— 否则这一轮它看不到。
+      // ⚠️ 对账**与产物无关**：Code 模式下工作区面板仍要实时看到 agent 的改动，故这一句照跑。
       await reconcileWorkspaceOnce(conversationId)
-      // 本轮窗口 = `[起点, now]`：起点之后动过的路径，按路径折叠成变更集（`shared#foldWorkspaceEvents`）。
-      const { items: changes } = await listWorkspaceChanges(conversationId, roundStartedAt.toISOString())
-      const collected = await collectRoundArtifacts({ conversationId, changes })
-      artifactItems.push(...collected)
-      if (collected.length > 0) {
-        enqueue(collected.map((item) => ({ name: 'artifact', data: item } as const satisfies SseEvent)))
+      /**
+       * ★ 产物口径（用户定案 2026-10-15）：**Code 模式下不再计算 agent 产物** —— 只有**非 Code
+       * 的 TaskAgent** 才算产物。理由：Code 模式里 agent 动过的文件已经由**工作区面板**（文件树 +
+       * 「最近变更」）完整呈现，"哪些算产物"在那里不好定义，再收一份只会与工作区重复、且容易算错。
+       * 判据 = 会话持久列 `codeMode`（与建容器时注入 `DOUBULEA_WORKSPACE_MEDIATION` 同一个来源）。
+       */
+      const conversationRow = await getPrisma().conversation.findUnique({
+        where: { id: conversationId },
+        select: { codeMode: true },
+      })
+      const codeMode = conversationRow?.codeMode ?? false
+      if (!codeMode) {
+        // 本轮窗口 = `[起点, now]`：起点之后动过的路径，按路径折叠成变更集（`shared#foldWorkspaceEvents`）。
+        const { items: changes } = await listWorkspaceChanges(conversationId, roundStartedAt.toISOString())
+        const collected = await collectRoundArtifacts({ conversationId, changes })
+        artifactItems.push(...collected)
+        if (collected.length > 0) {
+          enqueue(collected.map((item) => ({ name: 'artifact', data: item } as const satisfies SseEvent)))
+        }
       }
     } catch (error) {
       logger.warn(

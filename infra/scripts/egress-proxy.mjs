@@ -20,9 +20,10 @@
  * 环境变量：
  *   EGRESS_PORT               监听端口（默认 3128）
  *   EGRESS_LISTEN_HOST        绑定地址（默认 0.0.0.0；容器里必须非回环，否则沙箱够不着）
- *   EGRESS_POLICY_FILE        策略文件（**平台化主通道**）：JSON `{ allow: [...], deny: [...] }`。
+ *   EGRESS_POLICY_FILE        策略文件（**平台化主通道**）：JSON `{ allow: [...], deny: [...], modelHosts: [...] }`。
  *                             由 `egress-up.sh` 从 `egress_policy` 表 + 模型池落盘；设置后每
  *                             `EGRESS_POLICY_REFRESH_MS` 轮询热更新（改配置不用重启代理）。
+ *                             `modelHosts` = 模型池主机（只用于"模型端点 idle 超时"这一条，不参与放行判定）。
  *   EGRESS_ALLOW              逗号分隔白名单（旧通道 / 兜底）：`host` / `host:port` / `*.host` / `*`
  *   EGRESS_DENY               逗号分隔黑名单（旧通道 / 兜底）
  *   EGRESS_ALLOW_FILE         旧 CSV 白名单文件路径（可省；兼容保留）
@@ -31,13 +32,21 @@
  *   EGRESS_AUDIT_FILE         审计出口：每决策一条 JSONL 追加（省 = 不写，只走 stdout）——
  *                             留给"后面接日志平台做审计"的口子
  *   EGRESS_CONNECT_TIMEOUT_MS 建连超时（默认 30000）
+ *   EGRESS_MODEL_IDLE_TIMEOUT_MS 模型端点隧道**建成后**的空闲上限（默认 180000；0 = 不设）。
+ *                             只对策略文件里 `modelHosts` 命中的目标生效 —— 见下面那条 ★。
  *   EGRESS_LOG_BODIES         非空 = 明文 HTTP 的 ALLOW 也逐条打日志（默认只记 DENY 与错误）
  *
  * ⚠️ **策略语义**（与 `shared/src/egressPolicy.ts` 逐字一致）：`deny` 优先；两张表都空 = **全放行**；
  *    只配 allow = 只放行 allow；只配 deny = 除 deny 外全放行。模型池主机由写文件的 `egress-up.sh`
  *    **并入 allow**（"模型默认放行"在同步层做，不在本文件）。
- * ⚠️ **不对已建立的隧道设 idle 超时**：模型流式响应可能长时间静默，
- *    设了会把正常的慢响应掐断（症状是"模型答一半没了"，极易误判成引擎问题）。
+ * ⚠️ **默认不对已建立的隧道设 idle 超时**：流式响应 / 长下载可能长时间静默，
+ *    一律设了会把正常连接掐断（症状是"答一半没了"，极易误判成引擎问题）。
+ * ★ **模型端点例外**（`modelHosts` + `EGRESS_MODEL_IDLE_TIMEOUT_MS`，默认 180s）：
+ *    上游"回了响应头、正文长时间一个字节都没有"时把隧道掐掉，让容器里的引擎收到流错误、
+ *    走它自己的 `auto_retry`（**只重发这一次 provider 请求**，不会重跑整轮工具）。
+ *    判据：正常模型流会持续吐 delta（thinking / text），静默这么久基本等于死链；
+ *    `npm` / `pytest` 走各自 registry，不在 `modelHosts` 里，不受影响。
+ *    实测背景：一次真跑中上游静默 356s 后才被对端断开，`ttftMs` 几乎等于整轮耗时。
  */
 import http from 'node:http'
 import https from 'node:https'
@@ -47,6 +56,11 @@ import fs from 'node:fs'
 const PORT = Number(process.env.EGRESS_PORT ?? 3128)
 const LISTEN_HOST = process.env.EGRESS_LISTEN_HOST ?? '0.0.0.0'
 const CONNECT_TIMEOUT_MS = Number(process.env.EGRESS_CONNECT_TIMEOUT_MS ?? 30_000)
+/**
+ * 模型端点隧道**建成后**的空闲上限（ms；0 = 不设）。
+ * ⚠️ 只对策略文件里 `modelHosts` 命中的目标生效 —— 理由见文件头那条 ★。
+ */
+const MODEL_IDLE_TIMEOUT_MS = Number(process.env.EGRESS_MODEL_IDLE_TIMEOUT_MS ?? 180_000)
 const LOG_BODIES = (process.env.EGRESS_LOG_BODIES ?? '') !== ''
 const ALLOW_ENV = process.env.EGRESS_ALLOW ?? ''
 const DENY_ENV = process.env.EGRESS_DENY ?? ''
@@ -73,7 +87,7 @@ const AUDIT_FILE = process.env.EGRESS_AUDIT_FILE ?? ''
  *    `allow` / `deny` 两张表（`ALL`⇒`['*']`、`NONE`/`REGISTRY`⇒白名单）⇒ **本代理不认识 scope，
  *    也不做 per-conversation**（会话级出网覆盖已按 2026-10-14 用户定案移除）。
  */
-let POLICY = { allow: [], deny: [], allowAll: true, source: 'default' }
+let POLICY = { allow: [], deny: [], modelHosts: [], allowAll: true, source: 'default' }
 
 /** CSV 串 / 数组 → 去空白、去空段、小写、去重（保持顺序） */
 function toRules(value) {
@@ -92,8 +106,8 @@ function isAllowAll(allow, deny) {
   return allow.length === 0 && deny.length === 0
 }
 
-function applyPolicy(allow, deny, source) {
-  const normalized = { allow: toRules(allow), deny: toRules(deny) }
+function applyPolicy(allow, deny, source, modelHosts = []) {
+  const normalized = { allow: toRules(allow), deny: toRules(deny), modelHosts: toRules(modelHosts) }
   POLICY = { ...normalized, allowAll: isAllowAll(normalized.allow, normalized.deny), source }
   return POLICY
 }
@@ -101,28 +115,37 @@ function applyPolicy(allow, deny, source) {
 /** 策略摘要（日志 / `/healthz` 用） */
 function describePolicy() {
   const mode = POLICY.allowAll ? '全放行' : POLICY.allow.length > 0 ? '仅白名单' : '黑名单'
-  return `${mode}｜allow ${POLICY.allow.length} 条 / deny ${POLICY.deny.length} 条（来源 ${POLICY.source}）`
+  const idle = MODEL_IDLE_TIMEOUT_MS > 0 ? `${MODEL_IDLE_TIMEOUT_MS}ms` : '关'
+  return (
+    `${mode}｜allow ${POLICY.allow.length} 条 / deny ${POLICY.deny.length} 条` +
+    ` / modelHosts ${POLICY.modelHosts.length} 条（模型 idle ${idle}）（来源 ${POLICY.source}）`
+  )
 }
 
 function rulesFromCsvFile(file) {
   return fs.readFileSync(file, 'utf8').trim().split(',').map((s) => s.trim()).filter(Boolean)
 }
 
-/** 读并校验策略文件（JSON `{allow,deny}`）；形状不对就抛（调用方保留上一份） */
+/** 读并校验策略文件（JSON `{allow,deny,modelHosts}`）；形状不对就抛（调用方保留上一份） */
 function readPolicyFile(file) {
   const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
   if (parsed === null || typeof parsed !== 'object') throw new Error('策略文件不是对象')
   if (parsed.allow !== undefined && !Array.isArray(parsed.allow)) throw new Error('allow 不是数组')
   if (parsed.deny !== undefined && !Array.isArray(parsed.deny)) throw new Error('deny 不是数组')
-  return { allow: toRules(parsed.allow ?? []), deny: toRules(parsed.deny ?? []) }
+  if (parsed.modelHosts !== undefined && !Array.isArray(parsed.modelHosts)) throw new Error('modelHosts 不是数组')
+  return {
+    allow: toRules(parsed.allow ?? []),
+    deny: toRules(parsed.deny ?? []),
+    modelHosts: toRules(parsed.modelHosts ?? []),
+  }
 }
 
 // 初始策略：优先策略文件 → 旧 CSV 文件 → env → 默认全放行
 let initialSource = 'default'
 if (POLICY_FILE !== '') {
   try {
-    const { allow, deny } = readPolicyFile(POLICY_FILE)
-    applyPolicy(allow, deny, 'policy-file')
+    const { allow, deny, modelHosts } = readPolicyFile(POLICY_FILE)
+    applyPolicy(allow, deny, 'policy-file', modelHosts)
     initialSource = 'policy-file'
   } catch {
     /* 文件还没就绪 → 继续往下 */
@@ -152,16 +175,20 @@ if (initialSource === 'default') {
 // ⚠️ 解析失败 = 一次坏写入，**保留旧策略**并告警 —— 别让写一半把出口整个关掉 / 全开。
 function reloadPolicy() {
   if (POLICY_FILE !== '') {
-    const { allow, deny } = readPolicyFile(POLICY_FILE)
-    if (JSON.stringify(allow) === JSON.stringify(POLICY.allow) && JSON.stringify(deny) === JSON.stringify(POLICY.deny)) return
-    applyPolicy(allow, deny, 'policy-file')
+    const { allow, deny, modelHosts } = readPolicyFile(POLICY_FILE)
+    const same =
+      JSON.stringify(allow) === JSON.stringify(POLICY.allow) &&
+      JSON.stringify(deny) === JSON.stringify(POLICY.deny) &&
+      JSON.stringify(modelHosts) === JSON.stringify(POLICY.modelHosts)
+    if (same) return
+    applyPolicy(allow, deny, 'policy-file', modelHosts)
     log(`出网策略已热更新：${describePolicy()}`)
     return
   }
   const allow = ALLOW_FILE === '' ? POLICY.allow : toRules(rulesFromCsvFile(ALLOW_FILE))
   const deny = DENY_FILE === '' ? POLICY.deny : toRules(rulesFromCsvFile(DENY_FILE))
   if (JSON.stringify(allow) === JSON.stringify(POLICY.allow) && JSON.stringify(deny) === JSON.stringify(POLICY.deny)) return
-  applyPolicy(allow, deny, 'csv-file')
+  applyPolicy(allow, deny, 'csv-file', POLICY.modelHosts)
   log(`出网策略已热更新：${describePolicy()}`)
 }
 
@@ -216,6 +243,16 @@ function decide(host, port) {
       : { allowed: false, reason: 'not-in-allow-list' }
   }
   return { allowed: true, reason: mode === 'ALLOW_ALL' ? 'allow-all' : 'no-deny-match' }
+}
+
+/**
+ * 这个 `host:port` 是不是**模型端点**（`modelHosts` 命中）⇒ 返回要用的空闲上限（0 = 不设）。
+ * 规则形状与放行判定同款（复用 {@link matchRule}）；没配 `modelHosts` / 超时设为 0 ⇒ 一律不设。
+ */
+function modelIdleTimeoutFor(host, port) {
+  if (!(MODEL_IDLE_TIMEOUT_MS > 0) || POLICY.modelHosts.length === 0) return 0
+  const h = host.toLowerCase()
+  return POLICY.modelHosts.some((rule) => matchRule(rule, h, port)) ? MODEL_IDLE_TIMEOUT_MS : 0
 }
 
 /** 审计：每决策一条 JSONL 追加到 `EGRESS_AUDIT_FILE`（尽力而为，失败不影响转发） */
@@ -277,7 +314,23 @@ server.on('connect', (req, clientSocket, head) => {
   upstream.setTimeout(CONNECT_TIMEOUT_MS, () => fail(`建连超时 ${CONNECT_TIMEOUT_MS}ms`))
   upstream.on('connect', () => {
     settled = true
-    upstream.setTimeout(0) // ★ 隧道建成后撤掉超时：流式响应可以长时间静默
+    const modelIdleMs = modelIdleTimeoutFor(host, port)
+    if (modelIdleMs > 0) {
+      // ★ 模型端点：隧道建成后**保留一个空闲上限** —— 上游"回了响应头、正文长时间没数据"时
+      //   把它掐掉，让容器里的引擎收到流错误、走自己的 `auto_retry`（只重发这一次 provider
+      //   请求，不重跑整轮工具）。非模型目标仍走下面的 `setTimeout(0)`（npm/pytest 要静默）。
+      //   ⚠️ 这里**不能**用上面的 `fail()`：它在 `connect` 那一刻已经把 `settled` 置 true 了，
+      //      `fail` 会直接 return（初版就踩了这个坑，冒烟测试才暴露出来）。直接销毁两个 socket。
+      upstream.setTimeout(modelIdleMs, () => {
+        log(`CUT   CONNECT ${host}:${port} — 模型流空闲 ${modelIdleMs}ms（掐断，交给引擎 auto_retry）`)
+        audit('cut', 'CONNECT', host, port, 'model-idle-timeout')
+        clientSocket.destroy()
+        upstream.destroy()
+      })
+      log(`模型端点 idle 上限已挂：${host}:${port}（${modelIdleMs}ms）`)
+    } else {
+      upstream.setTimeout(0) // ★ 隧道建成后撤掉超时：流式响应可以长时间静默
+    }
     clientSocket.setTimeout(0)
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
     if (head?.length) upstream.write(head)
@@ -302,6 +355,8 @@ server.on('request', (req, res) => {
           mode: currentMode(),
           allow: POLICY.allow,
           deny: POLICY.deny,
+          modelHosts: POLICY.modelHosts,
+          modelIdleTimeoutMs: MODEL_IDLE_TIMEOUT_MS,
           source: POLICY.source,
         },
         null,
@@ -354,7 +409,15 @@ server.on('request', (req, res) => {
     },
   )
   upstream.setTimeout(CONNECT_TIMEOUT_MS, () => upstream.destroy(new Error('建连超时')))
-  upstream.on('response', () => upstream.setTimeout(0))
+  upstream.on('response', () => {
+    // 明文 HTTP 的模型端点（模型大多是 https CONNECT，这里只为口径一致）同样挂空闲上限
+    const modelIdleMs = modelIdleTimeoutFor(target.hostname, port)
+    if (modelIdleMs > 0) {
+      upstream.setTimeout(modelIdleMs, () => upstream.destroy(new Error(`模型流空闲超时 ${modelIdleMs}ms`)))
+    } else {
+      upstream.setTimeout(0)
+    }
+  })
   upstream.on('error', (err) => {
     log(`ERR   ${req.method} ${target.hostname}:${port} — ${err.code ?? err.message}`)
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' })
@@ -370,6 +433,11 @@ server.on('clientError', (_err, socket) => {
 server.listen(PORT, LISTEN_HOST, () => {
   log(`listening on ${LISTEN_HOST}:${PORT}`)
   log(`出网策略（初始来源 ${initialSource}）：${describePolicy()}`)
+  if (MODEL_IDLE_TIMEOUT_MS > 0) {
+    log(`模型端点空闲上限 ${MODEL_IDLE_TIMEOUT_MS}ms（仅 modelHosts 命中的目标；掐断后由引擎 auto_retry 重发该次请求）`)
+  } else {
+    log('模型端点空闲上限：关闭（所有隧道建成后一律不设 idle 超时）')
+  }
   if (!POLICY.allowAll && POLICY.allow.length > 0) {
     log(`只放行白名单，其余目标一律 403：allow=[${POLICY.allow.join(', ')}]`)
   } else if (!POLICY.allowAll) {

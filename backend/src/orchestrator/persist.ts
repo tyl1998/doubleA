@@ -111,6 +111,36 @@ export interface PersistRoundInput {
 }
 
 /**
+ * 去掉字符串里的 **NUL（`\u0000`）** —— 落库前的最后一道清洗（**递归覆盖整份 `content`**）。
+ *
+ * ⚠️ **为什么必须在写入端做**：Postgres 的 `text` / `jsonb` **存不了 NUL**
+ * （驱动报 `22P05 unsupported Unicode escape sequence` / `\u0000 cannot be converted to text`）。
+ * 而沙箱（TaskAgent）里读二进制文件、或引擎/上游把 NUL 混进 `thinking` / `delta` / 工具 `output`
+ * 都是真实会发生的 ⇒ 只要某一轮的内容里有一个 `\u0000`，**整个落库事务回滚**。
+ * 后果不是"少存一个字符"，而是**用户消息与助手消息一起丢**（它们在同一个事务里）——
+ * 症状正是"聊完切走再切回 / 刷新后，**这一轮凭空消失**"，而流式时明明看得到。
+ *
+ * ⚠️ 递归而不是逐字段列举：`content` 的段会继续长（`attachments` / `artifacts` / 将来的段），
+ * 逐字段写必漏一处，而漏掉的那一处就是下一次"整轮消失"。NUL 在文本里本就不可见、无意义，
+ * 直接删除（不替换成 `\uFFFD`）—— 与"这段内容原样透出"的口径不冲突。
+ *
+ * ⚠️ **导出仅供断言**（与 `conversation.service.ts#toMessagePage` 同款做法）：它是纯函数，
+ * 可以被无依赖档直接喂"带 NUL 的 content"逐段断言，而不必连真库。
+ */
+export function stripNulChars<T>(value: T): T {
+  // ⚠️ 用 `replaceAll('\u0000', '')` 而不是正则 `/\u0000/g`：后者会被 ESLint 的
+  //    `no-control-regex` 拦下（正则里出现控制字符本身就是一个要复核的信号）。
+  if (typeof value === 'string') return value.replaceAll('\u0000', '') as T
+  if (Array.isArray(value)) return value.map((entry) => stripNulChars(entry)) as T
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, entry] of Object.entries(value)) out[key] = stripNulChars(entry)
+    return out as T
+  }
+  return value
+}
+
+/**
  * 把这一轮落库：**用户消息 + 助手消息 + 活跃时间，同一个事务**。
  *
  * 三件事一起做的理由（`02` §4.5 ④）：`touchConversation` 的签名收
@@ -162,10 +192,12 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
           role: 'USER',
           // 附件（P1-4）：只在非空时写这个键（省键 = 本轮没有附件，与 `buildAssistantContent` 同口径）。
           // 它让"刷新后用户气泡里还能看到当时带过什么"成立（历史消息原样透出 `content`）。
-          content:
+          // ⚠️ `stripNulChars`：见它的注释 —— NUL 会让整个事务回滚（这一轮凭空消失）。
+          content: stripNulChars(
             attachments === undefined || attachments.length === 0
               ? { text: content }
               : { text: content, attachments: [...attachments] },
+          ),
         },
       })
       let assistantMessageId: string | null = null
@@ -174,14 +206,18 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
           data: {
             conversationId,
             role: 'ASSISTANT',
-            content: buildAssistantContent({
-              text: assistantText,
-              thinking: thinkingText,
-              citations,
-              toolCalls: toolRecords,
-              artifacts,
-              ...(model === undefined ? {} : { model }),
-            }),
+            // ⚠️ `stripNulChars`：引擎/上游把 NUL 混进正文 / 思考 / 工具 output 是真实会发生的
+            //（沙箱读二进制文件）⇒ 不清洗就是"整轮落库回滚、这一轮凭空消失"（见它的注释）。
+            content: stripNulChars(
+              buildAssistantContent({
+                text: assistantText,
+                thinking: thinkingText,
+                citations,
+                toolCalls: toolRecords,
+                artifacts,
+                ...(model === undefined ? {} : { model }),
+              }),
+            ),
             // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）
             tokensIn: usage?.tokensIn ?? null,
             tokensOut: usage?.tokensOut ?? null,
@@ -194,7 +230,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
       // 判据是"`topic` 还是 `null`"（CAS 更新，不是先读再写）：
       //   · 流式中用户手动改名 ⇒ `topic` 已非 null ⇒ 这里不会覆盖（后写覆盖先写是错的）；
       //   · 之后每一轮都一样 —— 标题只由"第一条消息"或"手动重命名"产生，二选一。
-      const derivedTopic = deriveConversationTopic(content)
+      const derivedTopic = stripNulChars(deriveConversationTopic(content))
       if (derivedTopic !== '') {
         await tx.conversation.updateMany({
           where: { id: conversationId, topic: null },

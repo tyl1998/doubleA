@@ -14,8 +14,9 @@
  *   │ └─────────────┘ └───────────────────────────────────────────┘ │
  *   └───────────────────────────────────────────────────────────────┘
  *
- * ⚠️ 资源管理器**不再折叠**（常驻整宽）：树行**右键**出菜单（新建文件 / 文件夹、上传到此目录、
- *   重命名 / 移动、下载、删除），文件行**可拖动**到目录或空白区完成移动；空白区右键 = 根级操作。
+ * ⚠️ 资源管理器**不再折叠**（常驻整宽）：文件行**右键**出菜单（打开 / 重命名·移动、下载、删除）；
+ *   目录行**右键**出菜单（新建文件 / 文件夹、上传到此目录、**删除文件夹（递归）**）；
+ *   文件行**可拖动**到目录或空白区完成移动；空白区右键 = 根级操作。
  * ⚠️ 文本文件**默认显示点文件**（`.git` 等），可用资源管理器头部的眼睛按钮隐藏。
  *
  * ⚠️ 编辑态**按路径**存（`docs`）：多标签各自保留草稿，切标签不丢未保存改动。
@@ -24,8 +25,10 @@
  */
 
 import {
+  BranchesOutlined,
   CloseOutlined,
   CodeOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   DownloadOutlined,
@@ -49,20 +52,31 @@ import { Alert, App, Button, Dropdown, Empty, Input, Modal, Popconfirm, Space, S
 import type { MenuProps } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
-import { foldWorkspaceEvents, WORKSPACE_ACTOR_LABELS, type WorkspaceEventItem } from '@doubulea/shared'
+import {
+  WORKSPACE_ACTOR_LABELS,
+  type WorkspaceChangeEntry,
+  type WorkspaceDiffLine,
+  type WorkspaceEventItem,
+} from '@doubulea/shared'
 
 import { ApiError } from '../../api/client.js'
 import { RuntimeSelect } from './RuntimeSelect.js'
 import {
   createWorkspaceFile,
+  deleteWorkspaceDirectory,
   deleteWorkspaceFile,
+  fetchWorkspaceChanges,
   fetchWorkspaceFile,
+  fetchWorkspaceFileDiff,
   moveWorkspaceFile,
   revertWorkspaceRound,
   saveWorkspaceFile,
   streamWorkspaceEvents,
   uploadWorkspaceFile,
+  useWorkspaceGit,
   useWorkspaceTree,
+  workspaceFileDiffQueryKey,
+  workspaceGitQueryKey,
   workspaceRawUrl,
   workspaceTreeQueryKey,
 } from '../../api/workspace.js'
@@ -81,13 +95,22 @@ import {
   isContentEvent,
   isEditableRead,
   isImageMime,
+  isWorkspacePathInDir,
+  mergeWorkspaceChanges,
+  revertActionLabel,
   revertSummaryText,
+  workspaceAncestorDirs,
   workspaceBaseName,
+  workspaceCopyValue,
   workspaceEditorLanguage,
+  workspaceGitChipLabel,
+  workspaceGitChipTitle,
   workspaceLanguageLabel,
   workspaceMoveTargetPath,
   workspaceNewFolderPlaceholderPath,
   workspaceParentDir,
+  WORKSPACE_COPY_ITEMS,
+  type WorkspaceCopyKind,
   type WorkspaceFileIconKind,
   type WorkspaceTreeNode,
 } from './workspaceModel.js'
@@ -148,7 +171,10 @@ interface TreeActions {
   open: (path: string) => void
   rename: (path: string) => void
   remove: (path: string) => void
+  removeDir: (dir: string) => void
   download: (path: string) => void
+  /** 复制三种口径之一（`relative` / `absolute`=容器 `/work/…` / `name`）；文件与目录同款 */
+  copy: (kind: WorkspaceCopyKind, path: string) => void
   newFile: (dir: string) => void
   newFolder: (dir: string) => void
   upload: (dir: string) => void
@@ -206,9 +232,12 @@ export function WorkspacePanel({
   const activateFile = useWorkspaceStore((state) => state.activateFile)
   const closeFile = useWorkspaceStore((state) => state.closeFile)
   const renameFile = useWorkspaceStore((state) => state.renameFile)
+  const expandDirs = useWorkspaceStore((state) => state.expandDirs)
 
   const [showHidden, setShowHidden] = useState(true)
   const [recentOpen, setRecentOpen] = useState(false)
+  /** 正在查看差异的文件路径（`null` = 差异弹窗关着） */
+  const [diffPath, setDiffPath] = useState<string | null>(null)
   /** 路径输入弹窗（新建文件 / 新建文件夹 / 重命名·移动，同一套壳） */
   const [prompt, setPrompt] = useState<PromptState>(null)
   /** 右键"上传到此处"的目标目录（'' = 根）；配合隐藏的 `<input type="file">` */
@@ -216,6 +245,13 @@ export function WorkspacePanel({
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
 
   const treeQuery = useWorkspaceTree(conversationId, codeMode)
+  /**
+   * 项目 git 概况（有哪些仓库 + 当前分支）。**锦上添花**：失败就当作没有 git，不打扰用户
+   * （`repos: []` 与"请求失败"在界面上都是"不显示分支 chip"，见头部的渲染条件）。
+   */
+  const gitQuery = useWorkspaceGit(conversationId, codeMode)
+  /** 有 git 才渲染分支 chip（见头部那段注释：空数组与失败都不显示） */
+  const gitRepos = gitQuery.data?.repos ?? []
   const treeNodes = useMemo(() => buildWorkspaceTree(treeQuery.data?.items ?? []), [treeQuery.data])
   const visibleNodes = useMemo(() => filterWorkspaceTree(treeNodes, showHidden), [treeNodes, showHidden])
   const fileCount = useMemo(() => treeQuery.data?.items.length ?? 0, [treeQuery.data])
@@ -350,6 +386,41 @@ export function WorkspacePanel({
     })
   }
 
+  /**
+   * 右键「删除文件夹」：**递归**删除该目录下所有文件（后端逐个软删 + 墓碑 + 各一条 `deleted` 事件，
+   * 再把目录整份落盘删除）。成功后关掉该目录下已打开的标签、清掉它们的草稿。
+   */
+  const removeDir = async (dir: string): Promise<void> => {
+    try {
+      const result = await deleteWorkspaceDirectory(conversationId, dir)
+      // 目录连同其下文件一起没了 ⇒ 关标签 + 清草稿（`isWorkspacePathInDir` 带尾斜杠，不误伤同前缀兄弟）
+      for (const path of openPaths.filter((item) => isWorkspacePathInDir(item, dir))) closeFile(conversationId, path)
+      setDocs((prev) => {
+        const next: Record<string, WorkspaceDoc> = {}
+        for (const [path, doc] of Object.entries(prev)) {
+          if (!isWorkspacePathInDir(path, dir)) next[path] = doc
+        }
+        return next
+      })
+      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      feedback.ok(result.deleted > 0 ? `已删除文件夹（${result.deleted} 个文件）` : '已删除文件夹')
+    } catch (error) {
+      feedback.fail(error, '删除文件夹失败')
+    }
+  }
+
+  /** 右键「删除文件夹」：递归软删仍可在历史里找回，故确认一次即可（但明示"整目录递归"） */
+  const confirmRemoveDir = (dir: string): void => {
+    modal.confirm({
+      title: '删除这个文件夹？',
+      content: `${dir}/ —— 将递归删除其中的所有文件（软删 + 墓碑；可在历史里找回，若在保留期内）`,
+      okText: '删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: () => removeDir(dir),
+    })
+  }
+
   /** 新建文件（`POST .../workspace/file`）：成功后刷新树并直接打开它 */
   const createFile = async (path: string): Promise<void> => {
     setPrompt(null)
@@ -451,13 +522,39 @@ export function WorkspacePanel({
 
   /**
    * 「撤销本轮」（P1-9 · P4 · R2）：把上一轮 agent/人的写入回退到轮初。
-   * 结果按落点动作汇总提示（冲突 / 缺历史 / 不支持都如实展示，见 `revertSummaryText`）。
+   *
+   * ★ 结果**逐条列出**（用户反馈："点「撤销本轮」时没有展示撤销了什么"）：汇总一句 + 每个落点
+   *   一行（路径 / 动作 / 说明）。冲突 / 缺历史 / 不支持都如实展示，而不是只弹一句"还原 N"。
    */
   const revert = async (): Promise<void> => {
     setReverting(true)
     try {
       const result = await revertWorkspaceRound(conversationId)
-      feedback.ok(revertSummaryText(result))
+      modal.info({
+        title: '已撤销本轮',
+        width: 560,
+        okText: '知道了',
+        content: (
+          <div data-testid="revert-report">
+            <p className="ws__revert-summary">{revertSummaryText(result)}</p>
+            {result.items.length > 0 && (
+              <ul className="ws__revert-list">
+                {result.items.map((item) => (
+                  <li key={`${item.action}:${item.path}`} className="ws__revert-item">
+                    <span className={`ws__revert-action ws__revert-action--${item.action}`}>
+                      {revertActionLabel(item.action)}
+                    </span>
+                    <span className="ws__revert-path">{item.path}</span>
+                    {item.message !== undefined && item.message !== '' && (
+                      <span className="ws__revert-message">{item.message}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ),
+      })
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
       // 打开的文件全量重读：干净的重铺，有草稿的进冲突（不静默覆盖）
       void queryClient.invalidateQueries({ queryKey: ['workspace-file', conversationId] })
@@ -468,8 +565,27 @@ export function WorkspacePanel({
     }
   }
 
-  // ── 事件流：内容事件 ⇒ 刷新树；命中当前文件 ⇒ 重载；`deleted` 命中打开的文件 ⇒ 关标签 ──
+  // ── 事件流：内容事件 ⇒ 刷新树 + 自动展开所在目录；命中当前文件 ⇒ 重载；`deleted` 命中打开的文件 ⇒ 关标签 ──
   const [recentEvents, setRecentEvents] = useState<WorkspaceEventItem[]>([])
+  /**
+   * 服务端变更集（`GET /workspace/changes`）：刷新 / 刚进会话时那份"改过哪些文件"的**基线**。
+   *
+   * ⚠️ 面板原来**只**累积实时 SSE 事件 ⇒ 刷新后 / 刚进会话时「最近变更」永远是空的
+   *    （用户反馈："「最近变更」你也看不到"）。这份基线补上那一段，实时事件再叠在它上面。
+   */
+  const [serverChanges, setServerChanges] = useState<WorkspaceChangeEntry[]>([])
+  useEffect(() => {
+    if (!codeMode) return
+    let cancelled = false
+    void fetchWorkspaceChanges(conversationId)
+      .then((result) => {
+        if (!cancelled) setServerChanges(result.items)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [conversationId, codeMode])
   const activePathRef = useRef<string | null>(activePath)
   activePathRef.current = activePath
   useEffect(() => {
@@ -480,7 +596,13 @@ export function WorkspacePanel({
       onEvent: (event) => {
         setRecentEvents((prev) => [...prev.slice(-199), event])
         if (!isContentEvent(event)) return
+        // agent 改了某个文件 ⇒ 自动展开它所在的目录：文件树**默认全折叠**（`WorkspaceTree`），
+        // 不展开就看不见深处的新文件（用户反馈："agent 新增/编辑过的文件没有展示"）。
+        const dirs = workspaceAncestorDirs(event.path)
+        if (dirs.length > 0) expandDirs(conversationId, dirs)
         void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+        // 分支可能刚被换成别的（`git checkout` 会写 `.git/HEAD` ⇒ 也是工作区事件）⇒ 一并失效
+        void queryClient.invalidateQueries({ queryKey: workspaceGitQueryKey(conversationId) })
         if (event.type === 'deleted' && (useWorkspaceStore.getState().tabsByConversation[conversationId]?.openPaths ?? []).includes(event.path)) {
           closeFile(conversationId, event.path)
           return
@@ -490,8 +612,8 @@ export function WorkspacePanel({
       onIssue: () => undefined,
     }).catch(() => undefined)
     return () => controller.abort()
-    // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` 通过 ref 与 getState 引用）
-  }, [conversationId, codeMode, queryClient, closeFile])
+    // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` / `expandDirs` 通过 ref 与稳定引用）
+  }, [conversationId, codeMode, queryClient, closeFile, expandDirs])
 
   // ── ⌘S / Ctrl+S：编辑器聚焦时由 CodeMirror 拦截；焦点在别处（文件树 / 标签）时由这里兜底保存 ──
   const saveActiveRef = useRef<() => void>(() => undefined)
@@ -526,14 +648,32 @@ export function WorkspacePanel({
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
   }, [])
 
-  const changes = useMemo(() => foldWorkspaceEvents(recentEvents).slice(0, 8), [recentEvents])
+  // 「最近变更」= 服务端基线（刷新/刚进会话时那份）∪ 实时事件，按路径折叠、只认内容事件、按时间倒序。
+  // ⚠️ 不能只 `foldWorkspaceEvents(recentEvents)`：那样刷新后 / 刚进会话时列表是空的。
+  const changes = useMemo(() => mergeWorkspaceChanges(serverChanges, recentEvents).slice(0, 8), [serverChanges, recentEvents])
+
+  /**
+   * 右键「复制」：三种口径见 `workspaceModel#workspaceCopyValue`（相对路径 / 容器内 `/work/…` / 名称）。
+   *
+   * ⚠️ 复制失败**不静默**（与用户消息、助手消息两处复制同一口径）：用户要的是那段字符串，
+   *    不是"点了菜单项"。`navigator.clipboard` 需要安全上下文（localhost / https）。
+   */
+  const copyPath = (kind: WorkspaceCopyKind, path: string): void => {
+    const value = workspaceCopyValue(kind, path)
+    navigator.clipboard
+      .writeText(value)
+      .then(() => feedback.ok(`已复制：${value}`))
+      .catch((error: unknown) => feedback.fail(error, '复制失败'))
+  }
 
   /** 文件树右键 / 拖拽要用的动作集合（下传给 `WorkspaceTree`） */
   const treeActions: TreeActions = {
     open: (path) => openFile(conversationId, path),
     rename: (path) => setPrompt({ mode: 'rename', path }),
     remove: confirmRemove,
+    removeDir: confirmRemoveDir,
     download: downloadPath,
+    copy: copyPath,
     newFile: (dir) => setPrompt({ mode: 'createFile', dir }),
     newFolder: (dir) => setPrompt({ mode: 'createFolder', dir }),
     upload: pickUpload,
@@ -626,23 +766,35 @@ export function WorkspacePanel({
                 {recentOpen && (
                   <ul className="ws__recent-list">
                     {changes.map((change) => (
-                      <li key={`${change.path}-${change.at}`}>
-                        <Tag color={changeTagColor(change.type)} style={{ marginInlineEnd: 0 }}>
-                          {change.type}
-                        </Tag>
-                        <button
-                          type="button"
-                          className="ws__recent-path"
-                          title={change.path}
-                          onClick={() => openFile(conversationId, change.path)}
-                        >
-                          {workspaceBaseName(change.path)}
-                        </button>
-                        <span className="ws__recent-actor">{WORKSPACE_ACTOR_LABELS[change.actor]}</span>
-                      </li>
+                      <RecentChangeRow
+                        key={`${change.path}-${change.at}`}
+                        conversationId={conversationId}
+                        change={change}
+                        onOpenFile={() => openFile(conversationId, change.path)}
+                        onOpenDiff={() => setDiffPath(change.path)}
+                      />
                     ))}
                   </ul>
                 )}
+              </div>
+            )}
+
+            {/*
+              项目 git 分支：**固定一栏**，钉在「最近变更」下面（用户反馈 2026-10-15：原来挤在
+              "资源管理器"标题行里，长分支名 / 多仓库根本看不全）。
+              数据来自只读的 `.git/HEAD`（`api/workspace.ts#useWorkspaceGit`）；
+              `repos: []`（没有 git / 工作区还没建 / 请求失败）⇒ **整栏不渲染** —— 宁可没有，
+              也不要一个空标签或"无 git"占位。
+            */}
+            {gitRepos.length > 0 && (
+              <div className="ws__git-bar" data-testid="workspace-git">
+                {gitRepos.map((repo) => (
+                  <div key={repo.path} className="ws__git-row" title={workspaceGitChipTitle(repo)}>
+                    <BranchesOutlined className="ws__git-icon" />
+                    {gitRepos.length > 1 && repo.path !== '' ? <span className="ws__git-repo">{repo.path}</span> : null}
+                    <span className="ws__git-branch">{workspaceGitChipLabel(repo)}</span>
+                  </div>
+                ))}
               </div>
             )}
           </div>
@@ -687,7 +839,15 @@ export function WorkspacePanel({
             <div className="ws__placeholder">
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={openPaths.length === 0 ? '从左侧选一个文件开始' : '正在读取文件…'}
+                description={
+                  // ⚠️ 读失败（文件被删 / 没权限）时**不能**一直显示"正在读取文件…"（产品反馈）：
+                  //    那种情况 `docs[path]` 永远不会被填上 ⇒ 这个占位会一直是"加载中"。
+                  activePath === null
+                    ? '从左侧选一个文件开始'
+                    : fileQuery.isError
+                      ? '文件读不到（可能已被删除，或没有权限）'
+                      : '正在读取文件…'
+                }
               />
             </div>
           ) : (
@@ -800,6 +960,13 @@ export function WorkspacePanel({
         }}
       />
 
+      {/* 行级差异（验收标记）：点「最近变更」某条的「差异」打开 */}
+      <WorkspaceDiffModal
+        conversationId={conversationId}
+        path={diffPath}
+        onClose={() => setDiffPath(null)}
+      />
+
       {/* 上传入口：右键菜单触发选择器，多选逐个 multipart 上传（同一时刻只有一个在传） */}
       <input
         ref={uploadInputRef}
@@ -808,6 +975,137 @@ export function WorkspacePanel({
         style={{ display: 'none' }}
         onChange={(event) => void onUploadPicked(event.target.files)}
       />
+    </div>
+  )
+}
+
+/**
+ * 「最近变更」里的一行：类型标签 + 路径 + **变更量徽标**（`+N −M`）+ 发起者。
+ *
+ * 打开文件与打开差异是**两个动作**：已删除的路径不能打开（读不存在的文件会卡在"加载中"），
+ * 但仍可**看差异**（整篇删除，能核对 agent 到底删了什么）。
+ */
+function RecentChangeRow(props: {
+  conversationId: string
+  change: WorkspaceChangeEntry
+  onOpenFile: () => void
+  onOpenDiff: () => void
+}) {
+  const { conversationId, change, onOpenFile, onOpenDiff } = props
+  // 逐行差异的**计数**（只回 `+N −M`，不带逐行内容）：每行一个轻量查询，点开才取全文
+  const stats = useQuery({
+    queryKey: workspaceFileDiffQueryKey(conversationId, change.path, change.version ?? undefined),
+    queryFn: () => fetchWorkspaceFileDiff(conversationId, change.path, { stats: true }),
+    enabled: change.version !== null,
+    staleTime: 30_000,
+  })
+  const badge = stats.data
+  const deleted = change.type === 'deleted'
+  return (
+    <li>
+      <Tag color={changeTagColor(change.type)} style={{ marginInlineEnd: 0 }}>
+        {change.type}
+      </Tag>
+      {deleted ? (
+        // 已删除的路径**不可点**（产品反馈：点了"一直展示文件加载中"）——但仍可看差异
+        <span className="ws__recent-path ws__recent-path--deleted" title={change.path}>
+          {workspaceBaseName(change.path)}
+        </span>
+      ) : (
+        <button type="button" className="ws__recent-path" title={change.path} onClick={onOpenFile}>
+          {workspaceBaseName(change.path)}
+        </button>
+      )}
+      {badge !== undefined && badge.available ? (
+        <button type="button" className="ws__recent-diff" onClick={onOpenDiff} title="查看行级差异">
+          <span className="ws__diff-added">+{badge.added}</span>
+          <span className="ws__diff-removed">−{badge.removed}</span>
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="ws__recent-diff ws__recent-diff--muted"
+          onClick={onOpenDiff}
+          title={badge?.message ?? '查看差异'}
+        >
+          差异
+        </button>
+      )}
+      <span className="ws__recent-actor">{WORKSPACE_ACTOR_LABELS[change.actor]}</span>
+    </li>
+  )
+}
+
+/**
+ * 文件**行级差异**弹窗（验收标记）：旧行号 / 新行号 / `+/−` 号 / 文本；
+ * 未变长段由后端折成「⋯ N 行未变⋯」一条（`gap`）。
+ */
+function WorkspaceDiffModal(props: { conversationId: string; path: string | null; onClose: () => void }) {
+  const { conversationId, path, onClose } = props
+  const query = useQuery({
+    queryKey: workspaceFileDiffQueryKey(conversationId, path ?? ''),
+    queryFn: () => fetchWorkspaceFileDiff(conversationId, path ?? ''),
+    enabled: path !== null,
+  })
+  const diff = query.data
+  const lines = diff?.lines ?? []
+  return (
+    <Modal
+      open={path !== null}
+      onCancel={onClose}
+      footer={null}
+      width={760}
+      title={
+        <span className="ws__diff-title">
+          差异
+          <span className="ws__diff-title-path">{path}</span>
+          {diff !== undefined && diff.available ? (
+            <span className="ws__diff-title-stat">
+              <span className="ws__diff-added">+{diff.added}</span>{' '}
+              <span className="ws__diff-removed">−{diff.removed}</span>
+            </span>
+          ) : null}
+        </span>
+      }
+    >
+      {query.isError ? (
+        <div className="ws__placeholder">
+          <Typography.Text type="danger">差异读取失败。</Typography.Text>
+        </div>
+      ) : diff === undefined ? (
+        <div className="ws__loading">
+          <Spin />
+        </div>
+      ) : !diff.available ? (
+        <div className="ws__placeholder">
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={diff.message ?? '该文件无法逐行比较'} />
+        </div>
+      ) : lines.length === 0 ? (
+        <div className="ws__placeholder">
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="内容没有变化" />
+        </div>
+      ) : (
+        <div className="ws__diff" data-testid="workspace-diff">
+          {lines.map((line, index) => (
+            <WorkspaceDiffLineRow key={`${index}:${line.type}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} line={line} />
+          ))}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+/** 差异里的一行（`gap` = 折叠的未变长段） */
+function WorkspaceDiffLineRow({ line }: { line: WorkspaceDiffLine }) {
+  if (line.type === 'gap') {
+    return <div className="ws__diff-line ws__diff-line--gap">⋯ {line.gap ?? 0} 行未变 ⋯</div>
+  }
+  return (
+    <div className={`ws__diff-line ws__diff-line--${line.type}`}>
+      <span className="ws__diff-no">{line.oldLine ?? ''}</span>
+      <span className="ws__diff-no">{line.newLine ?? ''}</span>
+      <span className="ws__diff-sign">{line.type === 'add' ? '+' : line.type === 'del' ? '−' : ' '}</span>
+      <span className="ws__diff-text">{line.text}</span>
     </div>
   )
 }
@@ -967,15 +1265,37 @@ function WorkspaceTree(props: {
 
   const toggle = (path: string): void => toggleExpanded(props.conversationId, path)
 
+  /**
+   * 「复制」子菜单（**文件与目录同款**）。三个子项直接取自 `WORKSPACE_COPY_ITEMS`
+   * —— 菜单文案与"复制出来到底是什么"同源一份，不会出现"写着相对路径、复制的是绝对路径"。
+   */
+  const copySubmenu = (): NonNullable<MenuProps['items']>[number] => ({
+    key: 'copy',
+    icon: <CopyOutlined />,
+    label: '复制',
+    children: WORKSPACE_COPY_ITEMS.map((item) => ({ key: `copy-${item.key}`, label: item.label })),
+  })
+
+  /** 命中的是不是「复制」子项 ⇒ 是就执行并回 `true`（调用方据此提前返回） */
+  const handleCopyKey = (key: string, path: string): boolean => {
+    const kind = WORKSPACE_COPY_ITEMS.find((item) => `copy-${item.key}` === key)?.key
+    if (kind === undefined) return false
+    props.actions.copy(kind, path)
+    return true
+  }
+
   const fileMenu = (path: string): MenuProps => ({
     items: [
       { key: 'open', label: '打开' },
       { key: 'rename', icon: <EditOutlined />, label: '重命名 / 移动' },
       { key: 'download', icon: <DownloadOutlined />, label: '下载' },
       { type: 'divider' },
+      copySubmenu(),
+      { type: 'divider' },
       { key: 'delete', icon: <DeleteOutlined />, label: '删除', danger: true },
     ],
     onClick: ({ key }) => {
+      if (handleCopyKey(key, path)) return
       if (key === 'open') props.actions.open(path)
       else if (key === 'rename') props.actions.rename(path)
       else if (key === 'download') props.actions.download(path)
@@ -988,11 +1308,17 @@ function WorkspaceTree(props: {
       { key: 'newFile', icon: <FileAddOutlined />, label: '新建文件' },
       { key: 'newFolder', icon: <FolderAddOutlined />, label: '新建文件夹' },
       { key: 'upload', icon: <UploadOutlined />, label: '上传文件到此目录' },
+      { type: 'divider' },
+      copySubmenu(),
+      { type: 'divider' },
+      { key: 'delete', icon: <DeleteOutlined />, label: '删除文件夹', danger: true },
     ],
     onClick: ({ key }) => {
+      if (handleCopyKey(key, dir)) return
       if (key === 'newFile') props.actions.newFile(dir)
       else if (key === 'newFolder') props.actions.newFolder(dir)
       else if (key === 'upload') props.actions.upload(dir)
+      else if (key === 'delete') props.actions.removeDir(dir)
     },
   })
 

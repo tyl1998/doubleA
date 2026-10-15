@@ -5,16 +5,23 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # 【这一层解的是什么】
 #   Code 会话要"跑项目"（`npm test` / `pytest` / `go build` / `mvn` / `cargo`），而 toolkit 只有
-#   python3 + 常用 CLI。本层按 `COMPONENTS` 给最终镜像**补语言运行时**（有限集合 ⇒ 预烘焙）。
+#   python3 + 常用 CLI。本层按 `COMPONENTS` 给最终镜像**补语言运行时**（预烘焙）。
 #   ★ **只装运行时、不装依赖**（依赖是无限集合、不能白名单，运行期经注册表拉，见 P1-17b）。
 #
-# 【COMPONENTS —— 不再是"一栈一分支"，而是"任意组合"】
-#   2026-10-14 修订（用户定案 B：按需自动构建）：本层不再按写死的 `RUNTIME` 名分支，而是接受
-#   一个**组件清单** `COMPONENTS=lang=ver,lang=ver,…`（如 `python=3.10,node=22`）。
-#   ⇒ 后端可以在**用户选了本机没有的组合时按需 `docker build`**（把同一份 Dockerfile 复用），
-#     运维不必预先猜组合、也不必为每个组合手改这里。
-#   约定：`lang ∈ {node, python, go, java, rust}`；`ver` 是该语言的版本字符串（python 用 `3.10`）。
-#   ⚠️ 空 `COMPONENTS` = 不装语言运行时（只有 toolkit），等价于旧的 `none`。
+# 【COMPONENTS —— "任意组合"，2026-10-15 起版本也不再枚举】
+#   本层接受一个**语言清单** `COMPONENTS=lang=ver,lang=ver,…`（如 `python=3.12,node=20`）。
+#   ⇒ 后端在**用户勾了语言、填了版本后按需 `docker build`**（把同一份 Dockerfile 复用），
+#     运维不必预先猜组合、也不必为每个组合/版本手改这里。
+#   约定：`lang ∈ {node, python, go, java, rust}`；`ver` 是该语言的版本字符串。
+#   各语言的**装法**（版本不再枚举；装法落在这几个脚本里）：
+#     · node：`22` = base 自带；其余 = `install-node-version.sh`（官方发行站 tarball → `node<ver>`）；
+#     · python：`3.11` = 系统自带；其余 = `install-python-version.sh`（uv 从 pypi 拉 → `python<ver>`）；
+#     · go：`install-go-version.sh`（go.dev 官方 tarball → 系统 `go`）；
+#     · java：`install-java-version.sh`（Adoptium/Temurin → 系统 `java`/`javac`，另装 maven）；
+#     · rust：`install-rust-version.sh`（rust-lang 官方 standalone → 系统 `rustc`/`cargo`）。
+#   ⚠️ node / python 有 base/toolkit 必须保留的固定版本（pi 用 node 22、pandas 挂 python 3.11）⇒
+#      非自带版本一律**带版本号的命令名**（`node20` / `python3.12`）；go / java / rust 本层独占 ⇒ 用系统命令名。
+#   ⚠️ 空 `COMPONENTS` = 不装语言运行时（只有 toolkit），等价于 `none`。
 #
 # ⚠️ 不要手敲 docker build：`BASE_IMAGE` / `COMPONENTS` 由 `pnpm sandbox:build` 或后端注入；
 #    缺参数会在下面第一道断言上大声失败，而不是默默烤出一个"不知道装了什么"的镜像。
@@ -25,14 +32,20 @@ FROM ${BASE_IMAGE}
 
 ARG COMPONENTS
 ARG APT_MIRROR
+# Node 发行站（装非自带 node 版本时用）。默认官方；可指向镜像站（如
+# `https://registry.npmmirror.com/-/binary/node`），见 `install-node-version.sh` 文件头。
+ARG NODE_DIST_MIRROR
+# Rust 发行站（装 rust 时用）。默认官方；官方在本机实测被限速到几十 KB/s ⇒ 建议指向镜像站
+# （如 `https://mirrors.ustc.edu.cn/rust-static/dist`），见 `install-rust-version.sh` 文件头。
+ARG RUST_DIST_MIRROR
 
 # base 层结尾是 `USER agent` ⇒ 装包前必须切回 root；装完再切回去（理由同 toolkit/Dockerfile）。
 USER root
 
-# 版本化 python 的安装脚本（python 版本 != 系统自带时调它）。
+# 版本化运行时的安装脚本。
 # ⚠️ 必须**先 COPY、后那条 apt RUN** —— 同一个 RUN 里没法先 COPY 再执行，故脚本单独提前 COPY。
-COPY install-python-version.sh /tmp/install-python-version.sh
-RUN set -eux; chmod 0755 /tmp/install-python-version.sh
+COPY install-python-version.sh install-node-version.sh install-go-version.sh install-java-version.sh install-rust-version.sh /tmp/
+RUN set -eux; chmod 0755 /tmp/install-*.sh
 
 # 与 toolkit 同款：Debian 源可换（本机实测官方源慢十几倍），apt 体量与索引挂构建缓存。
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -52,7 +65,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         echo "=== 组件：${lang}=${ver} ==="; \
         case "${lang}" in \
           node) \
-            echo "node ${ver}：由 base 的 node:22 提供（若 ${ver} != 22 需换 base 镜像，本层不支持改 node 版本）" ;; \
+            if [ "${ver}" = "22" ]; then \
+              echo "node 22 = base 自带（node:22），无需另装"; \
+            else \
+              NODE_DIST_MIRROR="${NODE_DIST_MIRROR:-https://nodejs.org/dist}" /tmp/install-node-version.sh "${ver}" || exit 1; \
+            fi ;; \
           python) \
             apt-get install -y --no-install-recommends python3-pip python3-venv; \
             if [ "${ver}" = "3.11" ]; then \
@@ -61,11 +78,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
               /tmp/install-python-version.sh "${ver}" || exit 1; \
             fi ;; \
           go) \
-            apt-get install -y --no-install-recommends golang-go ;; \
+            /tmp/install-go-version.sh "${ver}" || exit 1 ;; \
           java) \
-            apt-get install -y --no-install-recommends openjdk-17-jdk-headless maven ;; \
+            /tmp/install-java-version.sh "${ver}" || exit 1; \
+            apt-get install -y --no-install-recommends maven ;; \
           rust) \
-            apt-get install -y --no-install-recommends rustc cargo ;; \
+            RUST_DIST_MIRROR="${RUST_DIST_MIRROR:-https://static.rust-lang.org/dist}" /tmp/install-rust-version.sh "${ver}" || exit 1 ;; \
           *) \
             echo "未知的组件语言 ${lang}（应为 node/python/go/java/rust）" >&2; exit 1 ;; \
         esac; \

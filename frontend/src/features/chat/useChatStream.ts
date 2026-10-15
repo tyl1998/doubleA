@@ -1,5 +1,5 @@
 /**
- * 对话流 Hook（P0-1-32 建；P0-1-33 补"停止"与"断线对齐"）
+ * 对话流 Hook（P0-1-32 建；P0-1-33 补"停止"与"断线对齐"；**P1-19 多流**）
  *
  * 依据：`docs/03-前端设计.md` §六（"SSE 状态集中在 `useChatStream`（fetch 流解析 → store 分发），
  *      页面组件只读 store"）、§4.1（"**首条消息发送时才创建会话**"、输入区状态机与停止时序、
@@ -9,24 +9,33 @@
  * 一次发送的完整时序（每一步都在这里，页面不该再拼一遍）
  * ─────────────────────────────────────────────────────────────────────
  * ```
- * ① 同步闸门（`sendGate`）：上一次发送还没结束就直接拒绝 —— 见 `composerState.ts` 的 `createSendGate`
+ * ① 同步闸门（`sendGate`，**按会话**）：上一次发送还没结束就直接拒绝 —— 见 `composerState.ts#createSendGate`
  * ② 正文 trim（空串直接返回，不发请求 —— 与后端 `chatRequestBodySchema` 的 `.min(1)` 同口径）
- * ③ **另一个会话正在生成 ⇒ 拒绝**（P0-1-34；前端只有一个轮次槽，见下面那段长注释）
- *    ⚠️ 它必须排在 ④ 之前：放到后面会在"新建会话态"下先建出一个空会话再报错
- * ④ 没有会话 ⇒ `POST /api/conversations` 建一个（`03` §4.1），把新 id 交给页面写进 URL
+ * ③ 没有会话 ⇒ `POST /api/conversations` 建一个（`03` §4.1），把新 id 交给页面写进 URL
  *    ⚠️ 这一步失败 ⇒ **整次发送作废**，且**不在界面上留下任何痕迹**（前置失败一个字不落库）
- * ⑤ store.begin(...)  ← 注意顺序：**流建立之后**才开始画气泡。反过来会让"点发送就出现
- *    两条气泡、然后弹一个错误提示"，而那句话根本没被服务端接受过
- * ⑥ POST /chat + 读完事件流（每帧 `store.apply`）
- * ⑦ 收尾：`done` / `error` 事件由归约层收口；**没有终帧就结束** ⇒ 这里补一条"连接中断"
+ * ④ store.begin(conversationId, ...)  ← 注意顺序：**流建立之后**才开始画气泡
+ * ⑤ POST /chat + 读完事件流（每帧 `store.apply(conversationId, ...)`）
+ * ⑥ 收尾：`done` / `error` 事件由归约层收口；**没有终帧就结束** ⇒ 这里补一条"连接中断"
  *    （`terminated === false`，见 `chatStream.ts` 的文件头）**并亮黄条**
  * ```
  *
- * ⚠️ ③ 是 P0-1-34（会话侧栏）带出来的一条**新闸门**，它拦的不是"服务端不允许"，
- * 而是"**本批前端表达不了**"：见 `send` 里那段注释（一个轮次槽 + 淡出的串台）。
- * 它同时是**界面上的第六个状态**（`composerState.ts` 的 `elsewhere`）—— 于是用户在
- * 按下发送之前就知道发不出去，而不是"点了才被告知"。两面都要有：状态机负责"看得见"，
- * 这里负责"拦得住"。
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ P1-19：每个会话各有一条流（不再"一个轮次槽"）
+ * ─────────────────────────────────────────────────────────────────────
+ * 早先前端**只有一个轮次槽**（`stores/chatStream.ts` 的 `round`），于是"在 A 里发消息、没等
+ * 收口就切到 B"会串台，处置是**拦住**（第六态 `elsewhere` + `send` 的 `BUSY` 闸门，P0-1-34）。
+ * 代价是"只要 A 还在跑（TaskAgent 动辄数分钟），B 就一直发不出消息"（用户报的"切过去卡住"）。
+ *
+ * 现在 store 按会话存（`rounds[conversationId]`），本 hook 的每一处副作用也都**按会话**：
+ *   · **闸门**（`createSendGate`）与"发送中 / 停止中"标记 ⇒ `Map<conversationId, …>`；
+ *   · **abort 控制器** ⇒ `Map<conversationId, AbortController>`（在 B 里发消息**不会**掐掉 A 的那条）；
+ *   · 事件的 `begin`/`apply`/`fail`/`showDisconnect` 都带 `conversationId`（每个流的 `onEvent`
+ *     闭包各自捕获自己的 `targetId` —— 这是"不串台"的关键）。
+ * 于是"另一条流在跑"不再是**拦阻条件**，`elsewhere` 整个概念随之消失。
+ *
+ * ⚠️ 本 hook 仍然是"**当前会话**的那一条"：`send`/`stop`/`steer`/`align` 都作用于
+ * `conversationIdRef.current`（页面一次只看一个会话，只能对它操作）。别的会话的流由它自己的
+ * `onEvent` 闭包继续推进 store，切回去就能看到。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三类失败，三种处置（别混成一种）
@@ -34,7 +43,7 @@
  * | 失败 | 例子 | 界面 |
  * |------|------|------|
  * | **前置失败**（信封） | 401 / 400 / 404 / 409 只读 / 424 缺凭据 | `send` 返回 `{ok:false}`，**气泡不出现**，正文还给输入框 |
- * | **前端闸门**（不发请求） | 同标签页重复发送（`BUSY`）、**另一个会话正在生成**（`BUSY`，P0-1-34） | 同上（同一个出口） |
+ * | **前端闸门**（不发请求） | 同会话重复发送（`BUSY`） | 同上（同一个出口） |
  * | **流内 error 事件** | `CONFLICT`、上游 500 | 归约层把这一轮标红 ⇒ 消息流内错误卡 + **toast**（`03` §五 的 `error` 行），**不亮黄条** |
  * | **连接中断** | 服务端被 kill、代理断开 | 错误卡（`errorSource:'client'`）+ **顶部黄条**（`03` §4.1），**不弹 toast** |
  * 前两种的分界线由后端定（`shared/src/sse.ts` 文件头 ③），前端只需按"**响应是不是事件流**"分流
@@ -51,7 +60,7 @@
  */
 
 import { useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AgentType, ConversationActive, ConversationItem, MessagePageResult } from '@doubulea/shared'
 
 import {
@@ -68,7 +77,12 @@ import {
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
-import { useChatStreamStore, type DisconnectState } from '../../stores/chatStream.js'
+import {
+  disconnectOf,
+  roundOf,
+  useChatStreamStore,
+  type DisconnectState,
+} from '../../stores/chatStream.js'
 import { decideAlign, type AlignOutcome } from './alignHistory.js'
 import { createSendGate } from './composerState.js'
 import { reportSseIssue } from './chatStream.js'
@@ -86,6 +100,13 @@ export type SendOutcome = { ok: true } | { ok: false; error: unknown }
  * `signaled: false` 同款。`ok: false` 才是真失败（网络 / 信封错误），调用方给一句提示并把正文还回输入框。
  */
 export type SteerOutcome = { ok: true; accepted: boolean } | { ok: false; error: unknown }
+
+/**
+ * "新会话态"在闸门 / 发送中标记里用的**哨兵键**（`conversationId` 还是 `undefined` 时）。
+ * 空串与任何真实会话 id（uuid）都不可能相等 ⇒ 可安全当键。会话一建出来就**转**到真 id 上
+ * （见 `send`），否则"发完首条的会话还在跑"会一直占着这个键、把后续新会话挡住。
+ */
+const NEW_CONVERSATION_KEY = ''
 
 export interface UseChatStreamOptions {
   /**
@@ -109,25 +130,16 @@ export interface UseChatStreamOptions {
 }
 
 export interface UseChatStreamResult {
-  /** 当前会话进行中的那一轮（不属于当前会话时为 `null`，见 `stores/chatStream.ts` 的 `streamFor`） */
+  /** 当前会话进行中的那一轮（别的会话的轮次不在这里，见 `stores/chatStream.ts`） */
   round: StreamRound | null
-  /** 是否正在生成（输入区的禁用判据） */
+  /** 当前会话是否正在生成（输入区的禁用判据） */
   streaming: boolean
   /** `send()` 在飞（含"建会话 + 建流"这段 `round` 还不存在的空窗）—— 状态机的 `sending` */
   sending: boolean
   /** 点了停止、正在 5s 窗口里等收口 —— 状态机的 `stopping` */
   stopping: boolean
-  /** 顶部黄条（`03` §4.1 断线）；点击它应当调 {@link UseChatStreamResult.align} */
+  /** 当前会话的顶部黄条（`03` §4.1 断线）；点击它应当调 {@link UseChatStreamResult.align} */
   disconnect: DisconnectState | null
-  /**
-   * **哪个**会话此刻在生成（P0-1-34 的侧栏要用它点亮那一条的"生成中"灯）；`null` = 没有。
-   *
-   * ⚠️ 不能直接拿 `streamFor`：它一直留到这一轮被让位或被清掉（`stores/chatStream.ts`），
-   * 于是"刚收口的那条"会多亮几秒。判据与输入区的 `streaming` **同源** —— 只有
-   * `status === 'streaming'` 才算在生成（`stopping` 窗口里也是 `streaming`，
-   * 那段时间界面**确实**还在等服务端收口，亮着是对的）。
-   */
-  streamingId: string | null
   /**
    * 发一条消息；返回 `ok:false` 时正文应当还给输入框。`modelId` 省略走智能体默认模型。
    * `attachments` 是**已经上传好的**附件（P1-4）：正文展开成多模态 part / 文本注入由后端做。
@@ -146,8 +158,9 @@ export interface UseChatStreamResult {
   /**
    * 中途插话（P1-9 · P4 · R1）：向**运行中**的 agent 插一句话（`POST /:id/steer`）。
    *
-   * ⚠️ 只对 **TaskAgent** 会话有意义（沙箱）：ChatBot 链路的 producer 不注册 steer 监听器
-   * ⇒ 插话不会被消费。前端据此把它只对 TaskAgent 会话放出（`agentType` 判据在页面）。
+   * **P1-20 起两种会话都支持**：TaskAgent 投给沙箱 pi 引擎（bridge `steer` 命令）；ChatBot 在
+   * **下一次上游调用前**注入（producer 已注册 steer 监听器）。投递时机 = **助手 turn 边界**
+   * （见 `docs/子方案/Code模式工作区.md` §十五）。出口层还会回发一帧 `steer` ⇒ 界面看得到这条插话。
    * 返回 `{ ok:true, accepted:false }` = 流刚好结束（**幂等，不是错误**）。
    */
   steer: (message: string) => Promise<SteerOutcome>
@@ -164,19 +177,51 @@ export function useChatStream(
   conversationId: string | undefined,
   options: UseChatStreamOptions = {},
 ): UseChatStreamResult {
-  // 只订阅"这一轮"与"这一轮属于谁"两个字段：**不要**在 hook 里 `useChatStreamStore()`
-  // 整取（zustand v5 用 `useSyncExternalStore` 严格比较，返回新对象会无限重渲染）
-  const round = useChatStreamStore((state) => state.round)
-  const streamFor = useChatStreamStore((state) => state.streamFor)
-  const disconnect = useChatStreamStore((state) => state.disconnect)
+  // 只订阅"这个会话的那一轮"与"这个会话的黄条"：**不要**在 hook 里 `useChatStreamStore()` 整取
+  //（zustand v5 用 `useSyncExternalStore` 严格比较，返回新对象会无限重渲染）。两个 selector 都
+  // 返回**稳定引用**（没变就是同一个对象 / `null`）。
+  const round = useChatStreamStore((state) => roundOf(state, conversationId))
+  const disconnect = useChatStreamStore((state) => disconnectOf(state, conversationId))
 
-  const abortRef = useRef<AbortController | null>(null)
+  // 每个会话各一个 abort 控制器（多流：在 B 里发消息不该掐掉 A 的那条）
+  const abortRef = useRef(new Map<string, AbortController>())
   const queryClient = useQueryClient()
-  const [sending, setSending] = useState(false)
-  const [stopping, setStopping] = useState(false)
-  // 同标签页重复发送的**同步**闸门（见 `composerState.ts`）：React 状态更新是异步的，
-  // 两次极快的 Enter 都读得到旧草稿 ⇒ 只有同步闸门拦得住"各建一个会话"那种事故
-  const sendGate = useMemo(() => createSendGate(), [])
+
+  // 同步闸门按会话各一把（见 `send`）：同一会话别发两遍，不同会话互不阻塞
+  const sendGatesRef = useRef(new Map<string, ReturnType<typeof createSendGate>>())
+  const gateFor = useCallback((key: string): ReturnType<typeof createSendGate> => {
+    const existing = sendGatesRef.current.get(key)
+    if (existing !== undefined) return existing
+    const created = createSendGate()
+    sendGatesRef.current.set(key, created)
+    return created
+  }, [])
+
+  // "发送中 / 停止中"也按会话记（否则在 A 里发送中时切到 B，B 的输入区会被误判成 sending/stopping）
+  const [sendingKeys, setSendingKeys] = useState<ReadonlySet<string>>(() => new Set<string>())
+  const [stoppingKeys, setStoppingKeys] = useState<ReadonlySet<string>>(() => new Set<string>())
+  const markSending = useCallback((key: string): void => {
+    setSendingKeys((prev) => (prev.has(key) ? prev : new Set(prev).add(key)))
+  }, [])
+  const unmarkSending = useCallback((key: string): void => {
+    setSendingKeys((prev) => {
+      if (!prev.has(key)) return prev
+      const next = new Set(prev)
+      next.delete(key)
+      return next
+    })
+  }, [])
+  const markStopping = useCallback((key: string): void => {
+    setStoppingKeys((prev) => (prev.has(key) ? prev : new Set(prev).add(key)))
+  }, [])
+  const unmarkStopping = useCallback((key: string): void => {
+    setStoppingKeys((prev) => {
+      if (!prev.has(key)) return prev
+      const next = new Set(prev)
+      next.delete(key)
+      return next
+    })
+  }, [])
 
   // 回调/参数走 ref：`send` 的依赖里不该出现调用方每次渲染都新建的函数（否则引用每次都变，
   // 输入区的 `useCallback`/effect 跟着重跑）；`conversationId` 同理 —— 见下面的卸载注释
@@ -229,33 +274,12 @@ export function useChatStream(
     if (outcome.dropStreamVersion) {
       // 服务端存下来了 ⇒ 丢掉流式版本（否则同一轮会渲染两遍）。注意 `reset()` **不动黄条**：
       // 那是"我已经对齐过"的可见凭据，由调用方（点黄条那一下）显式清
-      useChatStreamStore.getState().reset()
+      useChatStreamStore.getState().reset(targetId)
     }
     return outcome
   }, [queryClient])
   const alignRef = useRef(align)
   alignRef.current = align
-
-  /**
-   * "别的会话正在生成" ⇒ 拒绝（P0-1-34）。`send` 与 `regenerate` **共用这一条判据**
-   * （两处各写一遍必然漂移）。返回 `null` = 可以继续。
-   *
-   * 为什么必须拦：本批的前端只有**一个轮次槽**（`stores/chatStream.ts` 的 `round`）。
-   * 侧栏让"切到别的会话再发一条"变成一个很容易的动作，而那时：
-   *   · `store.begin(targetId, …)` 会**覆盖**掉另一个会话正在进行的一轮；
-   *   · 旧流的帧还在往同一个槽里灌（`apply` 不认识"这一帧属于谁"）。
-   * 两者合起来是一个**静默串台**：B 的回答里混进 A 的增量，而两个会话各自看起来
-   * 都"有内容"。后端每个会话各有一把锁（允许并行），"同时只能有一条"是本批前端的约束
-   * （多流要把 store 改成 `Map`，属后续批次）。
-   *
-   * ⚠️ 文案要**能照着做**（"等它结束，或到那个会话点停止"），不能只说"不允许"。
-   */
-  const streamingElsewhere = useCallback((targetId: string | undefined): ApiError | null => {
-    const state = useChatStreamStore.getState()
-    const running = state.round !== null && state.round.status === 'streaming' ? state.streamFor : null
-    if (running === null || running === targetId) return null
-    return new ApiError('BUSY', '另一个会话正在生成中：等它结束，或到那个会话点「停止」', 429)
-  }, [])
 
   /** 一次流的"开流参数"（`streamChat` / `streamRegenerate` 的公共形状：URL/body 不同，读流一致） */
   type StreamOpener = (signal: AbortSignal) => Promise<Awaited<ReturnType<typeof streamChat>>>
@@ -270,6 +294,7 @@ export function useChatStream(
    * 两处各写一遍这套收尾，迟早有一处先腐烂（症状：重新生成后侧栏排序不动、或产物面板停在旧数）。
    *
    * `kind` 只影响渲染层（页面据此收起正在被替换的一轮），事件归约与收尾逐字同款。
+   * ⚠️ 事件走 `apply(targetId, …)` —— 这个闭包捕获的就是**本流**的会话（多流不串台的关键）。
    */
   const performStream = useCallback(
     async (
@@ -279,10 +304,11 @@ export function useChatStream(
       open: StreamOpener,
       userAttachments: readonly AttachmentView[] = [],
     ): Promise<SendOutcome> => {
-      // 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）
+      // 开一轮（此后界面上就有两条气泡了 —— 服务端已经接受这次请求）。
+      // ⚠️ 只 abort **同一个会话**上一条还没收尾的控制器（多流下不能顺手掐别的会话）
       const controller = new AbortController()
-      abortRef.current?.abort()
-      abortRef.current = controller
+      abortRef.current.get(targetId)?.abort()
+      abortRef.current.set(targetId, controller)
       useChatStreamStore.getState().begin(targetId, content, new Date().toISOString(), kind, userAttachments)
 
       try {
@@ -292,11 +318,13 @@ export function useChatStream(
           // 流没给终帧就结束了（服务端被 kill / 代理断开）。**必须让用户看到**：
           // 半条回答与完整回答在界面上长得一样，静默接受就是"把故障显示成成功"。
           // 两个通道各司其职：消息流内的错误卡（说"这一轮没成"）+ 顶部黄条（说"点我对齐"）
-          useChatStreamStore.getState().fail({
+          useChatStreamStore.getState().fail(targetId, {
             code: 'NETWORK',
             message: '与服务器的连接中断，已生成的内容保留（可点顶部的提示对齐历史）',
           })
-          useChatStreamStore.getState().showDisconnect({ extra: 'NETWORK · 没收到服务端的收口事件' })
+          useChatStreamStore
+            .getState()
+            .showDisconnect(targetId, { extra: 'NETWORK · 没收到服务端的收口事件' })
         }
         return { ok: true }
       } catch (error) {
@@ -305,12 +333,12 @@ export function useChatStream(
         if (!controller.signal.aborted) {
           const code: ClientErrorCode = error instanceof ApiError ? error.code : 'NETWORK'
           const message = error instanceof ApiError ? error.message : '读取回答时连接中断'
-          useChatStreamStore.getState().fail({ code, message })
-          useChatStreamStore.getState().showDisconnect({ extra: `${code} · ${message}` })
+          useChatStreamStore.getState().fail(targetId, { code, message })
+          useChatStreamStore.getState().showDisconnect(targetId, { extra: `${code} · ${message}` })
         }
         return { ok: true }
       } finally {
-        if (abortRef.current === controller) abortRef.current = null
+        if (abortRef.current.get(targetId) === controller) abortRef.current.delete(targetId)
         // 这一轮真的发生过 ⇒ 库里可能多了消息（`02` §5.2："中断/故障照样落库"）
         // ⇒ 让历史失效，下次读到的就是落库后的版本。
         // ⚠️ **不做这件事的后果很隐蔽**：`staleTime` 是 30s（`api/queryClient.ts`），
@@ -344,24 +372,18 @@ export function useChatStream(
       // 空正文：与后端 `.min(1)` 同口径，不发请求（把"必填"的失败留给界面自己判，见 `ChatPage`）
       if (content === '') return { ok: true }
 
-      // ① 同步闸门。**返回 `BUSY` 而不是静默丢弃**：用户打的字不能凭空消失，
-      //    页面会把正文还给输入框并提示（`ChatPage#submit` 对 `!outcome.ok` 的处置）
-      if (!sendGate.enter()) {
-        return {
-          ok: false,
-          error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429),
-        }
+      // ① 同步闸门（**按会话**）。**返回 `BUSY` 而不是静默丢弃**：用户打的字不能凭空消失，
+      //    页面会把正文还给输入框并提示（`ChatPage#submit` 对 `!outcome.ok` 的处置）。
+      //    新会话态先用哨兵键；会话一建出来、**URL 落定之后**再**转**到真 id（见下面）——
+      //    转了之后这条会话自己占一格，别的新会话才发得出去（否则"发完首条的那条会话还在跑"
+      //    会一直占着哨兵键，把后面的新会话挡住 —— 正是多流要修掉的那类卡住）。
+      let gateKey = conversationIdRef.current ?? NEW_CONVERSATION_KEY
+      if (!gateFor(gateKey).enter()) {
+        return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
       }
-
-      setSending(true)
+      markSending(gateKey)
       try {
-        // ③ 别的会话正在生成 ⇒ 拒绝（见 `streamingElsewhere`）。
-        // ⚠️ 它排在 `createConversation` **之前**：放到后面会在"新建会话态"下先建出一个
-        //    空会话再报错（用户侧栏里凭空多一条"新会话"）。
-        const busy = streamingElsewhere(conversationIdRef.current)
-        if (busy !== null) return { ok: false, error: busy }
-
-        // ④ 没有会话就先建（`03` §4.1：首条消息发送时才创建会话）
+        // ② 没有会话就先建（`03` §4.1：首条消息发送时才创建会话）
         let targetId = conversationIdRef.current
         if (targetId === undefined) {
           let created: ConversationItem
@@ -371,13 +393,21 @@ export function useChatStream(
             return { ok: false, error }
           }
           targetId = created.id
-          // ⚠️ **await**：回调可能在开流前要落一步服务端写（如新会话态预置的自动审批，
-          //    见 `UseChatStreamOptions.onConversationCreated`）。放在 `performStream` 之前，
-          //    才能保证第一轮生效 —— 否则首轮的危险工具会先弹一次确认卡。
+          // ⚠️ **await**：回调会把 id 写进 URL，并可能在开流前落几步服务端写（新会话态预置的
+          //    自动审批 / Code / 运行时 / 记忆，见 `UseChatStreamOptions.onConversationCreated`）。
+          //    必须放在 `performStream` 之前 —— 否则首轮的危险工具会先弹一次确认卡。
+          //    这期间**仍占着"新会话"那道闸门与标记**：窗口里 `round` 还不存在，若提前放开，
+          //    输入区会判成 idle、再按一次 Enter 就会**再建一个会话**（闸门要拦的正是它）。
           await onConversationCreatedRef.current?.(created)
+          // URL 已落定（`conversationId` 已是新 id）：把闸门与"发送中"标记转到真 id 上
+          gateFor(gateKey).leave()
+          unmarkSending(gateKey)
+          gateKey = targetId
+          gateFor(gateKey).enter()
+          markSending(gateKey)
         }
 
-        // ⑤ 开一轮并读完流
+        // ③ 开一轮并读完流
         return await performStream(
           targetId,
           content,
@@ -387,7 +417,8 @@ export function useChatStream(
               targetId,
               content,
               {
-                onEvent: (event) => useChatStreamStore.getState().apply(event),
+                // ⚠️ 捕获的是**本流**的 targetId（多流不串台）
+                onEvent: (event) => useChatStreamStore.getState().apply(targetId, event),
                 // 形状不对 = 两侧契约漂了（后端每帧都过同一份 schema）。**只记不改这一轮**：
                 // 丢一帧的代价远小于"把已经渲染好的回答改花"，而线索必须留下（见 `reportSseIssue`）
                 onIssue: reportSseIssue,
@@ -399,11 +430,11 @@ export function useChatStream(
           attachments,
         )
       } finally {
-        sendGate.leave()
-        setSending(false)
+        gateFor(gateKey).leave()
+        unmarkSending(gateKey)
       }
     },
-    [agentId, performStream, sendGate, streamingElsewhere],
+    [agentId, gateFor, markSending, performStream, unmarkSending],
   )
 
   /**
@@ -415,7 +446,7 @@ export function useChatStream(
    *   · **不校验 `content` 长度**：正文来自历史里那条消息（后端也会自己从库里读同一段），
    *     这里只用它渲染这一轮的气泡。空正文只是"这轮没什么可重跑"，拒绝即可。
    *
-   * 其余（同步闸门 / 别处正在生成 / 三类失败 / 三处失效）全部复用 {@link performStream}。
+   * 其余（同步闸门 / 三类失败 / 三处失效）全部复用 {@link performStream}。
    */
   const regenerate = useCallback(
     async (userText: string, modelId?: string): Promise<SendOutcome> => {
@@ -427,20 +458,16 @@ export function useChatStream(
       if (content === '') {
         return { ok: false, error: new ApiError('VALIDATION', '这一轮没有可重新生成的正文', 0) }
       }
-      if (!sendGate.enter()) {
+      if (!gateFor(targetId).enter()) {
         return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
       }
-
-      setSending(true)
+      markSending(targetId)
       try {
-        const busy = streamingElsewhere(targetId)
-        if (busy !== null) return { ok: false, error: busy }
-
         return await performStream(targetId, content, 'regenerate', (signal) =>
           streamRegenerate(
             targetId,
             {
-              onEvent: (event) => useChatStreamStore.getState().apply(event),
+              onEvent: (event) => useChatStreamStore.getState().apply(targetId, event),
               onIssue: reportSseIssue,
             },
             signal,
@@ -448,24 +475,25 @@ export function useChatStream(
           ),
         )
       } finally {
-        sendGate.leave()
-        setSending(false)
+        gateFor(targetId).leave()
+        unmarkSending(targetId)
       }
     },
-    [performStream, sendGate, streamingElsewhere],
+    [gateFor, markSending, performStream, unmarkSending],
   )
 
   /**
    * 停止控制器：**只创建一次**（`useRef`），否则每次渲染都会新建一个 ⇒
    * 里面那个"正在停止"的闸门与 `stopping` 状态每次渲染都被重置，"双击不会发两次请求"立刻失效。
    * 它读的东西全部走 ref（`conversationIdRef` / `abortRef` / `alignRef`）⇒ 闭包不会读到旧值。
+   * ⚠️ 它作用于**当前会话**（页面一次只看一个会话）。
    */
   const stopControllerRef = useRef<ReturnType<typeof createStopController> | null>(null)
   if (stopControllerRef.current === null) {
     stopControllerRef.current = createStopController({
       isRunning: () => {
         const state = useChatStreamStore.getState()
-        return state.round !== null && state.round.status === 'streaming'
+        return roundOf(state, conversationIdRef.current)?.status === 'streaming'
       },
       requestStop: async () => {
         const targetId = conversationIdRef.current
@@ -479,14 +507,15 @@ export function useChatStream(
           {
             subscribe: (listener) => useChatStreamStore.subscribe(listener),
             isSettled: () => {
-              const state = useChatStreamStore.getState()
-              return state.round === null || state.round.status !== 'streaming'
+              const round = roundOf(useChatStreamStore.getState(), conversationIdRef.current)
+              return round === null || round.status !== 'streaming'
             },
           },
           timeoutMs,
         ),
       abort: () => {
-        abortRef.current?.abort()
+        const targetId = conversationIdRef.current
+        if (targetId !== undefined) abortRef.current.get(targetId)?.abort()
       },
       align: async () => {
         await alignRef.current()
@@ -501,32 +530,33 @@ export function useChatStream(
    * 只有用户点一下对齐才能消掉（文案见 `streamErrors.ts`）。
    */
   const stop = useCallback(async (): Promise<StopOutcome> => {
-    setStopping(true)
+    const targetId = conversationIdRef.current
+    if (targetId !== undefined) markStopping(targetId)
     try {
       const outcome = await stopController.stop()
-      if (outcome.kind === 'settled-locally') {
+      if (targetId !== undefined && outcome.kind === 'settled-locally') {
         // 窗口内没等到 `done{STOPPED}`：客户端侧把这一轮标成"已停止"（如实标注，不假装收到了确认）
-        useChatStreamStore.getState().stoppedLocally()
-        useChatStreamStore.getState().showDisconnect({
+        useChatStreamStore.getState().stoppedLocally(targetId)
+        useChatStreamStore.getState().showDisconnect(targetId, {
           extra: `已过 ${Math.round(outcome.timeoutMs / 1000)}s 没等到服务端的收口事件`,
         })
-      } else if (outcome.kind === 'stop-request-failed') {
+      } else if (targetId !== undefined && outcome.kind === 'stop-request-failed') {
         const message =
           outcome.error instanceof ApiError ? `${outcome.error.code} · ${outcome.error.message}` : '停止信号没能发出去'
-        useChatStreamStore.getState().showDisconnect({ extra: message })
+        useChatStreamStore.getState().showDisconnect(targetId, { extra: message })
       }
       return outcome
     } finally {
-      setStopping(false)
+      if (targetId !== undefined) unmarkStopping(targetId)
     }
-  }, [stopController])
+  }, [markStopping, stopController, unmarkStopping])
 
   /**
    * 中途插话（P1-9 · P4 · R1）。**纯前端闸门 + 一次普通请求**（不走 `stopController` 那套时序）：
    * 与 `send` / `stop` 共用"本会话正在流式"这条判据，但**不参与流收口** —— 插话只是塞一句话进去，
    * 这一轮的 `done` / `error` 照旧由那条 SSE 流收尾（前端不做任何额外状态）。
    *
-   * ⚠️ 只在"本会话正 streaming"时发（`round.status === 'streaming' && streamFor === targetId`）：
+   * ⚠️ 只在"本会话正 streaming"时发（`rounds[targetId].status === 'streaming'`）：
    * 流刚好结束时的插话会得到 `accepted:false`（幂等），这里提前拦一下省一次必然落空的请求。
    */
   const steer = useCallback(async (message: string): Promise<SteerOutcome> => {
@@ -536,12 +566,19 @@ export function useChatStream(
     if (targetId === undefined) {
       return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法插话', 0) }
     }
-    const state = useChatStreamStore.getState()
-    if (state.round === null || state.round.status !== 'streaming' || state.streamFor !== targetId) {
+    const round = roundOf(useChatStreamStore.getState(), targetId)
+    if (round === null || round.status !== 'streaming') {
       return { ok: true, accepted: false }
     }
     try {
       const result = await steerConversation(targetId, text)
+      // ★ 乐观插入（P1-20）：插话常常发生在轮次的最后几秒，出口层的 `steer` 回帧依赖"通道轮询在
+      //   轮次结束前取到"，可能整个落空 ⇒ 界面上"插话直接消失了"。用户说过的话必须看得见 ⇒
+      //   **展示以本地为准**（`accepted:true` = 确实写给了一个正在跑的流）。出口层若真回了帧，
+      //   归约层按正文去重（`withInterjection`），不会显示两遍。
+      if (result.accepted) {
+        useChatStreamStore.getState().addInterjection(targetId, text, new Date().toISOString())
+      }
       return { ok: true, accepted: result.accepted }
     } catch (error) {
       return { ok: false, error }
@@ -551,43 +588,39 @@ export function useChatStream(
   /** 点黄条：对齐历史，然后把黄条收掉（无论对齐结论是什么 —— 用户点它就表示"以服务端为准"） */
   const alignAndClear = useCallback(async (): Promise<AlignOutcome | null> => {
     const outcome = await align()
-    useChatStreamStore.getState().clearDisconnect()
+    const targetId = conversationIdRef.current
+    if (targetId !== undefined) useChatStreamStore.getState().clearDisconnect(targetId)
     return outcome
   }, [align])
-  // 卸载：中断在飞的流 + 清空这一轮。
+
+  // 卸载：中断所有在飞的流 + 清空所有轮次与黄条。
   //
   // ⚠️ **刻意不依赖 `conversationId`**（早先写成依赖它，会导致一个很难查的 bug）：
   // "没有会话的新会话态"发第一条消息时，`send` 会先建会话、再把 id 写进 URL
   // （`onConversationCreated`）⇒ `conversationId` 从 `undefined` 变成 id ⇒ 依赖变化 ⇒
   // cleanup 立刻把**刚发起的那条流** abort 掉，症状是"第一条消息永远收不到回答、
   // 但第二条起一切正常"。改成空依赖后，切换会话**不会**中断旧流：
-  //   · 不串台由 `streamFor` 守卫保证（见 `stores/chatStream.ts`）；
+  //   · 不串台由 `rounds` 按键隔离保证（见 `stores/chatStream.ts`）；
   //   · 用户在流式中切走再切回，反而能看到完整内容（比"切走即中断"更好）。
-  // 卸载时连黄条一起收掉：它是"这个页面这一轮"的状态，没人看了就该走
+  // 卸载时连黄条一起收掉：它是"这个页面这一刻"的状态，没人看了就该走
   // （与"对齐后保留黄条"不矛盾：那是有页面在看的时候）。
   useEffect(() => {
     return () => {
-      abortRef.current?.abort()
-      abortRef.current = null
-      useChatStreamStore.getState().reset()
-      useChatStreamStore.getState().clearDisconnect()
+      for (const controller of abortRef.current.values()) controller.abort()
+      abortRef.current.clear()
+      useChatStreamStore.getState().resetAll()
     }
   }, [])
 
-  // 只有"这一轮属于当前会话"时才交给页面渲染（防串台）。
-  // ⚠️ `streaming` 也必须用**过滤后**的那一个：否则页面在别的会话里也会被禁用输入区
-  const visibleRound = streamFor !== null && streamFor === conversationId ? round : null
-
-  /** 见 {@link UseChatStreamResult.streamingId}：判据与 `streaming` 同源，但**不过滤会话** */
-  const streamingId = streamFor !== null && round !== null && round.status === 'streaming' ? streamFor : null
+  const sending = sendingKeys.has(conversationId ?? NEW_CONVERSATION_KEY)
+  const stopping = stoppingKeys.has(conversationId ?? NEW_CONVERSATION_KEY)
 
   return {
-    round: visibleRound,
-    streaming: visibleRound !== null && visibleRound.status === 'streaming',
+    round,
+    streaming: round !== null && round.status === 'streaming',
     sending,
     stopping,
     disconnect,
-    streamingId,
     send,
     regenerate,
     stop,

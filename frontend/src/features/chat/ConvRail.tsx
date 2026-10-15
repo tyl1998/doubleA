@@ -36,7 +36,7 @@ import { HOME_PATH, conversationPath, newConversationPath } from '../../app/path
 import { ServiceLed } from '../../app/ServiceLed.js'
 import { UserMenu } from '../../app/UserMenu.js'
 import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
-import { useChatStreamStore } from '../../stores/chatStream.js'
+import { streamingIdsOf, useChatStreamStore } from '../../stores/chatStream.js'
 import { useUiStore } from '../../stores/ui.js'
 import { useWorkspaceStore } from '../../stores/workspace.js'
 import { AgentPicker } from './AgentPicker.js'
@@ -63,16 +63,17 @@ export function ConvRail({ conversationId }: ConvRailProps) {
   const { data: user } = useCurrentUser()
 
   /**
-   * 正在生成的会话 id（判据与 `useChatStream` 的 `streamingId` 同源，但**不过滤会话**）：
+   * 正在生成的会话 id 集合（判据与 `useChatStream` 的 `streaming` 同源，但**不过滤会话**）：
    * `conversations` 表里没有"正在生成"这一列，真值只在 Redis 的活跃锁上（`stores/chatStream.ts`）。
+   * ⚠️ 选 `rounds`（引用稳定）再 `useMemo` 出集合 —— 直接在 selector 里返回新 `Set` 会无限重渲染。
+   * P1-19 多流后可能**同时**有多条在生成（每行各自点亮）。
    */
-  const streamingId = useChatStreamStore((state) =>
-    state.streamFor !== null && state.round !== null && state.round.status === 'streaming' ? state.streamFor : null,
-  )
+  const rounds = useChatStreamStore((state) => state.rounds)
+  const streamingIds = useMemo(() => streamingIdsOf({ rounds }), [rounds])
 
   const listQuery = useMyConversations({ offset: 0, limit: MY_CONVERSATIONS_PAGE_LIMIT_MAX })
   const items = listQuery.data?.items
-  const groups = useMemo(() => groupConversationViews(items ?? [], now, streamingId), [items, now, streamingId])
+  const groups = useMemo(() => groupConversationViews(items ?? [], now, streamingIds), [items, now, streamingIds])
 
   /** 行内重命名：同时只能有一条在编辑（判据在 `normalizeTopicDraft`） */
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -124,7 +125,7 @@ export function ConvRail({ conversationId }: ConvRailProps) {
   const handleDeleted = (removed: RemoveConversationResult): void => {
     useWorkspaceStore.getState().dropConversation(removed.id)
     if (removed.id === conversationId) navigate(HOME_PATH, { replace: true })
-    if (removed.id === streamingId) useChatStreamStore.getState().reset()
+    if (streamingIds.has(removed.id)) useChatStreamStore.getState().reset(removed.id)
   }
 
   if (user === undefined || user === null) return null
@@ -363,7 +364,7 @@ export function ConvRail({ conversationId }: ConvRailProps) {
       <DeleteConversationModal
         agentId={pendingDelete?.agentId ?? renameScope}
         conversation={pendingDelete}
-        streaming={pendingDelete !== null && pendingDelete.id === streamingId}
+        streaming={pendingDelete !== null && streamingIds.has(pendingDelete.id)}
         onClose={() => setPendingDelete(null)}
         onDeleted={(removed) => {
           setPendingDelete(null)

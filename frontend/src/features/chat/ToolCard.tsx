@@ -57,7 +57,10 @@ export function ToolCard({ tool }: ToolCardProps) {
   const [userChoice, setUserChoice] = useState<boolean | null>(null)
   const open = userChoice ?? tool.status === 'RUNNING'
 
-  const hasDetail = tool.output !== undefined && tool.output !== ''
+  // 终态**优先**权威 `output`（落库那份、与回填模型的是同一份）；`RUNNING` 时没有 `output`，
+  // 退回实时快照 `liveOutput`（`tool_output` 事件，覆盖语义；不落库、刷新后即无 —— 见 `roundReducer`）。
+  const detail = tool.output ?? tool.liveOutput
+  const hasDetail = detail !== undefined && detail !== ''
   const needsCredential = canConfigureCredential(tool)
   const hint = toolErrorHint(tool.errorCode)
 
@@ -109,7 +112,7 @@ export function ToolCard({ tool }: ToolCardProps) {
         </p>
         {hasDetail ? (
           <div className="code-block" style={{ marginTop: 'var(--sp-3)' }}>
-            {tool.output}
+            {detail}
           </div>
         ) : (
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>

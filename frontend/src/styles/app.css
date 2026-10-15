@@ -1117,6 +1117,34 @@
 .ws__explorer-actions { display: inline-flex; align-items: center; gap: 2px; }
 .ws__count { font-size: var(--fs-2xs); color: var(--muted-2); }
 
+/* 项目 git 分支：**固定一栏**，钉在「最近变更」下面，**占整行宽**（原来的 chip 挤在"资源管理器"
+   标题行里，长分支名 / 多仓库都看不全 —— 用户反馈 2026-10-15）。数据 = 服务端读 `.git/HEAD`；
+   工作区没有 git 时这一栏整块不渲染（见 `WorkspacePanel`）。 */
+.ws__git-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--rule);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.ws__git-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ws__git-icon { flex: 0 0 auto; color: var(--muted-2); }
+.ws__git-repo { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-2); }
+.ws__git-repo::after { content: '›'; margin-left: 6px; }
+.ws__git-branch {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  /* 分支名**大小写敏感**，用等宽字体也更像 git 里的那种标识符 */
+  font-family: var(--font-mono);
+}
+
 .ws__body { flex: 1; min-height: 0; display: flex; }
 
 /* 新会话态 Code 模式的空工作区占位（`WorkspacePanelPlaceholder`）：面板内居中一条说明 */
@@ -1207,7 +1235,87 @@
   text-align: left;
 }
 .ws__recent-path:hover { color: var(--accent-ink); text-decoration: underline; }
+/* 已删除的路径：不是入口（不可点）—— 划掉 + 默认光标，别再假装能打开 */
+.ws__recent-path--deleted { cursor: default; color: var(--muted-2); text-decoration: line-through; }
+.ws__recent-path--deleted:hover { color: var(--muted-2); text-decoration: line-through; }
 .ws__recent-actor { color: var(--muted-2); }
+
+/* 「已撤销本轮」报告弹窗：汇总一句 + 每个落点一行（路径 / 动作 / 说明） */
+.ws__revert-summary { margin: 0 0 var(--sp-2); color: var(--ink-2); }
+.ws__revert-list { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; }
+.ws__revert-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: 4px 0;
+  font-size: var(--fs-xs);
+  border-top: 1px solid var(--rule);
+}
+.ws__revert-action {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-2xs);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.ws__revert-action--restored { color: var(--ok); }
+.ws__revert-action--deleted { color: var(--ink-2); }
+.ws__revert-action--conflict,
+.ws__revert-action--unavailable,
+.ws__revert-action--unsupported { color: var(--warn); }
+.ws__revert-path { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+.ws__revert-message { flex: 1 1 auto; min-width: 0; color: var(--muted-2); }
+
+/* 「最近变更」变更量徽标 + 行级差异弹窗（验收标记） */
+.ws__recent-diff {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+}
+.ws__recent-diff--muted { color: var(--muted-2); }
+.ws__recent-diff:hover { text-decoration: underline; }
+.ws__diff-added { color: var(--ok); }
+.ws__diff-removed { color: var(--danger); }
+
+.ws__diff-title { display: inline-flex; gap: 6px; align-items: baseline; }
+.ws__diff-title-path { color: var(--muted); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.ws__diff-title-stat { font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+
+.ws__diff {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--fs-2xs);
+  line-height: 1.55;
+}
+.ws__diff-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 0 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ws__diff-no { flex: 0 0 auto; width: 3.5ch; text-align: right; color: var(--muted-2); user-select: none; }
+.ws__diff-sign { flex: 0 0 auto; width: 1ch; text-align: center; color: var(--muted-2); }
+.ws__diff-text { flex: 1 1 auto; min-width: 0; }
+.ws__diff-line--add { background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.ws__diff-line--del { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.ws__diff-line--gap {
+  color: var(--muted-2);
+  background: var(--surface-2);
+  justify-content: center;
+  font-style: italic;
+}
 
 /* 编辑器区：标签条 / 工具栏 / 编辑面 / 状态栏 */
 .ws__editor { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
@@ -1265,6 +1373,21 @@
 }
 .ws__banner { flex: 0 0 auto; padding: var(--sp-2) var(--sp-3); }
 .ws__editor-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* ★ CodeMirror 内置搜索面板（⌘F / Ctrl+F，`@codemirror/search` 的 `searchKeymap`）：
+   它的默认字号只有编辑器的 ~0.85em —— 编辑器本身是 12px ⇒ 面板 ≈10px，输入框也窄得看不清
+   （用户反馈 2026-10-15："文件的搜索打开后展示很小，页面都看不清楚"）。
+   ⇒ 只做「放大 + 加宽」：**不动它的排版**（默认是 inline 元素 + `<br>` 的流式两行，改成 flex 会把
+   查找 / 替换两行控件搅乱）。选择器锚在 `.ws__editor` 下 —— 面板是编辑器 host 里的 `.cm-panels`。 */
+.ws__editor .cm-panels { font-size: var(--fs-base); }
+.ws__editor .cm-panel.cm-search { padding: 8px 10px; }
+.ws__editor .cm-panel.cm-search input,
+.ws__editor .cm-panel.cm-search button,
+.ws__editor .cm-panel.cm-search label { font-size: var(--fs-base); }
+.ws__editor .cm-panel.cm-search input { min-width: 200px; padding: 3px 8px; height: auto; }
+.ws__editor .cm-panel.cm-search input[type='checkbox'] { min-width: 0; padding: 0; }
+.ws__editor .cm-panel.cm-search button { padding: 3px 10px; height: auto; }
+
 .ws__placeholder {
   flex: 1;
   min-height: 0;

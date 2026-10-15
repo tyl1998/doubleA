@@ -115,6 +115,12 @@ export async function workspaceFileSize(absolute: string): Promise<number | unde
 
 /**
  * 原子写：`mkdir -p` 父目录 → 写临时文件 → `rename` 覆盖目标（见文件头）。
+ *
+ * ★ **覆盖时保留原权限位**（P1-20）：以前固定写 `0644` ⇒ agent 用 `bash` `chmod +x` 出来的可执行脚本，
+ *   只要之后经**中介写 / 编辑器保存**动一次就被打回 `0644`（"`g.sh` 丢了执行权限"的真因；容器重建
+ *   只是让这件事被注意到，不是原因）。这里读一次目标现权限，原样带到新文件上；**新建**才用默认 `0644`。
+ *   ⚠️ 不改"新建即可执行"的判定（带 shebang 也不自动 `+x`）：那是 agent 用 `chmod` 的显式意图。
+ *
  * @returns 写入的字节数
  */
 export async function writeWorkspaceBytes(absolute: string, data: Buffer): Promise<number> {
@@ -123,7 +129,7 @@ export async function writeWorkspaceBytes(absolute: string, data: Buffer): Promi
   await alignAgentOwnership(parent)
   const tmp = join(parent, `${WORKSPACE_TMP_PREFIX}${randomBytes(8).toString('hex')}`)
   try {
-    await writeFile(tmp, data, { mode: WORKSPACE_FILE_MODE })
+    await writeFile(tmp, data, { mode: (await existingFileMode(absolute)) ?? WORKSPACE_FILE_MODE })
     await rename(tmp, absolute)
   } catch (error) {
     // 临时文件残留会让下次列举看到一半的垃圾 ⇒ 尽力清掉（失败只 debug）
@@ -136,10 +142,41 @@ export async function writeWorkspaceBytes(absolute: string, data: Buffer): Promi
   return data.byteLength
 }
 
+/** 目标已存在时的权限位（`0o777` 掩码；不存在 / 读不到 / 不是普通文件 ⇒ `undefined`） */
+async function existingFileMode(absolute: string): Promise<number | undefined> {
+  try {
+    const info = await lstat(absolute)
+    return info.isFile() ? info.mode & 0o777 : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** 删除一个文件（不存在视为成功）；返回是否真的删掉了 */
 export async function removeWorkspaceFile(absolute: string): Promise<boolean> {
   if (!(await workspaceExists(absolute))) return false
   await rm(absolute, { force: true })
+  return true
+}
+
+/** 是否是一个存在的**目录**（不跟随符号链接；文件 / 不存在 / 读不到 ⇒ `false`） */
+export async function workspaceIsDirectory(absolute: string): Promise<boolean> {
+  try {
+    return (await lstat(absolute)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 递归删除一个**目录**（含未索引的残留，如依赖目录 / `.git`；不存在视为成功）。
+ *
+ * ⚠️ 与 {@link removeWorkspaceFile} 同一纪律：删的是**盘上字节**；索引侧（墓碑 + 事件）由
+ *    调用方（`service#deleteWorkspaceDirectory`）先软删。二者顺序 = "先存历史字节 → 删盘 → 落索引"。
+ */
+export async function removeWorkspaceDir(absolute: string): Promise<boolean> {
+  if (!(await workspaceExists(absolute))) return false
+  await rm(absolute, { recursive: true, force: true })
   return true
 }
 

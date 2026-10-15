@@ -64,6 +64,16 @@ const {
   workspaceNewFolderPlaceholderPath,
   workspaceMoveTargetPath,
   WORKSPACE_FOLDER_PLACEHOLDER,
+  mergeWorkspaceChanges,
+  workspaceAncestorDirs,
+  unionExpandedDirs,
+  revertActionLabel,
+  isWorkspacePathInDir,
+  WORKSPACE_CONTAINER_ROOT,
+  WORKSPACE_COPY_ITEMS,
+  workspaceCopyValue,
+  workspaceGitChipLabel,
+  workspaceGitChipTitle,
 } = await import('../src/features/chat/workspaceModel.ts')
 
 const entry = (path, size = 10, mime = 'text/plain') => ({
@@ -267,6 +277,80 @@ it('W25 workspaceNewFolderPlaceholderPath：文件夹落 .gitkeep 占位', () =>
 it('W26 workspaceMoveTargetPath：拖到目录后目标路径（名字不变）', () => {
   eq(workspaceMoveTargetPath('a/b/c.ts', 'x/y'), 'x/y/c.ts', '移到别的目录')
   eq(workspaceMoveTargetPath('c.ts', ''), 'c.ts', '移到根目录保持原名')
+})
+
+console.log('── W12 最近变更 / 自动展开 / 撤销报告（P1-20 问题 1）──')
+it('W27 mergeWorkspaceChanges：服务端基线 ∪ 实时事件，按路径折叠、只认内容事件、时间倒序', () => {
+  const server = [
+    { path: 'a.ts', type: 'updated', version: 2, actor: 'AGENT', actorId: null, at: '2026-10-15T01:00:00.000Z' },
+    { path: 'b.ts', type: 'created', version: 1, actor: 'USER', actorId: 'u1', at: '2026-10-15T00:30:00.000Z' },
+  ]
+  const live = [
+    // 同路径、更晚 ⇒ 覆盖服务端那条
+    { id: 'e1', path: 'a.ts', type: 'deleted', version: 3, actor: 'AGENT', actorId: null, at: '2026-10-15T02:00:00.000Z' },
+    // 新路径 ⇒ 追加
+    { id: 'e2', path: 'c.ts', type: 'created', version: 1, actor: 'AGENT', actorId: null, at: '2026-10-15T02:30:00.000Z' },
+    // claim/release ⇒ 不是内容变更，丢弃（不顶掉真正的 updated）
+    { id: 'e3', path: 'b.ts', type: 'claim', version: 1, actor: 'AGENT', actorId: null, at: '2026-10-15T03:00:00.000Z' },
+  ]
+  const merged = mergeWorkspaceChanges(server, live)
+  eq(merged.map((item) => item.path).join(','), 'c.ts,a.ts,b.ts', '按时间倒序、去掉 claim')
+  eq(merged.find((item) => item.path === 'a.ts')?.type, 'deleted', '同路径取更晚的实时事件')
+  eq(merged.find((item) => item.path === 'b.ts')?.type, 'created', 'claim 不顶掉内容事件')
+})
+it('W28 mergeWorkspaceChanges：只有服务端基线（刷新/刚进会话）也能出列表', () => {
+  const merged = mergeWorkspaceChanges(
+    [{ path: 'x.ts', type: 'updated', version: 1, actor: 'AGENT', actorId: null, at: '2026-10-15T00:00:00.000Z' }],
+    [],
+  )
+  eq(merged.length, 1, '实时事件为空时仍展示服务端那句基线')
+  eq(merged[0].path, 'x.ts', '路径')
+})
+it('W29 workspaceAncestorDirs：列出一条路径的全部祖先目录', () => {
+  eq(workspaceAncestorDirs('a/b/c.ts').join(','), 'a,a/b', '两级祖先')
+  eq(workspaceAncestorDirs('c.ts').length, 0, '根层文件没有祖先')
+})
+it('W30 unionExpandedDirs：并入去重、保持既有顺序', () => {
+  eq(unionExpandedDirs(['a'], ['a', 'a/b']).join(','), 'a,a/b', '已展开的不重复')
+  eq(unionExpandedDirs([], ['a', 'a/b']).join(','), 'a,a/b', '空集合照单并入')
+})
+it('W31 revertActionLabel：落点动作 → 人读文案', () => {
+  eq(revertActionLabel('restored'), '已还原', 'restored')
+  eq(revertActionLabel('conflict'), '冲突', 'conflict')
+  eq(revertActionLabel('unavailable'), '缺历史', 'unavailable')
+})
+it('W32 isWorkspacePathInDir：删除文件夹只命中该目录之下（带尾斜杠，不误伤同前缀兄弟）', () => {
+  eq(isWorkspacePathInDir('out/a.ts', 'out'), true, '直接子文件')
+  eq(isWorkspacePathInDir('out/deep/x.ts', 'out'), true, '深层子文件')
+  eq(isWorkspacePathInDir('outsider.ts', 'out'), false, '同前缀文件')
+  eq(isWorkspacePathInDir('out2/x.ts', 'out'), false, '同前缀目录')
+})
+it('W33 workspaceCopyValue：三种口径（相对 / 容器绝对 / 名称），文件与目录同款', () => {
+  eq(WORKSPACE_CONTAINER_ROOT, '/work', '容器内挂载点（与 agent 看到的一致）')
+  eq(workspaceCopyValue('relative', 'a/b/c.ts'), 'a/b/c.ts', '相对路径')
+  eq(workspaceCopyValue('absolute', 'a/b/c.ts'), '/work/a/b/c.ts', '绝对路径 = 容器内 /work/…')
+  eq(workspaceCopyValue('name', 'a/b/c.ts'), 'c.ts', '名称 = 末段')
+  eq(workspaceCopyValue('relative', 'a/b'), 'a/b', '目录：相对路径就是目录本身')
+  eq(workspaceCopyValue('absolute', 'a/b'), '/work/a/b', '目录：绝对路径同样拼 /work')
+  eq(workspaceCopyValue('name', 'a/b'), 'b', '目录：名称 = 末段目录名')
+})
+it('W34 WORKSPACE_COPY_ITEMS 与 workspaceCopyValue 一一对应（菜单文案不会与复制内容错位）', () => {
+  eq(WORKSPACE_COPY_ITEMS.map((item) => item.key).join(','), 'relative,absolute,name', '三种口径、固定顺序')
+  eq(WORKSPACE_COPY_ITEMS[1].label, '绝对路径（/work）', '绝对路径那条把 /work 写进文案（用户一眼知道复制的是什么）')
+  for (const item of WORKSPACE_COPY_ITEMS) {
+    assert(workspaceCopyValue(item.key, 'x/y.ts') !== '', `口径 ${item.key} 必须有可复制的内容`)
+  }
+})
+it('W35 workspaceGitChipLabel / Title：分支直显、detached 标出来、读不到说未知（不猜）', () => {
+  eq(workspaceGitChipLabel({ branch: 'master', detached: false }), 'master', '分支名直显')
+  eq(workspaceGitChipLabel({ branch: '9f1c0d2', detached: true }), 'detached@9f1c0d2', 'detached ⇒ 短 SHA 加前缀')
+  eq(workspaceGitChipLabel({ branch: null, detached: false }), '未知分支', '读不到就说不认识')
+  eq(workspaceGitChipTitle({ path: '', branch: 'main', detached: false }), '工作区根 · 当前分支 main', '根仓库的 title')
+  eq(
+    workspaceGitChipTitle({ path: 'qatt-platform-qa', branch: '9f1c0d2', detached: true }),
+    'qatt-platform-qa · detached@9f1c0d2（detached HEAD，不在任何分支上）',
+    '子目录仓库 + detached 的 title',
+  )
 })
 
 console.log('')

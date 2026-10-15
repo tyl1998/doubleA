@@ -34,6 +34,7 @@ import {
   workspaceCreateFileBodySchema,
   workspaceChangesQuerySchema,
   workspaceEventsQuerySchema,
+  workspaceFileDiffQuerySchema,
   workspaceMoveBodySchema,
   workspacePathQuerySchema,
   workspaceRevertBodySchema,
@@ -42,6 +43,7 @@ import {
   type WorkspaceChangesQuery,
   type WorkspaceCreateFileBody,
   type WorkspaceEventsQuery,
+  type WorkspaceFileDiffQuery,
   type WorkspaceMoveBody,
   type WorkspacePathQuery,
   type WorkspaceRevertBody,
@@ -58,13 +60,16 @@ import {
   assertWorkspaceOwner,
   assertWorkspaceWriteRate,
   createWorkspaceFile,
+  deleteWorkspaceDirectory,
   deleteWorkspaceFile,
+  getWorkspaceFileDiff,
   listWorkspaceChanges,
   listWorkspaceEventsAfter,
   listWorkspaceFiles,
   moveWorkspaceFile,
   openWorkspaceFileSource,
   readWorkspaceFile,
+  readWorkspaceGitRepos,
   revertWorkspaceRound,
   serializeWorkspaceSseEvent,
   subscribeWorkspaceEvents,
@@ -99,6 +104,23 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
   )
 
   /**
+   * 工作区 **git 概况**（`GET /api/conversations/:id/workspace/git`，P1-9 · 补充）。
+   *
+   * 只回"有哪些仓库 + 各自在哪个分支"（**读 `.git/HEAD`，不调 git 二进制**，见 `workspace/git.ts`）。
+   * `repos: []` = 这个工作区没有 git ⇒ 前端**不渲染**分支 chip（而不是显示一个空标签）。
+   * 只读、不写库、不拿锁：失败一律按"没有 git"处理，不让面板因为这件事报错。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/workspace/git',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      return ok({ repos: await readWorkspaceGitRepos(request.params.id) })
+    },
+  )
+
+  /**
    * 轮末**变更集**（`GET /api/conversations/:id/workspace/changes?since=<iso>`，P4）。
    * 回 `[since, now]` 窗口内动过的路径各一条（最新状态），按时间倒序。`since` 缺省 = 全量。
    */
@@ -112,6 +134,26 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
       return ok(await listWorkspaceChanges(request.params.id, request.query.since))
+    },
+  )
+
+  /**
+   * 文件**行级差异**（`GET .../workspace/file/diff?path=…&baseVersion=…&stats=1`，P1-9 · 验收标记）。
+   *
+   * 「最近变更」里"哪个文件变了"之外的下一问：**改了什么**。旧字节取自历史字节存储（覆盖/删除前
+   * 自动存档）；`stats=1` 只回 `+N −M` 计数（列表徽标用），不带逐行内容。
+   */
+  app.get<{ Params: ConversationIdParams; Querystring: WorkspaceFileDiffQuery }>(
+    '/api/conversations/:id/workspace/file/diff',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, querystring: workspaceFileDiffQuerySchema },
+    },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      const { path, baseVersion, stats } = request.query
+      return ok(await getWorkspaceFileDiff(request.params.id, path, baseVersion, stats === 1))
     },
   )
 
@@ -283,6 +325,21 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
       return ok(await deleteWorkspaceFile(request.params.id, request.query.path, userAuthor(userId)))
+    },
+  )
+
+  /**
+   * 删除**文件夹（递归）**：把该目录下所有已索引文件一次软删（墓碑 + 各一条 `deleted` 事件），
+   * 再把目录整份落盘删除（含未索引残留）。空目录/不存在按幂等成功回 `deleted: 0`。
+   * 目标若是**文件**则回 400（请用上面的单文件删除，前端只对目录行提供本操作）。
+   */
+  app.delete<{ Params: ConversationIdParams; Querystring: WorkspacePathQuery }>(
+    '/api/conversations/:id/workspace/dir',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema, querystring: workspacePathQuerySchema } },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      return ok(await deleteWorkspaceDirectory(request.params.id, request.query.path, userAuthor(userId)))
     },
   )
 

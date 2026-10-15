@@ -7,7 +7,7 @@
  *
  * | 调用方 | 拿什么 |
  * |--------|--------|
- * | P1 的路由层（`routes/workspace.ts`） | `ensureWorkspace` / `listWorkspaceFiles` / `readWorkspaceFile` / `writeWorkspaceFile` / `createWorkspaceFile` / `deleteWorkspaceFile` / `moveWorkspaceFile` |
+ * | P1 的路由层（`routes/workspace.ts`） | `ensureWorkspace` / `listWorkspaceFiles` / `readWorkspaceFile` / `writeWorkspaceFile` / `createWorkspaceFile` / `deleteWorkspaceFile` / `deleteWorkspaceDirectory` / `moveWorkspaceFile` |
  * | P3 的 SSE | `subscribeWorkspaceEvents`（实时通道） |
  * | 进程入口（`index.ts`） | `stopAllWorkspaceWatchers`（退出） |
  * | 编排层（P0 起，派活前后） | `ensureWorkspace` / `reconcileWorkspaceOnce`（bash 兜底对账） |
@@ -19,8 +19,10 @@
 export {
   assertWorkspaceOwner,
   createWorkspaceFile,
+  deleteWorkspaceDirectory,
   deleteWorkspaceFile,
   ensureWorkspace,
+  getWorkspaceFileDiff,
   listWorkspaceChanges,
   listWorkspaceEventsAfter,
   listWorkspaceFiles,
@@ -49,18 +51,27 @@ export {
   type ResolvedWorkspacePath,
 } from './paths.js'
 
+// git 概况（`GET .../workspace/git` 用）：只读 `<gitdir>/HEAD`，不调 git 二进制。
+// 纯解析两枚 + 收根目录参数的扫描一枚一并导出 —— 回归里逐条喂字面量 / 造临时目录核对，不必依赖配置。
+export { parseGitDirFile, parseGitHead, readWorkspaceGitRepos, scanGitReposUnder } from './git.js'
+
 // 字节层（宿主 FS）
 export {
   alignAgentOwnership,
   ensureWorkspaceDir,
+  removeWorkspaceDir,
   scanWorkspaceFiles,
   scanWorkspaceTree,
   workspaceContentIsBinary,
   workspaceDirIsEmpty,
+  workspaceIsDirectory,
   WORKSPACE_TMP_PREFIX,
   type WorkspaceScanEntry,
   type WorkspaceScanResult,
 } from './store.js'
+
+// 文件夹递归删除判据（目录删除；零 config / DB / FS，可在自证脚本里逐条核对）
+export { isWorkspacePathInDir, selectWorkspaceDirPaths, workspaceDirPrefix } from './dirModel.js'
 
 // 依赖目录判据（P1-17b；零 config / DB / FS，可在自证脚本里逐条核对）
 export {

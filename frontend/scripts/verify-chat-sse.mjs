@@ -228,14 +228,14 @@ async function eventNamesOf(response) {
 
 const { SseFrameParser, parseSseFrame, parseSseText } = await import('../src/features/chat/sseParser.ts')
 const { readChatEventStream } = await import('../src/features/chat/chatStream.ts')
-const { beginRound, isSettled, reduceRound, roundToViews } = await import(
+const { beginRound, isSettled, reduceRound, roundToViews, withInterjection } = await import(
   '../src/features/chat/roundReducer.ts'
 )
 const { isAssistantEmpty, messageToView, messagesToViews, openingView } = await import(
   '../src/features/chat/messageModel.ts'
 )
 const { remarkToolCards } = await import('../src/features/chat/AssistantMarkdown.tsx')
-const { useChatStreamStore } = await import('../src/stores/chatStream.ts')
+const { disconnectOf, roundOf, streamingIdsOf, useChatStreamStore } = await import('../src/stores/chatStream.ts')
 const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
 const { flattenMessagePages, streamChat } = await import('../src/api/conversations.ts')
@@ -243,14 +243,8 @@ const { flattenMessagePages, streamChat } = await import('../src/api/conversatio
 const { composeState: composeStateRaw, isSubmitKey, createSendGate } = await import(
   '../src/features/chat/composerState.ts'
 )
-/**
- * 用例夹具：把 `elsewhere`（**P0-1-34** 新增的第六个输入）默认成 `false`。
- *
- * ⚠️ 这个默认值**只存在于本档**，刻意**不**放进 `composerState.ts`（生产侧要求每个调用点显式传）
- * —— 否则"忘了传"会静默等于"没有别的会话在生成"，而那正是新闸门失效的方式。
- * 本组只有 H9/H10 关心它，其余用例写满六个字段只会让"这条在验什么"变模糊。
- */
-const composeState = (patch) => composeStateRaw({ elsewhere: false, ...patch })
+/** 用例夹具：直接转发 `composeState`（**P1-19 删掉 `elsewhere` 后不再需要默认值补丁**） */
+const composeState = (patch) => composeStateRaw(patch)
 const { createStopController, waitForRoundSettled, STOP_SETTLE_TIMEOUT_MS } = await import(
   '../src/features/chat/stopController.ts'
 )
@@ -292,6 +286,9 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
     status: 'RUNNING',
     inputSummary: '/etc/hosts',
   },
+  // 工具执行中的**实时输出快照**（覆盖语义；不落库、刷新后即无）——
+  // 样本必须与 `shared#sseToolOutputPayloadSchema` 同步，否则 B1（事件全集能解析）会红。
+  tool_output: { callId: 'call-1', text: 'partial output' },
   // ⚠️ P0-2-11 起 `confirm` 载荷多了 `source` / `expiresAt`（倒计时只读服务端绝对时刻）——
   //    样本必须与 `shared#sseConfirmPayloadSchema` 同步，否则 B1（事件全集能解析）会红。
   confirm: {
@@ -305,6 +302,8 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
   artifact: { artifactId: 'art-1', fileName: '报告.md', size: 2048, mime: 'text/markdown' },
   queued: { position: 2 },
   status: { text: '沙箱已就绪，正在启动引擎…' },
+  // P1-20：中途插话已投递（发帧让界面看得见）—— 样本必须与 `shared#sseSteerPayloadSchema` 同步
+  steer: { message: '先别改 X，改 Y', at: '2026-09-23T00:00:30.000Z' },
   ping: { ts: '2026-09-23T00:00:00.000Z' },
   done: { messageId: 'msg-1', finishReason: 'COMPLETE', usage: { tokensIn: 10, tokensOut: 20 } },
   error: { code: 'CONFLICT', message: '该会话正在生成中' },
@@ -622,6 +621,33 @@ await it('D4 `tool_call` 按 callId upsert，且 `RUNNING` 那一帧的缺省 ou
   assertEqual(round.assistant.tools.map((tool) => tool.callId).join(','), 'call-a,call-b', '追加顺序')
 })
 
+await it('D4a `tool_output` 按 callId **覆盖**实时输出；找不到对应卡则忽略', () => {
+  let round = beginRound('跑个长命令', STARTED_AT)
+  round = reduceRound(
+    round,
+    eventOf('tool_call', {
+      callId: 'call-bash',
+      toolName: 'bash',
+      serverName: '',
+      kind: 'SANDBOX',
+      status: 'RUNNING',
+      inputSummary: 'pip install -r req.txt',
+    }),
+  )
+  // 覆盖语义：第二帧是**整体替换**（不是追加）
+  round = reduceRound(round, eventOf('tool_output', { callId: 'call-bash', text: 'line 1\n' }))
+  assertEqual(round.assistant.tools[0].liveOutput, 'line 1\n', '首帧实时输出落在对应卡上')
+  round = reduceRound(round, eventOf('tool_output', { callId: 'call-bash', text: 'line 1\nline 2\n' }))
+  assertEqual(round.assistant.tools[0].liveOutput, 'line 1\nline 2\n', '整体覆盖（不是拼接两帧）')
+  assertEqual(round.assistant.tools.length, 1, '实时输出不改卡片数量')
+  // 找不到对应卡 ⇒ 忽略（不凭空造一张没有名字/状态的卡），返回同一引用
+  assertSameRef(
+    reduceRound(round, eventOf('tool_output', { callId: 'ghost', text: 'x' })),
+    round,
+    '没有对应卡的 tool_output 被忽略',
+  )
+})
+
 await it('D4b 工具卡保留正文偏移，供正文与工具按事件顺序穿插', () => {
   let round = beginRound('问', STARTED_AT)
   round = reduceRound(round, eventOf('delta', { text: '前置' }))
@@ -802,6 +828,36 @@ await it('D12 `roundToViews` 产出"用户 + 助手"两条，顺序与角色正�
   assertEqual(views[1].status, 'complete', '助手状态')
   assertEqual(views[1].finishReason, 'COMPLETE', '收尾原因带出')
   assertEqual(views[1].persisted, true, '持久化判据带出')
+})
+
+await it('D13 `steer` ⇒ 追加用户插话，并在 roundToViews 里渲染成用户气泡（P1-20）', () => {
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('delta', { text: '答' }))
+  round = reduceRound(round, eventOf('steer', { message: '再补一句', at: '2026-09-23T10:00:05.000Z' }))
+  round = reduceRound(round, eventOf('steer', { message: '还有一句', at: '2026-09-23T10:00:06.000Z' }))
+  assertEqual(round.interjections.length, 2, '两条插话都落到 round 上')
+  const views = roundToViews(round)
+  assertEqual(views.length, 4, '用户 + 两条插话 + 助手')
+  assertEqual(views.map((view) => view.role).join(','), 'USER,USER,USER,ASSISTANT', '插话渲染成用户气泡（看得见）')
+  assertEqual(views[1].text, '再补一句', '插话正文')
+  assertEqual(views[1].createdAt, '2026-09-23T10:00:05.000Z', '插话时间')
+  assertEqual(views[3].text, '答', '助手仍是最后一条')
+})
+
+await it('D14 `withInterjection`：乐观插入 + 出口层回帧按正文去重（不显示两遍）', () => {
+  let round = beginRound('问', STARTED_AT)
+  // 前端在 `POST /:id/steer` 成功后乐观插入
+  round = withInterjection(round, { text: '补一句', at: '2026-09-23T10:00:05.000Z' })
+  assertEqual(round.interjections.length, 1, '乐观插入一条')
+  // 出口层随后（真的轮询到）又回同一帧 ⇒ 去重，不追加
+  round = reduceRound(round, eventOf('steer', { message: '补一句', at: '2026-09-23T10:00:05.200Z' }))
+  assertEqual(round.interjections.length, 1, '同正文去重')
+  // 不同的插话照常追加
+  round = reduceRound(round, eventOf('steer', { message: '再补一句', at: '2026-09-23T10:00:06.000Z' }))
+  assertEqual(round.interjections.length, 2, '不同正文追加')
+  // 已收口 ⇒ 乐观插入也忽略（收口后不再接受任何内容）
+  const done = reduceRound(round, eventOf('done', { messageId: 'm', finishReason: 'COMPLETE', usage: null }))
+  assertSameRef(withInterjection(done, { text: '迟到', at: '2026-09-23T10:00:07.000Z' }), done, '收口后忽略')
 })
 
 // ═════════════════════════════ E 组：历史 vs 流式（单一渲染路径）═════════════════════════
@@ -1115,16 +1171,28 @@ await it('F7 `flattenMessagePages`：页序要 reverse（游标指向更早的�
 
 groupStart('G', 'store：只剩"把归约结果塞回去"', 'store 里一旦出现事件分支，就有了第二处事件语义')
 
-await it('G1 `begin` 开一轮，`reset` 清空', () => {
+await it('G1 `begin` 开一轮（**按会话**），`reset` 只丢掉那一个会话的轮次', () => {
   const store = useChatStreamStore
-  store.getState().reset()
-  assertEqual(store.getState().streamFor, null, '初始无流')
-  assertEqual(store.getState().round, null, '初始无归约态')
+  store.getState().resetAll()
+  assertDeepEqual(store.getState().rounds, {}, '初始没有任何会话的轮次')
 
   store.getState().begin('conv-1', '你好', STARTED_AT)
-  assertEqual(store.getState().streamFor, 'conv-1', '流归属（防串台）')
-  assertEqual(store.getState().round.userText, '你好', '本轮用户正文')
-  assertEqual(store.getState().round.status, 'streaming', '状态')
+  assertEqual(roundOf(store.getState(), 'conv-1').userText, '你好', '本轮用户正文')
+  assertEqual(roundOf(store.getState(), 'conv-1').status, 'streaming', '状态')
+  // ★ P1-19 多流的核心：**另一个会话**不受影响（早先 `streamFor` 单值那套"防串台"由"按键隔离"承担）
+  assertEqual(roundOf(store.getState(), 'conv-2'), null, '别的会话没有轮次')
+  store.getState().begin('conv-2', '另一条', STARTED_AT)
+  assertEqual(roundOf(store.getState(), 'conv-1').userText, '你好', '先开的那条**没被覆盖**')
+  assertEqual(roundOf(store.getState(), 'conv-2').userText, '另一条', '后开的那条')
+  assertDeepEqual(
+    [...streamingIdsOf(store.getState())].sort(),
+    ['conv-1', 'conv-2'],
+    '两条可以**同时**在生成（这正是"切过去卡住"要修掉的那点）',
+  )
+  store.getState().reset('conv-1')
+  assertEqual(roundOf(store.getState(), 'conv-1'), null, '只清掉指定会话')
+  assertEqual(roundOf(store.getState(), 'conv-2').userText, '另一条', '另一个会话的轮次不受影响')
+  store.getState().resetAll()
 })
 
 await it('G2 `apply` 串行喂帧 == 手工 `reduceRound` 的结果', () => {
@@ -1137,45 +1205,45 @@ await it('G2 `apply` 串行喂帧 == 手工 `reduceRound` 的结果', () => {
     eventOf('delta', { text: '好' }),
     eventOf('done', { messageId: 'msg-1', finishReason: 'COMPLETE', usage: null }),
   ]
-  for (const frame of frames) store.getState().apply(frame)
+  for (const frame of frames) store.getState().apply('conv-1', frame)
 
   let expected = beginRound('你好', STARTED_AT)
   for (const frame of frames) expected = reduceRound(expected, frame)
 
-  assertDeepEqual(store.getState().round, expected, 'store 的归约态')
-  assertEqual(store.getState().round.assistant.text, '你好', '正文')
+  assertDeepEqual(roundOf(store.getState(), 'conv-1'), expected, 'store 的归约态')
+  assertEqual(roundOf(store.getState(), 'conv-1').assistant.text, '你好', '正文')
 })
 
 await it('G3 `ping` 经过 store 后 `round` 引用不变 ⇒ 不触发任何重渲染', () => {
   const store = useChatStreamStore
   store.getState().begin('conv-1', '你好', STARTED_AT)
-  store.getState().apply(eventOf('delta', { text: '答' }))
-  const before = store.getState().round
-  store.getState().apply(eventOf('ping'))
-  assertSameRef(store.getState().round, before, '心跳不该改变 state 引用')
+  store.getState().apply('conv-1', eventOf('delta', { text: '答' }))
+  const before = roundOf(store.getState(), 'conv-1')
+  store.getState().apply('conv-1', eventOf('ping'))
+  assertSameRef(roundOf(store.getState(), 'conv-1'), before, '心跳不该改变 state 引用')
 })
 
 await it('G4 未开轮时 `apply` 静默忽略（`done` 之后仍可能有尾帧，属正常）', () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   const before = store.getState()
-  store.getState().apply(eventOf('delta', { text: '幽灵帧' }))
+  store.getState().apply('conv-ghost', eventOf('delta', { text: '幽灵帧' }))
   assertSameRef(store.getState(), before, 'state 引用不变')
-  assertEqual(store.getState().round, null, '没有被凭空开轮')
+  assertEqual(roundOf(store.getState(), 'conv-ghost'), null, '没有被凭空开轮')
 })
 
 await it('G5 `fail` 把客户端侧的失败落到同一个出口（消息流内错误卡）', () => {
   const store = useChatStreamStore
   store.getState().begin('conv-1', '你好', STARTED_AT)
-  store.getState().apply(eventOf('delta', { text: '半' }))
-  store.getState().fail({ code: 'NETWORK', message: '与服务器的连接已断开' })
-  assertEqual(store.getState().round.status, 'error', '状态')
+  store.getState().apply('conv-1', eventOf('delta', { text: '半' }))
+  store.getState().fail('conv-1', { code: 'NETWORK', message: '与服务器的连接已断开' })
+  assertEqual(roundOf(store.getState(), 'conv-1').status, 'error', '状态')
   assertDeepEqual(
-    store.getState().round.error,
+    roundOf(store.getState(), 'conv-1').error,
     { code: 'NETWORK', message: '与服务器的连接已断开' },
     '错误载荷',
   )
-  assertEqual(store.getState().round.assistant.text, '半', '已经收到的内容保留（不假装没发生过）')
+  assertEqual(roundOf(store.getState(), 'conv-1').assistant.text, '半', '已经收到的内容保留（不假装没发生过）')
 })
 
 // ═════════════════════════════ H 组：输入区状态机（P0-1-33） ═════════════════════════
@@ -1187,7 +1255,7 @@ groupStart(
 )
 
 /** 五种状态各造一份输入（`round` 用 `beginRound` 造真值，不手搓半个对象） */
-function roundOf(patch = {}) {
+function roundFixture(patch = {}) {
   return { ...beginRound('你好', STARTED_AT), ...patch }
 }
 
@@ -1206,7 +1274,7 @@ await it('H1 `idle`：可输入、草稿非空才可发送，主按钮是「发�
 
 await it('H2 `streaming`：按钮变[停止]、**输入仍可编辑**、发送禁用（`03` §4.1 的原话）', () => {
   const view = composeState({
-    round: roundOf({ status: 'streaming' }),
+    round: roundFixture({ status: 'streaming' }),
     sending: true,
     stopping: false,
     draft: '下一条',
@@ -1226,7 +1294,7 @@ await it('H2 `streaming`：按钮变[停止]、**输入仍可编辑**、发送�
 await it('H3 `confirm`：锁输入（`canType:false`），且**优先级高于 streaming**', () => {
   const view = composeState({
     // 确认卡是"流挂起等你应答"⇒ 这一轮**仍然**是 streaming，但输入必须锁上
-    round: roundOf({
+    round: roundFixture({
       status: 'streaming',
       confirm: { confirmId: 'c1', toolName: 'run_shell', inputSummary: 'rm -rf build' },
     }),
@@ -1255,7 +1323,7 @@ await it('H5 `stopping`：点过停止 ⇒ 主按钮立刻变"停止中…"且�
   const view = composeState({
     // ⚠️ 此刻 `round.status` **还是** streaming（服务端还没收口）—— 若判据只看 round，
     //    按钮会停在「停止」，用户会以为没点上而反复点
-    round: roundOf({ status: 'streaming' }),
+    round: roundFixture({ status: 'streaming' }),
     sending: true,
     stopping: true,
     draft: '',
@@ -1266,16 +1334,16 @@ await it('H5 `stopping`：点过停止 ⇒ 主按钮立刻变"停止中…"且�
   assertEqual(view.canSend, false, '等待收口期间不能发下一条')
 })
 
-await it('H6 六个状态的 `label` 与 `state` 一致、文案两两不同（漏改一个状态看得见）', () => {
+await it('H6 五个状态的 `label` 与 `state` 一致、文案两两不同（漏改一个状态看得见）', () => {
   const views = [
     // ⚠️ idle 那一份**要带草稿**：不带草稿时 `canSend` 本来就是 false（H1 已验），
     //    拿它去断言"只有 idle 允许发送"会因为夹具与断言不匹配而假红
     composeState({ round: null, sending: false, stopping: false, draft: '你好' }),
     composeState({ round: null, sending: true, stopping: false, draft: '' }),
-    composeState({ round: roundOf({ status: 'streaming' }), sending: true, stopping: false, draft: '' }),
-    composeState({ round: roundOf({ status: 'streaming' }), sending: true, stopping: true, draft: '' }),
+    composeState({ round: roundFixture({ status: 'streaming' }), sending: true, stopping: false, draft: '' }),
+    composeState({ round: roundFixture({ status: 'streaming' }), sending: true, stopping: true, draft: '' }),
     composeState({
-      round: roundOf({
+      round: roundFixture({
         status: 'streaming',
         confirm: { confirmId: 'c1', toolName: 't', inputSummary: 's' },
       }),
@@ -1283,23 +1351,20 @@ await it('H6 六个状态的 `label` 与 `state` 一致、文案两两不同（�
       stopping: false,
       draft: '',
     }),
-    // 第六个：**别的**会话在生成（P0-1-34）。注意它的 `round` 是 `null` ——
-    // 那正是这个状态存在的理由（页面里这一轮不属于当前会话）
-    composeState({ round: null, sending: false, stopping: false, draft: '', elsewhere: true }),
   ]
   // 集合语义：先排序再比（`06` §六 第 ⑤ 条）
   assertDeepEqual(
     [...views.map((view) => view.state)].sort(),
-    ['confirm', 'elsewhere', 'idle', 'sending', 'stopping', 'streaming'],
-    '六个状态都真的可达（少一个就说明某个判据被更早的分支吃掉了）',
+    ['confirm', 'idle', 'sending', 'stopping', 'streaming'],
+    '五个状态都真的可达（少一个就说明某个判据被更早的分支吃掉了）',
   )
   for (const view of views) {
     assertEqual(view.label, view.state, `\`label\` 应等于 \`state\`（${view.state}）`)
   }
-  assertEqual(new Set(views.map((v) => v.placeholder)).size, 6, '占位符两两不同')
-  assertEqual(new Set(views.map((v) => v.hint)).size, 6, '提示行两两不同')
+  assertEqual(new Set(views.map((v) => v.placeholder)).size, 5, '占位符两两不同')
+  assertEqual(new Set(views.map((v) => v.hint)).size, 5, '提示行两两不同')
   // 两条不变量（它们是"防并发"与"锁输入"的最终口径）：
-  //   · **只有 idle 能发送** —— 其余五个状态里既有"正在跑"也有"正在等"，都不该放行
+  //   · **只有 idle 能发送** —— 其余四个状态里既有"正在跑"也有"正在等"，都不该放行
   //   · **只有 confirm 锁输入** —— 流式中必须还能打字（`03` §4.1）
   assertEqual(views.filter((v) => v.canSend).length, 1, '只有 idle 允许发送')
   assertEqual(views.filter((v) => v.primary.action === 'send').length, 1, '只有一个可点的发送按钮')
@@ -1331,62 +1396,15 @@ await it('H8 `createSendGate`：同标签页重复发送的同步闸门（释放
   gate.leave()
 })
 
-await it('H9 `elsewhere`（P0-1-34）：别的会话在生成 ⇒ 只能输入、不能发', () => {
-  const view = composeState({
-    round: null,
-    sending: false,
-    stopping: false,
-    draft: '下一条想说的话',
-    elsewhere: true,
-  })
-  assertEqual(view.state, 'elsewhere', '状态名')
-  assertEqual(view.canSend, false, '不许发（前端只有一个轮次槽，发了就会覆盖另一会话的那一轮）')
-  assertEqual(view.canType, true, '但**输入不禁**（先构思下一条是安全的，与 streaming 同款口径）')
-  assertEqual(view.locked, false, '它不是"锁输入"那一类（锁输入只有 confirm）')
-  assertEqual(view.primary.action, null, '没有可点的主动作')
-  assertEqual(view.primary.disabled, true, '按钮不可点')
-  // 文案要**能照着做**，不能只说"不允许"
-  assertIncludes(view.primary.label, '别的会话', '按钮文案指明了原因')
-  assertIncludes(view.hint, '停止', '提示行给了出路')
-})
-
-await it('H10 `elsewhere` 的优先级排在 `sending` **之后**（顺序即正确性）', () => {
-  // 用户按下发送的那一瞬间：这一次的 `sending` 已经为真，而另一个会话的流可能还在跑。
-  // 若 `elsewhere` 先赢，主按钮会在刚点完发送后立刻从「发送中…」闪回「别的会话生成中」，
-  // 看起来像"点了没反应" —— 这是本组唯一一个"顺序必须写对"的地方
-  //
-  // ⚠️ 夹具里 `stopping` 必须是 `false`：`stopping` 的优先级**高于** `sending`（全序是
-  //    `confirm > stopping > streaming > sending > elsewhere`），把它设成 `true` 会验成
-  //    "stopping 胜过 sending"（那是 H5 的事），而这条问的是 `elsewhere` 排不排在 `sending` 后面。
-  //    另外 `sending` 与 `stopping` 同真也不是真实形态：前者是"这一轮还没进 store"，后者是
-  //    "已点停止、等 done{STOPPED} 收口"，两者互斥。
-  const view = composeState({
-    round: null,
-    sending: true,
-    stopping: false,
-    draft: '',
-    elsewhere: true,
-  })
-  assertEqual(view.state, 'sending', '`sending` 胜（它比 `elsewhere` 靠前）')
-  assertEqual(view.primary.label, '发送中…', '按钮文案')
-
-  // 反过来：只有 `elsewhere` 为真时才轮到它（H9 已验）；`streaming`（本会话在跑）一定优先于它
-  const streaming = composeState({
-    round: roundOf({ status: 'streaming' }),
-    sending: false,
-    stopping: false,
-    draft: '',
-    elsewhere: true,
-  })
-  assertEqual(streaming.state, 'streaming', '本会话在跑 ⇒ 是 streaming（能点[停止]），不是 elsewhere')
-  assertEqual(streaming.primary.action, 'stop', '主按钮仍是停止')
-})
+// ⚠️ H9 / H10 原先是 `elsewhere`（P0-1-34「别的会话在生成 ⇒ 只能输入、不能发」）的断言。
+// **P1-19 多流**之后 store 按会话存、另一条流在跑不再是拦阻条件 ⇒ 该状态已删除，
+// 那两条随之作废（不是"没验"，而是"那个状态不存在了"）。
 
 await it('H11 「插话」入口（P1-9 · P4 · R1）：只在沙箱 streaming 且草稿非空时露出，且不改主按钮', () => {
   // 非沙箱（`steerable` 缺省 false）⇒ 永不露出：ChatBot 的 producer 不消费插话，
   // 放出入口只会得到一个"点了没反应"的按钮
   const chatBot = composeState({
-    round: roundOf({ status: 'streaming' }),
+    round: roundFixture({ status: 'streaming' }),
     sending: true,
     stopping: false,
     draft: '边跑边说',
@@ -1395,7 +1413,7 @@ await it('H11 「插话」入口（P1-9 · P4 · R1）：只在沙箱 streaming 
 
   // 沙箱 + streaming + **空草稿** ⇒ 不露出（没内容可插）
   const emptyDraft = composeState({
-    round: roundOf({ status: 'streaming' }),
+    round: roundFixture({ status: 'streaming' }),
     sending: true,
     stopping: false,
     draft: '',
@@ -1405,7 +1423,7 @@ await it('H11 「插话」入口（P1-9 · P4 · R1）：只在沙箱 streaming 
 
   // 沙箱 + streaming + 非空草稿 ⇒ 露出、可点，且**主按钮仍是停止**（插话是**并列**动作，不替换停止）
   const sandbox = composeState({
-    round: roundOf({ status: 'streaming' }),
+    round: roundFixture({ status: 'streaming' }),
     sending: true,
     stopping: false,
     draft: '先别删那个文件',
@@ -1615,21 +1633,21 @@ await it('I10 `waitForRoundSettled`：没人收口 ⇒ 返回 false（**超时�
 
 await it('I11 接真 store：`done{STOPPED}` 一落地，等待立刻返回', async () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   store.getState().begin('conv-stop', '长问题', STARTED_AT)
   const waiting = waitForRoundSettled(
     {
       subscribe: (listener) => store.subscribe(listener),
       isSettled: () => {
-        const state = store.getState()
-        return state.round === null || state.round.status !== 'streaming'
+        const round = roundOf(store.getState(), 'conv-stop')
+        return round === null || round.status !== 'streaming'
       },
     },
     1000,
   )
-  store.getState().apply(eventOf('done', { messageId: 'msg-stop', finishReason: 'STOPPED', usage: null }))
+  store.getState().apply('conv-stop', eventOf('done', { messageId: 'msg-stop', finishReason: 'STOPPED', usage: null }))
   assertEqual(await waiting, true, '收口即返回')
-  assertEqual(store.getState().round.status, 'stopped', '这一轮落成"已停止"')
+  assertEqual(roundOf(store.getState(), 'conv-stop').status, 'stopped', '这一轮落成"已停止"')
 })
 
 // ═════════════════════════════ J 组：断线、对齐与文案（P0-1-33） ═════════════════════════
@@ -1752,14 +1770,16 @@ await it('J6 `decideAlign` 的三种结论：服务端在跑 / 存下来了 / �
 
 await it('J7 `stoppedLocally`：标成"已停止"但**不动已生成内容**，并清掉本地错误', () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   store.getState().begin('conv-stop-2', '问', STARTED_AT)
-  store.getState().apply(eventOf('delta', { text: '已生成的内容' }))
-  store.getState().apply(eventOf('citations', { items: [{ docName: '手册.pdf', snippet: '片段', score: 0.5 }] }))
-  store.getState().fail({ code: 'NETWORK', message: '中途断了一次' })
-  assertEqual(store.getState().round.status, 'error', '先制造一个错误态')
-  store.getState().stoppedLocally()
-  const round = store.getState().round
+  store.getState().apply('conv-stop-2', eventOf('delta', { text: '已生成的内容' }))
+  store
+    .getState()
+    .apply('conv-stop-2', eventOf('citations', { items: [{ docName: '手册.pdf', snippet: '片段', score: 0.5 }] }))
+  store.getState().fail('conv-stop-2', { code: 'NETWORK', message: '中途断了一次' })
+  assertEqual(roundOf(store.getState(), 'conv-stop-2').status, 'error', '先制造一个错误态')
+  store.getState().stoppedLocally('conv-stop-2')
+  const round = roundOf(store.getState(), 'conv-stop-2')
   assertEqual(round.status, 'stopped', '状态')
   assertEqual(round.finishReason, 'STOPPED', '收尾原因')
   assertEqual(round.error, null, '错误被清掉（这一轮最终是"用户停止"，不是"失败"）')
@@ -1771,62 +1791,65 @@ await it('J7 `stoppedLocally`：标成"已停止"但**不动已生成内容**，
 
 await it('J8 `errorSource` 分得清"谁发现的"（决定 toast 还是黄条）', () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   store.getState().begin('conv-src', '问', STARTED_AT)
-  store.getState().apply(eventOf('error', { code: 'CONFLICT', message: '该会话正在生成中' }))
-  assertEqual(store.getState().round.errorSource, 'server', '流内 error 事件 = 服务端发现的')
-  assertEqual(store.getState().round.status, 'error', '状态')
-  store.getState().reset()
+  store.getState().apply('conv-src', eventOf('error', { code: 'CONFLICT', message: '该会话正在生成中' }))
+  assertEqual(roundOf(store.getState(), 'conv-src').errorSource, 'server', '流内 error 事件 = 服务端发现的')
+  assertEqual(roundOf(store.getState(), 'conv-src').status, 'error', '状态')
+  store.getState().reset('conv-src')
 
   store.getState().begin('conv-src', '问', STARTED_AT)
-  store.getState().fail({ code: 'NETWORK', message: '连接断了' })
-  assertEqual(store.getState().round.errorSource, 'client', '本地读流失败 = 客户端发现的')
-  assertEqual(store.getState().round.status, 'error', '状态')
+  store.getState().fail('conv-src', { code: 'NETWORK', message: '连接断了' })
+  assertEqual(roundOf(store.getState(), 'conv-src').errorSource, 'client', '本地读流失败 = 客户端发现的')
+  assertEqual(roundOf(store.getState(), 'conv-src').status, 'error', '状态')
 })
 
 await it('J9 黄条与轮次**解耦**：对齐丢掉轮次之后黄条还在，只有 `clearDisconnect` 才收', () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   store.getState().begin('conv-banner', '问', STARTED_AT)
-  store.getState().showDisconnect({ extra: 'NETWORK · 没收到终帧' })
-  assertEqual(store.getState().disconnect?.extra, 'NETWORK · 没收到终帧', '黄条亮起')
+  store.getState().showDisconnect('conv-banner', { extra: 'NETWORK · 没收到终帧' })
+  assertEqual(disconnectOf(store.getState(), 'conv-banner')?.extra, 'NETWORK · 没收到终帧', '黄条亮起')
   // 对齐的结论是"服务端存下来了 ⇒ 丢掉流式轮次"。若黄条挂在轮次上，它会在这一刻自己消失 ——
   // 用户就看不到"我点了它、它对齐了"这个动作（见 `stores/chatStream.ts` 的注释）
-  store.getState().reset()
-  assertEqual(store.getState().round, null, '轮次已丢')
-  assertEqual(store.getState().disconnect === null, false, '黄条仍在')
-  store.getState().clearDisconnect()
-  assertEqual(store.getState().disconnect, null, '点过之后才收')
+  store.getState().reset('conv-banner')
+  assertEqual(roundOf(store.getState(), 'conv-banner'), null, '轮次已丢')
+  assertEqual(disconnectOf(store.getState(), 'conv-banner') === null, false, '黄条仍在')
+  store.getState().clearDisconnect('conv-banner')
+  assertEqual(disconnectOf(store.getState(), 'conv-banner'), null, '点过之后才收')
 })
 
-await it('J10 开新一轮时清掉上一轮的黄条（否则用户以为这一轮出问题了）', () => {
+await it('J10 开新一轮时清掉**本会话**上一轮的黄条（否则用户以为这一轮出问题了）', () => {
   const store = useChatStreamStore
-  store.getState().reset()
-  store.getState().showDisconnect({ extra: null })
-  assertEqual(store.getState().disconnect === null, false, '先亮着')
+  store.getState().resetAll()
+  store.getState().showDisconnect('conv-new', { extra: null })
+  store.getState().showDisconnect('conv-other', { extra: null })
+  assertEqual(disconnectOf(store.getState(), 'conv-new') === null, false, '先亮着')
   store.getState().begin('conv-new', '新问题', STARTED_AT)
-  assertEqual(store.getState().disconnect, null, '新一轮开始时自动清掉')
+  assertEqual(disconnectOf(store.getState(), 'conv-new'), null, '新一轮开始时自动清掉')
+  // ⚠️ P1-19：只清**本会话**的 —— 别的会话的黄条不该被顺手抹掉
+  assertEqual(disconnectOf(store.getState(), 'conv-other') === null, false, '别的会话的黄条不动')
 })
 
 await it('J11 验收原文：停止后**不丢已生成内容**、且输入区回到可发送（能直接追问）', async () => {
   // 整条重演：发一条 → 看着它长出来 → 点停止（走真控制器 + 真等待）→ 收口 → 能不能接着问？
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   store.getState().begin('conv-resume', '写个长回答', STARTED_AT)
-  store.getState().apply(eventOf('delta', { text: '已经生成的前半段' }))
-  store.getState().apply(eventOf('thinking', { text: '想了一下' }))
+  store.getState().apply('conv-resume', eventOf('delta', { text: '已经生成的前半段' }))
+  store.getState().apply('conv-resume', eventOf('thinking', { text: '想了一下' }))
 
   // 点停止：依赖注入成"真 store 的收口等待"，`requestStop` 返回 `signaled:true`
   const controller = createStopController({
-    isRunning: () => store.getState().round?.status === 'streaming',
+    isRunning: () => roundOf(store.getState(), 'conv-resume')?.status === 'streaming',
     requestStop: async () => ({ signaled: true }),
     waitSettled: (ms) =>
       waitForRoundSettled(
         {
           subscribe: (listener) => store.subscribe(listener),
           isSettled: () => {
-            const state = store.getState()
-            return state.round === null || state.round.status !== 'streaming'
+            const round = roundOf(store.getState(), 'conv-resume')
+            return round === null || round.status !== 'streaming'
           },
         },
         ms,
@@ -1837,13 +1860,13 @@ await it('J11 验收原文：停止后**不丢已生成内容**、且输入区�
   })
   const stopping = controller.stop()
   // 服务端的收口帧紧跟着到达（`done{STOPPED, messageId}` —— 已生成部分照样落库，P0-1-26 定案）
-  store.getState().apply(
-    eventOf('done', { messageId: 'msg-partial', finishReason: 'STOPPED', usage: null }),
-  )
+  store
+    .getState()
+    .apply('conv-resume', eventOf('done', { messageId: 'msg-partial', finishReason: 'STOPPED', usage: null }))
   const outcome = await stopping
   assertEqual(outcome.kind, 'settled', '等到收口（不是兜底 abort）')
 
-  const round = store.getState().round
+  const round = roundOf(store.getState(), 'conv-resume')
   assertEqual(round.status, 'stopped', '收尾原因来自服务端')
   assertEqual(round.assistant.text, '已经生成的前半段', '**已生成的内容没有丢**')
   assertEqual(round.finishReason, 'STOPPED', '标注"已停止"')
@@ -1865,17 +1888,17 @@ await it('J11 验收原文：停止后**不丢已生成内容**、且输入区�
 
 await it('J12 `round === null` 也算"已收口"（少了这条会让停止按钮白转满 5 秒）', async () => {
   const store = useChatStreamStore
-  store.getState().reset()
+  store.getState().resetAll()
   const isSettled = () => {
-    const state = store.getState()
-    return state.round === null || state.round.status !== 'streaming'
+    const round = roundOf(store.getState(), 'conv-null')
+    return round === null || round.status !== 'streaming'
   }
   assertEqual(isSettled(), true, '没有轮次 ⇒ 没什么可等的')
   store.getState().begin('conv-null', '问', STARTED_AT)
   assertEqual(isSettled(), false, '有流在跑')
-  store.getState().reset()
+  store.getState().reset('conv-null')
   assertEqual(isSettled(), true, '被对齐丢掉了 ⇒ 也算收口')
-  store.getState().reset()
+  store.getState().resetAll()
 })
 
 // ═════════════════════════════ K 组：会话侧栏（P0-1-34） ═════════════════════════
@@ -1932,7 +1955,7 @@ await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持�
     convItem({ id: 'yesterday', lastMessageAt: '2026-09-22T18:20:00' }),
     convItem({ id: 'lastWeek', lastMessageAt: '2026-09-20T11:02:00' }),
   ]
-  const groups = groupConversationViews(list, SIDEBAR_NOW, null)
+  const groups = groupConversationViews(list, SIDEBAR_NOW, new Set())
 
   assertDeepEqual(
     groups.map((group) => group.label),
@@ -1957,39 +1980,39 @@ await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持�
   )
 
   assertDeepEqual(
-    groupConversationViews([convItem({ id: 'a' })], SIDEBAR_NOW, null).map((group) => group.label),
+    groupConversationViews([convItem({ id: 'a' })], SIDEBAR_NOW, new Set()).map((group) => group.label),
     ['今天'],
     '只有今天的内容 ⇒ 不该出现一个空的「更早」标题',
   )
   assertDeepEqual(
-    groupConversationViews([convItem({ id: 'b', lastMessageAt: '2026-09-10T10:00:00' })], SIDEBAR_NOW, null).map(
+    groupConversationViews([convItem({ id: 'b', lastMessageAt: '2026-09-10T10:00:00' })], SIDEBAR_NOW, new Set()).map(
       (group) => group.label,
     ),
     ['更早'],
     '反过来同理',
   )
-  assertDeepEqual(groupConversationViews([], SIDEBAR_NOW, null), [], '一个会话都没有 ⇒ 没有分组')
+  assertDeepEqual(groupConversationViews([], SIDEBAR_NOW, new Set()), [], '一个会话都没有 ⇒ 没有分组')
 })
 
 await it('K3 状态灯三态：「生成中」只由**流 store** 点亮，`FINISHED` ⇒ 只读保留', () => {
   const active = convItem({ id: 'a', topic: '本周部署变更周报', lastMessageAt: '2026-09-23T14:57:00' })
 
-  const running = conversationItemView(active, SIDEBAR_NOW, 'a')
+  const running = conversationItemView(active, SIDEBAR_NOW, new Set(['a']))
   assertEqual(running.led, 'run', '这一条在生成')
   assertEqual(running.state, '生成中', '状态文案（与灯"色 + 字"两重表达）')
   assertEqual(running.title, '本周部署变更周报', '标题取 topic')
   assertEqual(running.time, '3 分钟前', '时间读数')
 
   // ⚠️ 指向是**单侧**的：别的会话在生成，这一条不该亮 run（写成"只要有流就全都亮"的实现会红）
-  const other = conversationItemView(active, SIDEBAR_NOW, 'some-other-conversation')
+  const other = conversationItemView(active, SIDEBAR_NOW, new Set(['some-other-conversation']))
   assertEqual(other.led, 'idle', '别的会话在生成 ⇒ 这一条仍是 idle')
   assertEqual(other.state, '可继续', '文案')
 
-  const finished = conversationItemView(convItem({ id: 'c', status: 'FINISHED' }), SIDEBAR_NOW, null)
+  const finished = conversationItemView(convItem({ id: 'c', status: 'FINISHED' }), SIDEBAR_NOW, new Set())
   assertEqual(finished.led, 'warn', 'FINISHED（Agent 被软删 ⇒ 只读保留）')
   assertEqual(finished.state, '只读保留', '文案说结果，不说"已结束"')
 
-  const untitled = conversationItemView(convItem({ id: 'd' }), SIDEBAR_NOW, null)
+  const untitled = conversationItemView(convItem({ id: 'd' }), SIDEBAR_NOW, new Set())
   assertEqual(untitled.title, '新会话', '没命名过 ⇒ 回落到 shared 的 CONVERSATION_UNTITLED_HINT')
   assertEqual(untitled.time, '还没有消息', '没有消息时的时间读数')
 })

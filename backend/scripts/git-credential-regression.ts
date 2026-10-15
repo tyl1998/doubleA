@@ -14,7 +14,7 @@
  *    真的成功 —— 那些留给用户真跑（`子方案/Code模式工作区.md` §五 7 的验收口径）。
  */
 
-import { GIT_CREDENTIAL_KINDS, missingGitCredentialSecretFields } from '@doubulea/shared'
+import { GIT_CREDENTIAL_KINDS, missingGitCredentialSecretFields, normalizeGitIdentity } from '@doubulea/shared'
 
 import {
   GIT_CREDENTIAL_HELPER_PATH,
@@ -89,6 +89,38 @@ it('helper env：无参数、恒定、且**不含任何秘密**', () => {
   const joined = Object.values(env).join('\n')
   assert(!joined.includes('Authorization'), '不应出现 Authorization（旧 extraheader 做法已废）')
   assert(!joined.includes('x-access-token'), '不应出现用户名')
+})
+
+// ── helper env + git 提交身份（P1-20）──────────────────────────────────
+it('helper env + 身份：user.name/user.email 拼进**同一张** GIT_CONFIG_* 表（不覆盖 COUNT）', () => {
+  const env = gitCredentialHelperEnv({ name: 'Zhang San', email: 'zhangsan@example.com' })
+  assertEqual(env.GIT_CONFIG_COUNT, '4', '4 条：两个 credential.helper + 身份两条')
+  assertEqual(env.GIT_CONFIG_KEY_2, 'user.name', '第 3 条是 user.name')
+  assertEqual(env.GIT_CONFIG_VALUE_2, 'Zhang San')
+  assertEqual(env.GIT_CONFIG_KEY_3, 'user.email', '第 4 条是 user.email')
+  assertEqual(env.GIT_CONFIG_VALUE_3, 'zhangsan@example.com')
+  // 只配一个字段 ⇒ 只多一条
+  const onlyEmail = gitCredentialHelperEnv({ name: null, email: 'a@b.com' })
+  assertEqual(onlyEmail.GIT_CONFIG_COUNT, '3', '只有邮箱 ⇒ 3 条')
+  assertEqual(onlyEmail.GIT_CONFIG_KEY_2, 'user.email')
+  // 空身份 ⇒ 与无参逐字节一致（行为回到引入前）
+  assertEqual(
+    JSON.stringify(gitCredentialHelperEnv({ name: null, email: null })),
+    JSON.stringify(gitCredentialHelperEnv()),
+    '空身份不应产生任何身份条目',
+  )
+})
+it('normalizeGitIdentity：trim + 空串/空白 ⇒ null（"没填"只有一种表示）', () => {
+  assertEqual(
+    JSON.stringify(normalizeGitIdentity({ name: '  ', email: '' })),
+    JSON.stringify({ name: null, email: null }),
+    '空白/空串归一成 null',
+  )
+  assertEqual(
+    JSON.stringify(normalizeGitIdentity({ name: ' A ', email: ' a@b.com ' })),
+    JSON.stringify({ name: 'A', email: 'a@b.com' }),
+    '两端空白被 trim',
+  )
 })
 
 // ── 挑凭据：HTTPS ──────────────────────────────────────────────────────

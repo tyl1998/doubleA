@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tan
 import type {
   ListSandboxRuntimesResult,
   SandboxBuildJob,
+  SandboxRuntimeSelection,
   StartSandboxBuildResult,
 } from '@doubulea/shared'
 
@@ -34,7 +35,7 @@ export function useSandboxRuntimes(): UseQueryResult<ListSandboxRuntimesResult> 
 }
 
 /** **启动**一个运行时构建任务（P1-17a 定案 B）；立刻回 `buildId` 供轮询 */
-export function startSandboxBuild(components: string[]): Promise<StartSandboxBuildResult> {
+export function startSandboxBuild(components: SandboxRuntimeSelection[]): Promise<StartSandboxBuildResult> {
   return request<StartSandboxBuildResult>('/api/sandbox/runtimes/build', {
     method: 'POST',
     body: { components },

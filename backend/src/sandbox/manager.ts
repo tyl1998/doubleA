@@ -38,7 +38,7 @@
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import type { SandboxRuntimeItem } from '@doubulea/shared'
+import { normalizeGitIdentity, type SandboxRuntimeItem } from '@doubulea/shared'
 import * as docker from './docker.js'
 import { resolveSandboxLlm, type SandboxLlmResult } from './llm.js'
 import {
@@ -66,7 +66,7 @@ import { listSandboxRuntimes, resolveSandboxRuntimeImage } from './runtimeImages
 import { clearCredentialPhase } from './credentialPhase.js'
 import { bindSandboxToken, revokeSandboxToken } from './token.js'
 import { clearSandboxMcpMap } from './mcpMap.js'
-import { clearSandboxOwner, registerSandboxOwner } from './owner.js'
+import { clearSandboxOwner, ensureWorkspaceOwner, registerSandboxOwner } from './owner.js'
 import { ensureWorkspace } from '../workspace/service.js'
 import { startWorkspaceWatcher } from '../workspace/watcher.js'
 
@@ -491,6 +491,18 @@ async function createSandbox(
     })
     const codeMode = conversationRow?.codeMode ?? false
     /**
+     * ★ P1-20：会话发起者的 **git 提交身份**（可选）—— 派活时经 `GIT_CONFIG_*` 注入容器 git 的
+     *   `user.name`/`user.email`，免得 agent 自己猜署名、把身份写进仓库本地 config。
+     *   空 = 不注入（行为与引入前一致）。查一次用户行，失败按"未配置"降级（身份是赠品，不落轮）。
+     */
+    const gitIdentityRow = await prisma.user
+      .findUnique({ where: { id: owner.userId }, select: { gitName: true, gitEmail: true } })
+      .catch((error: unknown) => {
+        getLogger().warn({ err: error, conversationId }, '读取用户 git 身份失败（本轮不注入身份）')
+        return null
+      })
+    const gitIdentity = normalizeGitIdentity({ name: gitIdentityRow?.gitName, email: gitIdentityRow?.gitEmail })
+    /**
      * ★ P1-9 · R11 修订：git 凭据改为**按需拉取** —— 建容器时**不注入任何秘密**。
      *    容器里只有一份固定 env（`gitCredentialHelperEnv`，把 git 指向两个 helper 脚本）；
      *    真正的凭据由 helper 在 git 用时经 `/api/sandbox/git/credential` 回调换取
@@ -544,7 +556,8 @@ async function createSandbox(
           // ★ P1-9 · P3：Code 模式才注入（普通会话一个都不加，扩展默认关闭）
           ...workspaceMediationEnv(codeMode),
           // ★ P1-9 · R11 修订：git 凭据 helper env（**不含秘密**；凭据运行期按需回调取回）
-          ...gitCredentialHelperEnv(),
+          // ★ P1-20：同一处拼上会话发起者的 git 提交身份（`user.name`/`user.email`，公开信息）
+          ...gitCredentialHelperEnv(gitIdentity),
         },
       }),
     )
@@ -657,9 +670,28 @@ export async function recycleSandbox(conversationId: string, reason: string): Pr
   await clearSandboxMcpMap(conversationId)
   // ★ P1-17c：容器收了 ⇒ 执行相一起清（新容器从 `CLONE` 相开始，可以重新 clone）。
   await clearCredentialPhase(conversationId)
-  // ★ P1-14 §六 4：回收成功后 `DEL sandbox:owner:{id}`（失败留给 TTL）。
-  //   清目录后新的一轮 `/chat` 可自由落在任意实例并重新登记 —— 这是"owner 宕机降级"的兑现点。
-  await clearSandboxOwner(conversationId)
+  // ★ P1-14 §六 4 / P1-9 §十六 B–C：回收容器时怎么处理"会话 → 实例"目录（`sandbox:owner:{id}`）。
+  //
+  // ⚠️ **关键修正（用户反馈 2026-10-15 · 问题 2）**：**有工作区的会话不能清这份目录** ——
+  //    工作区是**宿主本地盘**（`WORKSPACE_ROOT/{id}`，bind 进容器 `/work`），里面除了源码还有
+  //    **运行期拉下来的依赖**（`node_modules` / `venv` / …）。把目录一清，下一轮 `/chat` 就可能
+  //    落到**别的实例**，而那台根本没有这份工作区 ⇒ 只能从 S3 冷备重建（**依赖不进冷备**）⇒
+  //    agent 又要重新 `npm install` / `pip install`（就是"每次装过的包和环境都要重新下载"）。
+  //    故：有工作区 ⇒ **续成工作区寿命**（`ensureWorkspaceOwner`，钉机记录早于建容器、寿命跟随
+  //    工作区，见 `owner.ts`）；没有工作区（非 Code / 从未触达）⇒ 旧行为（清掉，让容器自由重钉）。
+  const hasWorkspace = await prisma.workspace
+    .findUnique({ where: { conversationId }, select: { conversationId: true } })
+    .catch((error: unknown) => {
+      getLogger().warn({ err: error, conversationId }, '查工作区行失败（保守按"无工作区"处理：清目录）')
+      return null
+    })
+  if (hasWorkspace === null) {
+    await clearSandboxOwner(conversationId)
+  } else {
+    await ensureWorkspaceOwner(conversationId).catch((error: unknown) => {
+      getLogger().warn({ err: error, conversationId }, '续工作区钉机记录失败（留给 TTL）')
+    })
+  }
 
   if (slots.remove(conversationId)) changed = true
   if (changed) {

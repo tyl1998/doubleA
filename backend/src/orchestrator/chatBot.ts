@@ -207,8 +207,33 @@ export const chatBotProducer: ChatProducer = async (input) => {
    */
   const toolRecords: ToolCallRecord[] = []
 
+  /**
+   * 中途插话（steer，P1-9 · P4 · R1；**P1-20 起 ChatBot 也消费**）的退订句柄。
+   *
+   * 声明在 `try` **之外**：`unsubscribe()` 只在收尾的 `finally` 里调，而 `const` 在 `try` 块里
+   * 声明的话 `finally` 够不着（块作用域）。注册放在 `try` 内、退订放 `finally` —— 与 TaskAgent
+   * 对 bridge/通道订阅同一条纪律（通道活得比一轮久，不退就是漏监听器）。
+   */
+  let unsubscribeSteer: (() => void) | null = null
+
   try {
     const db = getPrisma()
+
+    /**
+     * 中途插话（steer，P1-9 · P4 · R1；**P1-20 起 ChatBot 也消费**）—— 用户在一轮**运行中**
+     * 插的一句话（`POST /:id/steer` → `chat.steer:{id}` → 通道轮询 → 这里）。
+     *
+     * ChatBot 没有 pi 的 `steer` 命令，投递语义用**同一句口径**兑现：**在助手 turn 边界、
+     * 下一次 LLM 调用前**注入（`docs/子方案/Code模式工作区.md` §十五 对 `steer` 的定义）。
+     * 实现 = 攒进 `steerInbox`，在工具循环**每轮开头**（= 下一次 `chatStream` 之前）作为一条
+     * `user` 消息推进 `messages`。⚠️ 若这一轮本就没有下一次上游调用（首轮即最终回答 / 无工具），
+     * 就没有"下一步"可注入 —— 与 pi 的 steer 一致（没有下个 turn 就不投）；界面那一帧 `steer`
+     * 已经由通道发出（用户仍看得到自己插的话）。
+     */
+    const steerInbox: string[] = []
+    unsubscribeSteer = input.onSteer((message) => {
+      steerInbox.push(message)
+    })
 
     // ── ②″ 会话行（owner + 会话级「不记入记忆」；长期记忆注入与收尾提取都要用）──
     const conversationRow = await db.conversation.findUnique({
@@ -437,6 +462,11 @@ export const chatBotProducer: ChatProducer = async (input) => {
     try {
       for (;;) {
         const limit = config.limits.toolLoopLimit
+        // 中途插话（P1-20）：把这一轮以来收到的插话在**下一次 LLM 调用前**注入（= 助手 turn 边界）。
+        // ⚠️ 排在拼本轮 `messages` 之后、`chatStream` 之前 —— 顺序即"模型看得到"。
+        if (steerInbox.length > 0) {
+          for (const message of steerInbox.splice(0)) messages.push({ role: 'user', content: message })
+        }
         /**
          * "还允不允许要工具"（见文件头 ④①）：到上限后就**当轮撤掉 `tools`** + 注入提示。
          * 撤掉比"等它要了再拒"少一次上游往返，而且**只有请求里没有 `tools` 才是真的禁工具**。
@@ -1103,6 +1133,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
       usage: totalUsage === null ? null : { tokensIn: totalUsage.tokensIn, tokensOut: totalUsage.tokensOut },
     }
   } finally {
+    // 中途插话（P1-20）：通道活得比一轮久 ⇒ 本轮收尾必须退订（与 TaskAgent 退订 bridge 订阅同款）。
+    unsubscribeSteer?.()
     release()
   }
 }
