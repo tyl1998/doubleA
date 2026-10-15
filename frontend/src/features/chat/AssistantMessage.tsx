@@ -19,7 +19,7 @@
  * 失败时不静默：复制不到就得告诉用户（他要的是那段文字，而不是"我点了按钮"）。
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { useFeedback } from '../../app/feedback.js'
 import { ArtifactCard } from './ArtifactCard.js'
@@ -27,7 +27,6 @@ import { AssistantMarkdown } from './AssistantMarkdown.js'
 import { CitationCard } from './CitationCard.js'
 import { ErrorCard } from './ErrorCard.js'
 import { ThinkingBlock } from './ThinkingBlock.js'
-import { ToolCard } from './ToolCard.js'
 import { isAssistantEmpty, type ChatMessageView } from './messageModel.js'
 
 export interface AssistantMessageProps {
@@ -103,23 +102,24 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
         {agentName}
       </p>
 
+      {/* 流式进度行：`statusText` + 已用时。比"只在空内容时给占位"更早、更持久 ——
+          工具参数生成期（可 20s+）里没有任何正文事件，这一行是唯一在动的东西。 */}
+      {view.status === 'streaming' ? (
+        <StreamingStatusLine statusText={view.statusText} startedAt={view.startedAt} />
+      ) : null}
+
       {/* 思考块：`thinking` 为空串 = 这一段本来就没有 ⇒ 不渲染（`03` §4.1 的"可选而非默认"口径） */}
       {view.thinking === '' ? null : (
         <ThinkingBlock text={view.thinking} streaming={view.status === 'streaming'} />
       )}
 
-      {view.tools.map((tool) => (
-        <ToolCard key={tool.callId} tool={tool} />
-      ))}
-
       {empty ? (
         <p className="ratio" data-testid="assistant-placeholder">
           {view.status === 'streaming' ? (
-            // 流式但**一个字都还没到**：先显示 TaskAgent 的生命周期中间态（`status` 事件，
-            // "沙箱就绪 → 引擎启动 → 引擎就绪"），没有就回落成"等待上游响应"占位。
-            // 状态行只是"还没内容时"的进度指示，真实内容一到归约层就会清掉它。
+            // 流式但**一个字都还没到**：占位。具体的生命周期文案（`status` 事件）已由上面的
+            // `StreamingStatusLine` 呈现，这里只留一句中性的"等待"与打字光标。
             <>
-              {view.statusText ?? '正在等待上游响应…'}
+              正在等待上游响应…
               <span className="caret" aria-hidden="true" />
             </>
           ) : view.status === 'stopped' ? (
@@ -130,7 +130,7 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
         </p>
       ) : (
         <>
-          {view.text === '' ? null : <AssistantMarkdown text={view.text} />}
+          {view.text !== '' || view.tools.length > 0 ? <AssistantMarkdown text={view.text} tools={view.tools} /> : null}
           {view.status === 'streaming' ? (
             // 流式光标：`design/styles/components.css` 的 `.caret`（块状、闪烁，暗示"打字机"）
             <span className="caret" aria-hidden="true" />
@@ -180,5 +180,28 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
         )}
       </div>
     </article>
+  )
+}
+
+/**
+ * 流式进度行：`statusText`（后端 `status` 事件：模型在思考 / 根据工具结果继续…）+ 秒级计时器。
+ *
+ * 只在**流式中**渲染。为什么单独一行而不是并进占位：占位只在"一个字都还没有"时出现，而真正
+ * 安静的是**工具参数生成期**（正文/思考已经出现过、参数还在流，可能 20s+）—— 那时占位早就不在了。
+ * 这一行在整段流式期间都在，且每秒自增，是"还在动"最直接的证据。
+ */
+function StreamingStatusLine({ statusText, startedAt }: { statusText?: string; startedAt?: string }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  const start = startedAt === undefined ? Number.NaN : Date.parse(startedAt)
+  const elapsedSec = Number.isNaN(start) ? null : Math.max(0, Math.floor((now - start) / 1000))
+  return (
+    <p className="msg__streaming ratio" data-testid="streaming-status">
+      {statusText ?? '正在生成…'}
+      {elapsedSec === null ? null : ` · 已用时 ${elapsedSec}s`}
+    </p>
   )
 }

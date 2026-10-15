@@ -49,7 +49,13 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { type ArtifactItem, type WorkspaceChangeEntry } from '@doubulea/shared'
+import {
+  type ArtifactItem,
+  DOCX_MIME,
+  WORKSPACE_MIME_BY_EXTENSION,
+  type WorkspaceChangeEntry,
+  XLSX_MIME,
+} from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -59,6 +65,7 @@ import { resolveWorkspacePath } from '../workspace/paths.js'
 import { ensureWorkspace } from '../workspace/service.js'
 import { readWorkspaceBytes, workspaceFileSize } from '../workspace/store.js'
 import { ARTIFACT_EXCLUDED_DIRS, artifactChangePaths } from './artifactChanges.js'
+import { filterGitCleanPaths } from './gitArtifacts.js'
 
 /**
  * 一个产物文件在对象存储里的键前缀（与 `kb/` 平级的命名空间 —— 两类对象永不混淆）。
@@ -77,33 +84,26 @@ export const ARTIFACT_EXEC_TIMEOUT_MS = 60_000
 /**
  * 产物 `mime` 的判定（扫描时定一次，之后**所有人只读 `artifacts.mime`** —— `子方案④` §四）。
  *
- * 名单收得**刻意保守**：认识几类常见产物（文本/表格/网页/图片/PDF）就够，认识不了的一律
- * `application/octet-stream`（`previewKindOf` 对它返回 `none`，前端不给「预览」按钮，
- * 下载不受影响）。不做嗅探（嗅探猜错是静默的，`子方案④` §八 同款理由）。
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ P1-16 起：**复用工作区那张更宽的表**（`WORKSPACE_MIME_BY_EXTENSION`）+ 产物专属项
+ * ─────────────────────────────────────────────────────────────────────
+ * 旧版这里是一张"刻意保守"的小名单（只认文本/表格/网页/图片/PDF），后果是 `.java`/`.go`/`.css`…
+ * 一律落 `octet-stream` ⇒ `previewKindOf` 返回 `none` ⇒ 产物连「预览」入口都没有（只能下载）。
+ * 现在改成：**扩展名 → mime 的判据只有一处**（`shared#WORKSPACE_MIME_BY_EXTENSION`），产物在它之上：
+ *   · **补产物专属**：`.docx` / `.xlsx`（工作区表没有，它们是产物渲染出口的新形态）；
+ *   · **两处覆盖**：`.vue` / `.svelte` 工作区表给 `text/html`（编辑器当网页开），但**产物当源码**更合适
+ *     ⇒ 覆盖成 `text/plain`（否则 `previewKindOf` 会把一份 SFC 当 HTML 直出）。
+ * 其余一律沿用工作区表；**两张表对同一扩展名的结论不再各写一份、不会分叉**（旧注释警告的正是这一点）。
+ * 仍未命中的一律 `application/octet-stream`（`previewKindOf` → `none`，只给下载）。不做嗅探。
  */
 const ARTIFACT_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
-  txt: 'text/plain',
-  md: 'text/markdown',
-  csv: 'text/csv',
-  tsv: 'text/tab-separated-values',
-  json: 'application/json',
-  xml: 'application/xml',
-  html: 'text/html',
-  htm: 'text/html',
-  svg: 'image/svg+xml',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  pdf: 'application/pdf',
-  py: 'text/x-python',
-  js: 'text/javascript',
-  ts: 'text/typescript',
-  sh: 'text/x-shellscript',
-  yaml: 'text/yaml',
-  yml: 'text/yaml',
-  log: 'text/plain',
+  ...WORKSPACE_MIME_BY_EXTENSION,
+  // ── 产物专属（工作区表没有；对应 `/render` 渲染出口的新形态）──
+  docx: DOCX_MIME,
+  xlsx: XLSX_MIME,
+  // ── 覆盖工作区表的取舍：SFC 产物按**源码**看，不按网页直出 ──
+  vue: 'text/plain',
+  svelte: 'text/plain',
 }
 
 /** 按扩展名定 mime（小写；不认识 → `application/octet-stream`）。导出为纯函数便于核对。 */
@@ -155,20 +155,43 @@ export async function collectRoundArtifacts(input: {
     return []
   }
 
-  const changed = artifactChangePaths(changes, {
+  // 先做**只读筛选**（隐藏 / excludedDirs），**不截断** —— 截断必须排在 git 过滤之后：
+  // 否则 clone 拉来的 200 个文件会先把上限占满、agent 真正的产物被截掉。
+  const candidates = artifactChangePaths(changes, {
     excludedDirs: ARTIFACT_EXCLUDED_DIRS,
-    maxFiles: config.limits.artifactScanMaxFiles,
-    onTruncate: (accepted, kept, maxFiles) => {
-      logger.warn(
-        { conversationId, changed: accepted, kept, maxFiles },
-        '产物扫描：本轮变更的工作区文件数超过单轮上限，已截断（防引擎写一万个小文件打爆上传；其余文件留待下轮对账）',
-      )
-    },
+    maxFiles: Number.MAX_SAFE_INTEGER,
   })
-  if (changed.length === 0) return []
+  if (candidates.length === 0) return []
 
   // 工作区根（宿主 canonical 目录；`ensureWorkspace` 幂等，顺带带上冷备恢复）
   const handle = await ensureWorkspace(conversationId)
+
+  // git 过滤（#3）：剔除 git 仓库里"干净的 tracked 文件"（clone / pull 拉下来、没再动过的）。
+  // ⚠️ 保守：git 不可用 / 命令失败 ⇒ 原样保留（见 `gitArtifacts.ts` 文件头）。
+  let selected = candidates
+  try {
+    const { kept, excluded } = await filterGitCleanPaths(handle.rootPath, candidates)
+    if (excluded.length > 0) {
+      logger.info(
+        { conversationId, excluded: excluded.length, kept: kept.length },
+        '产物扫描：剔除 git 仓库里干净的 tracked 文件（clone / pull 的初始填充不算产物）',
+      )
+    }
+    selected = kept
+  } catch (error) {
+    logger.warn({ err: error, conversationId }, '产物扫描：git 过滤失败，按原候选继续（不影响收集）')
+  }
+
+  // 单轮上限：截断 + 留痕（排在 git 过滤之后，截的是"真正要收的"那一批）
+  const maxFiles = config.limits.artifactScanMaxFiles
+  const changed = selected.slice(0, maxFiles)
+  if (changed.length < selected.length) {
+    logger.warn(
+      { conversationId, changed: selected.length, kept: changed.length, maxFiles },
+      '产物扫描：本轮变更的工作区文件数超过单轮上限，已截断（防引擎写一万个小文件打爆上传；其余文件留待下轮对账）',
+    )
+  }
+  if (changed.length === 0) return []
   const bucket = config.s3.bucket
   const maxFileBytes = config.limits.artifactMaxFileMb * 1024 * 1024
   const items: ArtifactItem[] = []

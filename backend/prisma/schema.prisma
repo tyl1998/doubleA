@@ -114,6 +114,12 @@ enum ConversationStatus {
   @@map("conversation_status")
 }
 
+/// ⚠️ 运行时 id **不再是数据库枚举**（旧的 `conversation_runtime` 枚举已于
+/// `20261015100000_conversation_runtime_text` 迁移里删除）：取值是后端从本机镜像**探测出来**的
+/// 运行时 id（镜像 tag `doubulea/sandbox-runtime:<id>-v<层版本>` 里的 `<id>`）。
+/// 理由（用户 2026-10-14 定案）："有就提供、没有就不提供" —— 可用运行时取决于**这套部署造了
+/// 哪些镜像**，不是编译期约束（见 `shared/src/conversation.ts` 同名段落）。
+
 /// 消息角色（`02` §三）
 enum MessageRole {
   USER
@@ -237,6 +243,23 @@ enum WorkspaceActor {
   SYSTEM
 
   @@map("workspace_actor")
+}
+
+/// 平台出网范围（P1-16a，`子方案/Code模式工作区.md` §五 7.5b）。
+///
+/// ⚠️ **平台级**（配在 `/admin/egress` 的出网策略里），**不是会话级**（2026-10-14 用户定案）。
+/// 它决定**基线放行集**，与既有的黑白名单**并列补充**（范围给基线，白名单再加零散主机，黑名单永远硬拒）。
+/// ⚠️ 这不是"能力档 / 执行档"：**能否执行由 `codeMode` 决定**（Code 模式即执行模式）。
+/// · ALL      —— 默认：全放行（除黑名单）；
+/// · NONE     —— 只放行模型池（+ 白名单里额外配的主机）；
+/// · REGISTRY —— 模型池 + 注册表 + git 主机（+ 白名单里额外配的主机）。
+/// 应用层取值域见 `shared#EGRESS_SCOPES`。
+enum EgressScope {
+  ALL
+  NONE
+  REGISTRY
+
+  @@map("egress_scope")
 }
 
 // ───────────────────────────── 表 ─────────────────────────────
@@ -462,6 +485,12 @@ model Conversation {
   /// （派活时给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`，pi 的 read/write/edit 走版本中介）。
   /// ⚠️ **持久列**（不是 Redis）：沙箱创建时要读到它；且它决定 `/work` 的语义，必须跨实例一致。
   codeMode      Boolean            @default(false) @map("code_mode")
+  /// 会话级 **Code 模式运行时**（P1-17a）：派活时按它选运行时镜像（后端扫本机镜像确定）。
+  /// 与 `codeMode` 同族（**持久列**：`ensureSandbox` 建容器时要读到它，且必须跨实例一致）。
+  /// ⚠️ **自由字符串**（后端探测出的运行时 id，如 `node` / `python310` / `node22-python38`），
+  ///    默认**空串**（产品反馈 2026-10-14：新会话默认**空环境** = 只带基础工具链、不额外装语言运行时）；
+  ///    找不到对应镜像（含空串）时 `ensureSandbox` 回退 `SANDBOX_IMAGE` 并 warn。
+  runtime       String             @default("") @map("runtime")
   lastMessageAt DateTime?          @map("last_message_at") @db.Timestamptz(3)
   createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -1283,4 +1312,27 @@ model GitCredential {
   @@unique([userId, label])
   @@index([userId])
   @@map("git_credentials")
+}
+
+/// egress_policy —— 平台级沙箱出网策略（egress 黑白名单；**单例行**）。
+///
+/// 依据：`子方案/Code模式工作区.md` §五 7.5（出网平台化 + 实时注入）。
+///   · **单行**（`id` 固定 `'default'`）—— 它是平台级单一事实，没有"每个用户/会话一份"的维度；
+///   · `mode` **不存**，由两张表推导（`shared#deriveEgressMode`）：
+///     都空 ⇒ 全放行 / 只有白名单 ⇒ 只放行白名单 / 只有黑名单 ⇒ 除黑名单外全放行 / 都有 ⇒ deny 优先；
+///   · 模型池 baseURL 的主机**不在这里**：它由同步层（`egress-up.sh`）恒定并入放行集。
+///   · 规则形状：`host` / `host:port` / `*.host`（与 `egress-proxy.mjs#matchRule` 逐字一致）。
+/// 真实执行点在 **egress 代理容器**（容器在 internal bridge 上没有公网路由）；本表只是"平台声明"，
+/// 由 `egress-up.sh --watch` 轮询落成代理挂载的策略文件（≤ 同步间隔 + 5s 生效）。
+model EgressPolicy {
+  id         String   @id @default("default") @db.VarChar(32)
+  /// 平台出网范围（P1-16a；默认 `ALL` = 全放行）。决定**基线放行集**，与下面两张表并列补充。
+  scope      EgressScope @default(ALL) @map("scope")
+  /// 白名单（`*` 或含 `*` 段 = 全放行）；空数组 = 未配白名单
+  allowHosts String[] @default([]) @map("allow_hosts")
+  /// 黑名单（命中即拒，优先级高于白名单）
+  denyHosts  String[] @default([]) @map("deny_hosts")
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("egress_policy")
 }

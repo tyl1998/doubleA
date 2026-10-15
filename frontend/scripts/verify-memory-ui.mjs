@@ -109,5 +109,24 @@ it('记忆面板支持作用域与提升为全局（P1-8a）', () => {
   }
 })
 
+console.log('── M4 记忆提示修复守门 ──')
+it('后端 `drainMemoryNotices` 只消费 AUTO、保留 SUGGEST（否则点"记住"找不到条目、静默不落库）', () => {
+  const svc = readFileSync(join(here, '../../backend/src/services/memory.service.ts'), 'utf8')
+  if (!svc.includes("notice.kind === 'SUGGEST'")) {
+    throw new Error('drainMemoryNotices 未保留 SUGGEST ⇒ 点"记住"会 applied:false、记忆写不进去')
+  }
+})
+it('提示栈：按 id 去重 + AUTO「撤销」直接删记忆 + SUGGEST 关闭走 REJECT', () => {
+  const src = readFileSync(join(here, '../src/features/chat/MemoryControls.tsx'), 'utf8')
+  for (const needle of [
+    'useDeleteMemory',
+    '!seen.has(item.id)',
+    'removeMemory.mutate',
+    "action: 'REJECT'",
+  ]) {
+    if (!src.includes(needle)) throw new Error(`MemoryControls 缺少修复点：${needle}`)
+  }
+})
+
 console.log(`\n${failed === 0 ? c.g : c.r}memory-ui：${passed} 通过，${failed} 失败${c.x}`)
 process.exit(failed === 0 ? 0 : 1)

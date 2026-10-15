@@ -71,6 +71,8 @@ export interface ToolCallView {
   kind: ToolCallKind
   status: ToolCallStatus
   inputSummary: string
+  /** 工具卡在助手正文中的 UTF-16 字符偏移；旧消息缺省时按正文前渲染。 */
+  textOffset?: number
   output?: string
   /**
    * 失败时的错误码（`shared/src/errors.ts` 的取值域，**不是 HTTP 状态码**）。
@@ -178,10 +180,15 @@ export interface ChatMessageView {
   /** 流内错误卡的内容（`status === 'error'` 时才有） */
   error?: { code: string; message: string }
   /**
-   * 本轮生命周期的**中间态**（`status` 事件，TaskAgent 专属）。
+   * 本轮生命周期的**中间态**（`status` 事件；TaskAgent 与 ChatBot 都会发）。
    * 只有流式助手消息有；一旦真实内容（正文/思考/工具卡）到达就被清掉。
    */
   statusText?: string
+  /**
+   * 本轮开始的时刻（ISO 8601；只在**流式**助手消息上有，给"已用时 Ns"计时器用）。
+   * 历史消息没有它（历史用 `createdAt`），故计时器只在流式中出现。
+   */
+  startedAt?: string
   /**
    * `false` = 这一轮**没有产生可持久化的消息**（`done.messageId === null`，
    * 见 `shared/src/sse.ts` 文件头 ④）⇒ 刷新后它不会出现在历史里，界面要如实标注。
@@ -216,6 +223,7 @@ export function toolViewFromEvent(payload: SseToolCallPayload): ToolCallView {
     kind: payload.kind,
     status: payload.status,
     inputSummary: payload.inputSummary,
+    ...(payload.textOffset === undefined ? {} : { textOffset: payload.textOffset }),
     ...(payload.output === undefined ? {} : { output: payload.output }),
     ...(payload.errorCode === undefined ? {} : { errorCode: payload.errorCode }),
   }
@@ -275,12 +283,17 @@ function pickCitations(source: Record<string, unknown>): CitationItem[] | null {
 function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
   const value = source['tool_calls']
   if (!Array.isArray(value)) return []
-  const views: ToolCallView[] = []
+  // ⚠️ **按 `callId` upsert（后者覆盖前者）**：库里同一张卡是有**两条**记录的 —— `RUNNING`
+  //   那条（`tool_execution_start`）与 `SUCCESS`/`ERROR` 那条（`tool_execution_end`；
+  //   `persist.ts` 原样落库，见 `taskAgent.ts` 落库前的说明）。流式侧本来就按 `callId` upsert，
+  //   历史侧若不去重就会把同一张卡渲染两遍（产品反馈 2026-10-14 的截图里 8 次调用显示成 16 张）。
+  //   用 `Map` 保序 + 覆盖 = "最后一条生效"，与流式侧同一口径。
+  const byCallId = new Map<string, ToolCallView>()
   for (const entry of value) {
     const parsed = toolCallRecordSchema.safeParse(entry)
     if (!parsed.success) continue
     const record = parsed.data
-    views.push({
+    byCallId.set(record.callId, {
       callId: record.callId,
       toolName: record.toolName,
       serverName: record.serverName,
@@ -288,11 +301,12 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
       kind: record.kind,
       status: record.status,
       inputSummary: record.inputSummary,
+      ...(record.textOffset === undefined ? {} : { textOffset: record.textOffset }),
       ...(record.output === undefined ? {} : { output: record.output }),
       ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
     })
   }
-  return views
+  return [...byCallId.values()]
 }
 
 /**

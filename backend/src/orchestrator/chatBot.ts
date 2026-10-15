@@ -141,9 +141,11 @@ import { runMemoryExtraction } from './memoryExtract.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from './memoryTools.js'
 import { persistRoundQuietly } from './persist.js'
 import { createSemaphore } from './semaphore.js'
+import { createToolTextOffsetTracker } from './toolTextOffset.js'
 import {
   ChatStoppedError,
   abortReasonOf,
+  readAutoApprove,
   type ChatProducer,
   type ConfirmDecision,
 } from './sse.js'
@@ -353,8 +355,13 @@ export const chatBotProducer: ChatProducer = async (input) => {
     }
 
     /** 发一张工具卡（同一 `callId` 多次推送 = 状态机流转；前端按 `callId` upsert） */
+    const toolTextOffsets = createToolTextOffsetTracker(() => assistantText.length)
+    const withToolTextOffset = <T extends { callId: string }>(payload: T): T & { textOffset: number } => ({
+      ...payload,
+      textOffset: toolTextOffsets.offsetFor(payload.callId),
+    })
     const emitToolCard = (payload: SseToolCallPayload): void => {
-      enqueue({ name: 'tool_call', data: payload })
+      enqueue({ name: 'tool_call', data: withToolTextOffset(payload) })
     }
 
     /** TTFT（`02` §十三：阶段一"首字 < 3s"验收的**唯一**测量依据，不能事后补） */
@@ -420,6 +427,13 @@ export const chatBotProducer: ChatProducer = async (input) => {
      */
     const blockedToolNames = new Set<string>()
 
+    /**
+     * 会话级自动审批（读一次缓存）——只用于决定"危险工具要不要**提前**落 RUNNING 卡"。
+     * 开了自动审批 ⇒ 不会弹确认卡，提前落 RUNNING 不矛盾；没开 ⇒ 危险工具仍等确认卡（见下）。
+     * 中途切换开关的极短竞态可接受（下一轮才生效）。
+     */
+    const autoApprove = await readAutoApprove(conversationId)
+
     try {
       for (;;) {
         const limit = config.limits.toolLoopLimit
@@ -436,6 +450,12 @@ export const chatBotProducer: ChatProducer = async (input) => {
           messages.push({ role: 'user', content: TOOL_LOOP_LIMIT_NOTICE })
         }
 
+        // 进度提示（ChatBot 现在也发 `status`，与 TaskAgent 同款口径）：上游还没吐字时，
+        // 让占位/进度行有话说，而不是干等一个转圈。
+        enqueue({
+          name: 'status',
+          data: { text: toolRounds === 0 ? '模型正在思考…' : '模型正在根据工具结果继续…' },
+        })
         upstreamRounds += 1
         const round = await chatStream(
           input.target,
@@ -470,6 +490,28 @@ export const chatBotProducer: ChatProducer = async (input) => {
             onThinking: (text) => {
               thinkingText += text
               enqueue({ name: 'thinking', data: { text } })
+            },
+            /**
+             * 提前落"待调用"卡（体验修复）：模型先把**工具名**报出来、参数再一段段吐，而参数可能
+             * 流很久（实测一轮 9 个调用花了 20+ 秒）。这里一知道"要调哪个工具"就先发一张 RUNNING 卡，
+             * 别让那段时间界面一条事件都没有（看起来像卡死）。
+             *   · 只对**目录里认得、且不需要确认**的 MCP 调用提前发：内置工具通常秒回；
+             *     危险工具要先弹确认卡 —— 只有开了自动审批才不矛盾（用上面缓存的 `autoApprove` 兜住）。
+             *   · `callId` 唯一 ⇒ 前端按 `callId` upsert，后面同一 `callId` 的真 RUNNING / 终态会覆盖它。
+             */
+            onToolCallStart: (call) => {
+              const route = catalog.routes[call.name]
+              if (route === undefined) return
+              if (route.dangerous && !autoApprove) return
+              emitToolCard({
+                callId: call.id,
+                toolName: call.name,
+                serverName: serverNameById.get(route.serverId) ?? '',
+                serverId: route.serverId,
+                kind: 'MCP',
+                status: 'RUNNING',
+                inputSummary: '',
+              })
             },
             // ⚠️ **不写 `onUsage`**：用量从每一轮返回的 `round.usage` 里取（那是外壳合并好的
             //    完整值）。两者同时算会把同一轮的用量记两遍（`onUsage` 回的就是 `round.usage`）。
@@ -510,7 +552,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
               output: toolLoopLimitUnexecutedOutput(limit),
             }
             emitToolCard(finished)
-            toolRecords.push({ ...finished, arguments: call.arguments })
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
           }
           logger.warn(
             {
@@ -568,7 +610,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
 
             const finished = { ...base, status, inputSummary, output }
             emitToolCard(finished)
-            toolRecords.push({ ...finished, arguments: call.arguments })
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
             outcomes.push({ callId: call.id, text: output, isError })
             continue
           }
@@ -592,7 +634,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
             const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
             const finished = { ...base, status, inputSummary, output: outcome.output }
             emitToolCard(finished)
-            toolRecords.push({ ...finished, arguments: call.arguments })
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
             outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
             continue
           }
@@ -621,7 +663,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
             const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
             const finished = { ...base, status, inputSummary, output: outcome.output }
             emitToolCard(finished)
-            toolRecords.push({ ...finished, arguments: call.arguments })
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
             outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
             continue
           }
@@ -648,7 +690,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
             const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
             const finished = { ...base, status, inputSummary, output: outcome.output }
             emitToolCard(finished)
-            toolRecords.push({ ...finished, arguments: call.arguments })
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
             outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
             continue
           }
@@ -881,7 +923,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
           emitToolCard(finished)
           // ⚠️ 完整入参**只补在落库这一份**上（`base` 里刻意没有它，见上面那段注释）——
           //    卡片要的是 `inputSummary` 摘要，而"模型到底传了什么"只有完整入参能回答。
-          toolRecords.push({ ...finished, arguments: call.arguments })
+          toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
           outcomes.push({ callId: call.id, text: output, isError })
         }
 

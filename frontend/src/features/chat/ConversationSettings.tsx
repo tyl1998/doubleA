@@ -46,13 +46,10 @@ export interface ConversationSettingsProps {
   onToggleCodeMode: (enabled: boolean) => void
   /** 第三列 / 工作区是否存在（TaskAgent 判据，与 ChatPage 的 `showPanel` 同源） */
   showPanel: boolean
-  /**
-   * 窄屏下打开**产物抽屉**（≤1280 断点，与 `showPanel` 同口径）。
-   * 宽屏第三列常驻 ⇒ 这枚按钮由 CSS（`.composer-control--narrow`）只在窄屏显形。
-   * ⚠️ **Code 模式不渲染它**：工作区在窄屏已常驻并排（R6），再给一个"盖住对话的抽屉"
-   * 正是用户不想要的（"展开后又不能和 agent 聊天"）。
-   */
-  onOpenPanel?: () => void
+  /** 第三列（非 Code 的产物面板）当前是否展开 */
+  panelOpen: boolean
+  /** 收起 / 展开第三列（产物面板） */
+  onTogglePanel: (open: boolean) => void
   /** Code 模式的专注态（§七 3）：`none` / 专注工作区 / 专注对话 */
   codeFocus: CodeFocus
   onChangeCodeFocus: (focus: CodeFocus) => void
@@ -72,8 +69,6 @@ function ControlButton(props: {
   danger?: boolean
   busy?: boolean
   disabled?: boolean
-  /** 额外类名（如窄屏专属入口的 `.composer-control--narrow`） */
-  className?: string
   onClick: () => void
 }) {
   const [pop, setPop] = useState(false)
@@ -83,7 +78,6 @@ function ControlButton(props: {
         type="button"
         className={
           'composer-control' +
-          (props.className === undefined ? '' : ` ${props.className}`) +
           (props.active === true ? ' is-active' : '') +
           (props.danger === true ? ' is-danger' : '') +
           (props.busy === true ? ' is-busy' : '') +
@@ -144,6 +138,8 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         </span>
       )}
 
+      {/* 出网范围（P1-16a）**不在会话里配**（2026-10-14 用户定案）：统一在平台「出网策略」页配置。 */}
+
       <ControlButton
         icon={<SafetyCertificateOutlined />}
         active={props.autoApprove}
@@ -183,6 +179,16 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         />
       ) : null}
 
+      {/* 第三列收起 / 展开（非 Code 的产物面板）。Code 模式已有「专注对话」收起工作区 ⇒ 这里不重复。 */}
+      {props.showPanel && !props.codeMode ? (
+        <ControlButton
+          icon={<FolderOpenOutlined />}
+          active={props.panelOpen}
+          label={props.panelOpen ? '产物面板：已展开（点击收起）' : '产物面板：已收起（点击展开）'}
+          onClick={() => props.onTogglePanel(!props.panelOpen)}
+        />
+      ) : null}
+
       {props.codeMode ? (
         <>
           <ControlButton
@@ -204,18 +210,6 @@ export function ConversationSettings(props: ConversationSettingsProps) {
             onClick={() => props.onChangeCodeFocus('chat')}
           />
         </>
-      ) : null}
-
-      {/* 产物抽屉入口（R5）：宽屏第三列常驻（这枚按钮由 CSS 藏起来），≤1280 才显形。
-          ⚠️ **Code 模式不渲染它**：工作区在窄屏已**常驻并排**（R6），无需"打开工作区"按钮；
-          要让工作区更大请用「专注工作区」。 */}
-      {props.showPanel && !props.codeMode && props.onOpenPanel !== undefined ? (
-        <ControlButton
-          icon={<FolderOpenOutlined />}
-          className="composer-control--narrow"
-          label="打开产物面板"
-          onClick={props.onOpenPanel}
-        />
       ) : null}
     </div>
   )

@@ -38,6 +38,7 @@
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import type { SandboxRuntimeItem } from '@doubulea/shared'
 import * as docker from './docker.js'
 import { resolveSandboxLlm, type SandboxLlmResult } from './llm.js'
 import {
@@ -55,20 +56,19 @@ import {
   isNonRootImageUser,
   piRpcArgv,
   readSandboxLabels,
-  SANDBOX_AGENT_HOME,
   sandboxEgressEnv,
   sandboxProxyEnv,
   workVolumeName,
   workspaceMediationEnv,
 } from './spec.js'
-import { gitCredentialEnv, gitCredentialFiles, gitCredentialTarEntries } from './gitCredential.js'
-import { buildTar } from './tar.js'
+import { gitCredentialHelperEnv } from './gitCredential.js'
+import { listSandboxRuntimes, resolveSandboxRuntimeImage } from './runtimeImages.js'
+import { clearCredentialPhase } from './credentialPhase.js'
 import { bindSandboxToken, revokeSandboxToken } from './token.js'
 import { clearSandboxMcpMap } from './mcpMap.js'
 import { clearSandboxOwner, registerSandboxOwner } from './owner.js'
 import { ensureWorkspace } from '../workspace/service.js'
 import { startWorkspaceWatcher } from '../workspace/watcher.js'
-import { decryptUserGitCredentials } from '../services/gitCredential.service.js'
 
 /**
  * 排队等待的轮询间隔（**代码常量**，不进 env）。
@@ -145,13 +145,8 @@ export async function ensureSandbox(
   conversationId: string,
   options: AcquireSandboxOptions = {},
 ): Promise<SandboxAcquireResult> {
-  const image = config.sandbox.image
-  if (image === undefined) {
-    return fail(
-      'NOT_CONFIGURED',
-      '未配置 SANDBOX_IMAGE。先构建镜像（pnpm sandbox:build），再把它打印的两行写进 infra/.env',
-    )
-  }
+  // ⚠️ P1-17a：镜像**不在这里定** —— 它取决于会话的 `runtime`（要等会话读出来才知道）。
+  //    见下方 `resolveSandboxRuntimeImage(...)`；`config.sandbox.image` 是回退镜像（toolkit 层）。
 
   // ★ 出口① 的前置（P0-3-3）：容器在**专用 internal bridge** 上，**没有公网路由** ⇒
   //   没有 egress 代理就必然调不到模型池。**在这里拦住**，而不是让容器建起来再在容器里失败 ——
@@ -192,10 +187,30 @@ export async function ensureSandbox(
     //   （`{conversationId, userId, agentId}` ⇒ `sandbox/token.ts`）。为什么在这一条查询里一起取：
     //   令牌要在**建容器之前**写好（容器一起来扩展就会拿它拉工具清单），而现在这里已经是
     //   "建容器之前唯一一次读会话"的位置 —— 再加一条查询只会多一个"两次读之间会话/Agent 变了"的窗口。
-    select: { status: true, userId: true, agentId: true, agent: { select: { modelId: true } } },
+    select: { status: true, userId: true, agentId: true, runtime: true, agent: { select: { modelId: true } } },
   })
   if (conversation === null) return fail('CONVERSATION_NOT_FOUND', '会话不存在')
   if (conversation.status !== 'ACTIVE') return fail('CONVERSATION_NOT_FOUND', '会话已结束（只读）')
+
+  // ★ P1-17a：按会话的 `runtime` 选**运行时镜像** —— 运行时集合由**本机镜像探测**得到
+  //   （`doubulea/sandbox-runtime:<id>-v<层版本>`；用户定案"有就提供、没有就不提供"）。
+  //   找不到该 id 的镜像 ⇒ 回退 `SANDBOX_IMAGE`（toolkit）并留 warn（老会话/换镜像集后仍能跑）。
+  //   位置在"动容器之前"：镜像选不出来时还什么都没建（同上面两条配置校验的纪律）。
+  const conversationRuntime = conversation.runtime
+  const availableRuntimes = await listAvailableSandboxRuntimes()
+  const image = resolveSandboxRuntimeImage(conversationRuntime, availableRuntimes, config.sandbox.image)
+  if (image === undefined) {
+    return fail(
+      'NOT_CONFIGURED',
+      '未配置 SANDBOX_IMAGE（回退镜像）。先构建镜像（pnpm sandbox:build），再把它打印的值写进 infra/.env',
+    )
+  }
+  if (image === config.sandbox.image && !availableRuntimes.some((item) => item.id === conversationRuntime)) {
+    getLogger().warn(
+      { conversationId, runtime: conversationRuntime, available: availableRuntimes.map((item) => item.id) },
+      '会话运行时在本机没有对应镜像 ⇒ 回退 SANDBOX_IMAGE（toolkit）起容器（P1-17a）',
+    )
+  }
 
   // ★ P0-3-4 第二道校验：解析这一轮要注入容器的 LLM 目标。
   //   位置是刻意的 —— 与上面两条配置校验一样**排在"动容器"之前**：
@@ -232,6 +247,22 @@ export async function ensureSandbox(
           '复用沙箱前发现模型已变（或容器没有模型标签）⇒ 回收重建',
         )
         await recycleSandbox(conversationId, 'model-changed')
+      } else if (labels?.runtime !== conversationRuntime) {
+        // ★ P1-17a：运行时变了 ⇒ 容器里是上一个运行时的镜像（可能没有这个语言）⇒ 回收重建。
+        //   与模型变更同一条推理：容器属性没跟着会话走时，Docker 与账本都不会报错。
+        getLogger().info(
+          { conversationId, containerId: running.containerId, was: labels?.runtime, now: conversationRuntime },
+          '复用沙箱前发现运行时已变（或容器没有运行时标签）⇒ 回收重建',
+        )
+        await recycleSandbox(conversationId, 'runtime-changed')
+      } else if (labels?.image !== image) {
+        // ★ P1-17a 收紧：层版本一升（base/toolkit/runtime 任一改了 + 重建 + 换 `.env`）而栈没变时，
+        //   只比栈会让这个容器**继续用旧镜像**（"改了没生效"）。比镜像 tag 就能判出来 ⇒ 回收重建。
+        getLogger().info(
+          { conversationId, containerId: running.containerId, was: labels?.image, now: image },
+          '复用沙箱前发现镜像已变（或容器没有镜像标签）⇒ 回收重建',
+        )
+        await recycleSandbox(conversationId, 'image-changed')
       } else {
         if (!slots.tryAdd(conversationId) && !slots.has(conversationId)) {
           // 只可能是"别的会话把名额占满了"（单实例下正常不该发生）⇒ 以容器为准放行 + 留痕。
@@ -283,6 +314,7 @@ export async function ensureSandbox(
       sandbox: await createSandbox(conversationId, image, runtime, llm, {
         userId: conversation.userId,
         agentId: conversation.agentId,
+        conversationRuntime,
       }),
     }
   } catch (error) {
@@ -373,12 +405,29 @@ interface SandboxRuntime {
   backendUrl: string
 }
 
+/**
+ * 探测本机可用的沙箱运行时（P1-17a）—— `ensureSandbox` 选镜像与 `GET /api/sandbox/runtimes` 共用。
+ *
+ * 口径（用户 2026-10-14 定案）：**以本机镜像为准** —— 有就提供、没有就不提供。
+ * ⚠️ Docker 不可达时**返回空列表**（不抛）：调用方据此走"回退 `SANDBOX_IMAGE`"/"前端显示空"，
+ *    而不是把"列镜像失败"变成一条 500（同一纪律见 `reaper` 的"没镜像就跳过"）。
+ */
+export async function listAvailableSandboxRuntimes(): Promise<SandboxRuntimeItem[]> {
+  try {
+    const refs = await docker.listRuntimeImages(config.sandbox.runtimeRepo)
+    return listSandboxRuntimes(refs, config.sandbox.runtimeRepo)
+  } catch (error) {
+    getLogger().warn({ err: error }, '列举沙箱运行时镜像失败（Docker 不可达？）⇒ 视为"没有可选运行时"')
+    return []
+  }
+}
+
 async function createSandbox(
   conversationId: string,
   image: string,
   runtime: SandboxRuntime,
   llm: Extract<SandboxLlmResult, { ok: true }>,
-  owner: { userId: string; agentId: string },
+  owner: { userId: string; agentId: string; conversationRuntime: string },
 ): Promise<SandboxHandle> {
   const prisma = getPrisma()
   const startedAt = new Date()
@@ -442,13 +491,12 @@ async function createSandbox(
     })
     const codeMode = conversationRow?.codeMode ?? false
     /**
-     * ★ P1-9 · R11：解密该用户的 git 凭据（明文**只在本进程与容器注入物里出现**，见服务文件头 ②）。
-     *    env 必须在 `buildSandboxContainerSpec` 之前定（`Env` 建容器时定死），
-     *    文件在容器起来后 `putArchive`（tmpfs `$HOME/.ssh`）。两条都只做**一次**（每次建容器）。
+     * ★ P1-9 · R11 修订：git 凭据改为**按需拉取** —— 建容器时**不注入任何秘密**。
+     *    容器里只有一份固定 env（`gitCredentialHelperEnv`，把 git 指向两个 helper 脚本）；
+     *    真正的凭据由 helper 在 git 用时经 `/api/sandbox/git/credential` 回调换取
+     *    （见 `sandbox/gitProxy.ts`）。⇒ 不用 putArchive（RO rootfs 下必失败）、
+     *    改凭据也不用重建容器。
      */
-    const gitCredentials = await decryptUserGitCredentials(owner.userId)
-    const gitEnv = gitCredentialEnv(gitCredentials)
-    const gitFiles = gitCredentialFiles(gitCredentials)
     // ★ 开始监听这个会话的工作区：捕获**未中介写**（agent 的 `bash`、宿主手工改）并补版本/事件。
     // ⚠️ 监听寿命**跟随工作区、不随容器回收而停**（§八）⇒ 这里只启动，回收路径不 stop；
     //    进程退出时由 `index.ts` 统一 `stopAllWorkspaceWatchers()`。
@@ -475,6 +523,8 @@ async function createSandbox(
         //   为什么不用 `sandboxes` 表存：表里的行是"账本"，而模型变更是**容器属性**的问题 ——
         //   要在"谁占着这个容器"这个问题上有一个跟着容器走的答案（同 label 族的其余三问）。
         modelId: llm.modelId,
+        // ★ P1-17a：运行时进标签（`doubulea.runtime`）—— **复用前比对**的判据之一（见 `ensureSandbox`）。
+        runtime: owner.conversationRuntime,
         network: runtime.network.name,
         limits: config.sandbox.limits,
         /**
@@ -493,29 +543,12 @@ async function createSandbox(
           ...sandboxProxyEnv({ token, proxyTimeoutSec: config.sandbox.proxyTimeoutSec }),
           // ★ P1-9 · P3：Code 模式才注入（普通会话一个都不加，扩展默认关闭）
           ...workspaceMediationEnv(codeMode),
-          // ★ P1-9 · R11：该用户的 git 凭据 env（HTTPS token 只在 env；SSH 另走 putArchive 落盘）
-          ...gitEnv,
+          // ★ P1-9 · R11 修订：git 凭据 helper env（**不含秘密**；凭据运行期按需回调取回）
+          ...gitCredentialHelperEnv(),
         },
       }),
     )
     await docker.startSandboxContainer(containerId)
-    /**
-     * ★ P1-9 · R11：把 SSH 私钥 / `known_hosts` 解到容器 tmpfs `$HOME/.ssh`（`putArchive`，§7.3）。
-     * ⚠️ 只解到 **tmpfs**（`/home/agent`，容器回收即消失），**绝不写 `/work`**（会进 S3 冷备 / 产物）。
-     * ⚠️ 失败只 **warn**（不让"凭据没注进去"变成"容器建不出来"）：后端一切正常、只是 agent 的
-     *    `git clone` 会退回系统默认身份 —— 这类"能继续干活"的降级不该把整轮派活打死。
-     */
-    if (gitFiles.length > 0) {
-      const archive = buildTar(gitCredentialTarEntries(gitFiles))
-      await docker
-        .putArchive(containerId, SANDBOX_AGENT_HOME, archive)
-        .catch((injectError: unknown) => {
-          getLogger().warn(
-            { err: injectError, conversationId, fileCount: gitFiles.length },
-            'git 凭据注入容器失败（容器仍可用，agent 的 git 将退回系统默认身份）',
-          )
-        })
-    }
     const updated = await prisma.sandbox.updateMany({
       where: { id: row.id, status: 'CREATING' },
       data: { containerId, status: 'RUNNING' },
@@ -622,6 +655,8 @@ export async function recycleSandbox(conversationId: string, reason: string): Pr
   //   ⚠️ 两者都幂等、失败只 warn（各自模块内部处理），不会把"回收"变成"抛出"。
   await revokeSandboxToken(conversationId)
   await clearSandboxMcpMap(conversationId)
+  // ★ P1-17c：容器收了 ⇒ 执行相一起清（新容器从 `CLONE` 相开始，可以重新 clone）。
+  await clearCredentialPhase(conversationId)
   // ★ P1-14 §六 4：回收成功后 `DEL sandbox:owner:{id}`（失败留给 TTL）。
   //   清目录后新的一轮 `/chat` 可自由落在任意实例并重新登记 —— 这是"owner 宕机降级"的兑现点。
   await clearSandboxOwner(conversationId)

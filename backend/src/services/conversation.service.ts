@@ -107,6 +107,7 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma, type PrismaClientInstance } from '../infra/prisma.js'
 import { chatActiveKey, chatAutoApproveKey, getRedis } from '../infra/redis.js'
+import { sandboxCredentialPhaseKey } from '../sandbox/credentialPhase.js'
 import { getS3Client } from '../infra/s3.js'
 import type { LlmTarget } from '../llm/client.js'
 import { resolveChatAttachments, type ChatAttachmentContext } from './file.service.js'
@@ -128,6 +129,7 @@ const CONVERSATION_SELECT = {
   agentId: true,
   topic: true,
   status: true,
+  runtime: true,
   lastMessageAt: true,
   createdAt: true,
   updatedAt: true,
@@ -140,6 +142,7 @@ interface ConversationRow {
   agentId: string
   topic: string | null
   status: ConversationItem['status']
+  runtime: ConversationItem['runtime']
   lastMessageAt: Date | null
   createdAt: Date
   updatedAt: Date
@@ -159,6 +162,8 @@ function toItem(row: ConversationRow): ConversationItem {
     agentType: row.agent.type,
     topic: row.topic,
     status: row.status,
+    // Code 模式运行时（P1-17a）—— 列表也回带它（界面据此回显；非 Code 会话照样有这一列）
+    runtime: row.runtime,
     // 列可空 ⇒ 对外也是 `null`（**不要**回落成 `createdAt`：那会让"还没消息"与"刚发了消息"
     // 在界面上无法区分，而"最后活跃时间"正是侧栏唯一要显示的东西）
     lastMessageAt: row.lastMessageAt === null ? null : row.lastMessageAt.toISOString(),
@@ -290,7 +295,12 @@ export async function createConversation(
   if (agent === null) throw AppError.notFound('智能体不存在')
 
   const created = await db.conversation.create({
-    data: { agentId: input.agentId, userId: viewer.id },
+    // P1-17a：可选的运行时不传就走 Prisma 默认（**空串 = 空环境**）—— 显式展开避免把 `undefined` 写进去。
+    data: {
+      agentId: input.agentId,
+      userId: viewer.id,
+      ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
+    },
     select: CONVERSATION_SELECT,
   })
 
@@ -396,7 +406,7 @@ export async function removeConversation(
   //    同时清掉自动审批开关键（同一批"指向已删会话的垃圾"；不删它虽会 12h 后自行过期，
   //    但会话都没了、开关留着没有任何意义）
   try {
-    await getRedis().del(chatActiveKey(id), chatAutoApproveKey(id))
+    await getRedis().del(chatActiveKey(id), chatAutoApproveKey(id), sandboxCredentialPhaseKey(id))
   } catch (error) {
     getLogger().warn({ err: error, conversationId: id }, '活跃流锁/自动审批开关清理失败（会话已删除，键会自行过期）')
   }
@@ -605,14 +615,19 @@ export async function getConversationActive(
     getRedis().get(chatAutoApproveKey(id)),
     getPrisma().conversation.findFirst({
       where: { id, userId: viewer.id },
-      select: { memoryExcluded: true, codeMode: true },
+      select: { memoryExcluded: true, codeMode: true, runtime: true },
     }),
   ])
   // 只认 `'1'`；读失败/键缺失都当"关"（安全默认，与 `sse.ts#readAutoApprove` 同口径）
   const autoApprove = autoApproveRaw === '1'
   const memoryExcluded = conv?.memoryExcluded ?? false
   const codeMode = conv?.codeMode ?? false
-  if (raw === null) return { streaming: false, autoApprove, memoryExcluded, codeMode, ...EMPTY_ACTIVE_SNAPSHOT }
+  // P1-17a：运行时是普通列，会话不存在时也该回一个合法值（`findMyConversation` 已先 404，
+  // 这里取不到只可能是并发删除）⇒ 回默认**空串**（= 空环境，与 Prisma 默认一致）。
+  const runtime = conv?.runtime ?? ''
+  if (raw === null) {
+    return { streaming: false, autoApprove, memoryExcluded, codeMode, runtime, ...EMPTY_ACTIVE_SNAPSHOT }
+  }
 
   const snapshot = parseActiveSnapshot(raw)
   if (snapshot.currentTool === null && snapshot.queuedPosition === null && snapshot.startedAt === null) {
@@ -620,7 +635,7 @@ export async function getConversationActive(
     // 但对读侧不构成失败：锁确实在，只是细节丢了。
     getLogger().warn({ conversationId: id }, '活跃流快照无法解析，已降级为仅有 streaming=true')
   }
-  return { streaming: true, autoApprove, memoryExcluded, codeMode, ...snapshot }
+  return { streaming: true, autoApprove, memoryExcluded, codeMode, runtime, ...snapshot }
 }
 
 /**
@@ -641,6 +656,26 @@ export async function setConversationCodeMode(
   })
   if (updated.count === 0) throw AppError.notFound('会话不存在')
   return enabled
+}
+
+/**
+ * 设置**会话运行时**（P1-17a）—— 持久列 `conversations.runtime`。
+ *
+ * 与 {@link setConversationCodeMode} 同款（落库、归属判据 `id + userId`），只是取值是枚举。
+ * ⚠️ 改运行时**不**主动回收容器：下次派活时 `ensureSandbox` 按 `doubulea.runtime` 标签比对，
+ * 不一致就**回收重建**（与"改模型"同一条推理，见 `sandbox/manager.ts`）。
+ */
+export async function setConversationRuntime(
+  id: string,
+  viewer: ConversationViewer,
+  runtime: string,
+): Promise<string> {
+  const updated = await getPrisma().conversation.updateMany({
+    where: { id, userId: viewer.id },
+    data: { runtime },
+  })
+  if (updated.count === 0) throw AppError.notFound('会话不存在')
+  return runtime
 }
 
 // ═════════════════════════════════════════════════════════════════════

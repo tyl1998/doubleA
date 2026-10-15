@@ -20,6 +20,8 @@ export const PASSWORD_PATH = '/settings/password'
 export const HOME_PATH = '/'
 export const ADMIN_USERS_PATH = '/admin/users'
 export const ADMIN_MODELS_PATH = '/admin/models'
+/** 出网策略（egress 黑白名单；平台级配置，**仅 ADMIN**） */
+export const ADMIN_EGRESS_PATH = '/admin/egress'
 /** 用量统计（`03` §二：`/admin/usage`；P1-7 接真页面；**P1-15 起登录即可**，见 §八） */
 export const ADMIN_USAGE_PATH = '/admin/usage'
 

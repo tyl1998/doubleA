@@ -22,13 +22,21 @@
  *     移到**输入框下方**、用**图标按钮**（`composer-control` + 点击弹动 `is-pop`）；
  *     标题栏右侧改为**设置图标**（直接进编辑智能体）。
  *   · **R5（2026-10-13）**：**模型不能只给一个图标** —— 用户要一眼看到当前模型 ⇒ 模型仍是
- *     **文字选择器**（`Select` / 只读 chip）；另：窄屏产物 / 工作区抽屉入口回到控件条
- *     （`composer-control--narrow` + `onOpenPanel`）。
+ *     **文字选择器**（`Select` / 只读 chip）。
  *   · **R6（2026-10-13）**：窄屏（≤1280）**Code 模式的工作区常驻并排**（不再收成盖住对话的
  *     抽屉）；主区左上角会话栏浮层按钮与标题栏智能体 chip **同高、纵向对齐**。
+ *   · **R7（2026-10-13）**：窄屏（≤1280）**非 Code 的产物面板也常驻并排**（与 Code 同款，
+ *     按比例收窄），输入框下方那枚「打开产物面板」入口（`composer-control--narrow` +
+ *     `onOpenPanel`）与产物抽屉一并删除。
+ *   · **F8（2026-10-14）**：新会话态（`conversationId` 尚未生成）开 Code 模式 ⇒ 第三列是
+ *     **空工作区占位**（`WorkspacePanelPlaceholder`），**不回落**到产物面板。
+ *   · **F9（2026-10-14）**：非 Code 的**产物面板可收起 / 展开**（第三列开关，`panelOpen` ∩ `showPanel`）。
  *
- * ⚠️ 验不到的（归浏览器端测）：进站即聊天主页、管理 popover 不换样、会话栏浮层开关、
- *   只读保留会话、头部内联控件的实际观感、专注工作区输入框不再冒滚动条。
+ *   · **G（2026-10-13）**：侧边栏分两层 —— 上层「平台功能」（六条直达入口 + `管理 ▸` 就地展开
+ *     剩余入口，约 35% 高）、下层「会话」（约 65% 高，分组标题可点击收缩）。
+ *
+ * ⚠️ 验不到的（归浏览器端测）：进站即聊天主页、平台功能高亮与「管理」展开、会话分组收缩、
+ *   会话栏浮层开关、只读保留会话、头部内联控件的实际观感、专注工作区输入框不再冒滚动条。
  */
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -311,29 +319,98 @@ it('F4（R4）会话控件移到输入框下方、用图标按钮；标题栏设
   includes(settings, 'is-pop', '点击要有弹动动效')
 })
 
-it('F5（R5）模型是**文字选择器**（不再只给图标）；窄屏有产物抽屉入口', () => {
+it('F5（R5）模型是**文字选择器**（不再只给图标）；窄屏产物入口已删除', () => {
   const settings = read('../src/features/chat/ConversationSettings.tsx')
   // R5：用户要一眼看到当前模型 ⇒ 模型走文字 `Select` / 只读文字 chip，**不再是** Thunderbolt 图标
   includes(settings, 'composer-model', '模型是文字选择器 / 只读 chip')
   includes(settings, 'Select', '模型池 ≥2 用下拉')
   notIncludes(settings, 'ThunderboltOutlined', '模型不再只给一枚图标')
-  // 窄屏产物抽屉入口（`onOpenPanel`；Code 模式不渲染 —— 工作区窄屏已常驻）
-  includes(settings, 'composer-control--narrow', '窄屏抽屉入口类')
-  includes(settings, 'onOpenPanel', '窄屏抽屉入口回调')
-  includes(settings, '!props.codeMode && props.onOpenPanel', 'Code 模式不下发放抽屉入口（避免盖住对话）')
+  // R7：产物面板窄屏也常驻 ⇒ 不再有「打开产物面板」抽屉入口
+  notIncludes(settings, 'composer-control--narrow', '不再有窄屏抽屉入口类')
+  notIncludes(settings, 'onOpenPanel', '不再有窄屏抽屉入口回调')
   const chatPage = read('../src/pages/chat/ChatPage.tsx')
-  includes(chatPage, 'onOpenPanel={', '页面把抽屉入口回调交给控件条')
+  notIncludes(chatPage, 'artifactDrawerOpen', 'ChatPage 不再持有产物抽屉开关')
+  notIncludes(chatPage, 'title="产物"', 'ChatPage 不再渲染产物抽屉')
 })
 
-it('F6（R6）窄屏 Code 模式工作区常驻并排；行末的会话栏浮层按钮与 chip 对齐', () => {
+it('F6（R6）窄屏第三列常驻并排；行末的会话栏浮层按钮与 chip 对齐', () => {
   const css = read('../src/styles/app.css')
-  // Code 模式窄屏不再藏第三列（`.chat--code.chat--with-panel` 覆写为并排）
-  includes(css, '.chat--code.chat--with-panel {', 'Code 模式窄屏并排')
-  includes(css, '.chat--code.chat--with-panel .panel { display: flex; }', '窄屏工作区常驻')
+  // R6/R7：窄屏（≤1280）第三列（Code 工作区 / 非 Code 产物面板）一律并排常驻，不再藏
+  includes(css, '.chat--with-panel { grid-template-columns: minmax(0, 1fr) minmax(0, 44%); }', '窄屏第三列并排')
+  includes(css, '.chat--with-panel .panel { display: flex; }', '窄屏第三列常驻')
   // 浮层开关 32×32、top 12px（与 32px 高的智能体 chip 垂直居中对齐）
   const toggleBlock = css.slice(css.indexOf('.app-shell__toggle {'))
   includes(toggleBlock.slice(0, 400), 'width: 32px;', '浮层开关宽 32（与 chip 同高）')
   includes(toggleBlock.slice(0, 400), 'top: var(--sp-3);', '浮层开关纵向对齐 chip')
+})
+
+it('F7（R7）非 Code 的产物面板窄屏也常驻并排；抽屉入口删除', () => {
+  const css = read('../src/styles/app.css')
+  // 非 Code（`.chat--with-panel` 无 `.chat--code`）与 Code 共用同一条窄屏并排规则
+  const media = css.slice(css.indexOf('@media (max-width: 1280px) {', css.indexOf('.ws__status--conflict')))
+  const block = media.slice(0, media.indexOf('/* ── 会话侧栏'))
+  includes(block, '.chat--with-panel { grid-template-columns: minmax(0, 1fr) minmax(0, 44%); }', '产物面板窄屏并排')
+  includes(block, '.chat--with-panel .panel { display: flex; }', '产物面板窄屏常驻')
+  // 专注对话仍显式收起（特异度压过并排规则）
+  includes(block, '.chat--with-panel.chat--focus-chat .panel { display: none; }', '专注对话收起第三列')
+  // 旧的窄屏抽屉入口样式已删
+  notIncludes(css, '.composer-control--narrow', '窄屏抽屉入口样式已删')
+})
+
+it('F8 新会话态开 Code 模式：第三列 = 空工作区占位（不回落到产物面板）', () => {
+  const chatPage = read('../src/pages/chat/ChatPage.tsx')
+  // 新会话态（conversationId 尚未生成）第三列必须是工作区占位，而不是 ArtifactPanel
+  includes(chatPage, 'WorkspacePanelPlaceholder', 'ChatPage 引用空工作区占位组件')
+  includes(chatPage, '<WorkspacePanelPlaceholder />', '新会话态渲染空工作区占位')
+  // 占位与真面板同壳：`.ws` + 标题「工作区」+ 空态说明
+  const panel = read('../src/features/chat/WorkspacePanel.tsx')
+  includes(panel, 'export function WorkspacePanelPlaceholder', '导出 WorkspacePanelPlaceholder')
+  includes(panel, 'workspace-panel-placeholder', '占位有稳定 testid')
+  includes(panel, '发送第一条消息后创建工作区', '空态说明指向"建会话后才创建工作区"')
+})
+
+it('F9 非 Code 的产物面板可收起 / 展开（第三列开关）', () => {
+  const chatPage = read('../src/pages/chat/ChatPage.tsx')
+  // 收起时摘掉 `chat--with-panel`（消息流占满整宽）；第三列渲染由 panelVisible 决定
+  includes(chatPage, 'panelOpen', 'ChatPage 持有产物面板展开态')
+  includes(chatPage, 'const panelVisible = showPanel && panelOpen', '第三列可见性 = showPanel ∩ panelOpen')
+  includes(chatPage, "panelVisible ? ' chat--with-panel'", '收起时摘掉 chat--with-panel')
+  includes(chatPage, 'onTogglePanel={setPanelOpen}', '把开关接到会话控件')
+  const settings = read('../src/features/chat/ConversationSettings.tsx')
+  includes(settings, 'onTogglePanel', '会话控件暴露收起 / 展开回调')
+  includes(settings, 'FolderOpenOutlined', '收起 / 展开用图标按钮')
+})
+
+// ───────────────────────────── G 侧边栏两层（2026-10-13） ─────────────────────────────
+
+console.log(`\n${c.b}── G 侧边栏两层（平台功能 35% / 会话 65%）──${c.x}`)
+
+it('G1 ConvRail 分两层：上层平台功能、下层会话；旧的「管理」popover 已删', () => {
+  const convRail = read('../src/features/chat/ConvRail.tsx')
+  includes(convRail, 'convrail__nav', '上层平台功能')
+  includes(convRail, 'convrail__convos', '下层会话')
+  notIncludes(convRail, 'Popover', '不再用底部「管理」popover')
+  notIncludes(convRail, 'rail-menu', '旧的 rail-menu 已删')
+})
+
+it('G2 上层六个直达入口 + 「管理」就地展开剩余；入口顺序 = 产品口径', () => {
+  const convRail = read('../src/features/chat/ConvRail.tsx')
+  includes(convRail, "['AG', 'KB', 'MC', 'TK', 'CR', 'AH']", '顺序：智能体/知识库/MCP/任务/我的凭据/会话产物')
+  includes(convRail, 'manageExpanded', '「管理」就地展开')
+  includes(convRail, 'manageItems', '剩余入口（用量统计 / 用户管理 / 模型池）')
+})
+
+it('G3 会话分组（今天 / 更早）标题可点击收缩', () => {
+  const convRail = read('../src/features/chat/ConvRail.tsx')
+  includes(convRail, 'collapsedGroups', '分组收缩态')
+  includes(convRail, 'convrail__group-caret', '分组标题有收缩箭头')
+  includes(convRail, 'toggleGroup', '点标题切换收缩')
+})
+
+it('G4 两层高度比 35 / 65（flex-grow）', () => {
+  const css = read('../src/styles/app.css')
+  includes(css, 'flex: 35 35 0;', '平台功能约 35%')
+  includes(css, 'flex: 65 65 0;', '会话约 65%')
 })
 
 // ───────────────────────────── 结论 ─────────────────────────────
@@ -341,7 +418,7 @@ it('F6（R6）窄屏 Code 模式工作区常驻并排；行末的会话栏浮层
 console.log('')
 if (failed === 0) {
   console.log(`${c.g}${c.b}✅ 聊天主页前端验收通过（P1-15）：${passed} 项全通过${c.x}`)
-  console.log(`${c.d}   ⚠️ 浏览器可见路径（进站即聊天主页 / 管理 popover 不换样 / 会话栏浮层开关 / 只读保留会话 / 输入框下图标控件 + 点击动效 / 专注工作区不挤）由用户人工端测${c.x}`)
+  console.log(`${c.d}   ⚠️ 浏览器可见路径（进站即聊天主页 / 平台功能高亮 + 管理展开 / 会话分组收缩 / 会话栏浮层开关 / 只读保留会话 / 输入框下图标控件 + 点击动效 / 专注工作区不挤）由用户人工端测${c.x}`)
   process.exit(0)
 } else {
   console.log(`${c.r}${c.b}❌ 聊天主页前端验收未通过：${failed} 项失败 / ${passed} 项通过${c.x}`)

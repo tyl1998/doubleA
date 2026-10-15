@@ -16,7 +16,7 @@
 
 import type { UserRole } from '@doubulea/shared'
 
-import { AGENTS_PATH, HOME_PATH } from './paths.js'
+import { ADMIN_EGRESS_PATH, AGENTS_PATH, HOME_PATH } from './paths.js'
 
 export interface NavItem {
   /** 导航项的稳定标识（本仓用它映射图标；原型里是左侧栏上的等宽字形） */
@@ -78,6 +78,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   // 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
   { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
   { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池', adminOnly: true },
+  // 出网策略（egress 黑白名单；平台级，仅 ADMIN）—— 排在模型池之后
+  { code: 'EG', label: '出网策略', path: ADMIN_EGRESS_PATH, serial: 'S-07d · 出网', adminOnly: true },
 ] as const
 
 /**

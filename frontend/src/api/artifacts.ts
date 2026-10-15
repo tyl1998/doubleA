@@ -28,10 +28,11 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 
-import type { ArtifactListResult } from '@doubulea/shared'
+import type { ArtifactListResult, BatchDeleteArtifactsResult } from '@doubulea/shared'
 
 import { request, requestBlob } from './client.js'
 import {
+  artifactBatchDeleteUrl,
   artifactContentUrl,
   artifactDeleteUrl,
   artifactDownloadUrl,
@@ -138,6 +139,24 @@ export function useMyArtifacts(offset: number, limit: number) {
  */
 export function deleteArtifact(artifactId: string): Promise<null> {
   return request<null>(artifactDeleteUrl(artifactId), { method: 'DELETE' })
+}
+
+/**
+ * 批量删除产物（`POST /api/artifacts/batch-delete`，**真删除**：S3 对象与行一并移除）。
+ *
+ * ⚠️ **用 POST 而不是带 body 的 DELETE**（见 `shared#batchDeleteArtifactsBodySchema`）：
+ * 一部分代理会丢掉 DELETE 的 body，那样就是"删了 0 个却报成功"的静默失败。
+ *
+ * 服务端会按 `userId = me` 过滤：**返回的 `deleted` 是实际删掉的行数**，可能小于
+ * `ids.length`（混进"不是我的"或"已不存在"的会被如实扣掉）—— 界面据此报数，别照勾选数报。
+ *
+ * 失败（401 / 400 参数非法 / 500 存储不可用）与其余接口同款抛 `ApiError`。
+ */
+export function deleteArtifacts(artifactIds: string[]): Promise<BatchDeleteArtifactsResult> {
+  return request<BatchDeleteArtifactsResult>(artifactBatchDeleteUrl(), {
+    method: 'POST',
+    body: { ids: artifactIds },
+  })
 }
 
 /**

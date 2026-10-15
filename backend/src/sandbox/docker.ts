@@ -147,6 +147,26 @@ export async function ensureImage(image: string): Promise<void> {
   }
 }
 
+/**
+ * 列出某个**仓库**下的镜像 ref（`repo:tag`）—— 用于探测"本机有哪些沙箱运行时"（P1-17a）。
+ *
+ * 口径：拉全量镜像再**在 JS 里按前缀过滤**（不依赖 Docker `reference` 过滤器的通配语义）。
+ * 运行时 id / 层版本的解析在 `runtimeImages.ts`（纯函数），这里只管"把 ref 拿出来"。
+ */
+export async function listRuntimeImages(repo: string): Promise<string[]> {
+  try {
+    const images = await getDocker().listImages({})
+    const prefix = `${repo}:`
+    const refs: string[] = []
+    for (const image of images) {
+      for (const tag of image.RepoTags ?? []) if (tag.startsWith(prefix)) refs.push(tag)
+    }
+    return refs
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
 /** 建具名卷（带 label —— 对账器靠它找回这个卷，见 `spec.ts` 文件头） */
 export async function createSandboxVolume(input: {
   name: string

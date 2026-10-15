@@ -6,13 +6,17 @@
  * ─────────────────────────────────────────────────────────────────────
  * 形态（第三列 / 窄屏抽屉同一份组件）
  * ─────────────────────────────────────────────────────────────────────
- *   ┌ 工作区头（资源管理器折叠 · 撤销本轮）─────────────────────────┐
+ *   ┌ 工作区头（撤销本轮）─────────────────────────────────────────┐
  *   │ ┌ 资源管理器 ─┐ ┌ 标签条（多标签 · dirty 圆点 · 关闭）──────┐ │
- *   │ │ 文件树      │ │ 面包屑 + 工具栏（重载/下载/保存/删除）    │ │
- *   │ │ …           │ │ CodeMirror / 图片 / 只读说明              │ │
+ *   │ │ 文件树      │ │ 面包屑 + 工具栏（重载 / 下载 / 保存）     │ │
+ *   │ │ （右键菜单）│ │ CodeMirror / 图片 / 只读说明              │ │
  *   │ │ 最近变更 ▾  │ │ 状态栏（语言 · vN · 大小 · 保存态）       │ │
  *   │ └─────────────┘ └───────────────────────────────────────────┘ │
  *   └───────────────────────────────────────────────────────────────┘
+ *
+ * ⚠️ 资源管理器**不再折叠**（常驻整宽）：树行**右键**出菜单（新建文件 / 文件夹、上传到此目录、
+ *   重命名 / 移动、下载、删除），文件行**可拖动**到目录或空白区完成移动；空白区右键 = 根级操作。
+ * ⚠️ 文本文件**默认显示点文件**（`.git` 等），可用资源管理器头部的眼睛按钮隐藏。
  *
  * ⚠️ 编辑态**按路径**存（`docs`）：多标签各自保留草稿，切标签不丢未保存改动。
  *    SSE 命中当前文件时才重载；**有草稿的**不静默覆盖 —— 走冲突横幅（`子方案` §六 2）。
@@ -32,19 +36,23 @@ import {
   FileImageOutlined,
   FileMarkdownOutlined,
   FileOutlined,
+  FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
   ReloadOutlined,
   RightOutlined,
   SaveOutlined,
   UndoOutlined,
+  UploadOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Empty, Input, Modal, Popconfirm, Space, Spin, Switch, Tag, Tooltip, Typography } from 'antd'
+import { Alert, App, Button, Dropdown, Empty, Input, Modal, Popconfirm, Space, Spin, Switch, Tag, Tooltip, Typography } from 'antd'
+import type { MenuProps } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { foldWorkspaceEvents, WORKSPACE_ACTOR_LABELS, type WorkspaceEventItem } from '@doubulea/shared'
 
 import { ApiError } from '../../api/client.js'
+import { RuntimeSelect } from './RuntimeSelect.js'
 import {
   createWorkspaceFile,
   deleteWorkspaceFile,
@@ -53,12 +61,13 @@ import {
   revertWorkspaceRound,
   saveWorkspaceFile,
   streamWorkspaceEvents,
+  uploadWorkspaceFile,
   useWorkspaceTree,
   workspaceRawUrl,
   workspaceTreeQueryKey,
 } from '../../api/workspace.js'
 import { useFeedback } from '../../app/feedback.js'
-import { useWorkspaceStore, useWorkspaceTabs } from '../../stores/workspace.js'
+import { useWorkspaceExpandedDirs, useWorkspaceStore, useWorkspaceTabs } from '../../stores/workspace.js'
 import { CodeMirrorEditor } from './CodeMirrorEditor.js'
 import {
   buildWorkspaceTree,
@@ -67,6 +76,7 @@ import {
   eventTouchesPath,
   fileIconKind,
   filterWorkspaceTree,
+  flattenWorkspaceTree,
   formatBytes,
   isContentEvent,
   isEditableRead,
@@ -75,6 +85,9 @@ import {
   workspaceBaseName,
   workspaceEditorLanguage,
   workspaceLanguageLabel,
+  workspaceMoveTargetPath,
+  workspaceNewFolderPlaceholderPath,
+  workspaceParentDir,
   type WorkspaceFileIconKind,
   type WorkspaceTreeNode,
 } from './workspaceModel.js'
@@ -115,8 +128,78 @@ interface WorkspaceDoc {
   conflict: { currentVersion?: number } | null
 }
 
-export function WorkspacePanel({ conversationId, codeMode }: { conversationId: string; codeMode: boolean }) {
+/** 资源管理器里的路径输入弹窗（新建文件 / 新建文件夹 / 重命名·移动） */
+type PromptState =
+  | { mode: 'createFile'; dir: string }
+  | { mode: 'createFolder'; dir: string }
+  | { mode: 'rename'; path: string }
+  | null
+
+/** 文件树拖拽的私有 MIME：只认"从工作区行里拖出来的"，浏览器拖进来的别的东西不当作移动 */
+const WS_DRAG_MIME = 'application/x-workspace-path'
+
+/** 这次拖拽是不是工作区里的行（dragover 阶段拿不到 data，只能看 `types`） */
+function hasWorkspaceDrag(event: DragEvent): boolean {
+  return event.dataTransfer.types.includes(WS_DRAG_MIME)
+}
+
+/** 文件树每一行 / 空白区要用的动作（由 `WorkspacePanel` 提供，递归 `WorkspaceTree` 只负责触发） */
+interface TreeActions {
+  open: (path: string) => void
+  rename: (path: string) => void
+  remove: (path: string) => void
+  download: (path: string) => void
+  newFile: (dir: string) => void
+  newFolder: (dir: string) => void
+  upload: (dir: string) => void
+  move: (from: string, dir: string) => void
+}
+
+/**
+ * 新会话态（`conversationId` 尚未生成）的 Code 模式第三列占位。
+ *
+ * ⚠️ 工作区是**按会话**存在的（`doubulea-work-<conversationId>` 卷），新会话态还没有会话 ⇒
+ * 没有工作区可读。但用户此刻已经开了 Code 模式，第三列就不该回落到**产物面板** —— 那会让
+ * "开了 Code 模式"看起来没生效，且首条消息建出会话后还会从产物面板突变成工作区面板。
+ * 这里给一个与 {@link WorkspacePanel} 同壳的空态：会话建出来后由 `ChatPage` 换成真面板。
+ */
+/** 运行时选择器的三件套（由 `ChatPage` 持有真值，见 P1-17a）；工作区头部用它 */
+export interface WorkspaceRuntimeControls {
+  runtime: string
+  runtimePending: boolean
+  /** `ready` = 目标组合本机已有镜像（true）/ 需要先构建（false）；见 `RuntimeSelectProps#onSelect` */
+  onSelectRuntime: (runtime: string, ready: boolean) => void
+}
+
+export function WorkspacePanelPlaceholder(props: WorkspaceRuntimeControls) {
+  return (
+    <div className="ws" data-testid="workspace-panel-placeholder">
+      <header className="ws__head">
+        <span className="ws__icon-btn ws__icon-btn--static" title="资源管理器" aria-hidden="true">
+          <FolderOutlined />
+        </span>
+        <span className="ws__title">工作区</span>
+        <div className="u-right">
+          {/* 新会话态也能选运行时：会话建出来前先记意图、开流前落地（见 ChatPage#runtimePresetRef） */}
+          <RuntimeSelect runtime={props.runtime} pending={props.runtimePending} onSelect={props.onSelectRuntime} />
+        </div>
+      </header>
+      <div className="ws__body">
+        <div className="ws__empty">
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="发送第一条消息后创建工作区" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function WorkspacePanel({
+  conversationId,
+  codeMode,
+  ...runtimeControls
+}: { conversationId: string; codeMode: boolean } & WorkspaceRuntimeControls) {
   const feedback = useFeedback()
+  const { modal } = App.useApp()
   const queryClient = useQueryClient()
   const { openPaths, activePath } = useWorkspaceTabs(conversationId)
   const openFile = useWorkspaceStore((state) => state.openFile)
@@ -124,11 +207,13 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
   const closeFile = useWorkspaceStore((state) => state.closeFile)
   const renameFile = useWorkspaceStore((state) => state.renameFile)
 
-  const [explorerOpen, setExplorerOpen] = useState(true)
-  const [showHidden, setShowHidden] = useState(false)
+  const [showHidden, setShowHidden] = useState(true)
   const [recentOpen, setRecentOpen] = useState(false)
-  /** 新建 / 重命名路径输入弹窗（同一套壳，两种模式） */
-  const [prompt, setPrompt] = useState<{ mode: 'create' } | { mode: 'rename' } | null>(null)
+  /** 路径输入弹窗（新建文件 / 新建文件夹 / 重命名·移动，同一套壳） */
+  const [prompt, setPrompt] = useState<PromptState>(null)
+  /** 右键"上传到此处"的目标目录（'' = 根）；配合隐藏的 `<input type="file">` */
+  const [uploadDir, setUploadDir] = useState<string | null>(null)
+  const uploadInputRef = useRef<HTMLInputElement | null>(null)
 
   const treeQuery = useWorkspaceTree(conversationId, codeMode)
   const treeNodes = useMemo(() => buildWorkspaceTree(treeQuery.data?.items ?? []), [treeQuery.data])
@@ -253,6 +338,18 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
     }
   }
 
+  /** 右键「删除」：软删仍可在历史里找回，故确认一次即可 */
+  const confirmRemove = (path: string): void => {
+    modal.confirm({
+      title: '删除这个文件？',
+      content: `${path}（软删 + 墓碑；可在历史里找回，若在保留期内）`,
+      okText: '删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: () => remove(path),
+    })
+  }
+
   /** 新建文件（`POST .../workspace/file`）：成功后刷新树并直接打开它 */
   const createFile = async (path: string): Promise<void> => {
     setPrompt(null)
@@ -267,11 +364,27 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
     }
   }
 
-  /** 改名 / 移动（`POST .../workspace/move`）：迁移打开态与草稿，刷新树 */
-  const doRename = async (to: string): Promise<void> => {
+  /**
+   * 新建文件夹：工作区模型里**空目录不算内容**（树由文件路径派生），故落一个隐藏占位文件
+   * （`.gitkeep`）让目录可见 —— 与 git 保留空目录同一手法。
+   */
+  const createFolder = async (dir: string): Promise<void> => {
     setPrompt(null)
-    const from = activePath
-    if (from === null || to === from) return
+    const placeholder = workspaceNewFolderPlaceholderPath(workspaceParentDir(dir), workspaceBaseName(dir))
+    try {
+      await createWorkspaceFile(conversationId, placeholder)
+      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      feedback.ok('已新建文件夹')
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, '同名文件夹已存在')
+      else feedback.fail(error, '新建文件夹失败')
+    }
+  }
+
+  /** 改名 / 移动（`POST .../workspace/move`）：迁移打开态与草稿，刷新树 */
+  const doRename = async (from: string, to: string): Promise<void> => {
+    setPrompt(null)
+    if (to === from) return
     try {
       await moveWorkspaceFile(conversationId, from, to)
       setDocs((prev) => {
@@ -288,6 +401,52 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
       if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, '目标路径已存在')
       else feedback.fail(error, '重命名失败')
     }
+  }
+
+  /** 拖拽移动：把文件移到某个目录下（名字不变）；目录相同则不做事 */
+  const moveToDir = async (from: string, dir: string): Promise<void> => {
+    const to = workspaceMoveTargetPath(from, dir)
+    if (to === from) return
+    if (workspaceParentDir(from) === dir) return
+    await doRename(from, to)
+  }
+
+  /** 右键「上传到此处」：记下目标目录并唤起隐藏的文件选择器 */
+  const pickUpload = (dir: string): void => {
+    setUploadDir(dir)
+    uploadInputRef.current?.click()
+  }
+
+  /** 选中文件后逐个上传（multipart 单文件），全部完成后刷新树并提示 */
+  const onUploadPicked = async (files: FileList | null): Promise<void> => {
+    const dir = uploadDir ?? ''
+    const list = files === null ? [] : Array.from(files)
+    setUploadDir(null)
+    if (uploadInputRef.current !== null) uploadInputRef.current.value = ''
+    if (list.length === 0) return
+    let okCount = 0
+    for (const file of list) {
+      try {
+        await uploadWorkspaceFile(conversationId, dir, file)
+        okCount += 1
+      } catch (error) {
+        feedback.fail(error, `上传失败：${file.name}`)
+      }
+    }
+    if (okCount > 0) {
+      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      feedback.ok(`已上传 ${okCount} 个文件`)
+    }
+  }
+
+  /** 右键菜单「下载」：用 `<a download>` 走字节出口（与会话已文件名一致） */
+  const downloadPath = (path: string): void => {
+    const link = document.createElement('a')
+    link.href = workspaceRawUrl(conversationId, path)
+    link.download = workspaceBaseName(path)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
   }
 
   /**
@@ -334,7 +493,52 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
     // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` 通过 ref 与 getState 引用）
   }, [conversationId, codeMode, queryClient, closeFile])
 
+  // ── ⌘S / Ctrl+S：编辑器聚焦时由 CodeMirror 拦截；焦点在别处（文件树 / 标签）时由这里兜底保存 ──
+  const saveActiveRef = useRef<() => void>(() => undefined)
+  saveActiveRef.current = () => {
+    if (activePath !== null && editable && dirty && savingPath === null) void save(activePath)
+  }
+  useEffect(() => {
+    if (!codeMode) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault()
+        saveActiveRef.current()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [codeMode])
+
+  // ── 有未保存草稿时离开页面给浏览器一次拦截（"文件被编辑了"的防丢改动兜底）──
+  const hasDirtyRef = useRef(false)
+  hasDirtyRef.current = openPaths.some((path) => {
+    const doc = docs[path]
+    return doc !== undefined && doc.text !== doc.baseText
+  })
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent): void => {
+      if (!hasDirtyRef.current) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+
   const changes = useMemo(() => foldWorkspaceEvents(recentEvents).slice(0, 8), [recentEvents])
+
+  /** 文件树右键 / 拖拽要用的动作集合（下传给 `WorkspaceTree`） */
+  const treeActions: TreeActions = {
+    open: (path) => openFile(conversationId, path),
+    rename: (path) => setPrompt({ mode: 'rename', path }),
+    remove: confirmRemove,
+    download: downloadPath,
+    newFile: (dir) => setPrompt({ mode: 'createFile', dir }),
+    newFolder: (dir) => setPrompt({ mode: 'createFolder', dir }),
+    upload: pickUpload,
+    move: (from, dir) => void moveToDir(from, dir),
+  }
 
   if (!codeMode) {
     return <Empty description="当前会话未开启 Code 模式" />
@@ -342,20 +546,24 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
 
   const language = activePath === null ? 'text' : workspaceEditorLanguage(activePath)
 
+  /** 弹窗初始值：重命名 = 原路径；新建 = 目标目录加尾斜杠（空目录 = 根，空串） */
+  const promptInitial =
+    prompt === null ? '' : prompt.mode === 'rename' ? prompt.path : prompt.dir === '' ? '' : `${prompt.dir}/`
+
   return (
     <div className="ws" data-testid="workspace-panel">
       <header className="ws__head">
-        <button
-          type="button"
-          className={`ws__icon-btn${explorerOpen ? ' is-on' : ''}`}
-          onClick={() => setExplorerOpen((open) => !open)}
-          title={explorerOpen ? '收起资源管理器' : '展开资源管理器'}
-          aria-pressed={explorerOpen}
-        >
+        <span className="ws__icon-btn ws__icon-btn--static" title="资源管理器" aria-hidden="true">
           <FolderOutlined />
-        </button>
+        </span>
         <span className="ws__title">工作区</span>
         <div className="u-right">
+          {/* 运行时选择（P1-17a）：建容器（派活）时用哪份预烘焙镜像；下次派活生效 */}
+          <RuntimeSelect
+            runtime={runtimeControls.runtime}
+            pending={runtimeControls.runtimePending}
+            onSelect={runtimeControls.onSelectRuntime}
+          />
           <Popconfirm
             title="撤销本轮？"
             description="把上一轮 agent / 你的写入回退到轮初；此后又被改过的文件不会被覆盖。"
@@ -371,16 +579,16 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
       </header>
 
       <div className="ws__body">
-        {/* 资源管理器：P1-15 起可**折叠成 44px 图标条**（只留文件夹 / 文件图标），把宽度让给编辑器
-            —— 而不是像改造前那样整块消失（消失后要回到"树"得先展开、再找不到刚才那个文件）。 */}
-        <div className={`ws__explorer${explorerOpen ? '' : ' ws__explorer--collapsed'}`}>
+        {/* 资源管理器：**常驻整宽**（不再折叠成 44px 图标条 —— 折叠态形态别扭，用户反馈去掉）；
+            树行右键出菜单、可拖拽移动到目录；空白区右键 = 根目录级的新建 / 上传 */}
+        <div className="ws__explorer">
           <div className="ws__explorer-head">
             <span className="ws__explorer-title">资源管理器</span>
               <span className="u-right ws__explorer-actions">
                 <button
                   type="button"
                   className="ws__icon-btn"
-                  onClick={() => setPrompt({ mode: 'create' })}
+                  onClick={() => setPrompt({ mode: 'createFile', dir: '' })}
                   title="新建文件"
                 >
                   <FileAddOutlined />
@@ -397,21 +605,18 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
                 <span className="ws__count">{fileCount}</span>
               </span>
             </div>
-            <div className="ws__tree-scroll">
-              {treeQuery.isLoading ? (
-                <Spin />
-              ) : visibleNodes.length === 0 ? (
-                <p className="ws__hint" data-testid="workspace-empty">
-                  （空工作区；agent 派活后可生成文件）
-                </p>
-              ) : (
-                <WorkspaceTree
-                  nodes={visibleNodes}
-                  selectedPath={activePath}
-                  onSelect={(path) => openFile(conversationId, path)}
-                />
-              )}
+          {treeQuery.isLoading ? (
+            <div className="ws__loading">
+              <Spin />
             </div>
+          ) : (
+            <WorkspaceTree
+              conversationId={conversationId}
+              nodes={visibleNodes}
+              selectedPath={activePath}
+              actions={treeActions}
+            />
+          )}
 
             {changes.length > 0 && (
               <div className={`ws__recent${recentOpen ? ' is-open' : ''}`}>
@@ -495,9 +700,6 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
                   <Tooltip title="重新加载（丢弃未保存改动）">
                     <Button size="small" type="text" icon={<ReloadOutlined />} onClick={reloadActive} />
                   </Tooltip>
-                  <Tooltip title="重命名 / 移动">
-                    <Button size="small" type="text" icon={<EditOutlined />} onClick={() => setPrompt({ mode: 'rename' })} />
-                  </Tooltip>
                   <Tooltip title="下载">
                     <a href={workspaceRawUrl(conversationId, activePath)} download>
                       <Button size="small" type="text" icon={<DownloadOutlined />} />
@@ -515,16 +717,6 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
                       保存
                     </Button>
                   )}
-                  <Popconfirm
-                    title="删除这个文件？"
-                    description="软删 + 墓碑；可在历史里找回（若在保留期内）。"
-                    okText="删除"
-                    cancelText="取消"
-                    okButtonProps={{ danger: true }}
-                    onConfirm={() => void remove(activePath)}
-                  >
-                    <Button size="small" type="text" danger icon={<DeleteOutlined />} />
-                  </Popconfirm>
                 </Space>
               </div>
 
@@ -550,10 +742,13 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
                   )}
                   <div className="ws__editor-main">
                     {fileQuery.isLoading ? (
-                      <Spin />
+                      <div className="ws__loading">
+                        <Spin />
+                      </div>
                     ) : editable ? (
                       <CodeMirrorEditor
                         value={activeDoc.text}
+                        docKey={activePath}
                         language={language}
                         onChange={(value) => editText(activePath, value)}
                         onSave={() => {
@@ -594,19 +789,33 @@ export function WorkspacePanel({ conversationId, codeMode }: { conversationId: s
 
       <WorkspacePathPrompt
         open={prompt !== null}
-        mode={prompt?.mode ?? 'create'}
-        initialValue={prompt?.mode === 'rename' ? activePath ?? '' : ''}
+        mode={prompt?.mode ?? 'createFile'}
+        initialValue={promptInitial}
         onCancel={() => setPrompt(null)}
-        onSubmit={(path) => (prompt?.mode === 'rename' ? void doRename(path) : void createFile(path))}
+        onSubmit={(path) => {
+          if (prompt === null) return
+          if (prompt.mode === 'rename') void doRename(prompt.path, path)
+          else if (prompt.mode === 'createFolder') void createFolder(path)
+          else void createFile(path)
+        }}
+      />
+
+      {/* 上传入口：右键菜单触发选择器，多选逐个 multipart 上传（同一时刻只有一个在传） */}
+      <input
+        ref={uploadInputRef}
+        type="file"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(event) => void onUploadPicked(event.target.files)}
       />
     </div>
   )
 }
 
-/** 新建 / 重命名共用的路径输入弹窗（相对路径；服务端负责归一化与越界校验） */
+/** 新建文件 / 新建文件夹 / 重命名共用的路径输入弹窗（相对路径；服务端负责归一化与越界校验） */
 function WorkspacePathPrompt(props: {
   open: boolean
-  mode: 'create' | 'rename'
+  mode: 'createFile' | 'createFolder' | 'rename'
   initialValue: string
   onCancel: () => void
   onSubmit: (path: string) => void
@@ -621,11 +830,12 @@ function WorkspacePathPrompt(props: {
     props.onSubmit(path)
   }
   const isRename = props.mode === 'rename'
+  const isFolder = props.mode === 'createFolder'
   return (
     <Modal
       open={props.open}
-      title={isRename ? '重命名 / 移动' : '新建文件'}
-      okText={isRename ? '重命名' : '新建'}
+      title={isRename ? '重命名 / 移动' : isFolder ? '新建文件夹' : '新建文件'}
+      okText={isRename ? '重命名' : isFolder ? '新建' : '新建'}
       cancelText="取消"
       onOk={submit}
       onCancel={props.onCancel}
@@ -634,12 +844,12 @@ function WorkspacePathPrompt(props: {
       <Input
         value={value}
         autoFocus
-        placeholder="例如 src/index.ts"
+        placeholder={isFolder ? '例如 src/utils' : '例如 src/index.ts'}
         onChange={(event) => setValue(event.target.value)}
         onPressEnter={submit}
       />
       <p className="ratio" style={{ marginTop: 8 }}>
-        相对工作区根目录的路径；目录不存在会自动建。{isRename ? '目标已存在会被拒绝。' : '同名已存在会被拒绝。'}
+        相对工作区根目录的路径；目录不存在会自动建。{isFolder ? '文件夹内会落一个 .gitkeep 占位。' : isRename ? '目标已存在会被拒绝。' : '同名已存在会被拒绝。'}
       </p>
     </Modal>
   )
@@ -697,54 +907,233 @@ function WorkspaceImagePreview({ url, alt }: { url: string; alt: string }) {
   )
 }
 
-/** 资源管理器文件树（可折叠目录 + 当前文件高亮） */
+/** 虚拟滚动：每行固定高度（px）—— 必须与 CSS `.ws__tree-row` 的 `height` 一致 */
+const TREE_ROW_HEIGHT = 24
+/** 视口上下各多渲染几行，减少快速滚动时的白屏 */
+const TREE_OVERSCAN = 8
+/** 每一层目录的缩进（px），与旧的 `.ws__tree .ws__tree { padding-left }` 同值 */
+const TREE_INDENT = 12
+
+/**
+ * 资源管理器文件树：**虚拟滚动 + 单一右键菜单**（可折叠目录 + 当前文件高亮 + 拖拽移动到目录）。
+ *
+ * ⚠️ 只渲染**视口内**的行（压平逻辑见 `workspaceModel#flattenWorkspaceTree`）：几千个文件也只挂
+ * 十几行 DOM。右键菜单由**容器上的一个 `Dropdown`** 承担（旧实现是**每行一个** —— 2534 行就有
+ * 2536 个 `Dropdown` 实例）；`onContextMenu` 时按命中的行（`data-ws-path` / `data-ws-kind`）决定菜单项。
+ *
+ * ⚠️ **目录默认全部折叠**（产品要求 2026-10-14：不要一进来就把几千个文件全铺开）：状态记的是
+ * "哪些目录**被展开**"（初始空集），而不是"哪些被折叠" —— 前者天然是"默认折叠"，后者要反着写。
+ * 这份状态**按会话持久化**在 `stores/workspace.ts#expandedByConversation`（落 localStorage）：
+ * 重进会话 / 刷新页面都记得住（与"标签是本次会话的临时选择"不同，浏览位置该被记住）。
+ */
 function WorkspaceTree(props: {
+  conversationId: string
   nodes: readonly WorkspaceTreeNode[]
   selectedPath: string | null
-  onSelect: (path: string) => void
+  actions: TreeActions
 }) {
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
-  const toggle = (path: string): void => {
-    setCollapsed((prev) => {
-      const next = new Set(prev)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  /** 被**展开**的目录（持久化在 store；初始为空 = 全部折叠，只看到顶层） */
+  const expandedDirs = useWorkspaceExpandedDirs(props.conversationId)
+  const toggleExpanded = useWorkspaceStore((state) => state.toggleExpanded)
+  const expanded = useMemo(() => new Set(expandedDirs), [expandedDirs])
+  /** 当前被拖到其上的目录（高亮落点） */
+  const [dropDir, setDropDir] = useState<string | null>(null)
+  const [rootDropActive, setRootDropActive] = useState(false)
+  /** 视口（滚动位置 + 高度）—— 决定渲染哪一段行 */
+  const [viewport, setViewport] = useState({ top: 0, height: 0 })
+  /** 当前右键菜单（`null` = 还没右键过，用空白区菜单兜底） */
+  const [menu, setMenu] = useState<MenuProps | null>(null)
+
+  const rows = useMemo(
+    () => flattenWorkspaceTree(props.nodes, (path) => !expanded.has(path)),
+    [props.nodes, expanded],
+  )
+
+  // 监听滚动 / 尺寸：只更新视口，不动数据
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el === null) return
+    const update = (): void => setViewport({ top: el.scrollTop, height: el.clientHeight })
+    update()
+    el.addEventListener('scroll', update, { passive: true })
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => {
+      el.removeEventListener('scroll', update)
+      observer.disconnect()
+    }
+  }, [])
+
+  const toggle = (path: string): void => toggleExpanded(props.conversationId, path)
+
+  const fileMenu = (path: string): MenuProps => ({
+    items: [
+      { key: 'open', label: '打开' },
+      { key: 'rename', icon: <EditOutlined />, label: '重命名 / 移动' },
+      { key: 'download', icon: <DownloadOutlined />, label: '下载' },
+      { type: 'divider' },
+      { key: 'delete', icon: <DeleteOutlined />, label: '删除', danger: true },
+    ],
+    onClick: ({ key }) => {
+      if (key === 'open') props.actions.open(path)
+      else if (key === 'rename') props.actions.rename(path)
+      else if (key === 'download') props.actions.download(path)
+      else if (key === 'delete') props.actions.remove(path)
+    },
+  })
+
+  const dirMenu = (dir: string): MenuProps => ({
+    items: [
+      { key: 'newFile', icon: <FileAddOutlined />, label: '新建文件' },
+      { key: 'newFolder', icon: <FolderAddOutlined />, label: '新建文件夹' },
+      { key: 'upload', icon: <UploadOutlined />, label: '上传文件到此目录' },
+    ],
+    onClick: ({ key }) => {
+      if (key === 'newFile') props.actions.newFile(dir)
+      else if (key === 'newFolder') props.actions.newFolder(dir)
+      else if (key === 'upload') props.actions.upload(dir)
+    },
+  })
+
+  const blankMenu: MenuProps = {
+    items: [
+      { key: 'newFile', icon: <FileAddOutlined />, label: '新建文件' },
+      { key: 'newFolder', icon: <FolderAddOutlined />, label: '新建文件夹' },
+      { key: 'upload', icon: <UploadOutlined />, label: '上传文件' },
+    ],
+    onClick: ({ key }) => {
+      if (key === 'newFile') props.actions.newFile('')
+      else if (key === 'newFolder') props.actions.newFolder('')
+      else if (key === 'upload') props.actions.upload('')
+    },
   }
+
+  /** 右键：命中行（`data-ws-path`）按其类型出菜单，否则出根级菜单 */
+  const onTreeContextMenu = (event: React.MouseEvent): void => {
+    const hit = (event.target as HTMLElement).closest<HTMLElement>('[data-ws-path]')
+    if (hit === null) {
+      setMenu(blankMenu)
+      return
+    }
+    const path = hit.dataset['wsPath'] ?? ''
+    setMenu(hit.dataset['wsKind'] === 'dir' ? dirMenu(path) : fileMenu(path))
+  }
+
+  const onRootDragOver = (event: React.DragEvent): void => {
+    if (!hasWorkspaceDrag(event)) return
+    event.preventDefault()
+    setRootDropActive(true)
+  }
+  const onRootDragLeave = (event: React.DragEvent): void => {
+    if (event.currentTarget.contains(event.relatedTarget as Node)) return
+    setRootDropActive(false)
+  }
+  const onRootDrop = (event: React.DragEvent): void => {
+    event.preventDefault()
+    setRootDropActive(false)
+    const from = event.dataTransfer.getData(WS_DRAG_MIME)
+    if (from !== '') props.actions.move(from, '')
+  }
+
+  // 只取视口内的一段（± overscan）；行按 `index × 行高` 绝对定位，撑出总高度
+  const start = Math.max(0, Math.floor(viewport.top / TREE_ROW_HEIGHT) - TREE_OVERSCAN)
+  const end = Math.min(rows.length, Math.ceil((viewport.top + viewport.height) / TREE_ROW_HEIGHT) + TREE_OVERSCAN)
+  const slice = rows.slice(start, end)
+
   return (
-    <ul className="ws__tree">
-      {props.nodes.map((node) =>
-        node.kind === 'dir' ? (
-          <li key={node.path}>
-            <button type="button" className="ws__tree-row ws__tree-row--dir" onClick={() => toggle(node.path)}>
-              <span className="ws__chevron">
-                {collapsed.has(node.path) ? <RightOutlined /> : <DownOutlined />}
-              </span>
-              {collapsed.has(node.path) ? <FolderOutlined /> : <FolderOpenOutlined />}
-              <span className="ws__tree-name">{node.name}</span>
-            </button>
-            {!collapsed.has(node.path) && (
-              <WorkspaceTree nodes={node.children} selectedPath={props.selectedPath} onSelect={props.onSelect} />
-            )}
-          </li>
+    <Dropdown menu={menu ?? blankMenu} trigger={['contextMenu']}>
+      <div
+        ref={scrollRef}
+        className={`ws__tree-scroll${rootDropActive ? ' is-drop' : ''}`}
+        data-testid="workspace-tree"
+        onContextMenu={onTreeContextMenu}
+        onDragOver={onRootDragOver}
+        onDragLeave={onRootDragLeave}
+        onDrop={onRootDrop}
+      >
+        {rows.length === 0 ? (
+          <p className="ws__hint" data-testid="workspace-empty">
+            （空工作区；右键可新建文件 / 文件夹，或上传文件）
+          </p>
         ) : (
-          <li key={node.path}>
-            <button
-              type="button"
-              className={`ws__tree-row${props.selectedPath === node.path ? ' is-active' : ''}`}
-              title={`${node.path} · ${formatBytes(node.entry.size)}`}
-              onClick={() => props.onSelect(node.path)}
-            >
-              <span className="ws__chevron" />
-              <FileGlyph path={node.path} />
-              <span className="ws__tree-name">{node.name}</span>
-              {/* 行内尺寸读数（P1-15）：与状态栏同一口径（`formatBytes`），浏览时一眼看到大小 */}
-              <span className="ws__tree-size num">{formatBytes(node.entry.size)}</span>
-            </button>
-          </li>
-        ),
-      )}
-    </ul>
+          <ul className="ws__tree" style={{ height: rows.length * TREE_ROW_HEIGHT, position: 'relative' }}>
+            {slice.map((row, offset) => {
+              const index = start + offset
+              const indent = { paddingLeft: `calc(var(--sp-3) + ${row.depth * TREE_INDENT}px)` }
+              const position = {
+                position: 'absolute' as const,
+                top: index * TREE_ROW_HEIGHT,
+                left: 0,
+                right: 0,
+                height: TREE_ROW_HEIGHT,
+              }
+              return (
+                <li
+                  key={row.node.path}
+                  className={`ws__tree-item${dropDir === row.node.path ? ' is-drop' : ''}`}
+                  style={position}
+                >
+                  {row.node.kind === 'dir' ? (
+                    <button
+                      type="button"
+                      className="ws__tree-row ws__tree-row--dir"
+                      data-ws-path={row.node.path}
+                      data-ws-kind="dir"
+                      style={indent}
+                      onClick={() => toggle(row.node.path)}
+                      onDragOver={(event) => {
+                        if (!hasWorkspaceDrag(event)) return
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setDropDir(row.node.path)
+                      }}
+                      onDragLeave={(event) => {
+                        if (event.currentTarget.contains(event.relatedTarget as Node)) return
+                        setDropDir((current) => (current === row.node.path ? null : current))
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setDropDir(null)
+                        const from = event.dataTransfer.getData(WS_DRAG_MIME)
+                        if (from !== '') props.actions.move(from, row.node.path)
+                      }}
+                    >
+                      <span className="ws__chevron">
+                        {expanded.has(row.node.path) ? <DownOutlined /> : <RightOutlined />}
+                      </span>
+                      {expanded.has(row.node.path) ? <FolderOpenOutlined /> : <FolderOutlined />}
+                      <span className="ws__tree-name">{row.node.name}</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className={`ws__tree-row${props.selectedPath === row.node.path ? ' is-active' : ''}`}
+                      data-ws-path={row.node.path}
+                      data-ws-kind="file"
+                      style={indent}
+                      title={`${row.node.path} · ${formatBytes(row.node.entry.size)}`}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData(WS_DRAG_MIME, row.node.path)
+                        event.dataTransfer.effectAllowed = 'move'
+                      }}
+                      onClick={() => props.actions.open(row.node.path)}
+                    >
+                      <span className="ws__chevron" />
+                      <FileGlyph path={row.node.path} />
+                      <span className="ws__tree-name">{row.node.name}</span>
+                      {/* 行内尺寸读数（P1-15）：与状态栏同一口径（`formatBytes`），浏览时一眼看到大小 */}
+                      <span className="ws__tree-size num">{formatBytes(row.node.entry.size)}</span>
+                    </button>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+    </Dropdown>
   )
 }

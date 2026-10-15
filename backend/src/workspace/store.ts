@@ -27,6 +27,7 @@ import { randomBytes } from 'node:crypto'
 import { getLogger } from '../infra/logger.js'
 import { SANDBOX_AGENT_UID } from '../sandbox/spec.js'
 import { looksBinaryWorkspaceContent } from './quotaModel.js'
+import { isWorkspaceDependencyDirName } from './dependencyModel.js'
 
 /** 原子写的临时文件名前缀（列举时排除；见文件头） */
 export const WORKSPACE_TMP_PREFIX = '.workspace-tmp-'
@@ -156,24 +157,51 @@ export interface WorkspaceScanEntry {
   mtimeMs: number
 }
 
+/** {@link scanWorkspaceTree} 的结果：源码条目 + **依赖字节单独计量**（P1-17b 的"配额口径区分"） */
+export interface WorkspaceScanResult {
+  entries: WorkspaceScanEntry[]
+  /**
+   * 依赖目录（{@link WORKSPACE_DEPENDENCY_DIRS}）里的字节总数。
+   * **不进 `entries`**（依赖不被索引 → 不进文件树 / 源码配额 / 冷备），但单独量出来供观测：
+   * 这样"源码配额"与"依赖体积"是两个数，而不是一个混在一起的数（`子方案` §五之二 3 ③）。
+   */
+  dependencyBytes: number
+}
+
 /**
  * 递归扫描工作区目录（**内容事件 + 轮末对账的输入**；watcher 与"重建索引"共用）。
  *
  * 四条口径：
  *   · **跳过临时文件**（{@link WORKSPACE_TMP_PREFIX} 开头）—— 它们不是内容；
+ *   · **依赖目录不下钻进索引**（{@link isWorkspaceDependencyDirName}，P1-17b）—— 只累计其字节数；
  *   · **符号链接不跟随**（`lstat` 判 `isSymbolicLink` ⇒ 跳过）—— 跟随会把根外的文件也列进来，
  *     与 `resolveWorkspacePath` 的逃逸判据配套：**列举侧与读取侧都不能穿过符号链接**；
- *   · 排序稳定（字典序），便于逐条比对；
- *   · 目录本身不作为条目（空目录不是内容，与文件树契约一致）。
+ *   · 排序稳定（字典序），便于逐条比对；目录本身不作为条目（空目录不是内容）。
  */
-export async function scanWorkspaceFiles(rootDir: string): Promise<WorkspaceScanEntry[]> {
-  const out: WorkspaceScanEntry[] = []
-  await walk(rootDir, '', out)
-  out.sort((a, b) => (a.relative < b.relative ? -1 : a.relative > b.relative ? 1 : 0))
-  return out
+export async function scanWorkspaceTree(rootDir: string): Promise<WorkspaceScanResult> {
+  const entries: WorkspaceScanEntry[] = []
+  const state = { dependencyBytes: 0 }
+  await walk(rootDir, '', entries, state)
+  entries.sort((a, b) => (a.relative < b.relative ? -1 : a.relative > b.relative ? 1 : 0))
+  return { entries, dependencyBytes: state.dependencyBytes }
 }
 
-async function walk(dirAbsolute: string, prefix: string, out: WorkspaceScanEntry[]): Promise<void> {
+/** 只要条目（旧签名，保留给只关心"有哪些文件"的调用方；依赖目录同样被排除） */
+export async function scanWorkspaceFiles(rootDir: string): Promise<WorkspaceScanEntry[]> {
+  return (await scanWorkspaceTree(rootDir)).entries
+}
+
+/** 递归过程中跨层累积的读数（`dependencyBytes` 是唯一的可变状态） */
+interface WalkState {
+  dependencyBytes: number
+}
+
+async function walk(
+  dirAbsolute: string,
+  prefix: string,
+  out: WorkspaceScanEntry[],
+  state: WalkState,
+): Promise<void> {
   let entries: Dirent[]
   try {
     entries = await readdir(dirAbsolute, { withFileTypes: true })
@@ -188,7 +216,13 @@ async function walk(dirAbsolute: string, prefix: string, out: WorkspaceScanEntry
     const childAbsolute = join(dirAbsolute, entry.name)
     if (entry.isSymbolicLink()) continue
     if (entry.isDirectory()) {
-      await walk(childAbsolute, relative, out)
+      // ★ P1-17b：依赖目录**不进索引**（不产生条目、不产生事件、不进文件树/配额/冷备），
+      //   但把它的字节数**量出来**（观测用；见 WorkspaceScanResult.dependencyBytes）。
+      if (isWorkspaceDependencyDirName(entry.name)) {
+        state.dependencyBytes += await measureDirBytes(childAbsolute)
+        continue
+      }
+      await walk(childAbsolute, relative, out, state)
     } else if (entry.isFile()) {
       try {
         const info = await stat(childAbsolute)
@@ -198,4 +232,33 @@ async function walk(dirAbsolute: string, prefix: string, out: WorkspaceScanEntry
       }
     }
   }
+}
+
+/**
+ * 量一个目录（通常是依赖目录）的**总字节**（`du -sb` 的等价物，纯 Node）。
+ *
+ * ⚠️ 它是**观测口径**、不是配额判据：只累加普通文件字节，符号链接不跟随（与列举同纪律）。
+ *    依赖目录可能上万个文件，故这里用 `readdir` 逐层下钻（Node 没有内置 `du`）。
+ */
+async function measureDirBytes(dirAbsolute: string): Promise<number> {
+  let entries: Dirent[]
+  try {
+    entries = await readdir(dirAbsolute, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue
+    const childAbsolute = join(dirAbsolute, entry.name)
+    if (entry.isDirectory()) total += await measureDirBytes(childAbsolute)
+    else if (entry.isFile()) {
+      try {
+        total += (await stat(childAbsolute)).size
+      } catch {
+        // 竞态（扫描途中被删）：跳过
+      }
+    }
+  }
+  return total
 }

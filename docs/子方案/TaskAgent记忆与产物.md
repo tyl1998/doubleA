@@ -137,3 +137,10 @@ writeMemoryDoc(containerId, doc) → void
 - **不做历史全文重放给引擎**：记忆文档只给"摘要 + 产物清单"，不是逐字历史；pi 会话活着时它自己记得全部。
 - **产物保留期不变**：会话产物仍受 `ARTIFACT_RETENTION_DAYS`（默认 7 天）清理收口，不因"可汇总查看"而变成永久。用户也可在「会话产物」页**主动删除**（对象 + 行一并移除）。
 - **撤回最新一轮（recall）的删除语义不变**：`conversation.service.ts#recallLastRound` 仍删该轮产物行 + S3 对象（撤回=撤销那一轮，与"删除会话"是两种操作）。
+---
+
+## 修订（2026-10-14）：记忆文档阅读指令必须给**工作区相对路径**
+
+**问题**：agent 每次执行开始读 `/work/.doubulea/memory.md` **都失败**。根因：Code 模式下引擎的 `read` 工具被 `pi-agent/extensions/workspace` **同名覆盖**（版本感知版），参数是**工作区相对路径**；后端 `normalizeWorkspacePath` 直接拒绝以 `/` 开头的绝对路径（`backend/src/workspace/paths.ts:55`）⇒ 绝对路径的阅读指令必然 `ok:false` 校验失败。
+
+**处置**：`backend/src/orchestrator/memoryDoc.ts` 新增 `MEMORY_DOC_RELATIVE_PATH = '.doubulea/memory.md'`，`memoryDocReadInstruction()` 改用它并显式提示"read 只接受工作区相对路径，不要传 `/work/...`"。相对路径在两种形态下都对：中介 `read` 认它；非中介的内置 `read` 以 cwd=`/work` 解析它。`MEMORY_DOC_PATH`（绝对）仍供 `writeMemoryDoc` 写盘与日志用。

@@ -49,14 +49,21 @@ const {
   withOpenedTab,
   nextActiveOnClose,
   renameOpenTab,
+  toggleExpandedDir,
   workspaceBaseName,
   filterWorkspaceTree,
+  flattenWorkspaceTree,
   fileIconKind,
   isImageMime,
   workspaceLanguageLabel,
   clampWorkspacePanelWidth,
   WORKSPACE_PANEL_MIN_W,
   WORKSPACE_PANEL_MAX_W,
+  workspaceParentDir,
+  joinWorkspacePath,
+  workspaceNewFolderPlaceholderPath,
+  workspaceMoveTargetPath,
+  WORKSPACE_FOLDER_PLACEHOLDER,
 } = await import('../src/features/chat/workspaceModel.ts')
 
 const entry = (path, size = 10, mime = 'text/plain') => ({
@@ -187,6 +194,12 @@ it('W23 renameOpenTab：迁移路径并去重', () => {
   eq(renameOpenTab(['a', 'b'], 'a', 'b').join(','), 'b', '改成已打开的路径 → 去重')
   eq(renameOpenTab(['a', 'b'], 'x', 'y').join(','), 'a,b', '不在列表里 → 原样')
 })
+it('W23b toggleExpandedDir：展开追加 / 再点移除（默认空 = 全折叠）', () => {
+  eq(toggleExpandedDir([], 'src').join(','), 'src', '空列表展开一个')
+  eq(toggleExpandedDir(['src', 'out'], 'out').join(','), 'src', '再点同一个 → 折叠（移除）')
+  eq(toggleExpandedDir(['src'], 'out').join(','), 'src,out', '展开新的 → 追加到末尾（顺序稳定）')
+  eq(toggleExpandedDir([], 'src').length, 1, '不修改入参以外的语义（纯函数）')
+})
 
 console.log('── W9 文件树过滤 / 图标 / 只读图片（P1-9 · R12）──')
 it('W18 filterWorkspaceTree：默认丢掉隐藏子树（.git 等）', () => {
@@ -194,6 +207,25 @@ it('W18 filterWorkspaceTree：默认丢掉隐藏子树（.git 等）', () => {
   const visible = filterWorkspaceTree(tree, false)
   eq(visible.map((n) => n.name).join(','), 'out,src', '隐藏目录不出现')
   eq(filterWorkspaceTree(tree, true).length, 3, '显示隐藏时全在')
+})
+it('W18b flattenWorkspaceTree：折叠目录整段跳过、depth 随层级（虚拟滚动按它切片）', () => {
+  const tree = buildWorkspaceTree([entry('src/a.ts'), entry('src/deep/b.ts'), entry('out/report.csv')])
+  const all = flattenWorkspaceTree(tree, () => false)
+  eq(
+    all.map((row) => `${row.node.name}@${row.depth}`).join(','),
+    'out@0,report.csv@1,src@0,deep@1,b.ts@2,a.ts@1',
+    '深度优先 + 层级（目录在前）',
+  )
+  eq(
+    flattenWorkspaceTree(tree, (path) => path === 'src').map((row) => row.node.name).join(','),
+    'out,report.csv,src',
+    '折叠的目录其整棵子树不进列表',
+  )
+  eq(
+    flattenWorkspaceTree(tree, (path) => path === 'src/deep').map((row) => row.node.name).join(','),
+    'out,report.csv,src,deep,a.ts',
+    '只跳过被折叠那一层的子树',
+  )
 })
 it('W19 fileIconKind：按扩展名归大类', () => {
   eq(fileIconKind('a.ts'), 'typescript', 'ts')
@@ -218,6 +250,23 @@ it('W22 clampWorkspacePanelWidth：下限 / 上限 / 视口收窄', () => {
   eq(clampWorkspacePanelWidth(5000, 1600), WORKSPACE_PANEL_MAX_W, '高过上限 → 压到上限')
   eq(clampWorkspacePanelWidth(600, 1600), 600, '区间内原样')
   eq(clampWorkspacePanelWidth(900, 800), Math.floor(800 * 0.72), '视口窄 → 上限收到 72%')
+})
+
+console.log('── W11 路径工具（右键新建 / 拖拽移动用）──')
+it('W24 workspaceParentDir / joinWorkspacePath', () => {
+  eq(workspaceParentDir('a/b/c.ts'), 'a/b', '嵌套取父目录')
+  eq(workspaceParentDir('a.ts'), '', '根层文件取空串')
+  eq(joinWorkspacePath('a/b', 'c.ts'), 'a/b/c.ts', '目录 + 名字拼接')
+  eq(joinWorkspacePath('', 'c.ts'), 'c.ts', '根目录拼接')
+})
+it('W25 workspaceNewFolderPlaceholderPath：文件夹落 .gitkeep 占位', () => {
+  eq(workspaceNewFolderPlaceholderPath('', 'utils'), 'utils/.gitkeep', '根下新目录')
+  eq(workspaceNewFolderPlaceholderPath('src', 'utils'), 'src/utils/.gitkeep', '子目录下新目录')
+  eq(WORKSPACE_FOLDER_PLACEHOLDER, '.gitkeep', '占位文件名')
+})
+it('W26 workspaceMoveTargetPath：拖到目录后目标路径（名字不变）', () => {
+  eq(workspaceMoveTargetPath('a/b/c.ts', 'x/y'), 'x/y/c.ts', '移到别的目录')
+  eq(workspaceMoveTargetPath('c.ts', ''), 'c.ts', '移到根目录保持原名')
 })
 
 console.log('')

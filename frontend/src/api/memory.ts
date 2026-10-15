@@ -11,7 +11,7 @@
  * | `DELETE /api/memories/:id` | **裸 `{ id }`** |
  * | `GET    /api/memories/settings` | `MemorySettings` |
  * | `PATCH  /api/memories/settings` | `MemorySettings` |
- * | `GET    /api/memories/notices?conversationId=` | `MemoryNoticesResult`（**取出即消费**） |
+ * | `GET    /api/memories/notices?conversationId=` | `MemoryNoticesResult`（AUTO 取出即消费、SUGGEST 留到作答） |
  * | `POST   /api/memories/notices/:noticeId?conversationId=` | `MemoryNoticeActionResult` |
  * | `PUT    /api/conversations/:id/memory-excluded` | `SetConversationMemoryExcludedResult` |
  *
@@ -127,7 +127,7 @@ export function useUpdateMemorySettings() {
   })
 }
 
-/** 取走待展示提示（**取出即消费**；返回后服务端已清空，故不进 query 缓存，由调用方一次性消费） */
+/** 取走待展示提示（AUTO 取出即消费、SUGGEST 留到作答；不进 query 缓存，由调用方按 `id` 去重消费） */
 export function fetchMemoryNotices(conversationId: string): Promise<MemoryNoticesResult> {
   return request<MemoryNoticesResult>(
     `/api/memories/notices?conversationId=${encodeURIComponent(conversationId)}`,

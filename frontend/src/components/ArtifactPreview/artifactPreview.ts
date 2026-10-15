@@ -51,6 +51,20 @@ export function artifactDownloadUrl(artifactId: string): string {
 }
 
 /**
+ * 渲染预览（`GET /api/artifacts/:id/render`）—— **DOCX 专用**（P1-16）。
+ *
+ * ⚠️ 它与 {@link artifactContentUrl} 是**两条出口**：`/content` 回**原始字节**（DOCX 是二进制
+ * OOXML，`/content` 对它上 `octet-stream` + `attachment`），`/render` 回**服务端渲染好的 HTML**
+ * （mammoth → HTML，带 CSP `sandbox` 头）。前端对 `previewKindOf === 'docx'` 的产物用这一条。
+ *
+ * ⚠️ 与其他几个 URL Builder 同处本文件：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
+ * 只在**这一个文件**里出现（否则第二处会各自演化）—— 所以别的模块一律调本函数，不自己拼。
+ */
+export function artifactRenderUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}/render`
+}
+
+/**
  * 会话产物列表（`GET /api/artifacts`，**跨会话汇总本人全部产物**）。
  *
  * ⚠️ **与上面两个出口不同，它带 query**（offset/limit 分页）—— 但那不是"同一个端点加参数"：
@@ -72,6 +86,18 @@ export function artifactsCollectionUrl(offset: number, limit: number): string {
  */
 export function artifactDeleteUrl(artifactId: string): string {
   return `/api/artifacts/${encodeURIComponent(artifactId)}`
+}
+
+/**
+ * 批量删除产物（`POST /api/artifacts/batch-delete`，**会话产物列表的批量删除动作**）。
+ *
+ * ⚠️ **与上面的单条删除同处本文件**：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
+ * 只出现在**这一个文件**（否则就有第二处会各自演化）。id 走 body、不进路径 ⇒ 这个 URL
+ * **不带任何路径参数**（也就不需要 `encodeURIComponent`）。
+ * ⚠️ **不带 query**（与预览 / 下载同款口径）：`ids` 全在 body 里，URL 只回答"打哪个端点"。
+ */
+export function artifactBatchDeleteUrl(): string {
+  return '/api/artifacts/batch-delete'
 }
 
 // ───────────────────────────── 体积闸门 ─────────────────────────────
@@ -141,6 +167,18 @@ export function decodeUtf8Text(bytes: Uint8Array | ArrayBuffer): string | null {
 }
 
 // ───────────────────────────── CSV（`子方案④` §五 5）─────────────────────────────
+
+/**
+ * 是不是 Markdown（`text/markdown` 及变体 `text/x-markdown`）—— `text` 一族里唯一**不当纯文本**
+ * 渲染、而交给 `MarkdownPreview` 的那一支。
+ *
+ * ⚠️ 判据同样**按 mime、不看扩展名**（与 `previewKindOf` / `csvDelimiterOf` 同款纪律）。
+ * P1-16 起 `previewKindOf` 把代码类并入 `text`；它们**不是** Markdown，走 `TextPreview` 的 `<pre>`。
+ */
+export function isMarkdownMime(mime: string): boolean {
+  const base = mime.trim().toLowerCase().split(';')[0]?.trim() ?? ''
+  return base === 'text/markdown' || base === 'text/x-markdown'
+}
 
 /**
  * 分隔符**按 mime 定，不做嗅探**（`子方案④` §五 5）。

@@ -11,7 +11,7 @@
  *   · `DELETE /api/memories/:id`                删（硬删）
  *   · `GET    /api/memories/settings`           读开关
  *   · `PATCH  /api/memories/settings`           改开关
- *   · `GET    /api/memories/notices`            取走"待展示提示"（toast 晚一拍；**取出即消费**）
+ *   · `GET    /api/memories/notices`            取走"待展示提示"（toast 晚一拍；AUTO 取出即消费、SUGGEST 留到作答）
  *   · `POST   /api/memories/notices/:noticeId`  对一条偏好建议作答（记住 / 忽略）
  *   · `PUT    /api/conversations/:id/memory-excluded`  会话级「不记入记忆」
  *
@@ -96,7 +96,7 @@ export function registerMemoryRoutes(app: FastifyInstance): void {
   )
 
   /**
-   * 取走"待展示提示"（toast 晚一拍；**取出即消费**，见 `memory.service#drainMemoryNotices`）。
+   * 取走"待展示提示"（toast 晚一拍；AUTO 取出即消费、SUGGEST 留到作答，见 `memory.service#drainMemoryNotices`）。
    * 先过会话归属（不是我的会话 ⇒ 404，与 `/memories` 同族判据）。
    */
   app.get<{ Querystring: { conversationId: string } }>(

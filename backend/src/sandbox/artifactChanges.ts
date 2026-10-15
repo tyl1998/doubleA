@@ -18,15 +18,17 @@
 
 import { WORKSPACE_CONTENT_EVENT_TYPES, type WorkspaceChangeEntry } from '@doubulea/shared'
 
+import { WORKSPACE_DEPENDENCY_DIRS } from '../workspace/dependencyModel.js'
+
 /**
  * 扫描排除的**顶层相对目录**（`子方案③` §十一 2 的"引擎自身的工作文件"名单）。
  *
- * ⚠️ **显式列出、一处定义**（不写死散落）：加名字只改这一处；隐藏目录（`.` 开头）
- * 由那条通用规则单独覆盖、不进本名单（两套规则混写就会出现"删了规则忘了名单"的分叉）。
- * - `node_modules`：镜像刻意不装包管理器，但工具运行期（pandas/jq 等）可能解出依赖目录 ——
- *   那是**环境**不是**产物**，且动辄几千个小文件，只会打爆 `maxFiles` 上限。
+ * ⚠️ **名单的唯一定义搬到了 `workspace/dependencyModel.ts`**（P1-17b）：依赖目录不仅要"不进产物"，
+ * 还要"不进索引 / 不进冷备 / 不算源码配额 / 不让中介写进去" —— 五个消费方**必须同一份名单**，
+ * 否则会出现"产物里没有 node_modules，但配额/冷备里却有"。这里只是给它一个**产物侧的名字**。
+ * ⚠️ 隐藏目录（`.` 开头）由那条通用规则单独覆盖、不进本名单（两套规则混写就会出现"删了规则忘了名单"的分叉）。
  */
-export const ARTIFACT_EXCLUDED_DIRS: readonly string[] = ['node_modules']
+export const ARTIFACT_EXCLUDED_DIRS: readonly string[] = WORKSPACE_DEPENDENCY_DIRS
 
 /** 过滤的入参（`excludedDirs` / `maxFiles` 由调用方从 config 取，保持本模块零 config 依赖） */
 export interface ArtifactPathFilterOptions {

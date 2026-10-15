@@ -47,6 +47,7 @@ import {
   renameConversationBodySchema,
   setConversationAutoApproveBodySchema,
   setConversationCodeModeBodySchema,
+  setConversationRuntimeBodySchema,
   steerConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
@@ -60,6 +61,7 @@ import {
   type RenameConversationBody,
   type SetConversationAutoApproveBody,
   type SetConversationCodeModeBody,
+  type SetConversationRuntimeBody,
   type SteerConversationBody,
   type SseEvent,
 } from '@doubulea/shared'
@@ -93,6 +95,7 @@ import {
   removeConversation,
   renameConversation,
   setConversationCodeMode,
+  setConversationRuntime,
   type ConversationViewer,
 } from '../services/conversation.service.js'
 
@@ -548,6 +551,26 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         })
       }
       return ok({ id: request.params.id, codeMode })
+    },
+  )
+
+  /**
+   * `POST /api/conversations/:id/runtime` —— 设置**会话运行时**（P1-17a；`子方案` §五之二 2 · 方案 B）。
+   *
+   * 运行时是一个**持久列**（`conversations.runtime`）：派活建容器时按它选运行时镜像
+   * （后端从本机镜像**探测**得到，见 `sandbox/runtimeImages.ts` 与 `GET /api/sandbox/runtimes`）。
+   * ⚠️ 本端点**不主动回收容器** —— 下次派活时 `ensureSandbox` 按 `doubulea.runtime` 标签比对，
+   * 不一致就回收重建（改运行时不必停机，也不会有一个"半新半旧"的容器）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SetConversationRuntimeBody }>(
+    '/api/conversations/:id/runtime',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: setConversationRuntimeBodySchema },
+    },
+    async (request) => {
+      const runtime = await setConversationRuntime(request.params.id, viewerOf(request), request.body.runtime)
+      return ok({ id: request.params.id, runtime })
     },
   )
 }

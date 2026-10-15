@@ -58,7 +58,7 @@
  */
 
 import { DownOutlined, SettingOutlined } from '@ant-design/icons'
-import { Button, Drawer, Tag, Tooltip } from 'antd'
+import { Button, Tag, Tooltip } from 'antd'
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -79,7 +79,7 @@ import {
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { uploadChatFile } from '../../api/files.js'
 import { setConversationMemoryExcluded } from '../../api/memory.js'
-import { setConversationCodeMode } from '../../api/workspace.js'
+import { setConversationCodeMode, setConversationRuntime } from '../../api/workspace.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -95,7 +95,7 @@ import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/con
 import { ConversationSettings, type CodeFocus } from '../../features/chat/ConversationSettings.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
-import { WorkspacePanel } from '../../features/chat/WorkspacePanel.js'
+import { WorkspacePanel, WorkspacePanelPlaceholder } from '../../features/chat/WorkspacePanel.js'
 import { useWorkspacePanelResize } from '../../features/chat/useWorkspacePanelResize.js'
 import { MessageList } from '../../features/chat/MessageList.js'
 import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
@@ -168,6 +168,11 @@ function StreamFrame({
   )
 }
 
+/**
+ * 出网范围（P1-16a）**不在会话里配**（2026-10-14 用户定案）：统一在平台「出网策略」页
+ * （`/admin/egress`）配置，作用于所有会话。会话控件不再有它。
+ */
+
 export function ChatPage({
   agentId,
   conversationId,
@@ -226,6 +231,18 @@ export function ChatPage({
           } catch (error: unknown) {
             // 落不下就如实说，但**不拦发送**：这一轮退回普通模式即可，用户仍能继续聊
             feedback.fail(error, 'Code 模式开关没有保存')
+          }
+        }
+        // 新会话态下预置过**运行时**（P1-17a）⇒ 同样在开流前落地（建沙箱时要按它选镜像）。
+        // 消费后立刻清，避免被下一条新会话误用。
+        const runtimePreset = runtimePresetRef.current
+        runtimePresetRef.current = null
+        if (runtimePreset !== null) {
+          try {
+            await setConversationRuntime(created.id, runtimePreset)
+          } catch (error: unknown) {
+            // 落不下就如实说，但**不拦发送**：这一轮退回默认运行时即可
+            feedback.fail(error, '运行时没有保存')
           }
         }
         // 新会话态下预置过「不记入记忆」⇒ 同样在开流前落地（否则第一轮就被写进长期记忆）。
@@ -327,6 +344,17 @@ export function ChatPage({
    */
   const [codeFocus, setCodeFocus] = useState<CodeFocus>('none')
   /**
+   * 第三列（TaskAgent 的产物面板）是否展开。纯客户端选择（不进 store、不落库）。
+   * ⚠️ 只影响**非 Code** 的产物面板：Code 模式的工作区面板走 `panelVisible` 的 `codeMode` 分支
+   *    （恒占位，收起/专注由 `codeFocus` 管）。
+   *
+   * ★ 展开策略（产品反馈 2026-10-14）：
+   *   · **新建会话**（`conversationId === undefined`）⇒ 默认**收起**（不该一进来就弹开文件预览那栏）；
+   *   · **进入已有 / 固定的历史会话** ⇒ 默认**展开**（保持一贯行为，逻辑不变）；
+   *   · 用户在某一屏手动切过的状态，到下一屏（切会话/新建）按上面两条重置。
+   */
+  const [panelOpen, setPanelOpen] = useState(true)
+  /**
    * 新会话态下用户**预置**的 Code 模式意图（与会话级自动审批同款）。
    *
    * `code_mode` 是会话列，会话要等首条消息才建出来 ⇒ 新会话态点开关时**先记在这里、
@@ -334,18 +362,38 @@ export function ChatPage({
    * 这样**第一轮**派活时容器就已按 Code 模式注入中介 env。
    */
   const codeModePresetRef = useRef(false)
+  /**
+   * 会话**运行时**（P1-17a）：Code 会话派活时用它选运行时镜像（`none/node/python/go/java/rust`）。
+   * 与 `codeMode` 同款 —— 由 `/active` 一并回带；切会话时先重置为**空串**（= 不指定）。
+   * ⚠️ 空串 = **空环境**（只带基础工具链，不额外装语言运行时）：后端 `resolveSandboxRuntimeImage`
+   *    找不到该 runtime 时回退 `SANDBOX_IMAGE`，正是"空环境"的语义。**不默认挑任何语言**——
+   *    用户不选就用空环境（产品反馈 2026-10-14：新会话不该默认显示 `node`）。
+   * ⚠️ 只在 Code 会话里可选（**工作区面板头部**，见 `RuntimeSelect` / `WorkspacePanel`）：非 Code 会话不建容器，运行时不生效。
+   */
+  const [runtime, setRuntime] = useState<string>('')
+  const [runtimePending, setRuntimePending] = useState(false)
+  /**
+   * 新会话态下用户**预置**的运行时意图（与 Code 模式预置同款）：`null` = 没预置。
+   * 会话要等首条消息才建出来 ⇒ 新会话态选运行时先记在这里、`onConversationCreated` 再落地。
+   */
+  const runtimePresetRef = useRef<string | null>(null)
   useEffect(() => {
     setAutoApprove(false)
     setMemoryExcluded(false)
     setCodeMode(false)
+    setRuntime('')
     // 专注态是"这一屏怎么摆"，切会话回到常规（否则下条会话莫名收着工作区）
     setCodeFocus('none')
+    // 产物面板展开态（见 panelOpen 的注释）：**新建会话默认收起、进入历史会话默认展开**。
+    // ⚠️ Code 模式不看它（走 panelVisible 的 codeMode 分支），所以这里对 Code 会话无副作用。
+    setPanelOpen(conversationId !== undefined)
     if (conversationId === undefined) {
       // 回到新会话态：清掉上一条会话残留的"预置自动审批 / 不记入记忆 / Code 模式"意图
       // （否则下条新会话会被它带偏）
       autoApprovePresetRef.current = false
       memoryExcludedPresetRef.current = false
       codeModePresetRef.current = false
+      runtimePresetRef.current = null
       return
     }
     let cancelled = false
@@ -355,6 +403,7 @@ export function ChatPage({
         setAutoApprove(active.autoApprove)
         setMemoryExcluded(active.memoryExcluded)
         setCodeMode(active.codeMode)
+        setRuntime(active.runtime)
       })
       .catch(() => {
         // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
@@ -364,12 +413,10 @@ export function ChatPage({
       cancelled = true
     }
   }, [conversationId])
-  /** 窄屏下的产物抽屉开关（第三列被 CSS 藏在 ≥1280 才显示，窄屏用抽屉给入口，见 `ArtifactPanel` 那段） */
-  const [artifactDrawerOpen, setArtifactDrawerOpen] = useState(false)
   /**
    * Code 模式第三列（IDE 面板）的宽度拖拽（P1-9 · R12）。
    * ⚠️ 宽度经 CSS 变量 `--panel-w` 注入（见下面的 `style`）——**不能直接写 `grid-template-columns`**：
-   * 内联样式会盖掉 <1280px 断点里"收成两栏并藏面板"的那条媒体查询（`app.css`），窄屏就会硬留一列。
+   * 内联样式会盖掉 <1280px 断点里"第三列改按比例收窄"的那条媒体查询（`app.css`），窄屏就会硬留一列。
    */
   const wsPanel = useWorkspacePanelResize(codeMode && conversationId !== undefined, conversationId)
   /**
@@ -531,6 +578,17 @@ export function ChatPage({
   // 第三列判据：Agent 类型。⚠️ 只读保留会话里 Agent 已软删 ⇒ 用会话项的类型快照兜，
   // 这样 TaskAgent 的只读会话仍能看产物 / 工作区（历史不该因为 Agent 被删就消失）。
   const showPanel = showArtifactPanel(agent?.type ?? agentTypeSnapshot)
+  /**
+   * 第三列**当前是否占位**。
+   *
+   * ⚠️ 展开判据**分模式**（产品反馈 2026-10-14 修订）：
+   *   · **非 Code**（产物面板）：由 `panelOpen` 决定 —— 默认**收起**（新建 TaskAgent 会话不该
+   *     默认弹开文件预览那栏），用户自己展开；
+   *   · **Code 模式**（工作区面板）：**恒占位**，不看 `panelOpen` —— 工作区是 Code 模式的核心，
+   *     它自己的收起/专注走 `codeFocus`（`chat--focus-chat` 用 CSS 隐藏 `.panel`）。
+   *     ⚠️ 不能再拿 `panelOpen` 管它：那个默认已改成收起，会让"Code 会话打开就看不到工作区"。
+   */
+  const panelVisible = showPanel && (codeMode || panelOpen)
 
   /**
    * 产物列表：**"刷新后产物还在"的唯一出口**（`artifact` 事件只发一次、
@@ -915,7 +973,44 @@ export function ChatPage({
     [conversationId, feedback],
   )
 
+  /**
+   * 选择**会话运行时**（P1-17a）。与 `handleToggleCodeMode` 同款：新会话态先记意图、只改本地，
+   * 等首条消息建出会话、开流前再落地（见 `onConversationCreated` / `runtimePresetRef`）。
+   * ⚠️ 运行时**下次派活生效**（`ensureSandbox` 按 `doubulea.runtime` 标签比对，不一致就回收重建）。
+   */
+  const handleSelectRuntime = useCallback(
+    (next: string, ready: boolean): void => {
+      if (conversationId === undefined) {
+        runtimePresetRef.current = next
+        setRuntime(next)
+        return
+      }
+      setRuntimePending(true)
+      void setConversationRuntime(conversationId, next)
+        .then((result) => {
+          setRuntime(result.runtime)
+          // 区分三种情形：空环境（不选语言）/ 镜像已就绪 / 本机没有（需先构建）。
+          // （选择本身只是持久化意图，真正的建容器/换镜在**下次派活**时发生，见 ensureSandbox 的 runtime 标签比对。）
+          if (result.runtime === '') {
+            feedback.ok('已切换为空环境（仅基础工具链），下次派活生效')
+          } else if (ready) {
+            feedback.ok('已切换运行时，下次派活生效')
+          } else {
+            feedback.note('已切换运行时，但本机暂无该环境镜像，需先构建后才会生效（下次派活时）')
+          }
+        })
+        .catch((error: unknown) => {
+          feedback.fail(error, '运行时没有保存')
+        })
+        .finally(() => {
+          setRuntimePending(false)
+        })
+    },
+    [conversationId, feedback],
+  )
+
   // ── 撤回 / 修改重发最新一轮（产品优化 2026-09-29）──────────────────────────────
+
 
   /** 撤回确认弹窗的目标；`null` = 关闭 */
   const [recallTarget, setRecallTarget] = useState<RecallTarget | null>(null)
@@ -971,11 +1066,9 @@ export function ChatPage({
     // 因为它是**跨智能体**的历史（与"当前会话属于谁"无关）。这里只剩消息流与第三列。
     <>
       <div
-        className={`chat${showPanel ? ' chat--with-panel' : ''}${codeMode ? ' chat--code' : ''}${codeMode && codeFocus !== 'none' ? ` chat--focus-${codeFocus}` : ''}`}
+        className={`chat${panelVisible ? ' chat--with-panel' : ''}${codeMode ? ' chat--code' : ''}${codeMode && codeFocus !== 'none' ? ` chat--focus-${codeFocus}` : ''}`}
         style={
-          codeMode && conversationId !== undefined
-            ? ({ '--panel-w': `${wsPanel.width}px` } as CSSProperties)
-            : undefined
+          codeMode ? ({ '--panel-w': `${wsPanel.width}px` } as CSSProperties) : undefined
         }
       >
         <main className="chat__main" aria-label="当前会话">
@@ -1149,7 +1242,7 @@ export function ChatPage({
               steerable={agent?.type === 'TASK_AGENT'}
               onSteer={handleSteer}
               steerPending={steerPending}
-              // R4：会话控件（模型 / 自动审批 / 记忆 / Code 模式 / 专注 / 产物入口）摆到输入框下方
+              // R4：会话控件（模型 / 自动审批 / 记忆 / Code 模式 / 专注）摆到输入框下方
               controls={
                 <ConversationSettings
                   agent={agent}
@@ -1166,7 +1259,8 @@ export function ChatPage({
                   codeModePending={codeModePending}
                   onToggleCodeMode={handleToggleCodeMode}
                   showPanel={showPanel}
-                  onOpenPanel={() => setArtifactDrawerOpen(true)}
+                  panelOpen={panelOpen}
+                  onTogglePanel={setPanelOpen}
                   codeFocus={codeFocus}
                   onChangeCodeFocus={setCodeFocus}
                 />
@@ -1185,19 +1279,37 @@ export function ChatPage({
 
             ⚠️ `streaming` 用 `round?.status === 'streaming'`（**当前会话**的那一轮）：
             别的会话在跑时本列不该亮灯 —— 它列出的是**这个**会话的产物。 */}
-        {showPanel ? (
-          codeMode && conversationId !== undefined ? (
-            // Code 模式：第三列换成**工作区面板**（P1-9 · P3）—— 人机共享可编辑（§六 4）
-            <aside className="panel" aria-label="工作区面板">
-              <div
-                className={`ws-resizer${wsPanel.dragging ? ' is-active' : ''}`}
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="调整工作区面板宽度"
-                onPointerDown={wsPanel.onPointerDown}
-              />
-              <WorkspacePanel conversationId={conversationId} codeMode={codeMode} />
-            </aside>
+        {panelVisible ? (
+          codeMode ? (
+            conversationId !== undefined ? (
+              // Code 模式：第三列换成**工作区面板**（P1-9 · P3）—— 人机共享可编辑（§六 4）
+              <aside className="panel" aria-label="工作区面板">
+                <div
+                  className={`ws-resizer${wsPanel.dragging ? ' is-active' : ''}`}
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="调整工作区面板宽度"
+                  onPointerDown={wsPanel.onPointerDown}
+                />
+                <WorkspacePanel
+                  conversationId={conversationId}
+                  codeMode={codeMode}
+                  runtime={runtime}
+                  runtimePending={runtimePending}
+                  onSelectRuntime={handleSelectRuntime}
+                />
+              </aside>
+            ) : (
+              // 新会话态（会话还没建出来）：Code 模式已开、工作区还没创建 ⇒ 给**空工作区占位**，
+              // 不回落到产物面板（否则"开了 Code 模式"看起来没生效，且首条消息后会突变一列）。
+              <aside className="panel" aria-label="工作区面板">
+                <WorkspacePanelPlaceholder
+                  runtime={runtime}
+                  runtimePending={runtimePending}
+                  onSelectRuntime={handleSelectRuntime}
+                />
+              </aside>
+            )
           ) : (
             <ArtifactPanel
               items={artifactItems}
@@ -1224,32 +1336,6 @@ export function ChatPage({
         open={previewedArtifact !== null}
         onClose={closePreview}
       />
-
-      {/* 产物列表抽屉（窄屏入口 = 输入框下方控件条那枚 `.composer-control--narrow`，
-          仅**非 Code** 的 TaskAgent 会发出该入口；Code 模式工作区窄屏已常驻并排，不开抽屉
-          —— 故这里也只渲染产物面板）。
-          ⚠️ 与第三列共用同一个 `ArtifactPanel`：数据（`items` / `total` / 失败与重试 / 流式）
-          全在这一页算好，面板只是换一种摆法。AntD `Drawer` 默认**首次打开才挂载**子节点 ⇒
-          宽屏下不产生第二个 `useMinuteTick` 节拍器。 */}
-      {showPanel && !codeMode ? (
-        <Drawer
-          title="产物"
-          placement="right"
-          width={340}
-          open={artifactDrawerOpen}
-          onClose={() => setArtifactDrawerOpen(false)}
-        >
-          <ArtifactPanel
-            items={artifactItems}
-            total={artifactsQuery.data?.total}
-            listFailed={artifactsQuery.isError}
-            onRetry={() => {
-              void artifactsQuery.refetch()
-            }}
-            streaming={round?.status === 'streaming'}
-          />
-        </Drawer>
-      ) : null}
 
       {/* 撤回 / 修改重发最新一轮（产品优化 2026-09-29）。`conversationId ?? ''` 是类型兜底：
           弹窗只在 `recallTarget` 非空时发请求，而那时 `conversationId` 必然存在（见 `recallable` 的判据） */}

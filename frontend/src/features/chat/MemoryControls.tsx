@@ -16,7 +16,7 @@ import { Button, Tag, Tooltip } from 'antd'
 import { useEffect, useState } from 'react'
 import type { MemoryNotice } from '@doubulea/shared'
 
-import { fetchMemoryNotices, useMemoryNoticeAction } from '../../api/memory.js'
+import { fetchMemoryNotices, useDeleteMemory, useMemoryNoticeAction } from '../../api/memory.js'
 import { memoryKindLabel } from '../../pages/tasks/memoryModel.js'
 
 /**
@@ -24,7 +24,8 @@ import { memoryKindLabel } from '../../pages/tasks/memoryModel.js'
  *
  * 拉取时机：`conversationId` 变化时、窗口**重新聚焦**时、以及 `refreshKey` 变化时
  * （`refreshKey` 由对话页在**每一轮结束后**递增 ⇒ 兑现"toast 晚一拍"）。
- * ⚠️ 后端是**取出即消费**（取一次就清空），故不用 query 缓存，用本地 `useState` 管队列。
+ * ⚠️ 后端对 `AUTO` 取出即消费、`SUGGEST` **留到作答**（要读回它才能落库）⇒ 不用 query 缓存，
+ *    改用本地 `useState` 管队列，并**按 `id` 去重**（SUGGEST 会被重复返回）。
  */
 export function MemoryNoticeStack({
   conversationId,
@@ -36,6 +37,7 @@ export function MemoryNoticeStack({
 }) {
   const [notices, setNotices] = useState<MemoryNotice[]>([])
   const action = useMemoryNoticeAction(conversationId)
+  const removeMemory = useDeleteMemory()
 
   useEffect(() => {
     if (conversationId === undefined) {
@@ -46,9 +48,14 @@ export function MemoryNoticeStack({
     const pull = (): void => {
       void fetchMemoryNotices(conversationId)
         .then((result) => {
-          if (!cancelled && result.items.length > 0) {
-            setNotices((prev) => [...prev, ...result.items])
-          }
+          if (cancelled || result.items.length === 0) return
+          // ⚠️ **按 `id` 去重**：SUGGEST 提示服务端**不消费**（要留到用户作答），故每次拉取都会
+          //    再返回一次；不去重就会叠出多张同一张建议卡。
+          setNotices((prev) => {
+            const seen = new Set(prev.map((item) => item.id))
+            const fresh = result.items.filter((item) => !seen.has(item.id))
+            return fresh.length === 0 ? prev : [...prev, ...fresh]
+          })
         })
         .catch(() => {
           /* 提示读不到不影响对话 */
@@ -62,21 +69,40 @@ export function MemoryNoticeStack({
     }
   }, [conversationId, refreshKey])
 
-  function resolve(notice: MemoryNotice, act: 'ACCEPT' | 'REJECT'): void {
-    // 先本地移除（提示是一次性的，不等服务端）；失败也不回滚 —— 记忆面板里能看到真实结果
+  function drop(notice: MemoryNotice): void {
     setNotices((prev) => prev.filter((item) => item.id !== notice.id))
-    action.mutate({ noticeId: notice.id, action: act })
+  }
+
+  /** 记住（仅 SUGGEST）：让服务端按提示里的 `memoryKind`/`memoryScope` 落库 */
+  function accept(notice: MemoryNotice): void {
+    drop(notice)
+    action.mutate({ noticeId: notice.id, action: 'ACCEPT' })
   }
 
   /**
-   * 关掉一条提示（不改变记忆本身）：
-   *   · AUTO 提示的「撤销」是**撤回刚写入的那条记忆**，不是"关掉提示"——想留着记忆、只是收起这条
-   *     提示时，用户原来没有任何出路（提示会一直挂在消息流上方）。
-   *   · 偏好建议卡同理：关掉 = 这次不作答（等价"忽略"，不写入）。
-   * 提示本身是**取出即消费**（服务端取一次就清空）⇒ 本地移除即永久收起，不会自己再冒出来。
+   * 撤销 / 忽略：
+   *   · `AUTO` 的「撤销」= **撤回刚写入的那条记忆**（删记忆本身）。⚠️ `AUTO` 提示在拉取时已被
+   *     服务端消费（一次性 toast）⇒ 走不了"按提示作答"，必须**直接按 `notice.memoryId` 删**。
+   *   · `SUGGEST` 的「忽略」= 消费掉这条建议（**不写入**）。
+   */
+  function reject(notice: MemoryNotice): void {
+    drop(notice)
+    if (notice.kind === 'AUTO' && notice.memoryId !== null) {
+      removeMemory.mutate(notice.memoryId)
+      return
+    }
+    action.mutate({ noticeId: notice.id, action: 'REJECT' })
+  }
+
+  /**
+   * 关掉一条提示（纯关闭）：
+   *   · `SUGGEST` 队列里**还留着它**（服务端只对 AUTO"取出即消费"）⇒ 关闭必须**显式作答**
+   *     （等价"忽略"、不写入），否则下次拉取会把它再弹一次。
+   *   · `AUTO` 已被服务端消费 ⇒ 本地移除即永久收起，不动记忆。
    */
   function dismiss(notice: MemoryNotice): void {
-    setNotices((prev) => prev.filter((item) => item.id !== notice.id))
+    drop(notice)
+    if (notice.kind === 'SUGGEST') action.mutate({ noticeId: notice.id, action: 'REJECT' })
   }
 
   if (notices.length === 0) return null
@@ -115,15 +141,15 @@ export function MemoryNoticeStack({
               </span>
             </Tooltip>
             {notice.kind === 'AUTO' ? (
-              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => resolve(notice, 'REJECT')}>
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => reject(notice)}>
                 撤销
               </Button>
             ) : (
               <>
-                <Button type="primary" size="small" onClick={() => resolve(notice, 'ACCEPT')}>
+                <Button type="primary" size="small" onClick={() => accept(notice)}>
                   记住
                 </Button>
-                <Button size="small" onClick={() => resolve(notice, 'REJECT')}>
+                <Button size="small" onClick={() => reject(notice)}>
                   忽略
                 </Button>
               </>

@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url'
 
 import { z } from 'zod'
 
+import { SANDBOX_RUNTIME_REPO_DEFAULT } from './sandbox/runtimeImages.js'
+
 /** 本文件所在目录（源码期 `backend/src`；构建后 `backend/dist/backend/src`）—— 用于向上找工作区根 */
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 /** 工作区根标志文件（`06` §3.0：单仓 + pnpm workspace） */
@@ -66,6 +68,20 @@ export function findWorkspaceRoot(from: string = MODULE_DIR): string | undefined
     dir = parent
   }
   return undefined
+}
+
+/**
+ * 推断"按需构建运行时的上下文目录"默认值（`infra/sandbox/runtime`）。
+ *
+ * 口径：从本模块**向上找工作区根**，再拼 `infra/sandbox/runtime`；目录不存在（生产镜像里常常没有
+ * 这份仓库源码）⇒ `undefined`（= **按需构建不可用**，由 `GET /api/sandbox/runtimes` 的 `canBuild` 反映）。
+ * ⚠️ 用"向上找标志文件"而不是相对层数：源码期与产物期的 `MODULE_DIR` 深浅不同（同 `resolveEnvFile`）。
+ */
+export function defaultRuntimeBuildContext(from: string = MODULE_DIR): string | undefined {
+  const root = findWorkspaceRoot(from)
+  if (root === undefined) return undefined
+  const context = resolve(root, 'infra', 'sandbox', 'runtime')
+  return existsSync(resolve(context, 'Dockerfile')) ? context : undefined
 }
 
 /**
@@ -460,6 +476,21 @@ const envSchema = z
     SANDBOX_IMAGE: optionalText,
     /** base 层镜像（Node + pin 版 pi + 桥扩展）；toolkit 层 `FROM` 它 */
     SANDBOX_IMAGE_BASE: optionalText,
+    /**
+     * **运行时镜像仓库名前缀**（P1-17a）：后端据此扫本机镜像，得到"有哪些运行时"。
+     * 镜像 tag 约定 `<repo>:<id>-v<层版本>`；默认与 `infra/sandbox/versions.mjs#RUNTIME_IMAGE_NAME` 同值。
+     */
+    SANDBOX_RUNTIME_REPO: defaultedVar(z.string().trim().min(1).max(200), SANDBOX_RUNTIME_REPO_DEFAULT),
+    /**
+     * **按需构建运行时的上下文目录**（P1-17a · 定案 B）：指向 `infra/sandbox/runtime`（含
+     * `Dockerfile` + `install-python-version.sh` + `selfcheck.sh`）。用户选了本机没有的组合时，
+     * 后端在这个目录上跑 `docker build`。
+     * 不配 ⇒ 自动从本模块位置推断（dev 下指向仓库里的那个目录）；推断不出 ⇒ **按需构建不可用**
+     * （`GET /api/sandbox/runtimes` 的 `canBuild=false`，前端只让选已就绪的）。
+     */
+    SANDBOX_RUNTIME_BUILD_CONTEXT: optionalText,
+    /** `docker` 可执行文件（按需构建用它；默认 `docker`，走 PATH）。 */
+    SANDBOX_DOCKER_BIN: defaultedVar(z.string().trim().min(1).max(200), 'docker'),
     /** 单容器内存上限（MB）。**主限额** —— 10 并发的真实瓶颈是内存，不是核（§二） */
     SANDBOX_MEM_LIMIT_MB: intVar('SANDBOX_MEM_LIMIT_MB', 2048, { min: 128, max: 65_536 }),
     /** 单容器 CPU 上限（核）。为辅：只防单容器跑飞拖垮宿主 ⇒ 可以是 1.5 这样的小数 */
@@ -927,6 +958,15 @@ export interface AppConfig {
     image: string | undefined
     /** base 层镜像（toolkit 的 `FROM`） */
     imageBase: string | undefined
+    /**
+     * 运行时镜像仓库名前缀（P1-17a）：后端扫本机 `doubulea/sandbox-runtime:*` 得到可选运行时。
+     * `manager.ts#ensureSandbox` 按会话的 `runtime`（id）在探测结果里找；找不到回退 `image`。
+     */
+    runtimeRepo: string
+    /** 按需构建运行时的上下文目录（`infra/sandbox/runtime`）；`undefined` = 不可按需构建 */
+    runtimeBuildContext: string | undefined
+    /** `docker` 可执行文件（按需构建用） */
+    dockerBin: string
     /** 沙箱代理 listener 端口（内网） */
     callbackPort: number
     /** per-container token 长度（字符） */
@@ -1284,6 +1324,9 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       idleTtlMin: vars.SANDBOX_IDLE_TTL_MIN,
       image: vars.SANDBOX_IMAGE,
       imageBase: vars.SANDBOX_IMAGE_BASE,
+      runtimeRepo: vars.SANDBOX_RUNTIME_REPO,
+      runtimeBuildContext: vars.SANDBOX_RUNTIME_BUILD_CONTEXT ?? defaultRuntimeBuildContext(),
+      dockerBin: vars.SANDBOX_DOCKER_BIN,
       callbackPort: vars.SANDBOX_CALLBACK_PORT,
       tokenLen: vars.SANDBOX_TOKEN_LEN,
       proxyTimeoutSec: vars.SANDBOX_PROXY_TIMEOUT_SEC,
@@ -1429,6 +1472,10 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
       idleTtlMin: value.sandbox.idleTtlMin,
       image: value.sandbox.image ?? null,
       imageBase: value.sandbox.imageBase ?? null,
+      // 运行时镜像仓库名前缀（P1-17a）：不含凭据、原样打印
+      runtimeRepo: value.sandbox.runtimeRepo,
+      runtimeBuildContext: value.sandbox.runtimeBuildContext ?? null,
+      dockerBin: value.sandbox.dockerBin,
       // egress 代理是**地址**，不脱敏（不含凭据）；未配置就如实报 null（P0-3-3 定案前它本来可以空着）
       egressProxyUrl: value.sandbox.egressProxyUrl ?? null,
       // 出网白名单是**策略**不是凭据，原样打印（运维要靠它看"这台到底放行了什么"）

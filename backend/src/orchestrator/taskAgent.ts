@@ -144,6 +144,7 @@ import {
   type EngineMcpToolCard,
   type EngineUsage,
 } from '../sandbox/map.js'
+import { enterRunPhase, executionCommandOf, isExecutionCommand } from '../sandbox/credentialPhase.js'
 import {
   KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB,
   KNOWLEDGE_TOOL_SERVER_NAME,
@@ -159,6 +160,7 @@ import { boundKnowledgeBaseIds, loadKnowledgeCatalog } from './knowledgeTools.js
 import { runMemoryExtraction } from './memoryExtract.js'
 import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
+import { attachToolTextOffsets, createToolTextOffsetTracker } from './toolTextOffset.js'
 import { getMemorySettings } from '../services/memory.service.js'
 import {
   recordWorkspaceRoundEnd,
@@ -225,6 +227,12 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     /** 认识、但载荷用不了（缺必填字段）的次数 —— 每一条都当场 warn，见下面的处理 */
     anomalies: 0,
   }
+
+  /**
+   * 工具卡的**正文偏移**追踪（`textOffset`）—— 卡片插在"它出现时正文写到哪"的位置。
+   * 与 ChatBot **同一份实现**（`toolTextOffset.ts`）；`getTextLength` 读本轮的正文累积。
+   */
+  const toolTextOffsets = createToolTextOffsetTracker(() => round.assistantText.length)
 
   /**
    * 把"当前 turn"的用量并进总数（判据 ③ 的后半句）。
@@ -389,12 +397,22 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       //   容器重建 / 复用都能拿到最新的。⚠️ **必须排在拍基线之前**：记忆文件每次都会变，
       //   写在基线之前它才落在基线里、不会被当成本轮新产物（另有一道隐藏目录兜底，见 memoryDoc.ts）。
       //   ⚠️ 失败只 warn 不落轮：记忆是本轮的赠品，写不进去 agent 照样能干活。
+      //
+      //   ★ P1-17a 修订（2026-10-14）：**只在容器新建那一轮**才让引擎读它。
+      //     判据 = `handle.reused`：复用同一容器时 pi 的 session（`/tmp/pi-sessions`，tmpfs）
+      //     仍活着、自己持有完整会话状态（工具调用 / thinking / compaction 摘要）⇒ 每轮再读
+      //     memory.md 是冗余的（白烧一次 read 的 token、也让 agent 每轮多一个多余动作）。
+      //     容器新建（`reused === false`）时 session 已随之消失 ⇒ 这一轮才是真需要"先读记忆"
+      //     以恢复"聊过什么、产出过哪些文件、附件怎么取回"的时刻。
+      //     ⚠️ 文件**照样每轮写**（内容随对话/产物变化，且是 session 卷缺失/损坏时的兜底），
+      //        只是**读取指令**的触发时机收窄到"新建容器那一轮"。
+      //     ⚠️ `hasContent === false`（全新会话第一轮）时仍不加（那句话只会是"读一个空文件"）。
       try {
         const memory = await buildMemoryDoc(conversationId)
         await writeMemoryDoc(handle.containerId, memory.markdown)
-        // 写入成功且确有内容 ⇒ 让引擎先读它（否则那句指令只是一句"读一个空文件"）。
+        // 写入成功 + 确有内容 + **本容器是新起的** ⇒ 让引擎先读它。
         // ⚠️ 只改发给引擎的那份；落库仍是 `content` 原文（见 engineContent 的注释）。
-        if (memory.hasContent) {
+        if (memory.hasContent && !handle.reused) {
           engineContent = `${memoryDocReadInstruction()}\n\n${content}`
         }
       } catch (error) {
@@ -508,9 +526,13 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       const mapper = createEngineEventMapper({ resolveMcpTool, resolveBuiltinTool })
       unsubscribe = bridge.onEvent((event) => {
         const mapped = mapper.map(event)
+        // ── 工具卡**内联定位**：给 `tool_call` 帧（进 SSE 流）与 `toolRecord`（进库）各补一份
+        //   `textOffset`。同一 `callId` 的 start/end 两帧共用同一偏移（追踪器记忆）⇒ 卡片流转不跳位置；
+        //   落库那份也带 ⇒ 刷新后历史里的卡片仍插在正文对应处。与 ChatBot 共用 `toolTextOffset.ts`。
+        const { events, toolRecord } = attachToolTextOffsets(mapped.events, mapped.toolRecord, toolTextOffsets)
 
         // ── 同步那一半：把"这一轮发生过什么"记下来 ──
-        for (const frame of mapped.events) {
+        for (const frame of events) {
           if (frame.name === 'delta') {
             round.assistantText += frame.data.text
             round.deltaCount += 1
@@ -544,7 +566,18 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         }
         // 同一 turn 内覆盖（`null` 表示这一帧没带，**不该盖掉**已有值）；跨 turn 靠上面那次归位
         if (mapped.usage !== null) round.currentTurnUsage = mapped.usage
-        if (mapped.toolRecord !== undefined) round.toolRecords.push(mapped.toolRecord)
+        if (toolRecord !== undefined) {
+          round.toolRecords.push(toolRecord)
+          // ★ P1-17c（凭据隔离 · 分相）：`bash` 工具一跑"装依赖 / 跑项目"命令，就把这个会话钉进
+          //   `run` 相 ⇒ 之后的 git 凭据请求被后端拒绝（`gitProxy.ts` 消费）。异步、尽力而为，
+          //   不阻塞本轮回调（写失败只 warn，下次命令还会再试）。
+          if (toolRecord.toolName === 'bash') {
+            const command = executionCommandOf('bash', toolRecord.arguments)
+            if (command !== undefined && isExecutionCommand(command)) {
+              void enterRunPhase(conversationId)
+            }
+          }
+        }
 
         // ── 可解释性：未知事件只留痕；"认识但载荷坏了"当场 warn ──
         if (!mapped.known) round.unknownEventTypes.add(event.type)
@@ -557,7 +590,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         }
 
         // ── 异步那一半：排队发出去（判据 ②）──
-        enqueue(mapped.events, mapped.snapshot)
+        enqueue(events, mapped.snapshot)
       })
 
       // ═════════════════════════════════════════════════════════════

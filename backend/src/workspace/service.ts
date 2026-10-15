@@ -46,6 +46,7 @@ import { resolveWorkspacePath, workspaceDirOf } from './paths.js'
 import { readWorkspaceRoundWindow } from './round.js'
 import { ensureWorkspaceOwner } from '../sandbox/owner.js'
 import { decideWorkspaceQuota } from './quotaModel.js'
+import { isWorkspaceDependencyPath } from './dependencyModel.js'
 import {
   ensureWorkspaceDir,
   moveWorkspaceFile as fsMove,
@@ -415,27 +416,37 @@ async function applyRevertEntry(
 }
 
 /**
- * 写文件（`PUT .../workspace/file?path=`）—— **CAS 是核心**。
+ * 写入字节（文本写 / 上传两条入口共用的核心）—— **CAS 是核心**。
  *
  * @param baseVersion 写前读到的版本；`0` = 认为文件不存在（新建）
+ * @param options.allowBinary `true` 时跳过二进制类型闸门（**仅显式上传**走这条）：
+ *   上传是用户对"把这个字节放进来"的明确意图，二进制照样可以落地（读取侧本就只读预览 / 下载）；
+ *   而文本编辑器的保存（`writeWorkspaceFile`）仍按 P6 · R6 拒收二进制，避免一屏乱码被写回。
  * @throws AppError(CONFLICT) `baseVersion` 与当前版本不符（并发写冲突）
- * @throws AppError(VALIDATION) 路径非法 / 超配额 / 内容为二进制（P6 · R6 类型闸门；`data.violation`）
+ * @throws AppError(VALIDATION) 路径非法 / 超配额 / （文本入口）内容为二进制；`data.violation`
  */
-export async function writeWorkspaceFile(
+async function writeWorkspaceFileBytes(
   conversationId: string,
   rawPath: unknown,
-  content: string,
+  data: Buffer,
   baseVersion: number,
   author: WorkspaceWriteActor,
+  options: { allowBinary?: boolean; overwrite?: boolean } = {},
 ): Promise<WorkspaceFileEntry> {
   const handle = await ensureWorkspace(conversationId)
   const { relative, absolute } = resolveWorkspacePath(handle.rootPath, rawPath)
-  const data = Buffer.from(content, 'utf8')
+
+  // ★ P1-17b：依赖目录是**环境不是内容** ⇒ 中介写（编辑器 / agent 的 write）不许落进去。
+  //   与"索引不列依赖目录"同一条判据（`dependencyModel`，名单一处定义）；拒绝而不是静默落盘，
+  //   否则会出现"盘上有、文件树里没有"的第三态（最难解释）。
+  assertNotDependencyPath(relative)
 
   const existing = await findRow(conversationId, relative)
   // 墓碑行按"已删除"处理：它的 version 照样参与 CAS（写回需带该版本，与 `delete` 的语义对齐）
   const currentVersion = existing === null ? 0 : existing.version
-  if (baseVersion !== currentVersion) {
+  // `overwrite`（上传）不做 CAS：目标已存在就直接覆盖（文件管理器"上传"的常见语义）；
+  // 文本保存（默认）仍严格 CAS，冲突即 409。
+  if (options.overwrite !== true && baseVersion !== currentVersion) {
     throw AppError.conflict('文件已被修改，请重新读取后再写', {
       path: relative,
       currentVersion,
@@ -448,7 +459,7 @@ export async function writeWorkspaceFile(
   await assertWithinQuota(conversationId, data.byteLength, {
     isNewFile: existing === null || existing.deletedAt !== null,
     createsRow: existing === null,
-    binary: workspaceContentIsBinary(data),
+    binary: options.allowBinary === true ? false : workspaceContentIsBinary(data),
   })
 
   const hash = sha256(data)
@@ -512,6 +523,33 @@ export async function writeWorkspaceFile(
   publishWorkspaceEventItem(conversationId, event)
 
   return { path: relative, size: data.byteLength, mime, version: nextVersion, updatedBy: author.actor, updatedAt: now.toISOString() }
+}
+
+/** 写文件（`PUT .../workspace/file?path=`）—— **文本入口**，等价于"字节核心 + UTF-8 编码"，拒收二进制 */
+export async function writeWorkspaceFile(
+  conversationId: string,
+  rawPath: unknown,
+  content: string,
+  baseVersion: number,
+  author: WorkspaceWriteActor,
+): Promise<WorkspaceFileEntry> {
+  return writeWorkspaceFileBytes(conversationId, rawPath, Buffer.from(content, 'utf8'), baseVersion, author)
+}
+
+/**
+ * 上传落盘（`POST .../workspace/upload`）。
+ *
+ * 与 {@link writeWorkspaceFile} 的差别：**允许二进制**（`allowBinary`）+ **覆盖语义**（`overwrite`，
+ * 目标已存在直接覆盖，不走 CAS）—— 上传是"把这个字节放到这个路径"的显式意图，与文本保存的
+ * 并发保护不同。配额（单文件 / 文件数 / 总字节）照旧判定。
+ */
+export async function uploadWorkspaceFile(
+  conversationId: string,
+  rawPath: unknown,
+  data: Buffer,
+  author: WorkspaceWriteActor,
+): Promise<WorkspaceFileEntry> {
+  return writeWorkspaceFileBytes(conversationId, rawPath, data, 0, author, { allowBinary: true, overwrite: true })
 }
 
 /** 新建文件（`POST .../workspace/file`）—— 等价于"`baseVersion=0` 的写"，已存在即 409 */
@@ -580,6 +618,8 @@ export async function moveWorkspaceFile(
   if (from.relative === to.relative) {
     throw AppError.validation('源路径与目标路径相同')
   }
+  // P1-17b：依赖目录是环境不是内容 ⇒ 不许移动进依赖目录（同写闸门一条判据）
+  assertNotDependencyPath(to.relative)
 
   const sourceRow = await findLiveRow(conversationId, from.relative)
   if (sourceRow === null) throw AppError.notFound('源文件不存在')
@@ -792,6 +832,21 @@ async function findRow(conversationId: string, path: string): Promise<FileRow | 
 async function findLiveRow(conversationId: string, path: string): Promise<FileRow | null> {
   const row = await findRow(conversationId, path)
   return row === null || row.deletedAt !== null ? null : row
+}
+
+/**
+ * 依赖目录写闸门（P1-17b）：中介写**不许落进依赖目录**（`node_modules` / `venv` / `target` …）。
+ *
+ * 判据本体在 `dependencyModel#isWorkspaceDependencyPath`（与"索引不列依赖目录""不进产物"同一份名单）。
+ * 依赖目录由**运行期安装**（`npm ci` / `pip install`，经 bash 直接落盘、被 watcher 有意跳过）产生 ——
+ * 它不是"内容"，所以编辑器 / agent 的 `write` 进不去；要改依赖就重装，不要手改。
+ */
+function assertNotDependencyPath(relative: string): void {
+  if (!isWorkspaceDependencyPath(relative)) return
+  throw AppError.validation(
+    `依赖目录不接受写入（${relative}）：依赖由运行期安装（npm/pip 等）产生，不属于工作区内容。` +
+      '如果确实要改依赖，请改依赖清单后重装。',
+  )
 }
 
 /**

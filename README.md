@@ -167,6 +167,35 @@ docker run --rm -i -v doubulea-sandbox-smoke:/work doubulea/sandbox-toolkit:5 --
 > ⚠️ **为什么 toolkit 必须构建期预烘焙**：egress 白名单只放行模型池 ⇒ 容器内 `pip install pandas` /
 > `npm i` **必然失败**，而阶段三的验收场景「分析这份 CSV 出汇总表」恰恰要 pandas（`子方案③` §五 2）。
 > 新增依赖 = 重建 toolkit 层 + 改 `versions.mjs` 里的层版本号，**不是运行时补**。
+>
+> ⚠️ **P1-17b 起口径更新**：运行时（语言栈）预烘焙、**依赖运行期经注册表出网拉**（§五之二）。
+> 依赖目录（`node_modules` / `venv` / `target` / `dist` …）**不进产物 / 冷备 / 源码配额**。
+
+**运行时层（P1-17a）—— 一变体一份镜像，按会话的 `runtime` 选**
+
+```bash
+# 构建 base → toolkit → 运行时层（默认 none/node/python/go/java/rust/multi + 版本化变体），
+# 末尾打印要写进 infra/.env 的几行（SANDBOX_IMAGE_BASE / SANDBOX_IMAGE / SANDBOX_RUNTIME_REPO）
+pnpm sandbox:build
+# 只重建某几个变体（`--runtime` 可多选：逗号分隔或重复给；不给则全建）
+pnpm sandbox:build -- --toolkit-only --runtime node22,python311
+# 造版本化 / 组合变体（变体 id = 组件按语言顺序用 '-' 连接）
+pnpm sandbox:build -- --toolkit-only --runtime python310,node22-python38
+```
+
+- **运行时列表来自后端探测**：后端扫本机镜像（`SANDBOX_RUNTIME_REPO` 前缀 + tag 约定 `<repo>:<变体>-v<层版本>`）得到"已就绪的运行时"，前端据它渲染；`SANDBOX_IMAGE` 是**回退镜像**（toolkit）。
+- **按需构建（不用运维预先猜组合）**：用户要的组合本机没有时，在工作区头部点「**+**」勾选语言/版本 ⇒ 调 `POST /api/sandbox/runtimes/build` ⇒ **后端自动 `docker build`**（串行 + 同 tag 去重），成功后自动选用。组合即镜像 tag ⇒ 第二次命中缓存。后端能否构建取决于 `SANDBOX_RUNTIME_BUILD_CONTEXT`（dev 自动推断 `infra/sandbox/runtime`；生产镜像里通常没有 ⇒ `canBuild=false`）。
+- **运行时 = 组件（语言+版本）的组合**：变体 id = 组件按语言顺序排序后用 `-` 连接（如 `node22-python310`）。组件目录在 `shared/src/runtime.ts`（与 `infra/sandbox/versions.mjs` **两处一致**）；加组件/版本要同时改这两处。
+- **多栈并存 / 版本化**：例如「Python 3.10 + Node 22」= 组件 `python310 + node22`（多版本 python 由 `runtime/install-python-version.sh` 在**构建期**用 uv 装，系统 `python3` 仍是 3.11；各版本按 `python3.10`/`python3.8` 并存）。
+- 只装运行时、**不装依赖**；依赖运行期在容器里经注册表出网拉，且**不进产物/冷备/源码配额**。
+
+**人工端测（P1-17 · 运行时 + 依赖 + 凭据分相）**：
+1. `pnpm sandbox:build`（本机需换源：见上 `--registry` / `--apt-mirror`）→ 把打印的几行写进 `infra/.env`（含 `SANDBOX_RUNTIME_REPO`）；
+2. `pnpm dev` 起来后开一个 Code 会话，在工作区面板头部选运行时（下拉即后端探测到的列表），发一条「建一个最小 node 项目并跑 `npm test`」；
+3. 预期：容器里 `npm ci` 成功（依赖经出网拉）、测试通过；工作区文件树里**看不到** `node_modules`（它不进索引/产物/冷备、不顶爆源码配额）；
+4. 同一会话里再让 agent `git clone` 一个私有仓库 ⇒ 因已跑过 `npm`（进入 `run` 相），凭据请求被拒（后端日志 `CREDENTIAL_ISOLATED`）：这是**分相**的兑现，新开一个没跑过代码的会话仍能 clone。
+5. ⚠️ 真跑取证由你完成（构建镜像 + 选运行时 + 真 clone）；本条只声明契约与配置已接好。
+
 
 **构建提速与清理（P0-3-14 起）**：
 

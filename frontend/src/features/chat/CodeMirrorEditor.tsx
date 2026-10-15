@@ -18,7 +18,7 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { bracketMatching, defaultHighlightStyle, indentOnInput, syntaxHighlighting } from '@codemirror/language'
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
-import { Compartment, EditorState, type Extension } from '@codemirror/state'
+import { Compartment, EditorState, Transaction, type Extension } from '@codemirror/state'
 import {
   EditorView,
   drawSelection,
@@ -71,6 +71,14 @@ const editorTheme = EditorView.theme({
 export function CodeMirrorEditor(props: {
   value: string
   language: WorkspaceEditorLanguage
+  /**
+   * 当前文档的**身份**（工作区里就是文件路径）。
+   *
+   * ⚠️ 唯一用途：切换文档时**清空撤销历史**。外部替换（切文件 / 重新加载 / SSE 回填）走的是
+   * `dispatch({changes})`，若不禁用历史，撤销栈会**跨文件**累积 —— 实测切到 B 后按 ⌘Z 会退回
+   * A 的整篇内容（轻则内存被 N 份整篇文档撑大，重则把 A 的内容当 B 保存）。
+   */
+  docKey?: string
   readOnly?: boolean
   onChange: (value: string) => void
   /** ⌘S / Ctrl+S（`子方案` §十"保存 / ⌘S"）；不给则不拦截默认快捷键 */
@@ -80,6 +88,10 @@ export function CodeMirrorEditor(props: {
   const viewRef = useRef<EditorView | null>(null)
   const languageCompartment = useRef(new Compartment())
   const readOnlyCompartment = useRef(new Compartment())
+  /** 撤销历史的 compartment：切文档时重配一次即可**清空**（见文件头） */
+  const historyCompartment = useRef(new Compartment())
+  /** 外部替换文档期间置位：抑制 `updateListener` 把这次替换当成"用户编辑"回吐给 `onChange` */
+  const suppressChangeRef = useRef(false)
 
   // 回调经 ref 转交：`EditorView` 建成后不再重建，闭包必须永远读到**最新**的 props
   const onChangeRef = useRef(props.onChange)
@@ -101,7 +113,7 @@ export function CodeMirrorEditor(props: {
           lineNumbers(),
           highlightActiveLineGutter(),
           highlightActiveLine(),
-          history(),
+          historyCompartment.current.of(history()),
           drawSelection(),
           dropCursor(),
           indentOnInput(),
@@ -128,7 +140,7 @@ export function CodeMirrorEditor(props: {
             },
           ]),
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) onChangeRef.current(update.state.doc.toString())
+            if (update.docChanged && !suppressChangeRef.current) onChangeRef.current(update.state.doc.toString())
           }),
         ],
       }),
@@ -142,13 +154,25 @@ export function CodeMirrorEditor(props: {
   }, [])
 
   // ── 外部 value 变化（切文件 / 重载 / 撤销后回填）⇒ 整篇替换（相同则不动，避免丢光标）──
+  //   ⚠️ `addToHistory: false`：外部替换**不进撤销栈**（否则撤销栈跨文件累积，⌘Z 会退回别的文件）
+  //   ⚠️ 期间抑制 `onChange`：这次替换不是"用户编辑"，别回吐给调用方（会白标 dirty / 白写草稿）
   useEffect(() => {
     const view = viewRef.current
     if (view === null) return
     const current = view.state.doc.toString()
     if (current === props.value) return
-    view.dispatch({ changes: { from: 0, to: current.length, insert: props.value } })
+    suppressChangeRef.current = true
+    view.dispatch({
+      changes: { from: 0, to: current.length, insert: props.value },
+      annotations: Transaction.addToHistory.of(false),
+    })
+    suppressChangeRef.current = false
   }, [props.value])
+
+  // ── 切文档（`docKey` 变化）⇒ 清空撤销历史（重配 history compartment 即重置其 state field）──
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: historyCompartment.current.reconfigure(history()) })
+  }, [props.docKey])
 
   // ── 语言热切换（compartment，不重建视图）──
   useEffect(() => {

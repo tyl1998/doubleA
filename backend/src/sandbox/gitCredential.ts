@@ -1,34 +1,36 @@
 /**
- * git 凭据 → 容器注入物（**纯函数**；P1-9 · R11）
+ * git 凭据 → 容器侧的**按需拉取**契约（**纯函数**；P1-9 · R11 修订）
  *
- * 依据：`docs/子方案/Code模式工作区.md` §五 7.4（两种凭据的接法）+ §7.2（AAD）+ §7.3（注入时机）。
+ * 依据：`docs/子方案/Code模式工作区.md` §五 7.4 / §7.5（出网与凭据口径）。
  *
- * ─────────────────────────────────────────────────────────────────────
- * 本文件的分工：只把"解密后的凭据"翻译成**两种注入物**，一个 IO 都不做
- * ─────────────────────────────────────────────────────────────────────
- *   · {@link gitCredentialEnv} —— 容器**环境变量**（建容器时定死，`docker create` 的 `Env`）；
- *   · {@link gitCredentialFiles} —— 落 tmpfs `$HOME` 的**文件**（容器起来后 `putArchive`）。
+ * ═══════════════════════════════════════════════════════════════════════
+ * ★ 为什么改成"按需拉取"（R11 原设计的两条死路）
+ * ═══════════════════════════════════════════════════════════════════════
+ * 原设计是**建容器时一次性注入**：HTTPS token 进 env、SSH 私钥 `putArchive` 落到 tmpfs `$HOME`。
+ * 两条都断了：
+ *   ① **SSH 私钥注不进去** —— 容器 `ReadonlyRootfs: true`，Docker 的归档 API（`putArchive` / `docker cp`）
+ *      在只读 rootfs 容器上**直接 400 拒绝**（即便是 tmpfs 目标）⇒ `$HOME/.ssh` 从来是空的，
+ *      而容器 env 里的 `GIT_SSH_COMMAND -i …/id_ed25519` 指向一个不存在的私钥。
+ *   ② **token 只能建容器那一刻定死** —— 改凭据必须重建容器；且明文一直躺在容器 env 里。
+ * 现在的口径：**凭据不进容器**（既不落盘也不进 env）。容器里只有两个**无状态的** helper 脚本
+ * （`/opt/sandbox-git/*.mjs`，由 toolkit 镜像预烘焙），`git` 需要认证时**回调平台**取短期凭据
+ * （经出口②的 `SANDBOX_BACKEND_URL` + `SANDBOX_TOKEN`，与 MCP / 工作区代理同一个通道）。
+ * 好处：RO rootfs 不再是问题（helper 把 SSH 私钥写到**可写的 `/tmp`**）；改凭据**不用重建容器**；
+ * 平台只在真正用到的时刻解密、且只回给这一只容器。
  *
- * IO（解密、`putArchive`）在 `services/gitCredential.service.ts` 与 `sandbox/manager.ts`。
- * 这样"两种凭据各注什么"这条判据可以在不连库、不连 Docker 的情况下逐条自证。
+ * ═══════════════════════════════════════════════════════════════════════
+ * 本文件的分工：只把"解密后的凭据"翻译成 helper 要回的**两种形状**，一个 IO 都不做
+ * ═══════════════════════════════════════════════════════════════════════
+ *   · {@link gitCredentialHelperEnv} —— 一份**不含任何秘密**的容器 env（把 git 指向两个 helper）；
+ *   · {@link selectGitCredential} —— 按 `(protocol, host)` 从解密后的凭据里挑一条，转成回包。
  *
- * ─────────────────────────────────────────────────────────────────────
- * 三条口径（对错都不报错，只是行为不对，故写在这里）
- * ─────────────────────────────────────────────────────────────────────
- * ① **HTTPS_TOKEN 不落盘**（§7.4：最干净）：token 只在 env（`GIT_CONFIG_*` 的 `http.*.extraheader`），
- *    与 `sandboxLlmEnv` 的明文 Key 同款 —— 容器回收即消失，不进 `/work`（否则进冷备 / 产物）。
- * ② **SSH_KEY 落 tmpfs `$HOME/.ssh`**（`/home/agent` 是 tmpfs，见 `spec.ts`）：`id_*` 0600、
- *    `known_hosts` 0644、属主 `SANDBOX_AGENT_UID`（否则以非 root agent 跑起来的容器读不到自己的私钥）。
- * ③ **多条按 host 匹配**（§7.4）：HTTPS 靠 `http.https://<host>/.extraheader` 由 git 按 URL 自选；
- *    SSH 把所有 `-i` 都给 `GIT_SSH_COMMAND`（ssh 依次尝试）。没有 SSH 凭据时**不加** `GIT_SSH_COMMAND`，
- *    退回系统默认（行为不变）。
+ * IO（解密、HTTP 端点）分别在 `services/gitCredential.service.ts` 与 `sandbox/gitProxy.ts`。
+ * 这样"挑哪条凭据 / 回什么形状"能在不连库、不连 Docker 的情况下逐条自证。
  */
 
 import type { GitCredentialKind, GitCredentialSecretInput } from '@doubulea/shared'
 
-import { SANDBOX_AGENT_HOME, SANDBOX_AGENT_UID } from './spec.js'
-
-/** 一条**解密后**的凭据（明文只在本进程内存与注入物里出现，见 `service` 的文件头） */
+/** 一条**解密后**的凭据（明文只在本进程内存里出现；唯一出口是 `decryptUserGitCredentials`） */
 export interface GitCredentialPlain {
   kind: GitCredentialKind
   /** 限定用途主机；`null` = 不限 */
@@ -44,104 +46,96 @@ export function gitCredentialAad(userId: string, kind: GitCredentialKind, label:
   return `${userId}:${kind}:${label}`
 }
 
-/** SSH 私钥在 `$HOME/.ssh` 下的文件名（第一条 = `id_ed25519`，其余加序号后缀） */
-function sshKeyFileName(index: number): string {
-  return index === 0 ? 'id_ed25519' : `id_ed25519_${index + 1}`
+// ───────────────────────── 容器侧 helper（跨边界契约）─────────────────────────
+
+/**
+ * 容器内 **git credential helper** 的绝对路径（toolkit 镜像预烘焙，`#!/usr/bin/env node`）。
+ *
+ * ⚠️ **跨边界契约**：容器脚本 `infra/sandbox/toolkit/git-credential-doubulea.mjs` 是这个路径的实体；
+ *    改路径就要同步改镜像（并 +1 `TOOLKIT_LAYER_VERSION`）。与 `SANDBOX_TOKEN_ENV` 同族。
+ */
+export const GIT_CREDENTIAL_HELPER_PATH = '/opt/sandbox-git/git-credential-doubulea.mjs'
+
+/** 容器内 **SSH 包装器** 的绝对路径（`GIT_SSH_COMMAND` 指向它；按需取私钥到 `/tmp` 再 exec ssh） */
+export const GIT_SSH_HELPER_PATH = '/opt/sandbox-git/git-ssh-doubulea.mjs'
+
+/**
+ * git 凭据 helper 的**容器环境变量**（**纯函数**；⚠️ 不含任何秘密）。
+ *
+ *   · `GIT_TERMINAL_PROMPT=0`：容器里没人应答交互式提问，不关掉会让 `git clone` 挂死；
+ *   · `credential.helper` 先置空（`GIT_CONFIG_VALUE_0=''` 清掉继承来的 helper 列表）再指向我们的
+ *     helper —— 否则镜像/系统里若有别的 helper 会先跑、并且可能弹提示；
+ *   · `GIT_SSH_COMMAND` 指向 SSH 包装器（无 SSH 凭据时它原样 exec `ssh`，行为不变）。
+ *
+ * ⚠️ 这一份 env **每次建容器都原样注入**（与"该用户有没有配凭据"无关）：凭据是**运行期**由 helper
+ *    回调取回的 ⇒ 用户后来新配/改了凭据，**不用重建容器**就能生效（这正是"按需拉取"的收益）。
+ */
+export function gitCredentialHelperEnv(): Record<string, string> {
+  return {
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+    GIT_CONFIG_KEY_1: 'credential.helper',
+    GIT_CONFIG_VALUE_1: GIT_CREDENTIAL_HELPER_PATH,
+    GIT_SSH_COMMAND: GIT_SSH_HELPER_PATH,
+  }
 }
 
-/** 容器内 `$HOME/.ssh/...` 的绝对路径（`GIT_SSH_COMMAND` 里用它） */
-function sshPath(name: string): string {
-  return `${SANDBOX_AGENT_HOME}/.ssh/${name}`
-}
+// ───────────────────────── 挑选凭据（纯判据）─────────────────────────
 
 /** 缺省登录名（PAT 通常配 `x-access-token`；GitLab 可用 `oauth2`，故允许覆盖） */
 const DEFAULT_TOKEN_USERNAME = 'x-access-token'
 
-/**
- * 凭据 → 容器环境变量（**纯函数**）。
- *
- * ⚠️ 返回值里含 **HTTPS token 的 base64**（`Authorization: Basic`）⇒ 与 `sandboxLlmEnv` /
- * `sandboxProxyEnv` 同一条纪律：只许交给 `buildSandboxContainerSpec`，**不许打日志、不许落库**。
- * （SSH 私钥走 {@link gitCredentialFiles}，不在这里。）
- */
-export function gitCredentialEnv(creds: readonly GitCredentialPlain[]): Record<string, string> {
-  const env: Record<string, string> = {}
-  const ssh = creds.filter((cred) => cred.kind === 'SSH_KEY')
-  const https = creds.filter((cred) => cred.kind === 'HTTPS_TOKEN' && (cred.secret.token ?? '') !== '')
-
-  if (ssh.length > 0 || https.length > 0) {
-    // 交互式提问会让 `git clone` 在一个无人应答的容器里挂死 ⇒ 一律关掉
-    env.GIT_TERMINAL_PROMPT = '0'
-  }
-
-  if (ssh.length > 0) {
-    const identities = ssh.map((_, index) => `-i ${sshPath(sshKeyFileName(index))}`).join(' ')
-    // `accept-new` 而非 `no`：首次可连、之后锁定（避免中间人）；严格 pin 时用落盘的 known_hosts
-    env.GIT_SSH_COMMAND =
-      `ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new ${identities}`
-  }
-
-  if (https.length > 0) {
-    // git 的 `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`：不落盘的临时配置
-    env.GIT_CONFIG_COUNT = String(https.length)
-    https.forEach((cred, index) => {
-      const username = (cred.secret.username ?? '') === '' ? DEFAULT_TOKEN_USERNAME : (cred.secret.username as string)
-      const basic = Buffer.from(`${username}:${cred.secret.token ?? ''}`, 'utf8').toString('base64')
-      const host = cred.host ?? ''
-      env[`GIT_CONFIG_KEY_${index}`] = host === '' ? 'http.extraheader' : `http.https://${host}/.extraheader`
-      env[`GIT_CONFIG_VALUE_${index}`] = `Authorization: Basic ${basic}`
-    })
-  }
-
-  return env
-}
-
-/** 一个待写入 tmpfs `$HOME` 的文件（`name` 相对 `$HOME`） */
-export interface GitCredentialFile {
-  /** 相对 `$HOME` 的路径（如 `.ssh/id_ed25519`；目录写 `.ssh/`） */
-  name: string
-  mode: number
-  content: Buffer
+/** 一条要回给容器的 SSH 私钥 */
+export interface GitCredentialSshKey {
+  privateKey: string
+  /** 可空；包装器把非空的拼进临时 `known_hosts` */
+  knownHosts: string
 }
 
 /**
- * 凭据 → 落 `$HOME` 的文件（**纯函数**；只 SSH_KEY 需要，HTTPS 一律空数组）。
- *
- * 顺序即正确性：**先目录后文件**（`putArchive` 不替我们建父目录且 `.ssh` 的 0700 是刻意钉的）。
- * `known_hosts` 把所有凭据里的非空内容**按输入顺序拼接**（幂等：同一条重复不会有害）。
+ * helper 回包（**跨边界契约**；容器脚本 `git-credential-doubulea.mjs` / `git-ssh-doubulea.mjs` 按此解析）。
+ *   · `https` ⇒ 打印 `username=…\npassword=…` 给 git；
+ *   · `ssh` ⇒ 包装器把 `keys` 写进 `/tmp`（0600）并以 `-i` 交给 `ssh`。
  */
-export function gitCredentialFiles(creds: readonly GitCredentialPlain[]): GitCredentialFile[] {
-  const ssh = creds.filter((cred) => cred.kind === 'SSH_KEY' && (cred.secret.privateKey ?? '') !== '')
-  if (ssh.length === 0) return []
+export type GitCredentialResolution =
+  | { kind: 'https'; username: string; password: string }
+  | { kind: 'ssh'; keys: GitCredentialSshKey[] }
 
-  const files: GitCredentialFile[] = [{ name: '.ssh/', mode: 0o700, content: Buffer.alloc(0) }]
-  ssh.forEach((cred, index) => {
-    const key = cred.secret.privateKey as string
-    files.push({
-      name: `.ssh/${sshKeyFileName(index)}`,
-      mode: 0o600,
-      // 私钥末尾要有换行（有些 ssh 实现对末行无换行的 key 报错）；已有则不重复加
-      content: Buffer.from(key.endsWith('\n') ? key : `${key}\n`, 'utf8'),
+/**
+ * 按 `(protocol, host)` 挑一条凭据并转成回包（**纯函数**，端点与回归共用一处判据）。没有则 `null`。
+ *
+ *   · `https`：候选 = 全部 `HTTPS_TOKEN`；**精确 host 优先**，其次"不限主机"的那条（§7.4 的多条按 host 匹配）；
+ *   · `ssh`：返回**全部** `SSH_KEY`（SSH 的 host 在包装器里拿不到，统一交给 ssh 依次尝试）。
+ */
+export function selectGitCredential(
+  creds: readonly GitCredentialPlain[],
+  protocol: 'https' | 'ssh',
+  host: string | null,
+): GitCredentialResolution | null {
+  if (protocol === 'https') {
+    const candidates = creds.filter(
+      (cred) => cred.kind === 'HTTPS_TOKEN' && (cred.secret.token ?? '') !== '',
+    )
+    const wanted = (host ?? '').toLowerCase()
+    const exact = candidates.find((cred) => {
+      const credHost = (cred.host ?? '').toLowerCase()
+      return credHost !== '' && credHost === wanted
     })
-  })
-
-  const knownHosts = ssh
-    .map((cred) => (cred.secret.knownHosts ?? '').trim())
-    .filter((text) => text !== '')
-    .join('\n')
-  if (knownHosts !== '') {
-    files.push({
-      name: '.ssh/known_hosts',
-      mode: 0o644,
-      content: Buffer.from(knownHosts.endsWith('\n') ? knownHosts : `${knownHosts}\n`, 'utf8'),
-    })
+    const anyHost = candidates.find((cred) => (cred.host ?? '') === '')
+    const chosen = exact ?? anyHost
+    if (chosen === undefined) return null
+    const rawUser = (chosen.secret.username ?? '').trim()
+    return {
+      kind: 'https',
+      username: rawUser === '' ? DEFAULT_TOKEN_USERNAME : rawUser,
+      password: chosen.secret.token ?? '',
+    }
   }
-  return files
-}
 
-/** 把 {@link GitCredentialFile} 补上属主（`SANDBOX_AGENT_UID`）—— `putArchive` 用的 tar 条目 */
-export function gitCredentialTarEntries(
-  files: readonly GitCredentialFile[],
-): Array<{ name: string; mode: number; content: Buffer; uid: number; gid: number }> {
-  return files.map((file) => ({ ...file, uid: SANDBOX_AGENT_UID, gid: SANDBOX_AGENT_UID }))
+  const keys = creds
+    .filter((cred) => cred.kind === 'SSH_KEY' && (cred.secret.privateKey ?? '') !== '')
+    .map((cred) => ({ privateKey: cred.secret.privateKey as string, knownHosts: (cred.secret.knownHosts ?? '').trim() }))
+  return keys.length === 0 ? null : { kind: 'ssh', keys }
 }

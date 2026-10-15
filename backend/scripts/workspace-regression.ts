@@ -15,6 +15,7 @@
  *    —— 那些按 §六 第 30 条留给用户真跑。
  */
 
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
@@ -41,6 +42,7 @@ import {
 } from '../src/workspace/coldModel.js'
 import { previewHeadersFor, workspaceRawHeadersFor } from '../src/services/previewHeaders.js'
 import { ARTIFACT_EXCLUDED_DIRS, artifactChangePaths, filterArtifactPaths } from '../src/sandbox/artifactChanges.js'
+import { filterGitCleanPaths, parsePorcelainPaths } from '../src/sandbox/gitArtifacts.js'
 import { isWorkspaceExpired, workspaceRetentionCutoff } from '../src/workspace/reapModel.js'
 import {
   decideWorkspaceQuota,
@@ -432,6 +434,64 @@ it('L3 超单轮上限即截断并留痕（不静默丢）', () => {
   eq(paths, ['a.txt', 'b.txt'], '截断后按路径升序取前 2 条')
   eq(noted, { accepted: 3, kept: 2, maxFiles: 2 }, '截断要留痕')
 })
+
+// ─────────────────── L4/L5 git 感知产物过滤（sandbox/gitArtifacts，#3） ───────────────────
+
+console.log('── L4/L5 git 感知产物过滤（sandbox/gitArtifacts）──')
+it('L4 parsePorcelainPaths：只认 `XY<空格>path`，rename 的裸原路径被丢弃', () => {
+  eq(
+    parsePorcelainPaths([' M a.txt', '?? b.txt', 'R  c.txt', 'c.txt', '', '?? dir/']),
+    ['a.txt', 'b.txt', 'c.txt', 'dir/'],
+    '脏路径集合（rename 的第二段裸路径不计）',
+  )
+})
+
+/** git 是否可用（不可用就跳过 L5，不让本档在没装 git 的机器上误红） */
+function gitAvailable(): boolean {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+if (gitAvailable()) {
+  const gitRoot = await mkdtemp(join(tmpdir(), 'ws-git-'))
+  try {
+    const run = (args: string[]): void => {
+      execFileSync('git', args, {
+        cwd: gitRoot,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 't',
+          GIT_AUTHOR_EMAIL: 't@example.com',
+          GIT_COMMITTER_NAME: 't',
+          GIT_COMMITTER_EMAIL: 't@example.com',
+        },
+      })
+    }
+    run(['init', '-q'])
+    await writeFile(join(gitRoot, 'committed.txt'), 'v1\n')
+    await writeFile(join(gitRoot, 'clean.txt'), 'c\n')
+    run(['add', 'committed.txt', 'clean.txt'])
+    run(['commit', '-q', '-m', 'init'])
+    // committed.txt 提交后被改（脏）；untracked.txt 未跟踪；clean.txt 提交后没再动（干净）
+    await writeFile(join(gitRoot, 'committed.txt'), 'v2\n')
+    await writeFile(join(gitRoot, 'untracked.txt'), 'new\n')
+
+    const result = await filterGitCleanPaths(gitRoot, ['committed.txt', 'clean.txt', 'untracked.txt'])
+    it('L5 filterGitCleanPaths：干净的 tracked 剔除；改动 / 未跟踪保留', () => {
+      eq(result.excluded, ['clean.txt'], '干净的 tracked 被剔除（clone/pull 初始填充）')
+      eq(result.kept.sort(), ['committed.txt', 'untracked.txt'], '改过的 tracked 与未跟踪新文件保留')
+    })
+  } finally {
+    await rm(gitRoot, { recursive: true, force: true })
+  }
+} else {
+  console.log('  [SKIP] L5 本机没有 git，跳过 git 过滤的集成核对')
+}
 
 // ───────────────────────────── M 保留期判据（P1-9 · P5 · R5） ─────────────────────────────
 

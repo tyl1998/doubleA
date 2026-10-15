@@ -88,6 +88,18 @@ export function isConversationReadOnly(status: ConversationStatus): boolean {
 }
 
 /**
+ * 会话的 **Code 模式运行时**（P1-17a；`子方案/Code模式工作区.md` §五之二 2）。
+ *
+ * ★ **取值 = 后端探测/构建出来的运行时"变体 id"**（如 `node22-python310`），**不是写死的枚举**：
+ *   可用运行时由后端**扫本机镜像探测**（有就提供），用户选了本机没有的组合 ⇒ 后端**按需构建**
+ *   （2026-10-14 用户定案）。⇒ 契约里 `runtime` 是一个**自由字符串**，编译期不约束取值。
+ *   组件目录 / 变体规范化 / 接口 schema 都在 `shared/src/runtime.ts`（单一来源）。
+ * ⚠️ 未知 id（本机没有对应镜像）**不报错**：`ensureSandbox` 建容器时回退 `SANDBOX_IMAGE`（toolkit）
+ *   并留一条 warn —— 比"选了却起不来"好，而且可观测。
+ */
+export const SANDBOX_RUNTIME_ID_MAX_LEN = 64
+
+/**
  * 没被命名过的会话在界面上的回落文案（`topic` 是 `null`）。
  *
  * 放 `shared` 的理由与 `DOCUMENT_PARSING_HINT`（P0-1-21）相同：这是**界面判据**，
@@ -144,6 +156,11 @@ export const conversationItemSchema = z.object({
   /** `null` = 还没命名过（界面回落 {@link CONVERSATION_UNTITLED_HINT}） */
   topic: z.string().nullable(),
   status: z.enum(CONVERSATION_STATUSES),
+  /**
+   * Code 模式运行时（P1-17a）—— 后端从本机镜像探测出的**运行时 id**（自由字符串）。
+   * 非 Code 会话也会回带它（它是一个普通列）；界面只在 Code 会话里展示选择器。
+   */
+  runtime: z.string(),
   /** 最后一条消息**落库**的时刻；`null` = 还没有消息 */
   lastMessageAt: z.string().nullable(),
   /** ISO 8601 */
@@ -186,6 +203,11 @@ export const createConversationBodySchema = z.object({
   agentId: z
     .string({ required_error: '请选择智能体' })
     .uuid('智能体 ID 不是合法 UUID'),
+  /**
+   * Code 模式运行时（P1-17a；可选）。不给 = 用 Prisma 默认**空串**（= 空环境）。
+   * ⚠️ 只在 Code 会话有意义 —— 运行时镜像只在派活建容器时才选；非 Code 会话从不建容器。
+   */
+  runtime: z.string().min(1).max(SANDBOX_RUNTIME_ID_MAX_LEN).optional(),
 })
 export type CreateConversationBody = z.infer<typeof createConversationBodySchema>
 
@@ -298,6 +320,27 @@ export const setConversationCodeModeResultSchema = z.object({
 })
 export type SetConversationCodeModeResult = z.infer<typeof setConversationCodeModeResultSchema>
 
+/**
+ * 设置**会话运行时**（P1-17a）的请求体。
+ * ⚠️ 与 `code-mode` 同款（改一个会话级设置 + 回带落定值）—— 取值是**后端探测出的运行时 id**
+ *    （自由字符串，不是枚举）：前端只提交它从 `GET /api/sandbox/runtimes` 拿到的 id。
+ * ⚠️ **空串是合法值**（产品反馈 2026-10-14）：表示**空环境**（只带基础工具链、不额外装语言运行时），
+ *    也是"用户不选任何环境"的默认落点 —— 后端 `ensureSandbox` 找不到该 runtime 时回退 `SANDBOX_IMAGE`。
+ */
+export const setConversationRuntimeBodySchema = z.object({
+  runtime: z
+    .string({ required_error: '缺少 runtime（形如 python / python310 / node22-python38；空串 = 空环境）' })
+    .max(SANDBOX_RUNTIME_ID_MAX_LEN, `runtime 过长（> ${SANDBOX_RUNTIME_ID_MAX_LEN}）`),
+})
+export type SetConversationRuntimeBody = z.infer<typeof setConversationRuntimeBodySchema>
+
+/** `POST /api/conversations/:id/runtime` 的响应（回带落定值） */
+export const setConversationRuntimeResultSchema = z.object({
+  id: z.string(),
+  runtime: z.string(),
+})
+export type SetConversationRuntimeResult = z.infer<typeof setConversationRuntimeResultSchema>
+
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 
 /**
@@ -346,6 +389,12 @@ export const conversationActiveSchema = conversationActiveSnapshotSchema.extend(
    * 由同一个 `/active` 端点回带，前端据此决定是否显示工作区面板。
    */
   codeMode: z.boolean(),
+  /**
+   * 会话**运行时**（**P1-17a 契约增量**）：与 `codeMode` 同款 —— 由同一个 `/active` 端点回带，
+   * 前端据此在 Code 会话里回显/切换运行时（不必额外读一次会话详情）。
+   * 值是后端探测/构建出的运行时**变体 id**（自由字符串，见 `shared/src/runtime.ts`）。
+   */
+  runtime: z.string(),
 })
 export type ConversationActive = z.infer<typeof conversationActiveSchema>
 
@@ -489,6 +538,11 @@ export const toolCallRecordSchema = z.object({
   status: z.enum(TOOL_CALL_STATUSES),
   /** 给用户看的**参数摘要**（截断过；凭据值已抹除，见 `chatContext#summarizeToolInput`） */
   inputSummary: z.string(),
+  /**
+   * 工具卡在助手正文中的位置（正文 UTF-16 字符偏移）。
+   * 省略时兼容旧消息，前端按历史口径将其放在正文前。
+   */
+  textOffset: z.number().int().min(0).optional(),
   /** 结果文本（`RUNNING` 时没有；与回填给模型的**是同一份**，见 `chatContext#truncateToolResult`） */
   output: z.string().optional(),
   /**
@@ -612,17 +666,79 @@ export const artifactIdParamsSchema = z.object({
 })
 export type ArtifactIdParams = z.infer<typeof artifactIdParamsSchema>
 
+// ───────────────────── 产物批量删除（会话产物页）─────────────────────
+
+/**
+ * 一次批量删除最多几个产物。
+ *
+ * ⚠️ **刻意与 `ARTIFACT_PAGE_LIMIT_MAX` 相等**：批量删除的选择面就是「会话产物」页的
+ * **当前页**（前端只在当页勾选），一页最多 `ARTIFACT_PAGE_LIMIT_MAX` 条 ⇒ 上限取它即可。
+ * 不给一个更大的额度，是因为那会引出"跨页选中后翻页，选择还在不在"这个凭空的问题。
+ * 服务端仍**独立校验**：客户端能把 `limit` 调小，但**不能**靠请求体绕过这个上限。
+ */
+export const ARTIFACT_BATCH_DELETE_MAX = ARTIFACT_PAGE_LIMIT_MAX
+
+/**
+ * `POST /api/artifacts/batch-delete` 的请求体（**会话产物页的批量删除**）。
+ *
+ * ⚠️ **用 POST 而不是 `DELETE /api/artifacts`（带 body）**：带 body 的 `DELETE` 会被一部分
+ * 代理 / 客户端丢掉 body（RFC 未禁止，但实践里不可靠），而本端点的**全部信息都在 body 里**
+ * ⇒ 丢掉 body 就是一次"删了 0 个却报成功"的静默失败。用 POST + 明确的 `/batch-delete`
+ * 动作段，与 `/api/conversations/:id/recall` 那类"动作端点"同款。
+ *
+ * 归属判据仍在服务层（`userId = me`）：**ids 里混进别人的产物只会被忽略**（不是 404）——
+ * 批量操作里"一个 id 越权就整批失败"会让一次正常的删除被一条脏数据卡死；服务层按
+ * `id ∈ ids AND user_id = me` 过滤，真正删掉的条数由响应里的 `deleted` 如实回报。
+ */
+export const batchDeleteArtifactsBodySchema = z.object({
+  ids: z
+    .array(z.string().uuid('产物 ID 不是合法 UUID'))
+    .min(1, '至少选择一个产物')
+    .max(ARTIFACT_BATCH_DELETE_MAX, `一次最多删除 ${ARTIFACT_BATCH_DELETE_MAX} 个产物`),
+})
+export type BatchDeleteArtifactsBody = z.infer<typeof batchDeleteArtifactsBodySchema>
+
+/**
+ * 批量删除的结果（**真删除**：S3 对象与 `artifacts` 行一并移除，见服务层）。
+ *
+ * `deleted` = **实际删掉的行数**（不是请求里的 id 个数）：ids 里混进"不是我的"或
+ * "已经不存在"的会被如实扣掉 —— 界面据此说"已删除 N 个"，而不是照着勾选数报一个假数。
+ */
+export const batchDeleteArtifactsResultSchema = z.object({
+  deleted: z.number().int().min(0),
+})
+export type BatchDeleteArtifactsResult = z.infer<typeof batchDeleteArtifactsResultSchema>
+
 // ───────────────────── 产物预览（P0-3-10）─────────────────────
 
 /**
- * 预览的**五种形态**（`子方案④` §四 2 / §五）。
+ * 预览的**七种形态**（`子方案④` §四 2 / §五）。
  *
- * `none` 不是一个错误态，而是"这个格式没有在线预览"这个**事实**（zip / docx / 未知类型）⇒
+ * `none` 不是一个错误态，而是"这个格式没有在线预览"这个**事实**（zip / 未知类型）⇒
  * 界面上表现为**没有「预览」按钮**、只给下载，而不是"按钮置灰"（`03` §4.5 同款口径：
  * 能力有无是事实，不是"暂不可用"）。
+ *
+ * ⚠️ `docx` / `xlsx` 自 **P1-16** 起是独立形态：它们**不是** `html` —— 原始字节是二进制 OOXML，
+ * 不能当 `html` 直出（`/content` 对它们仍按"字节代理"上 `octet-stream` + `attachment`）。
+ * 前端对它们走**渲染出口** `GET /api/artifacts/:id/render`（服务端转成净化 HTML：
+ * docx → mammoth、xlsx → 手写零依赖读取器），渲染结果才带 HTML 那套 `text/html` + CSP `sandbox` 头
+ * （见 `routes/artifacts.ts`）。
  */
-export const PREVIEW_KINDS = ['html', 'image', 'pdf', 'text', 'none'] as const
+export const PREVIEW_KINDS = ['html', 'image', 'pdf', 'docx', 'xlsx', 'text', 'none'] as const
 export type PreviewKind = (typeof PREVIEW_KINDS)[number]
+
+/**
+ * DOCX（Word OOXML）的 mime —— **本仓内唯一字面量**（`ARTIFACT_MIME_BY_EXTENSION` 与
+ * `previewKindOf` 都引用它，避免两处各写一个长串而分叉）。
+ */
+export const DOCX_MIME =
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+/**
+ * XLSX（Excel OOXML）的 mime —— 同上，唯一字面量。
+ */
+export const XLSX_MIME =
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 /**
  * 图片 / PDF **直连渲染**（`<img>` / `<iframe>`）的体积闸门（10 MiB）。
@@ -649,9 +765,13 @@ export const ARTIFACT_PREVIEW_MAX_TEXT_BYTES = 2 * 1024 * 1024
  *   ② ★ **`image/svg+xml` 归 `html` 那一族**：SVG 是**能带 `<script>` 的文档** —— `<img>` 上下文里
  *      脚本不执行（安全），但"在新标签页打开"就会以**我们站点的源**执行 ⇒ 它与 HTML 同级，走
  *      iframe + 双隔离，代价只是"SVG 不在 `<img>` 里直出"，观感完全一样；
- *   ③ **名单刻意保守**（与 `artifactMimeOf` 同款）：只认 `子方案④` §四 2 表里列出来的那些，
- *      其余（含 `text/x-python` / `text/javascript` / `text/yaml` 这类"其实也能当文本看"的类型）
- *      一律 `none` ⇒ 只给下载。**要扩就在这一处扩**，扩了前后端同时生效。
+ *   ③ **文本/代码：任何 `text/*` 都算 `text`**（`text/html` 除外，它归 `html`）—— 与工作区
+ *      `isWorkspaceTextMime` **同款口径**（`text/x-java` / `text/x-go` / `text/css` / `text/x-sql` /
+ *      `text/x-markdown`… 自动命中），另把"其实是文本但不是 `text/*`"的 `application/json` /
+ *      `application/xml` / `application/x-yaml` 显式列出。⇒ 产物只要**扩展名在后端 mime 表里**、
+ *      且定出来是 `text/*`，就能源码预览（后端一律回 `text/plain; charset=utf-8`，不会被当 HTML 渲染）。
+ *      ⚠️ **仍然不看扩展名**：判据只有 `mime`；能到本函数的 mime 是后端扫描时按扩展名定的那一个。
+ *      **要扩覆盖面只改后端那张扩展名表**（`artifactMimeOf`），本函数已对新 `text/*` 自动生效。
  *
  * `mime` 可能带参数（如 `text/html; charset=utf-8`）⇒ 先取 `;` 之前那一段再比；
  * 非字符串（`null` / `undefined`）与空串一律 `none`（**不抛错**：它只是决定"有没有预览入口"）。
@@ -666,12 +786,18 @@ export function previewKindOf(mime: string | null | undefined): PreviewKind {
   // ⚠️ `svg` 必须排在 `image/*` 之前（它是 `image/*` 的子集，却归 html 那一族）
   if (base === 'text/html' || base === 'application/xhtml+xml' || base === 'image/svg+xml') return 'html'
   if (base === 'application/pdf') return 'pdf'
+  // DOCX：二进制 OOXML，走**渲染出口**（服务端 mammoth → HTML），不是 `html` 的"直出字节"
+  if (base === DOCX_MIME) return 'docx'
+  // XLSX：同样是二进制 OOXML，走**渲染出口**（服务端手写零依赖读取器 → HTML 表格）
+  if (base === XLSX_MIME) return 'xlsx'
+  // 文本 / 代码：**任何 `text/*`**（`text/html` 已在上面归 `html`）都按源码预览 —— 与工作区
+  // `isWorkspaceTextMime` 同款口径（`text/x-java`、`text/x-go`、`text/css`、`text/x-sql`… 自动命中）；
+  // 再把几个"其实是文本但不是 `text/*`"的显式列出。后端一律回 `text/plain; charset=utf-8`（安全）。
   if (
-    base === 'text/markdown' ||
-    base === 'text/csv' ||
-    base === 'text/tab-separated-values' ||
-    base === 'text/plain' ||
-    base === 'application/json'
+    base.startsWith('text/') ||
+    base === 'application/json' ||
+    base === 'application/xml' ||
+    base === 'application/x-yaml'
   ) {
     return 'text'
   }

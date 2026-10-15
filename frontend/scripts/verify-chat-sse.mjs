@@ -46,6 +46,10 @@
 
 import { readdirSync, readFileSync } from 'node:fs'
 import { register } from 'node:module'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 const VITE_ENV_SHIM = `
 export async function load(url, context, nextLoad) {
@@ -230,6 +234,7 @@ const { beginRound, isSettled, reduceRound, roundToViews } = await import(
 const { isAssistantEmpty, messageToView, messagesToViews, openingView } = await import(
   '../src/features/chat/messageModel.ts'
 )
+const { remarkToolCards } = await import('../src/features/chat/AssistantMarkdown.tsx')
 const { useChatStreamStore } = await import('../src/stores/chatStream.ts')
 const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
@@ -617,6 +622,99 @@ await it('D4 `tool_call` 按 callId upsert，且 `RUNNING` 那一帧的缺省 ou
   assertEqual(round.assistant.tools.map((tool) => tool.callId).join(','), 'call-a,call-b', '追加顺序')
 })
 
+await it('D4b 工具卡保留正文偏移，供正文与工具按事件顺序穿插', () => {
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('delta', { text: '前置' }))
+  round = reduceRound(
+    round,
+    eventOf('tool_call', {
+      callId: 'call-offset',
+      toolName: 'read_file',
+      serverName: 'fs',
+      kind: 'MCP',
+      status: 'RUNNING',
+      inputSummary: '/tmp/a',
+      textOffset: 2,
+    }),
+  )
+  round = reduceRound(round, eventOf('delta', { text: '后置' }))
+  assertEqual(round.assistant.tools[0].textOffset, 2, '工具卡保留正文偏移')
+  assertEqual(round.assistant.text, '前置后置', '正文仍按增量顺序累计')
+})
+
+await it('D4c 完整解析 Markdown 再插工具卡：跨卡引用、围栏代码与历史顺序不变', () => {
+  const makeTool = (callId, textOffset) => ({
+    callId, textOffset, toolName: 'read_file', serverName: 'fs', kind: 'MCP',
+    status: 'SUCCESS', inputSummary: '/tmp/a', output: 'ok',
+  })
+  const render = (text, tools) => renderToStaticMarkup(React.createElement(Markdown, {
+    remarkPlugins: [remarkGfm, remarkToolCards(tools)],
+    components: { div: ({ node }) => React.createElement('aside', { 'data-tool': node?.properties?.dataToolId }) },
+  }, text))
+  const reference = '详情见[手册][doc]\n\n随后执行。\n\n[doc]: https://example.com/manual'
+  const first = makeTool('one', reference.indexOf('随后'))
+  const second = makeTool('two', reference.length)
+  const html = render(reference, [first, second])
+  assertIncludes(html, '<a href="https://example.com/manual">手册</a>', '跨工具卡的引用仍可解析')
+  assert(html.indexOf('手册</a>') < html.indexOf('data-tool="one"'), '第一张工具卡在前文之后')
+  assert(html.indexOf('data-tool="one"') < html.indexOf('随后执行'), '第一张工具卡在后文之前')
+  assert(html.indexOf('data-tool="two"') > html.indexOf('随后执行'), '第二张工具卡排在后面')
+
+  const code = '```js\nconst a = 1;\nconsole.log(a);\n```\n\n执行完成'
+  const codeHtml = render(code, [makeTool('inside-code', code.indexOf('console.log'))])
+  assertIncludes(codeHtml, 'console.log(a);', '代码围栏完整保留')
+  assert(codeHtml.indexOf('console.log(a);') < codeHtml.indexOf('data-tool="inside-code"'), '代码块中途的工具卡移到完整代码块后')
+  assert(codeHtml.indexOf('data-tool="inside-code"') < codeHtml.indexOf('执行完成'), '工具卡仍在后文之前')
+
+  const persisted = messageToView({
+    id: 'm-offset', role: 'ASSISTANT', conversationId: 'c-1', createdAt: STARTED_AT,
+    content: { text: reference, tool_calls: [first, second] },
+  })
+  assertEqual(render(persisted.text, persisted.tools), html, '历史还原与流式使用相同顺序')
+  const legacy = render('正文', [makeTool('legacy', undefined)])
+  assert(legacy.indexOf('data-tool="legacy"') < legacy.indexOf('正文'), '旧消息工具卡仍在正文之前')
+  const adjacent = render('第一段\n\n第二段', [makeTool('same-a', 5), makeTool('same-b', 5)])
+  assert(adjacent.indexOf('第一段') < adjacent.indexOf('data-tool="same-a"'), '同偏移的工具卡仍跟在前文之后')
+  assert(adjacent.indexOf('data-tool="same-a"') < adjacent.indexOf('data-tool="same-b"'), '同偏移工具卡保持调用顺序')
+  assert(adjacent.indexOf('data-tool="same-b"') < adjacent.indexOf('第二段'), '同偏移工具卡都排在后文之前')
+})
+
+await it('D4d 同一段内的多张工具卡按偏移切开正文穿插（产品反馈：不再叠在一起）', () => {
+  const makeTool = (callId, textOffset) => ({
+    callId, textOffset, toolName: 'read_file', serverName: 'fs', kind: 'MCP',
+    status: 'SUCCESS', inputSummary: '/tmp/a', output: 'ok',
+  })
+  const render = (text, tools) => renderToStaticMarkup(React.createElement(Markdown, {
+    remarkPlugins: [remarkGfm, remarkToolCards(tools)],
+    components: { div: ({ node }) => React.createElement('aside', { 'data-tool': node?.properties?.dataToolId }) },
+  }, text))
+  const at = (html, id) => html.indexOf(`data-tool="${id}"`)
+
+  // 模型在同一段里"一句话 → 调工具 → 又一句话"（两句话之间没有空行 ⇒ 一个段落）
+  const t1 = '我先看看文件。'
+  const t2 = '现在执行命令。'
+  const mixed = t1 + t2
+  const mixedHtml = render(mixed, [
+    makeTool('m-a', 0), makeTool('m-b', t1.length), makeTool('m-c', mixed.length),
+  ])
+  assert(at(mixedHtml, 'm-a') < mixedHtml.indexOf(t1), '段首的工具卡在前半句之前')
+  assert(mixedHtml.indexOf(t1) < at(mixedHtml, 'm-b'), '第一张段中卡在前半句之后')
+  assert(at(mixedHtml, 'm-b') < mixedHtml.indexOf(t2), '第一张段中卡在后半句之前（不再叠到段尾）')
+  assert(mixedHtml.indexOf(t2) < at(mixedHtml, 'm-c'), '第二张段中卡在后半句之后')
+  assertEqual((mixedHtml.match(/<p>/g) ?? []).length, 2, '同一段被切开成两段（卡落在两段之间）')
+
+  // 同一偏移的多张卡落在切点：保持调用顺序、且都在切点处
+  const sameHtml = render('甲乙丙丁', [makeTool('s-a', 2), makeTool('s-b', 2)])
+  assert(sameHtml.indexOf('甲乙') < at(sameHtml, 's-a'), '同偏移卡在切点之前段之后')
+  assert(at(sameHtml, 's-a') < at(sameHtml, 's-b'), '同偏移卡保持调用顺序')
+  assert(at(sameHtml, 's-b') < sameHtml.indexOf('丙丁'), '同偏移卡都在切点之后段之前')
+
+  // 不可切分的块（列表）维持原行为：卡排在完整块之后
+  const listText = '- 一\n- 二'
+  const listHtml = render(listText, [makeTool('in-list', 2)])
+  assert(listHtml.indexOf('一') < at(listHtml, 'in-list'), '列表内部的卡仍排在完整列表之后')
+})
+
 await it('D5 `citations` 空数组收敛成 null（不渲染空引用卡），非空则原样落上', () => {
   let round = beginRound('问', STARTED_AT)
   assertEqual(round.assistant.citations, null, '初始为 null（≠ 空数组）')
@@ -778,6 +876,37 @@ await it('E2 历史消息：按 text / thinking / citations 三段取值，坏�
     null,
     '全坏 ⇒ null',
   )
+})
+
+await it('E2b 历史工具卡按 callId 去重：库里 start+end 两条 ⇒ 只渲染一张（后者覆盖前者）', () => {
+  const record = (over) => ({
+    toolName: 'bash',
+    serverName: '',
+    kind: 'SANDBOX',
+    inputSummary: '{"command":"ls"}',
+    ...over,
+  })
+  const view = messageToView({
+    id: 'm-dup',
+    conversationId: 'c-1',
+    role: 'ASSISTANT',
+    content: {
+      text: '测完了。',
+      // 落库形态：同一 callId 有 start（RUNNING）与 end（SUCCESS）两条（见 `persist.ts`）
+      tool_calls: [
+        record({ callId: 'call-a', status: 'RUNNING' }),
+        record({ callId: 'call-a', status: 'SUCCESS', output: 'ok', textOffset: 0 }),
+        record({ callId: 'call-b', status: 'SUCCESS', inputSummary: '{"command":"pwd"}', textOffset: 3 }),
+      ],
+    },
+    createdAt: '2026-10-14T07:00:00.000Z',
+  })
+  assertEqual(view.tools.length, 2, '两条同 callId 记录合成一张卡')
+  assertEqual(view.tools[0].callId, 'call-a', '顺序按首次出现')
+  assertEqual(view.tools[0].status, 'SUCCESS', '后者覆盖前者（RUNNING → SUCCESS）')
+  assertEqual(view.tools[0].output, 'ok', '取到 end 那条的 output')
+  assertEqual(view.tools[0].textOffset, 0, '偏移取 end 那条（与流式同口径）')
+  assertEqual(view.tools[1].callId, 'call-b', '第二条保留')
 })
 
 await it('E3 同一轮对话：流式渲染的形状 == 刷新后从库里读回来的形状（字段逐字相等）', () => {
@@ -2010,6 +2139,26 @@ console.log(`     ${c.y}⚠️${c.x} "顺不顺"是交互与网络的事（导�
 console.log(`  ${c.g}②${c.x} 对话中途仍能进知识库/凭据页（导航不孤岛）... K10 的同族守门（源码级）`)
 console.log(`     ${c.y}⚠️${c.x} 左侧栏统一布局（**已无"专注布局"**）是渲染的事 ⇒ 归浏览器端测（` + '`README` ㊲）')
 console.log(`  ${c.g}坑${c.x} 活跃排序需在 done 后刷新 ................... K9（源码级守门：那一行被删掉就红）`)
+
+// ─────────────── 流式体验修复（2026-10-13）：提前工具卡 / ChatBot status / 用时计时器 ───────────────
+console.log(`\n${c.b}── 流式体验修复（提前工具卡 / ChatBot status / 用时计时器）──${c.x}`)
+
+await it('L1 提前工具卡：`client` 暴露 `onToolCallStart`，`chatBot` 据此先发 RUNNING 卡', () => {
+  const client = readFileSync(new URL('../../backend/src/llm/client.ts', import.meta.url), 'utf8')
+  const bot = readFileSync(new URL('../../backend/src/orchestrator/chatBot.ts', import.meta.url), 'utf8')
+  if (!client.includes('onToolCallStart')) throw new Error('client 未暴露 onToolCallStart 回调')
+  if (!client.includes('announceToolCalls')) throw new Error('client 未实现 announceToolCalls（id+name 齐备即通知）')
+  if (!bot.includes('onToolCallStart:')) throw new Error('chatBot 未消费 onToolCallStart（参数生成期没有提前卡）')
+})
+
+await it('L2 ChatBot 也发 `status`；前端进度行 = statusText + 已用时计时器', () => {
+  const bot = readFileSync(new URL('../../backend/src/orchestrator/chatBot.ts', import.meta.url), 'utf8')
+  if (!bot.includes("name: 'status'")) throw new Error('chatBot 未发 status 事件')
+  const msg = readFileSync(new URL('../src/features/chat/AssistantMessage.tsx', import.meta.url), 'utf8')
+  if (!msg.includes('StreamingStatusLine')) throw new Error('AssistantMessage 未渲染流式进度行')
+  const reducer = readFileSync(new URL('../src/features/chat/roundReducer.ts', import.meta.url), 'utf8')
+  if (!reducer.includes('startedAt: round.startedAt')) throw new Error('roundToViews 未把 startedAt 带给视图')
+})
 
 console.log(`\n${c.d}── 本档验不到的（别当全批验收）──`)
 console.log(`  · React 渲染与交互（七种卡片、黄条、状态灯长什么样、侧栏布局）⇒ 浏览器端测（` + '`README` ㉖~㊲）')

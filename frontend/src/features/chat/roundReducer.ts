@@ -333,6 +333,7 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       artifacts: round.assistant.artifacts,
       attachments: [],
       createdAt: null,
+      startedAt: round.startedAt,
       status: round.status,
       ...(round.statusText === null ? {} : { statusText: round.statusText }),
       ...(round.finishReason === null ? {} : { finishReason: round.finishReason }),

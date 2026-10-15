@@ -13,6 +13,7 @@ import { useQuery, type UseQueryResult } from '@tanstack/react-query'
 
 import type {
   SetConversationCodeModeResult,
+  SetConversationRuntimeResult,
   WorkspaceChangesResult,
   WorkspaceFileEntry,
   WorkspaceFileRead,
@@ -20,7 +21,7 @@ import type {
   WorkspaceTreeResult,
 } from '@doubulea/shared'
 
-import { openEventStream, request, requestBlob } from './client.js'
+import { openEventStream, request, requestBlob, requestFormData } from './client.js'
 
 import type { WorkspaceEventItem } from '@doubulea/shared'
 
@@ -91,6 +92,22 @@ export function createWorkspaceFile(conversationId: string, path: string, conten
     method: 'POST',
     body: { path, content },
   })
+}
+
+/**
+ * 上传文件到指定目录（`POST .../workspace/upload`，multipart）。
+ *
+ * 走 {@link requestFormData}（`content-type` 必须由浏览器带 `boundary`，不能手设）；
+ * 落点 = `dir/<上传文件名>`，服务端负责归一化与越界校验。
+ */
+export function uploadWorkspaceFile(conversationId: string, dir: string, file: File): Promise<WorkspaceFileEntry> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('dir', dir)
+  return requestFormData<WorkspaceFileEntry>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace/upload`,
+    form,
+  )
 }
 
 /** 删除文件（软删 + 墓碑） */
@@ -170,6 +187,17 @@ export function setConversationCodeMode(
   return request<SetConversationCodeModeResult>(
     `/api/conversations/${encodeURIComponent(conversationId)}/code-mode`,
     { method: 'POST', body: { enabled } },
+  )
+}
+
+/** 设置**会话运行时**（P1-17a）：改的是 Code 会话派活时用的运行时镜像（下次派活生效）。 */
+export function setConversationRuntime(
+  conversationId: string,
+  runtime: string,
+): Promise<SetConversationRuntimeResult> {
+  return request<SetConversationRuntimeResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/runtime`,
+    { method: 'POST', body: { runtime } },
   )
 }
 

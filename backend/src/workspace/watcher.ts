@@ -22,7 +22,7 @@ import { getPrisma } from '../infra/prisma.js'
 import type { WorkspaceActor } from '@doubulea/shared'
 
 import { ensureWorkspace, softDeleteIndexedFile, syncFileFromDisk } from './service.js'
-import { scanWorkspaceFiles } from './store.js'
+import { scanWorkspaceTree } from './store.js'
 
 /** 轮询间隔（毫秒，**代码常量**）：定间隔扫描，见文件头 */
 export const WORKSPACE_WATCH_POLL_MS = 1000
@@ -34,6 +34,11 @@ export interface WorkspaceReconcileReport {
   scanned: number
   /** 实际产生了事件的文件数（新/改/删） */
   changed: number
+  /**
+   * 依赖目录里的字节总数（P1-17b；**不进源码配额**，单独计量）。`0` = 这个工作区还没有依赖。
+   * 它只做观测（"配额口径区分源码 vs 依赖"的那个"依赖"数），不参与任何闸门判定。
+   */
+  dependencyBytes: number
 }
 
 /**
@@ -47,7 +52,7 @@ export async function reconcileWorkspaceOnce(
   author: { actor: WorkspaceActor; actorId?: string | null } = { actor: 'SYSTEM' },
 ): Promise<WorkspaceReconcileReport> {
   const handle = await ensureWorkspace(conversationId)
-  const disk = await scanWorkspaceFiles(handle.rootPath)
+  const { entries: disk, dependencyBytes } = await scanWorkspaceTree(handle.rootPath)
   const diskMap = new Map(disk.map((entry) => [entry.relative, entry]))
 
   const rows = await getPrisma().workspaceFile.findMany({
@@ -73,7 +78,7 @@ export async function reconcileWorkspaceOnce(
     if (event !== null) changed += 1
   }
 
-  return { conversationId, scanned: disk.length, changed }
+  return { conversationId, scanned: disk.length, changed, dependencyBytes }
 }
 
 // ───────────────────────────── watcher 生命周期（进程内） ─────────────────────────────

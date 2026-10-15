@@ -46,8 +46,10 @@ import { PdfPreview } from './PdfPreview.js'
 import { TextPreview } from './TextPreview.js'
 import { useArtifactDownload } from './useArtifactDownload.js'
 import {
+  artifactRenderUrl,
   csvDelimiterOf,
   formatBytes,
+  isMarkdownMime,
   previewAvailability,
   type PreviewAvailability,
 } from './artifactPreview.js'
@@ -110,6 +112,12 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
     switch (view.kind) {
       case 'html':
         return <HtmlPreview artifactId={artifactId} fileName={fileName} />
+      case 'docx':
+        // DOCX 走**渲染出口**（服务端 mammoth → HTML），复用 HTML 的沙箱 iframe（同一套属性）
+        return <HtmlPreview artifactId={artifactId} fileName={fileName} src={artifactRenderUrl(artifactId)} />
+      case 'xlsx':
+        // XLSX 同样走**渲染出口**（服务端手写读取器 → HTML 表格），复用同一个沙箱 iframe
+        return <HtmlPreview artifactId={artifactId} fileName={fileName} src={artifactRenderUrl(artifactId)} />
       case 'image':
         return <ImagePreview artifactId={artifactId} fileName={fileName} />
       case 'pdf':
@@ -138,7 +146,7 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
     if (text.phase !== 'ready') return null
 
     if (delimiter !== null) return <CsvPreview text={text.text} delimiter={delimiter} />
-    if (mime.startsWith('text/markdown')) return <MarkdownPreview text={text.text} />
+    if (isMarkdownMime(mime)) return <MarkdownPreview text={text.text} />
     return <TextPreview text={text.text} />
   }
 

@@ -74,7 +74,18 @@ export const MEMORY_DOC_MESSAGE_MAX_CHARS = 2000
 
 /** 记忆文档在容器里的目录与文件名（以 `.` 开头 ⇒ 产物扫描天然排除，见文件头） */
 export const MEMORY_DOC_DIR = `${SANDBOX_WORK_DIR}/.doubulea`
+/** 绝对路径（容器内；`writeMemoryDoc` 写盘、日志用） */
 export const MEMORY_DOC_PATH = `${MEMORY_DOC_DIR}/memory.md`
+/**
+ * **工作区相对路径**（= 相对 `/work`）—— 给 agent 读的**唯一**形态。
+ *
+ * ⚠️ 必须用它、不能把 {@link MEMORY_DOC_PATH}（绝对）写进阅读指令：Code 模式下引擎的 `read`
+ * 工具被 `pi-agent/extensions/workspace` **同名覆盖**（版本感知版），参数是**工作区相对路径**，
+ * 后端 `normalizeWorkspacePath` 直接拒绝以 `/` 开头的绝对路径（`workspace/paths.ts:55`）
+ * ⇒ agent 拿着 `/work/.doubulea/memory.md` 去 read 会**每次都失败**（`ok:false` 校验错误）。
+ * 相对路径在两种形态下都对：中介 `read` 认它；非中介的内置 `read` 以 cwd=`/work` 解析它。
+ */
+export const MEMORY_DOC_RELATIVE_PATH = '.doubulea/memory.md'
 
 /** {@link buildMemoryDoc} 的产物：文档正文 + "这份文档值不值得让引擎去读" */
 export interface MemoryDocResult {
@@ -178,10 +189,15 @@ export function memoryDocReadInstruction(): string {
   return (
     '【会话记忆】本会话在容器之外保存了一份记忆文档（此前对话摘要 + 已产出文件清单 + ' +
     '用户上传过的附件清单 + 按需取回文件的方法），路径：`' +
-    MEMORY_DOC_PATH +
-    '`。\n' +
+    MEMORY_DOC_RELATIVE_PATH +
+    '`（**工作区相对路径**，即 `/work/` 下的 ' +
+    MEMORY_DOC_RELATIVE_PATH +
+    '）。\n' +
     '在开始处理下面这条消息前，请先用 read 工具读取该文件，以便了解本会话之前发生过什么、' +
-    '已经产出过哪些文件、以及用户上传过哪些附件（需要时可按文档里的命令把它们取回 /work）。'
+    '已经产出过哪些文件、以及用户上传过哪些附件（需要时可按文档里的命令把它们取回 /work）。\n' +
+    '⚠️ read 工具只接受**工作区相对路径**：请传 `' +
+    MEMORY_DOC_RELATIVE_PATH +
+    '`，不要传 `/work/.doubulea/memory.md` 这类绝对路径（会被拒绝）。'
   )
 }
 
@@ -322,6 +338,16 @@ export function renderMemoryDoc(input: {
   )
   lines.push(
     '- 镜像**刻意没装 `curl` / `wget`**，上面这两条用容器里已有的 `node` + 内置 `fetch`（这也是它们长这样的原因）。',
+  )
+  lines.push('')
+
+  // ── git 使用提示（拉取仓库走 SSH；HTTPS 需先配 token，否则静默认证失败）──
+  lines.push('## Git 使用提示')
+  lines.push('')
+  lines.push(
+    '拉取 / 克隆仓库**优先用 SSH**（`git@<host>:<owner>/<repo>.git`）—— 本环境默认可用的 git 凭据就是 SSH key。' +
+      'HTTPS（`https://<host>/...`）需要先在平台「设置 → Git 凭据」配置 HTTPS token，**未配置时会认证失败**' +
+      '（凭据按需拉取，失败不会打印原因，只会是一个笼统的认证错误）。',
   )
   lines.push('')
 

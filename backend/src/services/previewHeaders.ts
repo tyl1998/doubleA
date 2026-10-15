@@ -45,7 +45,8 @@ function baseMimeOf(mime: string): string {
  *      被浏览器当 HTML 渲染）；
  *   ② **PDF 刻意不加 CSP `sandbox`**：MDN 明确说 sandbox "prevents the execution of plugins"，
  *      而 PDF 的浏览器内置 viewer 属这一类 ⇒ 加了会渲染不出来；
- *   ③ **`none`（zip / docx / 未知类型）当作下载处理**（`attachment` + `octet-stream`）。
+ *   ③ **`none` / `docx` / `xlsx`（zip / 未知类型 / OOXML 原始字节）当作下载处理**（`attachment` + `octet-stream`）。
+ *      ⚠️ `docx` / `xlsx` 的**在线预览**不在本函数（它们走 `/render` 出口，见 switch 里的注释）。
  */
 export function previewHeadersFor(mime: string): PreviewHeaders {
   const kind: PreviewKind = previewKindOf(mime)
@@ -60,6 +61,14 @@ export function previewHeadersFor(mime: string): PreviewHeaders {
       return { contentType: 'application/pdf', disposition: 'inline', csp: null }
     case 'text':
       return { contentType: 'text/plain; charset=utf-8', disposition: 'inline', csp: null }
+    case 'docx':
+    case 'xlsx':
+      // ⚠️ `docx` / `xlsx` 的**原始字节**是二进制 OOXML，绝不能当 HTML 直出（`/content` 与工作区
+      //    字节出口都走本函数）⇒ 与 `none` 同款：`octet-stream` + `attachment`，浏览器只会把它存下来。
+      //    它们的**在线预览**由另一条出口 `GET /api/artifacts/:id/render` 负责
+      //    （docx → mammoth、xlsx → 手写读取器，均产出 HTML），那个出口自己上
+      //    `text/html` + {@link HTML_PREVIEW_CSP}（见 `routes/artifacts.ts`）。
+      return { contentType: 'application/octet-stream', disposition: 'attachment', csp: null }
     default:
       return { contentType: 'application/octet-stream', disposition: 'attachment', csp: null }
   }

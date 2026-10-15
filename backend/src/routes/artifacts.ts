@@ -23,10 +23,11 @@
  * 别人的资源一律 **404**（不是 403）。路由层只挂 `requireAuth`，判据在服务层的 `where` 里。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ⚠️ **两条**都是不套信封的端点（`02` §4.9 的"恰好两个"自 P0-3-10 起读作"三个"：
+ * ⚠️ **不套信封**的端点在产物族里有**三条**（`02` §4.9 的"恰好两个"自 P0-3-10 起读作"三个"；
+ * P1-16 加 `/render` 后为**四个**，见 `子方案④` 版本记录）：
  * ─────────────────────────────────────────────────────────────────────
- * 文档下载、产物下载、产物预览）
- * 成功 = **字节流**；失败（404 / 500）= **标准 JSON 信封** ⇒ 客户端按**响应形状**
+ * 文档下载、产物下载、产物预览（`/content`）、**产物渲染预览（`/render`，P1-16）**。
+ * 成功 = **字节流 / HTML**；失败（404 / 400 / 500）= **标准 JSON 信封** ⇒ 客户端按**响应形状**
  * （`content-type` 是不是 `application/json`）分支，不按状态码（P0-1-35 已定案，前端
  * `api/client.ts#requestBlob` 就是这个）。
  *
@@ -41,28 +42,39 @@
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
 
+import type { Readable } from 'node:stream'
+
 import {
+  AppError,
   artifactIdParamsSchema,
+  ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
+  batchDeleteArtifactsBodySchema,
   conversationIdParamsSchema,
   listArtifactsQuerySchema,
   listMyArtifactsQuerySchema,
   ok,
+  previewKindOf,
   type ArtifactIdParams,
+  type BatchDeleteArtifactsBody,
   type ConversationIdParams,
   type ListArtifactsQuery,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
+import { getLogger } from '../infra/logger.js'
 import { requireAuthContext } from '../plugins/session.js'
 import {
   artifactDownloadContentType,
   deleteArtifact,
+  deleteArtifacts,
   listArtifacts,
   listMyArtifacts,
   openArtifactSource,
 } from '../services/artifact.service.js'
+import { renderDocxToHtml } from '../services/docxPreview.js'
 import { buildContentDisposition } from '../services/document.service.js'
-import { previewHeadersFor } from '../services/previewHeaders.js'
+import { HTML_PREVIEW_CSP, previewHeadersFor } from '../services/previewHeaders.js'
+import { parseXlsx, renderXlsxToHtml } from '../services/xlsxPreview.js'
 
 /**
  * 取调用者 —— **只取 `id`**（会话族不按角色判权，见 `conversation.service.ts` 文件头 ①）。
@@ -72,6 +84,25 @@ import { previewHeadersFor } from '../services/previewHeaders.js'
  */
 function userIdOf(request: FastifyRequest): string {
   return requireAuthContext(request).user.id
+}
+
+/**
+ * 把一个流读进内存（**带上限**）—— `/render` 出口专用。
+ *
+ * ⚠️ 为什么要有上限：转换（mammoth）必须拿到完整 buffer，而无上限地读一个 50MB 的产物会让
+ * 一个预览请求吃掉 50MB 堆。上限取 `ARTIFACT_PREVIEW_MAX_INLINE_BYTES`（与前端同一个闸门常量，
+ * 前后端同源）—— 超了直接抛 400，而不是先读进来再说。
+ */
+async function readStreamCapped(stream: Readable, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of stream) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+    total += buffer.length
+    if (total > maxBytes) throw AppError.validation('文件较大，无法在线渲染预览，请下载查看')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
 }
 
 
@@ -128,6 +159,32 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
     async (request) => {
       await deleteArtifact({ artifactId: request.params.id, userId: userIdOf(request) })
       return ok(null)
+    },
+  )
+
+  /**
+   * 批量删除产物（`POST /api/artifacts/batch-delete`，仅本人；**会话产物列表的批量删除动作**）。
+   *
+   * 与上面那条单条删除**同一条判据、同一套顺序**（真删除：先删对象、成功才删行），只是把
+   * "一个 id"换成"一组 id"（`body.ids`）。**用 POST 而不是带 body 的 DELETE**：见
+   * `shared#batchDeleteArtifactsBodySchema`（一部分代理会丢掉 DELETE 的 body，那样就是
+   * "删了 0 个却报成功"的静默失败）。
+   *
+   * ⚠️ ids 里混进别人的产物 / 不存在的 id **被静默忽略**（不是 404）：批量操作不该被一条
+   * 越权或脏数据卡死整批；真正删掉的条数由响应的 `deleted` 如实回报。
+   *
+   * ⚠️ 与"删除会话"刻意不同（同单条删除）：删会话只把产物行 `conversation_id` 置空、
+   * 产物转历史保留；本端点才是"用户明确不要这些产物"的出口。
+   */
+  app.post<{ Body: BatchDeleteArtifactsBody }>(
+    '/api/artifacts/batch-delete',
+    { preHandler: app.requireAuth, schema: { body: batchDeleteArtifactsBodySchema } },
+    async (request) => {
+      const deleted = await deleteArtifacts({
+        artifactIds: request.body.ids,
+        userId: userIdOf(request),
+      })
+      return ok({ deleted })
     },
   )
 
@@ -204,6 +261,65 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
       // ⚠️ CSP **只**给 HTML/SVG 那一路（PDF 加了会渲染不出来 —— 见 previewHeadersFor 的要点 ②）
       if (headers.csp !== null) reply.header('content-security-policy', headers.csp)
       return reply.send(source.body)
+    },
+  )
+
+  /**
+   * 渲染预览（P1-16）—— **OOXML 专用**（DOCX / XLSX）：服务端把二进制字节转成 HTML，再按 HTML 那套隔离头回。
+   *
+   * ★ **为什么是独立出口，而不是塞进 `/content`**：`/content` 是**字节代理** ——
+   * 它的 `Content-Type` **唯一来源是 `artifacts.mime`**（判据 ⑤）。DOCX / XLSX 的原始字节是二进制 OOXML，
+   * 把它们当 `text/html` 直出是错的、也不安全。所以"取原始字节"（`/content`）与"渲染成 HTML"
+   * （本出口，`Content-Type` 来自**渲染产物**而非原始 mime）**必须是两条 URL**
+   * （与 §三 1"两条出口不是一个端点加参数"同一条纪律）。
+   *
+   * ★ 转换器按形态分派（`previewKindOf`）：`docx` → `renderDocxToHtml`（mammoth）；
+   * `xlsx` → `renderXlsxToHtml(parseXlsx(...))`（手写零依赖读取器）。两者产出的都是 HTML 文档。
+   *
+   * ★ 前端**只对 `previewKindOf(mime) ∈ {docx, xlsx}` 的产物**打这个端点（`artifactRenderUrl`），
+   * 但 URL 可以手敲 ⇒ 这里按 mime **自己再判一次**：不是这两种形态一律 400。
+   *
+   * 归属判据复用 {@link openArtifactSource}（与下载 / 预览**同一条**，别人的产物 404）；
+   * 隔离头复用 {@link HTML_PREVIEW_CSP}（文件头第 ① 条：响应头才是第一道，iframe 属性只是第二道）。
+   */
+  app.get<{ Params: ArtifactIdParams }>(
+    '/api/artifacts/:id/render',
+    { preHandler: app.requireAuth, schema: { params: artifactIdParamsSchema } },
+    async (request, reply) => {
+      const source = await openArtifactSource({
+        artifactId: request.params.id,
+        userId: userIdOf(request),
+      })
+      const kind = previewKindOf(source.mime)
+      if (kind !== 'docx' && kind !== 'xlsx') {
+        throw AppError.validation('该类型的产物没有在线渲染预览')
+      }
+      if (source.contentLength > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) {
+        throw AppError.validation('文件较大，无法在线渲染预览，请下载查看')
+      }
+
+      const bytes = await readStreamCapped(source.body, ARTIFACT_PREVIEW_MAX_INLINE_BYTES)
+      let html: string
+      try {
+        html =
+          kind === 'xlsx'
+            ? renderXlsxToHtml(parseXlsx(bytes), source.fileName)
+            : await renderDocxToHtml(bytes, source.fileName)
+      } catch (error) {
+        // 走到这里基本是"不是合法 OOXML"（损坏 / 改名 / 截断）。文案要覆盖"其实不是该格式"这种可能，
+        // 而不是笼统一句"渲染失败"（与 `pipeline/parse/docx.ts` 的文案口径一致）。
+        if (error instanceof AppError) throw error
+        getLogger().warn({ err: error, artifactId: source.artifactId, kind }, 'OOXML 渲染失败')
+        throw AppError.validation('无法解析该 Office 文档（可能已损坏，或被改名的其它格式），请下载后用本地工具打开')
+      }
+
+      return reply
+        .header('content-type', 'text/html; charset=utf-8')
+        .header('content-security-policy', HTML_PREVIEW_CSP)
+        .header('content-disposition', buildContentDisposition(source.fileName, { disposition: 'inline' }))
+        .header('x-content-type-options', 'nosniff')
+        .header('cache-control', 'private, no-store')
+        .send(html)
     },
   )
 }

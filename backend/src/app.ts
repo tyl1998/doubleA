@@ -29,6 +29,7 @@ import { registerDocumentRoutes } from './routes/documents.js'
 import { registerFileRoutes } from './routes/files.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerGitCredentialRoutes } from './routes/gitCredentials.js'
+import { registerEgressPolicyRoutes } from './routes/egressPolicy.js'
 import { registerKnowledgeBaseRoutes } from './routes/knowledgeBases.js'
 import { registerMcpCredentialRoutes } from './routes/mcpCredentials.js'
 import { registerMcpServerRoutes } from './routes/mcpServers.js'
@@ -39,6 +40,7 @@ import { registerTaskRoutes } from './routes/tasks.js'
 import { registerUsageRoutes } from './routes/usage.js'
 import { registerUserRoutes } from './routes/users.js'
 import { registerWorkspaceRoutes } from './routes/workspace.js'
+import { registerSandboxRoutes } from './routes/sandbox.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -208,11 +210,17 @@ export function buildApp(): FastifyInstance {
   //    写（CAS）/ 建 / 移 / 删）。权限与会话同族（**仅本人**，`conversations.user_id`）。
   //    ⚠️ `/file/raw` 是**不套信封**的字节出口（本仓第四个，同产物下载/预览）；⚠️ 多机下全部粘性。
   registerWorkspaceRoutes(app)
+  registerSandboxRoutes(app)
 
   // ㉑ git 凭据（P1-9 · R11）：`/api/git-credentials` 四条（列表 / 建 / 改 / 删）。权限与会话同族
   //    （**仅本人**，`git_credentials.user_id`，ADMIN 无后门）；凭据按用户加密存平台、派活时解密
   //    注入容器 tmpfs `$HOME` / env（见 `services/gitCredential.service.ts`）。
   registerGitCredentialRoutes(app)
+
+  // ㉒ 沙箱出网策略（egress 黑白名单）：`/api/admin/egress-policy` 两条（读 / 整替换）。
+  //    权限 **仅 ADMIN**（平台级配置，与 `/api/model-providers` 同族 —— 不是"每个人自己的东西"）。
+  //    本表只是"平台声明"；真实拦截在 egress 代理容器，由 `egress-up.sh --watch` 轮询落成策略文件。
+  registerEgressPolicyRoutes(app)
 
   return app
 }

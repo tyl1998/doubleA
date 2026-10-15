@@ -26,8 +26,10 @@
  */
 
 import {
+  AppError,
   conversationIdParamsSchema,
   isWorkspaceTextMime,
+  normalizeWorkspacePath,
   ok,
   workspaceCreateFileBodySchema,
   workspaceChangesQuerySchema,
@@ -66,8 +68,13 @@ import {
   revertWorkspaceRound,
   serializeWorkspaceSseEvent,
   subscribeWorkspaceEvents,
+  uploadWorkspaceFile,
   writeWorkspaceFile,
 } from '../workspace/index.js'
+
+/** 上传端点的文件字段（与附件 / 知识库上传同款，浏览器 `FormData` 用）；`dir` = 目标目录（可空 = 根） */
+const WORKSPACE_UPLOAD_FILE_FIELD = 'file'
+const WORKSPACE_UPLOAD_DIR_FIELD = 'dir'
 
 /** 取调用者（会话族不按角色判权，只取 `id`；见 `routes/artifacts.ts#userIdOf`） */
 function userIdOf(request: FastifyRequest): string {
@@ -208,6 +215,52 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
       await assertWorkspaceOwner(request.params.id, userId)
       await assertWorkspaceWriteRate(request.params.id)
       return ok(await createWorkspaceFile(request.params.id, request.body.path, request.body.content, userAuthor(userId)))
+    },
+  )
+
+  /**
+   * 上传文件到指定目录（`POST /api/conversations/:id/workspace/upload`，multipart）。
+   *
+   * 字段：`file`（唯一文件，字段名同附件 / 知识库）+ 可选 `dir`（目标目录，空 = 根）。
+   * 落点 = `dir/<上传文件名>`（都由 `normalizeWorkspacePath` 归一化 + 越界判据）。
+   * ⚠️ 与文本写接口**刻意不同**：这里允许二进制落地（`allowBinary`）—— 上传是显式意图，
+   *    读取侧对二进制本就只读预览 / 下载（§九）。配额（单文件 / 文件数 / 总字节）照旧判定。
+   */
+  app.post<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/workspace/upload',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema },
+      bodyLimit: config.limits.uploadBodyLimitBytes,
+    },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      await assertWorkspaceWriteRate(request.params.id)
+
+      let uploaded: { fileName: string; bytes: Buffer } | undefined
+      let dir = ''
+      for await (const part of request.parts()) {
+        if (part.type === 'file') {
+          const bytes = await part.toBuffer()
+          if (part.file.truncated) throw AppError.validation(`文件超过上传上限：${part.filename || WORKSPACE_UPLOAD_FILE_FIELD}`)
+          if (uploaded !== undefined) throw AppError.validation('一次只能上传一个文件')
+          uploaded = { fileName: part.filename, bytes }
+        } else if (part.fieldname === WORKSPACE_UPLOAD_DIR_FIELD) {
+          dir = String(part.value ?? '')
+        }
+      }
+      if (uploaded === undefined) {
+        throw AppError.validation(`没有收到文件：请用 multipart/form-data 上传，文件字段名为 ${WORKSPACE_UPLOAD_FILE_FIELD}`)
+      }
+      if (uploaded.bytes.length === 0) {
+        throw AppError.validation(`上传的文件是空的（0 字节）：${uploaded.fileName || '未命名文件'}`)
+      }
+      // 文件名只取末段（浏览器选择目录上传时可能带相对路径），再与目标目录拼成工作区相对路径
+      const baseName = uploaded.fileName.split(/[\\/]/u).filter((seg) => seg !== '').pop() ?? uploaded.fileName
+      const target = normalizeWorkspacePath(dir === '' ? baseName : `${dir}/${baseName}`)
+      if (target === null) throw AppError.validation('目标路径不合法（不许绝对路径 / `..` / 空）', { path: dir })
+      return ok(await uploadWorkspaceFile(request.params.id, target, uploaded.bytes, userAuthor(userId)))
     },
   )
 

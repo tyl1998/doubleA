@@ -11,7 +11,7 @@
 
 import { create } from 'zustand'
 
-import { nextActiveOnClose, renameOpenTab, withOpenedTab } from '../features/chat/workspaceModel.js'
+import { nextActiveOnClose, renameOpenTab, toggleExpandedDir, withOpenedTab } from '../features/chat/workspaceModel.js'
 
 /** 一个会话的标签态 */
 export interface WorkspaceTabs {
@@ -22,9 +22,47 @@ export interface WorkspaceTabs {
 }
 
 const EMPTY_TABS: WorkspaceTabs = { openPaths: [], activePath: null }
+/** 没有展开任何目录时的稳定引用（`[]` 每次新建会让 selector 空转重渲染） */
+const EMPTY_EXPANDED: readonly string[] = []
+
+/**
+ * "被展开的目录"落 localStorage 的键。
+ *
+ * ⚠️ 与 `openPaths` **不同**：标签是"本次会话的临时选择"，刷新丢掉可接受；而"我展开了哪些目录"
+ * 是**用户对工作区的浏览位置**，重进会话 / 刷新页面都该记得住（产品反馈 2026-10-14）。
+ * 所以这一份**持久化**（写法对齐 `stores/ui.ts` 的 `doubulea.theme`）。
+ */
+const EXPANDED_STORAGE_KEY = 'doubulea.ws-expanded'
+
+/** localStorage 在隐私模式 / 存储被禁用时会抛异常 —— 浏览位置丢失不值得让页面挂掉 */
+function readStoredExpanded(): Record<string, string[]> {
+  try {
+    const raw = window.localStorage.getItem(EXPANDED_STORAGE_KEY)
+    if (raw === null) return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+    const out: Record<string, string[]> = {}
+    for (const [conversationId, value] of Object.entries(parsed)) {
+      if (Array.isArray(value)) out[conversationId] = value.filter((item): item is string => typeof item === 'string')
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeStoredExpanded(value: Record<string, string[]>): void {
+  try {
+    window.localStorage.setItem(EXPANDED_STORAGE_KEY, JSON.stringify(value))
+  } catch {
+    // 存不下就只在本次会话生效，不打扰用户
+  }
+}
 
 interface WorkspaceState {
   tabsByConversation: Record<string, WorkspaceTabs>
+  /** 每个会话"被展开的目录"（初始空 = 全部折叠，见 `WorkspaceTree`）；落 localStorage，重进/刷新记得住 */
+  expandedByConversation: Record<string, string[]>
   /** 打开（或聚焦已打开的）一个文件 */
   openFile: (conversationId: string, path: string) => void
   /** 聚焦一个已打开的标签 */
@@ -33,6 +71,8 @@ interface WorkspaceState {
   closeFile: (conversationId: string, path: string) => void
   /** 改名 / 移动：把打开态里 `from` 迁到 `to`（去重），当前标签也跟着迁 */
   renameFile: (conversationId: string, from: string, to: string) => void
+  /** 展开 / 折叠一个目录（`WorkspaceTree` 用） */
+  toggleExpanded: (conversationId: string, path: string) => void
   /** 关闭某会话的所有标签 */
   closeAll: (conversationId: string) => void
   /** 会话被删除：整份回收（避免 `tabsByConversation` 无限增长） */
@@ -41,6 +81,7 @@ interface WorkspaceState {
 
 export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   tabsByConversation: {},
+  expandedByConversation: readStoredExpanded(),
   openFile: (conversationId, path) =>
     set((state) => {
       const tabs = state.tabsByConversation[conversationId] ?? EMPTY_TABS
@@ -79,6 +120,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
       }
       return { tabsByConversation: { ...state.tabsByConversation, [conversationId]: next } }
     }),
+  toggleExpanded: (conversationId, path) =>
+    set((state) => {
+      const expandedByConversation = {
+        ...state.expandedByConversation,
+        [conversationId]: toggleExpandedDir(state.expandedByConversation[conversationId] ?? [], path),
+      }
+      writeStoredExpanded(expandedByConversation)
+      return { expandedByConversation }
+    }),
   closeAll: (conversationId) =>
     set((state) =>
       state.tabsByConversation[conversationId] === undefined
@@ -87,10 +137,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
     ),
   dropConversation: (conversationId) =>
     set((state) => {
-      if (!(conversationId in state.tabsByConversation)) return state
-      const next = { ...state.tabsByConversation }
-      delete next[conversationId]
-      return { tabsByConversation: next }
+      const hasTabs = conversationId in state.tabsByConversation
+      const hasExpanded = conversationId in state.expandedByConversation
+      if (!hasTabs && !hasExpanded) return state
+      const tabsByConversation = { ...state.tabsByConversation }
+      delete tabsByConversation[conversationId]
+      const expandedByConversation = { ...state.expandedByConversation }
+      delete expandedByConversation[conversationId]
+      writeStoredExpanded(expandedByConversation)
+      return { tabsByConversation, expandedByConversation }
     }),
 }))
 
@@ -101,4 +156,9 @@ export function useWorkspaceTabs(conversationId: string): WorkspaceTabs {
     (state) => state.tabsByConversation[conversationId]?.activePath ?? EMPTY_TABS.activePath,
   )
   return { openPaths, activePath }
+}
+
+/** 订阅某会话"被展开的目录"（返回稳定引用：没展开过时是同一个空数组） */
+export function useWorkspaceExpandedDirs(conversationId: string): readonly string[] {
+  return useWorkspaceStore((state) => state.expandedByConversation[conversationId] ?? EMPTY_EXPANDED)
 }

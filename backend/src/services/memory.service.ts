@@ -24,7 +24,8 @@
  * ─────────────────────────────────────────────────────────────────────
  * 自动写入发生在**落库之后**（`done` 已发出）⇒ 提示不能依赖同一轮 SSE 流。故后端把提示推进
  * 一个按会话的短 TTL 队列（Redis），前端在**下一轮/聚焦/重连**时拉取（toast 晚一拍）。
- * ⚠️ 队列是**取出即消费**（`GET` 时 `DEL`）：同一条提示不会在每个聚焦里反复弹。
+ * ⚠️ 队列不是整体"取出即消费"：`AUTO` 取出即删（一次性 toast，不重复打扰），
+ *    `SUGGEST` **留到用户作答或 TTL 到期**（作答要读回它才能落库，见 `drainMemoryNotices`）。
  */
 
 import {
@@ -611,10 +612,16 @@ export async function pushMemoryNotice(
 }
 
 /**
- * 取走并清空待展示提示（**取出即消费**）。
+ * 取走"待展示提示"：**AUTO 取出即消费，SUGGEST 保留至作答或 TTL 到期**。
  *
- * 为什么是"取走"而不是"读"：提示是 toast（晚一拍、一次性的），若每次聚焦都重放同一条，
- * 用户会被同一条提示反复打扰。提示丢了也不可惜（记忆本身在面板里随时可见）。
+ * ⚠️ 两者必须分开处置（P1-8 修复）：
+ *   · `AUTO` 的记忆**已经写入**，提示只是一次性 toast ⇒ 取出即可删（同"取出即消费"的初衷：
+ *     不重复打扰，提示丢了也不可惜 —— 记忆在面板里随时可见）；
+ *   · `SUGGEST` 的记忆**尚未写入**，而"记住/忽略"要读回这条提示才能落库
+ *     （`actOnMemoryNotice` 依赖队列里的 `memoryKind`/`memoryScope`）⇒ 若在这里也删掉，
+ *     用户点"记住"时队列已空、`applied:false`，记忆永远写不进去（这正是本批修掉的 bug）。
+ *     故 SUGGEST 留到用户作答（ACCEPT/REJECT）或 TTL 自然过期；前端按 `id` 去重，
+ *     重复拉取不会重复弹卡。
  */
 export async function drainMemoryNotices(conversationId: string): Promise<MemoryNotice[]> {
   try {
@@ -622,8 +629,17 @@ export async function drainMemoryNotices(conversationId: string): Promise<Memory
     const key = memoryNoticeKey(conversationId)
     const raw = await redis.get(key)
     if (raw === null) return []
-    await redis.del(key)
-    return parseNoticeList(raw)
+    const list = parseNoticeList(raw)
+    const kept = list.filter((notice) => notice.kind === 'SUGGEST')
+    if (kept.length === 0) {
+      await redis.del(key)
+    } else {
+      // ⚠️ 写回时**保留原 TTL**（`KEEPTTL` 的等价做法）：每次拉取都重置 TTL 会让一条没人答的
+      //    建议永久挂着，而设计口径是"TTL 到点自动消失"（用户一直没回来看就不弹了）。
+      const ttl = await redis.ttl(key)
+      await redis.set(key, JSON.stringify(kept), 'EX', ttl > 0 ? ttl : config.memory.noticeTtlSec)
+    }
+    return list
   } catch (error) {
     getLogger().warn({ err: error, conversationId }, '读取记忆提示失败（按无提示处理）')
     return []

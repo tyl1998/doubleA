@@ -50,6 +50,26 @@ export const SANDBOX_LABEL_CONVERSATION = 'doubulea.conversation'
  */
 export const SANDBOX_LABEL_MODEL = 'doubulea.model'
 /**
+ * 会话**运行时**标签的键：值 = `conversations.runtime`（P1-17a）。
+ *
+ * 用途与 {@link SANDBOX_LABEL_MODEL} 同族：**复用容器前判"里面那套运行时还是不是这一轮的"**。
+ * 用户改了会话运行时（`POST /api/conversations/:id/runtime`）后，旧容器里是上一个运行时的镜像
+ * （可能没有 node / python / go …），而 Docker 与账本都不报错 ⇒ 必须按标签**回收重建**。
+ * ⚠️ 它**不参与对账判据**（"该不该活着"仍只看 {@link keepSandboxObject}）；缺标签的旧容器
+ * 只按"标签读不出来 ⇒ 重建"处理。
+ */
+export const SANDBOX_LABEL_RUNTIME = 'doubulea.runtime'
+/**
+ * **镜像 tag**标签的键：值 = 建容器时用的具体镜像 ref（如 `doubulea/sandbox-runtime:python-1`）。
+ *
+ * 用途：**复用容器前判"这个容器用的还是不是当前部署的那份镜像"**（P1-17a 的收紧）。
+ * 为什么需要它：`doubulea.runtime` 只记**栈枚举**，层版本一升（`RUNTIME_LAYER_VERSION` / toolkit /
+ * base 改了 + 重建 + 换 `.env`）而栈没变 ⇒ 只比栈会让**已在跑的容器继续用旧镜像**（改了没生效，
+ * 本仓最怕的静默无操作）。比 image tag 就会把这种情况判成"不一致 ⇒ 回收重建"。
+ * ⚠️ 同样**不参与对账判据**（"该不该活着"仍只看 {@link keepSandboxObject}）。
+ */
+export const SANDBOX_LABEL_IMAGE = 'doubulea.image'
+/**
  * 启动时刻标签的键：值 = ISO 字符串。
  * ⚠️ 它**不是**空闲回收的判据 —— 判据是库里的 `sandboxes.last_active_at`（"最后一次**引擎事件**"，
  * 见 `schema.prisma` 的 Sandbox 注释）。这个标签只用于排障（`docker inspect` 时人眼能看出
@@ -98,10 +118,26 @@ export interface SandboxLabels {
    * 可选：P0-3-4 之前建的容器与**所有卷**都没有这个标签（卷不带模型语义）。
    */
   modelId?: string
+  /**
+   * 这一轮运行时（`conversations.runtime`）。见 {@link SANDBOX_LABEL_RUNTIME}。
+   * 可选：P1-17a 之前建的容器与**所有卷**都没有这个标签。
+   */
+  runtime?: string
+  /**
+   * 建容器时用的**镜像 ref**。见 {@link SANDBOX_LABEL_IMAGE}。
+   * 可选：P1-17a 之前建的容器与**所有卷**都没有这个标签。
+   */
+  image?: string
 }
 
 /** 拼出容器/卷要打的那组标签（容器与卷**用同一组**：对账器可以拿同一个谓词处理两者） */
-export function sandboxLabels(input: { conversationId: string; startedAt: Date; modelId?: string }): Record<string, string> {
+export function sandboxLabels(input: {
+  conversationId: string
+  startedAt: Date
+  modelId?: string
+  runtime?: string
+  image?: string
+}): Record<string, string> {
   const labels: Record<string, string> = {
     [SANDBOX_LABEL_ROLE]: SANDBOX_ROLE,
     [SANDBOX_LABEL_CONVERSATION]: input.conversationId,
@@ -110,6 +146,8 @@ export function sandboxLabels(input: { conversationId: string; startedAt: Date; 
   // 空串按"没有"处理（`docker` 的标签值可以为空串，但空串读回来在语义上与缺失等价 ⇒
   // 别在标签里制造两种"没有"）
   if (input.modelId !== undefined && input.modelId !== '') labels[SANDBOX_LABEL_MODEL] = input.modelId
+  if (input.runtime !== undefined && input.runtime !== '') labels[SANDBOX_LABEL_RUNTIME] = input.runtime
+  if (input.image !== undefined && input.image !== '') labels[SANDBOX_LABEL_IMAGE] = input.image
   return labels
 }
 
@@ -146,11 +184,15 @@ export function readSandboxLabels(labels: Readonly<Record<string, string>> | und
   const conversationId = labels[SANDBOX_LABEL_CONVERSATION]
   if (conversationId === undefined || !UUID_RE.test(conversationId)) return undefined
   const modelId = labels[SANDBOX_LABEL_MODEL]
+  const runtime = labels[SANDBOX_LABEL_RUNTIME]
+  const image = labels[SANDBOX_LABEL_IMAGE]
   return {
     conversationId,
     startedAt: labels[SANDBOX_LABEL_STARTED_AT] ?? '',
     // 空串归 undefined：**"缺这个标签"与"标签是空串"必须是一种情形**（见 `sandboxLabels`）
     ...(modelId === undefined || modelId === '' ? {} : { modelId }),
+    ...(runtime === undefined || runtime === '' ? {} : { runtime }),
+    ...(image === undefined || image === '' ? {} : { image }),
   }
 }
 
@@ -193,6 +235,11 @@ export interface SandboxContainerSpecInput {
    * 可选是为了让纯函数核对与"手工起容器"两种调用都不必构造一个假 UUID。
    */
   modelId?: string
+  /**
+   * 这一轮运行时（`conversations.runtime`，P1-17a）⇒ 写进标签 {@link SANDBOX_LABEL_RUNTIME}。
+   * 可选同理（纯函数核对 / 手工起容器）。
+   */
+  runtime?: string
   /** 专用 internal bridge 的**名字**（`sandbox/network.ts` 保证它存在且是我们的） */
   network: string
   /** 资源限额（值来自 `config.sandbox.limits`） */
@@ -212,12 +259,15 @@ export interface SandboxContainerSpecInput {
  * | 键 | 值 | 干什么 |
  * |----|----|--------|
  * | `HTTP_PROXY` / `HTTPS_PROXY` | `SANDBOX_EGRESS_PROXY_URL` | 出口①：容器在**内部网络**上没有公网路由 ⇒ 出公网**只可能**经这个代理 |
- * | `NO_PROXY` | 后端沙箱代理的 `host:port` 与 `hostname` | 出口②：容器 → 后端是**内网**，**绝不能**被塞进代理（否则它要先去公网绕一圈，且代理白名单里也没有它） |
+ * | `NO_PROXY` | 后端沙箱代理的 `host:port` 与 `hostname` | 出口②：容器 → 后端是**内网**，**绝不能**被塞进代理（否则它要先跑去公网绕一圈，且代理白名单里也没有它） |
  * | `SANDBOX_BACKEND_URL` | 同上地址 | 桥扩展（P0-3-9b）用它发 `POST /api/sandbox/mcp/call` |
  *
  * ⚠️ **只写大写形态**：pi 侧是 `undici.EnvHttpProxyAgent`，包内文档与实现都只认
  * `HTTP_PROXY` / `HTTPS_PROXY`（`docs/environment-variables.md`），pi 自己的 `httpProxy`
  * 设置项也是 `??=` 到这两个大写键上。同时写一份小写只会造出"两个真相"。
+ *
+ * ⚠️ **出网范围是平台级**（`egress_policy.scope`，P1-16a）：容器这边只是把流量交给代理，
+ *    代理按平台策略（范围 + 黑白名单）判定。**不在这里注入会话身份**（不做 per-conversation）。
  */
 export function sandboxEgressEnv(input: { proxyUrl: string; backendUrl: string }): Record<string, string> {
   const backend = new URL(input.backendUrl)
@@ -253,6 +303,14 @@ export const SANDBOX_PROXY_TIMEOUT_ENV = 'SANDBOX_PROXY_TIMEOUT_MS'
  * 头名一律按**小写**写（HTTP 头名不区分大小写，Node 侧 `request.headers` 拿到的也是小写）。
  */
 export const SANDBOX_TOKEN_HEADER = 'x-sandbox-token'
+
+/**
+ * 容器 → 后端的 **git 凭据代理路径**（P1-9 · R11 修订；"按需拉取"）。
+ *
+ * ⚠️ **跨边界契约**：容器脚本 `infra/sandbox/toolkit/git-credential-doubulea.mjs` /
+ *    `git-ssh-doubulea.mjs` 逐字用这个路径回调。改这里必须同步改两个脚本（并 +1 镜像层版本）。
+ */
+export const SANDBOX_GIT_CREDENTIAL_PATH = '/api/sandbox/git/credential'
 
 /**
  * MCP 代理要用的容器环境变量（**纯函数**，§七 3 ②/③）。
@@ -507,7 +565,14 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
   const tmpfsOpts = `rw,nosuid,nodev,size=${input.limits.tmpfsMb}m`
   return {
     Image: input.image,
-    Labels: sandboxLabels({ conversationId: input.conversationId, startedAt: input.startedAt, modelId: input.modelId }),
+    Labels: sandboxLabels({
+      conversationId: input.conversationId,
+      startedAt: input.startedAt,
+      modelId: input.modelId,
+      runtime: input.runtime,
+      // 镜像 tag 进标签（P1-17a 收紧）：层版本一升、`.env` 一换 ⇒ 复用前比对不符即回收重建
+      image: input.image,
+    }),
     WorkingDir: SANDBOX_WORK_DIR,
     // 出口①/② 的地址与代理（见 `sandboxEgressEnv`）+ LLM 目标（`sandboxLlmEnv`，P0-3-4，含明文 Key）
     Env: Object.entries(input.env).map(([key, value]) => `${key}=${value}`),

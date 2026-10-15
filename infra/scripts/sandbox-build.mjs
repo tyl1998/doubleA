@@ -45,9 +45,13 @@ import {
   NODE_IMAGE,
   PI_PACKAGE,
   PI_VERSION,
+  RUNTIME_IMAGE_NAME,
+  SANDBOX_RUNTIMES,
   TOOLKIT_IMAGE_NAME,
   baseImageRef,
+  runtimeImageRef,
   toolkitImageRef,
+  variantToComponentsArg,
 } from '../sandbox/versions.mjs'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
@@ -77,7 +81,7 @@ const aptMirror =
 
 if (flags.has('--help') || flags.has('-h')) {
   console.log(
-    '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--registry <url>|--apt-mirror <host>|--dry-run|--prune]\n' +
+    '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--runtime <name[,name]>|--registry <url>|--apt-mirror <host>|--dry-run|--prune]\n' +
       '环境变量: SANDBOX_NPM_REGISTRY=<url>   （等价于 --registry；本机需要换源，见 README）\n' +
       '          SANDBOX_APT_MIRROR=<host>    （等价于 --apt-mirror；只换 Debian 源主机名，留空 = 官方）',
   )
@@ -97,6 +101,33 @@ const dryRun = flags.has('--dry-run')
 const baseOnly = flags.has('--base-only')
 const toolkitOnly = flags.has('--toolkit-only')
 const doPrune = flags.has('--prune')
+// P1-17a：`--runtime` **可多选**（重复给、或逗号分隔，如 `--runtime python --runtime node` /
+// `--runtime python,node`）；不给则**全建**。常用于"只重建改过的那几栈"（最短的一圈）。
+const requestedRuntimes = []
+for (let i = 0; i < argv.length; i += 1) {
+  if (argv[i] !== '--runtime') continue
+  const value = argv[i + 1]
+  if (value === undefined || value.startsWith('--')) {
+    console.error('--runtime 后面要跟运行时名（可逗号分隔 / 重复给）：' + SANDBOX_RUNTIMES.join('/'))
+    process.exit(2)
+  }
+  for (const piece of value.split(',')) {
+    const name = piece.trim()
+    if (name !== '') requestedRuntimes.push(name)
+  }
+  i += 1
+}
+const unknownRuntimes = requestedRuntimes.filter((name) => !SANDBOX_RUNTIMES.includes(name))
+if (unknownRuntimes.length > 0) {
+  console.error(`未知的 --runtime ${unknownRuntimes.join('/')}（应为 ${SANDBOX_RUNTIMES.join('/')}）`)
+  process.exit(2)
+}
+// 去重 + 保持传入顺序；空 = 全部
+const selectedRuntimes = [...new Set(requestedRuntimes)]
+if (selectedRuntimes.length > 0 && baseOnly) {
+  console.error('--base-only 时不构建运行时镜像（运行时 FROM toolkit）⇒ 去掉 --runtime 或 --base-only')
+  process.exit(2)
+}
 if (baseOnly && toolkitOnly) {
   console.error('--base-only 与 --toolkit-only 不能同时给（那就是"都构建"，去掉参数即可）')
   process.exit(2)
@@ -208,6 +239,7 @@ if (aptMirror !== '') {
   info('（换源：本机实测官方源只 ~0.4MB/s，清华源 ~6MB/s —— 两个 Dockerfile 的 apt 步骤是大头）')
 }
 info(`base 标签：${baseImageRef()} ｜ toolkit 标签：${toolkitImageRef()}`)
+info(`运行时标签：${SANDBOX_RUNTIMES.map((r) => runtimeImageRef(r)).join('、')}`)
 
 // ── 1. base 层 ───────────────────────────────────────────────────────────
 if (!toolkitOnly) {
@@ -261,6 +293,36 @@ if (!baseOnly) {
   info('已跳过（--base-only）')
 }
 
+// ── 2.4 运行时层（P1-17a）─────────────────────────────────────────────────
+// 一变体一份镜像（`FROM toolkit`），只装语言运行时、不装依赖。运行时**不写进 .env** —— 后端扫
+// 本机镜像（`SANDBOX_RUNTIME_REPO` 前缀 + tag 约定 `<repo>:<id>-v<层版本>`）得到可选运行时。
+if (!baseOnly) {
+  const runtimesToBuild = selectedRuntimes.length > 0 ? selectedRuntimes : SANDBOX_RUNTIMES
+  step(`构建运行时层（${runtimesToBuild.join('/')}；只装运行时、不装依赖）`)
+  for (const runtime of runtimesToBuild) {
+    const args = [
+      'build',
+      '-f',
+      join(SANDBOX_DIR, 'runtime', 'Dockerfile'),
+      '-t',
+      runtimeImageRef(runtime),
+      '--build-arg',
+      `BASE_IMAGE=${toolkitImageRef()}`,
+      '--build-arg',
+      `COMPONENTS=${variantToComponentsArg(runtime)}`,
+      '--build-arg',
+      `APT_MIRROR=${aptMirror}`,
+    ]
+    if (noCache) args.push('--no-cache')
+    args.push(join(SANDBOX_DIR, 'runtime'))
+    run(args, `运行时层构建（${runtime}）`)
+    ok(`运行时层完成（${runtime}）→ ${runtimeImageRef(runtime)}`)
+  }
+} else {
+  step('构建运行时层')
+  info('已跳过（--base-only）')
+}
+
 // ── 2.5 回收（--prune）────────────────────────────────────────────────────
 // Docker **从不自动清理**：新 tag 建好后，旧 tag 的镜像、悬空镜像、已停容器、无主卷、以及
 // **构建缓存**（本机曾累积到 ~30GB）都只会越来越多。这里把"旧 sandbox 版本"收一遍。
@@ -278,6 +340,7 @@ if (doPrune && !dryRun) {
   const keep = new Set()
   if (!toolkitOnly) keep.add(baseImageRef())
   if (!baseOnly) keep.add(toolkitImageRef())
+  if (!baseOnly) for (const runtime of SANDBOX_RUNTIMES) keep.add(runtimeImageRef(runtime))
   const envFile = join(INFRA_DIR, '.env')
   if (existsSync(envFile)) {
     for (const line of readFileSync(envFile, 'utf8').split('\n')) {
@@ -287,8 +350,9 @@ if (doPrune && !dryRun) {
   }
   info(`保护中的 tag：${[...keep].join('、') || '（无）'}`)
 
-  // ① 删掉 `doubulea/sandbox-base:*` / `doubulea/sandbox-toolkit:*` 里**不在保护名单**的 tag
-  for (const repo of [BASE_IMAGE_NAME, TOOLKIT_IMAGE_NAME]) {
+  // ① 删掉 `doubulea/sandbox-base:*` / `doubulea/sandbox-toolkit:*` / `doubulea/sandbox-runtime:*`
+  //    里**不在保护名单**的 tag
+  for (const repo of [BASE_IMAGE_NAME, TOOLKIT_IMAGE_NAME, RUNTIME_IMAGE_NAME]) {
     for (const ref of capture(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repo])) {
       if (keep.has(ref)) {
         info(`保留 ${ref}（正在用 / 本次构建）`)
@@ -327,14 +391,23 @@ if (!dryRun) {
     }
   }
 }
+// 本次构建的运行时变体（`--runtime` 子集时只列这几栈；否则全部）
+const builtRuntimes = baseOnly ? [] : selectedRuntimes.length > 0 ? selectedRuntimes : SANDBOX_RUNTIMES
 console.log(`
   把下面两行写进 infra/.env（.env 已被 gitignore，模板见 infra/.env.example）：
 ${C.yellow}    SANDBOX_IMAGE_BASE=${baseImageRef()}${C.x}
 ${C.yellow}    SANDBOX_IMAGE=${toolkitImageRef()}${C.x}
+${C.yellow}    SANDBOX_RUNTIME_REPO=${RUNTIME_IMAGE_NAME}${C.x}
 
-  ⚠️ SANDBOX_IMAGE 指向的是**最终镜像 = toolkit 层**（子方案③ §五 1）。
+  ⚠️ SANDBOX_IMAGE 是**回退镜像**（toolkit 层）：会话的 \`runtime\` 找不到对应运行时镜像时用它。
+  ⚠️ **运行时不再写进 .env**：后端启动后**扫本机镜像**（\`SANDBOX_RUNTIME_REPO\` 前缀 + tag 约定
+     \`<repo>:<变体>-v<层版本>\`）得到"有哪些运行时"，前端据它渲染 —— **有就提供、没有就不提供**。
+     ⇒ 本次构建的镜像会**自动**出现在会话设置里，无需改配置。
+${builtRuntimes.length > 0 ? `  ⚠️ 本次构建的运行时：${builtRuntimes.map((r) => runtimeImageRef(r)).join('、')}\n` : ''}
   ⚠️ 改了镜像内容就要同时改 infra/sandbox/versions.mjs 里的层版本号并重建
      —— 否则宿主上会同时留着新旧两个 tag，"上次构建的"与"这次跑的"就此分叉。
+     ⚠️ 层版本号一升，**已在跑的容器仍用旧镜像**，要等它被回收（空闲 TTL / 引擎退出）
+        或下次派活时按 \`doubulea.image\` 标签比对不符而重建 —— 见 \`sandbox/manager.ts\` 的复用判据。
 
   手 run 一个能说话的容器（当前 CMD 默认就是 --mode rpc；P0-3-2 起由 dockerode 接管）：
 ${C.dim}    ${dockerBin} run --rm -i -v doubulea-sandbox-smoke:/work ${toolkitImageRef()} --help${C.x}

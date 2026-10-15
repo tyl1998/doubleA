@@ -248,7 +248,7 @@ export const memoryNoticeSchema = z.object({
 })
 export type MemoryNotice = z.infer<typeof memoryNoticeSchema>
 
-/** `GET /api/memories/notices?conversationId=` 的响应（**取出即消费**，见服务端实现） */
+/** `GET /api/memories/notices?conversationId=` 的响应（AUTO 取出即消费、SUGGEST 留到作答，见服务端实现） */
 export const memoryNoticesResultSchema = z.object({
   items: z.array(memoryNoticeSchema),
 })

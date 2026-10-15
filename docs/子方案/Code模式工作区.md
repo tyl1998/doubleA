@@ -2,7 +2,7 @@
 
 > 上游基准：`01-整体需求与实施步骤.md`（TaskAgent / 产物交付 / 沙箱安全）、`02-后端设计.md`（§七 TaskAgent 编排、§4.8 产物、§十 安全）、`03-前端设计.md`（对话页与产物面板）、`子方案/沙箱与引擎集成.md`（容器生命周期、引擎桥、产物收集）。
 > 定位：在现有 **TaskAgent + 沙箱 + 产物** 之上，新增「**人机共享、可实时编辑、可并发、可持久**」的工作区能力，即 **Code 模式**。
-> 状态：**设计讨论稿**（2026-10-08 立项；**2026-10-10 完成一轮设计讨论定案**——部署形态、轮末变更集、保留期、多用户、产物口径、轮级撤销，见 §十三「已决」；**2026-10-12 补 git 凭据与出网口径**，见 §五 7、§十三「已决」8；仅落设计，未动代码）。
+> 状态：**设计讨论稿**（2026-10-08 立项；**2026-10-10 完成一轮设计讨论定案**——部署形态、轮末变更集、保留期、多用户、产物口径、轮级撤销，见 §十三「已决」；**2026-10-12 补 git 凭据与出网口径**，见 §五 7、§十三「已决」8；**2026-10-14 补「出网范围 + 注册表专用代理」与「执行环境：运行时 + 依赖」**（⚠️ **不区分"执行档 / 默认档"：Code 模式即执行模式，非 Code 模式即不执行**），见 §五 7.5b、§五之二、§十三「已决」9/10 / 待决 13/14）。**2026-10-14 施工：P1-16a（平台级出网范围）已落地；P1-16b（注册表专用代理）经定案不做、关闭**（§五 7.5b）。**2026-10-14 施工：P1-17（执行环境：运行时 + 依赖，a+b+c 全量）已落地**（§五之二）。
 > 本文**新增一个产品能力**（不是纯实现细则），因此它同时是 `01/02/03/06` 的**需求增量候选**；落地前需按需求变更流程回写上游四份文档。
 
 ---
@@ -311,6 +311,8 @@ pi 的 `bash` 能绕过工具中介直接写文件：
 
 > ✅ **已落地（2026-10-12，R4；施工记录见 `06` §五·补 P1-9 · P5 R4）**：收产物判据由"每轮 `/work` 快照 diff（size+mtime）"改为**本轮工作区变更集**（`shared#foldWorkspaceEvents` 折叠窗口 `[轮次起点, now]` 内的 `workspace_events`）。落点：`backend/src/sandbox/artifactChanges.ts`（**新增**纯函数：`artifactChangePaths` = 只认内容事件、丢弃 `deleted`、`renamed` 取新路径 → `filterArtifactPaths` 做隐藏段 / `ARTIFACT_EXCLUDED_DIRS` / 截断 / 排序）+ `sandbox/artifacts.ts#collectRoundArtifacts`（入参 `{conversationId, changes}`，字节改从**宿主工作区 FS** 读，先传对象再建行）+ `orchestrator/taskAgent.ts`（轮次起点**前**先 `reconcileWorkspaceOnce` 落定记忆文档/附件等 setup 写 ⇒ 落在窗口之外，收产物**前**再对账补进未中介写）。**快照基线与 `docker exec` 扫容器退役**。⚠️ 忽略规则扩容（`dist/ build/ target/ *.lock`）**未做**（仍只有 `.` 隐藏 + `node_modules`）。
 
+> ✅ **已落地（2026-10-14，#3 · git 感知产物过滤）**：R4 的"工作区变更集"不认识 git ⇒ 轮内 `git clone` / `git pull` 会把整棵树当成本轮新增（实测命中单轮 200 上限、全进产物面板）。新增 `backend/src/sandbox/gitArtifacts.ts#filterGitCleanPaths`：用**宿主 git** 判"git 仓库里**干净的 tracked 文件**"（`git ls-files` ∩ `git status --porcelain` 无输出）并从候选里剔除 —— clone/pull 拉下来、没再动过的**不算产物**；被 agent 改过 / 新建的照常收。判据在 `collectRoundArtifacts` 里排在**截断之前**（否则 clone 的 200 个文件会先占满上限）。⚠️ **保守失败**：git 不可用 / 命令报错 ⇒ 不剔除（退回现状）。自证 `pnpm workspace:regression`（L4/L5）。忽略规则扩容（`dist/ build/ target/ *.lock`）仍**未做**。
+
 ### 7. git 凭据：平台配置 + 容器内注入（2026-10-12 新增）
 
 > 背景：§十三 已决 7 把 git 定为「**agent 的普通工具**」（clone/commit/branch 都由 agent 在 `bash` 里跑，后端不做 git-aware 端点）。但"**agent 拿什么身份 clone 私有仓库**"是那条定案**没回答**的问题 —— 本节补上：凭据从哪来、放哪、怎么消失。
@@ -318,6 +320,8 @@ pi 的 `bash` 能绕过工具中介直接写文件：
 **一句话**：凭据按用户**加密存平台**（复用 MCP 凭据那套 `infra/crypto.ts`），**每次 `ensureSandbox` 时解密注入到容器 tmpfs `$HOME/.ssh` / env**，随容器销毁而消失；**绝不写进 `/work`**。
 
 > ✅ **已落地（2026-10-12，P1-9 · R11；施工记录见 `06` §五·补 P1-9 · R11 落地记录）**：契约 `shared/src/gitCredential.ts` + 迁移 `20261012130000_git_credentials`（`git_credentials`）+ `services/gitCredential.service.ts`（AAD = `${userId}:${kind}:${label}`，`hasValue` 出口，条数闸门 `GIT_CREDENTIAL_MAX_PER_USER`）+ `routes/gitCredentials.ts` 四条（仅本人）+ `sandbox/gitCredential.ts`（`gitCredentialEnv` / `gitCredentialFiles`）+ `sandbox/tar.ts`（手写 ustar）+ `docker.ts#putArchive` + `manager.ts`（派活注入 env 与 tmpfs `$HOME`）+ `config.SANDBOX_EGRESS_ALLOW_HOSTS=*` + `egress-up.sh` + 前端 `/settings/git-credentials`。⚠️ **出网强制点在 egress 代理侧**（`egress-up.sh` 读 `.env`）；HTTPS(443) 走代理天然生效、SSH(22) 不经 HTTP 代理（本期取"直接放行"口径）；**"平台配置 + 实时注入"仍为后置演进项**（§十三 待决 12）。
+
+> ✅ **已落地（2026-10-14，#4 · 拉取失败可诊断 + SSH 提醒）**：实测日志显示 agent 先走 HTTPS、平台只配了 SSH ⇒ 凭据 404、helper **静默退出**、git 只报笼统的认证失败。三处补提示：① 容器 helper `infra/sandbox/toolkit/git-credential-doubulea.mjs` 在 404 时往 **stderr** 打一句**不含密钥**的提示（"没有为 `<host>` 配置 HTTPS 凭据：配 token 或改用 SSH"）——stderr 不是凭据通道，不违反"不吐凭据"；② 记忆文档新增「Git 使用提示」段（优先 SSH）；③ 前端「设置 → Git 凭据」页 lead 明确推荐 SSH、说明 HTTPS 按 host 精确匹配。⚠️ 仍未做：SSH(22) 经代理出口（依赖 §十三 待决）。
 
 #### 7.1 三条铁律
 
@@ -401,6 +405,12 @@ sequenceDiagram
 - 用户配了多条凭据时**按 `host` 匹配**（`github.com` 用 A、`gitlab.internal` 用 B）；无匹配则不加 `GIT_SSH_COMMAND`（退回系统默认，行为不变）。
 - **优先 HTTPS_TOKEN**：token 不落盘、可细粒度 scope、易轮换；SSH 仅在必要时用（私钥落 tmpfs 仍比 token 敏感）。
 
+> ⚠️ **2026-10-13 修订：以上"建容器时注入"的口径**作废**，改成「按需拉取」**（R11 修订）。
+>   · **为什么**：容器 `ReadonlyRootfs: true` ⇒ Docker 归档 API（`putArchive` / `docker cp`）在只读 rootfs 容器上**直接 400**（`container rootfs is marked read-only`），连 tmpfs 目标也拒 ⇒ SSH 私钥**从来落不了盘**（`$HOME/.ssh` 恒空、`GIT_SSH_COMMAND -i …` 指向不存在的私钥）；HTTPS token 只能建容器时定死、改凭据要重建容器。
+>   · **现在**：凭据**不进容器**（不落盘、不进 env）。容器里只有两个 toolkit 预烘焙的**无状态 helper**：`/opt/sandbox-git/git-credential-doubulea.mjs`（`credential.helper`，`get` 时回调取 HTTPS 凭据）与 `/opt/sandbox-git/git-ssh-doubulea.mjs`（`GIT_SSH_COMMAND`，把 SSH 私钥按需写到**可写的 `/tmp`**（0600）再 `exec ssh -i`）。二者经出口② `POST /api/sandbox/git/credential`（令牌即会话身份）由后端解密后回给这一只容器。
+>   · **收益**：绕开 RO rootfs；改凭据**不用重建容器**（helper 每次现取）；平台只在真正用到时解密，明文不驻留容器。
+>   · `sandbox/spec.ts#SANDBOX_GIT_CREDENTIAL_PATH` + `sandbox/gitProxy.ts` 是端点本体；`sandbox/gitCredential.ts` 只剩 `gitCredentialHelperEnv`（**不含秘密**）与 `selectGitCredential`（按 `(protocol,host)` 挑）。`sandbox/tar.ts` / `docker.ts#putArchive` 保留为通用原语但不再用于 git 凭据。
+
 #### 7.5 出网（2026-10-12 用户定案：先默认放行）
 
 现状是**默认拒绝**：容器在 internal bridge 上**没有到公网的路由**，出公网只可能经 egress 代理，而代理只放行模型池 baseURL（`network.ts:4/15`、`config.ts:490`、`spec.ts:222`）。git clone 到 github/gitlab 因此走不通。
@@ -410,6 +420,59 @@ sequenceDiagram
 - **后续（演进项，已记入 §十三 待决 12）**：把出网收敛成**平台上的一个配置项**（按用户 / 会话 / 主机），并支持**实时注入** —— 改配置**不重建容器**即生效。
   - 可行路径：**HTTPS 面走现有 egress 代理**（策略在代理侧，改配置天然实时，无需动容器）；**SSH 面**需给容器加一条**可热更新的出口**（跳板 `ProxyCommand` / 带策略的 SSH 代理），或在"实时"与"SSH"之间取舍（例如实时策略只管 HTTPS，SSH 仍走建容器时的静态放行）。
 
+> ✅ **已落地（2026-10-13）—— 出网平台化 + 实时注入（HTTPS 面）**：平台表 `egress_policy`（**单例**，两张表 `allow_hosts` / `deny_hosts`）→ `GET/PUT /api/admin/egress-policy`（**仅 ADMIN**）→ 前端 `/admin/egress` 页 → `egress-up.sh --watch` 轮询落成**策略文件**（`policy.json`，JSON `{allow,deny}`）→ egress 代理（`infra/scripts/egress-proxy.mjs`）每 5s 热更新 ⇒ **改配置不重建容器**。
+>   · **语义**（`mode` 由两张表**推导**、不单独存；`deny` 优先）：两张表都空 ⇒ **全放行**（默认）；只配白名单 ⇒ 只放行白名单；只配黑名单 ⇒ 除黑名单外全放行；都有 ⇒ 命中黑名单即拒、其余看白名单。**模型池主机在白名单非空时并集注入**（"模型默认放行"）。
+>   · **规则形状**：`host` / `host:port` / `*.host`；契约与纯判据在 `shared/src/egressPolicy.ts`（回归 `pnpm egress:regression`）。
+>   · **审计口子**：代理每次决策（ALLOW/DENY）发一条结构化 JSONL 到 `EGRESS_AUDIT_FILE`（省 = 只走 stdout），留给后续接日志平台做审计。
+>   · 顺带补 `toolkit` 镜像装了 `openssh-client`（`TOOLKIT_LAYER_VERSION → 7`），让 SSH 型凭据在容器里有 `ssh` 可用。
+>   · ⚠️ **仍适用 7.5 的路径差异**：本批的**实时策略只覆盖 HTTPS 面**（走 HTTP 代理）；**SSH(22) 不经 HTTP 代理**，其出口仍是静态放行口径 —— 若要 SSH 也实时收敛，仍需 7.5 所述的可热更新出口。
+>   · ⚠️ **取证边界**：策略引擎已用独立冒烟（白名单/黑名单/全放行 + 热更新 + 审计 JSONL）+ `egress:regression`（9）钉住；**平台→代理**的端到端（起 `--watch` → 改库 → 代理热更新 → 真容器出网）留给用户真跑。
+
+#### 7.5b 出网范围 + 注册表专用代理（2026-10-14 定案；**P1-16a 已落地，P1-16b 经决定不做、关闭**）
+
+> ⚠️ **2026-10-14 用户定案（两处）**：
+>   ① **不区分"执行档 / 默认档"**：**Code 模式本身即执行模式**（要跑代码、要装依赖）；**不想执行的用户直接用非 Code 模式**。本节与 §五之二 是 **Code 模式内部**的能力，**不是叠在 `codeMode` 之上的第二层档位** —— "能否执行"由 `codeMode` 一个开关决定，本节只定"执行时的出网范围"。
+>   ② **出网范围是平台级、不是会话级**：用户原话"**不要放在会话里配，放到出网策略里配，默认全放行**" ⇒ 范围配在 `/admin/egress`（与既有黑白名单**并列补充**），**不在会话设置里配**。（初版曾按 per-conversation 设计并实现，已按此定案移除。）
+
+> 背景：`7.5` 落地的「出网平台化」是**平台级单例**策略、且**只按 `host` 匹配**。两个缺口在"让 agent 真能跑项目"这件事上暴露：
+>   ① **没有"出网范围"的档位** —— 今天只有全放行 / 全白名单 / 全黑名单三选一，没有一个"整机级"的粗档（如"只放行模型"或"模型 + 取包"）。
+>   ② **出网"能干什么"没有粒度** —— 放行一个注册表 host = 对该 host 的**整条隧道**放行（HTTPS 走 `CONNECT`，代理**看不见** path/method），`npm publish`、往该 host 任意 `POST` 都通；审计只有 `CONNECT host:443`，回答不了"下了哪个包"。
+> ⇒ 本节定两个增量：**A 平台级出网范围**、**B 注册表专用代理（包级出口）**。
+
+**A. 平台级出网范围（`egress_policy.scope`）**
+
+- **定位**：给出网策略补一个**粗粒度范围**，决定**基线放行集**；与既有黑白名单**并列补充**（范围给基线、白名单再加零散主机、黑名单永远硬拒）。⚠️ **默认值 = `ALL`（全放行）** —— 本增量是"给运维一个整机级收窄手段"，**不改现状语义**（否则会打断现有 Code 模式 git clone）。
+- **三档**（`egress_policy` 加一列 `scope`）：`ALL`（默认，全放行）/ `NONE`（只放行模型池）/ `REGISTRY`（模型池 + 注册表 + git 主机）。⚠️ 这是**出网范围**，不是"能力档"——**能否执行由 `codeMode` 决定**。
+- **解析**（`shared#resolveEgressPolicy`，纯函数）：`ALL`⇒`allow=['*']`；`NONE`⇒`allow=模型池 ∪ 白名单`；`REGISTRY`⇒`allow=模型池 ∪ 注册表 ∪ git ∪ 白名单`；`deny=黑名单`。**模型池主机恒并入**收窄档（否则容器连模型都调不通）；收窄档若放行集为空 ⇒ `deny=['*']`（拒绝一切，别落进"两张空表=全放行"）。
+- **落地通道**：`egress-up.sh` 读 `egress_policy.scope` → 解析成代理要的 `{allow,deny}` 两张表（**代理侧不认识 scope、也不做 per-conversation**）⇒ 沿用既有 5s 热更新，**不动出网协议语义**。
+- **UI**：平台出网策略页（`/admin/egress`）加一档下拉；默认 `ALL`。**会话设置不再有它**。
+
+**B. 注册表专用代理（包级出口）—— ❌ 经决定不做、关闭（2026-10-14）**
+
+> ❌ **2026-10-14 用户定案：P1-16b 不做**（原话"不做，主机级别的就可以了"）。理由：要上它得**多一个常驻镜像服务**（Verdaccio / devpi）+ 一套容器 `.npmrc`/`pip.conf` 注入与包级审计，而"按包审计 / 禁止 publish"这条能力**当前用不上**。⇒ **`REGISTRY` 档以主机级放行为最终形态**（模型池 ∪ 注册表 host ∪ git host），**不做**包级收窄与包级审计。下面 B 段与分批表的 b 行**保留为设计留档**（若将来要做，从这里接）。
+
+- **目标**：把"连上某 host 就随便用"收窄成"**只能下载包**"，并让审计记到**包名 + 版本**。
+- ★ **前提（必须二选一，决定成败）**：HTTPS 的 `CONNECT` 隧道对代理**不透明** ⇒ 要"看懂包管理流量"只有两条路：
+  - **B2 网内注册表镜像（首选）**：沙箱网内起镜像（npm = Verdaccio / pypi = devpi 等），容器经 `.npmrc` / `pip.conf` 指向它（**明文 HTTP 到镜像**），镜像自带上游白名单、只放行"取元数据 / 下 tarball"、**拒绝 publish / 写**、并逐条记包名版本；代理只需放行"镜像容器 → 上游注册表"。**代价：多 1 个镜像 + 1 个常驻容器**（官方镜像，不用自建）。
+  - **B1 TLS 终止（备选）**：代理用平台 CA 签发证书（容器信任该 CA）⇒ 可见 path / method，能按"下载路径"放行、拒写。代价：CA 管理 + 容器装 CA（RO rootfs / agent-dir）+ 信任 / 隐私决策（**不加容器**）。
+- **审计**：`{registry, package, version, decision}`。
+- ⚠️ **不做 B 的话**（= 当前定案），A 的"注册表范围"退化成 host 级放行 —— 有整机级范围、无包级收窄与包级审计。
+
+**分批**（施工见 `06` §五·补 **P1-16**）：
+
+| 子批 | 内容 | 依赖 |
+|------|------|------|
+| **P1-16a** ✅ | 平台级出网范围：`egress_policy.scope` + 范围解析 + `/admin/egress` 下拉 + `egress-up.sh` 解析 | 无（**不动出网协议语义**） |
+| **P1-16b** ❌ | 注册表专用代理：网内镜像（首选）或 TLS 终止 + 包级审计 | —— **经决定不做、关闭（2026-10-14）**；`REGISTRY` 以主机级放行为最终形态 |
+
+> ✅ **P1-16a 已落地（2026-10-14，**平台级**）**：`egress_policy.scope`（枚举 `ALL`/`NONE`/`REGISTRY`，默认 `ALL`）+
+>   `resolveEgressPolicy`（范围 + 两张表 + 模型池 → 解析后两张表，收窄档空放行项兜 `deny=['*']`）+
+>   `egress-up.sh` 读 scope 并解析成代理的 `{allow,deny}` + `/admin/egress` 出网范围下拉。
+>   ⚠️ **改为平台级时移除了**：`Conversation.egressScope` 列 / `POST /:id/egress-scope` / 前端会话下拉 /
+>   per-container token 身份 / 策略文件 `tokens`·`conversations` / 代理的 `Proxy-Authorization` 解析。
+>   施工/自证见 `06` §五·补 P1-16 的落地注。
+> ❌ **P1-16b 关闭（2026-10-14）**：`REGISTRY` 档 = **主机级**放行（模型池 ∪ 注册表 host ∪ git host），这是**最终形态**，不做包级收窄 / 包级审计。
+
 #### 7.6 落到分期（§十二）
 
 | 阶段 | 增量 |
@@ -417,6 +480,52 @@ sequenceDiagram
 | **P2b**（§十二） | 凭据存储 + 注入（`$HOME/.ssh` / env）+ 出网默认放行；验收：配一把只读 deploy key，agent 能 `git clone` 私有仓库，且容器回收后 `$HOME` 里无密钥残留 |
 | P3 | 前端「我的凭据」页复用 MCP 凭据交互（`pages/mcp/McpCredentialsPage.tsx` 的按项配置 + 未配置置顶） |
 | 后置 | 出网平台化 + 实时注入（§十三 待决 12）。本节全部事项已登记为 `06` §五·补 P1-9 剩余清单 **R11** |
+
+---
+
+## 五之二、执行环境：运行时与依赖（2026-10-14 定案，✅ 已落地 2026-10-14 · P1-17）
+
+> 背景：**Code 模式即执行模式**（**不区分"执行档 / 默认档"**；不想执行的用户直接用非 Code 模式，见 §五 7.5b 的注）。"让 agent 跑起来验证"（`npm test` / `pytest` / `go build`）需要**语言运行时 + 项目依赖**，而依赖是**任意的、无法预先枚举**（2026-10-14 用户定案：**依赖不能白名单**）。本节定"环境从哪来"，是 §五 7.5b「注册表专用代理」的**消费方**。
+
+### 1. 两条不能混的事：运行时 vs 依赖
+
+- **运行时**（node / python / go …）是**有限集合** ⇒ **可以预烘焙**（小、可控、可白名单）。
+- **依赖**（`package.json` / `requirements.txt` / `go.mod` …）是**无限集合** ⇒ **不预烘焙**，**运行期**从注册表拉（§五 7.5b · B）。
+- ⇒ 环境 = **多语言运行时基础层**（有限、预烘焙）+ **运行期装依赖**（无限、经注册表代理）。
+- ⚠️ 澄清一处易混：用户否掉的是**依赖白名单**（无限）；**运行时镜像目录是白名单且成立**（有限）——两者不冲突。
+
+### 2. 运行时基础层（两条候选）
+
+- **现状**：base 层有 node（pi 用）；toolkit 层有 `python3 + numpy/pandas/openpyxl + jq + git + rg`。**没有** go / java / rust，也**没有** npm 安装能力。
+- **A 单一多语言基础层**：在 toolkit 层加 node + python + go（可选 java/rust），**只装运行时、不装依赖**。镜像 +几百 MB~1GB，**所有人共用一份**。
+- **B 按会话选运行时镜像（小目录）**：`runtime` 枚举（`none` / `node` / `python` / `go` / …），每栈一份镜像，`ensureSandbox` 时选。⚠️ 这是**运行时白名单**（有限、可控）。
+- ⚠️ **推荐 B**（按栈拆、同时只持有一份、不随栈爆炸）；A 作"先一份凑合"的退化。二者都**不预烘焙依赖**。
+
+### 3. 运行期装依赖
+
+- 容器里 `npm ci` / `pip install -r` 从**注册表代理**（§五 7.5b · B）拉，落到**工作区**（`/work/node_modules` 等）。
+- ⚠️ **与工作区配额 / 冷备的冲突（必解）**：`node_modules` 动辄几百 MB，会顶掉 `WORKSPACE_MAX_TOTAL_MB`（512MB）；且**不该进 S3 冷备**（可再生、巨大）。
+  - ⇒ 依赖目录按 **`.gitignore` 风格排除**：① **不进产物**（`ARTIFACT_EXCLUDED_DIRS` 已含 `node_modules`，需扩 `venv` / `.venv` / `target` / `dist` 等）；② **不进冷备**（否则换机重建时白备几百 MB）；③ 配额口径区分"**源码字节**"与"**依赖字节**"（§十三 待决 7 的延伸）。
+- ⚠️ **依赖安装只在 Code 模式**：非 Code 模式没有工作区执行（用户不想执行就用非 Code 模式）；Code 会话的出网范围由 §五 7.5b · A 的 `egressScope` 决定（`NONE` 则装不了，也不会误触发）。
+
+### 4. 凭据隔离（★ 与"跑任意代码"直接冲突）
+
+- 一旦允许装依赖 + 跑项目代码，**依赖的 postinstall / 项目脚本会执行**，而 git 凭据 helper（§五 7.4 的"按需拉取"）**在同一容器里** ⇒ 恶意脚本可回调 `POST /api/sandbox/git/credential` 取密钥并外带。
+- 候选：
+  - **a 分相**：`clone`（要凭据）与 `run`（跑不可信代码）**分两次容器生命周期 / 两个容器**；跑代码时不挂凭据 helper、后端拒绝该容器的凭据请求；
+  - **b 最小权限**：凭据只给**只读 deploy key**（无 push 权限），降低"被偷"的损失；
+  - **c 接受 + 审计**：依赖安装 / 执行阶段的出网与凭据调用**全量审计**（§五 7.5b 的 `conversationId` 归因）。
+- ⚠️ **默认取 a + b**（分相 + 只读凭据）；c 是兜底。
+
+### 5. 分批
+
+| 子批 | 内容 | 依赖 |
+|------|------|------|
+| **P1-17a** | 运行时基础层（多语言、只装运行时）+ `runtime` 会话选择 | 无 |
+| **P1-17b** | 运行期装依赖 + 依赖目录排除（产物 / 冷备 / 配额）+ `.npmrc` / `pip.conf` 指向镜像 | **P1-16b 已关闭（不做）** ⇒ 依赖走**主机级出网**（公共源 / 自配 `SANDBOX_EGRESS_REGISTRY_HOSTS`），**不指向网内镜像** |
+| **P1-17c** | 凭据隔离（分相 / 只读凭据 / 审计） | **P1-16a**（审计）+ P1-17b |
+
+> 施工见 `06` §五·补 **P1-17**。
 
 ---
 
@@ -555,7 +664,8 @@ flowchart LR
 | 越权 | 所有端点按会话归属判权，他人一律 404（与产物同族） |
 | 密钥 | 工作区不跨用户可见；日志脱敏沿用 `LOG_REDACT_PATHS` |
 | **git 凭据** | 按用户加密存平台（AAD 绑 `userId:kind:label`）；**只注入 tmpfs `$HOME/.ssh` / env，绝不写 `/work`**（否则进 S3 冷备与产物）；明文只在解密服务与建 spec 时出现（§五 7） |
-| **出网** | 本期 git 主机（22/443）**默认放行**；后续收敛为平台配置 + **实时注入**（§五 7.5、§十三 待决 12） |
+| **出网** | 本期 git 主机（22/443）**默认放行**；平台化 + 实时注入（HTTPS 面）已落地（§五 7.5）；**2026-10-14 定增量**：**平台级出网范围**（✅ 已落地，§五 7.5b）+ **注册表专用代理**（❌ 经决定不做、关闭），见 §五 7.5b、§十三 已决 9 / 待决 13 |
+| **执行环境** | 运行时**预烘焙**（有限、可白名单）、依赖**运行期拉**（无限，经注册表代理）；依赖目录**不进产物 / 冷备**、配额区分**源码字节 vs 依赖字节**；**跑不可信代码时凭据分相 + 只读**（§五之二、§十三 已决 10 / 待决 14） |
 | 注入 | 路径参数进 `docker exec` / FS 操作前必须校验（现状 `execInSandbox` 用数组 form 防注入，新写路径要维持同一纪律） |
 
 ---
@@ -587,9 +697,24 @@ flowchart LR
 | `WORKSPACE_RETENTION_DAYS` | **7** | 天 | 工作区保留期（**2026-10-10 定案：与 `ARTIFACT_RETENTION_DAYS` 共用同一值**，见 §十三 已决 4） |
 | `WORKSPACE_TEXT_INLINE_MAX_MB` | **2** | MB | 读接口内联返回的文本上限（超过改走流式 / 只读下载） |
 | `SANDBOX_EGRESS_ALLOW_HOSTS` | **`*`（本期全放行）** | 主机列表 | Code 模式 git 出网（22/443）；`*` = 默认放行，后续收敛为平台配置 + 实时注入（§五 7.5） |
+| `SANDBOX_EGRESS_REGISTRY_HOSTS` | **官方公共源**（npm/yarn/pypi/go） | 主机列表 | **P1-16a**：`REGISTRY` 范围放行的**取包主机**（逗号分隔；空 = 用 `egress-up.sh` 内默认）。⚠️ **P1-16b（网内镜像）已关闭** ⇒ 这就是**最终口径**（主机级） |
+| `SANDBOX_EGRESS_GIT_HOSTS` | **github/gitlab/bitbucket** | 主机列表 | **P1-16a**：`REGISTRY` 范围同时放行的 **git 主机**（逗号分隔；空 = 内默认） |
+| `egress_policy.scope` | **`ALL`** | 枚举 | **P1-16a**：**平台级出网范围**（`ALL` 全放行 / `NONE` 仅模型 / `REGISTRY` 模型 + 取包）；平台级单列，非"能力档"、**非会话级** |
 | `GIT_CREDENTIAL_MAX_PER_USER` | **5** | 条 | 单用户 git 凭据条数上限（§五 7.2） |
+| `SANDBOX_RUNTIME_REPO` | **`doubulea/sandbox-runtime`** | 仓库名前缀 | **P1-17a**：后端扫本机镜像（tag 约定 `<repo>:<变体>-v<层版本>`）得到"有哪些运行时"，前端据它渲染。★ **2026-10-14 定案 B：运行时集合来自"本机镜像探测" + 用户选到没有的组合时后端按需构建** |
+| `SANDBOX_RUNTIME_BUILD_CONTEXT` | **自动推断**（`infra/sandbox/runtime`；推断不出 = 不可构建） | 目录 | **P1-17a · B**：按需构建时的 `docker build` 上下文（含 `Dockerfile` + 脚本）。生产镜像里通常没有这份源码 ⇒ `canBuild=false` |
+| `SANDBOX_DOCKER_BIN` | **`docker`** | 可执行文件 | **P1-17a · B**：按需构建用的 docker CLI |
+| `Conversation.runtime` | **`node22`** | 自由字符串 | **P1-17a**：会话运行时**变体 id**（组件集合规范化，如 `node22-python310`；组件目录 `shared/src/runtime.ts`）；派活时按它在探测结果里选镜像（找不到回退 `SANDBOX_IMAGE`）+ 写 `doubulea.runtime` 标签。**依赖不在这里**（运行期拉）。要加组件/版本 = 改 `shared/src/runtime.ts` + `infra/sandbox/versions.mjs`（两处一致） |
+| 依赖目录名单 | **`node_modules` / `venv` / `.venv` / `target` / `dist` / `__pycache__` …** | 名单 | **P1-17b**：`workspace/dependencyModel.ts`（**一处定义**；任一段命中即算）。**不进索引 / 产物 / 冷备、不算源码配额、写/移闸门拒**；依赖字节单独计量（`scanWorkspaceTree.dependencyBytes`）。⚠️ **刻意不收 `build`/`out`**（易撞用户源码目录） |
+| 执行相键 TTL | **43200**（12h） | 秒 | **P1-17c**：`sandbox:credphase:{id}` 的 TTL（主机制是显式清除；TTL 只兜底） |
 
 > **代码常量不进 env** 的取舍同 `PI_RPC_STDIO_MAX_BYTES` / `ACTIVITY_TOUCH_INTERVAL_MS`。
+>
+> ⚠️ **P1-16a 不新增"身份"参数**：出网范围改为**平台级**后**不需要 per-container 身份** —— 代理只认平台策略（`egress-up.sh` 把 `scope` 解析进 `{allow,deny}`），容器注入的仍是裸 `SANDBOX_EGRESS_PROXY_URL`。
+>
+> ⚠️ **P1-17（执行环境：运行时 + 依赖，✅ 已落地 2026-10-14，§五之二）的新参数**（`SANDBOX_RUNTIME_REPO` / `Conversation.runtime` / 依赖目录名单 / 执行相键 TTL）**已并入本表**。**P1-16b（注册表专用代理）已关闭（不做）** ⇒ 不并入其"镜像地址 / 包清单"参数；`REGISTRY` 以主机级放行为准（见上两行）。
+> ★ **2026-10-14 修订（用户定案，重要）**：运行时**不做成写死的枚举** —— 可用运行时**由后端扫本机镜像探测**（`GET /api/sandbox/runtimes`，tag 约定 `<repo>:<变体>-v<层版本>`），前端据它渲染，**有就提供、没有就不提供**。`Conversation.runtime` 相应改为**自由字符串**（默认 `node22`），旧枚举 `conversation_runtime` 已在迁移 `20261015100000_conversation_runtime_text` 删除。
+> ★ **2026-10-14 定案 B（按需构建）**：用户选了**本机没有的组合**（如 Python 3.10 + Node 22）时，**后端自动 `docker build`** 该组合（`POST /api/sandbox/runtimes/build`；串行 + 同 tag 去重，组合键即 tag ⇒ 第二次命中缓存）—— **不再要求运维预先猜组合、也不必为每个组合手改镜像**。运行时 = **组件目录**（语言+版本，`shared/src/runtime.ts`）的**组合**；变体 id = 组件按语言顺序排序后用 `-` 连接（如 `node22-python310`）。`runtime/Dockerfile` 已从"写死 `RUNTIME` 分支"泛化为接受 `COMPONENTS=lang=ver,…`。**组件目录两处必须一致**：`shared/src/runtime.ts` 与 `infra/sandbox/versions.mjs`。
 
 ---
 
@@ -605,6 +730,8 @@ flowchart LR
 | P4 | 中途注入 / abort+重派 + 轮末 diff 审阅 + **「撤销本轮」**（轮级变更集回滚，§七 5） | 主动感知 + 变更集审阅 + **一键回滚整轮** |
 | P5 | S3 冷备 / 恢复 + artifact 集成 + workspace reaper | 容器回收后工作区仍在；宿主迁移后从 S3 重建。**R3（S3 冷备/恢复）已落地（2026-10-12）**；**R4（artifact 集成：产物 = 工作区变更集视图）已落地（2026-10-12）**；**R5（保留期清理：存活会话超期）已落地（2026-10-12）—— P5 三项全部落地** |
 | P6 | 配额 / 二进制 / 多用户协作（可选 Yjs） | 硬化与协同。**R6（配额/二进制硬化：二进制嗅探 + 更严的大小/数量/类型闸门 + 写入限流）已落地（2026-10-12）**；多用户协作（Yjs）为可分期的后续项 |
+| **P7** | **出网范围（平台级）+ 注册表专用代理**（§五 7.5b） | 平台出网策略可表达"全放行 / 仅模型 / 模型 + 取包"。**P1-16a 已落地（2026-10-14，平台级出网范围）；P1-16b（注册表专用代理，包级审计到包名 + 版本）经决定不做、关闭（2026-10-14）** ⇒ `REGISTRY` 以主机级放行为最终形态 |
+| **P8** | **执行环境：运行时 + 依赖**（§五之二） | 运行时预烘焙（有限、可白名单）、依赖运行期拉（无限）；依赖目录不进产物/冷备；跑不可信代码时凭据分相 + 只读。**✅ 已落地（2026-10-14，P1-17 a+b+c）**：方案 B 一栈一份运行时镜像（none/node/python/go/java/rust，另加多栈合一的 multi=node+python+go）+ `Conversation.runtime`；依赖目录名单一处定义（不进索引/产物/冷备、配额区分源码 vs 依赖）；凭据分相（clone→run 单向）+ 只读 helper + 审计 |
 
 每阶段需配套：`shared` 契约增量、验证脚本（对齐本仓 `verify:*` 文化）、README / `02` / `03` / `06` 回写。
 
@@ -632,6 +759,8 @@ flowchart LR
 | 6 | `artifacts` 与工作区的关系 | **产物收敛为「工作区变更集视图」**：产物 = 交付 / 变更子集，非目录树快照；`git clone` 等初始填充**不算产物**（§五 6） |
 | 7 | **git 的定位** | **git = agent 的普通工具**：clone/commit/branch 由 agent 在 `bash` 里跑，后端**不做 git-aware 端点 / UI**；`.git` 属**工作区内容**（保留）、**不进产物**（变更集永远排除 `.git/*`）、**进冷备**（否则换机重建丢历史）；**不预设"工作区 = 一个 repo"**，clone 是常规操作不是特例 |
 | 8 | **git 凭据与出网（2026-10-12）** | 凭据**按用户加密存平台**（复用 `infra/crypto.ts` + MCP 凭据同族纪律），**每次建容器时注入 tmpfs `$HOME/.ssh` / env**，随容器销毁；**绝不写 `/work`**（不进冷备 / 产物）。**出网本期默认放行**（git 22/443）；"平台配置 + 实时注入"为演进项（详见 §五 7、待决 12） |
+| 9 | **出网范围 + 注册表专用代理（2026-10-14）** | **A 平台级出网范围**（`egress_policy.scope` = `ALL`/`NONE`/`REGISTRY`，与黑白名单**并列补充**，**默认 `ALL` 全放行**；⚠️ **不是"能力档"** —— 能否执行由 `codeMode` 决定；⚠️ **平台级、不在会话里配**）✅ 已落地；**B 注册表专用代理**（包级出口与审计）❌ **经决定不做、关闭（2026-10-14）** ⇒ `REGISTRY` 以主机级放行为最终形态。见 §五 7.5b、`06` §五·补 P1-16 |
+| 10 | **执行环境：运行时 + 依赖（2026-10-14）** | **运行时**（有限）**预烘焙**、**依赖**（无限、不能白名单）**运行期**经注册表代理拉；**依赖目录不进产物 / 冷备、配额区分源码 vs 依赖**；**跑不可信代码时凭据分相（clone / run）+ 只读 deploy key**。分批 **P1-17a/b/c**，见 §五之二、`06` §五·补 P1-17 |
 
 ### 待决（需用户拍板）
 
@@ -642,7 +771,9 @@ flowchart LR
 | 9 | **无中介写（bash）的代码库忽略规则** | `.lock` / `dist` / 生成物反复冲突，需显式忽略名单（与 §五 6 忽略规则扩容同条） |
 | 10 | 与 P1-8 记忆文档的接缝 | 共享工作区里记忆文件（`.doubulea/memory.md`）与"单一真相"如何合流，避免被当工作区文件误改 |
 | 11 | **工作区「钉机记录」的载体与寿命** | Redis 长 TTL vs `Workspace.instanceId` 列（P1-14 用 Redis）；决定 §十六 C 的落地形态 |
-| 12 | **出网策略的平台化与实时注入** | 本期默认放行、静态生效；目标是把出网收敛为平台配置项（按用户 / 会话 / 主机）且**改配置不重建容器**。HTTPS 面可落在现有 egress 代理侧（天然实时）；**SSH(22) 不经 HTTP 代理**，需另设可热更新的出口或取舍（§五 7.5）。决定 egress 代理与网络层的改造范围 |
+| 12 | **出网策略的平台化与实时注入** | ✅ **已落地（2026-10-13，HTTPS 面）**：`egress_policy` 表（单例）+ `/api/admin/egress-policy`（仅 ADMIN）+ `/admin/egress` 页 + `egress-up.sh --watch` 落策略文件 + 代理 5s 热更新；`shared/src/egressPolicy.ts` 纯判据 + `egress:regression`。语义 = 两张表推导模式、deny 优先、模型池主机并集注入、默认全放行；审计 JSONL 口子留好。⚠️ **SSH(22) 面仍是静态口径**（不经 HTTP 代理），若要实时收敛仍需另设可热更新出口（见 §五 7.5 落地注）。 |
+| 13 | **出网范围的身份载体与注册表代理形态**（2026-10-14，§五 7.5b） | ✅ **已结（2026-10-14）**：① 身份载体（token vs IP）**作废** —— 出网范围【改为**平台级**】后**不需要 per-container 身份**（代理只认平台策略）；③ 出网范围默认值**已定**（`ALL` 全放行）。❌ ② 注册表代理形态、④ 注册表清单与 git 依赖 **随 P1-16b 关闭一并作废**（用户定案：**主机级放行即可、不做包级**）。 |
+| 14 | **执行环境的运行时范围与依赖排除**（2026-10-14，§五之二） | ✅ **已结（2026-10-14，P1-17 落地）**：① 运行时范围 = **node/python/go/java/rust**（+`none`；用户拍板）+ **`MULTI` 多栈合一**（node+python+go，2026-10-14 增量）；② 运行时载体 = **方案 B**（一栈一份运行时镜像 + `Conversation.runtime` + `ensureSandbox` 选镜像；用户拍板）；③ 依赖目录名单 = `workspace/dependencyModel.ts`（**一处定义**、任一段命中）**且配额区分源码字节 vs 依赖字节**（依赖不进索引 ⇒ 自然不计源码配额，另量 `dependencyBytes`）；④ 冷备**完全排除**依赖目录（冷备按索引行取字节 ⇒ 依赖不在索引里 ⇒ 天然排除）；⑤ 凭据隔离默认取"**分相 + 只读**"（`credentialPhase` 单向 clone→run + helper 只实现 `get`）。 |
 
 ---
 
@@ -667,6 +798,8 @@ flowchart LR
 | git 凭据注入容器 | `backend/src/sandbox/spec.ts`（`$HOME` tmpfs / env）、`manager.ts#ensureSandbox`、`docker.ts`（`putArchive`，§十四 待加原语） |
 | git 凭据数据模型 | `backend/prisma/schema.prisma`（新增 `GitCredential`，挂 `User`） |
 | 出网代理 / 白名单 | `backend/src/sandbox/network.ts`、`spec.ts#sandboxEgressEnv`、`config.ts`（`SANDBOX_EGRESS_PROXY_URL` / 新增 `SANDBOX_EGRESS_ALLOW_HOSTS`） |
+| 出网范围（平台级）· **P1-16a** ✅ 已落地（2026-10-14） | `shared/src/egressPolicy.ts`（`EGRESS_SCOPES` + `resolveEgressPolicy` + 两张表 schema 增 `scope`）、`backend/prisma/schema.prisma`（`EgressPolicy.scope`）、`backend/src/services/egressPolicy.service.ts` + `routes/egressPolicy.ts`（读写范围）、`infra/scripts/egress-up.sh`（读 `scope` → 解析成 `{allow,deny}`）、前端 `pages/admin/EgressPolicyPage.tsx` + `api/egressPolicy.ts` |
+| 注册表专用代理 · **P1-16b** ❌ 经决定不做、关闭（2026-10-14） | （留档）`infra/scripts/egress-proxy.mjs` + **新增网内镜像**（Verdaccio / devpi，首选）或 TLS 终止（备选）；容器 `.npmrc` / `pip.conf` 注入（`backend/src/sandbox/spec.ts`）；包级审计。⇒ **当前不做**：`REGISTRY` 以主机级放行（模型池 ∪ 注册表 host ∪ git host）为最终形态 |
 | 凭据页复用 | `frontend/src/pages/mcp/McpCredentialsPage.tsx`、`frontend/src/api/mcp.ts`（交互参照） |
 
 ---

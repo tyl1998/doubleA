@@ -116,8 +116,10 @@ const {
   ARTIFACT_PREVIEW_CSV_CELL_CHARS,
   artifactContentUrl,
   artifactDownloadUrl,
+  artifactRenderUrl,
   csvDelimiterOf,
   decodeUtf8Text,
+  isMarkdownMime,
   parseCsvText,
   buildCsvTable,
   csvTableNote,
@@ -150,10 +152,28 @@ await it('A2 ★ `image/svg+xml` 归 `html` 那一族（**不是** image）—�
 await it('A3 `none`：zip / 未知类型 / 空串 / `undefined` ⇒ 都不给预览入口', () => {
   assertEqual(previewKindOf('application/octet-stream'), 'none', 'octet-stream')
   assertEqual(previewKindOf('application/zip'), 'none', 'zip')
-  assertEqual(previewKindOf('application/vnd.openxmlformats-officedocument.wordprocessingml.document'), 'none', 'docx')
   assertEqual(previewKindOf(''), 'none', '空串')
   assertEqual(previewKindOf(undefined), 'none', 'undefined（不抛错）')
   assertEqual(previewKindOf(null), 'none', 'null（不抛错）')
+})
+
+await it('A3b ★ DOCX/XLSX 是独立形态（P1-16）：**不是** html（原始字节是二进制 OOXML），走 `/render` 出口', () => {
+  assertEqual(
+    previewKindOf('application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+    'docx',
+    'docx',
+  )
+  assertEqual(
+    previewKindOf('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+    'xlsx',
+    'xlsx',
+  )
+  // pptx 仍未支持 ⇒ none
+  assertEqual(
+    previewKindOf('application/vnd.openxmlformats-officedocument.presentationml.presentation'),
+    'none',
+    'pptx 仍 none',
+  )
 })
 
 await it('A4 大小写与参数都不影响判定（`text/HTML; charset=utf-8`）', () => {
@@ -162,11 +182,31 @@ await it('A4 大小写与参数都不影响判定（`text/HTML; charset=utf-8`�
   assertEqual(previewKindOf('  text/csv  '), 'text', '前后空白')
 })
 
-await it('A5 名单刻意保守：代码类（`text/x-python` 等）不在 `text` 一族 ⇒ 只给下载', () => {
-  // 这是 §四 2 那张表的逐字执行；要扩就在 `previewKindOf` 一处扩，前后端同时生效
-  assertEqual(previewKindOf('text/x-python'), 'none', 'py')
-  assertEqual(previewKindOf('text/javascript'), 'none', 'js')
-  assertEqual(previewKindOf('text/yaml'), 'none', 'yaml')
+await it('A5 文本/代码并入 `text` 一族（P1-16 起）：**任何 `text/*`** 都走源码预览，不再"只给下载"', () => {
+  assertEqual(previewKindOf('text/x-python'), 'text', 'py')
+  assertEqual(previewKindOf('text/javascript'), 'text', 'js')
+  assertEqual(previewKindOf('text/typescript'), 'text', 'ts')
+  assertEqual(previewKindOf('text/x-shellscript'), 'text', 'sh')
+  assertEqual(previewKindOf('text/yaml'), 'text', 'yaml')
+  assertEqual(previewKindOf('application/xml'), 'text', 'xml')
+  assertEqual(previewKindOf('text/x-markdown'), 'text', 'md 变体')
+  // 其它语言（工作区表认得的）现在也自动命中 `text/*` 兜底
+  assertEqual(previewKindOf('text/x-java'), 'text', 'java')
+  assertEqual(previewKindOf('text/x-go'), 'text', 'go')
+  assertEqual(previewKindOf('text/x-rust'), 'text', 'rust')
+  assertEqual(previewKindOf('text/css'), 'text', 'css')
+  assertEqual(previewKindOf('text/x-sql'), 'text', 'sql')
+  assertEqual(previewKindOf('text/x-toml'), 'text', 'toml')
+  // ★ `text/html` 仍归 `html`（不能被 `text/*` 兜底吞掉）—— 那是唯一必须"当文档"的 text/*
+  assertEqual(previewKindOf('text/html'), 'html', 'html 不被兜底吞掉')
+})
+
+await it('A6 Markdown 变体判据：`isMarkdownMime` 只认 MD，代码类仍走 `<pre>`', () => {
+  assertEqual(isMarkdownMime('text/markdown'), true, 'md')
+  assertEqual(isMarkdownMime('text/x-markdown'), true, 'md 变体')
+  assertEqual(isMarkdownMime('text/markdown; charset=utf-8'), true, '带参数')
+  assertEqual(isMarkdownMime('text/x-python'), false, 'py 不是 md')
+  assertEqual(isMarkdownMime('application/json'), false, 'json 不是 md')
 })
 
 // ───────────────────────────── B CSV 解析（RFC 4180，自写）─────────────────────────────
@@ -314,12 +354,15 @@ groupStart('E', '预览 / 下载 URL 的构造（**不带任何 query**：两个
 await it('E1 路径里带上 artifactId，且**没有** query', () => {
   assertEqual(artifactContentUrl('a1'), '/api/artifacts/a1/content', 'content')
   assertEqual(artifactDownloadUrl('a1'), '/api/artifacts/a1/download', 'download')
+  assertEqual(artifactRenderUrl('a1'), '/api/artifacts/a1/render', 'render（DOCX 渲染出口）')
   assert(!artifactContentUrl('a1').includes('?'), '预览 URL 不带 query')
   assert(!artifactDownloadUrl('a1').includes('?'), '下载 URL 不带 query')
+  assert(!artifactRenderUrl('a1').includes('?'), '渲染 URL 不带 query')
 })
 
 await it('E2 id 走 `encodeURIComponent`（产物 id 是 uuid，但拼串那处不该信任输入形态）', () => {
   assertEqual(artifactContentUrl("a b&c"), '/api/artifacts/a%20b%26c/content', '特殊字符已编码')
+  assertEqual(artifactRenderUrl("a b&c"), '/api/artifacts/a%20b%26c/render', '渲染 URL 同样编码')
 })
 
 // ───────────────────────────── F 源码级守门 ─────────────────────────────

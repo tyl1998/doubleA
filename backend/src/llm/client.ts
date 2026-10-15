@@ -205,6 +205,17 @@ export interface ChatStreamCallbacks {
   onThinking?: (text: string) => void
   /** usage 一旦出现就回调（多数实现只在最后一帧给，且需要 `stream_options` —— 见文件头 ②） */
   onUsage?: (usage: ChatUsage) => void
+  /**
+   * 一个工具调用的 **`id` + `name` 首次齐备**时回调一次（参数可能**还没流完**）。
+   *
+   * 存在的理由：工具调用是"先报名字、再把参数一段段吐出来"的，而参数可能流很久（实测一次
+   * 9 个调用的参数花了 20+ 秒）。没有这个回调，编排层要等整轮结束才拿到 `toolCalls`，
+   * 那段时间界面上**一条事件都没有**（正文没有、工具卡也没有）⇒ 看起来像卡死。
+   * 有了它，编排层可以在"知道要调哪个工具"的这一刻就先落一张"待调用"卡。
+   *
+   * ⚠️ **只在 id+name 齐备时触发**（缺一不可，否则落不出可 upsert 的卡）；同一个 `id` 只回调一次。
+   */
+  onToolCallStart?: (call: ChatToolCall) => void
 }
 
 export interface ChatOptions {
@@ -392,6 +403,22 @@ export async function chatStream(
    */
   const toolBuffer = createToolCallBuffer()
 
+  /**
+   * 已经"报过到"的工具调用 id —— 保证 {@link ChatStreamCallbacks.onToolCallStart} **每个 id 只回调一次**。
+   *
+   * 工具调用是逐片到达的：先来 `id`+`name`，再来一段段 `arguments`。这里只在"该段第一次 id+name 齐备"
+   * 时通知一次，绝不因为后续参数片重复通知（否则编排层会落一堆重复卡）。
+   */
+  const announcedToolCallIds = new Set<string>()
+  const announceToolCalls = (): void => {
+    if (callbacks.onToolCallStart === undefined) return
+    for (const call of readToolCalls(toolBuffer).calls) {
+      if (announcedToolCallIds.has(call.id)) continue
+      announcedToolCallIds.add(call.id)
+      callbacks.onToolCallStart(call)
+    }
+  }
+
   const body = protocol.buildBody({
     model: target.modelName,
     messages,
@@ -458,6 +485,7 @@ export async function chatStream(
     if (parsed.usage !== null) callbacks.onUsage?.(parsed.usage)
     // ⚠️ 这一路也要灌累积器：上游忽略 `stream:true` 时工具调用**照样可能在报文里**
     absorbToolCalls(toolBuffer, parsed.toolCalls)
+    announceToolCalls()
     const fallback = readToolCalls(toolBuffer)
     if (fallback.incomplete > 0) {
       logIncompleteToolCalls(target, fallback.incomplete)
@@ -525,7 +553,11 @@ export async function chatStream(
       callbacks.onUsage?.(state.usage)
     }
     // ⚠️ **只累积，不解析**（`arguments` 此刻可能只是 `{"a":`）—— 见 `protocol.ts` 文件头 ③
-    if (frame.toolCalls.length > 0) absorbToolCalls(toolBuffer, frame.toolCalls)
+    if (frame.toolCalls.length > 0) {
+      absorbToolCalls(toolBuffer, frame.toolCalls)
+      // 一旦某个调用 id+name 齐备就通知编排层（参数还没流完）⇒ 界面能提前落一张"待调用"卡
+      announceToolCalls()
+    }
     if (frame.done) endSignalSeen = true
   }
 

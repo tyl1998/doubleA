@@ -31,6 +31,7 @@ export {
   sha256,
   softDeleteIndexedFile,
   syncFileFromDisk,
+  uploadWorkspaceFile,
   writeWorkspaceFile,
   WORKSPACE_EVENT_REPLAY_MAX,
   type WorkspaceFileSource,
@@ -53,11 +54,20 @@ export {
   alignAgentOwnership,
   ensureWorkspaceDir,
   scanWorkspaceFiles,
+  scanWorkspaceTree,
   workspaceContentIsBinary,
   workspaceDirIsEmpty,
   WORKSPACE_TMP_PREFIX,
   type WorkspaceScanEntry,
+  type WorkspaceScanResult,
 } from './store.js'
+
+// 依赖目录判据（P1-17b；零 config / DB / FS，可在自证脚本里逐条核对）
+export {
+  isWorkspaceDependencyDirName,
+  isWorkspaceDependencyPath,
+  WORKSPACE_DEPENDENCY_DIRS,
+} from './dependencyModel.js'
 
 // 事件总线（实时订阅 + 落库）
 export {

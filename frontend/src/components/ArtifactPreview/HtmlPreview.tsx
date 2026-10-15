@@ -33,13 +33,19 @@ export interface HtmlPreviewProps {
   artifactId: string
   /** 用于 iframe 的无障碍标题（文件名） */
   fileName: string
+  /**
+   * iframe 的 `src`。缺省 = {@link artifactContentUrl}（HTML/SVG 的字节直出）；
+   * **DOCX 传 {@link artifactRenderUrl}**（`/render`，服务端渲染好的 HTML）——
+   * 两者都是"同源的 HTML 文档"，故共用本组件与同一套沙箱属性。
+   */
+  src?: string
 }
 
-export function HtmlPreview({ artifactId, fileName }: HtmlPreviewProps) {
+export function HtmlPreview({ artifactId, fileName, src }: HtmlPreviewProps) {
   return (
     <iframe
       className="preview__frame"
-      src={artifactContentUrl(artifactId)}
+      src={src ?? artifactContentUrl(artifactId)}
       // 空串 = 最严格：**不含 `allow-scripts`、不含 `allow-same-origin`**
       sandbox=""
       referrerPolicy="no-referrer"

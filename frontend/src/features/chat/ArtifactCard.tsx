@@ -37,7 +37,7 @@
  * 卡片只接受一个已经算好的字符串。
  */
 
-import { Button, Popconfirm } from 'antd'
+import { Button, Checkbox, Popconfirm } from 'antd'
 import { useState } from 'react'
 
 import { formatBytes } from '../../app/format.js'
@@ -60,6 +60,15 @@ export interface ArtifactCardProps {
    * 时按钮进入 loading 直到它落定 —— 失败由调用方（页面）统一提示。
    */
   onDelete?: () => Promise<void> | void
+  /**
+   * 提供时在卡片最左侧渲染一个**勾选框**（**会话产物页**用；对话页 / 产物面板不传 ⇒
+   * 行为逐字不变）。与 `onDelete` 同一条口径：可选入参，只有会话产物页传。
+   *
+   * ⚠️ 判据是 `onSelectedChange` 是否提供（不是 `selected`）—— 与 `onDelete` 同款：
+   * "能不能选"由调用方决定，卡片自己不认识"批量删除"这件事。
+   */
+  selected?: boolean
+  onSelectedChange?: (checked: boolean) => void
 }
 
 /** 卡片左侧的方框里写什么：取扩展名（大写、最多 4 字符），没有扩展名就写 `FILE` */
@@ -69,7 +78,7 @@ function kindOf(fileName: string): string {
   return fileName.slice(dot + 1).toUpperCase().slice(0, 4)
 }
 
-export function ArtifactCard({ artifact, timeText = null, onDelete }: ArtifactCardProps) {
+export function ArtifactCard({ artifact, timeText = null, onDelete, selected = false, onSelectedChange }: ArtifactCardProps) {
   const openPreview = useArtifactPreviewStore((state) => state.openPreview)
   const { downloading, download } = useArtifactDownload()
   const [deleting, setDeleting] = useState(false)
@@ -82,10 +91,19 @@ export function ArtifactCard({ artifact, timeText = null, onDelete }: ArtifactCa
 
   return (
     <div className="artifact" data-testid="artifact-card">
+      {onSelectedChange ? (
+        <Checkbox
+          checked={selected}
+          onChange={(event) => {
+            onSelectedChange(event.target.checked)
+          }}
+          aria-label={`选择 ${artifact.fileName}`}
+        />
+      ) : null}
       <span className="artifact__kind" aria-hidden="true">
         {kindOf(artifact.fileName)}
       </span>
-      <div>
+      <div className="artifact__body">
         <p className="artifact__name">{artifact.fileName}</p>
         <p className="artifact__meta num">{meta}</p>
       </div>

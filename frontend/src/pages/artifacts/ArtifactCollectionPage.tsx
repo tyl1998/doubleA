@@ -7,12 +7,18 @@
  * 所以它们也仍然出现在这里。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 三个动作：预览 / 下载 / 删除
+ * 四个动作：预览 / 下载 / 删除 / **批量删除**
  * ─────────────────────────────────────────────────────────────────────
  * 卡（`ArtifactCard`：预览 / 下载）与弹层（`ArtifactPreviewDrawer`）都是**只认一个产物**的
  * 独立机器 —— 本页与对话页的唯一区别只是"清单从哪来"，所以直接复用，两处行为不会分叉。
- * 「删除」是本页**独有**的（`onDelete` 只在会话产物页传）：真删除（对象 + 行），
- * 走 `Popconfirm` 二次确认；删除后本页失效缓存重取。
+ * 「删除」与「批量删除」都是本页**独有**的（`onDelete` / `onSelectedChange` 只在会话产物页传）：
+ * 真删除（对象 + 行），走 `Popconfirm` 二次确认；删除后本页失效缓存重取。
+ *
+ * ⚠️ 批量删除的**选择面只有当前页**（勾选集是当页 id 的集合，翻页 / 删除后一律清空）——
+ *    一页最多 `ARTIFACTS_PAGE_LIMIT` 条，也正是服务端 `ARTIFACT_BATCH_DELETE_MAX` 的来源；
+ *    跨页选中会引出一个本页答不了的"到底删了哪几条"，不做。
+ * ⚠️ 批量删除是**一个请求**（`POST /api/artifacts/batch-delete`，见 `api/artifacts.ts`），
+ *    不是"前端循环调单条删除"：后者中途失败会留下半删状态，且 N 个产物 = N 次往返。
  *
  * ⚠️ 预览弹层必须**在本页也渲染一次**：它订阅的是 `stores/artifactPreview.ts`，
  *    而那个 store 是全局的，但弹层的宿主组件是各页自己 —— 对话页渲染了不代表本页也渲染。
@@ -22,11 +28,11 @@
  */
 
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Button, Pagination } from 'antd'
+import { Button, Checkbox, Pagination, Popconfirm } from 'antd'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { ARTIFACTS_PAGE_LIMIT, deleteArtifact, useMyArtifacts } from '../../api/artifacts.js'
+import { ARTIFACTS_PAGE_LIMIT, deleteArtifact, deleteArtifacts, useMyArtifacts } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
 import { AGENTS_PATH } from '../../app/paths.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
@@ -51,10 +57,23 @@ export function ArtifactCollectionPage() {
   const items = query.data?.items ?? []
   const total = query.data?.total ?? 0
 
+  // 批量删除的勾选集（**只含当前页**的 id：翻页 / 删除后一律清空，见下面两处 setSelectedIds）。
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set<string>())
+  const selectedOnPage = items.filter((item) => selectedIds.has(item.artifactId))
+  const allSelected = items.length > 0 && selectedOnPage.length === items.length
+  const someSelected = selectedOnPage.length > 0 && !allSelected
+
   const remove = useMutation({
     mutationFn: (artifactId: string) => deleteArtifact(artifactId),
-    onSuccess: () => {
+    onSuccess: (_data, artifactId) => {
       feedback.ok('产物已删除')
+      // 单条删掉后把它从勾选集里摘掉，否则"批量删除（1）"会指着一个已不存在的产物
+      setSelectedIds((prev) => {
+        if (!prev.has(artifactId)) return prev
+        const next = new Set(prev)
+        next.delete(artifactId)
+        return next
+      })
     },
     onError: (error) => {
       feedback.fail(error, '删除失败')
@@ -65,6 +84,38 @@ export function ArtifactCollectionPage() {
       void queryClient.invalidateQueries({ queryKey: ['artifacts', 'collection'] })
     },
   })
+
+  const removeBatch = useMutation({
+    mutationFn: (artifactIds: string[]) => deleteArtifacts(artifactIds),
+    onSuccess: (result, artifactIds) => {
+      // ⚠️ 报的是服务端**实际删掉的行数**（`deleted`），不是勾选数 —— 混进"不是我的 /
+      //    已不存在"的会被如实扣掉（见 `api/artifacts.ts#deleteArtifacts`）。
+      feedback.ok(`已删除 ${result.deleted} 个产物`)
+      setSelectedIds(new Set())
+      // 把当页整页删空时回退一页（与单条删除同款，避免停在一个空页上）。
+      // ⚠️ 只在**成功**时回退：失败（如 S3 不可用）时删掉的可能不足一页，跳页会更迷惑。
+      if (artifactIds.length >= items.length && offset > 0) setOffset(Math.max(0, offset - limit))
+    },
+    onError: (error) => {
+      feedback.fail(error, '批量删除失败')
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['artifacts', 'collection'] })
+    },
+  })
+
+  const toggleOne = (artifactId: string, checked: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(artifactId)
+      else next.delete(artifactId)
+      return next
+    })
+  }
+
+  const toggleAll = (checked: boolean) => {
+    setSelectedIds(checked ? new Set(items.map((item) => item.artifactId)) : new Set())
+  }
 
   return (
     <>
@@ -101,15 +152,51 @@ export function ArtifactCollectionPage() {
         />
       ) : (
         <>
-          <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
-            共 <span className="num">{total}</span> 个 · 最新产出在最上面
-          </p>
+          <div className="row" style={{ marginBottom: 'var(--sp-3)' }}>
+            <Checkbox
+              checked={allSelected}
+              indeterminate={someSelected}
+              onChange={(event) => {
+                toggleAll(event.target.checked)
+              }}
+            >
+              全选本页
+            </Checkbox>
+            <p className="ratio">
+              共 <span className="num">{total}</span> 个 · 最新产出在最上面
+            </p>
+            <Popconfirm
+              title={`删除选中的 ${selectedOnPage.length} 个产物？`}
+              description="删除后不可恢复：文件与记录都会一并移除。"
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              disabled={selectedOnPage.length === 0}
+              onConfirm={async () => {
+                await removeBatch.mutateAsync([...selectedIds])
+              }}
+            >
+              <Button
+                danger
+                size="small"
+                style={{ marginLeft: 'auto' }}
+                disabled={selectedOnPage.length === 0}
+                loading={removeBatch.isPending}
+              >
+                批量删除{selectedOnPage.length > 0 ? `（${selectedOnPage.length}）` : ''}
+              </Button>
+            </Popconfirm>
+          </div>
           <div data-testid="artifact-collection-list">
             {items.map((item) => (
               <ArtifactCard
                 key={item.artifactId}
                 artifact={item}
                 timeText={artifactTimeText(item.createdAt, now)}
+                selected={selectedIds.has(item.artifactId)}
+                onSelectedChange={(checked) => {
+                  toggleOne(item.artifactId, checked)
+                }}
                 onDelete={async () => {
                   await remove.mutateAsync(item.artifactId)
                 }}
@@ -124,6 +211,9 @@ export function ArtifactCollectionPage() {
                 total={total}
                 showSizeChanger={false}
                 onChange={(page) => {
+                  // 翻页时勾选集**清空**：选择面只有"当前页"（见文件头与 `selectedIds` 注释），
+                  // 让上一次的勾选跨页带过来会引出一个本页答不了的"到底删了哪几条"。
+                  setSelectedIds(new Set())
                   setOffset((page - 1) * limit)
                 }}
               />

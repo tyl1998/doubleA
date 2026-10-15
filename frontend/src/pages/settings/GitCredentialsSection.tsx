@@ -100,8 +100,11 @@ export function GitCredentialsSection() {
         <h2 className="card__title">Git 凭据</h2>
         <p className="page__lead">
           Code 模式下，agent 会在容器里跑 <code>git clone</code> / <code>commit</code>。这里配置的凭据
-          <strong>按用户加密存平台</strong>，每次新建容器时解密注入到容器的临时目录（<code>$HOME</code> 是 tmpfs，
-          容器回收即消失），<strong>绝不写进工作区</strong>。列表接口永不返回明文或掩码。
+          <strong>按用户加密存平台</strong>，agent 需要时按需取用（容器里不落明文），<strong>绝不写进工作区</strong>。
+          列表接口永不返回明文或掩码。
+          <br />
+          <strong>推荐用 SSH（SSH_KEY）</strong>：HTTPS 需要额外配一个 PAT（HTTPS_TOKEN），且按
+          <code>host</code> 精确匹配 —— 未匹配时 git 只会报一个笼统的认证失败。
         </p>
       </div>
       <Button type="primary" onClick={openCreate}>

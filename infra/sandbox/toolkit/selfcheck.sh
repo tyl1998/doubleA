@@ -192,7 +192,16 @@ check 'pandas / numpy / openpyxl 可导入' bash -c \
   'python3 -c "import pandas, numpy, openpyxl; print(\"pandas\", pandas.__version__, \"| numpy\", numpy.__version__, \"| openpyxl\", openpyxl.__version__)"'
 check 'jq 可跑（stdin → json → stdout）' bash -c 'printf "{\"a\":1}\n" | jq -e ".a == 1" > /dev/null && jq --version'
 check 'git 可跑' bash -c 'git --version'
+# ⚠️ P1-9 · R11 补：`SSH_KEY` 型 git 凭据靠 `GIT_SSH_COMMAND=ssh …`，缺 ssh 客户端时
+#    `git clone git@…` 只会回一句 `ssh: not found`（看着像凭据错，其实是镜像少包）。
+check 'ssh 客户端可跑（git over SSH 需要）' bash -c 'ssh -V'
 check 'ripgrep 可跑' bash -c 'rg --version | head -n 1'
+# git 凭据 helper（P1-9 · R11 修订）：两个按需拉取的脚本必须在位且可执行。
+check 'git credential helper 就位可执行' bash -c 'test -x /opt/sandbox-git/git-credential-doubulea.mjs && echo ok'
+check 'git ssh 包装器就位可执行' bash -c 'test -x /opt/sandbox-git/git-ssh-doubulea.mjs && echo ok'
+# 行为级负向：没有后端 env 时 helper 必须**安静退出**（绝不吐半截凭据 / 不报错到 stdout）
+check 'helper 无后端 env 时安静退出（不输出任何凭据）' \
+  bash -c 'out="$(printf "protocol=https\nhost=x\n" | env -u SANDBOX_BACKEND_URL -u SANDBOX_TOKEN /opt/sandbox-git/git-credential-doubulea.mjs get)"; test -z "$out" && echo ok'
 
 # 验收场景「分析这份 CSV 出汇总表」的**最小复现**：只 import 成功是不够的 ——
 # `openpyxl` 单独缺一个，`import pandas` 照样绿，而 `to_excel` 才炸。
@@ -233,10 +242,11 @@ section 'TLS、入口与负向约束'
 check 'CA 证书包存在（否则调模型池报 TLS 错，误诊成网络问题）' \
   bash -c 'test -s /etc/ssl/certs/ca-certificates.crt && echo ok'
 check 'tini 存在（PID 1 僵尸回收；ENTRYPOINT 用它）' bash -c 'test -x /usr/bin/tini && echo ok'
-# ⚠️ 这是一条**反向断言**：守住 toolkit/Dockerfile 里"刻意不装 pip"的决定。
-# 有了 pip，"运行期安装"这条路就又开着（然后必然撞 egress 白名单，失败得莫名其妙）；
-# 没有 pip ⇒ 失败得更早、更好解释。有人哪天顺手加上，这里会红。
-check '刻意没有 pip（运行期安装这条路要一直是死的）' \
+# ⚠️ 这是一条**反向断言**：toolkit（= `none` / `node` 运行时的底座）**刻意不装 pip**。
+# P1-17b 起"运行期装依赖"是**开着的**（依赖经注册表出网拉），但**只对 python 运行时**开：
+# pip 装在 `runtime:python` 那一层（`infra/sandbox/runtime/Dockerfile`），toolkit 这一层不含它 ——
+# 想装 pip 依赖就选 python 运行时，别在底座层留一条"装了却不知道该不该用"的路。
+check 'toolkit 层刻意没有 pip（pip 只在 python 运行时层）' \
   bash -c '! command -v pip >/dev/null && ! command -v pip3 >/dev/null && ! python3 -m pip --version >/dev/null 2>&1 && echo ok'
 
 # ── 汇总 ───────────────────────────────────────────────────────────────

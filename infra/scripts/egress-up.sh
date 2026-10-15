@@ -27,19 +27,22 @@
 #   bash infra/scripts/egress-up.sh --write-env          # 顺便写进 infra/.env
 #   bash infra/scripts/egress-up.sh --allow api.foo.com  # 追加白名单（可重复）
 #   bash infra/scripts/egress-up.sh --allow-all          # 关白名单（只建议临时排查）
-#   bash infra/scripts/egress-up.sh --no-auto            # 不自动取库，只用 --allow
-#   bash infra/scripts/egress-up.sh --watch              # ★ 起完代理后保持前台，每 30s 从库刷新白名单
+#   bash infra/scripts/egress-up.sh --no-auto            # 不自动取库，只用 --allow / --deny
+#   bash infra/scripts/egress-up.sh --deny bad.example.com  # 追加黑名单（命中即拒）
+#   bash infra/scripts/egress-up.sh --watch              # ★ 起完代理后保持前台，每 30s 从库刷新策略
 #   bash infra/scripts/egress-up.sh --daemon             # ★★ 同 --watch，但**常驻后台**（pid → .pids/egress-watch.pid，
 #                                                        #     日志 → .dev-logs/egress.log；egress-down.sh 一并收掉）
 #   bash infra/scripts/egress-up.sh --port 3128 --name doubulea-egress --image node:22-bookworm-slim
 #
-# 【白名单自动同步】代理挂载一个**白名单文件**（`${TMPDIR:-/tmp}/doubulea-egress-allow/allow`），
-#   代理进程每 5s 轮询该文件、内容变了就热更新 —— 库里新增/停用 provider **不需要重启代理**。
-#   谁在写这个文件：
+# 【出网策略（黑白名单）】代理挂载一个**策略文件**（`${TMPDIR:-/tmp}/doubulea-egress-allow/policy.json`），
+#   代理进程每 5s 轮询该文件、内容变了就热更新 —— 平台改策略 / 库里增删 provider **不需要重启代理**。
+#   策略来源（并集）：平台表 `egress_policy`（`/admin/egress` 页配）+ 模型池主机（白名单非空时并集注入）
+#   + `--allow/--deny` + `infra/.env` 的 `SANDBOX_EGRESS_ALLOW_HOSTS`（`*` = 全放行）。
+#   语义：deny 优先；两张表都空 = **全放行**（默认）；只配白名单 = 只放行白名单；只配黑名单 = 除黑名单外全放行。
 #   · 本脚本**每次运行**时写一次（临时文件 + `mv`，原子写）；
 #   · `--watch` 模式起一个前台循环，每 30s 重新查库，变了就重写文件（代理 ≤5s 后热更新）。
-#   Ctrl+C 只停同步循环，代理容器照常跑（白名单停在最后一次一致状态）。
-#   ⚠️ 不跑 `--watch` 的话仍是"启动时抓一次"的旧语义 —— 想完全自动化就用 `--watch`。
+#   Ctrl+C 只停同步循环，代理容器照常跑（策略停在最后一次一致状态）。
+#   ⚠️ 不跑 `--watch` 的话是"启动时抓一次"的语义 —— 平台改完要重跑本脚本或起 `--watch`。
 #
 # 停止：bash infra/scripts/egress-down.sh
 # =====================================================================
@@ -58,10 +61,21 @@ NET=doubulea-sandbox
 IMAGE=node:22-bookworm-slim
 PG_CONTAINER=doubulea-postgres
 
-# 白名单文件（挂进代理容器，代理每 5s 轮询热更新 —— 加 provider 不用重启代理）
+# ★ P1-16a：平台出网范围（`egress_policy.scope`）
+#   ⚠️ **2026-10-14 用户定案：出网范围配在平台出网策略里（`/admin/egress`）**，**不在会话里配**。
+#   · 从库 `egress_policy.scope` 读（`ALL` 默认全放行 / `NONE` 仅模型 / `REGISTRY` 模型 + 取包）；
+#   · 本脚本把它**解析成代理要的 `allow` / `deny` 两张表**（`ALL`⇒`['*']`；`NONE`/`REGISTRY`⇒白名单，
+#     见 `compute_policy` 的 scope 分支）⇒ 代理侧不认识 scope、也不做 per-conversation。
+#   · 白名单（`allow_hosts`）与范围**并列补充**（额外的零散主机）；黑名单（`deny_hosts`）永远硬拒。
+# `SANDBOX_EGRESS_REGISTRY_HOSTS` / `SANDBOX_EGRESS_GIT_HOSTS`（.env，逗号分隔）可覆盖下面两份默认
+#   （`REGISTRY` 档 = 模型池 ∪ 注册表 ∪ git）。默认值属 `子方案` §十三 待决 13 ④（暂只放官方公共源）。
+DEFAULT_REGISTRY_HOSTS='registry.npmjs.org,registry.yarnpkg.com,pypi.org,files.pythonhosted.org,proxy.golang.org,sum.golang.org,repo.maven.apache.org,repo1.maven.org,index.crates.io,static.crates.io,crates.io'
+DEFAULT_GIT_HOSTS='github.com,*.github.com,gitlab.com,*.gitlab.com,bitbucket.org,*.bitbucket.org'
+
+# 策略文件（挂进代理容器，代理每 5s 轮询热更新 —— 改平台策略不用重启代理）
 ALLOW_DIR_HOST="${TMPDIR:-/tmp}/doubulea-egress-allow"
-ALLOW_FILE_HOST="$ALLOW_DIR_HOST/allow"
-ALLOW_FILE_CONTAINER=/egress-allow/allow
+POLICY_FILE_HOST="$ALLOW_DIR_HOST/policy.json"
+POLICY_FILE_CONTAINER=/egress-allow/policy.json
 
 # 常驻（--daemon）的 pid / 日志（与 dev-run.sh 同一套目录，gitignore 里已放行）
 LOG_DIR="$REPO_ROOT/.dev-logs"
@@ -70,12 +84,14 @@ WATCH_LOG="$LOG_DIR/egress.log"
 WATCH_PID_FILE="$PID_DIR/egress-watch.pid"
 
 ALLOW_ALL=0
+FORCE_ALLOW_ALL=0
 WRITE_ENV=0
 NO_AUTO=0
 WATCH=0
 DAEMON=0
 WATCH_INTERVAL_SEC=30
 EXTRA_ALLOW=()
+EXTRA_DENY=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -84,14 +100,15 @@ while [ $# -gt 0 ]; do
     --network)   shift; NET="${1:-doubulea-sandbox}" ;;
     --image)     shift; IMAGE="${1:-node:22-bookworm-slim}" ;;
     --allow)     shift; EXTRA_ALLOW+=("${1:-}") ;;
-    --allow-all) ALLOW_ALL=1 ;;
+    --deny)      shift; EXTRA_DENY+=("${1:-}") ;;
+    --allow-all) FORCE_ALLOW_ALL=1 ;;
     --no-auto)   NO_AUTO=1 ;;
     --write-env) WRITE_ENV=1 ;;
     --watch)     WATCH=1 ;;
     --daemon)    DAEMON=1; WATCH=1 ;;
     --watch-interval) shift; WATCH_INTERVAL_SEC="${1:-30}" ;;
     --)          : ;;   # `pnpm egress:up -- --write-env` 会把孤立 -- 传进来
-    -h|--help)   sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
   shift
@@ -139,24 +156,43 @@ else
        ⚠️ 别手工 docker network create：后端会校验标签与 Internal 标志，不认手工建的网。"
 fi
 
-# -- 1. 组装白名单 -----------------------------------------------------
+# -- 1. 组装出网策略（黑白名单）---------------------------------------
 
-step '白名单'
+step '出网策略'
 
+# 三个集合：ALLOW（白名单，含 `*`）/ DENY（黑名单）/ MODEL（模型池主机，白名单非空时并集注入）
 ALLOW=()
+DENY=()
+MODEL=()
+ALLOW_ALL=0
+# ★ P1-16a：平台出网范围（`ALL`/`NONE`/`REGISTRY`，默认 `ALL`）+ 注册表 / git 主机名单（REGISTRY 档用）
+SCOPE=ALL
+REGISTRY_HOSTS=()
+GIT_HOSTS=()
+
 add_allow() {
   local item="$1" existing
   [ -n "$item" ] || return 0
-  for existing in ${ALLOW[@]+"${ALLOW[@]}"}; do
-    [ "$existing" = "$item" ] && return 0
-  done
+  for existing in ${ALLOW[@]+"${ALLOW[@]}"}; do [ "$existing" = "$item" ] && return 0; done
   ALLOW+=("$item")
+}
+add_deny() {
+  local item="$1" existing
+  [ -n "$item" ] || return 0
+  for existing in ${DENY[@]+"${DENY[@]}"}; do [ "$existing" = "$item" ] && return 0; done
+  DENY+=("$item")
+}
+add_model() {
+  local item="$1" existing
+  [ -n "$item" ] || return 0
+  for existing in ${MODEL[@]+"${MODEL[@]}"}; do [ "$existing" = "$item" ] && return 0; done
+  MODEL+=("$item")
 }
 
 SKIPPED_LOOPBACK=()
 
-# 从库里取 enabled 的 model_providers 主机名（不自动取库时只留 --allow 的）
-db_allow_hosts() {
+# 从库里取 enabled 的 model_providers 主机名（候选白名单成员，见 compute_policy ⑤）
+db_model_hosts() {
   [ "$NO_AUTO" -eq 1 ] && return 0
   local PG_USER PG_DB urls h
   PG_USER="$(env_value POSTGRES_USER)"; [ -n "$PG_USER" ] || PG_USER=doubulea
@@ -175,38 +211,86 @@ db_allow_hosts() {
         SKIPPED_LOOPBACK+=("$u")
         ;;
       *)
-        add_allow "$h"
+        add_model "$h"
         ;;
     esac
   done <<< "$urls"
   return 0
 }
 
-# 重算白名单 → 填 ALLOW / ALLOW_CSV。
-# 参数 `quiet`：非空 = 只填值、不打"库里的模型池主机 / 放行 N 个"这些启动期日志
-#               （watch 每 30s 调一次，不能每轮都刷屏）。
-# 返回 0 = ALLOW_CSV 可用（含 '*'）；1 = 白名单为空（调用方决定是拒启还是保留旧值）。
-compute_allow_csv() {
+# 从库里取平台策略 `egress_policy`（单行；范围 + 两张表。两张表以空格分隔的 host 列表）。
+# 表 / 列可能还不存在（迁移没跑）⇒ psql 报错、返回 1，调用方按默认口径处理。
+# ★ P1-16a：一并取 `scope`（`ALL`/`NONE`/`REGISTRY`），写进全局 `SCOPE`。
+db_policy_hosts() {
+  [ "$NO_AUTO" -eq 1 ] && return 0
+  local PG_USER PG_DB row rest allow_csv deny_csv scope item
+  PG_USER="$(env_value POSTGRES_USER)"; [ -n "$PG_USER" ] || PG_USER=doubulea
+  PG_DB="$(env_value POSTGRES_DB)";     [ -n "$PG_DB" ]   || PG_DB=doubulea
+
+  row="$("$DOCKER_BIN" exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -F'|' \
+            -c "SELECT array_to_string(allow_hosts, ' '), array_to_string(deny_hosts, ' '), scope FROM egress_policy WHERE id = 'default';" 2>/dev/null)"
+  [ -n "$row" ] || return 1
+  allow_csv="${row%%|*}"
+  rest="${row#*|}"
+  deny_csv="${rest%%|*}"
+  scope="${rest##*|}"
+  case "$scope" in
+    ALL|NONE|REGISTRY) SCOPE="$scope" ;;
+    *) SCOPE=ALL ;;
+  esac
+  for item in $allow_csv; do add_allow "$item"; done
+  for item in $deny_csv; do add_deny "$item"; done
+  return 0
+}
+
+# CSV → 全局数组（用于 REGISTRY / GIT 主机名单；空值 → 空数组）
+csv_to_array() {
+  local csv="$1" name="$2" item
+  local -a out=() items=()
+  if [ -n "$csv" ]; then
+    IFS=',' read -r -a items <<< "$csv"
+    for item in ${items[@]+"${items[@]}"}; do
+      item="$(printf '%s' "$item" | tr -d '[:space:]')"
+      [ -n "$item" ] && out+=("$item")
+    done
+  fi
+  eval "$name=(\"\${out[@]}\")"
+}
+
+# 重算策略 → 填 ALLOW / DENY / MODEL / ALLOW_ALL（再由 write_policy_file 落成 JSON）。
+# 参数 `quiet`：非空 = 不打启动期日志（watch 每轮调一次，不能刷屏）。
+# 返回 0 = 已装好（**永远** 0：默认全放行，DB 读不到不阻塞启动）。
+compute_policy() {
   local quiet="${1:-}"
-  ALLOW=()
+  ALLOW=(); DENY=(); MODEL=(); ALLOW_ALL=0
+  SCOPE=ALL
   SKIPPED_LOOPBACK=()
-  if db_allow_hosts; then
-    if [ -z "$quiet" ]; then
-      info "库里的模型池主机：${ALLOW[*]:-（无）}"
-    fi
+  # ★ P1-16a：注册表 / git 主机名单（.env 可覆盖默认；仅 REGISTRY 档用）
+  csv_to_array "$(env_value SANDBOX_EGRESS_REGISTRY_HOSTS)" REGISTRY_HOSTS
+  [ "${#REGISTRY_HOSTS[@]}" -gt 0 ] || csv_to_array "$DEFAULT_REGISTRY_HOSTS" REGISTRY_HOSTS
+  csv_to_array "$(env_value SANDBOX_EGRESS_GIT_HOSTS)" GIT_HOSTS
+  [ "${#GIT_HOSTS[@]}" -gt 0 ] || csv_to_array "$DEFAULT_GIT_HOSTS" GIT_HOSTS
+
+  # ① 平台策略（egress_policy 表：范围 + 两张表）
+  if db_policy_hosts; then
+    [ -z "$quiet" ] && info "平台策略：范围 ${SCOPE} / allow ${#ALLOW[@]} 条 / deny ${#DENY[@]} 条"
+  elif [ -z "$quiet" ]; then
+    warn "从库里没取到 egress_policy（迁移没跑 / 容器 ${PG_CONTAINER} 不在？）—— 按默认口径处理（范围 ALL）"
+  fi
+
+  # ② 模型池主机（候选白名单成员）
+  if db_model_hosts; then
+    [ -z "$quiet" ] && info "库里的模型池主机：${MODEL[*]:-（无）}"
   elif [ -z "$quiet" ]; then
     warn "从库里没取到 enabled 的 model_providers（容器 ${PG_CONTAINER} 在跑吗？）"
   fi
 
+  # ③ --allow / --deny 追加
   local extra
-  for extra in ${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}; do
-    add_allow "$extra"
-  done
+  for extra in ${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}; do add_allow "$extra"; done
+  for extra in ${EXTRA_DENY[@]+"${EXTRA_DENY[@]}"}; do add_deny "$extra"; done
 
-  # P1-9 · R11：平台声明的出网白名单（`infra/.env` 的 `SANDBOX_EGRESS_ALLOW_HOSTS`）。
-  #   · `*` ⇒ 关白名单（全放行，设计对 Code 模式 git 出网的默认口径）；
-  #   · 逗号列表 ⇒ 逐项追加（host / host:port / *.host）；
-  #   · **未设（空）⇒ 不改变既有行为**（仍只放行模型池 + --allow）—— 免得老部署"升上来就全通"。
+  # ④ env 通道：SANDBOX_EGRESS_ALLOW_HOSTS（`*` = 全放行 / 列表 = 追加白名单）、SANDBOX_EGRESS_DENY_HOSTS（追加黑名单）
   local env_allow env_item
   env_allow="$(env_value SANDBOX_EGRESS_ALLOW_HOSTS)"
   if [ "$env_allow" = '*' ]; then
@@ -217,37 +301,85 @@ compute_allow_csv() {
       add_allow "$(printf '%s' "$env_item" | tr -d '[:space:]')"
     done
   fi
+  local env_deny
+  env_deny="$(env_value SANDBOX_EGRESS_DENY_HOSTS)"
+  if [ -n "$env_deny" ]; then
+    IFS=',' read -r -a env_deny_items <<< "$env_deny"
+    for env_item in ${env_deny_items[@]+"${env_deny_items[@]}"}; do
+      add_deny "$(printf '%s' "$env_item" | tr -d '[:space:]')"
+    done
+  fi
+  # `--allow-all` 命令行开关（优先级最高）
+  if [ "$FORCE_ALLOW_ALL" -eq 1 ]; then
+    ALLOW_ALL=1
+  fi
 
+  # ★ P1-16a ⑤：平台出网范围 → 解析进 ALLOW（`ALL` ⇒ 全放行；`NONE` ⇒ 仅模型池；
+  #   `REGISTRY` ⇒ 模型池 ∪ 注册表 ∪ git）。白名单（上面）与范围**并列补充**，黑名单永远硬拒。
+  local sc_item
+  case "$SCOPE" in
+    ALL)
+      [ "$ALLOW_ALL" -eq 0 ] && ALLOW_ALL=1
+      ;;
+    NONE)
+      for sc_item in ${MODEL[@]+"${MODEL[@]}"}; do add_allow "$sc_item"; done
+      ;;
+    REGISTRY)
+      for sc_item in ${MODEL[@]+"${MODEL[@]}"} ${REGISTRY_HOSTS[@]+"${REGISTRY_HOSTS[@]}"} ${GIT_HOSTS[@]+"${GIT_HOSTS[@]}"}; do
+        add_allow "$sc_item"
+      done
+      ;;
+  esac
+
+  # ★ P1-16a ⑥：白名单非空 ⇒ **并集注入模型池主机**（"模型默认放行"）；白名单为空 ⇒ 不并
+  #    （空 = 全放行 / 黑名单，模型主机本就放行，并进去反而会把模式变成"仅白名单"）
+  if [ "${#ALLOW[@]}" -gt 0 ] && [ "$ALLOW_ALL" -ne 1 ]; then
+    local m
+    for m in ${MODEL[@]+"${MODEL[@]}"}; do add_allow "$m"; done
+  fi
   if [ "$ALLOW_ALL" -eq 1 ]; then
-    ALLOW_CSV='*'
-    if [ -z "$quiet" ]; then
-      warn "白名单已关闭（--allow-all）：任何目标都放行，只建议临时排查用"
-    fi
-  elif [ "${#ALLOW[@]}" -eq 0 ]; then
-    ALLOW_CSV=''
-    return 1
-  else
-    ALLOW_CSV="$(printf '%s,' ${ALLOW[@]+"${ALLOW[@]}"})"
-    ALLOW_CSV="${ALLOW_CSV%,}"
+    ALLOW=('*')
+  fi
+
+  # ★ P1-16a ⑦：收窄档（NONE/REGISTRY）而放行集仍为空 ⇒ 显式拒绝一切
+  #    （否则两张空表会被代理解成"全放行"，与语义正好相反）
+  if [ "$ALLOW_ALL" -ne 1 ] && [ "${#ALLOW[@]}" -eq 0 ]; then
+    DENY=('*')
   fi
   return 0
 }
 
-# 原子写白名单文件（临时文件 + mv：代理轮询读的是路径，mv 后立即可见新内容）
-write_allow_file() {
-  mkdir -p "$ALLOW_DIR_HOST"
-  local tmp="$ALLOW_FILE_HOST.tmp"
-  printf '%s\n' "$ALLOW_CSV" > "$tmp"
-  mv "$tmp" "$ALLOW_FILE_HOST"
+# 一组规则 → JSON 数组字面量（只接受合法 host 形状；其余丢弃，避免把坏值写进 JSON）
+json_host_array() {
+  local out='' item
+  for item in "$@"; do
+    if [ "$item" = '*' ] || [[ "$item" =~ ^(\*\.)?[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+      out="${out}\"${item}\","
+    fi
+  done
+  printf '[%s]' "${out%,}"
 }
 
-if compute_allow_csv; then
-  if [ "$ALLOW_ALL" -ne 1 ] && [ "${#ALLOW[@]}" -gt 0 ]; then
-    ok "放行 ${#ALLOW[@]} 个主机：$ALLOW_CSV"
-  fi
+# 原子写策略文件（临时文件 + mv：代理轮询读的是路径，mv 后立即可见新内容）
+# ⚠️ 形状 = 代理认识的 `{allow,deny}`（scope 已在 `compute_policy` 解析进这两张表）。
+write_policy_file() {
+  mkdir -p "$ALLOW_DIR_HOST"
+  local tmp="$POLICY_FILE_HOST.tmp"
+  local allow_json='[]' deny_json='[]'
+  [ "${#ALLOW[@]}" -gt 0 ] && allow_json="$(json_host_array "${ALLOW[@]}")"
+  [ "${#DENY[@]}" -gt 0 ] && deny_json="$(json_host_array "${DENY[@]}")"
+  printf '{"allow":%s,"deny":%s}\n' "$allow_json" "$deny_json" > "$tmp"
+  mv "$tmp" "$POLICY_FILE_HOST"
+}
+
+compute_policy
+write_policy_file
+if [ "$ALLOW_ALL" -eq 1 ]; then
+  warn "全放行模式（范围 ALL / 白名单关闭 / 两张表皆空）—— 任何目标都放行"
+elif [ "${#ALLOW[@]}" -gt 0 ]; then
+  ok "白名单模式（范围 ${SCOPE}）：放行 ${#ALLOW[@]} 个主机（含模型池主机）"
 else
-  fail "白名单是空的 —— 拒启（空白名单不是「全放行」，那样等于把 internal bridge 的设计意图作废）。
-       加目标：--allow api.example.com    或显式关掉白名单：--allow-all"
+  ok "黑名单模式：拒绝 ${#DENY[@]} 个主机，其余放行"
 fi
 
 for skipped in ${SKIPPED_LOOPBACK[@]+"${SKIPPED_LOOPBACK[@]}"}; do
@@ -257,9 +389,8 @@ for skipped in ${SKIPPED_LOOPBACK[@]+"${SKIPPED_LOOPBACK[@]}"}; do
        再重跑本脚本（代理那台容器在默认 bridge 上够得着宿主）。"
 done
 
-# 白名单落盘（挂进容器；代理轮询它做热更新）
-write_allow_file
-info "白名单已写入 $ALLOW_FILE_HOST（代理挂载 + 热更新）"
+# 策略落盘（挂进容器；代理轮询它做热更新）
+info "出网策略已写入 ${POLICY_FILE_HOST}（代理挂载 + 热更新）"
 
 # -- 2. 起容器（公网腿）------------------------------------------------
 
@@ -273,8 +404,7 @@ fi
 "$DOCKER_BIN" run -d --name "$NAME" \
   --network bridge --restart unless-stopped \
   -e "EGRESS_PORT=${PORT}" \
-  -e "EGRESS_ALLOW=${ALLOW_CSV}" \
-  -e "EGRESS_ALLOW_FILE=${ALLOW_FILE_CONTAINER}" \
+  -e "EGRESS_POLICY_FILE=${POLICY_FILE_CONTAINER}" \
   -v "$PROXY_SRC:/app/egress-proxy.mjs:ro" \
   -v "$ALLOW_DIR_HOST:/egress-allow:ro" \
   "$IMAGE" node /app/egress-proxy.mjs >/dev/null || fail "容器起不来（$DOCKER_BIN logs $NAME 看原因）"
@@ -353,30 +483,30 @@ cat <<EOF
 
   日志：$DOCKER_BIN logs -f $NAME
   停止：bash infra/scripts/egress-down.sh
-  白名单热更新：代理每 5s 轮询 $ALLOW_FILE_HOST，库变了会在 ≤5s 内生效（不用重启代理）
+  策略热更新：代理每 5s 轮询 ${POLICY_FILE_HOST}，平台改了策略会在 ≤5s 内生效（不用重启代理）
 EOF
 
-# -- 5. 白名单自动同步（--watch / --daemon）----------------------------
+# -- 5. 出网策略自动同步（--watch / --daemon）--------------------------
 
 # 常驻循环本体（函数 → 前台直调或后台子 shell 都能复用）
+# 每轮从库（`egress_policy` + 模型池）重算策略、原子写文件；内容没变就不打日志。
 watch_loop() {
-  last_saved="$(cat "$ALLOW_FILE_HOST" 2>/dev/null || true)"
+  last_saved="$(cat "$POLICY_FILE_HOST" 2>/dev/null || true)"
   while true; do
     sleep "$WATCH_INTERVAL_SEC"
-    if compute_allow_csv quiet; then
-      if [ "$ALLOW_CSV" != "$last_saved" ]; then
-        write_allow_file
-        last_saved="$ALLOW_CSV"
-        ok "白名单已同步（${ALLOW_CSV:-*}）→ 代理 ≤5s 内热更新"
-      fi
-    else
-      warn "本次查库失败/白名单为空 —— 保留上一份（$last_saved），下轮再试"
+    compute_policy quiet
+    write_policy_file
+    local current
+    current="$(cat "$POLICY_FILE_HOST" 2>/dev/null || true)"
+    if [ "$current" != "$last_saved" ]; then
+      last_saved="$current"
+      ok "出网策略已同步 → 代理 ≤5s 内热更新（${current:-空}）"
     fi
   done
 }
 
 if [ "$WATCH" -eq 1 ]; then
-  step "白名单自动同步（每 ${WATCH_INTERVAL_SEC}s 从库刷新）"
+  step "出网策略自动同步（每 ${WATCH_INTERVAL_SEC}s 从库刷新）"
 
   if [ "$NO_AUTO" -eq 1 ]; then
     warn "--watch/--daemon 与 --no-auto 同时出现：库里没有可刷的来源，只会在 --allow 变化时更新（但 --allow 是启动参数，运行中不变 ⇒ 实际上不会更新）"

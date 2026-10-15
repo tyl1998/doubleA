@@ -347,3 +347,54 @@ export async function deleteArtifact(params: { artifactId: string; userId: strin
   await db.artifact.delete({ where: { id: row.id } })
   getLogger().info({ artifactId: row.id, userId: params.userId }, '用户删除了产物（对象与行一并移除）')
 }
+
+/**
+ * 批量删除产物（`POST /api/artifacts/batch-delete`，仅本人；**会话产物页的批量删除**）。
+ *
+ * 与 {@link deleteArtifact} 是**同一条判据、同一套顺序**（先删对象、成功才删行），只是把
+ * "一个 id"换成"一组 id"。**刻意逐条删**（而不是"先删全部对象、再 `deleteMany` 行"）：
+ * 逐条时每一条要么完整删掉、要么原样保留 —— 中途 S3 故障只影响"这一条及其之后"，
+ * 前面已删的与后面未动的**账都对得上**；先删对象再删行则会在故障时留下"对象没了、行还在"
+ * 的暗账（与保留期清理 `reapExpiredArtifacts` 相反，那里能接受，因为清理会重跑）。
+ *
+ * ⚠️ **归属判据落在 `where` 里**（`id ∈ ids AND user_id = me`）：别人的产物与不存在的 id
+ * 一样**被静默忽略**（不是 404 —— 批量操作不该被一条越权 / 脏数据卡死整批，见
+ * `shared#batchDeleteArtifactsBodySchema`）。返回的是**实际删掉的行数**，界面据此如实报数。
+ *
+ * @throws {AppError} `INTERNAL`(500) 存储不可用（某条对象删不掉 ⇒ 该条及之后的行保留，可重试）
+ */
+export async function deleteArtifacts(params: {
+  artifactIds: string[]
+  userId: string
+}): Promise<number> {
+  const db = getPrisma()
+  const rows = await db.artifact.findMany({
+    where: { id: { in: params.artifactIds }, userId: params.userId },
+    select: { id: true, fileKey: true },
+  })
+  if (rows.length === 0) return 0
+
+  const bucket = config.s3.bucket
+  const s3 = getS3Client()
+  let deleted = 0
+  for (const row of rows) {
+    try {
+      // 先删对象：删不掉就不删行（与单条删除同款，避免"对象还在、谁也找不到"的暗账）
+      await s3.removeObject(bucket, row.fileKey)
+    } catch (error) {
+      getLogger().error(
+        { err: error, artifactId: row.id, fileKey: row.fileKey, deleted },
+        '批量删除产物对象失败（该行及其之后的行保留，可重试）',
+      )
+      throw AppError.internal('存储服务暂时不可用，请稍后重试')
+    }
+    await db.artifact.delete({ where: { id: row.id } })
+    deleted += 1
+  }
+
+  getLogger().info(
+    { userId: params.userId, requested: params.artifactIds.length, deleted },
+    '用户批量删除了产物（对象与行一并移除）',
+  )
+  return deleted
+}

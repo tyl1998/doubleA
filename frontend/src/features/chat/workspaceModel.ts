@@ -207,10 +207,49 @@ export function renameOpenTab(openPaths: readonly string[], from: string, to: st
   return mapped.filter((path, index) => mapped.indexOf(path) === index)
 }
 
+/**
+ * 展开 / 折叠一个目录（纯函数，给 `stores/workspace.ts` 维护"被展开的目录"列表）。
+ *
+ * 已在列表里 ⇒ 移除（折叠）；不在 ⇒ 追加（展开，保持插入顺序 ⇒ 稳定）。
+ * 列表初始为空 = **全部折叠**（产品要求：一进来不铺开几千个文件，见 `WorkspaceTree`）。
+ */
+export function toggleExpandedDir(expanded: readonly string[], path: string): string[] {
+  return expanded.includes(path) ? expanded.filter((item) => item !== path) : [...expanded, path]
+}
+
 /** 文件树里按名字取末段（标签文字用） */
 export function workspaceBaseName(path: string): string {
   const segments = path.split('/')
   return segments[segments.length - 1] ?? path
+}
+
+/** 取父目录（`'a/b/c.ts'` ⇒ `'a/b'`；根层文件 ⇒ `''`）。右键"上传到此 / 拖到此处"的目标目录用它。 */
+export function workspaceParentDir(path: string): string {
+  const index = path.lastIndexOf('/')
+  return index === -1 ? '' : path.slice(0, index)
+}
+
+/**
+ * 把目录与一个名字拼成工作区相对路径（目录为空 = 根）。
+ *
+ * ⚠️ 纯拼接，**不做归一化 / 越界校验**（那是 `@doubulea/shared#normalizeWorkspacePath` 的职责，
+ * 服务端还会再判一次）—— 这里只服务于"拖到某个目录后目标路径是什么"这类展示逻辑。
+ */
+export function joinWorkspacePath(dir: string, name: string): string {
+  return dir === '' ? name : `${dir}/${name}`
+}
+
+/** 「新建文件夹」的占位文件名：工作区模型里空目录不算内容（树由文件路径派生），故落一个隐藏占位使目录可见 */
+export const WORKSPACE_FOLDER_PLACEHOLDER = '.gitkeep'
+
+/** 「新建文件夹」实际要创建的文件路径（`dir/name` 目录下的占位文件） */
+export function workspaceNewFolderPlaceholderPath(dir: string, name: string): string {
+  return joinWorkspacePath(joinWorkspacePath(dir, name), WORKSPACE_FOLDER_PLACEHOLDER)
+}
+
+/** 拖拽移动的目标路径：把 `from` 移到 `dir` 目录下，名字不变 */
+export function workspaceMoveTargetPath(from: string, dir: string): string {
+  return joinWorkspacePath(dir, workspaceBaseName(from))
 }
 
 /**
@@ -222,6 +261,41 @@ export function filterWorkspaceTree(nodes: readonly WorkspaceTreeNode[], include
   return nodes
     .filter((node) => !node.hidden)
     .map((node) => (node.kind === 'dir' ? { ...node, children: filterWorkspaceTree(node.children, includeHidden) } : node))
+}
+
+/** 虚拟滚动列表的一行：节点 + 缩进层级（目录 / 文件都由**扁平列表**渲染） */
+export interface WorkspaceTreeRow {
+  node: WorkspaceTreeNode
+  depth: number
+}
+
+/**
+ * 把（已过滤隐藏项的）树按"展开 / 折叠"压成**线性行列表**，供文件树**虚拟滚动**。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么压平 + 虚拟滚动（产品反馈 2026-10-14：打开多文件后浏览器占 1.5G）
+ * ─────────────────────────────────────────────────────────────────────
+ * 工作区里一次 `git clone` 就可能长出几千个文件（实测某会话 2231 个）。旧实现把整棵树
+ * **全量渲染**，且每行套一个 antd `Dropdown`（右键菜单）—— 实测 2534 行 ⇒ 约 2.4 万 DOM 节点、
+ * 2536 个 `Dropdown` 实例，基线 JS 堆数百 MB，而且每个内容事件都会整树重渲。
+ * 压平后组件只渲染**视口内**的十几行（按 `index × 行高` 绝对定位），渲染成本与文件总数**脱钩**。
+ *
+ * 折叠的目录**整段不进列表**（其子树直接跳过）；`nodes` 传入前应已过 {@link filterWorkspaceTree}。
+ * 纯函数 ⇒ 断言进 `verify-workspace-ui.mjs`。
+ */
+export function flattenWorkspaceTree(
+  nodes: readonly WorkspaceTreeNode[],
+  isCollapsed: (path: string) => boolean,
+): WorkspaceTreeRow[] {
+  const rows: WorkspaceTreeRow[] = []
+  const walk = (list: readonly WorkspaceTreeNode[], depth: number): void => {
+    for (const node of list) {
+      rows.push({ node, depth })
+      if (node.kind === 'dir' && !isCollapsed(node.path)) walk(node.children, depth + 1)
+    }
+  }
+  walk(nodes, 0)
+  return rows
 }
 
 /** 文件图标大类（纯展示；组件据此挑图标与配色，本模块不 import 任何图标库） */

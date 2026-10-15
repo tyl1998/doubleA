@@ -64,6 +64,20 @@ export const DEFAULT_NPM_REGISTRY = 'https://registry.npmjs.org'
 
 export const BASE_IMAGE_NAME = 'doubulea/sandbox-base'
 export const TOOLKIT_IMAGE_NAME = 'doubulea/sandbox-toolkit'
+/**
+ * **运行时层**镜像名（P1-17a；`docs/子方案/Code模式工作区.md` §五之二 2 · 方案 B）。
+ *
+ * 一层一栈：`doubulea/sandbox-runtime:<runtime>-<ver>`，全部 `FROM toolkit`。做法与理由：
+ *   · **运行时是有限集合 ⇒ 预烘焙**（可白名单）；**依赖是无限集合 ⇒ 运行期拉**（P1-17b）；
+ *   · 每栈一份（而不是把所有语言塞进一个层）⇒ 按会话的 `runtime` 选镜像，镜像体积不随栈爆炸
+ *     （`子方案` §五之二 2 定案取 B）；
+ *   · 都是 FROM toolkit ⇒ 拿到同一套 pi / 工具链 / git helper，只多一个语言运行时。
+ *
+ * ⚠️ **`node` = toolkit 本身**（node 由 base 的 `node:22` 提供，npm 随 node 一起来了）——
+ *    刻意**不**用 apt 的 `nodejs` 覆盖它（那是 Debian 的 v18，会把镜像里的 v22 顶掉）。
+ * ⚠️ 这批镜像**只装运行时、不装任何依赖**；依赖由 P1-17b 在运行期经注册表出网拉。
+ */
+export const RUNTIME_IMAGE_NAME = 'doubulea/sandbox-runtime'
 
 /**
  * base 层内容版本（改 Node 基线 / pi 版本 / 桥扩展 / pi 配置 时 +1）
@@ -111,11 +125,93 @@ export const BASE_LAYER_VERSION = '6'
  *
  * ⚠️ **P1-9 R8 起为 `6`**：同一条理由 —— base 层换了（多了 workspace 扩展），
  * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向旧 base（扩展根本没进镜像）。
+ *
+ * ⚠️ **P1-9 R11 复补起为 `7`**：本层**自己的包清单**变了 —— 装了 `openssh-client`
+ * （`SSH_KEY` 型 git 凭据要在容器里跑 `ssh`；缺它 `git clone git@…` 报 `ssh: not found`）。
+ * 不 +1 的症状：宿主上留着没有 ssh 的旧 toolkit，agent 用 SSH 凭据 clone 必失败。
+ *
+ * ⚠️ **P1-9 R11 修订起为 `8`**：本层多了两个 git 凭据 helper（`/opt/sandbox-git/*.mjs`，
+ * "按需拉取"的两个脚本）⇒ 只读层内容又变了。不 +1 的症状：宿主上的 toolkit 没有 helper，
+ * 而容器 env 里的 `credential.helper` / `GIT_SSH_COMMAND` 指向不存在的脚本
+ * ⇒ `git clone` 认证静默失败（git 对缺失的 helper 只在 stderr 提一句，很容易看漏）。
  */
-export const TOOLKIT_LAYER_VERSION = '6'
+export const TOOLKIT_LAYER_VERSION = '8'
+
+/**
+ * 运行时层内容版本（P1-17a；加/换一个语言运行时、或改 runtime Dockerfile 时 +1）
+ *
+ * 同 base/toolkit 的那条纪律：不 +1 ⇒ 宿主上留着旧 tag 的运行时镜像，会话选的运行时
+ * **静默地**还是上一版（例如 python 运行时里没有 pip）。tag 形态 `<变体>-v<ver>`。
+ */
+export const RUNTIME_LAYER_VERSION = '2'
+
+/**
+ * **组件目录的构建侧镜像**（必须与 `shared/src/runtime.ts#SANDBOX_RUNTIME_COMPONENTS` **逐条一致**）。
+ *
+ * ⚠️ 这是本仓第二处"同一份词汇写两遍"（第一处是 `shared` 与 Prisma 的枚举）—— 因为构建侧是 JS、
+ *    后端/前端是 TS，无法直接共享。**两处不一致的症状**：后端算出的变体 id 与构建出的 tag 对不上
+ *    ⇒"明明建了却说没有、反复重建"。加组件时**两处一起改**。
+ *
+ * 组件 id：`node22` / `python311` / `python310` / `python38` / `go` / `java17` / `rust`。
+ * 变体 id = 组件 id 按 `LANGUAGE_ORDER` 排序后用 `-` 连接（空集合 = `none`）。
+ */
+const RUNTIME_LANGUAGE_ORDER = ['node', 'python', 'go', 'java', 'rust']
+export const RUNTIME_COMPONENTS = [
+  { language: 'node', version: '22', id: 'node22' },
+  { language: 'python', version: '3.11', id: 'python311' },
+  { language: 'python', version: '3.10', id: 'python310' },
+  { language: 'python', version: '3.8', id: 'python38' },
+  { language: 'go', version: 'default', id: 'go' },
+  { language: 'java', version: '17', id: 'java17' },
+  { language: 'rust', version: 'default', id: 'rust' },
+]
+
+/**
+ * `pnpm sandbox:build` **默认预构建**的变体（常用组合；不是"白名单"，按需构建仍可建任意组合）。
+ * 顺序即构建顺序。`none` = 空集合（只有 toolkit）。
+ */
+export const SANDBOX_RUNTIMES = [
+  'none',
+  'node22',
+  'python311',
+  'go',
+  'java17',
+  'rust',
+  'python310',
+  'python38',
+  'node22-python310',
+  'node22-python38',
+]
+
+/** 组件 id → 目录项（构建侧解析变体用） */
+const COMPONENT_BY_ID = new Map(RUNTIME_COMPONENTS.map((component) => [component.id, component]))
+
+/**
+ * 变体 id → 给 `runtime/Dockerfile` 的 `COMPONENTS` 串（`lang=ver,…`，按语言顺序）。
+ * `none` / 空 ⇒ `''`（不装语言运行时）。含未知 id ⇒ 抛（构建侧宁可红，也别烤出一个空壳）。
+ */
+export function variantToComponentsArg(variant) {
+  if (variant === '' || variant === 'none') return ''
+  const ids = variant.split('-').filter((piece) => piece !== '')
+  const components = ids.map((id) => {
+    const component = COMPONENT_BY_ID.get(id)
+    if (component === undefined) throw new Error(`未知的运行时组件 id：${id}（变体 ${variant}）`)
+    return component
+  })
+  components.sort((a, b) => RUNTIME_LANGUAGE_ORDER.indexOf(a.language) - RUNTIME_LANGUAGE_ORDER.indexOf(b.language))
+  return components.map((component) => `${component.language}=${component.version}`).join(',')
+}
 
 /** `doubulea/sandbox-base:<ver>` —— toolkit 的 `FROM` 与 `.env` 的 `SANDBOX_IMAGE_BASE` 都用它 */
 export const baseImageRef = () => `${BASE_IMAGE_NAME}:${BASE_LAYER_VERSION}`
 
-/** `doubulea/sandbox-toolkit:<ver>` —— `.env` 的 `SANDBOX_IMAGE`，即**最终镜像**（§五 1） */
+/** `doubulea/sandbox-toolkit:<ver>` —— `.env` 的 `SANDBOX_IMAGE`，即**默认/回退镜像**（§五 1） */
 export const toolkitImageRef = () => `${TOOLKIT_IMAGE_NAME}:${TOOLKIT_LAYER_VERSION}`
+
+/**
+ * `doubulea/sandbox-runtime:<变体>-v<层版本>` —— 一变体一份（P1-17a）。
+ *
+ * ⚠️ `-v` 分隔符与后端 `backend/src/sandbox/runtimeImages.ts` 的解析**必须一致**：
+ *    变体名自己可以含 `-`（组合名 `node22-python38`），故用**最后一个 `-v<数字>`** 切变体名。
+ */
+export const runtimeImageRef = (runtime) => `${RUNTIME_IMAGE_NAME}:${runtime}-v${RUNTIME_LAYER_VERSION}`

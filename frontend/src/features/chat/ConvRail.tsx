@@ -1,11 +1,13 @@
 /**
  * 会话栏（P1-15 · `子方案/聊天主页与信息架构改造.md` §四）
  *
- * 一列承载三件事：
- *   · 顶部：品牌字标 + 「＋ 新对话」（经 `AgentPicker` 选智能体 ⇒ `/new/:agentId`）；
- *   · 中段：**跨智能体**会话历史（分组：今天 / 更早；每条 = 状态灯 + 标题 + 智能体徽标 + 相对时间；
- *     行内 hover 浮出 [重命名][删除]）；
- *   · 底部：`管理 ▸` 折叠 popover（**管理跟会话走**，不占常驻列）+ 用户菜单 / 配色 / 服务灯。
+ * 一列分两层（2026-10-13 修订）：
+ *   · 上层「平台功能」（约 35% 高）：智能体 / 知识库 / MCP / 任务 / 我的凭据 / 会话产物 六个直达入口；
+ *     末尾「管理 ▸」点击**就地展开**其余入口（用量统计 / 用户管理 / 模型池）；
+ *   · 下层「会话」（约 65% 高）：**跨智能体**会话历史（分组：今天 / 更早；组标题可点击**收缩**；
+ *     每条 = 状态灯 + 标题 + 智能体徽标 + 相对时间；行内 hover 浮出 [重命名][删除]）；
+ *   · 顶部与底部固定：品牌字标 + 「＋ 新对话」（经 `AgentPicker` 选智能体 ⇒ `/new/:agentId`）；
+ *     用户菜单 / 配色 / 服务灯。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三条"不新造口径"（与 `ConversationSidebar` 同源，见 `conversationList.ts`）
@@ -19,16 +21,16 @@
  * 都要导航到同两条路径 —— 与其把这几次导航层层透传到 `ChatPage`，不如让导航住在"它本就属于谁"。
  */
 
-import { DownOutlined, MenuOutlined, PlusOutlined } from '@ant-design/icons'
-import { Button, Input, Popover, Tag, Tooltip } from 'antd'
+import { DownOutlined, MenuOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
+import { Button, Input, Tag, Tooltip } from 'antd'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { CONVERSATION_TOPIC_MAX_CHARS, type ConversationItem, type RemoveConversationResult } from '@doubulea/shared'
 
 import { useCurrentUser } from '../../api/auth.js'
 import { MY_CONVERSATIONS_PAGE_LIMIT_MAX, useMyConversations, useRenameConversation } from '../../api/conversations.js'
 import { useFeedback } from '../../app/feedback.js'
-import { visibleNavItems } from '../../app/nav.js'
+import { matchNavItem, visibleNavItems, type NavItem } from '../../app/nav.js'
 import { ICON_BY_CODE, NAV_FALLBACK_ICON } from '../../app/navIcons.js'
 import { HOME_PATH, conversationPath, newConversationPath } from '../../app/paths.js'
 import { ServiceLed } from '../../app/ServiceLed.js'
@@ -41,6 +43,13 @@ import { AgentPicker } from './AgentPicker.js'
 import { DeleteConversationModal } from './DeleteConversationModal.js'
 import { groupConversationViews, normalizeTopicDraft } from './conversationList.js'
 import { useMinuteTick } from './useMinuteTick.js'
+
+/**
+ * 上层「平台功能」的直达入口（按 `NavItem.code`）；顺序即产品口径的展示顺序
+ * （智能体 / 知识库 / MCP / 任务 / 我的凭据 / 会话产物），**不跟 `NAV_ITEMS` 的排列**。
+ * 其余导航项归「管理 ▸」展开后的「剩余部分」（用量统计 / 用户管理 / 模型池）。
+ */
+const PLATFORM_NAV_CODES: readonly string[] = ['AG', 'KB', 'MC', 'TK', 'CR', 'AH']
 
 export interface ConvRailProps {
   /** 路由里的当前会话 id；`undefined` = 新会话态 / 聊天主页空态 */
@@ -70,11 +79,22 @@ export function ConvRail({ conversationId }: ConvRailProps) {
   const [draft, setDraft] = useState('')
   /** 待确认删除的那一条 */
   const [pendingDelete, setPendingDelete] = useState<ConversationItem | null>(null)
-  /** 「管理」popover 开合 */
-  const [manageOpen, setManageOpen] = useState(false)
+  /** 「管理 ▸」是否就地展开（展开后露出「其余入口」：用量统计 / 用户管理 / 模型池） */
+  const [manageExpanded, setManageExpanded] = useState(false)
+  /** 已收缩的会话分组标题（"更早"这类长列表可点标题收起；默认全部展开） */
+  const [collapsedGroups, setCollapsedGroups] = useState<readonly string[]>([])
 
   const themeMode = useUiStore((state) => state.themeMode)
   const toggleThemeMode = useUiStore((state) => state.toggleThemeMode)
+
+  /** 当前命中的导航项 —— 平台功能列表据此高亮（与顶栏面包屑同一判据，见 `nav.ts`） */
+  const currentNav = matchNavItem(useLocation().pathname)
+
+  const toggleGroup = (label: string): void => {
+    setCollapsedGroups((current) =>
+      current.includes(label) ? current.filter((entry) => entry !== label) : [...current, label],
+    )
+  }
 
   // 切会话 ⇒ 收起编辑态（留着的症状是"点开另一条，输入框还开着、内容是上一条的"）
   useEffect(() => {
@@ -109,11 +129,15 @@ export function ConvRail({ conversationId }: ConvRailProps) {
 
   if (user === undefined || user === null) return null
   const navItems = visibleNavItems(user.role)
-  const normalItems = navItems.filter((item) => item.adminOnly !== true)
-  const adminItems = navItems.filter((item) => item.adminOnly === true)
+  // 上层「平台功能」= 用户点名的六个直达入口（顺序按产品口径，不随 `NAV_ITEMS` 排）；
+  // 其余（用量统计 / 用户管理 / 模型池）= 「管理 ▸」展开后的「剩余部分」。
+  const platformItems = PLATFORM_NAV_CODES.map((code) => navItems.find((item) => item.code === code)).filter(
+    (item): item is NavItem => item !== undefined,
+  )
+  const manageItems = navItems.filter((item) => !PLATFORM_NAV_CODES.includes(item.code))
 
   return (
-    <aside className="convrail" aria-label="会话历史">
+    <aside className="convrail" aria-label="平台功能与会话历史">
       <div className="convrail__head">
         <span className="convrail__mark" aria-hidden="true">
           A
@@ -135,166 +159,198 @@ export function ConvRail({ conversationId }: ConvRailProps) {
         />
       </div>
 
-      {listQuery.isPending ? (
-        <div className="convrail__body">
-          <p className="convrail__hint">正在读取会话…</p>
-        </div>
-      ) : listQuery.isError ? (
-        <div className="convrail__body">
-          <p className="convrail__hint">会话列表没有读出来。</p>
-          <Button
-            size="small"
-            loading={listQuery.isFetching}
-            onClick={() => {
-              void listQuery.refetch()
-            }}
-          >
-            重试
-          </Button>
-        </div>
-      ) : groups.length === 0 ? (
-        <div className="convrail__body">
-          <p className="convrail__hint">还没有会话。点上方「新对话」选一个智能体开始。</p>
-        </div>
-      ) : (
-        <ul className="convrail__list">
-          {groups.map((group) => (
-            <li key={group.label}>
-              <p className="convrail__group">{group.label}</p>
-              <ul className="convrail__group-list">
-                {group.items.map((view) => {
-                  const item = items?.find((candidate) => candidate.id === view.id)
-                  if (item === undefined) return null
-                  const current = item.id === conversationId
-                  const editing = editingId === item.id
-                  return (
-                    <li className="conv" data-current={current} key={item.id}>
-                      {editing ? (
-                        <div className="conv__edit">
-                          <Input
-                            size="small"
-                            aria-label="会话名称"
-                            value={draft}
-                            maxLength={CONVERSATION_TOPIC_MAX_CHARS}
-                            autoFocus
-                            onChange={(event) => setDraft(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Escape') {
-                                setEditingId(null)
-                                return
-                              }
-                              if (event.key !== 'Enter') return
-                              if (event.nativeEvent.isComposing) return
-                              submitRename(item)
-                            }}
-                          />
-                          <div className="conv__edit-ops">
-                            <Button
-                              size="small"
-                              type="primary"
-                              disabled={normalizeTopicDraft(draft, item.topic) === null}
-                              onClick={() => submitRename(item)}
-                            >
-                              保存
-                            </Button>
-                            <Button size="small" onClick={() => setEditingId(null)}>
-                              取消
-                            </Button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          className="conv__open"
-                          type="button"
-                          aria-current={current ? 'true' : undefined}
-                          onClick={() => {
-                            if (!current) navigate(conversationPath(item.id))
-                          }}
-                        >
-                          <span className="conv__title">{view.title}</span>
-                          <span className="conv__meta">
-                            <span className={`led led--${view.led}`} aria-hidden="true" />
-                            <span>{view.state}</span>
-                            {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
-                            <Tag className="conv__agent" title={view.agentName}>
-                              {AGENT_TYPE_LABEL[view.agentType]}
-                            </Tag>
-                            <span aria-hidden="true">·</span>
-                            <span className="num">{view.time}</span>
-                          </span>
-                        </button>
-                      )}
-
-                      {editing ? null : (
-                        <span className="conv__ops">
-                          <Tooltip title="重命名">
-                            <button
-                              type="button"
-                              aria-label={`重命名会话「${view.title}」`}
-                              onClick={() => {
-                                setEditingId(item.id)
-                                setDraft(item.topic ?? '')
-                              }}
-                            >
-                              ✎
-                            </button>
-                          </Tooltip>
-                          <Tooltip title="删除">
-                            <button
-                              type="button"
-                              aria-label={`删除会话「${view.title}」`}
-                              onClick={() => setPendingDelete(item)}
-                            >
-                              ✕
-                            </button>
-                          </Tooltip>
-                        </span>
-                      )}
-                    </li>
-                  )
-                })}
-              </ul>
+      {/* 上层：平台功能（约 35% 高）。直达入口 + 就地展开的「管理」。 */}
+      <nav className="convrail__nav" aria-label="平台功能">
+        <ul className="convrail__nav-list">
+          {platformItems.map((item) => (
+            <li key={item.path}>
+              <Link
+                to={item.path}
+                className="convrail__nav-item"
+                data-current={currentNav?.path === item.path}
+              >
+                <span className="convrail__nav-icon" aria-hidden="true">
+                  {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
+                </span>
+                <span className="convrail__nav-label">{item.label}</span>
+              </Link>
             </li>
           ))}
-        </ul>
-      )}
-
-      <div className="convrail__foot">
-        <Popover
-          open={manageOpen}
-          onOpenChange={setManageOpen}
-          trigger="click"
-          placement="topLeft"
-          content={
-            <nav className="rail-menu" aria-label="管理">
-              <div className="rail-menu__grid">
-                {[...normalItems, ...adminItems].map((item) => (
-                  <Link key={item.path} to={item.path} className="rail-menu__item" onClick={() => setManageOpen(false)}>
-                    <span className="rail-menu__icon" aria-hidden="true">
+          <li>
+            <button
+              type="button"
+              className="convrail__nav-item convrail__nav-toggle"
+              aria-expanded={manageExpanded}
+              title={manageExpanded ? '收起管理入口' : '展开管理入口'}
+              onClick={() => {
+                setManageExpanded((value) => !value)
+              }}
+            >
+              <span className="convrail__nav-icon" aria-hidden="true">
+                <MenuOutlined />
+              </span>
+              <span className="convrail__nav-label">管理</span>
+              <DownOutlined className="convrail__nav-caret" data-open={manageExpanded} />
+            </button>
+          </li>
+          {manageExpanded
+            ? manageItems.map((item) => (
+                <li key={item.path}>
+                  <Link
+                    to={item.path}
+                    className="convrail__nav-item convrail__nav-item--sub"
+                    data-current={currentNav?.path === item.path}
+                  >
+                    <span className="convrail__nav-icon" aria-hidden="true">
                       {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
                     </span>
-                    {item.label}
+                    <span className="convrail__nav-label">{item.label}</span>
                   </Link>
-                ))}
-              </div>
-              {adminItems.length > 0 && normalItems.length > 0 ? (
-                <p className="rail-menu__note">下方为管理员入口</p>
-              ) : null}
-            </nav>
-          }
-        >
-          <button
-            type="button"
-            className="convrail__manage"
-            aria-haspopup="menu"
-            title="管理（智能体 / 知识库 / MCP / 任务 / 产物 / 凭据 / 用量）"
-          >
-            <MenuOutlined />
-            <span className="convrail__manage-label">管理</span>
-            <DownOutlined className="convrail__manage-caret" />
-          </button>
-        </Popover>
+                </li>
+              ))
+            : null}
+        </ul>
+      </nav>
 
+      {/* 下层：会话（约 65% 高）。 */}
+      <section className="convrail__convos" aria-label="会话历史">
+        {listQuery.isPending ? (
+          <p className="convrail__hint">正在读取会话…</p>
+        ) : listQuery.isError ? (
+          <div className="convrail__empty">
+            <p className="convrail__hint">会话列表没有读出来。</p>
+            <Button
+              size="small"
+              loading={listQuery.isFetching}
+              onClick={() => {
+                void listQuery.refetch()
+              }}
+            >
+              重试
+            </Button>
+          </div>
+        ) : groups.length === 0 ? (
+          <p className="convrail__hint">还没有会话。点上方「新对话」选一个智能体开始。</p>
+        ) : (
+          <ul className="convrail__list">
+            {groups.map((group) => {
+              const collapsed = collapsedGroups.includes(group.label)
+              return (
+                <li key={group.label}>
+                  <button
+                    type="button"
+                    className="convrail__group"
+                    aria-expanded={!collapsed}
+                    title={collapsed ? `展开「${group.label}」` : `收缩「${group.label}」`}
+                    onClick={() => toggleGroup(group.label)}
+                  >
+                    <RightOutlined className="convrail__group-caret" data-open={!collapsed} />
+                    <span className="convrail__group-label">{group.label}</span>
+                    <span className="convrail__group-count num">{group.items.length}</span>
+                  </button>
+                  {collapsed ? null : (
+                    <ul className="convrail__group-list">
+                      {group.items.map((view) => {
+                        const item = items?.find((candidate) => candidate.id === view.id)
+                        if (item === undefined) return null
+                        const current = item.id === conversationId
+                        const editing = editingId === item.id
+                        return (
+                          <li className="conv" data-current={current} key={item.id}>
+                            {editing ? (
+                              <div className="conv__edit">
+                                <Input
+                                  size="small"
+                                  aria-label="会话名称"
+                                  value={draft}
+                                  maxLength={CONVERSATION_TOPIC_MAX_CHARS}
+                                  autoFocus
+                                  onChange={(event) => setDraft(event.target.value)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === 'Escape') {
+                                      setEditingId(null)
+                                      return
+                                    }
+                                    if (event.key !== 'Enter') return
+                                    if (event.nativeEvent.isComposing) return
+                                    submitRename(item)
+                                  }}
+                                />
+                                <div className="conv__edit-ops">
+                                  <Button
+                                    size="small"
+                                    type="primary"
+                                    disabled={normalizeTopicDraft(draft, item.topic) === null}
+                                    onClick={() => submitRename(item)}
+                                  >
+                                    保存
+                                  </Button>
+                                  <Button size="small" onClick={() => setEditingId(null)}>
+                                    取消
+                                  </Button>
+                                </div>
+                              </div>
+                            ) : (
+                              <button
+                                className="conv__open"
+                                type="button"
+                                aria-current={current ? 'true' : undefined}
+                                onClick={() => {
+                                  if (!current) navigate(conversationPath(item.id))
+                                }}
+                              >
+                                <span className="conv__title">{view.title}</span>
+                                <span className="conv__meta">
+                                  <span className={`led led--${view.led}`} aria-hidden="true" />
+                                  <span>{view.state}</span>
+                                  {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
+                                  <Tag className="conv__agent" title={view.agentName}>
+                                    {AGENT_TYPE_LABEL[view.agentType]}
+                                  </Tag>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="num">{view.time}</span>
+                                </span>
+                              </button>
+                            )}
+
+                            {editing ? null : (
+                              <span className="conv__ops">
+                                <Tooltip title="重命名">
+                                  <button
+                                    type="button"
+                                    aria-label={`重命名会话「${view.title}」`}
+                                    onClick={() => {
+                                      setEditingId(item.id)
+                                      setDraft(item.topic ?? '')
+                                    }}
+                                  >
+                                    ✎
+                                  </button>
+                                </Tooltip>
+                                <Tooltip title="删除">
+                                  <button
+                                    type="button"
+                                    aria-label={`删除会话「${view.title}」`}
+                                    onClick={() => setPendingDelete(item)}
+                                  >
+                                    ✕
+                                  </button>
+                                </Tooltip>
+                              </span>
+                            )}
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </section>
+
+      <div className="convrail__foot">
         <div className="convrail__user">
           <Button size="small" type="text" onClick={toggleThemeMode} title="切换配色（浅色为交付主态）">
             {themeMode === 'dark' ? '暗色' : '浅色'}
