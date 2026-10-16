@@ -67,6 +67,7 @@ import {
   GUIDE_QUESTIONS_MAX,
   createAgentBodySchema,
   updateAgentBodySchema,
+  type AgentComponentInput,
   type AgentItem,
 } from '@doubulea/shared'
 import { useState, type ReactNode } from 'react'
@@ -76,7 +77,7 @@ import { useAgent, useCreateAgent, useReplaceAgentComponents, useUpdateAgent } f
 import { describeError } from '../../api/client.js'
 import { useMyConversationCount } from '../../api/conversations.js'
 import { useKnowledgeBases } from '../../api/knowledgeBases.js'
-import { useMcpServers, useMyCredentials } from '../../api/mcp.js'
+import { useMcpServers, useMcpServerTools, useMyCredentials } from '../../api/mcp.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
@@ -100,6 +101,7 @@ import {
   mcpIdsOf,
   mcpSelectionOf,
   orderSections,
+  pinnedMcpToolsOf,
   sameComponentSet,
   sectionOrdinal,
   sectionsOfUpdateBody,
@@ -212,7 +214,7 @@ interface SaveFailure {
 /** "最后一次落库的快照"：文本/模型字段 + 组件绑定（分别由 PATCH 与 PUT 推进） */
 interface SavedSnapshot {
   values: AgentFormValues
-  components: { componentType: 'KNOWLEDGE' | 'MCP'; refId: string }[]
+  components: AgentComponentInput[]
 }
 
 function toFailures(sections: readonly AgentSectionKey[], error: unknown): SaveFailure[] {
@@ -246,6 +248,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
    * 初值走 `mcpIdsOf`（与知识库那条同款），保证"编辑一个已绑定的智能体"时勾选状态是对的。
    */
   const [selectedMcpIds, setSelectedMcpIds] = useState<string[]>(mcpIdsOf(initialComponents))
+  /**
+   * 常驻工具（P1-19）：server id → MCP 原始工具名。工具总数超过阈值时只有这些直接下发给模型，
+   * 其余走工具网关（`mcp_list_tools` / `mcp_call_tool` 按需发现）。初值从已保存的绑定里取。
+   */
+  const [pinnedMcpTools, setPinnedMcpTools] = useState<Record<string, string[]>>(
+    pinnedMcpToolsOf(initialComponents),
+  )
   const [deleteOpen, setDeleteOpen] = useState(false)
 
   const item = initialItem ?? created
@@ -266,7 +275,10 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const mcpItems = mcpQuery.data?.items ?? []
   const modelOptions = modelQuery.data?.items ?? []
 
-  const selectedComponents = [...knowledgeSelectionOf(selectedKbIds), ...mcpSelectionOf(selectedMcpIds)]
+  const selectedComponents = [
+    ...knowledgeSelectionOf(selectedKbIds),
+    ...mcpSelectionOf(selectedMcpIds, pinnedMcpTools),
+  ]
 
   /**
    * 已勾选、但**不在知识库列表里**的 id（列表重拉后消失的那些）。
@@ -485,6 +497,25 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
     setSelectedMcpIds((current) =>
       checked ? [...current.filter((id) => id !== serverId), serverId] : current.filter((id) => id !== serverId),
     )
+    // 解绑时顺手丢掉它的常驻工具（P1-19）：解绑后再留着这批名字，一旦重新勾选会"凭空复活"
+    if (!checked) {
+      setPinnedMcpTools((current) => {
+        if (current[serverId] === undefined) return current
+        const next = { ...current }
+        delete next[serverId]
+        return next
+      })
+    }
+  }
+
+  /** 设置某台 server 的常驻工具（P1-19）；空数组 = 清掉常驻 */
+  const setPinnedForServer = (serverId: string, names: string[]) => {
+    setPinnedMcpTools((current) => {
+      const next = { ...current }
+      if (names.length === 0) delete next[serverId]
+      else next[serverId] = names
+      return next
+    })
   }
 
   return (
@@ -901,6 +932,28 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                     </div>
                   )}
 
+                  {/* 常驻工具（P1-19）：工具多时（超过 MCP_INLINE_TOOL_LIMIT）只有这些**直接**下发给模型，
+                      其余仍可用 —— 模型先用「列出 MCP 工具」发现，再用「调用 MCP 工具」触达。
+                      工具少时本设置不生效（全部直接下发）。 */}
+                  {selectedMcpIds.length > 0 && mcpItems.length > 0 && (
+                    <div className="stack stack--tight" style={{ marginTop: 'var(--sp-3)' }}>
+                      <p className="block-label">常驻工具（可选）</p>
+                      <span className="ratio">
+                        选中的工具会直接提供给模型；其余工具仍可用，只是模型要先「列出」再「调用」。
+                        绑定的工具总数不多时本设置不生效（那时全部工具都直接提供）。
+                      </span>
+                      {selectedMcpIds.map((serverId) => (
+                        <McpPinnedToolsRow
+                          key={serverId}
+                          server={serverId}
+                          serverName={mcpItems.find((server) => server.id === serverId)?.name ?? serverId}
+                          value={pinnedMcpTools[serverId] ?? []}
+                          onChange={(names) => setPinnedForServer(serverId, names)}
+                        />
+                      ))}
+                    </div>
+                  )}
+
                   {/* ⚠️ 「已勾选但已不在列表里」的 server **必须显式列出来，而且必须能取消勾选**
                       （与上面知识库那一段同一条推理，而 MCP 这边更可能真发生：server 是全员可删的）。 */}
                   {missingMcpIds.length > 0 && (
@@ -1055,6 +1108,49 @@ function SummaryRow({ label, value, last = false }: { label: string; value: stri
     <div className="summary-row" style={last ? { borderBottom: 0 } : undefined}>
       <span className="summary-row__label">{label}</span>
       <span className="ratio">{value}</span>
+    </div>
+  )
+}
+
+/**
+ * 某台 MCP server 的**常驻工具**选择器（P1-19）。
+ *
+ * 工具清单来自 `GET /api/mcp/servers/:id/tools`（读缓存，不联网）；`value`/`onChange` 是
+ * **MCP 原始工具名**（与后端 `agent_components.config.pinnedMcpTools` 同一口径）。
+ */
+function McpPinnedToolsRow({
+  server,
+  serverName,
+  value,
+  onChange,
+}: {
+  server: string
+  serverName: string
+  value: string[]
+  onChange: (names: string[]) => void
+}) {
+  const toolsQuery = useMcpServerTools(server)
+  const tools = toolsQuery.data?.tools ?? []
+  return (
+    <div>
+      <span className="pick__title">{serverName}</span>
+      <Select
+        mode="multiple"
+        allowClear
+        style={{ width: '100%', marginTop: 'var(--sp-1)' }}
+        loading={toolsQuery.isPending}
+        value={value}
+        onChange={(names: string[]) => onChange(names)}
+        optionFilterProp="label"
+        placeholder={
+          toolsQuery.isPending
+            ? '加载工具列表…'
+            : tools.length === 0
+              ? '该 server 还没有工具（先到 MCP 管理页点「测试」拉取）'
+              : '选择要常驻的工具（可留空）'
+        }
+        options={tools.map((tool) => ({ label: tool.name, value: tool.name }))}
+      />
     </div>
   )
 }

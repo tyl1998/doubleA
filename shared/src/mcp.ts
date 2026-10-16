@@ -209,6 +209,66 @@ export const MCP_TOOL_DESCRIPTION_MAX = 1024
  */
 export const MCP_TOOL_WRAPPER_KEY = 'input'
 
+// ───────────────────────────── 工具网关（渐进披露，P1-19）─────────────────────────────
+//
+// 背景：Agent 可以绑**多台** MCP server、每台几十个工具 ⇒ 若把全部工具一次性放进 `tools`
+// 下发给模型，上下文会被几十上百个工具定义挤爆，模型挑工具的准确率也会掉。
+// 处置：**工具网关** —— 数量多时只下发两个固定工具（list / call），其余工具**按需发现**；
+// 少量工具（或 Agent 明确标的"常驻工具"）仍直接下发。策略的纯函数在
+// `backend/src/orchestrator/mcpGatewayModel.ts`，执行体在 `mcpGatewayTools.ts`。
+
+/**
+ * 「列出 / 搜索 MCP 工具」内置工具名（工具网关的**发现**侧）。
+ *
+ * ⚠️ 它**带 `mcp_` 前缀**，与真实 MCP 工具（`mcp_{slug}_{tool}`）同形 ⇒ **不能靠前缀**
+ * 区分网关工具与真实工具，必须按**精确名字**判（见 {@link isMcpGatewayToolName}）。
+ * 为避免真实工具撞上它，装配时会先把这两个名字塞进跨 server 的「已占用名字」集合
+ * （`mcp/toolSchema.ts#disambiguate` 的 `taken`）—— 于是真实工具会被逼成 `mcp_list_tools-2` 之类。
+ */
+export const MCP_LIST_TOOLS_TOOL_NAME = 'mcp_list_tools'
+
+/**
+ * 「调用 MCP 工具」内置工具名（工具网关的**执行**侧）。
+ *
+ * 模型先用 {@link MCP_LIST_TOOLS_TOOL_NAME} 拿到工具名，再用本工具按名调用。参数 `name`
+ * 是**下发给模型的名字**（`mcp_{slug}_{tool}`；沙箱里是 `mcp_{alias}_{tool}`），
+ * `arguments` 是那台工具自己的参数对象。
+ */
+export const MCP_CALL_TOOL_TOOL_NAME = 'mcp_call_tool'
+
+/** 两个网关工具名（装配时用于占用名字、分流时用于识别） */
+export const MCP_GATEWAY_TOOL_NAMES = [MCP_LIST_TOOLS_TOOL_NAME, MCP_CALL_TOOL_TOOL_NAME] as const
+
+/** 这个名字是不是网关工具（**精确匹配**，见 {@link MCP_LIST_TOOLS_TOOL_NAME} 的注释） */
+export function isMcpGatewayToolName(name: string): boolean {
+  return (MCP_GATEWAY_TOOL_NAMES as readonly string[]).includes(name)
+}
+
+/**
+ * `mcp_list_tools` 一次最多返回多少条工具。
+ *
+ * 它是"**给模型看的目录**"、不是"必须列全"：超出的部分明确写「其余 N 个未列出，请用 query
+ * 缩小范围」，让模型自己收敛（同 `knowledgeTools.ts#KNOWLEDGE_LIST_MAX_DOCS` 的取舍）。
+ */
+export const MCP_LIST_TOOLS_MAX_RESULTS = 100
+
+/** 目录里**每条工具**描述的截断上限（码点）：目录要短，完整描述在真的调用时才有意义 */
+export const MCP_LIST_TOOLS_ENTRY_DESCRIPTION_MAX = 160
+
+/** `mcp_list_tools` 的入参（都可选：不给 query 就列全部，不给 server 就跨全部 server） */
+export const mcpListToolsArgsSchema = z.object({
+  /** 只看某一台 server（收 server 名或 id；见执行体） */
+  server: z.string().trim().max(MCP_SERVER_NAME_MAX).optional(),
+  /** 关键词（按工具名与描述做包含匹配） */
+  query: z.string().trim().max(200).optional(),
+})
+
+/** `mcp_call_tool` 的入参（`name` 必填；`arguments` 省略 = 无参调用） */
+export const mcpCallToolArgsSchema = z.object({
+  name: z.string().trim().min(1),
+  arguments: z.record(z.unknown()).optional(),
+})
+
 /**
  * 凭据模板的条目数上限。
  *

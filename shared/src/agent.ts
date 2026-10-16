@@ -244,15 +244,47 @@ export function normalizeGuideQuestions(raw: unknown): string[] {
  * 一条组件绑定（读侧形态）。字段名与列名一致（`componentType` / `refId`），
  * 见文件头 ② —— **不带目标名**。
  *
- * `config` 不在契约里：`02` §三 把它标为"预留给未来的 per-binding 参数，P0 不写"，
- * 现在下发一个恒为 `null` 的字段只会诱使前端写永远走不到的分支。
+ * `pinnedToolNames` 是 **P1-19** 加的（只对 `componentType=MCP` 有意义）：**常驻工具**的
+ * MCP 原始工具名 —— 当 Agent 绑定的 MCP 工具总数超过网关阈值时，只有这些**直接下发**给模型，
+ * 其余由 `mcp_list_tools` / `mcp_call_tool` 按需触达（见 `backend/src/services/mcpCall.service.ts`）。
+ * 存储落在 `agent_components.config` 这个既有 jsonb 列（`{ pinnedMcpTools: [...] }`）。
+ * `KNOWLEDGE` 行不带它。
  */
 export const agentComponentRefSchema = z.object({
   componentType: z.enum(COMPONENT_TYPES),
   /** `KNOWLEDGE` → `knowledge_bases.id`；`MCP` → `mcp_servers.id`（多态，无外键，`02` §3.1） */
   refId: z.string(),
+  /** 常驻的 MCP 工具原始名（仅 `MCP`；缺省 = 无常驻，工具多时全走网关） */
+  pinnedToolNames: z.array(z.string()).optional(),
 })
 export type AgentComponentRef = z.infer<typeof agentComponentRefSchema>
+
+/** 单个组件绑定能标的**常驻工具数**上限（防"把整台 server 的工具全常驻"把阈值架空） */
+export const MCP_PINNED_TOOL_NAMES_MAX = 200
+
+/**
+ * 从 `agent_components.config`（jsonb）里读出**常驻工具名**。**永不抛错**（读侧的唯一入口）。
+ *
+ * 形状是 `{ pinnedMcpTools: string[] }`。逐条过滤（非字符串 / 空串丢掉）、去重、封顶 ——
+ * 与 `normalizeGuideQuestions` 同族的"读取端只求能渲染、坏值静默丢弃"：config 是 jsonb，
+ * 手工改库 / 跨环境导入都可能塞进半截数据。
+ */
+export function pinnedMcpToolNamesFromConfig(config: unknown): string[] {
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) return []
+  const raw = (config as { pinnedMcpTools?: unknown }).pinnedMcpTools
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (name === '' || seen.has(name)) continue
+    seen.add(name)
+    out.push(name)
+    if (out.length >= MCP_PINNED_TOOL_NAMES_MAX) break
+  }
+  return out
+}
 
 /**
  * 模型池里的**一个可选模型**（对话页的模型选择器逐项渲染）。
@@ -357,6 +389,14 @@ export const agentComponentInputSchema = z.object({
   refId: z
     .string({ required_error: '请提供组件引用 ID' })
     .uuid('组件引用 ID 不是合法 UUID（KNOWLEDGE 必须是知识库 id）'),
+  /**
+   * 常驻的 MCP 工具原始名（仅 `MCP`；P1-19）。省略 / 空数组 = 无常驻。
+   * ⚠️ 常驻只是"**优先直接下发**"：工具总数没超阈值时本来就全部下发，常驻不起作用。
+   */
+  pinnedToolNames: z
+    .array(z.string().trim().min(1).max(256), { invalid_type_error: 'pinnedToolNames 必须是字符串数组' })
+    .max(MCP_PINNED_TOOL_NAMES_MAX, `常驻工具最多 ${MCP_PINNED_TOOL_NAMES_MAX} 个`)
+    .optional(),
 })
 export type AgentComponentInput = z.infer<typeof agentComponentInputSchema>
 

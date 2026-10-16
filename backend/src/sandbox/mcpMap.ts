@@ -90,13 +90,22 @@ export interface SandboxMcpCatalog {
   servers: SandboxMcpServerRef[]
   /** **注册给引擎的名字**（`mcp_<alias>_<tool>`）→ 这个工具是谁 */
   tools: Record<string, SandboxMcpToolRef>
+  /**
+   * **直接注册给容器**的工具名（P1-19 工具网关）；其余工具**不注册**，由容器侧的内置工具
+   * `mcp_list_tools` / `mcp_call_tool` 按需触达。
+   * ⚠️ `tools` 仍是**全部**工具（它是反查表：网关的 `call` 靠它把名字解析回 server/tool）——
+   * `inlineTools` 只决定"哪些名字注册进容器"，不改变这张表本身。
+   * ⚠️ 老值（P1-19 之前写进 Redis 的）没有这个字段 ⇒ `parseCatalog` 缺失时按 **`tools` 的全部键**
+   * 兜底（= 全量注册，与旧行为一致），TTL 会兜底过期。
+   */
+  inlineTools: string[]
   /** 平台内置工具（知识库检索 / 目录 / 整篇阅读）。**没有就是空数组**（绝大多数 Agent 不绑 KB） */
   builtins: SandboxBuiltinToolRef[]
 }
 
 /** 空清单（Agent 没绑任何 MCP server / 知识库 —— 这是最常见的一种） */
 export function emptySandboxMcpCatalog(): SandboxMcpCatalog {
-  return { servers: [], tools: {}, builtins: [] }
+  return { servers: [], tools: {}, inlineTools: [], builtins: [] }
 }
 
 // ───────────────────────────── 纯函数：命名 ─────────────────────────────
@@ -255,7 +264,12 @@ function parseCatalog(raw: string): SandboxMcpCatalog | null {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
-    const { servers, tools, builtins } = parsed as { servers?: unknown; tools?: unknown; builtins?: unknown }
+    const { servers, tools, builtins, inlineTools: rawInlineTools } = parsed as {
+      servers?: unknown
+      tools?: unknown
+      builtins?: unknown
+      inlineTools?: unknown
+    }
     if (!Array.isArray(servers)) return null
     if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) return null
     // `builtins` 是本批新增的字段：老值（本批之前写进 Redis 的）没有它 ⇒ 缺失按空数组（TTL 会兜底）
@@ -304,7 +318,21 @@ function parseCatalog(raw: string): SandboxMcpCatalog | null {
       }
     }
 
-    return { servers: serverRefs, tools: toolRefs, builtins: builtinRefs }
+    // `inlineTools` 是 P1-19 新增：老值没有它 ⇒ 按 `tools` 的全部键兜底（= 全量注册，与旧行为一致）
+    let inlineTools: string[]
+    if (rawInlineTools === undefined) {
+      inlineTools = Object.keys(toolRefs)
+    } else {
+      if (!Array.isArray(rawInlineTools)) return null
+      inlineTools = []
+      for (const name of rawInlineTools) {
+        if (typeof name !== 'string') return null
+        // 只收**确实在反查表里**的名字（人工改过 Redis 的脏名丢掉，不让它变成"注册了却调不到"）
+        if (Object.prototype.hasOwnProperty.call(toolRefs, name)) inlineTools.push(name)
+      }
+    }
+
+    return { servers: serverRefs, tools: toolRefs, inlineTools, builtins: builtinRefs }
   } catch {
     return null
   }

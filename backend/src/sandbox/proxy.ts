@@ -53,18 +53,34 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 
-import { AppError, RECALL_MEMORY_TOOL_NAME, REMEMBER_TOOL_NAME, SEND_NOTIFICATION_TOOL_NAME } from '@doubulea/shared'
+import {
+  AppError,
+  MCP_CALL_TOOL_TOOL_NAME,
+  MCP_GATEWAY_TOOL_NAMES,
+  MCP_LIST_TOOLS_TOOL_NAME,
+  RECALL_MEMORY_TOOL_NAME,
+  REMEMBER_TOOL_NAME,
+  SEND_NOTIFICATION_TOOL_NAME,
+  mcpCallToolArgsSchema,
+  pinnedMcpToolNamesFromConfig,
+} from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { McpAbortError } from '../mcp/errors.js'
+import { selectMcpInlineTools, type McpCatalogToolEntry } from '../mcp/gatewayModel.js'
 import { isDangerousTool } from '../mcp/risk.js'
 import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
 import { executeSendNotification, getNotifyTarget, notifyBuiltinDescriptor } from '../notify/index.js'
 import { knowledgeListTool, knowledgeSearchTool, readDocumentTool, summarizeToolInput } from '../orchestrator/chatContext.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from '../orchestrator/memoryTools.js'
+import {
+  callMcpToolTool,
+  executeListMcpTools,
+  listMcpToolsTool,
+} from '../orchestrator/mcpGatewayTools.js'
 import {
   boundKnowledgeBaseIds,
   executeKnowledgeTool,
@@ -109,7 +125,7 @@ export async function buildSandboxMcpCatalog(
 
   const components = await db.agentComponent.findMany({
     where: { agentId },
-    select: { componentType: true, refId: true },
+    select: { componentType: true, refId: true, config: true },
     orderBy: [{ componentType: 'asc' }, { refId: 'asc' }],
   })
   const serverIds = [
@@ -144,6 +160,10 @@ export async function buildSandboxMcpCatalog(
 
   /** 已占用的**注册名**（跨 server 累积 —— 见 `mcpMap.ts#registeredSandboxMcpToolName`） */
   const taken = new Set<string>()
+  // ⚠️ P1-19：预留两个**网关内置工具名**。沙箱里的真实工具名恒是 `mcp_s{alias}_{tool}`
+  // （alias 以 `s` 开头）⇒ 结构上撞不到 `mcp_list_tools` / `mcp_call_tool`；这一步是**防御性**的
+  // （对齐 ChatBot 路径，也让将来 alias 方案变更时不至于把网关顶掉）。
+  for (const name of MCP_GATEWAY_TOOL_NAMES) taken.add(name)
 
   ordered.forEach((row, index) => {
     const alias = sandboxMcpAliasAt(index)
@@ -184,10 +204,36 @@ export async function buildSandboxMcpCatalog(
     }
   })
 
+  // ── P1-19：工具网关（只有工具多时才开）—— 决定"哪些 MCP 工具直接注册进容器" ──
+  // 反查表 `catalog.tools` 保留**全部**工具（网关的 `call` 靠它解析名字），`inlineTools` 只圈出
+  // 直接注册的那些；策略与 ChatBot 路径**同一个纯函数**（`mcp/gatewayModel.ts#selectMcpInlineTools`）。
+  const entries: McpCatalogToolEntry[] = Object.entries(catalog.tools).map(([name, ref]) => ({
+    name,
+    serverId: ref.serverId,
+    serverName: ref.serverName,
+    toolName: ref.toolName,
+    description: ref.description,
+    dangerous: isDangerousTool({ annotations: ref.annotations }),
+  }))
+  const pinned = new Set<string>()
+  for (const component of components) {
+    if (component.componentType !== 'MCP') continue
+    const pins = pinnedMcpToolNamesFromConfig(component.config)
+    if (pins.length === 0) continue
+    const pinnedNames = new Set(pins)
+    for (const entry of entries) {
+      if (entry.serverId === component.refId && pinnedNames.has(entry.toolName)) pinned.add(entry.name)
+    }
+  }
+  const selection = selectMcpInlineTools(entries, pinned, config.mcp.inlineToolLimit)
+  catalog.inlineTools = [...selection.inline]
+
   // ── 平台内置工具（知识库检索 / 目录 / 整篇阅读）—— 绑了库才下发 ──
   // 与 ChatBot 同源（`knowledgeTools.ts`）；容器侧注册的商品名下不带 `mcp_` 前缀，
   // 执行时经 `/api/sandbox/builtin/call` 由后端代跑（凭据/库都不进容器）。见 `子方案③` §七。
   const builtins = knowledgeIds.length > 0 ? knowledgeBuiltinTools() : []
+  // 工具网关（P1-19）：只在走了网关时下发 —— 与 ChatBot 的 `catalog.gatewayActive` 同一条判据
+  if (selection.gatewayActive) builtins.push(...mcpGatewayBuiltinDescriptors())
   // 「记忆」内置工具（P1-8/P1-8a：remember 写入 + recall_memory 按需检索）：与知识库无关、**始终下发**
   builtins.push(...memoryBuiltinDescriptors())
   // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行时下发
@@ -201,11 +247,41 @@ export async function buildSandboxMcpCatalog(
       agentId,
       serverCount: catalog.servers.length,
       toolCount: Object.keys(catalog.tools).length,
+      inlineToolCount: catalog.inlineTools.length,
+      gatewayActive: selection.gatewayActive,
       builtinToolCount: catalog.builtins.length,
     },
     '已为沙箱下发工具清单（MCP 别名 s1…sN + 知识库内置工具；清单内容与别名映射都已发布）',
   )
   return catalog
+}
+
+/**
+ * 工具网关（P1-19）在容器清单里的描述符（`mcp_list_tools` / `mcp_call_tool`）。
+ *
+ * 与 {@link knowledgeBuiltinTools} 同源（**同一份定义** `orchestrator/mcpGatewayTools.ts`），
+ * 只是转成容器清单要的 `{name, description, inputSchema}` —— 执行仍走 `/api/sandbox/builtin/call`。
+ */
+export function mcpGatewayBuiltinDescriptors(): SandboxBuiltinToolRef[] {
+  return [listMcpToolsTool(), callMcpToolTool()].map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description ?? '',
+    inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
+  }))
+}
+
+/**
+ * 容器清单里的**全部** MCP 工具 → 目录条目（`mcp_list_tools` 与 `selectMcpInlineTools` 共用）。
+ */
+function sandboxCatalogEntries(catalog: SandboxMcpCatalog): McpCatalogToolEntry[] {
+  return Object.entries(catalog.tools).map(([name, ref]) => ({
+    name,
+    serverId: ref.serverId,
+    serverName: ref.serverName,
+    toolName: ref.toolName,
+    description: ref.description,
+    dangerous: isDangerousTool({ annotations: ref.annotations }),
+  }))
 }
 
 /**
@@ -323,19 +399,23 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     if (!auth.ok) return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', auth.message)
 
     const catalog = await ensureSandboxMcpCatalog(auth.record.conversationId, auth.record.agentId)
+    // P1-19：只把 `inlineTools` 里的工具注册进容器；其余由网关（内置工具）按需触达。
+    const inline = new Set(catalog.inlineTools)
     const payload: SandboxMcpToolsResponse = {
       servers: catalog.servers.map((server) => ({
         alias: server.alias,
         id: server.serverId,
         name: server.serverName,
       })),
-      tools: Object.entries(catalog.tools).map(([name, ref]) => ({
-        name,
-        serverAlias: ref.alias,
-        toolName: ref.toolName,
-        description: ref.description,
-        inputSchema: ref.inputSchema,
-      })),
+      tools: Object.entries(catalog.tools)
+        .filter(([name]) => inline.has(name))
+        .map(([name, ref]) => ({
+          name,
+          serverAlias: ref.alias,
+          toolName: ref.toolName,
+          description: ref.description,
+          inputSchema: ref.inputSchema,
+        })),
       builtinTools: catalog.builtins.map((tool) => ({
         name: tool.name,
         description: tool.description,
@@ -447,8 +527,17 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
 
     const isNotify = body.name === SEND_NOTIFICATION_TOOL_NAME
     const isMemory = body.name === REMEMBER_TOOL_NAME || body.name === RECALL_MEMORY_TOOL_NAME
-    // 只认内置工具（知识库一族 + 通知 + 记忆）；其他名字不是这条端点的职责
-    if (!isKnowledgeToolName(body.name) && !isNotify && !isMemory) {
+    // 工具网关（P1-19）：与内置工具同族（走本端点，容器侧不直连 MCP）
+    const isGatewayList = body.name === MCP_LIST_TOOLS_TOOL_NAME
+    const isGatewayCall = body.name === MCP_CALL_TOOL_TOOL_NAME
+    // 只认内置工具（知识库一族 + 通知 + 记忆 + 工具网关）；其他名字不是这条端点的职责
+    if (
+      !isKnowledgeToolName(body.name) &&
+      !isNotify &&
+      !isMemory &&
+      !isGatewayList &&
+      !isGatewayCall
+    ) {
       return sendSandboxProxyError(reply, 404, 'NOT_FOUND', `没有名为 ${body.name} 的内置工具。`)
     }
 
@@ -464,6 +553,57 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
     // 清单必须**确实下发过**这个内置工具（与 MCP 的 findOfferedTool 同一条判据）
     if (!catalog.builtins.some((tool) => tool.name === body.name)) {
       return sendSandboxProxyError(reply, 404, 'NOT_FOUND', `内置工具 ${body.name} 不曾下发给本容器。`)
+    }
+
+    // ── 工具网关（P1-19）──
+    // `mcp_list_tools`：把容器清单里的**全部**工具（含未直接注册的）列成目录（不碰凭据）。
+    if (isGatewayList) {
+      const outcome = executeListMcpTools({
+        entries: sandboxCatalogEntries(catalog),
+        arguments: JSON.stringify(body.arguments),
+      })
+      return reply.send({ isError: outcome.isError, text: outcome.output })
+    }
+    // `mcp_call_tool`：把 name 解析回真实工具，复用 `/mcp/call` 那条链路（越权检查 + 危险确认 + 凭据）
+    if (isGatewayCall) {
+      const inner = mcpCallToolArgsSchema.safeParse(body.arguments)
+      if (!inner.success) {
+        return reply.send({
+          isError: true,
+          text: `工具调用失败：缺少 name 参数（请填 ${MCP_LIST_TOOLS_TOOL_NAME} 给出的工具名）。`,
+        })
+      }
+      const ref = catalog.tools[inner.data.name]
+      if (ref === undefined) {
+        return reply.send({
+          isError: true,
+          text: `工具调用失败：本轮没有名为「${inner.data.name}」的工具。请先用 ${MCP_LIST_TOOLS_TOOL_NAME} 确认真实的工具名。`,
+        })
+      }
+      // 越权检查与 `/mcp/call` 同一条（清单是快照，绑定可能已改）
+      const bound = await getPrisma().agentComponent.findFirst({
+        where: { agentId: auth.record.agentId, componentType: 'MCP', refId: ref.serverId },
+        select: { id: true },
+      })
+      if (bound === null) {
+        getLogger().warn(
+          {
+            conversationId: auth.record.conversationId,
+            agentId: auth.record.agentId,
+            mcpServerId: ref.serverId,
+            toolName: ref.toolName,
+          },
+          '沙箱经网关请求调用一个**未绑定在本次 Agent 上**的 MCP server ⇒ 已拒绝（越权）',
+        )
+        return reply.send({ isError: true, text: '这个 MCP server 不属于当前智能体，已拒绝调用。' })
+      }
+      const result = await callToolViaProxy({
+        conversationId: auth.record.conversationId,
+        userId: auth.record.userId,
+        toolRef: ref,
+        args: inner.data.arguments ?? {},
+      })
+      return reply.send(result)
     }
 
     // 通知工具：执行体与 ChatBot 共用（`notify/index.ts`），渠道从本次运行的会话登记表取

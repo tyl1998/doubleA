@@ -74,6 +74,7 @@ import {
   canViewAsset,
   normalizeGuideQuestions,
   normalizeAudienceInput,
+  pinnedMcpToolNamesFromConfig,
   type AgentAudience,
   type AgentComponentInput,
   type AgentComponentRef,
@@ -173,6 +174,8 @@ const COMPONENT_SELECT = {
   agentId: true,
   componentType: true,
   refId: true,
+  // P1-19：常驻工具存在这里（`{ pinnedMcpTools: [...] }`），装配与回显都要它
+  config: true,
 } as const
 
 // ═════════════════════════════════════════════════════════════════════
@@ -310,11 +313,30 @@ function toItem(
 async function componentsOf(agentId: string): Promise<AgentComponentRef[]> {
   const rows = await getPrisma().agentComponent.findMany({
     where: { agentId },
-    select: { componentType: true, refId: true },
+    select: { componentType: true, refId: true, config: true },
     // 稳定顺序：前端把这两组分别灌进"知识库多选框 / MCP 多选框"，顺序稳定才不会闪
     orderBy: [{ componentType: 'asc' }, { refId: 'asc' }],
   })
-  return rows.map((row) => ({ componentType: row.componentType, refId: row.refId }))
+  return rows.map((row) => toComponentRef(row))
+}
+
+/**
+ * 组件行 → 读侧投影（P1-19：把 `config.pinnedMcpTools` 摊成 `pinnedToolNames`）。
+ * 抽取成一处，免得"列表一次查、详情单条查"两条路径各拼一次而漂移。
+ */
+function toComponentRef(row: {
+  componentType: AgentComponentRef['componentType']
+  refId: string
+  config: unknown
+}): AgentComponentRef {
+  // 常驻工具只对 MCP 有意义；KNOWLEDGE 行即使 config 里有键也忽略
+  if (row.componentType !== 'MCP') return { componentType: row.componentType, refId: row.refId }
+  const pinned = pinnedMcpToolNamesFromConfig(row.config)
+  return {
+    componentType: row.componentType,
+    refId: row.refId,
+    ...(pinned.length === 0 ? {} : { pinnedToolNames: pinned }),
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -369,7 +391,7 @@ export async function listAgents(
   const byAgent = new Map<string, AgentComponentRef[]>()
   for (const row of componentRows) {
     const list = byAgent.get(row.agentId) ?? []
-    list.push({ componentType: row.componentType, refId: row.refId })
+    list.push(toComponentRef(row))
     byAgent.set(row.agentId, list)
   }
 
@@ -700,6 +722,7 @@ export async function copyAgent(id: string, viewer: AgentViewer): Promise<AgentI
           agentId: agent.id,
           componentType: ref.componentType,
           refId: ref.refId,
+          config: componentConfigOf(ref.pinnedToolNames),
         })),
       })
     }
@@ -1005,11 +1028,39 @@ function compareComponents(
   return 0
 }
 
-/** 两个绑定集合是否**完全相同**（与顺序无关；条数相同且逐条能对上） */
+/** 两个绑定集合是否**完全相同**（与顺序无关；条数相同且逐条能对上，**含常驻工具集合**） */
 function sameComponentSet(a: AgentComponentRef[], b: AgentComponentInput[]): boolean {
   if (a.length !== b.length) return false
-  const keys = new Set(a.map(componentKey))
-  return b.every((item) => keys.has(componentKey(item)))
+  const byKey = new Map(a.map((item) => [componentKey(item), toNameSet(item.pinnedToolNames)]))
+  return b.every((item) => {
+    const existing = byKey.get(componentKey(item))
+    if (existing === undefined) return false
+    return sameNameSet(existing, toNameSet(item.pinnedToolNames))
+  })
+}
+
+/** `pinnedToolNames`（可缺省）→ 集合（判等与写库共用；缺省 = 空集） */
+function toNameSet(names: readonly string[] | undefined): Set<string> {
+  return new Set(names ?? [])
+}
+
+/** 两个字符串集合是否相等（P1-19 常驻工具判等用；与顺序无关） */
+function sameNameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const item of a) if (!b.has(item)) return false
+  return true
+}
+
+/**
+ * 组件绑定的 `config`（P1-19：只装常驻工具）。**空 ⇒ `undefined`**（不写该列，保持 NULL）——
+ * 与 `guideQuestions` 用 `[]` 表达清空不同：这里的"没有常驻"就是"没有 config"。
+ */
+function componentConfigOf(
+  pinnedToolNames: readonly string[] | undefined,
+): { pinnedMcpTools: string[] } | undefined {
+  return pinnedToolNames === undefined || pinnedToolNames.length === 0
+    ? undefined
+    : { pinnedMcpTools: [...pinnedToolNames] }
 }
 
 /**
@@ -1164,6 +1215,7 @@ export async function replaceAgentComponents(
             agentId: id,
             componentType: item.componentType,
             refId: item.refId,
+            config: componentConfigOf(item.pinnedToolNames),
           })),
           skipDuplicates: true,
         })

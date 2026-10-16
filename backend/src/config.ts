@@ -759,6 +759,17 @@ const envSchema = z
      * 而模型对几十个工具的挑选准确率也会掉。
      */
     MCP_TOOL_LIMIT: intVar('MCP_TOOL_LIMIT', 64, { min: 1, max: 512 }),
+    /**
+     * 「直接下发给模型的 MCP 工具」总数量上限（P1-19 工具网关消费）。
+     *
+     * 语义（策略见 `orchestrator/mcpGatewayModel.ts`）：绑定的全部 MCP 工具总数 **≤ 本值时全部直接下发**；
+     * **超过**本值时改走工具网关 —— 只直接下发 Agent 标的"常驻工具"（没有就一个都不直接下发），
+     * 其余由模型用 `mcp_list_tools` / `mcp_call_tool` 按需发现与调用。
+     * 定 24 的理由：低于它时"全量下发"的上下文成本可接受；高于它时模型挑工具的准确率与
+     * 上下文占用一起变差（工具一多，"该用哪个"本身就成了噪声）。
+     * ⚠️ 它只影响"下发面"，不影响"能不能调"：走网关时**全部工具仍然可调**，只是要知道名字。
+     */
+    MCP_INLINE_TOOL_LIMIT: intVar('MCP_INLINE_TOOL_LIMIT', 24, { min: 0, max: 512 }),
 
     // ── 知识库流水线（子方案① §二 参数总表）──
     CHUNK_SIZE_DEFAULT: intVar('CHUNK_SIZE_DEFAULT', 512),
@@ -1040,6 +1051,8 @@ export interface AppConfig {
     confirmTimeoutSec: number
     /** 单个 server 进 function 列表的工具数上限；超限截断并告警（P0-2-6） */
     toolLimit: number
+    /** 直接下发给模型的 MCP 工具**总数**上限；超过则走工具网关（P1-19） */
+    inlineToolLimit: number
   }
   limits: {
     uploadBodyLimitRaw: string
@@ -1368,6 +1381,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       requestTimeoutMs: vars.MCP_REQUEST_TIMEOUT_MS,
       confirmTimeoutSec: vars.MCP_CONFIRM_TIMEOUT_SEC,
       toolLimit: vars.MCP_TOOL_LIMIT,
+      inlineToolLimit: vars.MCP_INLINE_TOOL_LIMIT,
     },
     limits: {
       uploadBodyLimitRaw: vars.UPLOAD_BODY_LIMIT.raw,

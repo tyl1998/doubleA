@@ -48,6 +48,7 @@
     "egress:regression": "pnpm --filter @doubulea/backend egress:regression",
     "runtime-build:regression": "pnpm --filter @doubulea/backend runtime-build:regression",
     "router:regression": "pnpm --filter @doubulea/backend router:regression",
+    "gateway:regression": "pnpm --filter @doubulea/backend gateway:regression",
     "tool-text-offset:regression": "pnpm --filter @doubulea/backend tool-text-offset:regression",
     "xlsx:regression": "pnpm --filter @doubulea/backend xlsx:regression",
     "router:start": "pnpm --filter @doubulea/backend router:start",

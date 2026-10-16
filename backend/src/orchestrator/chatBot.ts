@@ -77,10 +77,13 @@
 import {
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
+  MCP_CALL_TOOL_TOOL_NAME,
+  MCP_LIST_TOOLS_TOOL_NAME,
   MEMORY_TOOL_SERVER_NAME,
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
+  pinnedMcpToolNamesFromConfig,
   type CitationItem,
   type ErrorCode,
   type RetrievalHit,
@@ -137,6 +140,13 @@ import {
   type ToolOutcome,
 } from './chatContext.js'
 import { executeKnowledgeTool, isKnowledgeToolName, loadKnowledgeCatalog } from './knowledgeTools.js'
+import {
+  MCP_GATEWAY_TOOL_SERVER_NAME,
+  callMcpToolTool,
+  executeListMcpTools,
+  listMcpToolsTool,
+  resolveMcpGatewayCall,
+} from './mcpGatewayTools.js'
 import { runMemoryExtraction } from './memoryExtract.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from './memoryTools.js'
 import { persistRoundQuietly } from './persist.js'
@@ -256,7 +266,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
         // ⚠️ 一次取全部组件再在内存里分流（`componentType` 是判别列）：Prisma 不允许在同一次
         //    查询里对同一个关系写两个 `select` 分支，而分两次查会多一次往返。
         //    `orderBy: refId asc` 与 P0-1-23 起的历史口径相同 —— 两个列表都按它排序。
-        components: { orderBy: { refId: 'asc' }, select: { componentType: true, refId: true } },
+        components: { orderBy: { refId: 'asc' }, select: { componentType: true, refId: true, config: true } },
       },
     })
     // 走到这里还查不到 = 软删与发消息的竞态（`assertConversationSendable` 已用 409 挡过一次）
@@ -274,6 +284,16 @@ export const chatBotProducer: ChatProducer = async (input) => {
     // 想收回某个组件 = 从 Agent 解绑（`filterVisibleAssetIds` 已随 P1-18 删除）。
     const kbIds = kbIdsRaw
     const mcpServerIds = mcpServerIdsRaw
+
+    // P1-19：**常驻工具**（`agent_components.config.pinnedMcpTools`，按 server 分组）——
+    // 工具总数超过 `MCP_INLINE_TOOL_LIMIT` 时，只有这些工具直接下发，其余走网关
+    // （策略与翻译在 `mcpCall.service.ts#resolveMcpToolCatalog`）。
+    const pinnedByServer = new Map<string, ReadonlySet<string>>()
+    for (const component of agent.components) {
+      if (component.componentType !== 'MCP') continue
+      const pinned = pinnedMcpToolNamesFromConfig(component.config)
+      if (pinned.length > 0) pinnedByServer.set(component.refId, new Set(pinned))
+    }
 
     // ── ②′ 可用知识库清单（库名 + 文档名）──
     /**
@@ -312,15 +332,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * `tool_call{ERROR, NEED_CREDENTIAL}` 的形式出现（`02` §9.3）。反过来做的代价：
      * 用户一进对话页就会看到一堆"缺凭据"，而他可能压根没打算用那台 server。
      */
-    const catalog = await resolveMcpToolCatalog(mcpServerIds)
+    const catalog = await resolveMcpToolCatalog(mcpServerIds, { pinnedByServer })
     /** `serverId → 展示名`：工具卡片要显示"工具来自哪个系统"，**失败时也要显示** */
     const serverNameById = new Map(catalog.servers.map((server) => [server.id, server.name]))
-    if (mcpServerIds.length > 0 && catalog.tools.length === 0) {
-      // 绑了 server 却一个工具都没下发：最可能的原因是"从没成功拉过工具列表"
+    // ⚠️ 判据是**目录总数**（`totalToolCount`）而不是"直接下发的条数"（P1-19）：走网关时
+    //    `catalog.tools` 可以一个都没有（只下发网关工具），而 `entries` 里其实有几十个工具 ——
+    //    拿 `tools.length` 判会打出"工具缓存为空"的**假警告**。
+    if (mcpServerIds.length > 0 && catalog.totalToolCount === 0) {
+      // 绑了 server 却一个工具都没有：最可能的原因是"从没成功拉过工具列表"
       // （每台这样的 server 在 `resolveMcpToolCatalog` 里已各有一条 warn，这里只记本轮）
       logger.warn(
         { conversationId, agentId, mcpServerCount: mcpServerIds.length },
-        '本轮绑定了 MCP server，但没有一个工具下发给模型（工具缓存为空）',
+        '本轮绑定了 MCP server，但一个工具都没有（工具缓存为空）',
       )
     }
 
@@ -334,6 +357,12 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 排在 MCP 工具**前面**：让模型先看到它们，与系统提示里"知识库优先"的顺序一致。
      */
     const builtinTools = kbIds.length === 0 ? [] : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()]
+    /**
+     * 工具网关（P1-19）：**只在工具多、走了网关时**下发（`catalog.gatewayActive`）。
+     * 走网关时 `catalog.tools` 里只有常驻工具，其余工具需要模型用 `mcp_list_tools` 发现、
+     * 再 `mcp_call_tool` 调用；工具少时（全量下发）不加，行为与旧版逐字一致。
+     */
+    if (catalog.gatewayActive) builtinTools.push(listMcpToolsTool(), callMcpToolTool())
     // 「记住」+「按需检索记忆」内置工具（P1-8/P1-8a）：与知识库无关、**始终下发** —— 记忆是平台级能力
     builtinTools.push(rememberTool(), recallMemoryTool())
     // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行（含"立即执行"）时下发
@@ -610,7 +639,63 @@ export const chatBotProducer: ChatProducer = async (input) => {
         messages.push(buildAssistantToolCallsMessage(stripToolCallMarkup(round.text), round.toolCalls))
 
         const outcomes: ToolOutcome[] = []
-        for (const call of round.toolCalls) {
+        for (const rawCall of round.toolCalls) {
+          /**
+           * ── P1-19 工具网关分流（排在最前，先于知识库/通知/记忆/MCP 的既有分流）──
+           *
+           * ① `mcp_list_tools`：**纯内置**（把这一轮的全部 MCP 工具列成目录），没有 server/凭据/
+           *    危险确认，与知识库一族同款处置（发卡 + 执行 + 回填）。
+           * ② `mcp_call_tool`：把入参**改写成一次真实工具调用**，改写后**逐字复用**下面的 MCP 分支
+           *    —— 危险确认 / 凭据注入 / 工具卡 / 错误回填全部照旧，网关因此**不引入第二条执行语义**。
+           *    改写失败（参数非法 / 名字不在目录里）就看不成 MCP 调用 ⇒ 在这里补一张 ERROR 卡收尾。
+           */
+          if (rawCall.name === MCP_LIST_TOOLS_TOOL_NAME) {
+            const parsed = parseToolArguments(rawCall.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: rawCall.arguments })
+            const base = {
+              callId: rawCall.id,
+              toolName: MCP_LIST_TOOLS_TOOL_NAME,
+              serverName: MCP_GATEWAY_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: MCP_LIST_TOOLS_TOOL_NAME })
+            const outcome = executeListMcpTools({ entries: catalog.entries, arguments: rawCall.arguments })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const finished = { ...base, status, inputSummary, output: outcome.output }
+            emitToolCard(finished)
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: rawCall.arguments })
+            outcomes.push({ callId: rawCall.id, text: outcome.output, isError: outcome.isError })
+            continue
+          }
+
+          let call = rawCall
+          if (rawCall.name === MCP_CALL_TOOL_TOOL_NAME) {
+            const resolved = resolveMcpGatewayCall(catalog.routes, rawCall.arguments)
+            if (!resolved.ok) {
+              const parsed = parseToolArguments(rawCall.arguments)
+              const inputSummary = parsed.ok
+                ? summarizeToolInput(parsed.value)
+                : summarizeToolInput({ raw: rawCall.arguments })
+              const base = {
+                callId: rawCall.id,
+                toolName: MCP_CALL_TOOL_TOOL_NAME,
+                serverName: MCP_GATEWAY_TOOL_SERVER_NAME,
+                kind: 'BUILTIN' as const,
+              }
+              emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+              await input.updateSnapshot({ currentTool: MCP_CALL_TOOL_TOOL_NAME })
+              const finished = { ...base, status: 'ERROR' as const, inputSummary, output: resolved.output }
+              emitToolCard(finished)
+              toolRecords.push({ ...withToolTextOffset(finished), arguments: rawCall.arguments })
+              outcomes.push({ callId: rawCall.id, text: resolved.output, isError: true })
+              continue
+            }
+            // 改写成真实调用：`id` 保持不变（协议要求 assistant 那条的工具调用与结果成对）
+            call = { id: rawCall.id, name: resolved.name, arguments: resolved.arguments }
+          }
           // ── 内置知识库工具（检索 / 目录 / 整篇阅读）：在**第一行**与 MCP 调用分流 ──
           //
           // 它们没有 MCP server / 凭据 / 危险确认，走不了下面那套（`route` 查不到、`McpToolRoute`

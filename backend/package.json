@@ -23,6 +23,7 @@
     "egress:regression": "node --import tsx scripts/egress-policy-regression.ts",
     "runtime-build:regression": "node --import tsx scripts/runtime-build-regression.ts",
     "router:regression": "node --import tsx scripts/router-regression.ts",
+    "gateway:regression": "node --import tsx scripts/mcp-gateway-regression.ts",
     "tool-text-offset:regression": "node --import tsx scripts/tool-text-offset-regression.ts",
     "xlsx:regression": "node --import tsx scripts/xlsx-regression.ts",
     "router:start": "node dist/backend/src/router/main.js",

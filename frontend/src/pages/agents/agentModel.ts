@@ -207,12 +207,19 @@ export function componentKey(component: { componentType: string; refId: string }
  * `id`/`created_at` 全换一遍）—— P0-1-23 已为这类"写了但看起来没变"立过规矩。
  */
 export function sameComponentSet(
-  a: readonly { componentType: string; refId: string }[],
-  b: readonly { componentType: string; refId: string }[],
+  a: readonly AgentComponentInput[],
+  b: readonly AgentComponentInput[],
 ): boolean {
   if (a.length !== b.length) return false
-  const left = new Set(a.map(componentKey))
-  return b.every((item) => left.has(componentKey(item)))
+  const left = new Map(a.map((item) => [componentKey(item), new Set(item.pinnedToolNames ?? [])]))
+  return b.every((item) => {
+    const existing = left.get(componentKey(item))
+    if (existing === undefined) return false
+    const next = new Set(item.pinnedToolNames ?? [])
+    if (existing.size !== next.size) return false
+    for (const name of existing) if (!next.has(name)) return false
+    return true
+  })
 }
 
 /** 服务端投影里的绑定 → 写侧形态（`AgentItem.components` 与写侧 schema 是同一对字段名） */
@@ -220,6 +227,9 @@ export function componentsFromAgent(item: AgentItem): AgentComponentInput[] {
   return item.components.map((component) => ({
     componentType: component.componentType,
     refId: component.refId,
+    ...(component.pinnedToolNames === undefined || component.pinnedToolNames.length === 0
+      ? {}
+      : { pinnedToolNames: [...component.pinnedToolNames] }),
   }))
 }
 
@@ -236,13 +246,16 @@ export function componentsFromAgent(item: AgentItem): AgentComponentInput[] {
  * 多一类就会把不该动的绑定一起交上去。两条都是**没有编译期错误**的错。
  */
 export function submittableComponents(
-  components: readonly { componentType: string; refId: string }[],
+  components: readonly AgentComponentInput[],
 ): AgentComponentInput[] {
   return components
     .filter((component) => component.componentType === 'KNOWLEDGE' || component.componentType === 'MCP')
     .map((component) => ({
       componentType: component.componentType as 'KNOWLEDGE' | 'MCP',
       refId: component.refId,
+      ...(component.pinnedToolNames === undefined || component.pinnedToolNames.length === 0
+        ? {}
+        : { pinnedToolNames: [...component.pinnedToolNames] }),
     }))
 }
 
@@ -251,9 +264,37 @@ export function knowledgeSelectionOf(selectedIds: readonly string[]): AgentCompo
   return selectedIds.map((refId) => ({ componentType: 'KNOWLEDGE' as const, refId }))
 }
 
-/** 当前表单里的绑定（MCP 多选 → 写侧形态） */
-export function mcpSelectionOf(selectedIds: readonly string[]): AgentComponentInput[] {
-  return selectedIds.map((refId) => ({ componentType: 'MCP' as const, refId }))
+/**
+ * 当前表单里的绑定（MCP 多选 → 写侧形态）。
+ *
+ * `pinnedByServer`（P1-19）带上**常驻工具**（server id → MCP 原始工具名）；缺省 = 没有常驻。
+ * ⚠️ 必须随绑定一起提交：`PUT …/components` 是**整体替换**，不带 `pinnedToolNames` 会把它清空。
+ */
+export function mcpSelectionOf(
+  selectedIds: readonly string[],
+  pinnedByServer: Readonly<Record<string, readonly string[]>> = {},
+): AgentComponentInput[] {
+  return selectedIds.map((refId) => {
+    const pinned = pinnedByServer[refId]
+    return {
+      componentType: 'MCP' as const,
+      refId,
+      ...(pinned === undefined || pinned.length === 0 ? {} : { pinnedToolNames: [...pinned] }),
+    }
+  })
+}
+
+/** 从绑定集合里取出 MCP 常驻工具（server id → 工具名），供表单状态初始化（P1-19） */
+export function pinnedMcpToolsOf(
+  components: readonly AgentComponentInput[],
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  for (const component of components) {
+    if (component.componentType !== 'MCP') continue
+    if (component.pinnedToolNames === undefined || component.pinnedToolNames.length === 0) continue
+    out[component.refId] = [...component.pinnedToolNames]
+  }
+  return out
 }
 
 /** 从绑定集合里取出知识库 id 列表（供多选框的 `value`） */

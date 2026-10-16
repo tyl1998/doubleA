@@ -81,6 +81,7 @@
 
 import {
   AppError,
+  MCP_GATEWAY_TOOL_NAMES,
   missingRequiredCredentialKeys,
   normalizeCredentialSchema,
 } from '@doubulea/shared'
@@ -89,6 +90,7 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { McpClient, type McpClientOptions } from '../mcp/client.js'
+import { selectMcpInlineTools, type McpCatalogToolEntry } from '../mcp/gatewayModel.js'
 import {
   buildCredentialInjection,
   createCredentialFetch,
@@ -267,23 +269,47 @@ export async function resolveMcpCallContext(
 export interface McpCatalogServer {
   id: string
   name: string
-  /** 这次**真的下发给模型**的工具数（`truncated` 非 null 时会小于 `total`） */
+  /** 这台 server 这一轮**进目录**的工具数（`truncated` 非 null 时会小于 `total`） */
   toolCount: number
   /** 被 `MCP_TOOL_LIMIT` 截断时的实况；没截断是 `null` */
   truncated: { total: number; kept: number } | null
+  /** 这台 server 里**直接下发**的工具数（P1-19；其余走网关） */
+  inlineCount: number
+}
+
+/** {@link resolveMcpToolCatalog} 的入参 */
+export interface McpCatalogOptions {
+  /**
+   * 「常驻工具」（P1-19）：**每台 server 的 MCP 原始工具名集合**（来自 `agent_components.config`）。
+   * 工具总数超过 `MCP_INLINE_TOOL_LIMIT` 时，只有这些直接下发，其余走网关。
+   */
+  pinnedByServer?: ReadonlyMap<string, ReadonlySet<string>>
 }
 
 /** 本轮能下发给模型的全部 MCP 工具（`chatBot.ts` 的消费形态） */
 export interface McpToolCatalog {
-  /** 直接进 `ChatOptions.tools`（OpenAI 形态）；**空数组 = 一个工具都没有** */
+  /**
+   * 直接进 `ChatOptions.tools`（OpenAI 形态）—— **只含"直接下发"的那些**（P1-19）：
+   * 工具总数 ≤ `MCP_INLINE_TOOL_LIMIT` 时是全部；超过时只含常驻工具（可能为空）。
+   * ⚠️ 走网关的工具**不在**这里，它们由 `mcp_list_tools` / `mcp_call_tool` 触达。
+   */
   tools: OpenAiFunctionTool[]
   /**
-   * 模型回的工具名 → "要调哪台 server 的哪个工具"。
+   * 模型回的**任意**工具名 → "要调哪台 server 的哪个工具"（**含未直接下发的**，见 P1-19）。
    * ⚠️ 它是唯一的映射来源（`toolSchema.ts` 的口径 4）：**绝不从名字里 split 出 server**。
+   * 网关的 `mcp_call_tool` 靠它把名字改写成真实调用。
    */
   routes: Record<string, McpToolRoute>
+  /** **全部**工具的可检索条目（含未直接下发的）—— `mcp_list_tools` 的目录本体 */
+  entries: McpCatalogToolEntry[]
   /** 参与的 server，顺序 = 名字分配的顺序（见文件头 ⑥） */
   servers: McpCatalogServer[]
+  /** 目录里的工具总数（= `entries.length`） */
+  totalToolCount: number
+  /** 直接下发的工具数（= `tools.length`） */
+  inlineToolCount: number
+  /** 是否走了网关（= 有工具没直接下发，模型需要 `mcp_list_tools` 才能看到） */
+  gatewayActive: boolean
 }
 
 /** 组装目录要用到的列（`slug` 只用于拼名字，不进 `routes` —— 见 `toolSchema.ts`） */
@@ -299,11 +325,35 @@ const CATALOG_SERVER_SELECT = { id: true, name: true, slug: true, toolCache: tru
  * 缓存空（从没成功拉过 / 被失效清掉）的 server **只记账 + 打一条 warn**，不影响别的 server ——
  * 一台没拉过工具的 server 不该让其他 server 的工具也下发不了。
  *
+ * ─────────────────────────────────────────────────────────────────────
+ * P1-19：**工具网关**（数量多时不全量下发）
+ * ─────────────────────────────────────────────────────────────────────
+ * 读 `tool_cache` + 命名之后，本函数还要按 {@link McpCatalogOptions} 与
+ * `config.mcp.inlineToolLimit` 把工具分成两拨：**直接下发**（进 `tools`）与**走网关**
+ * （只在 `entries`/`routes` 里，模型要用 `mcp_list_tools`/`mcp_call_tool` 才触达）。
+ * 策略是纯函数 `mcp/gatewayModel.ts#selectMcpInlineTools`，这里只做 I/O 与翻译。
+ * ⚠️ 两个网关工具名（`mcp_list_tools`/`mcp_call_tool`）**先占住跨 server 的命名集合**
+ * （与真实工具同形，不占会被某台 slug 恰好的 server 撞上）。
+ *
  * @param serverIds Agent 绑定的 server id（**集合语义**：顺序不参与结果，见文件头 ⑥；重复值会去重）
+ * @param options 装配选项（P1-19 的"常驻工具"，见 {@link McpCatalogOptions}）
  */
-export async function resolveMcpToolCatalog(serverIds: readonly string[]): Promise<McpToolCatalog> {
+export async function resolveMcpToolCatalog(
+  serverIds: readonly string[],
+  options: McpCatalogOptions = {},
+): Promise<McpToolCatalog> {
   const unique = [...new Set(serverIds)]
-  if (unique.length === 0) return { tools: [], routes: {}, servers: [] }
+  if (unique.length === 0) {
+    return {
+      tools: [],
+      routes: {},
+      entries: [],
+      servers: [],
+      totalToolCount: 0,
+      inlineToolCount: 0,
+      gatewayActive: false,
+    }
+  }
 
   const logger = getLogger()
   const db = getPrisma()
@@ -323,11 +373,17 @@ export async function resolveMcpToolCatalog(serverIds: readonly string[]): Promi
     a.name === b.name ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name),
   )
 
-  const tools: OpenAiFunctionTool[] = []
+  const allTools: OpenAiFunctionTool[] = []
   const routes: Record<string, McpToolRoute> = {}
+  const entries: McpCatalogToolEntry[] = []
   const servers: McpCatalogServer[] = []
-  /** 已被占用的下发给模型的名字（跨 server，**逐台累积** —— 见文件头 ⑥） */
-  const taken = new Set<string>()
+  /**
+   * 已被占用的下发给模型的名字（跨 server，**逐台累积** —— 见文件头 ⑥）。
+   * ⚠️ **先塞进两个网关工具名**（P1-19）：它们与真实工具名同形（都以 `mcp_` 开头），
+   * 不预留的话"某台 slug 恰好叫 `list` 的 server 的 `tools` 工具"会拿到 `mcp_list_tools`、
+   * 与网关工具撞名 —— 模型调它就会打到网关身上。预留后真实工具会被逼成 `mcp_list_tools-2`。
+   */
+  const taken = new Set<string>(MCP_GATEWAY_TOOL_NAMES)
 
   for (const row of ordered) {
     const cache = parseToolCache(row.toolCache)
@@ -337,15 +393,28 @@ export async function resolveMcpToolCatalog(serverIds: readonly string[]): Promi
         { mcpServerId: row.id, name: row.name },
         'MCP server 没有可用的工具缓存 ⇒ 本轮它一个工具都不会下发（去 /api/mcp/servers/:id/tools?refresh=1 或点「测试」拉一次）',
       )
-      servers.push({ id: row.id, name: row.name, toolCount: 0, truncated: null })
+      servers.push({ id: row.id, name: row.name, toolCount: 0, truncated: null, inlineCount: 0 })
       continue
     }
 
     const conversion = toOpenAiTools({ id: row.id, slug: row.slug }, cache.tools, config.mcp.toolLimit, taken)
-    for (const name of Object.keys(conversion.routes)) taken.add(name)
-    tools.push(...conversion.tools)
-    // 名字恒以 `mcp_` 开头 ⇒ 不会撞上 `Object.prototype` 的键，普通对象当映射表是安全的
-    Object.assign(routes, conversion.routes)
+    for (const tool of conversion.tools) {
+      const name = tool.function.name
+      // 名字恒以 `mcp_` 开头 ⇒ 不会撞上 `Object.prototype` 的键，普通对象当映射表是安全的
+      const route = conversion.routes[name]
+      if (route === undefined) continue // `toOpenAiTools` 保证同序同集合，这里只为类型收窄
+      allTools.push(tool)
+      routes[name] = route
+      entries.push({
+        name,
+        serverId: row.id,
+        serverName: row.name,
+        toolName: route.toolName,
+        description: tool.function.description,
+        dangerous: route.dangerous,
+      })
+      taken.add(name)
+    }
 
     if (conversion.truncated !== null) {
       // `06` P0-2-6 的验收原文是"超过 MCP_TOOL_LIMIT **截断并告警**"，告警落点就在这里
@@ -359,19 +428,61 @@ export async function resolveMcpToolCatalog(serverIds: readonly string[]): Promi
       name: row.name,
       toolCount: conversion.tools.length,
       truncated: conversion.truncated,
+      inlineCount: 0,
     })
+  }
+
+  // ── P1-19：把"常驻工具"（**MCP 原始名**，按 server 分组）翻译成"下发给模型的名字" ──
+  const pinned = new Set<string>()
+  if (options.pinnedByServer !== undefined) {
+    for (const entry of entries) {
+      const raw = options.pinnedByServer.get(entry.serverId)
+      if (raw !== undefined && raw.has(entry.toolName)) pinned.add(entry.name)
+    }
+  }
+
+  const selection = selectMcpInlineTools(entries, pinned, config.mcp.inlineToolLimit)
+  const tools = allTools.filter((tool) => selection.inline.has(tool.function.name))
+  for (const server of servers) {
+    server.inlineCount = tools.filter((tool) => routes[tool.function.name]?.serverId === server.id).length
   }
 
   logger.debug(
     {
       serverCount: servers.length,
-      toolCount: tools.length,
-      servers: servers.map((server) => ({ id: server.id, name: server.name, toolCount: server.toolCount })),
+      totalToolCount: entries.length,
+      inlineToolCount: tools.length,
+      gatewayActive: selection.gatewayActive,
+      servers: servers.map((server) => ({
+        id: server.id,
+        name: server.name,
+        toolCount: server.toolCount,
+        inlineCount: server.inlineCount,
+      })),
     },
     '已组装本轮 MCP 工具目录（读 tool_cache，未联网）',
   )
+  if (selection.gatewayActive) {
+    logger.info(
+      {
+        serverCount: servers.length,
+        totalToolCount: entries.length,
+        inlineToolCount: tools.length,
+        inlineToolLimit: config.mcp.inlineToolLimit,
+      },
+      'MCP 工具总数超过 MCP_INLINE_TOOL_LIMIT ⇒ 本轮走工具网关（只直接下发常驻工具，其余由 mcp_list_tools/mcp_call_tool 按需触达）',
+    )
+  }
 
-  return { tools, routes, servers }
+  return {
+    tools,
+    routes,
+    entries,
+    servers,
+    totalToolCount: entries.length,
+    inlineToolCount: tools.length,
+    gatewayActive: selection.gatewayActive,
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════
