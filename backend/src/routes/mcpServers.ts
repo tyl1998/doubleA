@@ -19,8 +19,10 @@
  * | `/api/agents` | `requireAuth` + **行级判定** | `01` 决策 18（创建者 + ADMIN） |
  *
  * ⇒ 仍然**一个 `requireAdmin` 都没有**（行级判定**不走路由钩子**，与 `agents` 同款实现）：
- * 服务层**先 404 再 403**。⚠️ **`POST /:id/test` 与 `GET /:id/tools` 两条刻意不判定** ——
- * 它们是"**使用**"不是编辑，收窄它们只会造出"server 建完就没人能测了"（注册者离职/停用）。
+ * 服务层**先 404 再 403**。⚠️ **2026-10-16 修订（用户定案）**：`POST /:id/test` **改为行级判定**
+ * —— 它用的是**所属人**的凭据，让任何登录用户都能点等于"拿别人的凭据去探活"；现在只有
+ * 所属人或 ADMIN 能发起（不可见先 404、可见非所属人 403）。
+ * `GET /:id/tools`（**纯读缓存**）仍不判定 —— 它是"看"，收窄它只会造出"server 建完就没人能看工具了"。
  * ⚠️ 与 `/api/mcp/credentials/**` **同一个前缀却仍是两族**（那边按 `user_id` 收窄、ADMIN 无后门，
  * 见那个文件头）—— 别照抄。
  *
@@ -61,11 +63,13 @@ import {
   mcpServerIdParamsSchema,
   mcpServerToolsQuerySchema,
   ok,
+  transferAssetBodySchema,
   updateMcpServerBodySchema,
   type CreateMcpServerBody,
   type ListMcpServersQuery,
   type McpServerIdParams,
   type McpServerToolsQuery,
+  type TransferAssetBody,
   type UpdateMcpServerBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -77,6 +81,7 @@ import {
   listMcpServers,
   removeMcpServer,
   testMcpServer,
+  transferMcpServer,
   updateMcpServer,
   type McpViewer,
 } from '../services/mcpServer.service.js'
@@ -144,11 +149,29 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
   )
 
   /**
-   * 连通测试（登录即可）。**HTTP 恒 200**，结论放在 `{ok,…}` 里。
+   * 转移所属人（P1-13，**注册者或 ADMIN**）。`{ toUserId }`。
+   * ⚠️ **MCP 特例**：转移后**探测主语**变为新所属人 —— 若新所属人没配该 server 的凭据，
+   * 测试/工具列表会失败（`tools/call` 仍用调用者自己的凭据）。前端弹窗须提示。
+   */
+  app.post<{ Params: McpServerIdParams; Body: TransferAssetBody }>(
+    '/api/mcp/servers/:id/transfer',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: mcpServerIdParamsSchema, body: transferAssetBodySchema },
+    },
+    async (request) =>
+      ok(await transferMcpServer(request.params.id, request.body.toUserId, viewerOf(request))),
+  )
+
+  /**
+   * 连通测试（**登录即可 + 所属人/ADMIN 行级**）。**HTTP 恒 200**，结论放在 `{ok,…}` 里。
    *
    * ⚠️ 语义是"探活端点自身是请求成功"（`02` §4.9 的 `/health` 同源口径）：
    * `ok:false` 是一条**信息**（这个 server 现在通不通），把它映射成 502/504 会让界面
    * 把"一个可用的结论"渲染成"一个错误"。只有 server 不存在才是 404（请求本身的问题）。
+   *
+   * ⚠️ **2026-10-16 修订（用户定案）**：只有**所属人或 ADMIN** 能发起（服务层先 404 再 403）——
+   * 这条探测用**所属人的凭据**，不该让任何登录用户都能拿它去探活。
    *
    * ⚠️ **P0-2-12 起它用注册者（所属人）的凭据**（原文"本层不带用户凭据"已作废）：
    * 有些 server 的 `tools/list` 也要求鉴权 —— 以前那类 server 在这里恒 401（⇒ 工具数恒 0
@@ -158,7 +181,7 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
   app.post<{ Params: McpServerIdParams }>(
     '/api/mcp/servers/:id/test',
     { preHandler: app.requireAuth, schema: { params: mcpServerIdParamsSchema } },
-    async (request) => ok(await testMcpServer(request.params.id)),
+    async (request) => ok(await testMcpServer(request.params.id, viewerOf(request))),
   )
 
   /**
@@ -180,6 +203,12 @@ export function registerMcpServerRoutes(app: FastifyInstance): void {
       schema: { params: mcpServerIdParamsSchema, querystring: mcpServerToolsQuerySchema },
     },
     async (request) =>
-      ok(await getMcpServerTools(request.params.id, { refresh: request.query.refresh })),
+      ok(
+        await getMcpServerTools(
+          request.params.id,
+          { refresh: request.query.refresh },
+          viewerOf(request),
+        ),
+      ),
   )
 }

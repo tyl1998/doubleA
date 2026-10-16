@@ -24,28 +24,37 @@
  * 代价写清楚：超过 100 个智能体时第 100 条之后看不到，页脚会如实提示（不是静默截断）。
  */
 
-import { Button, Input, Table, Tag, type TableColumnsType } from 'antd'
+import { Button, Input, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
 import { AGENT_TYPES, type AgentItem, type AgentType } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import { AGENTS_PAGE_LIMIT_MAX, useAgents, useCopyAgent } from '../../api/agents.js'
+import { useCurrentUser } from '../../api/auth.js'
 import { AGENT_TYPE_LABEL, formatUpdatedAt, mcpRefsOf } from './agentModel.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
+import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { useFeedback } from '../../app/feedback.js'
 import { AGENTS_NEW_PATH, chatPath, agentEditPath } from '../../app/paths.js'
 
 /** 类型筛选：`ALL` 是"全部"，其余取 `AGENT_TYPES` 的字面量 */
 type TypeFilter = 'ALL' | AgentType
 
+/** 所属筛选（P1-13）：`MINE` = 只看我建的（`createdBy === 我`），`ALL` = 全部对我可见的 */
+type OwnerFilter = 'ALL' | 'MINE'
+
 export function AgentsListPage() {
   const navigate = useNavigate()
   const feedback = useFeedback()
   const [keyword, setKeyword] = useState('')
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL')
+  const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>('ALL')
   const [pendingDelete, setPendingDelete] = useState<AgentItem | null>(null)
+  const [transferFor, setTransferFor] = useState<AgentItem | null>(null)
   const copy = useCopyAgent()
+  const { data: me } = useCurrentUser()
 
   const { data, isPending, isError, error, isFetching, refetch } = useAgents({
     offset: 0,
@@ -58,6 +67,7 @@ export function AgentsListPage() {
 
   const normalizedKeyword = keyword.trim().toLowerCase()
   const filtered = items.filter((item) => {
+    if (ownerFilter === 'MINE' && item.createdBy !== me?.id) return false
     if (typeFilter !== 'ALL' && item.type !== typeFilter) return false
     if (normalizedKeyword === '') return true
     const haystack = `${item.name}\n${item.description ?? ''}`.toLowerCase()
@@ -128,6 +138,43 @@ export function AgentsListPage() {
       },
     },
     {
+      // P1-13：所属人（= `createdBy`/`creatorName`）。列表对全员可见，这是"这条是谁的"的读数
+      //（判据都是服务端下发的字段，前端不自己算）。
+      title: '所属人',
+      dataIndex: 'creatorName',
+      width: 140,
+      render: (_, agent) =>
+        // P1-18（2026-10-16 修订）：把这一列做成转移入口 —— 只有创建者/管理员（`canEdit`）能点，
+        // 点了弹转移弹窗；其余人只显示名字。
+        // ⚠️ 可见性徽标与受众人数**移到独立的「可见性」列**（2026-10-16 复议）：原先三者挤在
+        // 一个 160px 列里，指定用户分享后 `名字 + 徽标 + 「N 人 / M 组」` 溢出换行、看着错乱。
+        agent.canEdit ? (
+          <Tooltip title="点击转移所属人">
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(agent)}>
+              {agent.creatorName}
+            </Button>
+          </Tooltip>
+        ) : (
+          <span>{agent.creatorName}</span>
+        ),
+    },
+    {
+      // P1-18：可见性徽标 + （指定用户时）受众规模；判据都来自服务端下发字段，前端不自己算。
+      title: '可见性',
+      dataIndex: 'visibility',
+      width: 170,
+      render: (_, agent) => (
+        <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+          <VisibilityBadge visibility={agent.visibility} />
+          {agent.visibility === 'SHARED' && (
+            <span className="ratio" title="受众 = 直接指定的用户 ∪ 指定组里的成员">
+              {agent.audience.users.length} 人 / {agent.audience.groups.length} 组
+            </span>
+          )}
+        </span>
+      ),
+    },
+    {
       title: '最近更新',
       dataIndex: 'updatedAt',
       width: 130,
@@ -137,7 +184,7 @@ export function AgentsListPage() {
       title: '操作',
       key: 'actions',
       // 复制对所有行都提供（不需要编辑权限，见服务层 `copyAgent` 口径 ①）⇒ 比原来宽一点
-      width: 240,
+      width: 320,
       align: 'right',
       render: (_, agent) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
@@ -241,6 +288,14 @@ export function AgentsListPage() {
             </button>
           ))}
         </div>
+        <div className="seg" role="group" aria-label="按所属人筛选">
+          <button type="button" aria-pressed={ownerFilter === 'ALL'} onClick={() => setOwnerFilter('ALL')}>
+            全部可见
+          </button>
+          <button type="button" aria-pressed={ownerFilter === 'MINE'} onClick={() => setOwnerFilter('MINE')}>
+            只看我的
+          </button>
+        </div>
         <span className="ratio u-right">
           数据来自 GET /api/agents · 缓存 30s
           {total > items.length && (
@@ -277,6 +332,7 @@ export function AgentsListPage() {
                 onClick={() => {
                   setKeyword('')
                   setTypeFilter('ALL')
+                  setOwnerFilter('ALL')
                 }}
               >
                 清空筛选
@@ -299,6 +355,14 @@ export function AgentsListPage() {
       )}
 
       <DeleteAgentModal agent={pendingDelete} onClose={() => setPendingDelete(null)} />
+      <TransferOwnershipModal
+        open={transferFor !== null}
+        assetKind="AGENT"
+        assetId={transferFor?.id ?? ''}
+        assetName={transferFor?.name ?? ''}
+        currentOwnerName={transferFor?.creatorName ?? ''}
+        onClose={() => setTransferFor(null)}
+      />
     </>
   )
 }

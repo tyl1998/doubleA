@@ -54,6 +54,7 @@
     "router:dev": "pnpm --filter @doubulea/backend router:dev",
     "verify:workspace-ui": "pnpm --filter @doubulea/frontend verify:workspace-ui",
     "verify:git-credentials-ui": "pnpm --filter @doubulea/frontend verify:git-credentials-ui",
+    "verify:asset-acl": "pnpm --filter @doubulea/frontend verify:asset-acl",
     "db:generate": "pnpm --filter @doubulea/backend db:generate",
     "db:migrate": "pnpm --filter @doubulea/backend db:migrate",
     "db:deploy": "pnpm --filter @doubulea/backend db:deploy",

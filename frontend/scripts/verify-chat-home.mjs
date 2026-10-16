@@ -31,6 +31,9 @@
  *   · **F8（2026-10-14）**：新会话态（`conversationId` 尚未生成）开 Code 模式 ⇒ 第三列是
  *     **空工作区占位**（`WorkspacePanelPlaceholder`），**不回落**到产物面板。
  *   · **F9（2026-10-14）**：非 Code 的**产物面板可收起 / 展开**（第三列开关，`panelOpen` ∩ `showPanel`）。
+ *   · **H（2026-10-16）**：新建对话前的**模型 Key 预检**（`modelKeyGuard`）—— 池内模型分"能用 / 被 Key
+ *     挡住"：**一个能用的都没有**才在 `AgentPicker` 拦（弹窗、不导航）；有能用的就放行，默认模型缺 Key
+ *     时自动换一个能用的（优先共享 Key），用户**手动选到**缺 Key 的模型时由 `ChatPage` 选择器弹窗。
  *
  *   · **G（2026-10-13）**：侧边栏分两层 —— 上层「平台功能」（六条直达入口 + `管理 ▸` 就地展开
  *     剩余入口，约 35% 高）、下层「会话」（约 65% 高，分组标题可点击收缩）。
@@ -415,6 +418,88 @@ it('G4 两层高度比 35 / 65（flex-grow）', () => {
   const css = read('../src/styles/app.css')
   includes(css, 'flex: 35 35 0;', '平台功能约 35%')
   includes(css, 'flex: 65 65 0;', '会话约 65%')
+})
+
+// ───────────────────────────── H 新建对话模型 Key 预检（2026-10-16） ─────────────────────────────
+
+const { missingModelKeyProviders, partitionPoolModels, isConversationBlocked, pickUsableModelId } =
+  await import('../src/features/chat/modelKeyGuard.ts')
+
+/** 造一个只带预检需要的字段的 `ModelOption` 字面量（其余字段它不看） */
+function modelOption(id, providerId, providerName, label, mode, hasKey) {
+  return { id, providerId, providerName, label, providerCredentialMode: mode, providerUserHasKey: hasKey }
+}
+
+it('H1 缺 Key 的「各自 Key」Provider 被识别出来，并按 Provider 归并', () => {
+  const models = [
+    modelOption('m1', 'p1', '甲', '甲-1', 'PER_USER', false),
+    modelOption('m2', 'p1', '甲', '甲-2', 'PER_USER', false),
+    modelOption('m3', 'p2', '乙', '乙-1', 'PER_USER', true),
+    modelOption('m4', 'p3', '丙', '丙-1', 'SHARED', false),
+  ]
+  const missing = missingModelKeyProviders(['m1', 'm2', 'm3', 'm4'], models)
+  eq(missing.length, 1, '只有 p1 缺 Key')
+  eq(missing[0].providerId, 'p1', '命中的 Provider')
+  eq(missing[0].providerName, '甲', 'Provider 名')
+  eq(missing[0].modelLabels.join('/'), '甲-1/甲-2', '同 Provider 的模型归并到一条')
+})
+
+it('H2 都已配置 / 共享 Key / 池内模型不在可选列表 ⇒ 不拦（返回空）', () => {
+  const models = [
+    modelOption('m1', 'p1', '甲', '甲-1', 'PER_USER', true),
+    modelOption('m2', 'p3', '丙', '丙-1', 'SHARED', false),
+  ]
+  eq(missingModelKeyProviders(['m1', 'm2', 'm9'], models).length, 0, 'm9 不在列表里 ⇒ 跳过')
+})
+
+it('H3 AgentPicker 选中智能体时先预检：**一个能用的都没有**才弹窗且不导航', () => {
+  const picker = read('../src/features/chat/AgentPicker.tsx')
+  includes(picker, 'isConversationBlocked(', '用"有没有能用的模型"当准入判据')
+  includes(picker, 'partitionPoolModels(', '先分"能用/被 Key 挡住"')
+  includes(picker, 'missingModelKeyProviders(', '弹窗内容用同一判据')
+  includes(picker, '<MissingModelKeyModal', '共用同一个弹窗组件')
+  const guardAt = picker.indexOf('isConversationBlocked(')
+  const onPickAt = picker.indexOf('onPick(agent.id)')
+  assert(guardAt >= 0, '要有"没有能用的模型 ⇒ 弹窗"的分支')
+  assert(onPickAt > guardAt, '该分支要在 `onPick` 之前 return（不导航 = 不开始对话）')
+})
+
+it('H4 ChatPage 兜底（发送前判本次要用的模型）+ 选择器拦截 + 共用一个弹窗', () => {
+  const chatPage = read('../src/pages/chat/ChatPage.tsx')
+  includes(chatPage, 'missingModelKeyProviders(', '用同一个纯判据')
+  includes(chatPage, "conversationId === undefined", '只对**新建**对话（还没建出会话）预检')
+  includes(chatPage, '<MissingModelKeyModal', '共用同一个弹窗组件')
+  // 选择器换到缺 Key 的模型 ⇒ 不切换、弹窗
+  includes(chatPage, 'handleSelectModel', '模型选择器有拦截')
+  // 默认模型缺 Key ⇒ 自动换成能用的
+  includes(chatPage, 'pickUsableModelId(', '新会话态自动换一个能用的模型')
+  assert(
+    chatPage.indexOf('handleSelectModel = useCallback') < chatPage.indexOf('onSelectModel={handleSelectModel}'),
+    '选择器要接拦截后的回调，不是裸 setSelectedModelId',
+  )
+})
+
+it('H5 弹窗「去配置」跳「我的凭据」的 Provider 分区，「取消」只关弹窗', () => {
+  const modal = read('../src/features/chat/MissingModelKeyModal.tsx')
+  includes(modal, 'credentialsSectionPath', '「去配置」跳「我的凭据」的 Provider 分区（2026-10-16 分区后）')
+  includes(modal, 'onCancel={onClose}', '取消只关弹窗（"不建会话/不切换"由调用方拦截）')
+})
+
+it('H6 准入与"挑一个能用的"：有能用的就放行，默认缺 Key 时优先挑共享 Key 的模型', () => {
+  const shared1 = modelOption('m1', 'p1', '甲', '甲-1', 'SHARED', false)
+  const perUserNoKey = modelOption('m2', 'p2', '乙', '乙-1', 'PER_USER', false)
+  const perUserHasKey = modelOption('m3', 'p3', '丙', '丙-1', 'PER_USER', true)
+  const models = [shared1, perUserNoKey, perUserHasKey]
+
+  const partition = partitionPoolModels(['m1', 'm2', 'm3'], models)
+  eq(partition.usableModelIds.join(','), 'm1,m3', '能用：共享 + 各自(我已配)')
+  eq(partition.blockedModelIds.join(','), 'm2', '被挡：各自(我未配)')
+  eq(isConversationBlocked(partition), false, '有能用的 ⇒ 放行')
+  eq(isConversationBlocked(partitionPoolModels(['m2'], models)), true, '一个能用的都没有 ⇒ 拦')
+
+  eq(pickUsableModelId(['m1', 'm2'], models, () => 0), 'm1', '优先共享 Key')
+  eq(pickUsableModelId(['m2', 'm3'], models, () => 0), 'm3', '没有共享则退而挑"我已配"的')
+  eq(pickUsableModelId(['m2'], models, () => 0), null, '一个能用的都没有 ⇒ null')
 })
 
 // ───────────────────────────── 结论 ─────────────────────────────

@@ -40,6 +40,7 @@ import { registerModelProviderRoutes } from './routes/modelProviders.js'
 import { registerTaskRoutes } from './routes/tasks.js'
 import { registerUsageRoutes } from './routes/usage.js'
 import { registerUserRoutes } from './routes/users.js'
+import { registerUserGroupRoutes } from './routes/userGroups.js'
 import { registerWorkspaceRoutes } from './routes/workspace.js'
 import { registerSandboxRoutes } from './routes/sandbox.js'
 
@@ -152,6 +153,7 @@ export function buildApp(): FastifyInstance {
   registerHealthRoutes(app)
   registerAuthRoutes(app)
   registerUserRoutes(app)
+  registerUserGroupRoutes(app)
   registerModelProviderRoutes(app)
   registerModelRoutes(app)
   // ⑧ 知识库（P0-1-15）。注意权限是**登录即可**（`03` §25：`/knowledge` 的权限列是「登录」，

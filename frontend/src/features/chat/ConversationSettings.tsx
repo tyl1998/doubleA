@@ -35,6 +35,12 @@ export interface ConversationSettingsProps {
   /** 本会话选用的模型（`undefined` = 走智能体默认模型） */
   selectedModelId: string | undefined
   onSelectModel: (modelId: string) => void
+  /**
+   * 缺 Key（「各自 Key」且我未配）的池内模型 id（2026-10-16）。给这些选项标一句「需配 Key」——
+   * 让"选了会弹窗"可预期；判据与准入/预检同一份（`modelKeyGuard`），选项**不置灰**
+   * （点了会就地弹"去配置"，比一个点不动的灰项有用）。
+   */
+  keyBlockedModelIds?: ReadonlySet<string>
   autoApprove: boolean
   autoApprovePending: boolean
   onToggleAutoApprove: (enabled: boolean) => void
@@ -127,7 +133,11 @@ export function ConversationSettings(props: ConversationSettingsProps) {
           onChange={props.onSelectModel}
           options={agent.models.map((m) => ({
             value: m.modelId,
-            label: m.available ? m.modelLabel : `${m.modelLabel}（已停用）`,
+            label: !m.available
+              ? `${m.modelLabel}（已停用）`
+              : props.keyBlockedModelIds?.has(m.modelId) === true
+                ? `${m.modelLabel}（需配 Key）`
+                : m.modelLabel,
             disabled: !m.available,
           }))}
           title="选择本会话使用的模型（来自该智能体的模型池）"

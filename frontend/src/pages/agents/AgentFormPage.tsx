@@ -61,6 +61,8 @@ import {
   AGENT_OPENING_REMARKS_MAX_CHARS,
   AGENT_SYSTEM_PROMPT_MAX_CHARS,
   AGENT_TYPES,
+  ASSET_VISIBILITIES,
+  ASSET_VISIBILITY_LABELS,
   GUIDE_QUESTION_MAX_CHARS,
   GUIDE_QUESTIONS_MAX,
   createAgentBodySchema,
@@ -78,7 +80,8 @@ import { useMcpServers, useMyCredentials } from '../../api/mcp.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
-import { AGENTS_PATH, chatPath, credentialsPath } from '../../app/paths.js'
+import { AGENTS_PATH, chatPath, credentialsPath, credentialsSectionPath } from '../../app/paths.js'
+import { AudiencePicker } from '../../components/AudiencePicker.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import {
@@ -106,9 +109,31 @@ import {
   type AgentSectionKey,
 } from './agentModel.js'
 
-// ═════════════════════════════ 数据编排（两条路由各自入口） ═════════════════════════════
+/**
+ * 受众字段的 AntD 适配层（P1-18）：把 `Form.Item name="audience"` 的 `{ value, onChange }`
+ * 接到 {@link AudiencePicker} 的 `userIds`/`groupIds` 两个入参上 —— 于是 zod 的
+ * `path: ['audience']` 能精确挂到这一项（空受众的 400 文案有处可显）。
+ */
+function AudienceField({
+  value,
+  onChange,
+  disabled,
+}: {
+  value?: { userIds: string[]; groupIds: string[] }
+  onChange?: (next: { userIds: string[]; groupIds: string[] }) => void
+  disabled?: boolean
+}) {
+  return (
+    <AudiencePicker
+      userIds={value?.userIds ?? []}
+      groupIds={value?.groupIds ?? []}
+      onChange={(next) => onChange?.(next)}
+      disabled={disabled}
+    />
+  )
+}
 
-/** 新建入口（`/agents/new`） */
+// ═════════════════════════════ 数据编排（两条路由各自入口） ═════════════════════════════/** 新建入口（`/agents/new`） */
 export function AgentCreatePage() {
   return <AgentFormPage />
 }
@@ -429,6 +454,26 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
     values.modelIds.includes(option.value),
   )
 
+  /**
+   * 池里那些「各自 Key」且**我还没配 Key** 的模型所属 Provider 名（P1-18）。
+   *
+   * 判据来自服务端随模型下发的 `providerCredentialMode` / `providerUserHasKey`
+   * （`GET /api/models/available`）—— 前端**不自己猜**凭据模式。这些 Provider 的模型选了也能存，
+   * 但发消息会 424「尚未配置所需凭据」⇒ 就地提示并引导去「我的凭据」配（唯一配置入口）。
+   */
+  const unconfiguredCredProviders = [
+    ...new Map(
+      modelOptions
+        .filter(
+          (option) =>
+            values.modelIds.includes(option.id) &&
+            option.providerCredentialMode === 'PER_USER' &&
+            !option.providerUserHasKey,
+        )
+        .map((option) => [option.providerId, option.providerName]),
+    ).values(),
+  ]
+
   const toggleKb = (kbId: string, checked: boolean) => {
     setSelectedKbIds((current) =>
       checked ? [...current.filter((id) => id !== kbId), kbId] : current.filter((id) => id !== kbId),
@@ -464,7 +509,18 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
           form={form}
           layout="vertical"
           initialValues={initialValues}
-          onValuesChange={(_, all) => setValues(all)}
+          /**
+           * ⚠️ 必须用 `form.getFieldsValue(true)`（取**整个 store**），**不能**用 `onValuesChange` 的第二个入参。
+           *
+           * 那个入参是 `getFieldsValue()` 的结果 —— 它**只含当前已注册（已挂载）的字段**。本表单里的
+           * `audience` 是**条件渲染**的（仅 `visibility=SHARED` 才挂 `Form.Item`）⇒ 私有/公开时它不是
+           * 注册字段、不出现在那个入参里。用 `setValues(all)` 会把 `values.audience` 覆盖成 `undefined`
+           * ⇒ 紧接着 `changedSections → audienceChanged` 读 `values.audience.userIds` 抛 TypeError，
+           * React 卸载整棵子树 = **页面白屏**（勾选模型池只是"任意一次 onValuesChange"的一个触发点）。
+           * `getFieldsValue(true)` 取的是 store 全量（含 initialValues 与未挂载字段的值）⇒ `values` 始终是
+           * 表单的完整镜像，`audience` 不会凭空消失。
+           */
+          onValuesChange={() => setValues(form.getFieldsValue(true))}
           onFinish={(submitted) => {
             void runSave(submitted)
           }}
@@ -516,6 +572,35 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 >
                   <Input placeholder="一句话说清它做什么、边界在哪" />
                 </Form.Item>
+                <Form.Item
+                  name="visibility"
+                  label="可见范围"
+                  extra="私有 = 仅所属人（你）与管理员；指定用户 = 只有你圈定的用户/组可见可用；公开 = 全员可看可用。"
+                >
+                  <Radio.Group>
+                    {ASSET_VISIBILITIES.map((value) => (
+                      <Radio key={value} value={value}>
+                        {ASSET_VISIBILITY_LABELS[value]}
+                      </Radio>
+                    ))}
+                  </Radio.Group>
+                </Form.Item>
+                {values.visibility === 'SHARED' && (
+                  <Form.Item
+                    name="audience"
+                    label="受众"
+                    required
+                    extra="受众 = 你直接指定的用户 ∪ 你选的组里全部成员；至少选一位用户或一个组。"
+                  >
+                    <AudienceField />
+                  </Form.Item>
+                )}
+                {(values.visibility === 'PUBLIC' || values.visibility === 'SHARED') && (
+                  <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                    公开 / 指定用户后，该智能体引用的私有知识库 / MCP 工具内容、以及共享 Key 的模型额度，
+                    将对该受众可见 / 可用 —— 这属于自愿共享（不受引用的组件 / Provider 自身可见范围限制）。
+                  </p>
+                )}
                 {typeLocked ? (
                   <div>
                     <p className="block-label">类型</p>
@@ -586,6 +671,21 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                     notFoundContent="模型池为空：请先在上面选择至少一个模型"
                   />
                 </Form.Item>
+                {unconfiguredCredProviders.length > 0 && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message={`所选模型的 Provider「${unconfiguredCredProviders.join('、')}」是「各自 Key」模式，你还没配置 Key`}
+                    description={
+                      <>
+                        这些 Provider 的模型选了也能保存，但发消息时会返回「尚未配置所需凭据」。
+                        请到「我的凭据」的「模型 Provider 凭据」分区配置你自己的 API Key。
+                        <br />
+                        <Link to={credentialsSectionPath('provider')}>去我的凭据配置 →</Link>
+                      </>
+                    }
+                  />
+                )}
               </div>
             </FormSection>
 

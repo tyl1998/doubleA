@@ -75,7 +75,8 @@
  *     能解开，那"绑定层"的验收就成了摆设（`06` P0-2-4 坑预判 3）。多带 `key` 是为了让值
  *     不能在字段之间搬运；**刻意不带行 id** —— 那样 upsert 就得先有 id（P0-1-10 的 Provider 是
  *     反例：它的 AAD 含 id，所以加密只能发生在拿到 id 之后）。
- *   · **`configured` 按当前模板逐 key 判**，不是"表里有没有行"（见 {@link isCredentialConfigured}）。
+ *   · **`configured` 按"我是否真的填过值"判**（见 {@link isCredentialConfigured}；2026-10-16 修订：
+ *     原判据"必填项齐全"会让没勾必填的模板对**所有人**都返回已配置，等于把别人的凭据当成你的）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ⑥ 工具列表（P0-2-5）：两种取法 / `refresh` 是白名单 / 缓存是"每个 server 一份"
@@ -105,13 +106,11 @@
 
 import { z } from 'zod'
 
+import { canEditAsset, KB_MCP_VISIBILITIES } from './assetAcl.js'
 import { type UserRole } from './auth.js'
 import { offsetPageOf } from './envelope.js'
 
 // ───────────────────────────── 权限判据（唯一实现）─────────────────────────────
-
-/** `UserRole` 里的管理员字面量（与 `agent.ts#ADMIN_ROLE` 同款：`shared` 里刻意各写一份，见下） */
-const ADMIN_ROLE: UserRole = 'ADMIN'
 
 /**
  * "这台 MCP server 我能不能改/删"（P0-2-12；`06` §4.2、`02` §三③、`01` §3.6）。
@@ -132,8 +131,8 @@ export function canEditMcpServer(
   server: { createdBy: string },
   viewer: { id: string; role: UserRole },
 ): boolean {
-  if (viewer.role === ADMIN_ROLE) return true
-  return server.createdBy === viewer.id
+  // P1-13：判据统一收口到 `assetAcl`（可见性不影响编删权）
+  return canEditAsset({ ownerId: server.createdBy }, viewer)
 }
 
 // ───────────────────────────── 取值域与上限（常量即契约）─────────────────────────────
@@ -669,25 +668,34 @@ export function missingRequiredCredentialKeys(
 }
 
 /**
- * 「我这份凭据算不算配好了」—— **按当前模板逐 key 检查**，不是"表里有没有行"。
+ * 「我这份凭据算不算配好了」—— **按"我是否真的填过值"判**（2026-10-16 修订）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 为什么不是"有没有行"（`06` P0-2-4 坑预判 2）
+ * 为什么不再按「必填项齐全」判（原 P0-2-4 口径）
  * ─────────────────────────────────────────────────────────────────────
- * `PUT` 是**合并**语义（见 {@link putMyCredentialBodySchema}）⇒ 注册者后来给模板**新增**一个
- * `required` 参数时，老用户的行**还在**、但那个 key **没有值**。若用"表里有行 = 已配置"，
- * 界面会显示 ✓、工具调用时才发现缺 key（甚至只表现为"上游说我没权限"）。
- * ⇒ 判据只认「**当前模板的必填项是否齐全**」：
- *   · 模板里没有必填项（含空模板）⇒ **`true`**（没有任何东西要他填）；
- *   · 有行但缺必填 ⇒ `false`（与没有行**同一个结论**）；
- *   · 没行但模板无需填写 ⇒ `true`（例如内网无鉴权的 server）。
- * ⚠️ 非必填项缺值**不影响** `configured`（它只影响界面上那一行的 ✓）。
+ * 原判据是 `missingRequiredCredentialKeys(...).length === 0`，于是**注册者没把任何参数勾成必填**时，
+ * 每个人（哪怕从没配过）都会被算成「已配置」—— 而 MCP server 是**按人各配一份**的（`(serverId,userId)`），
+ * 于是"注册者/admin 配的凭据"看起来像是**对所有人都生效**了。用户 2026-10-16 定案：这一列必须
+ * **区分到人**（列表里我到底配没配），故判据改成"**我这边至少有一个（模板内的）值**"。
+ *
+ * 四条：
+ *   · 模板**没有参数**（空模板 / 内网无鉴权服务）⇒ `true`（没有任何东西要他填，不进"未配置"计数）；
+ *   · 我有 ≥1 个**模板内**的值 ⇒ `true`（哪怕还有必填项没填齐 —— 那是 `missingKeys` 的事，
+ *     界面上仍会提示"还缺 X"，但那不是"我完全没配"）；
+ *   · 我没有任何模板内的值 ⇒ `false`（界面显示「未配置」并给"去配置"入口）；
+ *   · 只统计**当前模板里还认的 key**：模板里被删掉的 key 即使库里还留着值也不会被注入，
+ *     不拿它冒充"我配过了"。
  */
 export function isCredentialConfigured(
   schema: readonly CredentialSchemaEntry[],
   presentKeys: Iterable<string>,
 ): boolean {
-  return missingRequiredCredentialKeys(schema, presentKeys).length === 0
+  if (schema.length === 0) return true
+  const templateKeys = new Set(schema.map((entry) => entry.key))
+  for (const key of presentKeys) {
+    if (templateKeys.has(key)) return true
+  }
+  return false
 }
 
 /**
@@ -727,11 +735,12 @@ export const mcpCredentialItemSchema = z.object({
   fields: z.array(mcpCredentialFieldSchema),
   /** 当前模板的必填项里我还没值的（顺序 = 模板顺序）；空 ⇒ `configured:true` */
   missingKeys: z.array(z.string()),
-  /** = `missingKeys.length === 0`（见 {@link isCredentialConfigured}，**不是**"表里有没有行"） */
+  /** = 「我这边至少有一个（模板内的）值」（见 {@link isCredentialConfigured}；**不是**"必填齐全"、
+   *  更不是"表里有没有行"）。⚠️ 它**按人算** —— 同一台 server 对不同人给出不同答案。 */
   configured: z.boolean(),
   /**
    * 我这份凭据最后一次写入时间；`null` = **从没写过**（没有行）。
-   * ⚠️ 它与 `configured` 是两件事：模板没有必填项时"从没写过"也是 `configured:true`。
+   * ⚠️ 与 `configured` 大致同向但不完全等价：空模板（无参数）时"从没写过"也是 `configured:true`。
    */
   updatedAt: z.string().nullable(),
 })
@@ -859,6 +868,8 @@ export const mcpServerItemSchema = z.object({
    * 列表对**全员**开放 ⇒ 用户必须能看出"这台 server 该找谁去配凭据"，只给一个 uuid 是没有用的。
    */
   creatorName: z.string(),
+  /** P1-18：可见范围（**两档**：私有 / 公开；MCP server 不接受「指定用户」） */
+  visibility: z.enum(KB_MCP_VISIBILITIES),
   /**
    * P0-2-12：**我能不能改/删这台 server**（判据 = {@link canEditMcpServer}，注册者 + ADMIN）。
    * ⚠️ 由**服务端现算**（它依赖 viewer）—— 前端**不要**自己拿 `createdBy` 跟当前用户 id 比：
@@ -1147,6 +1158,12 @@ export const createMcpServerBodySchema = z.object({
     })
     .optional(),
   credentialSchema: credentialSchemaSchema.optional(),
+  /** P1-18：可见范围（**两档**：私有 / 公开）。**可省** ⇒ 服务层按 `PRIVATE`（安全默认） */
+  visibility: z
+    .enum(KB_MCP_VISIBILITIES, {
+      errorMap: () => ({ message: `visibility 只能是 ${KB_MCP_VISIBILITIES.join('/')}` }),
+    })
+    .optional(),
 })
 export type CreateMcpServerBody = z.infer<typeof createMcpServerBodySchema>
 
@@ -1182,13 +1199,20 @@ export const updateMcpServerBodySchema = z
       .optional(),
     /** 整体替换（数组语义，"提交什么就是什么"）；清空提交 `[]` */
     credentialSchema: credentialSchemaSchema.optional(),
+    /** P1-18：可见范围（两档：私有 / 公开） */
+    visibility: z
+      .enum(KB_MCP_VISIBILITIES, {
+        errorMap: () => ({ message: `visibility 只能是 ${KB_MCP_VISIBILITIES.join('/')}` }),
+      })
+      .optional(),
   })
   .refine(
     (body) =>
       body.name !== undefined ||
       body.endpointUrl !== undefined ||
       body.authType !== undefined ||
-      body.credentialSchema !== undefined,
+      body.credentialSchema !== undefined ||
+      body.visibility !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
 export type UpdateMcpServerBody = z.infer<typeof updateMcpServerBodySchema>

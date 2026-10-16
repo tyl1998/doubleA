@@ -28,38 +28,49 @@ import {
   listKnowledgeBasesQuerySchema,
   ok,
   searchKnowledgeBaseBodySchema,
+  transferAssetBodySchema,
   updateKnowledgeBaseBodySchema,
+  type AssetViewer,
   type CreateKnowledgeBaseBody,
   type KnowledgeBaseIdParams,
   type ListKnowledgeBasesQuery,
   type SearchKnowledgeBaseBody,
+  type TransferAssetBody,
   type UpdateKnowledgeBaseBody,
 } from '@doubulea/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyRequest } from 'fastify'
 
+import { requireAuthContext } from '../plugins/session.js'
 import {
   createKnowledgeBase,
   getKnowledgeBase,
   listKnowledgeBases,
   rebuildKnowledgeBase,
   removeKnowledgeBase,
+  transferKnowledgeBase,
   updateKnowledgeBase,
 } from '../services/kb.service.js'
 import { searchKnowledgeBase } from '../services/retrieval.js'
 
+/** 取调用者（`id` + `role`）—— P1-13 起知识库也走行级权限，服务层需要它 */
+function viewerOf(request: FastifyRequest): AssetViewer {
+  const auth = requireAuthContext(request)
+  return { id: auth.user.id, role: auth.user.role }
+}
+
 export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
-  /** 列表（登录即可；`03` §4.3 的列表页与 §4.2 的 KB 多选框共用） */
+  /** 列表（登录即可；P1-13 起按"对我可见"过滤） */
   app.get<{ Querystring: ListKnowledgeBasesQuery }>(
     '/api/knowledge-bases',
     { preHandler: app.requireAuth, schema: { querystring: listKnowledgeBasesQuerySchema } },
-    async (request) => ok(await listKnowledgeBases(request.query)),
+    async (request) => ok(await listKnowledgeBases(request.query, viewerOf(request))),
   )
 
-  /** 详情（登录即可） */
+  /** 详情（登录即可；私有库对他人 404） */
   app.get<{ Params: KnowledgeBaseIdParams }>(
     '/api/knowledge-bases/:id',
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
-    async (request) => ok(await getKnowledgeBase(request.params.id)),
+    async (request) => ok(await getKnowledgeBase(request.params.id, viewerOf(request))),
   )
 
   /**
@@ -72,24 +83,37 @@ export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
   app.post<{ Body: CreateKnowledgeBaseBody }>(
     '/api/knowledge-bases',
     { preHandler: app.requireAuth, schema: { body: createKnowledgeBaseBodySchema } },
-    async (request) => ok(await createKnowledgeBase(request.body)),
+    async (request) => ok(await createKnowledgeBase(request.body, viewerOf(request))),
   )
 
-  /** 部分更新（登录即可）。三态与局部合并的语义在服务层收口 */
+  /** 部分更新（登录即可进入，行级判定：所属人或 ADMIN）。三态与局部合并的语义在服务层收口 */
   app.patch<{ Params: KnowledgeBaseIdParams; Body: UpdateKnowledgeBaseBody }>(
     '/api/knowledge-bases/:id',
     {
       preHandler: app.requireAuth,
       schema: { params: knowledgeBaseIdParamsSchema, body: updateKnowledgeBaseBodySchema },
     },
-    async (request) => ok(await updateKnowledgeBase(request.params.id, request.body)),
+    async (request) => ok(await updateKnowledgeBase(request.params.id, request.body, viewerOf(request))),
   )
 
-  /** 删除（登录即可）。连带清 chunks（外键 CASCADE）与 S3 原文件；被 Agent 绑定时 409 */
+  /**
+   * 转移所属人（P1-13，**所属人或 ADMIN**）。`{ toUserId }`；接收方须为 ACTIVE 用户、不能转给自己。
+   */
+  app.post<{ Params: KnowledgeBaseIdParams; Body: TransferAssetBody }>(
+    '/api/knowledge-bases/:id/transfer',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: knowledgeBaseIdParamsSchema, body: transferAssetBodySchema },
+    },
+    async (request) =>
+      ok(await transferKnowledgeBase(request.params.id, request.body.toUserId, viewerOf(request))),
+  )
+
+  /** 删除（登录即可进入，行级判定：所属人或 ADMIN）。连带清 chunks 与 S3 原文件；被 Agent 绑定时自动解绑 */
   app.delete<{ Params: KnowledgeBaseIdParams }>(
     '/api/knowledge-bases/:id',
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
-    async (request) => ok(await removeKnowledgeBase(request.params.id)),
+    async (request) => ok(await removeKnowledgeBase(request.params.id, viewerOf(request))),
   )
 
   /**
@@ -108,7 +132,7 @@ export function registerKnowledgeBaseRoutes(app: FastifyInstance): void {
   app.post<{ Params: KnowledgeBaseIdParams }>(
     '/api/knowledge-bases/:id/rebuild',
     { preHandler: app.requireAuth, schema: { params: knowledgeBaseIdParamsSchema } },
-    async (request) => ok(await rebuildKnowledgeBase(request.params.id)),
+    async (request) => ok(await rebuildKnowledgeBase(request.params.id, viewerOf(request))),
   )
 
   /**

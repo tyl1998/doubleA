@@ -98,10 +98,14 @@ export function App() {
           {/* S-07c · 用量统计（P1-7）：**P1-15 起登录即可**（移出 `RequireAdmin`，见文件头） */}
           <Route path="/admin/usage" element={<UsagePage />} />
 
-          {/* ADMIN 专属（`03` §三：这两页仅 ADMIN 可见） */}
+          {/* S-07b · 模型池（P1-13）：**登录即可** —— `/api/model-providers/**` 与 `/api/models/**`
+              已从 `requireAdmin` 改成 `requireAuth` + 行级权限（ADMIN 看全部，其他人看/管
+              公开 + 自己的 + 分享给自己的）。所以它**移出** `RequireAdmin`（别当成漏写）。 */}
+          <Route path="/admin/models" element={<ModelsPage />} />
+
+          {/* ADMIN 专属（`03` §三：用户管理 / 出网策略仅 ADMIN 可见） */}
           <Route element={<RequireAdmin />}>
             <Route path="/admin/users" element={<UsersListPage />} />
-            <Route path="/admin/models" element={<ModelsPage />} />
             <Route path="/admin/egress" element={<EgressPolicyPage />} />
           </Route>
 

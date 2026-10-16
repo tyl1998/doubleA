@@ -20,6 +20,7 @@
     "verify:memory-ui": "node --import tsx scripts/verify-memory-ui.mjs",
     "verify:workspace-ui": "node --import tsx scripts/verify-workspace-ui.mjs",
     "verify:git-credentials-ui": "node --import tsx scripts/verify-git-credentials-ui.mjs",
+    "verify:asset-acl": "node --import tsx scripts/verify-asset-acl.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {

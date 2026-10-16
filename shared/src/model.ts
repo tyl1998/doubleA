@@ -42,7 +42,7 @@ import { offsetPageOf } from './envelope.js'
 // （`schema.prisma` 的 `enum ModelType`），拆两份迟早会出现"这里加了、那里忘了"。
 // 刻意**不再 re-export**（`MODEL_TYPES` 已由 `modelProvider.ts` 出口）：`index.ts` 用
 // `export *`，同一个名字从两个模块出来会让"是否算歧义"取决于运行时实现，没必要冒这个险。
-import { MODEL_TYPES } from './modelProvider.js'
+import { MODEL_TYPES, PROVIDER_CREDENTIAL_MODES } from './modelProvider.js'
 
 // ───────────────────────────── 输出形态（两套投影） ─────────────────────────────
 
@@ -58,6 +58,13 @@ export const modelItemSchema = z.object({
   providerId: z.string(),
   /** 上游 Provider 名。列表里直接显示，避免管理员再点一次 Provider 才认得出是谁 */
   providerName: z.string(),
+  /**
+   * 所属 Provider 的 `baseUrl`（P1-18 追加）。
+   *
+   * 为什么随模型下发：同名 Provider 靠 id 区分，用户只看名字认不出"这个模型到底打到哪个上游"；
+   * 模型表把 Provider 的 `baseUrl` 作为副行显示，一眼就能核对。它是**只读读数**，不参与编删。
+   */
+  providerBaseUrl: z.string(),
   /** Provider 是否启用。**停用的 Provider 下的模型不会出现在可选列表**，管理页要能看出这一点 */
   providerEnabled: z.boolean(),
   /** 上游真实型号名（会原样放进请求体的 `model` 字段） */
@@ -90,6 +97,18 @@ export const modelItemSchema = z.object({
    * 与 `agentCount` 不同，它**不**是删除守卫：删模型会把 `embedding_model_id` 置空（`onDelete: SetNull`）。
    */
   knowledgeBaseCount: z.number().int().min(0),
+  /**
+   * P1-13：模型**随 Provider 归属** —— 以下字段取自其 Provider（Model 本身没有可见性/归属列）。
+   * ⚠️ P1-13 修订（2026-10-16）：Provider **不再有可见性** ⇒ 这里没有 `providerVisibility`。
+   * `providerOwnerId`/`providerOwnerName` 用于"所属人"列；`canEdit` = 该 Provider 的所属人或 ADMIN。
+   */
+  providerOwnerId: z.string(),
+  providerOwnerName: z.string(),
+  /**
+   * P1-13：**我能不能改/删这个模型** —— 判据 = 其 Provider 的 `canEditAsset`（所属人或 ADMIN）。
+   * ⚠️ 系统级 Provider（owner=ADMIN）下的模型**只有 ADMIN** 能改/删。
+   */
+  canEdit: z.boolean(),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -118,6 +137,19 @@ export const modelOptionSchema = z.object({
   supportsVision: z.boolean(),
   /** 是否支持"深度思考"（reasoning / thinking）：选模型时也要看得见这个能力 */
   supportsReasoning: z.boolean(),
+  /**
+   * P1-18：该模型所属 Provider 的**凭据模式**（共享 Key / 各自 Key）。
+   *
+   * 为什么放这里：智能体表单要能就地下判断——"我选的这个模型，它的 Provider 是不是
+   * 要我配自己的 Key，而我还没配"。表单是**按模型**判断的（一次请求即拿到 模型 ↔ 其 Provider
+   * 的凭据模式 + 我有没有 Key），不必再单独拉一张凭据表 ⇒ 随模型一起下发最直接、最可靠。
+   */
+  providerCredentialMode: z.enum(PROVIDER_CREDENTIAL_MODES),
+  /**
+   * P1-18：**当前调用者**是否已为该 Provider 配置了自己的 Key
+   * （仅 `providerCredentialMode=PER_USER` 时有意义）。凭据是个人隐私：**只有布尔**，无明文/掩码。
+   */
+  providerUserHasKey: z.boolean(),
 })
 export type ModelOption = z.infer<typeof modelOptionSchema>
 

@@ -35,6 +35,7 @@ import { Alert, Button, Checkbox, Input, Popconfirm, Select, Table, Tag, Tooltip
 import {
   MODEL_TYPES,
   MODEL_TYPE_LABELS,
+  PROVIDER_CREDENTIAL_MODE_LABELS,
   UPSTREAM_PROTOCOL_LABELS,
   type ModelItem,
   type ModelProviderItem,
@@ -50,9 +51,10 @@ import {
   useRemoveModel,
 } from '../../api/modelPool.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
-import { AGENTS_PATH } from '../../app/paths.js'
+import { AGENTS_PATH, credentialsSectionPath } from '../../app/paths.js'
 import { DeleteProviderModal } from './DeleteProviderModal.js'
 import { ModelFormModal } from './ModelFormModal.js'
 import { ProviderFormModal } from './ProviderFormModal.js'
@@ -69,6 +71,18 @@ const TYPE_FILTER_OPTIONS = [
   { value: 'ALL', label: '全部类型' },
   ...MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] })),
 ]
+
+/**
+ * 转移目标（P1-18）：Provider 行与模型行都用它。
+ *
+ * 模型行的「所属人」其实是**其 Provider 的所属人**（模型随 Provider 归属）⇒ 从模型行点所属人
+ * 转移的仍然是那个 Provider。两种行汇成同一个形状，弹窗与文案只有一处。
+ */
+interface TransferTarget {
+  id: string
+  name: string
+  ownerName: string
+}
 
 export function ModelsPage() {
   const feedback = useFeedback()
@@ -88,15 +102,25 @@ export function ModelsPage() {
   const [creatingModel, setCreatingModel] = useState(false)
   const [editingModel, setEditingModel] = useState<ModelItem | null>(null)
 
+  const [transferFor, setTransferFor] = useState<TransferTarget | null>(null)
+
   const [providerFilter, setProviderFilter] = useState<string>('ALL')
   const [typeFilter, setTypeFilter] = useState<ModelType | 'ALL'>('ALL')
   const [keyword, setKeyword] = useState('')
   const [onlyDisabled, setOnlyDisabled] = useState(false)
 
-  const providers = providersQuery.data?.items ?? []
+  const allProviders = providersQuery.data?.items ?? []
   const providerTotal = providersQuery.data?.total ?? 0
-  const models = modelsQuery.data?.items ?? []
+  const allModels = modelsQuery.data?.items ?? []
   const modelTotal = modelsQuery.data?.total ?? 0
+
+  // 访问控制由服务端按行下发（2026-10-16 修订：Provider **读 = 全体登录用户**，平台模型池人人可见；
+  // 编 / 删 / 转移 = 所属人 + ADMIN，逐行由 `canEdit` 表达）。列表已是全量，前端不再叠筛选。
+  const providers = allProviders
+  const models = allModels
+
+  // 能新建模型的 Provider（非 ADMIN 不能往别人的 Provider 下加模型 ⇒ 只给自己的可编 Provider）
+  const editableProviders = providers.filter((provider) => provider.canEdit)
 
   const normalizedKeyword = keyword.trim().toLowerCase()
   // ⚠️ 只 filter，不 sort（见文件头 ②）—— 顺序就是服务端给的顺序
@@ -158,21 +182,6 @@ export function ModelsPage() {
       ),
     },
     {
-      title: 'API Key',
-      dataIndex: 'apiKeyPreview',
-      width: 170,
-      render: (_, provider) => (
-        <div className="kb-cell">
-          <span className="num">{describeProviderKey(provider)}</span>
-          {provider.hasKey ? (
-            <span className="kb-cell__sub">掩码，仅用于核对</span>
-          ) : (
-            <span className="kb-cell__sub">该 Provider 下的模型调用会失败</span>
-          )}
-        </div>
-      ),
-    },
-    {
       title: '模型数',
       dataIndex: 'modelCount',
       width: 90,
@@ -194,6 +203,65 @@ export function ModelsPage() {
       ),
     },
     {
+      // P1-18（2026-10-16 修订）：**合并「共享 Key」与「凭据」两列**。原来两列都在讲 Key
+      //（一列讲共享 Key 掩码、一列讲凭据模式），对 `PER_USER` 的 Provider 会出现
+      //「不使用（各自 Key）」+「各自 Key · 我未配置」两格互相打架 ⇒ 用户读不懂。
+      // 现在**一列讲清"这个 Provider 用谁的 Key、配没配"**：
+      //   · 共享 Key：显示掩码 + 已配置/未配置（改它走「编辑」表单）
+      //   · 各自 Key：显示我配没配；**没配就把用户引到「我的凭据」**（不再有行内「我的 Key」入口）
+      title: '凭据',
+      dataIndex: 'credentialMode',
+      width: 230,
+      render: (_, provider) =>
+        provider.credentialMode === 'PER_USER' ? (
+          <div className="kb-cell">
+            <span>{PROVIDER_CREDENTIAL_MODE_LABELS.PER_USER}</span>
+            {provider.userHasKey ? (
+              <span className="kb-cell__sub">我已配置（用自己的 Key 调用）</span>
+            ) : (
+              <span className="kb-cell__sub">
+                <Tag color="warning">我未配置</Tag>
+                <Link to={credentialsSectionPath('provider')} style={{ marginLeft: 'var(--sp-2)' }}>
+                  去我的凭据配置 →
+                </Link>
+              </span>
+            )}
+          </div>
+        ) : (
+          <div className="kb-cell">
+            <span className="num">{describeProviderKey(provider)}</span>
+            <span className="kb-cell__sub">
+              共享 Key · {provider.hasKey ? '掩码，仅用于核对' : '未配置：其下模型调用会失败'}
+            </span>
+          </div>
+        ),
+    },
+    {
+      // P1-13：所属人来自服务端下发的字段（Provider 的访问控制归服务端行级）。
+      // P1-18（2026-10-16 修订）：**去掉操作列的「转移所属人」按钮**，把这一列本身做成入口 ——
+      // 只有所属人或 ADMIN（服务端下发的 `canEdit`）能点，点了弹转移弹窗；其余人只显示名字。
+      title: '所属人',
+      dataIndex: 'creatorName',
+      width: 150,
+      render: (_, provider) =>
+        provider.canEdit ? (
+          <Tooltip title="点击转移所属人">
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0 }}
+              onClick={() =>
+                setTransferFor({ id: provider.id, name: provider.name, ownerName: provider.creatorName })
+              }
+            >
+              {provider.creatorName}
+            </Button>
+          </Tooltip>
+        ) : (
+          <span>{provider.creatorName}</span>
+        ),
+    },
+    {
       title: '最近更新',
       dataIndex: 'updatedAt',
       width: 130,
@@ -202,30 +270,39 @@ export function ModelsPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 250,
+      width: 220,
       align: 'right',
       // 固定右侧（`03` §七 表格规范）。本表列宽之和超过 1000px ⇒ 窄屏必然横向滚动
       fixed: 'right',
-      render: (_, provider) => (
-        <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
-          <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditingProvider(provider)}>
-            编辑
-          </Button>
-          <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setProbingProvider(provider)}>
-            拉取上游模型
-          </Button>
-          {/* 删除放最后（§七）；Provider 删除是**级联**那一档 ⇒ 走 Modal + 逐字确认 */}
-          <Button
-            type="link"
-            size="small"
-            danger
-            style={{ padding: 0 }}
-            onClick={() => setDeletingProvider(provider)}
-          >
-            删除
-          </Button>
-        </div>
-      ),
+      render: (_, provider) =>
+        // P1-18：编 / 删 按服务端给的 `canEdit`（所属人或 ADMIN）渲染。
+        // Provider 访问 = 所属人 + ADMIN（P1-18 起无"分享给你"这一档）。
+        // ⚠️ 2026-10-16 修订：行内**去掉「转移所属人」按钮**（改点「所属人」列）
+        //    与「我的 Key」按钮（统一去「我的凭据」页配置）。
+        provider.canEdit ? (
+          <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditingProvider(provider)}>
+              编辑
+            </Button>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setProbingProvider(provider)}>
+              拉取上游模型
+            </Button>
+            {/* 删除放最后（§七）；Provider 删除是**级联**那一档 ⇒ 走 Modal + 逐字确认 */}
+            <Button
+              type="link"
+              size="small"
+              danger
+              style={{ padding: 0 }}
+              onClick={() => setDeletingProvider(provider)}
+            >
+              删除
+            </Button>
+          </div>
+        ) : (
+          <span className="ratio" title="只有该 Provider 的所属人或管理员可以编辑 / 删除">
+            无编辑权限
+          </span>
+        ),
     },
   ]
 
@@ -233,12 +310,15 @@ export function ModelsPage() {
     {
       title: 'Provider',
       dataIndex: 'providerName',
-      width: 170,
+      width: 200,
       // ⚠️ 相邻同 Provider 的行合并；**不许**给这一列开客户端排序（见 `providerGroupSpans`）
       onCell: (_, index) => ({ rowSpan: spans[index ?? 0] ?? 1 }),
       render: (_, model) => (
         <div className="kb-cell">
           <span className="kb-cell__name">{model.providerName}</span>
+          {/* P1-18（2026-10-16 追加）：把所属 Provider 的 baseUrl 显示出来 —— 同名 Provider
+              靠 id 区分，仅凭名字认不出"这个模型到底打到哪个上游"。 */}
+          <span className="kb-cell__sub num">{model.providerBaseUrl}</span>
           {!model.providerEnabled && <span className="kb-cell__sub">Provider 已停用</span>}
         </div>
       ),
@@ -305,6 +385,31 @@ export function ModelsPage() {
       ),
     },
     {
+      // P1-13：模型随 Provider —— 所属人取自其 Provider（`providerOwnerName`，Model 本身没有这一列）。
+      // P1-18（2026-10-16 修订）：这一列可点 —— 从模型行转移的**是它所属的 Provider**
+      //（模型没有独立归属，所有权只在 Provider 上）。只有 `canEdit`（Provider 的所属人或 ADMIN）能点。
+      title: '所属人',
+      dataIndex: 'providerOwnerName',
+      width: 150,
+      render: (_, model) =>
+        model.canEdit ? (
+          <Tooltip title="点击转移所属 Provider 的所属人">
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0 }}
+              onClick={() =>
+                setTransferFor({ id: model.providerId, name: model.providerName, ownerName: model.providerOwnerName })
+              }
+            >
+              {model.providerOwnerName}
+            </Button>
+          </Tooltip>
+        ) : (
+          <span>{model.providerOwnerName}</span>
+        ),
+    },
+    {
       title: (
         // 列头写明"含已删除的智能体"：软删的 Agent 照样占着外键（`02` §4.3），
         // 不写会出现"显示 0 个却删不掉"的困惑
@@ -325,6 +430,15 @@ export function ModelsPage() {
       align: 'right',
       fixed: 'right',
       render: (_, model) => {
+        // P1-13：模型的编 / 删判据 = 其 Provider 的 `canEdit`（所属人或 ADMIN）
+        // ⇒ 只读行（分享给你但不可编）不给编辑 / 删除入口。
+        if (!model.canEdit) {
+          return (
+            <span className="ratio" title="只有该模型所属 Provider 的所属人或管理员可以编辑 / 删除">
+              无编辑权限
+            </span>
+          )
+        }
         const blocked = modelDeleteBlockedNotice(model)
         return (
           <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
@@ -401,8 +515,12 @@ export function ModelsPage() {
           <Button
             type="primary"
             onClick={() => setCreatingModel(true)}
-            disabled={providers.length === 0}
-            title={providers.length === 0 ? '先建一个 Provider（模型必须挂在它下面）' : '新建模型'}
+            disabled={editableProviders.length === 0}
+            title={
+              editableProviders.length === 0
+                ? '先建一个你可编辑的 Provider（模型必须挂在它下面）'
+                : '新建模型'
+            }
           >
             新建模型
           </Button>
@@ -451,7 +569,7 @@ export function ModelsPage() {
               dataSource={providers}
               loading={false}
               pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
-              scroll={{ x: 1050 }}
+              scroll={{ x: 1280 }}
             />
           </div>
         )}
@@ -527,12 +645,16 @@ export function ModelsPage() {
             <EmptyState
               title="还没有模型"
               lead={
-                providers.length === 0
-                  ? '模型必须挂在某个 Provider 下。先在上面的 Provider 区建一个，再回来录模型。'
+                editableProviders.length === 0
+                  ? '模型必须挂在某个 Provider 下。你能看到全部 Provider，但只能往**自己可编辑的** Provider 下录入模型 —— 先新建一个自己的 Provider 再回来录模型。'
                   : '可以点某个 Provider 行上的「拉取上游模型」把上游真实的型号名列出来，复制过来手工录入。'
               }
               action={
-                <Button type="primary" onClick={() => setCreatingModel(true)} disabled={providers.length === 0}>
+                <Button
+                  type="primary"
+                  onClick={() => setCreatingModel(true)}
+                  disabled={editableProviders.length === 0}
+                >
                   新建模型
                 </Button>
               }
@@ -587,15 +709,23 @@ export function ModelsPage() {
       <ModelFormModal
         model={null}
         open={creatingModel}
-        providers={providers}
+        providers={editableProviders}
         defaultProviderId={providerFilter === 'ALL' ? undefined : providerFilter}
         onClose={() => setCreatingModel(false)}
       />
       <ModelFormModal
         model={editingModel}
         open={editingModel !== null}
-        providers={providers}
+        providers={editableProviders}
         onClose={() => setEditingModel(null)}
+      />
+      <TransferOwnershipModal
+        open={transferFor !== null}
+        assetKind="PROVIDER"
+        assetId={transferFor?.id ?? ''}
+        assetName={transferFor?.name ?? ''}
+        currentOwnerName={transferFor?.ownerName ?? ''}
+        onClose={() => setTransferFor(null)}
       />
     </>
   )

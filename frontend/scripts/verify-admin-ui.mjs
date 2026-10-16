@@ -194,6 +194,7 @@ function makeUser(overrides = {}) {
     role: 'MEMBER',
     status: 'ACTIVE',
     mustChangePassword: false,
+    groups: [],
     createdAt: '2026-09-23T10:00:00.000Z',
     ...overrides,
   }
@@ -204,12 +205,17 @@ function makeProvider(overrides = {}) {
     id: 'p-1',
     name: 'OpenAI 生产',
     baseUrl: 'https://api.openai.com/v1',
+    customUrl: false,
     type: 'CHAT',
     protocol: 'OPENAI_COMPAT',
     enabled: true,
     hasKey: true,
     apiKeyPreview: 'sk-****abcd',
+    credentialMode: 'SHARED',
+    userHasKey: false,
     modelCount: 3,
+    creatorName: '管理员',
+    canEdit: true,
     createdAt: '2026-09-23T10:00:00.000Z',
     updatedAt: '2026-09-23T10:00:00.000Z',
     ...overrides,
@@ -221,6 +227,7 @@ function makeModel(overrides = {}) {
     id: 'm-1',
     providerId: 'p-1',
     providerName: 'OpenAI 生产',
+    providerBaseUrl: 'https://api.openai.com/v1',
     providerEnabled: true,
     modelName: 'gpt-4o-mini',
     label: 'GPT-4o mini',
@@ -241,7 +248,17 @@ function makeModel(overrides = {}) {
 
 /** 与 `providerEditValuesOf` 同形状的表单值（编辑态 `apiKey` 恒为空串） */
 function makeProviderForm(overrides = {}) {
-  return { name: 'OpenAI 生产', baseUrl: 'https://api.openai.com/v1', type: 'CHAT', enabled: true, apiKey: '', ...overrides }
+  return {
+    name: 'OpenAI 生产',
+    baseUrl: 'https://api.openai.com/v1',
+    customUrl: false,
+    type: 'CHAT',
+    protocol: 'OPENAI_COMPAT',
+    enabled: true,
+    apiKey: '',
+    credentialMode: 'SHARED',
+    ...overrides,
+  }
 }
 
 function makeModelForm(overrides = {}) {
@@ -921,7 +938,11 @@ await it('J5 ⚠️ 模型池写操作必须失效**「可用模型」下拉**�
   assertIncludes(api.source, 'AVAILABLE_CHAT_MODELS_QUERY_KEY', '要带上这一个键')
   assertIncludes(api.source, 'invalidateModelPoolViews', '失效口径收在一处（三个键一次失效）')
   const calls = (api.source.match(/invalidateModelPoolViews\(queryClient\)/g) ?? []).length
-  assertEqual(calls, 6, `六个写操作都要调它，实际 ${calls} 处（Provider 3 + 模型 3）`)
+  assertEqual(
+    calls,
+    9,
+    `每个写操作都要调它，实际 ${calls} 处（Provider 3 + 模型 3 + P1-13 转移/分享/取消分享 3）`,
+  )
 })
 
 await it('J6 重置密码走 `POST .../reset-password`（不是 PATCH —— 写成 PATCH 会 200 但什么都没发生）', () => {
@@ -930,14 +951,16 @@ await it('J6 重置密码走 `POST .../reset-password`（不是 PATCH —— 写
   assertIncludes(api.source, "method: 'POST'", '动词')
 })
 
-await it('J7 ⚠️ 两条 admin 路由必须是**真页面且挂在 `RequireAdmin` 之内**', () => {
+await it('J7 ⚠️ 用户管理挂在 `RequireAdmin` 之内；模型池 P1-13 起登录即可（移出守卫）', () => {
   const app = sourceFiles().find(({ name }) => name === 'app/App.tsx')
   assert(app !== undefined, '找不到 App.tsx')
   const guardAt = app.source.indexOf('<RequireAdmin')
   const usersAt = app.source.indexOf('path="/admin/users"')
   const modelsAt = app.source.indexOf('path="/admin/models"')
   assert(guardAt !== -1 && usersAt !== -1 && modelsAt !== -1, '三处都要在')
-  assert(guardAt < usersAt && guardAt < modelsAt, '守卫必须在页面之前（嵌套顺序）')
+  assert(guardAt < usersAt, '用户管理仍在守卫之内（嵌套顺序）')
+  // P1-13：`/api/model-providers/**` 与 `/api/models/**` 改为 requireAuth + 行级 ⇒ 模型池页移出守卫
+  assert(modelsAt < guardAt, '模型池必须移出 RequireAdmin（登录即可，行级权限）')
   assertIncludes(app.source, '<UsersListPage />', '用户管理换真页面')
   assertIncludes(app.source, '<ModelsPage />', '模型池换真页面')
   assertExcludes(app.source, 'batch="P0-1-36"', '占位页必须已经撤掉')
@@ -956,11 +979,12 @@ await it('J9 ⚠️ 仪表轨的屏号能认出模型池（不然会显示兜底
   assertEqual(serialForPath('/admin/models'), 'S-07b · 模型池', '模型池')
 })
 
-await it('J10 导航的 ADMIN 过滤仍只有一处判据（MEMBER 看不到两条管理项）', () => {
+await it('J10 导航的 ADMIN 过滤仍只有一处判据（P1-13：模型池对 MEMBER 也开放）', () => {
   const memberPaths = visibleNavItems('MEMBER').map((item) => item.path)
   const adminPaths = visibleNavItems('ADMIN').map((item) => item.path)
   assertEqual(memberPaths.includes('/admin/users'), false, 'MEMBER 看不到用户管理')
-  assertEqual(memberPaths.includes('/admin/models'), false, 'MEMBER 看不到模型池')
+  // P1-13：模型池不再 adminOnly ⇒ MEMBER 也能看到（页面内按 canEdit 收窄）
+  assertEqual(memberPaths.includes('/admin/models'), true, 'MEMBER 能看到模型池')
   assertEqual(adminPaths.includes('/admin/users'), true, 'ADMIN 能看到用户管理')
   assertEqual(adminPaths.includes('/admin/models'), true, 'ADMIN 能看到模型池')
   assertEqual(visibleNavItems(undefined).includes(undefined), false, '未登录时按"只有公开项"处理（不抛错）')

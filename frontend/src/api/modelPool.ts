@@ -49,14 +49,19 @@ import type {
   ModelItem,
   ModelListResult,
   ModelProviderItem,
+  MyProviderCredentialEntry,
+  MyProviderCredentialsResult,
   ModelProviderListResult,
   ProbeChatBody,
   ProbeChatResult,
   ProbeEmbeddingBody,
   ProbeEmbeddingResult,
   ProviderBoundModelsResult,
+  ProviderUserCredentialItem,
   RemoteModelListResult,
   RemoveModelProviderResult,
+  SetProviderUserCredentialBody,
+  TransferAssetBody,
   UpdateModelBody,
   UpdateModelProviderBody,
 } from '@doubulea/shared'
@@ -68,7 +73,8 @@ import { request } from './client.js'
 export const MODEL_PROVIDERS_QUERY_KEY = ['admin', 'model-providers'] as const
 /** 管理面模型列表键 */
 export const ADMIN_MODELS_QUERY_KEY = ['admin', 'models'] as const
-
+/** P1-18：**发现**"我需要配 Key 的 PER_USER Provider"键（「我的凭据」页 Provider 区） */
+export const MY_PROVIDER_CREDENTIALS_QUERY_KEY = ['model-providers', 'my-credentials'] as const
 /** 与两个列表 schema 的 `limit` 上限同源（100）；一次取满，翻页交给 AntD Table */
 export const MODEL_POOL_PAGE_LIMIT_MAX = 100
 
@@ -101,6 +107,8 @@ export function invalidateModelPoolViews(queryClient: QueryClient): void {
   void queryClient.invalidateQueries({ queryKey: MODEL_PROVIDERS_QUERY_KEY })
   void queryClient.invalidateQueries({ queryKey: ADMIN_MODELS_QUERY_KEY })
   void queryClient.invalidateQueries({ queryKey: AVAILABLE_CHAT_MODELS_QUERY_KEY })
+  // P1-18：`{hasKey, apiKeyPreview}` 会同时出现在「我的凭据」页的 Provider 区与模型池行内 ⇒ 一起失效
+  void queryClient.invalidateQueries({ queryKey: MY_PROVIDER_CREDENTIALS_QUERY_KEY })
 }
 
 // ───────────────────────────── Provider ─────────────────────────────
@@ -197,6 +205,81 @@ export function useProbeRemoteModels() {
   return useMutation({
     mutationFn: (providerId: string) =>
       request<RemoteModelListResult>(`/api/model-providers/${encodeURIComponent(providerId)}/remote-models`),
+  })
+}
+
+/**
+ * 转移 Provider 所属人（P1-13，`POST /api/model-providers/:id/transfer`，**所属人或 ADMIN**）。
+ *
+ * 请求体 `{ toUserId }`，响应是**更新后的裸 `ModelProviderItem`**。转移会改变
+ * `createdBy`/`creatorName`/`canEdit`（并连带其下模型的 `providerOwnerId`/`canEdit`）
+ * ⇒ 失效两个管理键 + 全站下拉键。
+ */
+export function useTransferModelProvider() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, toUserId }: { id: string; toUserId: string }) =>
+      request<ModelProviderItem>(`/api/model-providers/${encodeURIComponent(id)}/transfer`, {
+        method: 'POST',
+        body: { toUserId } satisfies TransferAssetBody,
+      }),
+    onSuccess: () => invalidateModelPoolViews(queryClient),
+  })
+}
+
+/**
+ * P1-18：「我的凭据」页的 Provider 凭据清单（登录即可）——**只列"我自己的"**。
+ *
+ * `PER_USER`：**全部启用的「各自 Key」Provider**（含未配置，可就地配置自己的 Key）；
+ * `SHARED`：只列**我作为所属人**的。别人的配置（尤其共享 Key）不会出现在这里。
+ */
+export function useMyProviderCredentials() {
+  return useQuery({
+    queryKey: MY_PROVIDER_CREDENTIALS_QUERY_KEY,
+    queryFn: () => request<MyProviderCredentialsResult>('/api/model-providers/my-credentials'),
+    select: (data): MyProviderCredentialEntry[] => data.items,
+  })
+}
+
+/**
+ * P1-18：「我的 Key」——`credentialMode=PER_USER` 时每个调用者配自己的 Key。
+ *
+ * 三条端点（`GET/PUT/DELETE /api/model-providers/:id/my-credential`，**登录即可**、只影响本人）。
+ * 响应是 `{ hasKey, apiKeyPreview }`（**无明文**）。
+ */
+export function useMyProviderCredential(providerId: string | undefined) {
+  return useQuery({
+    queryKey: ['model-providers', 'my-credential', providerId ?? ''] as const,
+    queryFn: () =>
+      request<ProviderUserCredentialItem>(
+        `/api/model-providers/${encodeURIComponent(providerId ?? '')}/my-credential`,
+      ),
+    enabled: providerId !== undefined,
+  })
+}
+
+/** 写入/替换「我的 Key」（`PUT`） */
+export function useSetMyProviderCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, apiKey }: { id: string; apiKey: string }) =>
+      request<ProviderUserCredentialItem>(`/api/model-providers/${encodeURIComponent(id)}/my-credential`, {
+        method: 'PUT',
+        body: { apiKey } satisfies SetProviderUserCredentialBody,
+      }),
+    onSuccess: () => invalidateModelPoolViews(queryClient),
+  })
+}
+
+/** 清空「我的 Key」（`DELETE`，幂等） */
+export function useDeleteMyProviderCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      request<ProviderUserCredentialItem>(`/api/model-providers/${encodeURIComponent(id)}/my-credential`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => invalidateModelPoolViews(queryClient),
   })
 }
 

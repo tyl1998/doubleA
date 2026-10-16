@@ -31,6 +31,12 @@
 
 import { z } from 'zod'
 
+import {
+  ASSET_VISIBILITIES,
+  agentAudienceInputSchema,
+  agentAudienceSchema,
+  audienceIsEmpty,
+} from './assetAcl.js'
 import { offsetPageOf } from './envelope.js'
 
 // ───────────────────────────── 取值域与默认值 ─────────────────────────────
@@ -237,6 +243,22 @@ export const knowledgeBaseItemSchema = z.object({
    * 否则会留下"Agent 说绑着某库、那个库已经不存在"的孤儿绑定（检索时才炸，且查不出来）。
    */
   agentCount: z.number().int().min(0),
+  /**
+   * P1-13：**所属人**（新增 `created_by` 列，存量回填最早的 ADMIN）。判据的唯一主体：
+   * 编/删/改可见性/转移 = 所属人 + ADMIN。字段名沿用 `createdBy`/`creatorName`（与 Agent/MCP 统一）。
+   */
+  createdBy: z.string(),
+  /** 所属人显示名（昵称优先、回落用户名） */
+  creatorName: z.string(),
+  /** P1-18.x：可见范围（**三档**：私有 / 指定用户 / 公开，2026-10-16 起与 Agent 一致） */
+  visibility: z.enum(ASSET_VISIBILITIES),
+  /**
+   * P1-18.x：**受众**（`visibility=SHARED` 时给出：用户 ∪ 组）。非 `SHARED` 时恒为空数组。
+   * 回显用（建/改页面据此恢复选择）。
+   */
+  audience: agentAudienceSchema,
+  /** P1-13：当前调用者是否可编删（服务端按 `canEditAsset` 算好，前端**不自己拼**） */
+  canEdit: z.boolean(),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -359,8 +381,47 @@ export const createKnowledgeBaseBodySchema = z.object({
   chunkOverlap: chunkOverlapSchema.optional(),
   /** 局部覆盖：只给 `{topK: 10, score: 0.5}` 也行，其余键取默认值 */
   retrievalConfig: retrievalConfigInputSchema.optional(),
+  /**
+   * P1-18.x：可见范围（**三档**：私有 / 指定用户 / 公开）。**可省** ⇒ 服务层按 `PRIVATE`（安全默认）。
+   * ⚠️ 2026-10-16 起知识库也开放「指定用户」（与 Agent 一致）；取消可见性闭包后，
+   * 公开/指定用户库不再有"引用模型必须公开"的写时校验。
+   */
+  visibility: z
+    .enum(ASSET_VISIBILITIES, {
+      errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+    })
+    .optional(),
+  /** P1-18.x：受众（仅 `visibility=SHARED` 允许给；`SHARED` 时至少一个主体非空） */
+  audience: agentAudienceInputSchema.optional(),
 })
+  .superRefine((body, ctx) => {
+    // P1-18.x：可见范围 × 受众（建库时缺省即 PRIVATE ⇒ 不允许带 audience）
+    const visibility = body.visibility ?? 'PRIVATE'
+    if (visibility === 'SHARED') {
+      if (body.audience === undefined || audienceIsEmpty(normalizeAudienceForCheck(body.audience))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['audience'],
+          message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+        })
+      }
+    } else if (body.audience !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '只有可见范围为「指定用户」时才能设置受众',
+      })
+    }
+  })
 export type CreateKnowledgeBaseBody = z.infer<typeof createKnowledgeBaseBodySchema>
+
+/** 受众输入 → 是否为空（superRefine 用；与 `agent.ts` 同款，不引服务层的 normalize） */
+function normalizeAudienceForCheck(audience: { userIds?: string[]; groupIds?: string[] }): {
+  userIds: string[]
+  groupIds: string[]
+} {
+  return { userIds: audience.userIds ?? [], groupIds: audience.groupIds ?? [] }
+}
 
 // ───────────────────────────── 改 ─────────────────────────────
 
@@ -396,6 +457,14 @@ export const updateKnowledgeBaseBodySchema = z
      * uuid = 设置。设置时后端校验它是 `CHAT` 且 `supportsVision`（{@link CAPTION_MODEL_MUST_SUPPORT_VISION_HINT}）。
      */
     captionModelId: z.string().uuid('captionModelId 不是合法 UUID').nullable().optional(),
+    /** P1-18.x：可见范围（三档：私有 / 指定用户 / 公开） */
+    visibility: z
+      .enum(ASSET_VISIBILITIES, {
+        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+      })
+      .optional(),
+    /** P1-18.x：受众（整体替换；`visibility≠SHARED` 时不得给） */
+    audience: agentAudienceInputSchema.optional(),
   })
   .refine(
     (body) =>
@@ -406,9 +475,32 @@ export const updateKnowledgeBaseBodySchema = z
       body.chunkOverlap !== undefined ||
       body.retrievalConfig !== undefined ||
       body.embeddingModelId !== undefined ||
-      body.captionModelId !== undefined,
+      body.captionModelId !== undefined ||
+      body.visibility !== undefined ||
+      body.audience !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
+  .superRefine((body, ctx) => {
+    // P1-18.x：同请求内 visibility × audience 的**局部**一致性（合并库里现状后的最终判定在服务层）
+    if (body.visibility !== undefined && body.visibility !== 'SHARED' && body.audience !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '只有可见范围为「指定用户」时才能设置受众',
+      })
+    }
+    if (
+      body.visibility === 'SHARED' &&
+      body.audience !== undefined &&
+      audienceIsEmpty(normalizeAudienceForCheck(body.audience))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+      })
+    }
+  })
 export type UpdateKnowledgeBaseBody = z.infer<typeof updateKnowledgeBaseBodySchema>
 
 // ───────────────────────────── 路径参数与删除结果 ─────────────────────────────

@@ -26,7 +26,7 @@
  * 其他都给"这么随手写 —— 完整矩阵与理由都在 `documentActions` 上，验收档逐格断言。
  */
 
-import { Button, Popconfirm, Table, Tooltip, type TableColumnsType } from 'antd'
+import { Button, Input, Modal, Popconfirm, Table, Tooltip, type TableColumnsType } from 'antd'
 import {
   describeImageOptions,
   hasAnyImageOption,
@@ -34,8 +34,9 @@ import {
   isDocumentSearchable,
   type DocumentItem,
 } from '@doubulea/shared'
+import { useState } from 'react'
 
-import { saveDocumentFile, useRemoveDocument, useRetryDocument } from '../../api/knowledgeBases.js'
+import { saveDocumentFile, useRemoveDocument, useRenameDocument, useRetryDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import {
@@ -63,6 +64,40 @@ export function DocumentTable({ kbId, documents, rebuildRequired = false, onReup
   const feedback = useFeedback()
   const retry = useRetryDocument(kbId)
   const remove = useRemoveDocument(kbId)
+  const rename = useRenameDocument(kbId)
+
+  /** 重命名弹窗（2026-10-16）：只改展示名，不碰内容 —— 任意状态都可改 */
+  const [renameTarget, setRenameTarget] = useState<DocumentItem | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+
+  const openRename = (doc: DocumentItem): void => {
+    setRenameTarget(doc)
+    setRenameValue(doc.fileName)
+  }
+
+  const submitRename = (): void => {
+    if (renameTarget === null) return
+    const fileName = renameValue.trim()
+    if (fileName === '') {
+      feedback.note('文件名不能为空')
+      return
+    }
+    if (fileName === renameTarget.fileName) {
+      setRenameTarget(null)
+      return
+    }
+    rename.mutate(
+      { docId: renameTarget.id, fileName },
+      {
+        onSuccess: (updated) => {
+          feedback.ok(`已重命名为「${updated.fileName}」`)
+          setRenameTarget(null)
+        },
+        // 最可能是 400（改了扩展名）：服务端文案本身可以照做，只补一个标题
+        onError: (error) => feedback.fail(error, '重命名失败'),
+      },
+    )
+  }
 
   const download = (doc: DocumentItem): void => {
     void saveDocumentFile(kbId, doc).catch((error: unknown) => {
@@ -148,7 +183,7 @@ export function DocumentTable({ kbId, documents, rebuildRequired = false, onReup
     {
       title: '操作',
       key: 'actions',
-      width: 260,
+      width: 320,
       align: 'right',
       render: (_, doc) => {
         const actions = documentActions(doc.status)
@@ -161,6 +196,10 @@ export function DocumentTable({ kbId, documents, rebuildRequired = false, onReup
             )}
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => download(doc)}>
               下载
+            </Button>
+            {/* 重命名（2026-10-16）：只改展示名，任意状态都可用（不碰内容/chunk/入队） */}
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openRename(doc)}>
+              重命名
             </Button>
             {actions.canReupload && (
               <Tooltip title={rebuildRequired ? KNOWLEDGE_BASE_NEEDS_REBUILD_HINT : undefined}>
@@ -219,18 +258,47 @@ export function DocumentTable({ kbId, documents, rebuildRequired = false, onReup
   ]
 
   return (
-    <Table<DocumentItem>
-      rowKey="id"
-      size="middle"
-      columns={columns}
-      dataSource={[...documents]}
-      // 加载态由页面的骨架屏承担（`ListStates`），这里不再叠一层 AntD 遮罩转圈
-      loading={false}
-      pagination={
-        documents.length > 20 ? { pageSize: 20, showSizeChanger: false, showTotal: (n) => `共 ${n} 篇` } : false
-      }
-      locale={{ emptyText: '还没有文档' }}
-      scroll={{ x: 900 }}
-    />
+    <>
+      <Table<DocumentItem>
+        rowKey="id"
+        size="middle"
+        columns={columns}
+        dataSource={[...documents]}
+        // 加载态由页面的骨架屏承担（`ListStates`），这里不再叠一层 AntD 遮罩转圈
+        loading={false}
+        pagination={
+          documents.length > 20 ? { pageSize: 20, showSizeChanger: false, showTotal: (n) => `共 ${n} 篇` } : false
+        }
+        locale={{ emptyText: '还没有文档' }}
+        scroll={{ x: 900 }}
+      />
+
+      {/* 重命名弹窗（2026-10-16）：整表一个，`renameTarget` 决定打开与目标 */}
+      <Modal
+        open={renameTarget !== null}
+        title={`重命名「${renameTarget?.fileName ?? ''}」`}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={rename.isPending}
+        maskClosable={!rename.isPending}
+        okButtonProps={{ disabled: renameValue.trim() === '' }}
+        onOk={submitRename}
+        onCancel={() => setRenameTarget(null)}
+      >
+        <p className="block-label">文件名</p>
+        <Input
+          value={renameValue}
+          maxLength={255}
+          aria-label="文档文件名"
+          placeholder="新的文件名（扩展名保持不变）"
+          onChange={(event) => setRenameValue(event.target.value)}
+          onPressEnter={submitRename}
+        />
+        <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+          只改展示名 —— 文档内容与已入库的片段不变，也不会重新解析。扩展名要与原来一致
+          （如 <code>.pdf</code>），否则下载 / 预览的类型会对不上，服务端会拒绝。
+        </p>
+      </Modal>
+    </>
   )
 }

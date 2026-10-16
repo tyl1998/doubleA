@@ -311,6 +311,8 @@ interface VectorUnavailable {
 async function resolveVectorProvider(kb: {
   embeddingModelId: string | null
   embeddingDim: number | null
+  /** P1-18：embedding 上游凭据的主语 = 库所属人（`PER_USER` 的 Provider 取他的 Key） */
+  createdBy: string
 }): Promise<{ provider: EmbeddingProvider } | VectorUnavailable> {
   if (kb.embeddingModelId === null || kb.embeddingDim === null) {
     return {
@@ -319,7 +321,7 @@ async function resolveVectorProvider(kb: {
     }
   }
   try {
-    const target = await resolveEmbeddingTarget(kb.embeddingModelId)
+    const target = await resolveEmbeddingTarget(kb.embeddingModelId, kb.createdBy)
     return {
       provider: buildPoolEmbeddingProvider(
         {
@@ -480,7 +482,7 @@ export async function searchKnowledgeBase(
   const db = getPrisma()
   const kb = await db.knowledgeBase.findUnique({
     where: { id: input.kbId },
-    select: { id: true, embeddingModel: true, embeddingModelId: true, embeddingDim: true, retrievalConfig: true },
+    select: { id: true, embeddingModel: true, embeddingModelId: true, embeddingDim: true, retrievalConfig: true, createdBy: true },
   })
   if (kb === null) throw AppError.notFound('知识库不存在')
 

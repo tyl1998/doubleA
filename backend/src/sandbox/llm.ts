@@ -65,9 +65,13 @@ export type SandboxLlmResult =
  * （404 / 409 / 424 / 500）在**这个上下文里是同一件事** —— "这一轮的模型用不了"，
  * 用户能做的动作也一样（去模型池/智能体页改一改）。文案原样透传（它本来就是给人看的）。
  */
-export async function resolveSandboxLlm(modelId: string | null): Promise<SandboxLlmResult> {
+export async function resolveSandboxLlm(
+  modelId: string | null,
+  subjectUserId: string | null,
+): Promise<SandboxLlmResult> {
   try {
-    const target = await resolveChatTarget(modelId)
+    // P1-18：模型上游凭据的主语 = **会话发起者**（`PER_USER` 模式的 Provider 取他的 Key）
+    const target = await resolveChatTarget(modelId, subjectUserId)
     // `resolveChatTarget` 已经保证了非 null（缺 Key 会抛 `needCredential`）——
     // 这里再判一次是为了让类型收窄，不是"双重校验"
     if (target.apiKey === null) {

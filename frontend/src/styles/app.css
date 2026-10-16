@@ -509,6 +509,11 @@
 .kb-cell__name { font-weight: 500; color: var(--ink); }
 .kb-cell__sub { font-size: var(--fs-xs); color: var(--muted); }
 
+/* 「名称」列旁的 hover 入口（P1-35 窄屏适配）：窄屏隐藏「检索口径」列后，口径改从这里 hover 查看。
+   图标不参与收缩（`flex: 0 0 auto`），否则长名称会把图标挤没、hover 入口跟着消失。 */
+.kb-cell__flag { color: var(--muted-2); font-size: var(--fs-sm); cursor: help; flex: 0 0 auto; }
+.kb-cell__flag--warn { color: var(--danger); }
+
 /* 检索测试抽屉里的命中片段（`hit.snippet` 是**原文窗口**，可能带整段换行 ⇒ 必须截断，
    否则一行结果能把抽屉撑成几屏高，用户再也看不出"哪一条排在前面"）。
    三行是刻意的：够看出命中上下文，又不至于让一屏放不下三条结果。 */

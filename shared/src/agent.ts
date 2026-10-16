@@ -56,6 +56,13 @@
 import { z } from 'zod'
 
 import { type UserRole } from './auth.js'
+import {
+  ASSET_VISIBILITIES,
+  agentAudienceInputSchema,
+  agentAudienceSchema,
+  audienceIsEmpty,
+  canEditAsset,
+} from './assetAcl.js'
 import { offsetPageOf } from './envelope.js'
 
 // ───────────────────────────── 取值域 ─────────────────────────────
@@ -74,15 +81,6 @@ export const COMPONENT_TYPES = ['KNOWLEDGE', 'MCP'] as const
 export type ComponentType = (typeof COMPONENT_TYPES)[number]
 
 // ───────────────────────────── 权限判据（唯一实现） ─────────────────────────────
-
-/**
- * 管理员角色的字面量。
- *
- * 取**字面量**而不是 `USER_ROLES[0]`：后者要数索引才知道是什么意思，而且一旦有人重排
- * `USER_ROLES` 就会**静默**把管理员判成别人。写成带类型标注的常量则两头都安全 ——
- * 既一眼看得出是哪个角色，`USER_ROLES` 里删掉 `ADMIN` 时也会编译报错。
- */
-const ADMIN_ROLE: UserRole = 'ADMIN'
 
 /**
  * 「这个智能体对该调用者是否可编辑/可删除」—— `01` §3.3 决策 18 的唯一落点。
@@ -104,9 +102,8 @@ export function canEditAgent(
   agent: { createdBy: string; deletedAt: Date | string | null },
   viewer: { id: string; role: UserRole },
 ): boolean {
-  if (agent.deletedAt !== null) return false
-  if (viewer.role === ADMIN_ROLE) return true
-  return agent.createdBy === viewer.id
+  // P1-13：判据统一收口到 `assetAcl`（见文件头）；可见性不影响"编/删"（公开资产他人仍不可编删 → 403）
+  return canEditAsset({ ownerId: agent.createdBy, deletedAt: agent.deletedAt }, viewer)
 }
 
 // ───────────────────────────── 公共字段 ─────────────────────────────
@@ -321,7 +318,18 @@ export const agentItemSchema = z.object({
   createdBy: z.string(),
   /** 创建者显示名（昵称优先、回落用户名） */
   creatorName: z.string(),
-  /** `01` §3.3 决策 18：创建者 + ADMIN 可编删（见 {@link canEditAgent}） */
+  /**
+   * P1-18：**可见范围**。`PRIVATE` = 仅所属人（+ ADMIN）；`SHARED` = 所属人 + 受众（见
+   * {@link agentAudienceSchema}）+ ADMIN（**仅 Agent 有这一档**）；`PUBLIC` = 全员。
+   * 判据见 `assetAcl#canViewAsset`。私有/指定用户 Agent 对受众外的人**列表不可见、详情 404**。
+   */
+  visibility: z.enum(ASSET_VISIBILITIES),
+  /**
+   * P1-18：**受众**（`visibility=SHARED` 时给出：用户 ∪ 组）。非 `SHARED` 时恒为空数组。
+   * 回显用（建/改页面据此恢复选择）。
+   */
+  audience: agentAudienceSchema,
+  /** `01` §3.3 决策 18：创建者（= 所属人）+ ADMIN 可编删（见 {@link canEditAgent}） */
   canEdit: z.boolean(),
   /** 已绑定的组件（`02` §4.4 详情"含组件绑定"）；解绑走 P0-1-23 的 `PUT …/components` 整体替换 */
   components: z.array(agentComponentRefSchema),
@@ -447,6 +455,19 @@ export const createAgentBodySchema = z
      * 给了就必须包含 `modelId`（默认模型），见下面的 superRefine。
      */
     modelIds: agentModelPoolSchema.optional(),
+    /**
+     * P1-18：可见范围。**可省** ⇒ 服务层按 `PRIVATE`（安全默认）。
+     * `SHARED` 时必须带非空 `audience`；`PRIVATE`/`PUBLIC` 时不得带（见下方 superRefine）。
+     * ⚠️ 建/改为 `PUBLIC`/`SHARED` **不再**校验引用的组件是否公开（**取消可见性闭包**，
+     * P1-18 定案：组件通过 Agent 被使用时授权来自 Agent 的受众，见 `assetAcl` 文件头 ①）。
+     */
+    visibility: z
+      .enum(ASSET_VISIBILITIES, {
+        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+      })
+      .optional(),
+    /** P1-18：受众（仅 `visibility=SHARED` 允许给；`SHARED` 时至少一个主体非空） */
+    audience: agentAudienceInputSchema.optional(),
   })
   .superRefine((body, ctx) => {
     if (body.modelIds !== undefined && !body.modelIds.includes(body.modelId)) {
@@ -456,8 +477,33 @@ export const createAgentBodySchema = z
         message: '默认模型必须在模型池中',
       })
     }
+    // P1-18：可见范围 × 受众（创建时缺省即 PRIVATE ⇒ 不允许带 audience）
+    const visibility = body.visibility ?? 'PRIVATE'
+    if (visibility === 'SHARED') {
+      if (body.audience === undefined || audienceIsEmpty(normalizeForCheck(body.audience))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['audience'],
+          message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+        })
+      }
+    } else if (body.audience !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '只有可见范围为「指定用户」时才能设置受众',
+      })
+    }
   })
 export type CreateAgentBody = z.infer<typeof createAgentBodySchema>
+
+/** 受众输入 → 是否为空（superRefine 用；不引服务层的 normalize，避免契约层依赖过长） */
+function normalizeForCheck(audience: { userIds?: string[]; groupIds?: string[] }): {
+  userIds: string[]
+  groupIds: string[]
+} {
+  return { userIds: audience.userIds ?? [], groupIds: audience.groupIds ?? [] }
+}
 
 // ───────────────────────────── 改 ─────────────────────────────
 
@@ -500,6 +546,14 @@ export const updateAgentBodySchema = z
     modelId: agentModelIdSchema.optional(),
     /** 整体替换模型池（非空）；与 `modelId` 的一致性见下方 superRefine 与服务层 */
     modelIds: agentModelPoolSchema.optional(),
+    /** P1-18：可见范围（`SHARED` 需带非空 `audience`；合并后的一致性由服务层最终判定） */
+    visibility: z
+      .enum(ASSET_VISIBILITIES, {
+        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+      })
+      .optional(),
+    /** P1-18：受众（整体替换；`visibility≠SHARED` 时不得给） */
+    audience: agentAudienceInputSchema.optional(),
   })
   .refine(
     (body) =>
@@ -512,7 +566,9 @@ export const updateAgentBodySchema = z
       body.openingRemarks !== undefined ||
       body.guideQuestions !== undefined ||
       body.modelId !== undefined ||
-      body.modelIds !== undefined,
+      body.modelIds !== undefined ||
+      body.visibility !== undefined ||
+      body.audience !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
   .superRefine((body, ctx) => {
@@ -522,6 +578,25 @@ export const updateAgentBodySchema = z
         code: z.ZodIssueCode.custom,
         path: ['modelId'],
         message: '默认模型必须在模型池中',
+      })
+    }
+    // P1-18：同请求内 visibility × audience 的**局部**一致性（合并库里现状后的最终判定在服务层）
+    if (body.visibility !== undefined && body.visibility !== 'SHARED' && body.audience !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '只有可见范围为「指定用户」时才能设置受众',
+      })
+    }
+    if (
+      body.visibility === 'SHARED' &&
+      body.audience !== undefined &&
+      audienceIsEmpty(normalizeForCheck(body.audience))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
       })
     }
   })

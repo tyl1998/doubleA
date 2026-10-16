@@ -25,8 +25,14 @@
  * 可访问性靠 `aria-label`（与 P0-1-31 的编辑页同一写法）。
  */
 
-import { Alert, Input, InputNumber, Modal, Select } from 'antd'
-import { EMBEDDING_MODEL_CHANGE_REBUILD_HINT, type KnowledgeBaseItem } from '@doubulea/shared'
+import { Alert, Input, InputNumber, Modal, Radio, Select } from 'antd'
+import {
+  ASSET_VISIBILITIES,
+  ASSET_VISIBILITY_LABELS,
+  EMBEDDING_MODEL_CHANGE_REBUILD_HINT,
+  type AssetVisibility,
+  type KnowledgeBaseItem,
+} from '@doubulea/shared'
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
@@ -36,6 +42,7 @@ import {
   useUpdateKnowledgeBase,
 } from '../../api/knowledgeBases.js'
 import { useAvailableChatModels, useAvailableEmbeddingModels } from '../../api/models.js'
+import { AudiencePicker } from '../../components/AudiencePicker.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   buildCreateBody,
@@ -69,6 +76,11 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   const [captionModelId, setCaptionModelId] = useState('')
   const [chunkSize, setChunkSize] = useState<number | null>(null)
   const [chunkOverlap, setChunkOverlap] = useState<number | null>(null)
+  const [visibility, setVisibility] = useState<AssetVisibility>('PRIVATE')
+  const [audience, setAudience] = useState<{ userIds: string[]; groupIds: string[] }>({
+    userIds: [],
+    groupIds: [],
+  })
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const editing = kb !== null
@@ -107,6 +119,8 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       setCaptionModelId('')
       setChunkSize(null)
       setChunkOverlap(null)
+      setVisibility('PRIVATE')
+      setAudience({ userIds: [], groupIds: [] })
     } else {
       const values = editValuesOf(kb)
       setName(values.name)
@@ -115,6 +129,8 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       setCaptionModelId(values.captionModelId)
       setChunkSize(values.chunkSize)
       setChunkOverlap(values.chunkOverlap)
+      setVisibility(values.visibility)
+      setAudience(values.audience)
     }
     setErrorText(null)
   }, [open, kb])
@@ -124,7 +140,15 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   /** 两端共用的"能不能提交"：名字必填；两个分块参数**都填了**才判跨字段（见文件头 ①） */
   const chunkingError =
     chunkSize !== null && chunkOverlap !== null ? validateChunking(chunkSize, chunkOverlap) : null
-  const canSubmit = name.trim() !== '' && (editing || embeddingModelId !== '') && (editing || chunkingError === null) && !submitting
+  /** 「指定用户」至少要有一个受众主体（与后端同一条不变量，前端先拦一次给出即时的按钮禁用） */
+  const audienceMissing =
+    visibility === 'SHARED' && audience.userIds.length === 0 && audience.groupIds.length === 0
+  const canSubmit =
+    name.trim() !== '' &&
+    (editing || embeddingModelId !== '') &&
+    (editing || chunkingError === null) &&
+    !audienceMissing &&
+    !submitting
 
   /**
    * 该库此刻是否处于"需重建"状态（P1-5，重建的**唯一触发点**在这里）：
@@ -157,7 +181,16 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
     setErrorText(null)
 
     if (kb === null) {
-      const values: KnowledgeCreateFormValues = { name, description, embeddingModelId, captionModelId, chunkSize, chunkOverlap }
+      const values: KnowledgeCreateFormValues = {
+        name,
+        description,
+        embeddingModelId,
+        captionModelId,
+        chunkSize,
+        chunkOverlap,
+        visibility,
+        audience,
+      }
       if (chunkingError !== null) {
         setErrorText(chunkingError)
         return
@@ -182,6 +215,8 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       captionModelId,
       chunkSize: chunkSize ?? kb.chunkSize,
       chunkOverlap: chunkOverlap ?? kb.chunkOverlap,
+      visibility,
+      audience,
     }
     const body = buildKnowledgeUpdateBody(kb, values)
     if (body === null) {
@@ -244,6 +279,34 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
             placeholder="这个库里放什么、给谁用（留空表示不写）"
             onChange={(event) => setDescription(event.target.value)}
           />
+        </div>
+
+        <div>
+          <p className="block-label">可见性</p>
+          <Radio.Group value={visibility} onChange={(event) => setVisibility(event.target.value as AssetVisibility)}>
+            {ASSET_VISIBILITIES.map((value) => (
+              <Radio key={value} value={value}>
+                {ASSET_VISIBILITY_LABELS[value]}
+              </Radio>
+            ))}
+          </Radio.Group>
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            私有 = 仅所属人（你）与管理员可见；指定用户 = 只有你圈定的用户 / 组可见可用；
+            公开 = 全员可看可用。⚠️ 设为「指定用户 / 公开」后，本库被引用时其内容对受众 / 全员可见。
+          </p>
+          {visibility === 'SHARED' && (
+            <div style={{ marginTop: 'var(--sp-3)' }}>
+              <p className="block-label">受众</p>
+              <AudiencePicker
+                userIds={audience.userIds}
+                groupIds={audience.groupIds}
+                onChange={setAudience}
+              />
+              <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                受众 = 你直接指定的用户 ∪ 你选的组里全部成员；至少选一位用户或一个组。
+              </p>
+            </div>
+          )}
         </div>
 
         <div>

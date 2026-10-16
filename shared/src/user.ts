@@ -18,6 +18,13 @@ import { offsetPageOf } from './envelope.js'
 
 // ───────────────────────────── 列表项 ─────────────────────────────
 
+/** 用户所属组的最小引用（`id` + 组名；列表页「所在组」列展示用） */
+export const userGroupRefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+})
+export type UserGroupRef = z.infer<typeof userGroupRefSchema>
+
 /**
  * 用户列表/建号/重置密码的**统一输出形态**。
  *
@@ -31,6 +38,11 @@ export const userListItemSchema = z.object({
   role: z.enum(USER_ROLES),
   status: z.enum(USER_STATUSES),
   mustChangePassword: z.boolean(),
+  /**
+   * P1-18：该用户**所在的用户组**（按组名排序；不在任何组则为空数组）。
+   * 列表页「所在组」列据此展示 —— 与 `/admin/users` 的「用户组」tab 同源（组是 Agent 受众的主授权单位）。
+   */
+  groups: z.array(userGroupRefSchema),
   /** ISO 8601（前端排序/展示用；DB 侧是 `timestamptz(3)`） */
   createdAt: z.string(),
 })
@@ -103,6 +115,34 @@ export const userIdParamsSchema = z.object({
 export type UserIdParams = z.infer<typeof userIdParamsSchema>
 
 // ───────────────────────────── 建号 / 重置密码 的响应 ─────────────────────────────
+
+// ───────────────────────────── 用户搜索（P1-18 · 子批 B） ─────────────────────────────
+
+/**
+ * `GET /api/users/search?q=` —— **登录可用**的轻量用户搜索（受众选择器用）。
+ *
+ * 与 `GET /api/users`（ADMIN）刻意不同：这里**只回 `{ id, name }`**（不泄露角色/状态/建号时间），
+ * 且只在 `ACTIVE` 用户里按用户名/显示名模糊匹配、限量 20 条 —— 够圈人，不承担用户管理职责。
+ */
+export const userSearchQuerySchema = z.object({
+  q: z
+    .string({ required_error: '请输入搜索关键词' })
+    .trim()
+    .min(1, '请输入搜索关键词')
+    .max(USERNAME_MAX_LENGTH, `关键词最多 ${USERNAME_MAX_LENGTH} 个字符`),
+})
+export type UserSearchQuery = z.infer<typeof userSearchQuerySchema>
+
+/** 搜索结果项（**只有 id + 显示名**） */
+export const userSearchItemSchema = z.object({
+  id: z.string(),
+  /** 显示名（昵称优先、回落用户名） */
+  name: z.string(),
+})
+export type UserSearchItem = z.infer<typeof userSearchItemSchema>
+
+export const userSearchResultSchema = z.object({ items: z.array(userSearchItemSchema) })
+export type UserSearchResult = z.infer<typeof userSearchResultSchema>
 
 /**
  * 「初始密码仅此一次明文返回」的响应形态（建号与重置密码共用）。

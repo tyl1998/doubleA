@@ -36,11 +36,25 @@
  */
 
 import { Alert, Input, Modal, Select, Switch } from 'antd'
-import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelProviderItem, type ModelType, type UpstreamProtocol } from '@doubulea/shared'
+import {
+  MODEL_TYPES,
+  MODEL_TYPE_LABELS,
+  PROVIDER_CREDENTIAL_MODES,
+  PROVIDER_CREDENTIAL_MODE_LABELS,
+  type ModelProviderItem,
+  type ModelType,
+  type ProviderCredentialMode,
+  type UpstreamProtocol,
+} from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
-import { useCreateModelProvider, useUpdateModelProvider } from '../../api/modelPool.js'
+import {
+  useCreateModelProvider,
+  useDeleteMyProviderCredential,
+  useSetMyProviderCredential,
+  useUpdateModelProvider,
+} from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
 import {
   EMPTY_PROVIDER_FORM_VALUES,
@@ -69,6 +83,10 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
   const feedback = useFeedback()
   const create = useCreateModelProvider()
   const update = useUpdateModelProvider()
+  // P1-18：`PER_USER` 模式下表单里那把 Key 是**创建人自己的 Key** ⇒ 走「我的凭据」端点
+  // （不再有行内「我的 Key」入口 —— 统一在「我的凭据」页维护）。
+  const setMyCredential = useSetMyProviderCredential()
+  const deleteMyCredential = useDeleteMyProviderCredential()
 
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
@@ -76,6 +94,9 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
   const [type, setType] = useState<ModelType>(EMPTY_PROVIDER_FORM_VALUES.type)
   const [protocol, setProtocol] = useState<UpstreamProtocol>(EMPTY_PROVIDER_FORM_VALUES.protocol)
   const [enabled, setEnabled] = useState(true)
+  const [credentialMode, setCredentialMode] = useState<ProviderCredentialMode>(
+    EMPTY_PROVIDER_FORM_VALUES.credentialMode,
+  )
   const [apiKey, setApiKey] = useState('')
   const [clearRequested, setClearRequested] = useState(false)
   const [errorText, setErrorText] = useState<string | null>(null)
@@ -96,53 +117,89 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     setType(values.type)
     setProtocol(values.protocol)
     setEnabled(values.enabled)
+    setCredentialMode(values.credentialMode)
     setApiKey(values.apiKey)
     setClearRequested(false)
     setErrorText(null)
   }, [open, provider])
 
-  const submitting = create.isPending || update.isPending
+  const submitting =
+    create.isPending || update.isPending || setMyCredential.isPending || deleteMyCredential.isPending
   const canSubmit = name.trim() !== '' && baseUrl.trim() !== '' && !submitting
 
-  const submit = (): void => {
+  const submit = async (): Promise<void> => {
     setErrorText(null)
 
+    // P1-18：`PER_USER` 模式下输入框里那把 Key 是**创建人自己的 Key**（写「我的凭据」）；
+    // `SHARED` 模式下它才是共享 Key（进 Provider 建/改体）。判据唯一 = `credentialMode`。
+    const personalKey = credentialMode === 'PER_USER' ? apiKey.trim() : ''
+
     if (provider === null) {
-      create.mutate(buildCreateProviderBody({ name, baseUrl, customUrl, type, protocol, enabled, apiKey }), {
-        onSuccess: (created) => {
-          feedback.ok(
-            `已创建 Provider「${created.name}」` +
-              (created.hasKey ? '' : '（还没配 Key，可在编辑里补）'),
-          )
+      try {
+        const created = await create.mutateAsync(
+          buildCreateProviderBody({ name, baseUrl, customUrl, type, protocol, enabled, apiKey, credentialMode }),
+        )
+        if (personalKey !== '') {
+          // Provider 已经建出来了 —— 这一步失败**不能**假装整体失败（那会让用户重建成两条）。
+          try {
+            await setMyCredential.mutateAsync({ id: created.id, apiKey: personalKey })
+          } catch (error) {
+            feedback.fail(error, 'Provider 已创建，但你的 Key 没能存入「我的凭据」')
+            onClose()
+            return
+          }
+          feedback.ok(`已创建 Provider「${created.name}」，并把你的 Key 存入了「我的凭据」`)
           onClose()
-        },
-        onError: (error) => setErrorText(describeError(error).message),
-      })
+          return
+        }
+        feedback.ok(
+          `已创建 Provider「${created.name}」` +
+            (credentialMode === 'PER_USER'
+              ? '（「各自 Key」模式：请到「我的凭据」配置你自己的 Key）'
+              : created.hasKey
+                ? ''
+                : '（还没配 Key，可在编辑里补）'),
+        )
+        onClose()
+      } catch (error) {
+        setErrorText(describeError(error).message)
+      }
       return
     }
 
     const body = buildProviderUpdateBody(
       provider,
-      { name, baseUrl, customUrl, type, protocol, enabled, apiKey },
+      { name, baseUrl, customUrl, type, protocol, enabled, apiKey, credentialMode },
       clearRequested,
     )
-    if (body === null) {
+    const personalTouched = credentialMode === 'PER_USER' && (personalKey !== '' || clearRequested)
+    if (body === null && !personalTouched) {
       feedback.note('没有需要保存的改动')
       onClose()
       return
     }
-    update.mutate(
-      { id: provider.id, body },
-      {
-        onSuccess: (saved) => {
-          const keyNote =
-            body.apiKey === null ? '（已清除 API Key）' : body.apiKey === undefined ? '' : '（已更新 API Key）'
-          feedback.ok(`已保存「${saved.name}」${keyNote}`)
-          onClose()
-        },
-        onError: (error) => setErrorText(describeError(error).message),
-      },
-    )
+    try {
+      if (body !== null) await update.mutateAsync({ id: provider.id, body })
+      if (personalKey !== '') await setMyCredential.mutateAsync({ id: provider.id, apiKey: personalKey })
+      else if (credentialMode === 'PER_USER' && clearRequested) await deleteMyCredential.mutateAsync(provider.id)
+
+      const keyNote =
+        body === null
+          ? credentialMode === 'PER_USER'
+            ? clearRequested
+              ? '（已清除你在「我的凭据」里的 Key）'
+              : '（已更新你在「我的凭据」里的 Key）'
+            : ''
+          : body.apiKey === null
+            ? '（已清除 API Key）'
+            : body.apiKey === undefined
+              ? ''
+              : '（已更新 API Key）'
+      feedback.ok(`已保存「${provider.name}」${keyNote}`)
+      onClose()
+    } catch (error) {
+      setErrorText(describeError(error).message)
+    }
   }
 
   return (
@@ -152,7 +209,9 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
       okText={editing ? '保存' : '创建'}
       okButtonProps={{ disabled: !canSubmit, loading: submitting }}
       cancelText="取消"
-      onOk={submit}
+      onOk={() => {
+        void submit()
+      }}
       onCancel={onClose}
       maskClosable={!submitting}
       width={560}
@@ -258,11 +317,43 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
         </div>
 
         <div>
-          <p className="block-label">API Key</p>
+          <p className="block-label">凭据模式</p>
+          <Select
+            value={credentialMode}
+            options={PROVIDER_CREDENTIAL_MODES.map((mode) => ({
+              value: mode,
+              label: PROVIDER_CREDENTIAL_MODE_LABELS[mode],
+            }))}
+            style={{ width: '100%' }}
+            aria-label="凭据模式"
+            onChange={setCredentialMode}
+          />
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            {credentialMode === 'PER_USER'
+              ? '「各自 Key」：每个使用者配自己的 API Key，调用模型时用他的那一把；未配置时对话返回 424「尚未配置所需凭据」。'
+              : '「共享 Key」：所有使用者共用上面这把 Key（额度和计费都算在它头上）。'}
+          </p>
+        </div>
+
+        <div>
+          <p className="ratio">
+            模型 Provider 没有单独的公开/私有：访问由<strong>所属人</strong>与管理员掌握。想给某位同事使用，
+            请保存后在该行点<strong>所属人</strong>把 Provider 转移给他。
+          </p>
+        </div>
+
+        <div>
+          <p className="block-label">{credentialMode === 'PER_USER' ? '你的 Key（各自 Key 模式）' : 'API Key'}</p>
 
           {editing && (
             <p className="num" style={{ marginBottom: 'var(--sp-2)' }}>
-              {provider.hasKey ? `当前：${describeProviderKey(provider)}` : '当前：未配置'}
+              {credentialMode === 'PER_USER'
+                ? provider.userHasKey
+                  ? '当前：已配置（你的 Key，存在「我的凭据」里）'
+                  : '当前：未配置'
+                : provider.hasKey
+                  ? `当前：${describeProviderKey(provider)}`
+                  : '当前：未配置'}
             </p>
           )}
 
@@ -271,7 +362,15 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
             maxLength={512}
             autoComplete="off"
             aria-label="API Key"
-            placeholder={editing ? '留空表示保持现有 Key 不变' : '可留空：先建 Provider，之后再补 Key'}
+            placeholder={
+              credentialMode === 'PER_USER'
+                ? editing
+                  ? '输入新的 Key 以替换「我的凭据」里的那一把'
+                  : '粘贴你的 API Key（可留空，稍后到「我的凭据」填）'
+                : editing
+                  ? '留空表示保持现有 Key 不变'
+                  : '可留空：先建 Provider，之后再补 Key'
+            }
             onChange={(event) => {
               setApiKey(event.target.value)
               // 输入了新值 ⇒ "清除"的意图自动作废（两件事不能同时成立）
@@ -279,24 +378,37 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
             }}
           />
 
-          {editing && provider.hasKey && (
-            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginTop: 'var(--sp-3)' }}>
-              <span style={{ flex: 1 }}>
-                清除已配置的 Key（<code>apiKey: null</code>）
-              </span>
-              <Switch
-                checked={clearRequested}
-                disabled={apiKey.trim() !== ''}
-                aria-label="清除已配置的 Key"
-                onChange={setClearRequested}
-              />
-            </div>
-          )}
+          {/* 「清除」只在"确实有东西可清"时出现：`SHARED` 看清共享 Key、`PER_USER` 清我在「我的凭据」里的 Key */}
+          {editing &&
+            (credentialMode === 'PER_USER' ? provider.userHasKey : provider.hasKey) && (
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginTop: 'var(--sp-3)' }}>
+                <span style={{ flex: 1 }}>
+                  {credentialMode === 'PER_USER'
+                    ? '清除你在「我的凭据」里的 Key'
+                    : '清除已配置的 Key（apiKey: null）'}
+                </span>
+                <Switch
+                  checked={clearRequested}
+                  disabled={apiKey.trim() !== ''}
+                  aria-label="清除已配置的 Key"
+                  onChange={setClearRequested}
+                />
+              </div>
+            )}
 
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            Key <strong>只进不出</strong>：保存后任何接口都不会再回显它（列表里那个 `sk-****abcd`
-            是后端解密后取首尾生成的掩码，用来核对配的是哪一把）。留空 = 不动原 Key；
-            要清空请用上面的开关 —— 空字符串会被服务端拒绝（400）。
+            {credentialMode === 'PER_USER' ? (
+              <>
+                这把 Key <strong>只属于你自己</strong>：保存后写入「我的凭据」（仅你能读、能改），
+                调用模型时用你自己的那一把（额度、计费都算在你头上）。留空 = 不动；要清空请用上面的开关。
+              </>
+            ) : (
+              <>
+                Key <strong>只进不出</strong>：保存后任何接口都不会再回显它（列表里那个 sk-****abcd
+                是后端解密后取首尾生成的掩码，用来核对配的是哪一把）。留空 = 不动原 Key；
+                要清空请用上面的开关 —— 空字符串会被服务端拒绝（400）。
+              </>
+            )}
           </p>
         </div>
 
@@ -304,8 +416,12 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
           <Alert
             type="warning"
             showIcon
-            message="保存后会清除这把 Key"
-            description="该 Provider 下的模型将无法再被调用（对话会以鉴权失败告终）。密文删除后无法恢复，只能重新填写。"
+            message={credentialMode === 'PER_USER' ? '保存后会清除你在「我的凭据」里的 Key' : '保存后会清除这把 Key'}
+            description={
+              credentialMode === 'PER_USER'
+                ? '清除后，经该 Provider 的对话会报「尚未配置所需凭据」，直到你重新填写。'
+                : '该 Provider 下的模型将无法再被调用（对话会以鉴权失败告终）。密文删除后无法恢复，只能重新填写。'
+            }
           />
         )}
 

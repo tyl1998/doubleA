@@ -434,6 +434,60 @@ export async function listDocuments(params: {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 重命名（2026-10-16）：只改展示名，不碰内容
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 重命名文档（`PATCH /api/knowledge-bases/:id/documents/:docId`，登录即可）。
+ *
+ * 只改 `documents.file_name`：它是列表页的展示名与下载的 `Content-Disposition` 文件名。
+ * **不动** `file_key`（S3 对象）、`content_hash`、`chunk_count`、`status` —— 内容一个字节都不变，
+ * 所以**不重新入队**（重命名不是"覆盖重建"）。
+ *
+ * 三条：
+ *   ① 文档必须属于该知识库（跨库 docId 一律 404，与 retry/delete/download 同款）；
+ *   ② 名字**与当前一致** ⇒ 直接返回（幂等，省一次写）；
+ *   ③ **扩展名必须不变**（否则下载的 Content-Type 与真实字节对不上）⇒ 400。
+ *
+ * ⚠️ 与"覆盖重传顺带改 `file_name`"（{@link reuploadDocument}）不同：那条换了内容才改名，
+ *    这里只换名、不换内容。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 文档不存在 / 不属于该库 / `VALIDATION`(400) 扩展名变了
+ */
+export async function renameDocument(params: {
+  kbId: string
+  docId: string
+  fileName: string
+}): Promise<DocumentItem> {
+  const db = getPrisma()
+  const row = await db.document.findFirst({
+    where: { id: params.docId, kbId: params.kbId },
+    select: DOCUMENT_SELECT,
+  })
+  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+
+  const nextName = params.fileName.trim()
+  if (nextName === row.fileName) return toItem(row)
+
+  if (fileNameExtension(nextName) !== fileNameExtension(row.fileName)) {
+    throw AppError.validation(
+      '重命名不能改变文件格式：扩展名要与原来的保持一致（文件内容并没有变，换了扩展名会让下载 / 预览的类型对不上）',
+    )
+  }
+
+  const updated = await db.document.update({
+    where: { id: row.id },
+    data: { fileName: nextName },
+    select: DOCUMENT_SELECT,
+  })
+  getLogger().info(
+    { kbId: params.kbId, docId: row.id, from: row.fileName, to: nextName },
+    '文档已重命名（仅展示名，内容与 chunk 未变）',
+  )
+  return toItem(updated)
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // 下载原始文件（P0-1-21）
 // ═════════════════════════════════════════════════════════════════════
 
@@ -471,6 +525,18 @@ export function downloadContentType(fileName: string): string {
       ? DOWNLOAD_MIME_BY_EXTENSION[ext as UploadExtension]
       : undefined) ?? 'application/octet-stream'
   )
+}
+
+/**
+ * 取小写扩展名（无点）；没有扩展名时返回 `null`。
+ *
+ * ⚠️ **只用于"重命名不得换格式"这一条校验**：它不是解析入口的那份 `extensionOf`
+ * （`pipeline/parse/index.ts`），也不参与上传白名单 —— 那两处各自是判定入口，不能互相顶替。
+ * 这里只要"改名前后的扩展名是不是同一个"这一个布尔结论。
+ */
+function fileNameExtension(fileName: string): string | null {
+  const matched = /\.([^.\\/]+)$/u.exec(fileName)
+  return matched?.[1]?.toLowerCase() ?? null
 }
 
 /** RFC 5987 的 `attr-char` 之外还要转义这几个：`encodeURIComponent` 会放过它们 */

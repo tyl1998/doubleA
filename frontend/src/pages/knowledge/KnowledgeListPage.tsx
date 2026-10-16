@@ -24,23 +24,33 @@
  * 超过 100 个库时页脚如实提示，不是静默截断。
  */
 
-import { Button, Input, Table, Tag, type TableColumnsType } from 'antd'
+import { Button, Input, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
 import type { KnowledgeBaseItem } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import { KNOWLEDGE_BASES_PICKER_LIMIT, useKnowledgeBases } from '../../api/knowledgeBases.js'
+import { useCurrentUser } from '../../api/auth.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
+import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { knowledgeDetailPath } from '../../app/paths.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { DeleteKnowledgeBaseModal } from './DeleteKnowledgeBaseModal.js'
 import { KnowledgeBaseFormModal } from './KnowledgeBaseFormModal.js'
 import { describeRetrieval, embeddingChangedNotice } from './knowledgeModel.js'
 
+/** 所属筛选（P1-13）：`MINE` = 只看我建的，`ALL` = 全部对我可见的 */
+type OwnerFilter = 'ALL' | 'MINE'
+
 export function KnowledgeListPage() {
   const navigate = useNavigate()
+  const { data: me } = useCurrentUser()
   const [keyword, setKeyword] = useState('')
+  const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>('ALL')
   const [creating, setCreating] = useState(false)
+  const [editing, setEditing] = useState<KnowledgeBaseItem | null>(null)
+  const [transferFor, setTransferFor] = useState<KnowledgeBaseItem | null>(null)
   const [pendingDelete, setPendingDelete] = useState<KnowledgeBaseItem | null>(null)
 
   const { data, isPending, isError, error, isFetching, refetch } = useKnowledgeBases(
@@ -51,18 +61,22 @@ export function KnowledgeListPage() {
   const total = data?.total ?? 0
 
   const normalizedKeyword = keyword.trim().toLowerCase()
-  const filtered =
-    normalizedKeyword === ''
-      ? items
-      : items.filter((item) =>
-          `${item.name}\n${item.description ?? ''}`.toLowerCase().includes(normalizedKeyword),
-        )
+  const filtered = items.filter((item) => {
+    if (ownerFilter === 'MINE' && item.createdBy !== me?.id) return false
+    if (normalizedKeyword === '') return true
+    return `${item.name}\n${item.description ?? ''}`.toLowerCase().includes(normalizedKeyword)
+  })
 
   const columns: TableColumnsType<KnowledgeBaseItem> = [
     {
       title: '名称',
       dataIndex: 'name',
+      // 显式宽度：窄屏下让这一列**不被挤扁**（其余列宽固定，本列有 width 才不会被压成一行碎片）。
+      // 宽度之和交给 Table 的 `scroll.x` 兜底（见表格处）。
+      width: 280,
       render: (_, kb) => (
+        // ⚠️ 名称旁**不再挂 hover 检索口径图标**（2026-10-16 修订）：口径是「检索口径」列的读数，
+        // 名称列只承载名称本身 —— 一个悬停图标既挤名字、又与右侧整列重复说同一件事。
         <div className="kb-cell">
           <Link to={knowledgeDetailPath(kb.id)} className="kb-cell__name">
             {kb.name}
@@ -95,6 +109,9 @@ export function KnowledgeListPage() {
       title: '检索口径',
       key: 'retrieval',
       width: 300,
+      // 窄屏（< xl = 1200px）**整列隐藏**：它是本表最宽的一列，窄屏上留着会把「名称」挤到看不清。
+      // 隐藏后口径不丢 —— 「名称」列的名称旁有一个 hover 图标（见上）承载同一份内容。
+      responsive: ['xl'],
       render: (_, kb) => {
         const notice = embeddingChangedNotice(kb.embeddingModelChanged)
         return (
@@ -117,6 +134,39 @@ export function KnowledgeListPage() {
       },
     },
     {
+      // P1-13：所属人（= `createdBy`/`creatorName`）。只有所属人/管理员（`canEdit`）能点，点了弹转移弹窗；
+      // 其余人只显示名字。可见性徽标与受众规模移到独立的「可见性」列。
+      title: '所属人',
+      dataIndex: 'creatorName',
+      width: 140,
+      render: (_, kb) =>
+        kb.canEdit ? (
+          <Tooltip title="点击转移所属人">
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(kb)}>
+              {kb.creatorName}
+            </Button>
+          </Tooltip>
+        ) : (
+          <span>{kb.creatorName}</span>
+        ),
+    },
+    {
+      // P1-18.x：可见性徽标 +（指定用户时）受众规模（判据来自服务端下发字段，前端不自己算）
+      title: '可见性',
+      dataIndex: 'visibility',
+      width: 170,
+      render: (_, kb) => (
+        <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+          <VisibilityBadge visibility={kb.visibility} />
+          {kb.visibility === 'SHARED' && (
+            <span className="ratio" title="受众 = 直接指定的用户 ∪ 指定组里的成员">
+              {kb.audience.users.length} 人 / {kb.audience.groups.length} 组
+            </span>
+          )}
+        </span>
+      ),
+    },
+    {
       title: '最近更新',
       dataIndex: 'updatedAt',
       width: 130,
@@ -125,14 +175,26 @@ export function KnowledgeListPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 140,
+      width: 260,
       align: 'right',
       render: (_, kb) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
           <Link to={knowledgeDetailPath(kb.id)}>打开</Link>
-          <Button type="link" danger size="small" style={{ padding: 0 }} onClick={() => setPendingDelete(kb)}>
-            删除
-          </Button>
+          {/* P1-13：知识库现在有 owner —— 编 / 删按服务端给的 `canEdit` 渲染（所属人或 ADMIN） */}
+          {kb.canEdit ? (
+            <>
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditing(kb)}>
+                编辑
+              </Button>
+              <Button type="link" danger size="small" style={{ padding: 0 }} onClick={() => setPendingDelete(kb)}>
+                删除
+              </Button>
+            </>
+          ) : (
+            <span className="ratio" title="只有该知识库的所属人或管理员可以编辑 / 删除">
+              无编辑权限
+            </span>
+          )}
         </div>
       ),
     },
@@ -148,9 +210,8 @@ export function KnowledgeListPage() {
               '正在读取知识库列表…'
             ) : (
               <>
-                共 <span className="num">{total}</span> 个知识库。知识库是<strong>共享</strong>的：任何
-                登录用户都能查看、上传与修改（没有归属人），删除受限之处只有一处 —— 被智能体引用时
-                接口会返回 409。
+                共 <span className="num">{total}</span> 个知识库（仅列出对你可见的：公开的、共享给你的、以及你自己的）。
+                编辑 / 删除只对<strong>所属人</strong>或管理员开放；被智能体引用时删除会被后端拒绝（409）。
               </>
             )}
           </p>
@@ -193,6 +254,14 @@ export function KnowledgeListPage() {
           style={{ width: 260 }}
           aria-label="搜索知识库"
         />
+        <div className="seg" role="group" aria-label="按所属人筛选">
+          <button type="button" aria-pressed={ownerFilter === 'ALL'} onClick={() => setOwnerFilter('ALL')}>
+            全部可见
+          </button>
+          <button type="button" aria-pressed={ownerFilter === 'MINE'} onClick={() => setOwnerFilter('MINE')}>
+            只看我的
+          </button>
+        </div>
         <span className="ratio u-right">
           数据来自 GET /api/knowledge-bases · 缓存 30s
           {total > items.length && (
@@ -228,6 +297,7 @@ export function KnowledgeListPage() {
               <Button
                 onClick={() => {
                   setKeyword('')
+                  setOwnerFilter('ALL')
                 }}
               >
                 清空筛选
@@ -243,6 +313,9 @@ export function KnowledgeListPage() {
             columns={columns}
             dataSource={filtered}
             loading={false}
+            // 各列宽度之和即自适应最小宽度：窄屏改为**横向滚动**，而不是把「名称」压缩变形
+            //（`max-content` 会随 `responsive` 隐藏的「检索口径」列自动收放）。
+            scroll={{ x: 'max-content' }}
             pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
           />
         </div>
@@ -254,6 +327,16 @@ export function KnowledgeListPage() {
         onClose={() => setCreating(false)}
         // 刚建完最想做的事是"传一篇文档" ⇒ 直接带到详情页
         onCreated={(created) => navigate(knowledgeDetailPath(created.id))}
+      />
+      {/* 编辑（P1-13：知识库有 owner 后，行内「编辑」入口按 canEdit 渲染） */}
+      <KnowledgeBaseFormModal kb={editing} open={editing !== null} onClose={() => setEditing(null)} />
+      <TransferOwnershipModal
+        open={transferFor !== null}
+        assetKind="KNOWLEDGE"
+        assetId={transferFor?.id ?? ''}
+        assetName={transferFor?.name ?? ''}
+        currentOwnerName={transferFor?.creatorName ?? ''}
+        onClose={() => setTransferFor(null)}
       />
       <DeleteKnowledgeBaseModal kb={pendingDelete} open={pendingDelete !== null} onClose={() => setPendingDelete(null)} />
     </>

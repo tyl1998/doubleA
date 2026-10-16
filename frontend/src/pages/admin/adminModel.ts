@@ -42,6 +42,7 @@ import type {
   ModelItem,
   ModelProviderItem,
   ModelType,
+  ProviderCredentialMode,
   RemoteModelListResult,
   UpdateModelBody,
   UpdateModelProviderBody,
@@ -240,6 +241,8 @@ export interface ProviderFormValues {
   enabled: boolean
   /** ⚠️ 编辑态**恒为空串**（`apiKeyPreview` 绝不回填）；空串 + 未动 = "不动原 Key" */
   apiKey: string
+  /** P1-18：凭据模式（共享 Key / 各自 Key） */
+  credentialMode: ProviderCredentialMode
 }
 
 export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
@@ -250,6 +253,7 @@ export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
   protocol: DEFAULT_UPSTREAM_PROTOCOL,
   enabled: true,
   apiKey: '',
+  credentialMode: 'SHARED',
 }
 
 /**
@@ -271,6 +275,7 @@ export function providerEditValuesOf(provider: ModelProviderItem): ProviderFormV
     protocol: provider.protocol,
     enabled: provider.enabled,
     apiKey: '',
+    credentialMode: provider.credentialMode,
   }
 }
 
@@ -343,6 +348,10 @@ export function providerKeyIntent(
 /** 建 Provider 请求体（`apiKey` 可缺省 —— 先建后配 Key 是正常流程） */
 export function buildCreateProviderBody(values: ProviderFormValues): CreateModelProviderBody {
   const apiKey = values.apiKey.trim()
+  // P1-18：`PER_USER`（各自 Key）模式下，表单里那把 Key 是**创建人自己的 Key**（会写入「我的凭据」，
+  // 见 `ProviderFormModal`），**不是**共享 Key ⇒ 不进 Provider 创建体（共享 Key 在这个模式下不参与调用）。
+  // `SHARED` 模式下它才是共享 Key，照旧带上（空串不带 = "先建后配"）。
+  const sharedKey = values.credentialMode === 'PER_USER' || apiKey === '' ? undefined : apiKey
   return {
     name: values.name.trim(),
     baseUrl: values.baseUrl.trim(),
@@ -354,8 +363,22 @@ export function buildCreateProviderBody(values: ProviderFormValues): CreateModel
     //    （与 `role` 总是带上同一个理由，见 `buildCreateUserBody`）
     protocol: values.protocol,
     enabled: values.enabled,
-    ...(apiKey === '' ? {} : { apiKey }),
+    credentialMode: values.credentialMode,
+    ...(sharedKey === undefined ? {} : { apiKey: sharedKey }),
   }
+}
+
+/**
+ * 表单里那把 Key 在**这一次提交**里代表什么（P1-18）。
+ *
+ * · `SHARED` ⇒ 它是 **Provider 共享 Key**（进 Provider 的建/改体，由 `apiKey*` 三态处理）；
+ * · `PER_USER` ⇒ 它是**创建人自己的 Key**（写「我的凭据」，不进 Provider 体）。
+ *
+ * 判据只有一个：`credentialMode`。抽成函数是为了让页面与 body 构造器读**同一份**口径
+ * —— 各写一遍必然会在"换模式"时出现一边当共享、一边当个人的错配。
+ */
+export function providerKeyRole(values: Pick<ProviderFormValues, 'credentialMode'>): 'SHARED' | 'PER_USER' {
+  return values.credentialMode
 }
 
 /**
@@ -386,8 +409,11 @@ export function buildProviderUpdateBody(
   const baseUrl = values.baseUrl.trim()
   if (baseUrl !== provider.baseUrl) body.baseUrl = baseUrl
 
-  // 布尔开关：逐字比较后只在真变了才带（同 `enabled` 的处置）
-  if (values.customUrl !== provider.customUrl) body.customUrl = values.customUrl
+  // 布尔开关：逐字比较后只在真变了才带（同 `enabled` 的处置）。
+  // ⚠️ 与 `protocol` 同款三态：`undefined`（调用方没给这个键）= 没改，**不**当成改动 ——
+  // 否则会往请求体里塞一个 `customUrl: undefined`（被 JSON.stringify 丢掉、却已破坏
+  // "零改动 ⇒ return null" 的判据，见下方 `protocol` 那段注释）。
+  if (values.customUrl !== undefined && values.customUrl !== provider.customUrl) body.customUrl = values.customUrl
 
   if (values.type !== provider.type && !providerTypeChangeBlocked(provider)) body.type = values.type
 
@@ -403,9 +429,20 @@ export function buildProviderUpdateBody(
 
   if (values.enabled !== provider.enabled) body.enabled = values.enabled
 
-  const intent = providerKeyIntent(values, clearRequested)
-  if (intent === 'set') body.apiKey = values.apiKey.trim()
-  if (intent === 'clear') body.apiKey = null
+  // P1-18：凭据模式（两态：只在真变了才带）。⚠️ 与 `protocol` 同款 —— `undefined` = 没给这个键 = 不改，
+  // 绝不能把 `undefined !== 'SHARED'` 判成一次改动（那会破坏"零改动 ⇒ 不发请求"）。
+  if (values.credentialMode !== undefined && values.credentialMode !== provider.credentialMode) {
+    body.credentialMode = values.credentialMode
+  }
+
+  // P1-18：`PER_USER`（各自 Key）模式下 Provider 的共享 Key 不参与调用，那把 Key 归「我的凭据」管
+  // ⇒ 编辑体**不碰** `apiKey`（个人 Key 的设置 / 清除由页面走 `my-credential` 端点）。
+  // `SHARED` 模式照旧走三态（见 {@link providerKeyIntent}）。
+  if (providerKeyRole(values) === 'SHARED') {
+    const intent = providerKeyIntent(values, clearRequested)
+    if (intent === 'set') body.apiKey = values.apiKey.trim()
+    if (intent === 'clear') body.apiKey = null
+  }
 
   if (Object.keys(body).length === 0) return null
   return body as UpdateModelProviderBody

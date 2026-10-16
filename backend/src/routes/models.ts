@@ -38,6 +38,7 @@ import {
   probeChatBodySchema,
   probeEmbeddingBodySchema,
   updateModelBodySchema,
+  type AssetViewer,
   type CreateModelBody,
   type ListAvailableModelsQuery,
   type ListModelsQuery,
@@ -46,8 +47,9 @@ import {
   type ProbeEmbeddingBody,
   type UpdateModelBody,
 } from '@doubulea/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyRequest } from 'fastify'
 
+import { requireAuthContext } from '../plugins/session.js'
 import {
   createModel,
   listAvailableModels,
@@ -58,6 +60,12 @@ import {
   updateModel,
 } from '../services/model.service.js'
 
+/** 取调用者（P1-13 起模型池由 `(A)` 放宽为"登录 + 行级"） */
+function viewerOf(request: FastifyRequest): AssetViewer {
+  const auth = requireAuthContext(request)
+  return { id: auth.user.id, role: auth.user.role }
+}
+
 export function registerModelRoutes(app: FastifyInstance): void {
   // ── ① 全员可选列表（登录即可，**不带** requireAdmin）──
   // 注册在前只是排版习惯（两条 GET 路径不同，先后无影响）。
@@ -65,63 +73,63 @@ export function registerModelRoutes(app: FastifyInstance): void {
   app.get<{ Querystring: ListAvailableModelsQuery }>(
     '/api/models/available',
     { preHandler: app.requireAuth, schema: { querystring: listAvailableModelsQuerySchema } },
-    async (request) => ok({ items: await listAvailableModels(request.query) }),
+    async (request) => ok({ items: await listAvailableModels(request.query, viewerOf(request)) }),
   )
 
-  // ── ② 管理列表（仅 ADMIN）──
+  // ── ② 管理列表（P1-13：登录即可；按"对我可见"过滤，行级 `canEdit`）──
   // 与可选列表的差别：看得见 `enabled=false` 的模型、要分页、带 `agentCount` 等管理字段。
   app.get<{ Querystring: ListModelsQuery }>(
     '/api/models',
-    { preHandler: app.requireAdmin, schema: { querystring: listModelsQuerySchema } },
-    async (request) => ok(await listModels(request.query)),
+    { preHandler: app.requireAuth, schema: { querystring: listModelsQuerySchema } },
+    async (request) => ok(await listModels(request.query, viewerOf(request))),
   )
 
   /**
-   * 新建（仅 ADMIN）。成功返回 `200`（信封的 `code=0` 是唯一契约，与 `/api/users`、
-   * `/api/model-providers` 同口径，不引入 201）。
+   * 新建（P1-13：登录即可；仅**该 Provider 的所属人或 ADMIN**）。
+   * 成功返回 `200`（信封的 `code=0` 是唯一契约，与 `/api/users`、`/api/model-providers` 同口径，不引入 201）。
    */
   app.post<{ Body: CreateModelBody }>(
     '/api/models',
-    { preHandler: app.requireAdmin, schema: { body: createModelBodySchema } },
-    async (request) => ok(await createModel(request.body)),
+    { preHandler: app.requireAuth, schema: { body: createModelBodySchema } },
+    async (request) => ok(await createModel(request.body, viewerOf(request))),
   )
 
   /**
-   * 探测向量模型维度（仅 ADMIN）：按表单值试发一次 embedding，**不落库**。
+   * 探测向量模型维度（P1-13：登录 + 行级：该 Provider 所属人或 ADMIN）：按表单值试发一次 embedding，**不落库**。
    *
    * 静态段 `/probe-embedding` 与 `POST /api/models`、`PATCH|DELETE /api/models/:id` 路径不同，
    * 不存在被参数路由抢先匹配的问题（见文件头）。
    */
   app.post<{ Body: ProbeEmbeddingBody }>(
     '/api/models/probe-embedding',
-    { preHandler: app.requireAdmin, schema: { body: probeEmbeddingBodySchema } },
-    async (request) => ok(await probeModelEmbedding(request.body)),
+    { preHandler: app.requireAuth, schema: { body: probeEmbeddingBodySchema } },
+    async (request) => ok(await probeModelEmbedding(request.body, viewerOf(request))),
   )
 
   /**
-   * 对话模型连通测试（仅 ADMIN；P1-1）：按表单值试发一次极小对话（`max_tokens: 1`），
+   * 对话模型连通测试（P1-13：登录 + 行级；P1-1）：按表单值试发一次极小对话（`max_tokens: 1`），
    * **不落库**。与 `/probe-embedding` 同款——静态段、不会被 `:id` 参数路由抢先匹配。
    */
   app.post<{ Body: ProbeChatBody }>(
     '/api/models/probe-chat',
-    { preHandler: app.requireAdmin, schema: { body: probeChatBodySchema } },
-    async (request) => ok(await probeModelChat(request.body)),
+    { preHandler: app.requireAuth, schema: { body: probeChatBodySchema } },
+    async (request) => ok(await probeModelChat(request.body, viewerOf(request))),
   )
 
-  /** 部分更新（仅 ADMIN）。三条守卫（迁移 Provider / 改 type 有引用 / 唯一冲突）在服务层 */
+  /** 部分更新（P1-13：登录 + 行级：该 Provider 所属人或 ADMIN）。三条守卫在服务层 */
   app.patch<{ Params: ModelIdParams; Body: UpdateModelBody }>(
     '/api/models/:id',
     {
-      preHandler: app.requireAdmin,
+      preHandler: app.requireAuth,
       schema: { params: modelIdParamsSchema, body: updateModelBodySchema },
     },
-    async (request) => ok(await updateModel(request.params.id, request.body)),
+    async (request) => ok(await updateModel(request.params.id, request.body, viewerOf(request))),
   )
 
-  /** 删除（仅 ADMIN）。被 Agent 引用时 409（`agents.model_id` 是 RESTRICT，见 `02` §三） */
+  /** 删除（P1-13：登录 + 行级：该 Provider 所属人或 ADMIN）。被 Agent 引用时 409 */
   app.delete<{ Params: ModelIdParams }>(
     '/api/models/:id',
-    { preHandler: app.requireAdmin, schema: { params: modelIdParamsSchema } },
-    async (request) => ok(await removeModel(request.params.id)),
+    { preHandler: app.requireAuth, schema: { params: modelIdParamsSchema } },
+    async (request) => ok(await removeModel(request.params.id, viewerOf(request))),
   )
 }

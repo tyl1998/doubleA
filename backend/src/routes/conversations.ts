@@ -107,7 +107,10 @@ import {
  * （那时会 401 而不是拿 null 崩）。
  */
 function viewerOf(request: FastifyRequest): ConversationViewer {
-  return { id: requireAuthContext(request).user.id }
+  const { user } = requireAuthContext(request)
+  // P1-13：带上 `role` —— 会话本身的查询仍只看 `userId`，`role` 只用于"所选模型对其是否可见"
+  // （私有 Provider 的模型对非所属人/非 ADMIN 不可用）这一条资产可见性判据。
+  return { id: user.id, role: user.role }
 }
 
 export function registerConversationRoutes(app: FastifyInstance): void {

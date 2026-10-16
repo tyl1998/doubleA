@@ -30,7 +30,7 @@
  * 如实提示（不静默截断）。
  */
 
-import { Alert, Button, Input, Popconfirm, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
+import { Alert, Button, Input, Popconfirm, Table, Tabs, Tag, Tooltip, type TableColumnsType } from 'antd'
 import { PASSWORD_MAX_BYTES, type InitialPasswordResult, type UserListItem } from '@doubulea/shared'
 import { useState } from 'react'
 
@@ -41,6 +41,7 @@ import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
 import { InitialPasswordModal } from './InitialPasswordModal.js'
 import { UserFormModal } from './UserFormModal.js'
+import { UserGroupsPanel } from './UserGroupsPanel.js'
 import { USER_ROLE_LABELS, describeUserStatus, userRowActions } from './adminModel.js'
 
 /** 建号成功的提示里要提一句密码口径 —— 读数来自 `shared` 的常量，不写死数字 */
@@ -58,6 +59,8 @@ export function UsersListPage() {
   const [editing, setEditing] = useState<UserListItem | null>(null)
   const [passwordResult, setPasswordResult] = useState<InitialPasswordResult | null>(null)
   const [passwordForReset, setPasswordForReset] = useState(false)
+  /** P1-18：用户与用户组合成一页的两个 tab（`users` 落在 `/admin/users`） */
+  const [tab, setTab] = useState<'users' | 'groups'>('users')
 
   const currentUserId = currentUser?.id ?? ''
   const items = data?.items ?? []
@@ -68,7 +71,9 @@ export function UsersListPage() {
     normalizedKeyword === ''
       ? items
       : items.filter((item) =>
-          `${item.username}\n${item.nickname ?? ''}`.toLowerCase().includes(normalizedKeyword),
+          `${item.username}\n${item.nickname ?? ''}\n${item.groups.map((group) => group.name).join(' ')}`
+            .toLowerCase()
+            .includes(normalizedKeyword),
         )
 
   const toggleStatus = (user: UserListItem): void => {
@@ -124,6 +129,23 @@ export function UsersListPage() {
       render: (_, user) => (
         <Tag className={user.role === 'ADMIN' ? 'tag--warn' : undefined}>{USER_ROLE_LABELS[user.role]}</Tag>
       ),
+    },
+    {
+      // P1-18：该用户**所在的用户组**（服务端下发，已按组名排序）。组是 Agent「指定用户」受众的
+      // 主授权单位 ⇒ "谁在哪些组里"应当在用户列表一眼可见（与「用户组」tab 同源，不另算一份）。
+      title: '所在组',
+      dataIndex: 'groups',
+      width: 200,
+      render: (_, user) =>
+        user.groups.length === 0 ? (
+          <span className="ratio">未分组</span>
+        ) : (
+          <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+            {user.groups.map((group) => (
+              <Tag key={group.id}>{group.name}</Tag>
+            ))}
+          </span>
+        ),
     },
     {
       title: '状态',
@@ -231,51 +253,20 @@ export function UsersListPage() {
   ]
 
   const head = (
-    <>
-      <div className="page__head">
-        <div>
-          <h1>用户管理</h1>
-          <p className="page__lead">
-            {isPending ? (
-              '正在读取用户列表…'
-            ) : (
-              <>
-                共 <span className="num">{total}</span> 个账号。建号后的初始密码<strong>只显示一次</strong>；
-                停用会立刻失效（下一个请求即 401）。管理员不能对自己做停用 / 降级 / 重置密码
-                —— 这一条是后端定的（防止把自己锁在门外）。
-              </>
-            )}
-          </p>
-        </div>
-        <div className="page__head-actions">
-          <Button type="primary" onClick={() => setCreating(true)}>
-            创建用户
-          </Button>
-        </div>
+    <div className="page__head">
+      <div>
+        <h1>用户管理</h1>
+        <p className="page__lead">
+          管理平台账号（<strong>用户</strong>）与 Agent 受众用的<strong>用户组</strong>。
+          建号后的初始密码<strong>只显示一次</strong>；停用会立刻失效（下一个请求即 401）。
+          管理员不能对自己做停用 / 降级 / 重置密码 —— 这一条是后端定的（防止把自己锁在门外）。
+        </p>
       </div>
-    </>
+    </div>
   )
 
-  if (isError) {
-    return (
-      <>
-        {head}
-        <ErrorState
-          title="用户列表加载失败"
-          error={error}
-          retrying={isFetching}
-          onRetry={() => {
-            void refetch()
-          }}
-        />
-      </>
-    )
-  }
-
-  return (
+  const usersTab = (
     <>
-      {head}
-
       <div className="row row--wrap" style={{ marginBottom: 'var(--sp-5)' }}>
         <Input.Search
           allowClear
@@ -285,16 +276,20 @@ export function UsersListPage() {
           style={{ width: 260 }}
           aria-label="搜索用户"
         />
-        <span className="ratio u-right">
-          数据来自 GET /api/users · 缓存 30s
+        <span className="ratio">
+          共 <span className="num">{total}</span> 个账号 · 缓存 30s
           {total > items.length && (
             <>
               {' '}
-              · 共 <span className="num">{total}</span> 个，本次取回前 <span className="num">{items.length}</span> 个
-              （<code>limit</code> 上限 100）
+              · 本次取回前 <span className="num">{items.length}</span> 个（<code>limit</code> 上限 100）
             </>
           )}
         </span>
+        <div className="u-right">
+          <Button type="primary" onClick={() => setCreating(true)}>
+            创建用户
+          </Button>
+        </div>
       </div>
 
       <Alert
@@ -349,6 +344,37 @@ export function UsersListPage() {
           />
         </div>
       )}
+    </>
+  )
+
+  if (isError) {
+    return (
+      <>
+        {head}
+        <ErrorState
+          title="用户列表加载失败"
+          error={error}
+          retrying={isFetching}
+          onRetry={() => {
+            void refetch()
+          }}
+        />
+      </>
+    )
+  }
+
+  return (
+    <>
+      {head}
+
+      <Tabs
+        activeKey={tab}
+        onChange={(key) => setTab(key as 'users' | 'groups')}
+        items={[
+          { key: 'users', label: '用户', children: usersTab },
+          { key: 'groups', label: '用户组', children: <UserGroupsPanel /> },
+        ]}
+      />
 
       <UserFormModal
         user={null}

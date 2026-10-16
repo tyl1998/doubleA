@@ -428,7 +428,12 @@ groupStart('E', '建库 / 改库的请求体（三态 + 局部合并 + "没改�
 
 await it('E1 建库：分块参数**留空 = 不带这两个键**（服务端用环境默认值快照）', () => {
   const body = buildCreateBody({ ...EMPTY_KNOWLEDGE_FORM_VALUES, name: ' 运维手册 ' })
-  assertDeepEqual(body, { name: '运维手册', embeddingModelId: '' }, '留空时请求体里不能出现 chunkSize / chunkOverlap')
+  // P1-13：可见性是表单上的明确开关，建库请求体总是带上它（EMPTY 的默认 = 私有）
+  assertDeepEqual(
+    body,
+    { name: '运维手册', embeddingModelId: '', visibility: 'PRIVATE' },
+    '留空时请求体里不能出现 chunkSize / chunkOverlap（可见性照带）',
+  )
   assertExcludes(canonical(body), 'chunkSize', '不带 chunkSize')
   // ⚠️ 反向：填了就必须带上（否则用户以为设了，实际是默认值）
   const filled = buildCreateBody({ name: 'x', embeddingModelId: 'model-1', description: '', chunkSize: 256, chunkOverlap: 32 })
@@ -680,6 +685,18 @@ await it('H5 详情页把"解析中每 N 秒自动刷新"写在明处（读数�
   const page = sourceFiles().find(({ name }) => name === 'pages/knowledge/KnowledgeDetailPage.tsx')
   assert(page !== undefined, '找不到详情页')
   assertIncludes(page.source, 'DOCUMENT_POLL_INTERVAL_MS / 1000', '表尾那句提示的数字要来自常量')
+})
+
+await it('H6 列表页窄屏适配：「检索口径」列窄屏隐藏，表格横向滚动（2026-10-16：名称列不再挂 hover 图标）', () => {
+  const page = sourceFiles().find(({ name }) => name === 'pages/knowledge/KnowledgeListPage.tsx')
+  assert(page !== undefined, '找不到知识库列表页')
+  // 宽列窄屏隐藏（否则会把「名称」挤到看不清）
+  assertIncludes(page.source, "responsive: ['xl']", '「检索口径」列必须按屏宽隐藏')
+  // 2026-10-16 用户定案：名称列**不再**挂 hover 检索口径图标（口径是「检索口径」列的读数）
+  assertExcludes(page.source, 'InfoCircleOutlined', '名称列不该再有 hover 图标')
+  assertIncludes(page.source, 'describeRetrieval(', '口径仍由同一纯函数给出（只有一处来源）')
+  // 窄屏改为横向滚动，而不是把名称列压缩变形
+  assertIncludes(page.source, "scroll={{ x: 'max-content' }}", '表格要横向滚动兜底')
 })
 
 // ───────────────────────────── I 下载文件名的解析 ─────────────────────────────

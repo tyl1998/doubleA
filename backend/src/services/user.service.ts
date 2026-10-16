@@ -25,6 +25,8 @@ import {
   type OffsetPage,
   type UpdateUserBody,
   type UserListItem,
+  type UserSearchItem,
+  type UserSearchQuery,
 } from '@doubulea/shared'
 
 import { generateInitialPassword, hashPassword } from '../infra/crypto.js'
@@ -45,6 +47,8 @@ const USER_LIST_SELECT = {
   status: true,
   mustChangePassword: true,
   createdAt: true,
+  // P1-18：带上所属组（列表页「所在组」列）。只取 `id` + 组名，不泄露成员/描述等无关信息。
+  userGroupMembers: { select: { group: { select: { id: true, name: true } } } },
 } as const
 
 /** Prisma 行 → 对外形态（`createdAt` 的 Date 转 ISO 字符串：JSON 里 Date 会变成同一形态，但显式转换更可控） */
@@ -56,6 +60,7 @@ function toListItem(row: {
   status: UserListItem['status']
   mustChangePassword: boolean
   createdAt: Date
+  userGroupMembers: { group: { id: string; name: string } }[]
 }): UserListItem {
   return {
     id: row.id,
@@ -64,6 +69,10 @@ function toListItem(row: {
     role: row.role,
     status: row.status,
     mustChangePassword: row.mustChangePassword,
+    // 按组名排序，读数稳定（与查询顺序无关）；展示口径由前端负责
+    groups: row.userGroupMembers
+      .map((member) => member.group)
+      .sort((a, b) => a.name.localeCompare(b.name)),
     createdAt: row.createdAt.toISOString(),
   }
 }
@@ -239,4 +248,33 @@ export async function resetUserPassword(
     '已重置密码（初始密码仅本次响应下发；同时清掉了登录失败计数）',
   )
   return { user: toListItem(updated), initialPassword }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 用户搜索（P1-18 · 子批 B；**登录可用**，受众选择器用）
+// ═════════════════════════════════════════════════════════════════════
+
+/** 搜索返回条数上限（够圈人即可；防"输入一个字拉全表"） */
+export const USER_SEARCH_LIMIT = 20
+
+/**
+ * 按关键词搜 `ACTIVE` 用户（`GET /api/users/search?q=`，**登录即可**）。
+ *
+ * 与 `listUsers`（ADMIN）口径不同：这里**只回 `{ id, name }`**（不泄露角色/状态/建号时间），
+ * 只搜 `ACTIVE`、按用户名/昵称模糊匹配、**限量 20**。用途是 Agent 受众选择器，不承担用户管理职责。
+ */
+export async function searchUsers(query: UserSearchQuery): Promise<UserSearchItem[]> {
+  const rows = await getPrisma().user.findMany({
+    where: {
+      status: 'ACTIVE',
+      OR: [
+        { username: { contains: query.q, mode: 'insensitive' } },
+        { nickname: { contains: query.q, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true, username: true, nickname: true },
+    orderBy: [{ username: 'asc' }],
+    take: USER_SEARCH_LIMIT,
+  })
+  return rows.map((row) => ({ id: row.id, name: row.nickname ?? row.username }))
 }

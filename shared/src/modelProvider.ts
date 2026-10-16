@@ -124,6 +124,23 @@ export function maskApiKey(apiKey: string): string {
 // ───────────────────────────── 输出形态 ─────────────────────────────
 
 /**
+ * **凭据模式**（P1-18 · 子批 C；与"可见范围"**正交**）：Provider 的 Key 从哪来。
+ *
+ * · `SHARED`（默认，共享 Key）= 用 Provider 自己配的那把 Key（既有行为）；
+ * · `PER_USER`（各自 Key）= 每个调用者用自己的 Key（`provider_user_credentials`）；
+ *   缺 ⇒ **424 `NEED_CREDENTIAL`**（走既有的缺凭据提示通道）。
+ *
+ * 与 `schema.prisma` 的 `enum ProviderCredentialMode` 逐字一致。
+ */
+export const PROVIDER_CREDENTIAL_MODES = ['SHARED', 'PER_USER'] as const
+export type ProviderCredentialMode = (typeof PROVIDER_CREDENTIAL_MODES)[number]
+
+export const PROVIDER_CREDENTIAL_MODE_LABELS: Readonly<Record<ProviderCredentialMode, string>> = {
+  SHARED: '共享 Key',
+  PER_USER: '各自 Key',
+}
+
+/**
  * Provider 的**统一输出形态**（列表 / 建 / 改三个响应共用）。
  *
  * ⚠️ 刻意**没有** `apiKey` / `apiKeyEnc` / `apiKeyEncrypted` 之类的字段：
@@ -148,15 +165,40 @@ export const modelProviderItemSchema = z.object({
    */
   protocol: z.enum(UPSTREAM_PROTOCOLS),
   enabled: z.boolean(),
-  /** 是否已配置 Key。**只有布尔**，不泄露长度等元信息 */
+  /** 是否已配置**共享** Key（`credentialMode=SHARED` 时才有意义）。**只有布尔**，不泄露长度等元信息 */
   hasKey: z.boolean(),
   /**
-   * Key 的掩码（如 `sk-****abcd`）；未配置时为 `null`。
+   * 共享 Key 的掩码（如 `sk-****abcd`）；未配置时为 `null`。
    * 由后端**解密后**取首尾生成 —— 也就是说"能看到掩码"本身证明了密文可解（主密钥没换错）。
    */
   apiKeyPreview: z.string().nullable(),
+  /** P1-18：**凭据模式**（共享 Key / 各自 Key）。见 {@link PROVIDER_CREDENTIAL_MODES} */
+  credentialMode: z.enum(PROVIDER_CREDENTIAL_MODES),
+  /**
+   * P1-18：**当前调用者**是否已配置自己的 Key（`credentialMode=PER_USER` 时才有意义）。
+   * 前端据此把"我的 Key"入口渲染成"已配置（掩码）/ 去设置"。
+   */
+  userHasKey: z.boolean(),
   /** 该 Provider 下挂的模型数（前端删 Provider 前的提示、"这个能不能删"的依据） */
   modelCount: z.number().int().min(0),
+  /**
+   * P1-13：**所属人**（新增 `created_by` 列，存量回填最早的 ADMIN）。编/删/转移 = 所属人 + ADMIN。
+   * ⚠️ **系统级 Provider**（`createdBy` 是 ADMIN）**只有 ADMIN** 能改/删
+   * （非 ADMIN 既不是所属人、也不是 ADMIN ⇒ `canEdit` 恒 false，防普通用户改坏系统模型）。
+   */
+  createdBy: z.string(),
+  /** 所属人显示名（昵称优先、回落用户名） */
+  creatorName: z.string(),
+  /**
+   * P1-18：**Provider 没有可见范围**（`PUBLIC`/`PRIVATE` 与定向分享都已删除）。
+   *
+   * 2026-10-16 修订：**读 = 全体登录用户**（Provider/Model 即"平台模型池"，人人可见、只读），
+   * **写 = 所属人 + ADMIN**（本字段逐行下发供前端门禁编 / 删 / 转移 / 建模型）。
+   * 原因：模型只能通过某个 **Agent** 被使用 ⇒ 全局"曝光"不承担访问控制（那归 Agent 可见范围）；
+   * 但"能不能看见平台模型池"是产品需求（管理员维护、全员选用），故读不设限、写按所属人收敛。
+   * 见 `shared/src/assetAcl.ts` 文件头 ①。
+   */
+  canEdit: z.boolean(),
   /** ISO 8601 */
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -249,6 +291,15 @@ export const createModelProviderBodySchema = z.object({
     })
     .optional(),
   enabled: z.boolean().optional(),
+  /**
+   * P1-18：**凭据模式**（缺省即 `SHARED`）。`PER_USER` 时每个调用者用自己的 Key（缺 ⇒ 424）。
+   * 与 `protocol` 同款：`.optional()` 而非 `.default()`，默认值只在服务层补一处。
+   */
+  credentialMode: z
+    .enum(PROVIDER_CREDENTIAL_MODES, {
+      errorMap: () => ({ message: `credentialMode 只能是 ${PROVIDER_CREDENTIAL_MODES.join('/')}` }),
+    })
+    .optional(),
   /** 可缺省（先建 Provider 后配 Key 是正常流程）。`null` 与缺省同义：不配置 Key */
   apiKey: providerApiKeySchema.nullish(),
 })
@@ -306,6 +357,15 @@ export const updateModelProviderBodySchema = z
       .optional(),
     enabled: z.boolean().optional(),
     /**
+     * P1-18：**凭据模式**（两态：不带 = 不动；给值 = 改成它）。不加 `.default()`，理由同 `protocol`。
+     * 改成 `PER_USER` 后共享 Key 不再被使用（保留原密文，便于改回）；改成 `SHARED` 恢复使用共享 Key。
+     */
+    credentialMode: z
+      .enum(PROVIDER_CREDENTIAL_MODES, {
+        errorMap: () => ({ message: `credentialMode 只能是 ${PROVIDER_CREDENTIAL_MODES.join('/')}` }),
+      })
+      .optional(),
+    /**
      * ⚠️ 这里必须是 `.nullable().optional()`（**不能**用 `.nullish()` 之外的简化写法，
      * 也不要加 `.default()`）：要保留 `undefined`（不动）与 `null`（清空）两个不同的输入。
      */
@@ -319,6 +379,7 @@ export const updateModelProviderBodySchema = z
       body.type !== undefined ||
       body.protocol !== undefined ||
       body.enabled !== undefined ||
+      body.credentialMode !== undefined ||
       // `apiKey: null`（清空）在这里也判为 true —— `null !== undefined`，正是想要的效果；
       // 只有"整个字段缺席"（undefined）才算没给。
       body.apiKey !== undefined,
@@ -349,6 +410,67 @@ export const modelProviderIdParamsSchema = z.object({
   id: z.string().uuid('Provider ID 不是合法 UUID'),
 })
 export type ModelProviderIdParams = z.infer<typeof modelProviderIdParamsSchema>
+
+// ───────────────────── 我的 Key（P1-18 · 子批 C；per-user 凭据） ─────────────────────
+
+/**
+ * `GET/PUT/DELETE /api/model-providers/:id/my-credential` 的响应：**当前调用者**的 Key 状态。
+ *
+ * ⚠️ 与 Provider 的 `apiKey` 同一条不变式：只有布尔 + 掩码，**没有明文**。
+ * 任何人（含被 Agent 受众圈进的普通用户）都能给自己的 Key，**ADMIN 也读不到别人的**（凭据是个人隐私）。
+ */
+export const providerUserCredentialItemSchema = z.object({
+  hasKey: z.boolean(),
+  apiKeyPreview: z.string().nullable(),
+})
+export type ProviderUserCredentialItem = z.infer<typeof providerUserCredentialItemSchema>
+
+/**
+ * `PUT /api/model-providers/:id/my-credential` 请求体：写入/替换**我的** Key。
+ * 清空走 `DELETE`（不在这里用 `null` 表达——那是 Provider 共享 Key 的三态口径，这里只有一条路）。
+ */
+export const setProviderUserCredentialBodySchema = z.object({
+  apiKey: providerApiKeySchema,
+})
+export type SetProviderUserCredentialBody = z.infer<typeof setProviderUserCredentialBodySchema>
+
+/**
+ * `GET /api/model-providers/my-credentials` 的一行（P1-18 ·「我的凭据」页的 Provider 凭据清单）。
+ *
+ * 为什么需要它：`credentialMode=PER_USER` 的 Provider 每个使用者各配一把 Key；缺了，对话返回 424
+ * 「尚未配置所需凭据」。「我的凭据」页需要一份**带凭据状态**的 Provider 清单来就地配置。
+ *
+ * ⚠️ 2026-10-16 修订（用户定案）：**只列"我自己的"** ——
+ *   · **我作为所属人**的 Provider（任何模式），其中 **`SHARED` 共享 Key 只给所属人看**（别人看不到）；
+ *   · **全部启用的「各自 Key」Provider**（`PER_USER`，**含未配置**）—— 平台模型池人人可见，
+ *     任何使用者都可能要给它配自己的 Key，故一律给配置入口。
+ *   与我无关的 `SHARED` Provider 不列。
+ *
+ * ⚠️ 只有布尔 + 掩码，**无明文**。
+ *
+ * ⚠️ 两种模式下 `hasKey`/`apiKeyPreview` 的**主语不同**：
+ *   · `PER_USER` ⇒ 是**我自己的** Key 状态（可就地配置）。
+ *   · `SHARED`   ⇒ 是该 Provider **共享 Key** 的状态与掩码（**只读**，改它去模型池编辑表单）。
+ *   判定"我该不该配"时要**先看 `credentialMode`** —— 别把共享 Key 的"未配置"当成我要处理的事。
+ */
+export const myProviderCredentialEntrySchema = z.object({
+  providerId: z.string(),
+  providerName: z.string(),
+  /** 该 Provider 的**凭据模式**（决定 `hasKey`/`apiKeyPreview` 说的是谁的 Key） */
+  credentialMode: z.enum(PROVIDER_CREDENTIAL_MODES),
+  /**
+   * 是否已配置 Key —— **主语随 `credentialMode` 变**：
+   * `PER_USER` = 我是否配了自己的那把；`SHARED` = 该 Provider 是否配了共享 Key（或：凭据是否已就绪）。
+   */
+  hasKey: z.boolean(),
+  /** 掩码（主语同上）；未配置为 `null`。**永不含明文** */
+  apiKeyPreview: z.string().nullable(),
+})
+export type MyProviderCredentialEntry = z.infer<typeof myProviderCredentialEntrySchema>
+
+export const myProviderCredentialsResultSchema = z.object({ items: z.array(myProviderCredentialEntrySchema) })
+export type MyProviderCredentialsResult = z.infer<typeof myProviderCredentialsResultSchema>
+
 
 // ─────────────── 删除前的"被绑定模型"清单 + 删除结果（删模型商自动解绑） ───────────────
 

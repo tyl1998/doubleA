@@ -31,11 +31,11 @@
  * 只提示、绝不自动清理 —— 用户只是临时改错了模板时，「值没了」是不可逆的）。
  */
 
-import { Alert, Button, Input, Modal, Select } from 'antd'
+import { Alert, Button, Input, Modal, Radio, Select } from 'antd'
 import { useEffect, useMemo, useState } from 'react'
 
 import { ApiError } from '../../api/client.js'
-import { useCreateMcpServer, useUpdateMcpServer } from '../../api/mcp.js'
+import { useCreateMcpServer, usePutMyCredential, useUpdateMcpServer } from '../../api/mcp.js'
 import {
   INJECT_LOCATION_LABEL,
   INJECT_LOCATIONS,
@@ -57,7 +57,12 @@ import {
   type TemplateRowDraft,
 } from './mcpModel.js'
 import { useFeedback } from '../../app/feedback.js'
-import type { McpServerItem } from '@doubulea/shared'
+import {
+  ASSET_VISIBILITY_LABELS,
+  KB_MCP_VISIBILITIES,
+  type KbMcpVisibility,
+  type McpServerItem,
+} from '@doubulea/shared'
 
 export interface McpServerFormModalProps {
   /** `null` = 新建；有值 = 编辑那一条 */
@@ -77,8 +82,15 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
   const feedback = useFeedback()
   const createServer = useCreateMcpServer()
   const updateServer = useUpdateMcpServer()
+  // P1-18（2026-10-16 追加）：创建时把创建人填的凭据值默认写入「我的凭据」
+  // （与 Provider「各自 Key」创建流程同一口径：创建人建完即已配好，不必再跳一次凭据页）。
+  const putCredential = usePutMyCredential()
 
   const [draft, setDraft] = useState<ServerFormDraft>(emptyServerFormDraft)
+  // 可见性单独一份 state（不进 `ServerFormDraft` —— 那两个纯函数被无依赖验收档按旧形状断言）
+  const [visibility, setVisibility] = useState<KbMcpVisibility>('PRIVATE')
+  /** 创建时创建人为各模板参数填的**自己的**凭据值（`rowId` → 值；仅创建态使用，见文件头 ④） */
+  const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
   const [nameError, setNameError] = useState<string | null>(null)
   const [urlError, setUrlError] = useState<string | null>(null)
   /** 服务端 400 的字段级错误（`ApiError.fieldMessage` 取不到归属时的兜底展示行） */
@@ -88,6 +100,8 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
   useEffect(() => {
     if (!open) return
     setDraft(server === null ? emptyServerFormDraft() : serverFormDraftFrom(server))
+    setVisibility(server === null ? 'PRIVATE' : server.visibility)
+    setCredentialValues({})
     setNameError(null)
     setUrlError(null)
     setFormError(null)
@@ -95,7 +109,9 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
 
   const rowIssues = useMemo(() => templateRowIssues(draft.credentialSchema), [draft.credentialSchema])
   const formIssues = formLevelTemplateIssues(rowIssues)
-  const saving = createServer.isPending || updateServer.isPending
+  /** 创建态可为哪些参数填自己的凭据值（只有 `key` 非空的行才有意义） */
+  const credentialValueRows = draft.credentialSchema.filter((row) => row.key.trim() !== '')
+  const saving = createServer.isPending || updateServer.isPending || putCredential.isPending
 
   const setRows = (rows: TemplateRowDraft[]) => {
     setDraft((current) => ({ ...current, credentialSchema: rows }))
@@ -132,17 +148,38 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
 
     try {
       if (server === null) {
-        const result = await createServer.mutateAsync(buildCreateServerBody(draft))
+        // P1-18：先把创建人为各参数填的**自己的**凭据值收上来（`key` 非空 + 这次真填了值才进提交体）
+        const myValues: Record<string, string> = {}
+        for (const row of draft.credentialSchema) {
+          const value = credentialValues[row.rowId] ?? ''
+          if (row.key.trim() !== '' && value.length > 0) myValues[row.key.trim()] = value
+        }
+        const result = await createServer.mutateAsync(buildCreateServerBody(draft, visibility))
+        // P1-18：创建成功后把凭据值写入「我的凭据」（仅创建人可见）。
+        // ⚠️ server 已经建出来了 —— 这一步失败**不能**让用户重建成两条（与 Provider「各自 Key」同一处置）。
+        if (Object.keys(myValues).length > 0) {
+          try {
+            await putCredential.mutateAsync({ serverId: result.server.id, values: myValues })
+          } catch (error) {
+            feedback.fail(error, 'server 已注册，但你的凭据没能存入「我的凭据」')
+            onClose()
+            return
+          }
+        }
         // ⚠️ `test.ok === false` **不是注册失败**（`06` P0-2-2 定案：注册照常成功，
         // 这次探测只是 best-effort 的一条信息）⇒ 用中性的 note，不用红色的 fail。
-        feedback.ok(`已注册 server「${result.server.name}」`)
+        feedback.ok(
+          Object.keys(myValues).length > 0
+            ? `已注册 server「${result.server.name}」，并把凭据存入了「我的凭据」`
+            : `已注册 server「${result.server.name}」`,
+        )
         if (result.test.ok) {
           feedback.note(`顺带握手成功：拿到 ${result.test.tools.length} 个工具。`)
         } else {
           feedback.note(`顺带握手失败：${result.test.error}（不影响注册，可稍后点「测试」重试）`)
         }
       } else {
-        const body = buildServerUpdateBody(server, draft)
+        const body = buildServerUpdateBody(server, draft, visibility)
         if (body === null) {
           // 与 §七「保存语义」口径一致：什么也没改 ⇒ 说清楚并**不发请求**
           feedback.note('没有需要保存的改动')
@@ -234,6 +271,21 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
         </div>
 
         <div>
+          <p className="block-label">可见性</p>
+          <Radio.Group value={visibility} onChange={(event) => setVisibility(event.target.value as KbMcpVisibility)}>
+            {KB_MCP_VISIBILITIES.map((value) => (
+              <Radio key={value} value={value}>
+                {ASSET_VISIBILITY_LABELS[value]}
+              </Radio>
+            ))}
+          </Radio.Group>
+          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+            公开 = 全员可看可用、可被公开的智能体绑定；私有 = 仅所属人（你）与管理员可见。
+            转移所属人后，连通测试与工具列表会用新所属人的凭据。
+          </p>
+        </div>
+
+        <div>
           <p className="block-label">凭据参数模板</p>
           <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
             模板决定「我的凭据」页出现哪些输入项，以及它们注入到请求的哪个位置（HEADER / QUERY / BODY）。
@@ -314,6 +366,39 @@ export function McpServerFormModal({ server, open, onClose }: McpServerFormModal
             </p>
           ))}
         </div>
+
+        {server === null && credentialValueRows.length > 0 && (
+          <div>
+            <p className="block-label">你的凭据（可选）</p>
+            <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
+              这里填的值会随注册一起写入「我的凭据」—— 也就是<strong>代表你调用该工具</strong>用的那一份，
+              仅你可见。留空表示稍后到「我的凭据」页再填（连所属人以外的使用者也要各自填自己的）。
+            </p>
+            <div className="stack stack--tight">
+              {credentialValueRows.map((row) => (
+                <div key={row.rowId}>
+                  <label className="block-label" htmlFor={`create-cred-${row.rowId}`}>
+                    {row.label.trim() !== '' ? row.label : row.key}
+                    {row.required ? <span title="必填"> *</span> : null}
+                  </label>
+                  <Input.Password
+                    id={`create-cred-${row.rowId}`}
+                    value={credentialValues[row.rowId] ?? ''}
+                    autoComplete="off"
+                    placeholder={row.placeholder.trim() === '' ? `参数 ${row.key.trim()}` : row.placeholder}
+                    onChange={(event) =>
+                      setCredentialValues((current) => ({ ...current, [row.rowId]: event.target.value }))
+                    }
+                  />
+                  <p className="ratio" style={{ marginTop: 'var(--sp-1)' }}>
+                    参数名 <code>{row.key.trim()}</code> · 注入位置{' '}
+                    {INJECT_LOCATION_LABEL[row.inject]}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {formError === null ? null : <Alert type="error" showIcon message={formError} />}
 

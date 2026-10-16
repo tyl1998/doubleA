@@ -77,7 +77,10 @@ export const NAV_ITEMS: readonly NavItem[] = [
   // ⚠️ 为什么必须拆而不是"留一条、另一条走头像菜单"：`serialForPath` 的读数来自 `matchNavItem`，
   // 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
   { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
-  { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池', adminOnly: true },
+  // ⚠️ P1-13：模型池**不再 adminOnly** —— `/api/model-providers/**` 与 `/api/models/**` 已从
+  // `requireAdmin` 改成 `requireAuth` + **行级**权限：ADMIN 看全部，其他人看/管"公开 + 自己的 +
+  // 分享给自己的"。故它对任何登录用户都可见（`03` §三 原话的"模型池仅 ADMIN"已被本批取代）。
+  { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池' },
   // 出网策略（egress 黑白名单；平台级，仅 ADMIN）—— 排在模型池之后
   { code: 'EG', label: '出网策略', path: ADMIN_EGRESS_PATH, serial: 'S-07d · 出网', adminOnly: true },
 ] as const

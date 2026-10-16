@@ -19,6 +19,8 @@ export const ERROR_CODES = [
   'NOT_FOUND',
   /** 409 — 状态冲突（并发发送、重复创建、首登未改密等） */
   'CONFLICT',
+  /** 422 — 语义不可处理：可见性闭包校验失败（公开资产引用了私有资产，P1-13） */
+  'UNPROCESSABLE',
   /** 429 — 资源繁忙（并发闸打满、队列满） */
   'BUSY',
   /** 424 — 缺凭据：MCP server 需用户配置凭据但尚未配置（`02` §九） */
@@ -40,6 +42,7 @@ export const HTTP_STATUS_BY_ERROR_CODE: Readonly<Record<ErrorCode, number>> = {
   FORBIDDEN: 403,
   NOT_FOUND: 404,
   CONFLICT: 409,
+  UNPROCESSABLE: 422,
   BUSY: 429,
   NEED_CREDENTIAL: 424,
   UPSTREAM_ERROR: 502,
@@ -54,6 +57,7 @@ export const DEFAULT_MESSAGE_BY_ERROR_CODE: Readonly<Record<ErrorCode, string>> 
   FORBIDDEN: '没有权限执行该操作',
   NOT_FOUND: '资源不存在',
   CONFLICT: '操作与当前状态冲突',
+  UNPROCESSABLE: '该操作会使公开资产引用到私有资产，请先处理引用',
   BUSY: '当前请求过多，请稍后重试',
   NEED_CREDENTIAL: '尚未配置所需凭据',
   UPSTREAM_ERROR: '上游服务返回异常',
@@ -90,6 +94,9 @@ export class AppError extends Error {
   }
   static conflict(message?: string, data?: unknown): AppError {
     return new AppError('CONFLICT', message, data)
+  }
+  static unprocessable(message?: string, data?: unknown): AppError {
+    return new AppError('UNPROCESSABLE', message, data)
   }
   static busy(message?: string, data?: unknown): AppError {
     return new AppError('BUSY', message, data)

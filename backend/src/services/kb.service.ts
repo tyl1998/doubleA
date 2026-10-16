@@ -38,9 +38,17 @@
 
 import {
   AppError,
+  assetVisibilityWhere,
+  audienceIsEmpty,
+  canEditAsset,
+  canViewAsset,
   CAPTION_MODEL_MUST_SUPPORT_VISION_HINT,
   DEFAULT_RETRIEVAL_CONFIG,
+  normalizeAudienceInput,
   normalizeRetrievalConfig,
+  type AgentAudience,
+  type AssetViewer,
+  type AssetVisibility,
   type CreateKnowledgeBaseBody,
   type KnowledgeBaseItem,
   type ListKnowledgeBasesQuery,
@@ -93,6 +101,12 @@ const KB_SELECT = {
   // 图片描述模型（P1-11）：只取展示需要的 label（模型被删时关系为 null ⇒ captionModelName 为 null）
   captionModelId: true,
   captionModelRef: { select: { label: true } },
+  // P1-13：所属人 + 可见性（判权与列表过滤）
+  createdBy: true,
+  visibility: true,
+  creator: { select: { username: true, nickname: true } },
+  // P1-18.x：受众主体（仅 `visibility=SHARED` 时有行）—— 用于回显与 `SHARED` 可见性判定
+  audiences: { select: { subjectType: true, subjectId: true } },
 } as const
 
 type KnowledgeBaseRow = {
@@ -116,6 +130,10 @@ type KnowledgeBaseRow = {
   } | null
   captionModelId: string | null
   captionModelRef: { label: string } | null
+  createdBy: string
+  visibility: AssetVisibility
+  creator: { username: string; nickname: string | null }
+  audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[]
 }
 
 /**
@@ -152,6 +170,13 @@ function hasPrismaCode(error: unknown, code: string): boolean {
     'code' in error &&
     (error as { code: unknown }).code === code
   )
+}
+
+/** 两个字符串集合是否相同（受众比对用；与 `agent.service` 同款，忽略顺序） */
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  const set = new Set(a)
+  return b.every((item) => set.has(item))
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -231,6 +256,8 @@ function snapshotDefaults(): {
 function toItem(
   row: KnowledgeBaseRow,
   counts: { documentCount: number; agentCount: number },
+  viewer: AssetViewer,
+  audience: AgentAudience,
 ): KnowledgeBaseItem {
   return {
     id: row.id,
@@ -256,8 +283,133 @@ function toItem(
     retrievalConfig: normalizeRetrievalConfig(row.retrievalConfig),
     documentCount: counts.documentCount,
     agentCount: counts.agentCount,
+    createdBy: row.createdBy,
+    creatorName: row.creator.nickname ?? row.creator.username,
+    // P1-18.x：知识库 2026-10-16 起支持三档（私有 / 指定用户 / 公开），与 Agent 一致
+    visibility: row.visibility,
+    audience,
+    canEdit: canEditAsset({ ownerId: row.createdBy }, viewer),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+  }
+}
+
+/** 空受众（非 `SHARED` / 无受众行的知识库） */
+function emptyAudience(): AgentAudience {
+  return { users: [], groups: [] }
+}
+
+/** 行里的受众主体 → `canViewAsset` 要的命中信息（`audienceUserIds` / `audienceGroupIds`） */
+function audienceHitOf(row: { audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[] }): {
+  audienceUserIds: string[]
+  audienceGroupIds: string[]
+} {
+  return {
+    audienceUserIds: row.audiences.filter((a) => a.subjectType === 'USER').map((a) => a.subjectId),
+    audienceGroupIds: row.audiences.filter((a) => a.subjectType === 'GROUP').map((a) => a.subjectId),
+  }
+}
+
+/**
+ * 把若干知识库行的受众主体**批量**解析成带名字的 {@link AgentAudience}
+ * （与 `agent.service.ts#loadAudiences` 同构：一次查用户表、一次查组表，避免 N+1）。
+ *
+ * 返回 `Map<kbId, AgentAudience>`（无受众的库不在 map 里，调用方 `?? emptyAudience()`）。
+ */
+async function loadKbAudiences(
+  rows: { id: string; audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[] }[],
+): Promise<Map<string, AgentAudience>> {
+  const userIds = new Set<string>()
+  const groupIds = new Set<string>()
+  for (const row of rows) {
+    for (const a of row.audiences) {
+      if (a.subjectType === 'USER') userIds.add(a.subjectId)
+      else groupIds.add(a.subjectId)
+    }
+  }
+  if (userIds.size === 0 && groupIds.size === 0) return new Map()
+
+  const db = getPrisma()
+  const [users, groups] = await Promise.all([
+    userIds.size === 0
+      ? Promise.resolve([])
+      : db.user.findMany({
+          where: { id: { in: [...userIds] } },
+          select: { id: true, username: true, nickname: true },
+        }),
+    groupIds.size === 0
+      ? Promise.resolve([])
+      : db.userGroup.findMany({ where: { id: { in: [...groupIds] } }, select: { id: true, name: true } }),
+  ])
+  const userName = new Map(users.map((u) => [u.id, u.nickname ?? u.username]))
+  const groupName = new Map(groups.map((g) => [g.id, g.name]))
+
+  const out = new Map<string, AgentAudience>()
+  for (const row of rows) {
+    const usersList: AgentAudience['users'] = []
+    const groupsList: AgentAudience['groups'] = []
+    for (const a of row.audiences) {
+      if (a.subjectType === 'USER') {
+        const name = userName.get(a.subjectId)
+        // 指向已硬删用户的孤儿行：读取端**跳过**（不因脏行 500，与 agent.service 同款）
+        if (name !== undefined) usersList.push({ id: a.subjectId, name })
+      } else {
+        const name = groupName.get(a.subjectId)
+        if (name !== undefined) groupsList.push({ id: a.subjectId, name })
+      }
+    }
+    out.set(row.id, { users: usersList, groups: groupsList })
+  }
+  return out
+}
+
+/** 调用者所属的组 id 集合（`SHARED` 的组受众命中判据；与 `agent.service` 同款，`requireAuth` 之外无缓存） */
+async function resolveViewerGroupIds(viewer: AssetViewer): Promise<string[]> {
+  if (viewer.role === 'ADMIN') return []
+  const rows = await getPrisma().userGroupMember.findMany({
+    where: { userId: viewer.id },
+    select: { groupId: true },
+  })
+  return rows.map((row) => row.groupId)
+}
+
+/** 归一化后的受众 → `knowledge_base_audiences` 待写行（服务层唯一入口） */
+function audienceRows(audience: { userIds: string[]; groupIds: string[] }): {
+  subjectType: 'USER' | 'GROUP'
+  subjectId: string
+}[] {
+  return [
+    ...audience.userIds.map((id) => ({ subjectType: 'USER' as const, subjectId: id })),
+    ...audience.groupIds.map((id) => ({ subjectType: 'GROUP' as const, subjectId: id })),
+  ]
+}
+
+/**
+ * 校验受众主体**真实存在**（`subject_id` 是多态、无 FK ⇒ 只能服务层查）。
+ *
+ * ⚠️ 用户要求 `status='ACTIVE'`（停用用户不该成为"被分享者"）；组只看存在性。
+ * 与 `agent.service#assertAudienceSubjectsExist` 同款（不抽公共模块是为了不动已验收的 Agent 路径）。
+ */
+async function assertAudienceSubjectsExist(audience: { userIds: string[]; groupIds: string[] }): Promise<void> {
+  const db = getPrisma()
+  const [users, groups] = await Promise.all([
+    audience.userIds.length === 0
+      ? Promise.resolve([])
+      : db.user.findMany({
+          where: { id: { in: audience.userIds }, status: 'ACTIVE' },
+          select: { id: true },
+        }),
+    audience.groupIds.length === 0
+      ? Promise.resolve([])
+      : db.userGroup.findMany({ where: { id: { in: audience.groupIds } }, select: { id: true } }),
+  ])
+  const missingUsers = audience.userIds.filter((id) => !users.some((u) => u.id === id))
+  if (missingUsers.length > 0) {
+    throw AppError.validation(`受众里这些用户不存在或不是有效（ACTIVE）用户：${missingUsers.join('、')}`)
+  }
+  const missingGroups = audience.groupIds.filter((id) => !groups.some((g) => g.id === id))
+  if (missingGroups.length > 0) {
+    throw AppError.validation(`受众里这些用户组不存在：${missingGroups.join('、')}`)
   }
 }
 
@@ -286,18 +438,24 @@ async function countsOf(id: string): Promise<{ documentCount: number; agentCount
  */
 export async function listKnowledgeBases(
   query: ListKnowledgeBasesQuery,
+  viewer: AssetViewer,
 ): Promise<OffsetPage<KnowledgeBaseItem>> {
   const db = getPrisma()
 
+  // P1-13 / P1-18.x：按"对我可见"过滤（`PUBLIC` + 自己的 + `SHARED` 且受众命中我的；
+  // ADMIN 见全部）。组受众要靠"我所在的组集合"判 ⇒ 先解析一次。
+  const viewerGroupIds = await resolveViewerGroupIds(viewer)
+  const where = assetVisibilityWhere({ ...viewer, groupIds: viewerGroupIds }, { withAudience: true })
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位
   const [rows, total] = await db.$transaction([
     db.knowledgeBase.findMany({
+      where,
       select: { ...KB_SELECT, _count: { select: { documents: true } } },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       skip: query.offset,
       take: query.limit,
     }),
-    db.knowledgeBase.count(),
+    db.knowledgeBase.count({ where }),
   ])
 
   // 一次 groupBy 拿到整页的 agent 引用数（`component_type=KNOWLEDGE` 才可能指向知识库）
@@ -312,9 +470,17 @@ export async function listKnowledgeBases(
         })
   const agentCountByRef = new Map(agentCounts.map((row) => [row.refId, row._count._all]))
 
+  // 受众名字批量解析（一次查用户表 + 一次查组表，避免逐行 N+1）
+  const audiences = await loadKbAudiences(rows)
+
   return {
     items: rows.map((row) =>
-      toItem(row, { documentCount: row._count.documents, agentCount: agentCountByRef.get(row.id) ?? 0 }),
+      toItem(
+        row,
+        { documentCount: row._count.documents, agentCount: agentCountByRef.get(row.id) ?? 0 },
+        viewer,
+        audiences.get(row.id) ?? emptyAudience(),
+      ),
     ),
     total,
     offset: query.offset,
@@ -327,11 +493,22 @@ export async function listKnowledgeBases(
  *
  * @throws {AppError} `NOT_FOUND`(404)
  */
-export async function getKnowledgeBase(id: string): Promise<KnowledgeBaseItem> {
+export async function getKnowledgeBase(id: string, viewer: AssetViewer): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const row = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
   if (row === null) throw AppError.notFound('知识库不存在')
-  return toItem(row, await countsOf(id))
+  // P1-13 / P1-18.x：私有库对他人 **404**；`SHARED` 要看受众是否命中（含我所在的组）
+  const viewerGroupIds = await resolveViewerGroupIds(viewer)
+  if (
+    !canViewAsset(
+      { ownerId: row.createdBy, visibility: row.visibility, ...audienceHitOf(row) },
+      { ...viewer, groupIds: viewerGroupIds },
+    )
+  ) {
+    throw AppError.notFound('知识库不存在')
+  }
+  const audiences = await loadKbAudiences([row])
+  return toItem(row, await countsOf(id), viewer, audiences.get(row.id) ?? emptyAudience())
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -359,8 +536,12 @@ interface EmbeddingSnapshot {
  *
  * @throws {AppError} 模型不可用（`resolveEmbeddingTarget`） / `VALIDATION`(400) 维度探测失败
  */
-async function resolveEmbeddingSnapshot(modelId: string): Promise<EmbeddingSnapshot> {
-  const target = await resolveEmbeddingTarget(modelId)
+async function resolveEmbeddingSnapshot(
+  modelId: string,
+  subjectUserId: string | null,
+): Promise<EmbeddingSnapshot> {
+  // P1-18：embedding 上游凭据的**主语 = 知识库所属人**（`PER_USER` 模式的 Provider 取他的 Key）
+  const target = await resolveEmbeddingTarget(modelId, subjectUserId)
   let embeddingDim = target.embeddingDim
   if (embeddingDim === null) {
     try {
@@ -441,15 +622,30 @@ async function resolveCaptionModelId(modelId: string | null | undefined): Promis
  */
 export async function createKnowledgeBase(
   input: CreateKnowledgeBaseBody,
+  viewer: AssetViewer,
 ): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const defaults = snapshotDefaults()
 
   // 解析建库时**选定**的 embedding 模型 → `{ embeddingModel, embeddingModelId, embeddingDim }`
-  const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId)
+  const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId, viewer.id)
   const { embeddingModel, embeddingDim } = snapshot
   // 可选的图片描述模型（P1-11）：不选则 null（该库不产出图片描述）
   const captionModelId = await resolveCaptionModelId(input.captionModelId)
+
+  // P1-13 / P1-18.x：所选 embedding/caption 模型必须**对我可用**（所属人 / ADMIN）
+  const visibility: AssetVisibility = input.visibility ?? 'PRIVATE'
+  const audience = normalizeAudienceInput(input.audience)
+  if (visibility === 'SHARED') {
+    if (audienceIsEmpty(audience)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+    await assertAudienceSubjectsExist(audience)
+  }
+  await assertKbModelsAccessible(
+    [snapshot.embeddingModelId, captionModelId].filter((id): id is string => id !== null),
+    viewer,
+  )
 
   const chunkSize = input.chunkSize ?? defaults.chunkSize
   const chunkOverlap = input.chunkOverlap ?? defaults.chunkOverlap
@@ -469,16 +665,54 @@ export async function createKnowledgeBase(
       chunkSize,
       chunkOverlap,
       retrievalConfig,
+      createdBy: viewer.id,
+      visibility,
+      // 受众（仅 SHARED）：一次建行，整体写入
+      ...(visibility === 'SHARED' ? { audiences: { create: audienceRows(audience) } } : {}),
     },
     select: KB_SELECT,
   })
 
   getLogger().info(
-    { kbId: created.id, name: created.name, embeddingModel, embeddingDim, captionModelId, chunkSize, chunkOverlap },
+    {
+      kbId: created.id,
+      name: created.name,
+      embeddingModel,
+      embeddingDim,
+      captionModelId,
+      chunkSize,
+      chunkOverlap,
+      visibility,
+      audienceSize: audience.userIds.length + audience.groupIds.length,
+    },
     '已创建知识库',
   )
   // 刚建的库必然 0 文档 0 引用，不必再查库（也避免"建完立刻查"这一对多余的往返）
-  return toItem(created, { documentCount: 0, agentCount: 0 })
+  const audiences = await loadKbAudiences([created])
+  return toItem(created, { documentCount: 0, agentCount: 0 }, viewer, audiences.get(created.id) ?? emptyAudience())
+}
+
+/**
+ * P1-18：校验"这批 embedding/caption 模型对我**有权使用**"（所属人 / ADMIN）。
+ *
+ * ⚠️ Provider 无可见范围、无定向分享 ⇒ "可用"= 我对该 Provider 有权（所属人 / ADMIN）。
+ * 模型只能通过 Agent / 知识库被使用，这里判的是"我能不能把它选进**我**的库"。
+ */
+async function assertKbModelsAccessible(modelIds: string[], viewer: AssetViewer): Promise<void> {
+  const ids = [...new Set(modelIds)]
+  if (ids.length === 0) return
+  const rows = await getPrisma().model.findMany({
+    where: { id: { in: ids } },
+    select: {
+      id: true,
+      label: true,
+      provider: { select: { createdBy: true } },
+    },
+  })
+  for (const row of rows) {
+    const usable = viewer.role === 'ADMIN' || row.provider.createdBy === viewer.id
+    if (!usable) throw AppError.notFound(`所选模型对你不可用：${row.label}`)
+  }
 }
 
 /**
@@ -525,10 +759,15 @@ function assertChunkWindow(chunkSize: number, chunkOverlap: number): void {
 export async function updateKnowledgeBase(
   id: string,
   input: UpdateKnowledgeBaseBody,
+  viewer: AssetViewer,
 ): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const current = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
   if (current === null) throw AppError.notFound('知识库不存在')
+  // P1-13：先 404 再 403（库 id 本就出现在可见列表里，藏不住也不必藏）
+  if (!canEditAsset({ ownerId: current.createdBy }, viewer)) {
+    throw AppError.forbidden('只有该知识库的所属人或管理员可以修改它')
+  }
 
   const chunkSize = input.chunkSize ?? current.chunkSize
   const chunkOverlap = input.chunkOverlap ?? current.chunkOverlap
@@ -544,7 +783,7 @@ export async function updateKnowledgeBase(
   // ⚠️ 例外：**空库**没有任何旧向量可重建 ⇒ 快照直接跟进，否则会留下一条"需重建"的假告警。
   let embeddingPatch: { embeddingModelId?: string; embeddingDim?: number; embeddingModel?: string } = {}
   if (input.embeddingModelId !== undefined && input.embeddingModelId !== current.embeddingModelId) {
-    const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId)
+    const snapshot = await resolveEmbeddingSnapshot(input.embeddingModelId, current.createdBy)
     const documentCount = await db.document.count({ where: { kbId: id } })
     embeddingPatch = {
       embeddingModelId: snapshot.embeddingModelId,
@@ -560,23 +799,121 @@ export async function updateKnowledgeBase(
     captionPatch = { captionModelId: await resolveCaptionModelId(input.captionModelId) }
   }
 
-  const updated = await db.knowledgeBase.update({
-    where: { id },
-    data: {
-      ...(input.name === undefined ? {} : { name: input.name }),
-      // `null` 是"清空"，`undefined` 是"不动" —— 必须用 `!== undefined` 判，不能真值判断
-      ...(input.description === undefined ? {} : { description: input.description }),
-      chunkSize,
-      chunkOverlap,
-      retrievalConfig,
-      ...embeddingPatch,
-      ...captionPatch,
-    },
-    select: KB_SELECT,
+  // P1-13：**仅当本次改了可见性或换了模型**时校验"模型对我可用"。刻意不在"纯改名"时重跑：
+  // 否则转移所属人后，新所属人连改名都会被挡。
+  const effectiveModelIds = [
+    embeddingPatch.embeddingModelId ?? current.embeddingModelId,
+    captionPatch.captionModelId !== undefined ? captionPatch.captionModelId : current.captionModelId,
+  ].filter((modelId): modelId is string => modelId !== null && modelId !== undefined)
+  if (input.embeddingModelId !== undefined || input.captionModelId !== undefined) {
+    await assertKbModelsAccessible(effectiveModelIds, viewer)
+  }
+
+  // P1-18.x：可见范围 × 受众（合并库里现状后判定）。与 `agent.service` 同口径：
+  //   · 给了 audience ⇒ 目标可见性必须是 SHARED，且非空、主体存在；
+  //   · 目标可见性是 SHARED 但没给 audience ⇒ 沿用现有（现有为空则拒绝，维持"SHARED 必有受众"）；
+  //   · 目标可见性非 SHARED ⇒ 清空受众（audienceChanged = true）。
+  const nextVisibility: AssetVisibility = input.visibility ?? current.visibility
+  const currentAudience = {
+    userIds: current.audiences.filter((a) => a.subjectType === 'USER').map((a) => a.subjectId),
+    groupIds: current.audiences.filter((a) => a.subjectType === 'GROUP').map((a) => a.subjectId),
+  }
+  let nextAudience = currentAudience
+  let audienceChanged = false
+  if (input.audience !== undefined) {
+    if (nextVisibility !== 'SHARED') {
+      throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+    }
+    const normalized = normalizeAudienceInput(input.audience)
+    if (audienceIsEmpty(normalized)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+    await assertAudienceSubjectsExist(normalized)
+    nextAudience = normalized
+    audienceChanged =
+      !sameStringSet(currentAudience.userIds, normalized.userIds) ||
+      !sameStringSet(currentAudience.groupIds, normalized.groupIds)
+  } else if (nextVisibility === 'SHARED') {
+    if (audienceIsEmpty(currentAudience)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+  } else if (!audienceIsEmpty(currentAudience)) {
+    audienceChanged = true
+  }
+
+  const updated = await db.$transaction(async (tx) => {
+    await tx.knowledgeBase.update({
+      where: { id },
+      data: {
+        ...(input.name === undefined ? {} : { name: input.name }),
+        // `null` 是"清空"，`undefined` 是"不动" —— 必须用 `!== undefined` 判，不能真值判断
+        ...(input.description === undefined ? {} : { description: input.description }),
+        chunkSize,
+        chunkOverlap,
+        retrievalConfig,
+        ...embeddingPatch,
+        ...captionPatch,
+        ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
+      },
+    })
+    // 受众有变化才重写（整体替换：删旧行 + 建新行）—— 没变则一行都不动
+    if (audienceChanged) {
+      await tx.knowledgeBaseAudience.deleteMany({ where: { knowledgeBaseId: id } })
+      if (nextVisibility === 'SHARED') {
+        await tx.knowledgeBaseAudience.createMany({
+          data: audienceRows(nextAudience).map((row) => ({ knowledgeBaseId: id, ...row })),
+          skipDuplicates: true,
+        })
+      }
+    }
+    return tx.knowledgeBase.findUniqueOrThrow({ where: { id }, select: KB_SELECT })
   })
 
-  getLogger().info({ kbId: id, changed: Object.keys(input) }, '已更新知识库')
-  return toItem(updated, await countsOf(id))
+  getLogger().info(
+    { kbId: id, changed: Object.keys(input), audienceChanged, visibility: nextVisibility },
+    '已更新知识库',
+  )
+  const audiences = await loadKbAudiences([updated])
+  return toItem(updated, await countsOf(id), viewer, audiences.get(updated.id) ?? emptyAudience())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 转移所属人（P1-13，`子方案` §3.5）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 转移知识库所属人（`POST /api/knowledge-bases/:id/transfer`，**所属人或 ADMIN**）。
+ * 口径同 `agent.service.ts#transferAgent`（接收方须 ACTIVE、不能转给自己、无需接收方确认）。
+ */
+export async function transferKnowledgeBase(
+  id: string,
+  toUserId: string,
+  viewer: AssetViewer,
+): Promise<KnowledgeBaseItem> {
+  const db = getPrisma()
+  const target = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
+  if (target === null) throw AppError.notFound('知识库不存在')
+  if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
+    throw AppError.forbidden('只有该知识库的所属人或管理员可以转移它')
+  }
+  if (toUserId === target.createdBy) {
+    throw AppError.validation('接收人已经是该知识库的所属人，无需转移')
+  }
+  const newOwner = await db.user.findUnique({
+    where: { id: toUserId },
+    select: { id: true, status: true },
+  })
+  if (newOwner === null || newOwner.status !== 'ACTIVE') {
+    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+  }
+  const updated = await db.knowledgeBase.update({
+    where: { id },
+    data: { createdBy: toUserId },
+    select: KB_SELECT,
+  })
+  getLogger().info({ kbId: id, from: target.createdBy, to: toUserId }, '已转移知识库所属人')
+  const audiences = await loadKbAudiences([updated])
+  return toItem(updated, await countsOf(id), viewer, audiences.get(updated.id) ?? emptyAudience())
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -624,7 +961,10 @@ export async function updateKnowledgeBase(
  *   embedding 模型/维度（早期建的库）、或目标模型不可用（停用/删除） /
  *   `INTERNAL`(500) 全部入队失败（队列不可用）
  */
-export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledgeBaseResult> {
+export async function rebuildKnowledgeBase(
+  id: string,
+  viewer: AssetViewer,
+): Promise<RebuildKnowledgeBaseResult> {
   const db = getPrisma()
   const logger = getLogger()
 
@@ -633,6 +973,7 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
     select: {
       id: true,
       name: true,
+      createdBy: true,
       embeddingModel: true,
       embeddingModelId: true,
       embeddingDim: true,
@@ -640,6 +981,10 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
     },
   })
   if (kb === null) throw AppError.notFound('知识库不存在')
+  // P1-13：重建属"编"（会重写整库索引），仅所属人 / ADMIN
+  if (!canEditAsset({ ownerId: kb.createdBy }, viewer)) {
+    throw AppError.forbidden('只有该知识库的所属人或管理员可以重建它的索引')
+  }
 
   // 入库/检索都离不开"这个库选定的模型 + 维度快照"（worker 用它们构造 provider）。
   // 老库可能缺其一 ⇒ 早失败并给可操作文案，而不是投一批注定 FAILED 的 job
@@ -658,7 +1003,7 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
   //    ⚠️ 必须用它的维度、而不是 `kb.embeddingDim` 那个可能已过期的快照 —— 用户实测：
   //    在模型池把 embedding 模型改名后，KB 快照仍是旧维度（2048），worker 拿它构造 provider，
   //    上游返回 4096 维 ⇒ 每篇都报"上游返回 N 维与期望 M 维不一致"整库失败。
-  const snapshot = await resolveEmbeddingSnapshot(kb.embeddingModelId)
+  const snapshot = await resolveEmbeddingSnapshot(kb.embeddingModelId, kb.createdBy)
 
   // ② **维度快照必须先刷新**（worker 读的就是它；见 `worker.ts` 的 `row.kb.embeddingDim`）。
   //    放在入队之前，worker 取到 job 时用的就是新维度。任意维度都能重建：`chunks.embedding`
@@ -736,13 +1081,20 @@ export async function rebuildKnowledgeBase(id: string): Promise<RebuildKnowledge
  *
  * @throws {AppError} `NOT_FOUND`(404) 库不存在
  */
-export async function removeKnowledgeBase(id: string): Promise<RemoveKnowledgeBaseResult> {
+export async function removeKnowledgeBase(
+  id: string,
+  viewer: AssetViewer,
+): Promise<RemoveKnowledgeBaseResult> {
   const db = getPrisma()
   const target = await db.knowledgeBase.findUnique({
     where: { id },
-    select: { id: true, name: true, documents: { select: { fileKey: true } } },
+    select: { id: true, name: true, createdBy: true, documents: { select: { fileKey: true } } },
   })
   if (target === null) throw AppError.notFound('知识库不存在')
+  // P1-13：删 = 仅所属人 / ADMIN
+  if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
+    throw AppError.forbidden('只有该知识库的所属人或管理员可以删除它')
+  }
 
   const fileKeys = target.documents.map((doc) => doc.fileKey)
 

@@ -217,7 +217,7 @@ export async function ensureSandbox(
   //   模型不可用时，容器根本不该被建出来（建了它也只能在容器里失败，而容器内的失败只会以
   //   一条含糊的 stderr 出现，见 `子方案③` §六 3）。这里失败还**没占名额**、没有副作用。
   //   ⚠️ 返回值含明文 Key ⇒ **只往下传给 `buildSandboxContainerSpec`**，不 log（见 `llm.ts` 文件头）。
-  const llm = await resolveSandboxLlm(conversation.agent.modelId)
+  const llm = await resolveSandboxLlm(conversation.agent.modelId, conversation.userId)
   if (!llm.ok) return fail(llm.code, llm.message)
 
   // ① 复用：账本说有 RUNNING 行 **且容器还在跑**（账本会撒谎，Docker 不会）。

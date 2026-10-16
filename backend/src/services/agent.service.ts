@@ -68,11 +68,17 @@
 import {
   AGENT_NAME_MAX_CHARS,
   AppError,
+  audienceIsEmpty,
+  assetVisibilityWhere,
   canEditAgent,
+  canViewAsset,
   normalizeGuideQuestions,
+  normalizeAudienceInput,
+  type AgentAudience,
   type AgentComponentInput,
   type AgentComponentRef,
   type AgentItem,
+  type AssetVisibility,
   type CreateAgentBody,
   type ListAgentsQuery,
   type OffsetPage,
@@ -118,6 +124,7 @@ const AGENT_SELECT = {
   guideQuestions: true,
   modelId: true,
   createdBy: true,
+  visibility: true,
   createdAt: true,
   updatedAt: true,
   deletedAt: true,
@@ -132,6 +139,8 @@ const AGENT_SELECT = {
     },
   },
   creator: { select: { username: true, nickname: true } },
+  // P1-18：受众主体（仅 `visibility=SHARED` 时有行；用户/组两类）。回显与编辑用。
+  audiences: { select: { subjectType: true, subjectId: true } },
 } as const
 
 /** {@link AGENT_SELECT} 的产物形态（手写出来给 {@link toItem} 收窄用） */
@@ -146,6 +155,7 @@ interface AgentRow {
   guideQuestions: unknown
   modelId: string | null
   createdBy: string
+  visibility: AgentItem['visibility']
   createdAt: Date
   updatedAt: Date
   deletedAt: Date | null
@@ -155,6 +165,7 @@ interface AgentRow {
     model: { modelName: string; label: string; enabled: boolean; provider: { enabled: boolean } }
   }[]
   creator: { username: string; nickname: string | null }
+  audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[]
 }
 
 /** 组件绑定的查询字段（列表整页一次查、详情单条查，共用） */
@@ -169,13 +180,95 @@ const COMPONENT_SELECT = {
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 行 + 该行的组件绑定 → 对外形态（**唯一的出口**，见文件头 ② 的"一套投影"）。
+ * 解析调用者所属的**组 id 集合**（P1-18；`SHARED` 受众命中判据需要）。
+ *
+ * 一次查询（`user_group_members` 按 `userId` 取 `groupId`）。`canViewAsset` / `assetVisibilityWhere`
+ * 都靠它判"viewer 是否落在某个组的受众里"。ADMIN 不必解析（它对全部资产可见），但解析也无害 ——
+ * 调用方自行决定是否跳过。
+ */
+async function resolveViewerGroupIds(viewer: AgentViewer): Promise<string[]> {
+  const rows = await getPrisma().userGroupMember.findMany({
+    where: { userId: viewer.id },
+    select: { groupId: true },
+  })
+  return rows.map((row) => row.groupId)
+}
+
+/**
+ * 把若干 Agent 行的受众主体 **批量**解析成带名字的 {@link AgentAudience}（一次查用户表、一次查组表）。
+ *
+ * 为什么批量：列表页一页 20 条，逐条查名字就是 N+1（P0-1-22 对组件绑定已经立过同款规矩）。
+ * 返回 `Map<agentId, AgentAudience>`（无受众的 Agent 不在 map 里，调用方 `?? emptyAudience()`）。
+ */
+async function loadAudiences(
+  rows: { id: string; audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[] }[],
+): Promise<Map<string, AgentAudience>> {
+  const userIds = new Set<string>()
+  const groupIds = new Set<string>()
+  for (const row of rows) {
+    for (const a of row.audiences) {
+      if (a.subjectType === 'USER') userIds.add(a.subjectId)
+      else groupIds.add(a.subjectId)
+    }
+  }
+  if (userIds.size === 0 && groupIds.size === 0) return new Map()
+
+  const db = getPrisma()
+  const [users, groups] = await Promise.all([
+    userIds.size === 0
+      ? Promise.resolve([])
+      : db.user.findMany({
+          where: { id: { in: [...userIds] } },
+          select: { id: true, username: true, nickname: true },
+        }),
+    groupIds.size === 0
+      ? Promise.resolve([])
+      : db.userGroup.findMany({
+          where: { id: { in: [...groupIds] } },
+          select: { id: true, name: true },
+        }),
+  ])
+  const userName = new Map(users.map((u) => [u.id, u.nickname ?? u.username]))
+  const groupName = new Map(groups.map((g) => [g.id, g.name]))
+
+  const out = new Map<string, AgentAudience>()
+  for (const row of rows) {
+    const usersList: AgentAudience['users'] = []
+    const groupsList: AgentAudience['groups'] = []
+    for (const a of row.audiences) {
+      if (a.subjectType === 'USER') {
+        const name = userName.get(a.subjectId)
+        // 指向已硬删用户的孤儿行：读取端**跳过**（不因脏行 500，与 normalizeGuideQuestions 同族口径）
+        if (name !== undefined) usersList.push({ id: a.subjectId, name })
+      } else {
+        const name = groupName.get(a.subjectId)
+        if (name !== undefined) groupsList.push({ id: a.subjectId, name })
+      }
+    }
+    out.set(row.id, { users: usersList, groups: groupsList })
+  }
+  return out
+}
+
+/** 空受众（非 `SHARED` / 无受众行的 Agent） */
+function emptyAudience(): AgentAudience {
+  return { users: [], groups: [] }
+}
+
+/**
+ * 行 + 该行的组件绑定 + 受众 → 对外形态（**唯一的出口**，见文件头 ② 的"一套投影"）。
  *
  * @param viewer 当前调用者 —— `canEdit` 由 {@link canEditAgent} 现算，不查库也不缓存：
  *   它是给界面用的提示，服务端每次请求都会重新判（把"能不能"与"允不允许"混成一个字段
  *   是最典型的越权来源）。
+ * @param audience 受众回显（由 {@link loadAudiences} 批量解析后传入；非 `SHARED` 传空）
  */
-function toItem(row: AgentRow, components: AgentComponentRef[], viewer: AgentViewer): AgentItem {
+function toItem(
+  row: AgentRow,
+  components: AgentComponentRef[],
+  viewer: AgentViewer,
+  audience: AgentAudience,
+): AgentItem {
   return {
     id: row.id,
     name: row.name,
@@ -193,7 +286,9 @@ function toItem(row: AgentRow, components: AgentComponentRef[], viewer: AgentVie
     // 改绑也走同一段校验，所以库里不可能出现"绑着 EMBEDDING 模型"的智能体）。
     // **未绑定模型**（被删模型商/删模型解绑后 model 为 null）恒为 false —— 前端据此提示重新绑定。
     modelAvailable: row.model !== null && row.model.enabled && row.model.provider.enabled,
-    // 模型池投影：与默认模型同口径算 available（停用的留在池里、置灰，不凭空消失）
+    // 模型池投影：与默认模型同口径算 available（停用的留在池里、置灰，不凭空消失）。
+    // ⚠️ P1-18：Provider 无可见性 ⇒ **不按可见性过滤池**（能用这个 Agent 就能用它的池；
+    // 池里的 Provider 通过"你能用的 Agent"被揭示）。
     models: row.pool.map((entry) => ({
       modelId: entry.modelId,
       modelName: entry.model.modelName,
@@ -202,6 +297,8 @@ function toItem(row: AgentRow, components: AgentComponentRef[], viewer: AgentVie
     })),
     createdBy: row.createdBy,
     creatorName: row.creator.nickname ?? row.creator.username,
+    visibility: row.visibility,
+    audience,
     canEdit: canEditAgent(row, viewer),
     components,
     createdAt: row.createdAt.toISOString(),
@@ -239,27 +336,36 @@ export async function listAgents(
   viewer: AgentViewer,
 ): Promise<OffsetPage<AgentItem>> {
   const db = getPrisma()
+  // P1-18：列表按"对我可见"过滤（`PUBLIC` + 我的 + `SHARED` 且受众命中我；ADMIN 见全部）。软删恒排除。
+  // 受众含组 ⇒ 先解析调用者的组集合，再拼 `where`（见 `assetVisibilityWhere`）。
+  const groupIds = await resolveViewerGroupIds(viewer)
+  const where = {
+    deletedAt: null,
+    ...assetVisibilityWhere({ ...viewer, groupIds }, { withAudience: true }),
+  }
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位
   const [rows, total] = await db.$transaction([
     db.agent.findMany({
-      where: { deletedAt: null },
+      where,
       select: AGENT_SELECT,
       orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
       skip: query.offset,
       take: query.limit,
     }),
-    db.agent.count({ where: { deletedAt: null } }),
+    db.agent.count({ where }),
   ])
 
   const ids = rows.map((row) => row.id)
-  const componentRows =
+  const [componentRows, audiences] = await Promise.all([
     ids.length === 0
-      ? []
-      : await db.agentComponent.findMany({
+      ? Promise.resolve([])
+      : db.agentComponent.findMany({
           where: { agentId: { in: ids } },
           select: COMPONENT_SELECT,
           orderBy: [{ componentType: 'asc' }, { refId: 'asc' }],
-        })
+        }),
+    loadAudiences(rows),
+  ])
   const byAgent = new Map<string, AgentComponentRef[]>()
   for (const row of componentRows) {
     const list = byAgent.get(row.agentId) ?? []
@@ -268,7 +374,9 @@ export async function listAgents(
   }
 
   return {
-    items: rows.map((row) => toItem(row, byAgent.get(row.id) ?? [], viewer)),
+    items: rows.map((row) =>
+      toItem(row, byAgent.get(row.id) ?? [], viewer, audiences.get(row.id) ?? emptyAudience()),
+    ),
     total,
     offset: query.offset,
     limit: query.limit,
@@ -291,7 +399,75 @@ export async function getAgent(id: string, viewer: AgentViewer): Promise<AgentIt
     select: AGENT_SELECT,
   })
   if (row === null) throw AppError.notFound('智能体不存在')
-  return toItem(row, await componentsOf(id), viewer)
+  // P1-18：私有/指定用户 Agent 对受众外的人**404**（不泄漏存在性）—— 与列表过滤同判据（`canViewAsset`）
+  const groupIds = await resolveViewerGroupIds(viewer)
+  if (
+    !canViewAsset(
+      {
+        ownerId: row.createdBy,
+        visibility: row.visibility,
+        deletedAt: row.deletedAt,
+        ...audienceHitOf(row),
+      },
+      { ...viewer, groupIds },
+    )
+  ) {
+    throw AppError.notFound('智能体不存在')
+  }
+  const audiences = await loadAudiences([row])
+  return toItem(row, await componentsOf(id), viewer, audiences.get(row.id) ?? emptyAudience())
+}
+
+/** 从行的受众主体里抽 `canViewAsset` 需要的两个 id 集合 */
+function audienceHitOf(row: { audiences: { subjectType: 'USER' | 'GROUP'; subjectId: string }[] }): {
+  audienceUserIds: string[]
+  audienceGroupIds: string[]
+} {
+  return {
+    audienceUserIds: row.audiences.filter((a) => a.subjectType === 'USER').map((a) => a.subjectId),
+    audienceGroupIds: row.audiences.filter((a) => a.subjectType === 'GROUP').map((a) => a.subjectId),
+  }
+}
+
+/** 归一化后的受众 → `agent_audiences` 待写行（服务层唯一入口） */
+function audienceRows(audience: { userIds: string[]; groupIds: string[] }): {
+  subjectType: 'USER' | 'GROUP'
+  subjectId: string
+}[] {
+  return [
+    ...audience.userIds.map((id) => ({ subjectType: 'USER' as const, subjectId: id })),
+    ...audience.groupIds.map((id) => ({ subjectType: 'GROUP' as const, subjectId: id })),
+  ]
+}
+
+/**
+ * 校验受众主体存在：用户须为 `ACTIVE`、组须存在 —— 否则 **400**（指明是哪一类不存在）。
+ *
+ * ⚠️ `agent_audiences.subject_id` 是**多态外键、无 FK**（同 `agent_components.ref_id`）：写进去
+ * 一个不存在的 id，就是一条"永远命不中任何人"的受众行（用户界面上却显示"已选 1 个组"）。
+ * 所以这里**必须先查再写**，把静默的脏行变成显式报错。
+ */
+async function assertAudienceSubjectsExist(audience: { userIds: string[]; groupIds: string[] }): Promise<void> {
+  const db = getPrisma()
+  const [users, groups] = await Promise.all([
+    audience.userIds.length === 0
+      ? Promise.resolve([])
+      : db.user.findMany({
+          where: { id: { in: audience.userIds }, status: 'ACTIVE' },
+          select: { id: true },
+        }),
+    audience.groupIds.length === 0
+      ? Promise.resolve([])
+      : db.userGroup.findMany({ where: { id: { in: audience.groupIds } }, select: { id: true } }),
+  ])
+  const missingUsers = audience.userIds.filter((id) => !users.some((u) => u.id === id))
+  if (missingUsers.length > 0) {
+    throw AppError.validation(`受众里有不存在或已停用的用户：${missingUsers.join('、')}`)
+  }
+  const missingGroups = audience.groupIds.filter((id) => !groups.some((g) => g.id === id))
+  if (missingGroups.length > 0) {
+    throw AppError.validation(`受众里有不存在的用户组：${missingGroups.join('、')}`)
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -311,7 +487,7 @@ export async function getAgent(id: string, viewer: AgentViewer): Promise<AgentIt
  *
  * @throws {AppError} `NOT_FOUND`(404) / `CONFLICT`(409)
  */
-async function assertChatModelsBindable(modelIds: string[]): Promise<void> {
+async function assertChatModelsBindable(modelIds: string[], viewer: AgentViewer): Promise<void> {
   const unique = [...new Set(modelIds)]
   if (unique.length === 0) return
 
@@ -322,7 +498,13 @@ async function assertChatModelsBindable(modelIds: string[]): Promise<void> {
       modelName: true,
       type: true,
       enabled: true,
-      provider: { select: { name: true, enabled: true } },
+      provider: {
+        select: {
+          name: true,
+          enabled: true,
+          createdBy: true,
+        },
+      },
     },
   })
   const byId = new Map(rows.map((row) => [row.id, row]))
@@ -345,6 +527,12 @@ async function assertChatModelsBindable(modelIds: string[]): Promise<void> {
         `该模型所属的 Provider「${row.provider.name}」已停用，不能绑定。` +
           '请启用该 Provider，或改用其他模型',
       )
+    }
+    // P1-18：Provider 无可见范围、无定向分享 ⇒ 绑定时要求**我对该 Provider 有权使用**
+    // （所属人 / ADMIN）。别人私有的 Provider 我绑不了（要复用请让对方把**引用它的 Agent** 分享给我）。
+    const usable = viewer.role === 'ADMIN' || row.provider.createdBy === viewer.id
+    if (!usable) {
+      throw AppError.notFound(`模型不存在或对你不可用：${row.modelName}`)
     }
   }
 }
@@ -384,7 +572,21 @@ export async function createAgent(
   // （schema 已在"同时给了两者"时校验；只给 modelId 时这里补进去）。
   const pool = [...new Set(input.modelIds ?? [input.modelId])]
   if (!pool.includes(input.modelId)) pool.push(input.modelId)
-  await assertChatModelsBindable(pool)
+  await assertChatModelsBindable(pool, viewer)
+
+  // P1-18：可见范围（可省 ⇒ PRIVATE 安全默认）+ 受众（仅 SHARED 允许）。
+  // ⚠️ 取消可见性闭包：建为 PUBLIC/SHARED **不再**校验引用的组件是否公开（新建无组件，且组件随
+  // Agent 受众可用，见 `assetAcl` 文件头 ①）。
+  const visibility: AssetVisibility = input.visibility ?? 'PRIVATE'
+  const audience = normalizeAudienceInput(input.audience)
+  if (visibility === 'SHARED') {
+    if (audienceIsEmpty(audience)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+    await assertAudienceSubjectsExist(audience)
+  } else if (!audienceIsEmpty(audience)) {
+    throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+  }
 
   const created = await db.agent.create({
     data: {
@@ -399,6 +601,9 @@ export async function createAgent(
       guideQuestions: input.guideQuestions ?? [],
       modelId: input.modelId,
       createdBy: viewer.id,
+      visibility,
+      // 受众一并落库（仅 SHARED；嵌套 create，agentId 由关系自动填）
+      ...(visibility === 'SHARED' ? { audiences: { create: audienceRows(audience) } } : {}),
       // 模型池一并落库（嵌套 create，agentId 由关系自动填）
       pool: { create: pool.map((modelId) => ({ modelId })) },
     },
@@ -406,11 +611,20 @@ export async function createAgent(
   })
 
   getLogger().info(
-    { agentId: created.id, name: created.name, type: created.type, modelId: created.modelId, poolSize: pool.length },
+    {
+      agentId: created.id,
+      name: created.name,
+      type: created.type,
+      modelId: created.modelId,
+      poolSize: pool.length,
+      visibility,
+      audienceSize: audience.userIds.length + audience.groupIds.length,
+    },
     '已创建智能体',
   )
-  // 刚建的必然没有组件绑定，不必再查库
-  return toItem(created, [], viewer)
+  // 刚建的必然没有组件绑定，不必再查库；受众回显按已写入的受众反查（拿到显示名）
+  const audiences = await loadAudiences([created])
+  return toItem(created, [], viewer, audiences.get(created.id) ?? emptyAudience())
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -502,7 +716,7 @@ export async function copyAgent(id: string, viewer: AgentViewer): Promise<AgentI
     },
     '已复制智能体（含模型池与组件绑定）',
   )
-  return toItem(created, components, viewer)
+  return toItem(created, components, viewer, emptyAudience())
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -564,9 +778,41 @@ export async function updateAgent(
   const toValidate = new Set<string>()
   if (newPoolInput !== undefined) newPoolInput.forEach((id) => toValidate.add(id))
   if (defaultChanged && input.modelId !== undefined) toValidate.add(input.modelId)
-  await assertChatModelsBindable([...toValidate])
+  await assertChatModelsBindable([...toValidate], viewer)
 
   const poolChanged = !sameStringSet(currentPool, effectivePool)
+
+  // P1-18：可见范围 × 受众（合并库里现状后判定）。**取消可见性闭包** —— 改 `PUBLIC`/`SHARED`
+  // 不再校验引用的组件是否公开（组件随 Agent 受众可用，见 `assetAcl` 文件头 ①）。
+  const nextVisibility: AssetVisibility = input.visibility ?? target.visibility
+  const currentAudience = {
+    userIds: target.audiences.filter((a) => a.subjectType === 'USER').map((a) => a.subjectId),
+    groupIds: target.audiences.filter((a) => a.subjectType === 'GROUP').map((a) => a.subjectId),
+  }
+  let nextAudience = currentAudience
+  let audienceChanged = false
+  if (input.audience !== undefined) {
+    if (nextVisibility !== 'SHARED') {
+      throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+    }
+    const normalized = normalizeAudienceInput(input.audience)
+    if (audienceIsEmpty(normalized)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+    await assertAudienceSubjectsExist(normalized)
+    nextAudience = normalized
+    audienceChanged =
+      !sameStringSet(currentAudience.userIds, normalized.userIds) ||
+      !sameStringSet(currentAudience.groupIds, normalized.groupIds)
+  } else if (nextVisibility === 'SHARED') {
+    // 改为/已是 SHARED 但本次没给受众 ⇒ 沿用现有；若现有为空则拒绝（不变量：SHARED 必须非空）
+    if (audienceIsEmpty(currentAudience)) {
+      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+    }
+  } else if (!audienceIsEmpty(currentAudience)) {
+    // 改成非 SHARED ⇒ 清空受众
+    audienceChanged = true
+  }
 
   const updated = await db.$transaction(async (tx) => {
     await tx.agent.update({
@@ -580,8 +826,19 @@ export async function updateAgent(
         ...(input.openingRemarks === undefined ? {} : { openingRemarks: input.openingRemarks }),
         ...(input.guideQuestions === undefined ? {} : { guideQuestions: input.guideQuestions }),
         ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
+        ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
       },
     })
+    // 受众有变化才重写（整体替换：删旧行 + 建新行）—— 没变则一行都不动
+    if (audienceChanged) {
+      await tx.agentAudience.deleteMany({ where: { agentId: id } })
+      if (nextVisibility === 'SHARED') {
+        await tx.agentAudience.createMany({
+          data: audienceRows(nextAudience).map((row) => ({ agentId: id, ...row })),
+          skipDuplicates: true,
+        })
+      }
+    }
     // 池有变化才重写（整体替换：删旧行 + 建新行）—— 没变则一行都不动，避免无谓刷新 created_at
     if (poolChanged) {
       await tx.agentModel.deleteMany({ where: { agentId: id } })
@@ -594,10 +851,18 @@ export async function updateAgent(
   })
 
   getLogger().info(
-    { agentId: id, changed: Object.keys(input), poolChanged, poolSize: effectivePool.length },
+    {
+      agentId: id,
+      changed: Object.keys(input),
+      poolChanged,
+      poolSize: effectivePool.length,
+      audienceChanged,
+      visibility: nextVisibility,
+    },
     '已更新智能体',
   )
-  return toItem(updated, await componentsOf(id), viewer)
+  const audiences = await loadAudiences([updated])
+  return toItem(updated, await componentsOf(id), viewer, audiences.get(updated.id) ?? emptyAudience())
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -670,6 +935,53 @@ export async function removeAgent(
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 转移所属人（P1-13，`子方案` §3.5）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 转移智能体所属人（`POST /api/agents/:id/transfer`，**所属人或 ADMIN**）。
+ *
+ * 口径（`子方案` §3.5）：`toUserId` 必须是 `ACTIVE` 用户；**不能转给自己**（已是所属人 ⇒ 400）；
+ * **不需要接收方确认**（用户 2026-10-16 定案）。转移后 `createdBy` 改为新所属人，权限随新所属人。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) / `FORBIDDEN`(403) / `VALIDATION`(400)
+ */
+export async function transferAgent(
+  id: string,
+  toUserId: string,
+  viewer: AgentViewer,
+): Promise<AgentItem> {
+  const db = getPrisma()
+  const target = await db.agent.findFirst({ where: { id, deletedAt: null }, select: AGENT_SELECT })
+  if (target === null) throw AppError.notFound('智能体不存在')
+  if (!canEditAgent(target, viewer)) {
+    throw AppError.forbidden('只有该智能体的所属人或管理员可以转移它')
+  }
+  if (toUserId === target.createdBy) {
+    throw AppError.validation('接收人已经是该智能体的所属人，无需转移')
+  }
+  const newOwner = await db.user.findUnique({
+    where: { id: toUserId },
+    select: { id: true, status: true },
+  })
+  if (newOwner === null || newOwner.status !== 'ACTIVE') {
+    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+  }
+
+  const updated = await db.agent.update({
+    where: { id },
+    data: { createdBy: toUserId },
+    select: AGENT_SELECT,
+  })
+  getLogger().info(
+    { agentId: id, from: target.createdBy, to: toUserId },
+    '已转移智能体所属人',
+  )
+  const audiences = await loadAudiences([updated])
+  return toItem(updated, await componentsOf(id), viewer, audiences.get(updated.id) ?? emptyAudience())
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // 组件绑定（写侧：整体替换，P0-1-23；口径见文件头 ⑥）
 // ═════════════════════════════════════════════════════════════════════
 
@@ -727,7 +1039,10 @@ function sameComponentSet(a: AgentComponentRef[], b: AgentComponentInput[]): boo
  *
  * @throws {AppError} `NOT_FOUND`(404) 引用的知识库或 MCP server 不存在
  */
-async function assertComponentRefsBindable(components: AgentComponentInput[]): Promise<void> {
+async function assertComponentRefsBindable(
+  components: AgentComponentInput[],
+  viewer: AgentViewer,
+): Promise<void> {
   // 去重后再查：同一批里"同一个目标"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
   const refIdsOf = (type: AgentComponentInput['componentType']): string[] => [
     ...new Set(components.filter((item) => item.componentType === type).map((item) => item.refId)),
@@ -737,13 +1052,20 @@ async function assertComponentRefsBindable(components: AgentComponentInput[]): P
   if (knowledgeIds.length === 0 && mcpIds.length === 0) return
 
   const db = getPrisma()
+  const viewerGroupIds = await resolveViewerGroupIds(viewer)
   const [kbRows, mcpRows] = await Promise.all([
     knowledgeIds.length === 0
       ? Promise.resolve([])
-      : db.knowledgeBase.findMany({ where: { id: { in: knowledgeIds } }, select: { id: true } }),
+      : db.knowledgeBase.findMany({
+          where: { id: { in: knowledgeIds } },
+          select: { id: true, name: true, createdBy: true, visibility: true },
+        }),
     mcpIds.length === 0
       ? Promise.resolve([])
-      : db.mcpServer.findMany({ where: { id: { in: mcpIds } }, select: { id: true } }),
+      : db.mcpServer.findMany({
+          where: { id: { in: mcpIds } },
+          select: { id: true, name: true, createdBy: true, visibility: true },
+        }),
   ])
 
   const missingKb = knowledgeIds.filter((refId) => !kbRows.some((row) => row.id === refId))
@@ -753,6 +1075,26 @@ async function assertComponentRefsBindable(components: AgentComponentInput[]): P
   const missingMcp = mcpIds.filter((refId) => !mcpRows.some((row) => row.id === refId))
   if (missingMcp.length > 0) {
     throw AppError.notFound(`MCP server 不存在或已被删除：${missingMcp.join('、')}`)
+  }
+
+  // P1-18：**取消可见性闭包** —— 不再要求"公开 Agent 只能引用公开组件"。
+  // 唯一保留的写时判据：**绑定时只能选"对我可见"的组件**（公开 / 我的）。这保护的是"绑的人自己"
+  // （看不到的东西不该出现在他的多选框里），而不是"受众"；组件一旦被绑上，就随 Agent 受众可用
+  // （想收回组件 = 从 Agent 解绑）。
+  const viewerForAsset = { ...viewer, groupIds: viewerGroupIds }
+  const notVisible: string[] = []
+  for (const kb of kbRows) {
+    if (!canViewAsset({ ownerId: kb.createdBy, visibility: kb.visibility }, viewerForAsset)) {
+      notVisible.push(`知识库《${kb.name}》`)
+    }
+  }
+  for (const mcp of mcpRows) {
+    if (!canViewAsset({ ownerId: mcp.createdBy, visibility: mcp.visibility }, viewerForAsset)) {
+      notVisible.push(`MCP server《${mcp.name}》`)
+    }
+  }
+  if (notVisible.length > 0) {
+    throw AppError.notFound(`引用的组件对你不可见或不存在：${notVisible.join('、')}`)
   }
 }
 
@@ -809,8 +1151,8 @@ export async function replaceAgentComponents(
   // 便于用"id 逐字不变"取证，见 ④）
   const desired = [...input.components].sort(compareComponents)
 
-  // ③ 校验在写之前
-  await assertComponentRefsBindable(desired)
+  // ③ 校验在写之前（P1-18：绑定时只允许选"对我可见"的组件；**不再**有公开/私有两类分支的闭包校验）
+  await assertComponentRefsBindable(desired, viewer)
 
   const current = await componentsOf(id)
   if (!sameComponentSet(current, desired)) {
@@ -839,5 +1181,6 @@ export async function replaceAgentComponents(
   // ⑥ 重读（极短窗口内被并发软删的话，按"不存在"回 —— 与详情口径一致）
   const fresh = await db.agent.findFirst({ where: { id, deletedAt: null }, select: AGENT_SELECT })
   if (fresh === null) throw AppError.notFound('智能体不存在')
-  return toItem(fresh, await componentsOf(id), viewer)
+  const audiences = await loadAudiences([fresh])
+  return toItem(fresh, await componentsOf(id), viewer, audiences.get(fresh.id) ?? emptyAudience())
 }

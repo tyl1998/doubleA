@@ -24,6 +24,7 @@ import {
   UPLOAD_EXTENSIONS,
   isDocumentSearchable,
   isImageUploadExtension,
+  type AssetVisibility,
   type ChunkItem,
   type DocumentItem,
   type DocumentStatus,
@@ -35,6 +36,13 @@ import {
   type SplitStrategy,
   type UpdateKnowledgeBaseBody,
 } from '@doubulea/shared'
+
+/** 两个字符串数组是否**同一个集合**（受众比对用；纯函数、忽略顺序，供验收档断言） */
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  const set = new Set(a)
+  return b.every((item) => set.has(item))
+}
 
 // ───────────────────────────── 上传白名单（accept 属性 + 发送前拦截）─────────────────────────────
 
@@ -586,6 +594,10 @@ export interface KnowledgeCreateFormValues {
   captionModelId: string
   chunkSize: number | null
   chunkOverlap: number | null
+  /** P1-18.x：可见性（三档：私有 = 所属人 + ADMIN；指定用户 = 受众；公开 = 全员） */
+  visibility: AssetVisibility
+  /** P1-18.x：受众（仅 `visibility=SHARED` 时有效）——直接指定的用户 ∪ 组 */
+  audience: { userIds: string[]; groupIds: string[] }
 }
 
 export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
@@ -595,6 +607,9 @@ export const EMPTY_KNOWLEDGE_FORM_VALUES: KnowledgeCreateFormValues = {
   captionModelId: '',
   chunkSize: null,
   chunkOverlap: null,
+  // 安全默认：新建时私有（与后端"省略 ⇒ PRIVATE"同口径）
+  visibility: 'PRIVATE',
+  audience: { userIds: [], groupIds: [] },
 }
 
 /**
@@ -612,6 +627,8 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
   description?: string
   chunkSize?: number
   chunkOverlap?: number
+  visibility?: AssetVisibility
+  audience?: { userIds: string[]; groupIds: string[] }
 } {
   const body: {
     name: string
@@ -620,6 +637,8 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
     description?: string
     chunkSize?: number
     chunkOverlap?: number
+    visibility?: AssetVisibility
+    audience?: { userIds: string[]; groupIds: string[] }
   } = { name: values.name.trim(), embeddingModelId: values.embeddingModelId }
 
   const description = values.description.trim()
@@ -630,6 +649,12 @@ export function buildCreateBody(values: KnowledgeCreateFormValues): {
   if (captionModelId !== '') body.captionModelId = captionModelId
   if (values.chunkSize !== null) body.chunkSize = values.chunkSize
   if (values.chunkOverlap !== null) body.chunkOverlap = values.chunkOverlap
+  // 可见性（P1-13）：显式带上（表单上是个明确的开关）；`undefined`（旧调用方）则不带
+  if (values.visibility !== undefined) body.visibility = values.visibility
+  // 受众（P1-18.x，仅 SHARED）：至少一个主体，否则后端 400（此处照实提交，让后端给字段级文案）
+  if (values.visibility === 'SHARED' && values.audience !== undefined) {
+    body.audience = { userIds: values.audience.userIds, groupIds: values.audience.groupIds }
+  }
   return body
 }
 
@@ -643,6 +668,10 @@ export interface KnowledgeEditFormValues {
   captionModelId: string
   chunkSize: number
   chunkOverlap: number
+  /** P1-18.x：可见性（三档，编辑态回填当前值） */
+  visibility: AssetVisibility
+  /** P1-18.x：受众（仅 `visibility=SHARED` 时有效） */
+  audience: { userIds: string[]; groupIds: string[] }
 }
 
 export function editValuesOf(kb: KnowledgeBaseItem): KnowledgeEditFormValues {
@@ -653,6 +682,12 @@ export function editValuesOf(kb: KnowledgeBaseItem): KnowledgeEditFormValues {
     captionModelId: kb.captionModelId ?? '',
     chunkSize: kb.chunkSize,
     chunkOverlap: kb.chunkOverlap,
+    visibility: kb.visibility,
+    // `?? {users:[],groups:[]}` 兜住"夹具/老契约没带 audience"（P1-18.x 之前的知识库）
+    audience: {
+      userIds: (kb.audience?.users ?? []).map((u) => u.id),
+      groupIds: (kb.audience?.groups ?? []).map((g) => g.id),
+    },
   }
 }
 
@@ -718,6 +753,25 @@ export function buildKnowledgeUpdateBody(
     if ((baseline.captionModelId ?? null) !== null) body.captionModelId = null
   } else if (captionModelId !== baseline.captionModelId) {
     body.captionModelId = captionModelId
+  }
+
+  // 可见性（P1-18.x）：只在真的变了时带上；`undefined`（旧调用方）视为"没给"，不凭空造键
+  const visibilityChanged = values.visibility !== undefined && values.visibility !== baseline.visibility
+  if (visibilityChanged) body.visibility = values.visibility
+
+  // 受众（P1-18.x，整体替换）：仅在 SHARED 且（受众变了 或 刚切到 SHARED）时带上。
+  // 切离 SHARED 时**不带** audience —— 后端会在可见范围变为非 SHARED 时自动清空受众。
+  if (values.visibility === 'SHARED') {
+    const current = {
+      userIds: (baseline.audience?.users ?? []).map((u) => u.id),
+      groupIds: (baseline.audience?.groups ?? []).map((g) => g.id),
+    }
+    const next = values.audience ?? { userIds: [], groupIds: [] }
+    const audienceChanged =
+      !sameStringSet(current.userIds, next.userIds) || !sameStringSet(current.groupIds, next.groupIds)
+    if (visibilityChanged || audienceChanged) {
+      body.audience = { userIds: next.userIds, groupIds: next.groupIds }
+    }
   }
 
   return Object.keys(body).length === 0 ? null : body

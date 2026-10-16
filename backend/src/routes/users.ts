@@ -17,17 +17,36 @@ import {
   ok,
   updateUserBodySchema,
   userIdParamsSchema,
+  userSearchQuerySchema,
   type CreateUserBody,
   type ListUsersQuery,
   type UpdateUserBody,
   type UserIdParams,
+  type UserSearchQuery,
 } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
 
 import { requireAuthContext } from '../plugins/session.js'
-import { createUser, listUsers, resetUserPassword, updateUser } from '../services/user.service.js'
+import {
+  createUser,
+  listUsers,
+  resetUserPassword,
+  searchUsers,
+  updateUser,
+} from '../services/user.service.js'
 
 export function registerUserRoutes(app: FastifyInstance): void {
+  /**
+   * 用户搜索（P1-18 · 子批 B，**登录可用**）：受众选择器用。
+   * ⚠️ 必须注册在 `/:id` 之前的口径无关紧要（无 `GET /:id`），但**权限是 `requireAuth` 而非 `requireAdmin`**
+   * —— 只回 `{id, name}`、只搜 ACTIVE、限量 20。
+   */
+  app.get<{ Querystring: UserSearchQuery }>(
+    '/api/users/search',
+    { preHandler: app.requireAuth, schema: { querystring: userSearchQuerySchema } },
+    async (request) => ok({ items: await searchUsers(request.query) }),
+  )
+
   /** 列表（`02` §4.2）：offset/limit 分页，默认 20 */
   app.get<{ Querystring: ListUsersQuery }>(
     '/api/users',

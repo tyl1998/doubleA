@@ -279,6 +279,34 @@ export const documentParamsSchema = z.object({
 })
 export type DocumentParams = z.infer<typeof documentParamsSchema>
 
+// ───────────────────────────── 重命名文件名（2026-10-16）─────────────────────────────
+
+/**
+ * 文档文件名的长度上限（列 `documents.file_name` 是 `VARCHAR(255)`）—— 前端输入框与校验共用。
+ */
+export const DOCUMENT_FILE_NAME_MAX_CHARS = 255
+
+/**
+ * `PATCH /api/knowledge-bases/:id/documents/:docId` 请求体：给这篇文档**换个展示名**。
+ *
+ * ── 它只改 `file_name`，不碰任何内容 ──
+ * `documents.file_name` 在本仓只承担两件事：列表页的展示名，以及下载端点的
+ * `Content-Disposition` 文件名（见 `document.service.ts#openDocumentSource`）。重命名**不动**
+ * `file_key`（S3 对象）、`content_hash`、chunk —— 也就是"内容一个字节都没变，只是换个名字"。
+ *
+ * ⚠️ **扩展名必须保持不变**（服务层判、给 400）：下载/预览的 `Content-Type` 是按**文件名里的扩展名**
+ * 推出来的（`downloadContentType`），而真实字节没变 —— 把 `报告.pdf` 改成 `报告.txt` 会让下载
+ * 声明的类型与内容对不上。所以这里只接受"改基名"。
+ */
+export const renameDocumentBodySchema = z.object({
+  fileName: z
+    .string({ required_error: '请输入文件名' })
+    .trim()
+    .min(1, '文件名不能为空')
+    .max(DOCUMENT_FILE_NAME_MAX_CHARS, `文件名最多 ${DOCUMENT_FILE_NAME_MAX_CHARS} 个字符`),
+})
+export type RenameDocumentBody = z.infer<typeof renameDocumentBodySchema>
+
 // ───────────────────────────── 覆盖重建 / 重试 / 删除（P0-1-19）─────────────────────────────
 
 /**

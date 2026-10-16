@@ -62,6 +62,7 @@ import type {
   RetryDocumentResult,
   SearchKnowledgeBaseBody,
   SearchKnowledgeBaseResult,
+  TransferAssetBody,
   UpdateKnowledgeBaseBody,
   UploadDocumentResult,
 } from '@doubulea/shared'
@@ -155,6 +156,24 @@ export function useRemoveKnowledgeBase() {
   return useMutation({
     mutationFn: (id: string) =>
       request<RemoveKnowledgeBaseResult>(`/api/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => invalidateKnowledgeViews(queryClient),
+  })
+}
+
+/**
+ * 转移所属人（P1-13，`POST /api/knowledge-bases/:id/transfer`，**所属人或 ADMIN**）。
+ *
+ * 请求体 `{ toUserId }`，响应是**更新后的裸 `KnowledgeBaseItem`**（同一套投影）。
+ * 转移会改变 `createdBy`/`creatorName`/`canEdit` ⇒ 列表与详情都要失效。
+ */
+export function useTransferKnowledgeBase() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, toUserId }: { id: string; toUserId: string }) =>
+      request<KnowledgeBaseItem>(`/api/knowledge-bases/${encodeURIComponent(id)}/transfer`, {
+        method: 'POST',
+        body: { toUserId } satisfies TransferAssetBody,
+      }),
     onSuccess: () => invalidateKnowledgeViews(queryClient),
   })
 }
@@ -336,6 +355,24 @@ export function useRemoveDocument(kbId: string) {
       request<RemoveDocumentResult>(
         `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}`,
         { method: 'DELETE' },
+      ),
+    onSuccess: () => invalidateKnowledgeViews(queryClient),
+  })
+}
+
+/**
+ * 重命名文档（`PATCH /api/knowledge-bases/:id/documents/:docId`，2026-10-16）。
+ *
+ * 只改展示名（`fileName`），不碰内容与 chunk、不重新入队；响应是**更新后的裸 `DocumentItem`**。
+ * ⚠️ 扩展名必须保持不变（后端 400）—— 失败文案由调用方原样展示。
+ */
+export function useRenameDocument(kbId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ docId, fileName }: { docId: string; fileName: string }) =>
+      request<DocumentItem>(
+        `/api/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}`,
+        { method: 'PATCH', body: { fileName } },
       ),
     onSuccess: () => invalidateKnowledgeViews(queryClient),
   })

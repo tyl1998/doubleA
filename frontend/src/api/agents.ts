@@ -34,6 +34,7 @@ import type {
   CreateAgentBody,
   RemoveAgentResult,
   ReplaceAgentComponentsBody,
+  TransferAssetBody,
   UpdateAgentBody,
 } from '@doubulea/shared'
 
@@ -165,6 +166,24 @@ export function useRemoveAgent() {
   return useMutation({
     mutationFn: (id: string) =>
       request<RemoveAgentResult>(`/api/agents/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => invalidateAffectedViews(queryClient),
+  })
+}
+
+/**
+ * 转移所属人（P1-13，`POST /api/agents/:id/transfer`，**所属人或 ADMIN**）。
+ *
+ * 请求体 `{ toUserId }`，响应是**更新后的裸 `AgentItem`**（同一套投影）。
+ * 转移会改变 `createdBy`/`creatorName`/`canEdit` ⇒ 列表与详情都要失效。
+ */
+export function useTransferAgent() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, toUserId }: { id: string; toUserId: string }) =>
+      request<AgentItem>(`/api/agents/${encodeURIComponent(id)}/transfer`, {
+        method: 'POST',
+        body: { toUserId } satisfies TransferAssetBody,
+      }),
     onSuccess: () => invalidateAffectedViews(queryClient),
   })
 }

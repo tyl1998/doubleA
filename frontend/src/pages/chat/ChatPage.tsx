@@ -68,6 +68,7 @@ import type { AgentItem, RecallConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
 import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
+import { useAvailableChatModels } from '../../api/models.js'
 import {
   conversationMessagesQueryKey,
   fetchConversationActive,
@@ -106,6 +107,14 @@ import {
   type AttachmentView,
   type ChatMessageView,
 } from '../../features/chat/messageModel.js'
+import {
+  isModelBlockedByKey,
+  missingModelKeyProviders,
+  partitionPoolModels,
+  pickUsableModelId,
+  type MissingModelKeyProvider,
+} from '../../features/chat/modelKeyGuard.js'
+import { MissingModelKeyModal } from '../../features/chat/MissingModelKeyModal.js'
 import { roundToViews } from '../../features/chat/roundReducer.js'
 import { chatErrorTitle, shouldToastChatError } from '../../features/chat/streamErrors.js'
 import { useChatStream } from '../../features/chat/useChatStream.js'
@@ -187,6 +196,9 @@ export function ChatPage({
   // `agentId` 为空串时不查（`useAgent` 的 `enabled` 判据是"不是 undefined"，空串会打出一个 400）
   const agentQuery = useAgent(agentId === '' ? undefined : agentId)
   const messagesQuery = useConversationMessages(conversationId)
+  // 新建对话前的模型 Key 预检要用它（`ModelOption` 带 `providerCredentialMode` / `providerUserHasKey`）。
+  // 与智能体编辑页共用同一个查询键（见 `api/models.ts`），不额外打请求。
+  const availableModelsQuery = useAvailableChatModels()
 
   /**
    * `agent?.type` 传给 hook 的**唯一**用途：TaskAgent 的断线对齐要先查 `GET /active`
@@ -280,6 +292,11 @@ export function ChatPage({
   const [attachments, setAttachments] = useState<readonly AttachmentView[]>([])
   /** 有附件正在上传（此时发送按钮禁用，避免"附件没带上就发出去"） */
   const [uploading, setUploading] = useState(false)
+  /**
+   * 新建对话的**模型 Key 预检**结果（2026-10-16 用户定案）。非空 = 弹窗提示"还没配 Key"，
+   * **点取消就不建会话**（`submit` 在真正创建前就 return 了）。配完再发即可。
+   */
+  const [missingKeys, setMissingKeys] = useState<readonly MissingModelKeyProvider[] | null>(null)
   /**
    * 本会话**这一轮选用的模型**（模型池特性）。`undefined` = 走智能体默认模型（`agent.modelId`）。
    * 切换会话时重置（下面的 effect）：一个会话选的模型不该带到另一个会话。
@@ -507,6 +524,39 @@ export function ChatPage({
     if (member === undefined || !member.available) return
     setSelectedModelId(lastUsedModel.modelId)
   }, [selectedModelId, lastUsedModel, agent])
+
+  /**
+   * 新会话态：保证"本会话要用的模型"是**现在真的能用**的（2026-10-16 用户定案）。
+   *
+   * 默认模型是「各自 Key」而我没配时**不把整段对话拦死** —— 换一个能用的开起来（优先共享 Key，
+   * 见 `pickUsableModelId`）。用户仍可在选择器里换回那个模型，那时会弹"去配置"。
+   * ⚠️ 只在**新会话态**做：已有会话用哪个模型是历史的一部分，不该被悄悄改掉。
+   */
+  useEffect(() => {
+    if (conversationId !== undefined) return
+    const agent = agentQuery.data
+    const items = availableModelsQuery.data?.items
+    if (agent === undefined || items === undefined) return
+    const current = selectedModelId ?? agent.modelId ?? ''
+    if (current === '' || !isModelBlockedByKey(current, items)) return
+    const fallback = pickUsableModelId(
+      agent.models.map((model) => model.modelId),
+      items,
+    )
+    if (fallback !== null && fallback !== current) setSelectedModelId(fallback)
+  }, [agentQuery.data, availableModelsQuery.data, conversationId, selectedModelId])
+
+  /** 缺 Key 的池内模型 id（选择器里给它们标一句"需配 Key"，让"选了会弹窗"可预期） */
+  const keyBlockedModelIds = useMemo(
+    () =>
+      new Set(
+        partitionPoolModels(
+          agent?.models.map((model) => model.modelId) ?? [],
+          availableModelsQuery.data?.items ?? [],
+        ).blockedModelIds,
+      ),
+    [agent?.models, availableModelsQuery.data],
+  )
 
   const messages = useMemo(() => {
     const all = [...history, ...streamViews]
@@ -737,11 +787,42 @@ export function ChatPage({
     setAttachments((previous) => previous.filter((item) => item.fileId !== fileId))
   }, [])
 
+  /**
+   * 选择器换模型（2026-10-16 用户定案）：换到"缺 Key 的各自 Key 模型"时**不切换**，改弹"去配置"。
+   * 可选列表没到时判不了 ⇒ 直接切（发送时还有一次兜底）。
+   */
+  const handleSelectModel = useCallback(
+    (modelId: string): void => {
+      const missing = missingModelKeyProviders([modelId], availableModelsQuery.data?.items ?? [])
+      if (missing.length > 0) {
+        setMissingKeys(missing)
+        return
+      }
+      setSelectedModelId(modelId)
+    },
+    [availableModelsQuery.data],
+  )
+
   const submit = useCallback(async (): Promise<void> => {
     // 只读保留会话（Agent 已软删）：不发消息（输入区在界面上已被只读提示替换，这里再兜一道）
     if (readOnly) return
     const text = draft.trim()
     if (text === '') return
+    // 新建对话（还没建出会话）再兜一道**模型 Key 预检**：本次要用的模型缺 Key ⇒ 弹窗、**不建会话**。
+    // ⚠️ 主准入点在 `AgentPicker`（池里一个能用的都没有才拦）；进会话后会先把默认模型换成能用的
+    //（见上面的 fallback effect），所以这里通常不会触发 —— 它挡的是"可选列表晚到 / 深链"等窗口。
+    // ⚠️ 放在清空草稿**之前**：拦下来时正文与附件都还在输入区。
+    if (conversationId === undefined) {
+      const usedModelId = selectedModelId ?? agentQuery.data?.modelId ?? ''
+      const missing =
+        usedModelId === ''
+          ? []
+          : missingModelKeyProviders([usedModelId], availableModelsQuery.data?.items ?? [])
+      if (missing.length > 0) {
+        setMissingKeys(missing)
+        return
+      }
+    }
     // 先清空输入框（体感"发出去了"），失败时再还回来 —— 见下面的 `setDraft(text)`。
     // ⚠️ "能不能发"由输入区状态机（`composerState.ts#canSend`）判，这里**不再判一次**：
     // 两处判据必然漂移（最典型：这里放行了、按钮却是灰的，用户看到"没反应"）
@@ -756,7 +837,7 @@ export function ChatPage({
       setAttachments(sentAttachments)
       feedback.fail(outcome.error, '发送失败')
     }
-  }, [attachments, draft, feedback, readOnly, send, selectedModelId])
+  }, [agentQuery.data, attachments, availableModelsQuery.data, conversationId, draft, feedback, readOnly, send, selectedModelId])
 
   /**
    * 点「停止」（`03` §4.1 的时序在 `useChatStream` → `stopController`，这里只报告结果）。
@@ -1248,7 +1329,8 @@ export function ChatPage({
                   agent={agent}
                   conversationId={conversationId}
                   selectedModelId={selectedModelId}
-                  onSelectModel={setSelectedModelId}
+                  onSelectModel={handleSelectModel}
+                  keyBlockedModelIds={keyBlockedModelIds}
                   autoApprove={autoApprove}
                   autoApprovePending={autoApprovePending}
                   onToggleAutoApprove={handleToggleAutoApprove}
@@ -1346,6 +1428,11 @@ export function ChatPage({
         onClose={() => setRecallTarget(null)}
         onRecalled={handleRecalled}
       />
+
+      {/* 新建对话的模型 Key 预检（2026-10-16 用户定案）：缺 Key ⇒ 弹窗；**取消即不创建会话**
+          （`submit` 已在创建前 return，未清草稿）。主触发点在 `AgentPicker`（选中智能体时拦），
+          这里是**其它进入 `/new/:agentId` 的路**（列表页「对话」/ 深链）的兜底。 */}
+      <MissingModelKeyModal missing={missingKeys} onClose={() => setMissingKeys(null)} />
     </>
   )
 }

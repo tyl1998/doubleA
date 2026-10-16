@@ -8,6 +8,7 @@
  *   `GET    /api/knowledge-bases/:id/documents`                    列表（分页；流水线进度的可视出口）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/reupload`    覆盖重建（multipart，同上）
  *   `POST   /api/knowledge-bases/:id/documents/:docId/retry`       失败重试（无请求体）
+ *   `PATCH  /api/knowledge-bases/:id/documents/:docId`             重命名（只改展示名，不碰内容）
  *   `GET    /api/knowledge-bases/:id/documents/:docId/download`    下载原始文件（**返回字节流**）
  *   `GET    /api/knowledge-bases/:id/documents/:docId/chunks`      片段预览（分页；按 `seq` 升序）
  *   `DELETE /api/knowledge-bases/:id/documents/:docId`             删除（清 chunk + 原文件）
@@ -38,6 +39,7 @@ import {
   knowledgeBaseIdParamsSchema,
   listDocumentChunksQuerySchema,
   listDocumentsQuerySchema,
+  renameDocumentBodySchema,
   IMAGE_RECOGNITIONS,
   ok,
   UPLOAD_IMAGE_RECOGNIZE_FIELD,
@@ -48,6 +50,7 @@ import {
   type KnowledgeBaseIdParams,
   type ListDocumentChunksQuery,
   type ListDocumentsQuery,
+  type RenameDocumentBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
@@ -58,6 +61,7 @@ import {
   deleteDocument,
   listDocuments,
   openDocumentSource,
+  renameDocument,
   retryDocument,
   reuploadDocument,
   uploadDocument,
@@ -192,6 +196,26 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
     async (request) =>
       ok(
         await retryDocument({ kbId: request.params.id, docId: request.params.docId }),
+      ),
+  )
+
+  /**
+   * 重命名（2026-10-16，登录即可）：只改展示名（`documents.file_name`），不碰内容。
+   * 扩展名必须保持不变（服务层判 400 —— 下载类型按扩展名推，内容却没变）。
+   */
+  app.patch<{ Params: DocumentParams; Body: RenameDocumentBody }>(
+    '/api/knowledge-bases/:id/documents/:docId',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: documentParamsSchema, body: renameDocumentBodySchema },
+    },
+    async (request) =>
+      ok(
+        await renameDocument({
+          kbId: request.params.id,
+          docId: request.params.docId,
+          fileName: request.body.fileName,
+        }),
       ),
   )
 

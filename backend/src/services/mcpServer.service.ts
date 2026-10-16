@@ -66,13 +66,16 @@
 
 import {
   AppError,
+  assetVisibilityWhere,
   canEditMcpServer,
+  canViewAsset,
   credentialSchemaImpactOf,
   diffCredentialSchema,
   missingRequiredCredentialKeys,
   normalizeCredentialSchema,
   slugifyServerName,
   uniqueSlug,
+  type AssetVisibility,
   type CreateMcpServerBody,
   type ListMcpServersQuery,
   type McpAuthType,
@@ -121,6 +124,7 @@ const MCP_SERVER_SELECT = {
   toolCache: true,
   status: true,
   createdBy: true,
+  visibility: true,
   /**
    * 注册者显示名（P0-2-12 加的；`creatorName` 昵称优先、回落用户名）。
    * ⚠️ **只取这两列**，别图省事写 `creator: true` —— 那会把密码哈希 / 状态 / 角色整行拉出来，
@@ -141,6 +145,7 @@ type McpServerRow = {
   toolCache: unknown
   status: 'UNKNOWN' | 'OK' | 'ERROR'
   createdBy: string
+  visibility: AssetVisibility
   creator: { username: string; nickname: string | null }
   createdAt: Date
   updatedAt: Date
@@ -170,6 +175,8 @@ function toItem(row: McpServerRow, viewer: McpViewer): McpServerItem {
     status: row.status,
     createdBy: row.createdBy,
     creatorName: row.creator.nickname ?? row.creator.username,
+    // P1-18：MCP server 只有私有/公开两档（不带 SHARED）；防御式收敛（库里若被手工写进 SHARED，按私有处理）
+    visibility: row.visibility === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE',
     canEdit: canEditMcpServer(row, { id: viewer.userId, role: viewer.role }),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -392,15 +399,18 @@ export async function listMcpServers(
   viewer: McpViewer,
 ): Promise<OffsetPage<McpServerItem>> {
   const db = getPrisma()
+  // P1-13：按"对我可见"过滤（`PUBLIC` + 自己的；ADMIN 见全部）
+  const where = assetVisibilityWhere({ id: viewer.userId, role: viewer.role })
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位
   const [rows, total] = await db.$transaction([
     db.mcpServer.findMany({
+      where,
       select: MCP_SERVER_SELECT,
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       skip: query.offset,
       take: query.limit,
     }),
-    db.mcpServer.count(),
+    db.mcpServer.count({ where }),
   ])
   return { items: rows.map((row) => toItem(row, viewer)), total, offset: query.offset, limit: query.limit }
 }
@@ -447,6 +457,8 @@ export async function createMcpServer(
       authType: input.authType ?? 'NONE',
       credentialSchema: toJsonInput(input.credentialSchema ?? []),
       createdBy: viewer.userId,
+      // P1-13：可见性（可省 ⇒ PRIVATE 安全默认）
+      visibility: input.visibility ?? 'PRIVATE',
     },
     select: MCP_SERVER_SELECT,
   })
@@ -547,6 +559,7 @@ export async function updateMcpServer(
       ...(input.credentialSchema === undefined
         ? {}
         : { credentialSchema: toJsonInput(input.credentialSchema) }),
+      ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
       // ⚠️ 清缓存写的是 `Prisma.DbNull`（SQL NULL），**不是**字面量 `null` ——
       //    Prisma 对可空 jsonb 列要求显式区分"这个列没有值"（`DbNull`）与
       //    "这个列的值是一个 jsonb 的 null"（`JsonNull`）。读侧的判据是
@@ -634,6 +647,48 @@ export async function removeMcpServer(id: string, viewer: McpViewer): Promise<Re
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 转移所属人（P1-13，`子方案` §3.5）
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * 转移 MCP server 所属人（`POST /api/mcp/servers/:id/transfer`，**注册者（所属人）或 ADMIN**）。
+ *
+ * ⚠️ **MCP 特例**（`子方案` §3.5）：`created_by` 同时是**探测主语**（`POST /:id/test` 与
+ * `GET /:id/tools` 用**注册者**的凭据连上游）—— 转移后探测主语变为新所属人。若新所属人没配该
+ * server 的凭据，测试/工具列表会失败（`tools/call` 仍用**调用者自己**的凭据，不受影响）。
+ * **前端转移弹窗必须就此给出提示**。
+ */
+export async function transferMcpServer(
+  id: string,
+  toUserId: string,
+  viewer: McpViewer,
+): Promise<McpServerItem> {
+  const db = getPrisma()
+  const target = await db.mcpServer.findUnique({ where: { id }, select: MCP_SERVER_SELECT })
+  if (target === null) throw AppError.notFound('MCP server 不存在')
+  if (!canEditMcpServer(target, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以转移它')
+  }
+  if (toUserId === target.createdBy) {
+    throw AppError.validation('接收人已经是该 MCP server 的所属人，无需转移')
+  }
+  const newOwner = await db.user.findUnique({
+    where: { id: toUserId },
+    select: { id: true, status: true },
+  })
+  if (newOwner === null || newOwner.status !== 'ACTIVE') {
+    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+  }
+  const updated = await db.mcpServer.update({
+    where: { id },
+    data: { createdBy: toUserId },
+    select: MCP_SERVER_SELECT,
+  })
+  getLogger().info({ mcpServerId: id, from: target.createdBy, to: toUserId }, '已转移 MCP server 所属人（探测主语随之变更）')
+  return toItem(updated, viewer)
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // 测试连通 / 读工具列表
 // ═════════════════════════════════════════════════════════════════════
 
@@ -654,16 +709,36 @@ export async function removeMcpServer(id: string, viewer: McpViewer): Promise<Re
  * 这里恒 200（连不上是 `{ok:false,error}`），那边缓存空且拉不到时是 **502**（文件头 ⑦）。
  * 差别不在实现而在**响应形状里有没有"失败"的位置** —— 别把两条路由的出口"统一"起来。
  *
- * @throws {AppError} `NOT_FOUND`(404)
+ * ⚠️ **2026-10-16 修订（用户定案）**：连通测试**只有所属人或 ADMIN** 能发起 —— 因为它用的是
+ * **所属人的凭据**，让任何登录用户都能点等于"任何人都能拿别人的凭据去探活"。用户不可见的私有
+ * server 仍先 404；可见但非所属人 ⇒ **403**。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) / `FORBIDDEN`(403) 既不是所属人也不是 ADMIN
  */
-export async function testMcpServer(id: string): Promise<McpServerTestResult> {
+export async function testMcpServer(id: string, viewer: McpViewer): Promise<McpServerTestResult> {
   const db = getPrisma()
   const target = await db.mcpServer.findUnique({
     where: { id },
     // `credentialSchema` / `createdBy` 是 P0-2-12 加的：探测要用**注册者**的凭据（见 `probeServer`）
-    select: { id: true, name: true, endpointUrl: true, credentialSchema: true, createdBy: true },
+    // `visibility` / `createdBy` 同时用于 P1-13 的可见性判定（私有 server 对他人 404）
+    select: {
+      id: true,
+      name: true,
+      endpointUrl: true,
+      credentialSchema: true,
+      createdBy: true,
+      visibility: true,
+    },
   })
   if (target === null) throw AppError.notFound('MCP server 不存在')
+  // P1-13：私有 server 对他人 **404**（"测试/工具列表"是"用"，受可见性约束）
+  if (!canViewAsset({ ownerId: target.createdBy, visibility: target.visibility }, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.notFound('MCP server 不存在')
+  }
+  // 2026-10-16 修订：连通测试只有所属人或 ADMIN 能发起（先 404 再 403 —— 见文件头）
+  if (!canEditMcpServer({ createdBy: target.createdBy }, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.forbidden('只有该 server 的所属人或管理员可以测试连通')
+  }
 
   const { test } = await refreshServerTools(target)
 
@@ -711,6 +786,7 @@ function readCachedTools(raw: unknown, serverId: string): McpToolCache | null {
 export async function getMcpServerTools(
   id: string,
   options: { refresh: boolean },
+  viewer: McpViewer,
 ): Promise<McpServerToolsResult> {
   const db = getPrisma()
   const row = await db.mcpServer.findUnique({
@@ -723,10 +799,15 @@ export async function getMcpServerTools(
       endpointUrl: true,
       credentialSchema: true,
       createdBy: true,
+      visibility: true,
       toolCache: true,
     },
   })
   if (row === null) throw AppError.notFound('MCP server 不存在')
+  // P1-13：私有 server 对他人 **404**
+  if (!canViewAsset({ ownerId: row.createdBy, visibility: row.visibility }, { id: viewer.userId, role: viewer.role })) {
+    throw AppError.notFound('MCP server 不存在')
+  }
 
   /** 上一次**成功**拉到的缓存（库里那份解析不了时按"没有"处理，并留一条 warn） */
   const previous = readCachedTools(row.toolCache, id)

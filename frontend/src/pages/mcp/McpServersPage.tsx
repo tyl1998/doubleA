@@ -8,15 +8,16 @@
  *      `docs/02` §4.7（六条端点的权限与信封）、`design/mcp.html`。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ① 权限口径：**建/看/测试/调用全员可用；改/删只有所属人 + ADMIN**（⚠️ P0-2-12 改过）
+ * ① 权限口径：**建/看/调用全员可用；测试 / 改 / 删只有所属人 + ADMIN**（P0-2-12 改过、2026-10-16 再收窄「测试」）
  * ─────────────────────────────────────────────────────────────────────
  * 原文是"登录即可、人人可改可删（第五族）、`createdBy` 只留痕、本页**不做任何按钮过滤**"。
  * **2026-09-24 起**：`createdBy` 升为**权限判据**，服务端在**改/删**上**先 404 再 403**
  * （判据 `shared#canEditMcpServer`）。⇒ 本页的「编辑」「删除」按**服务端给的 `canEdit`** 渲染，
  * **不**按角色或"我是不是创建者"自己判 —— `canEdit` 已经把"ADMIN 也算"算进去了，
  * 自己拿 `createdBy` 比 id 会让管理员连自己的编辑入口都没有（服务端却放行 ⇒ 两边对不上）。
- * ⚠️ **「测试」不做过滤**：它对全员开放，用的是**所属人**的凭据（见 ④）—— 收窄它只会造出
- * "server 建完就没人能测了"。
+ * ⚠️ **2026-10-16 修订（用户定案）**：「测试」**也**收进 `canEdit` 门禁 —— 它用的是**所属人**
+ * 的凭据（见 ④），让任何登录用户都能点等于"拿别人的凭据去探活"。服务端 `testMcpServer` 已先
+ * 404（不可见）再 403（可见非所属人）。
  * ⚠️ 页面顶部那条 Alert 必须**如实转述当前口径**：界面上写着"人人可改可删"而实际不是，
  * 与写着"能过滤"而实际不能，是同一种谎（原文那段注释讲的正是这个道理，口径换了、道理不变）。
  *
@@ -46,7 +47,7 @@
  * 两条链路的主语不同（`06` §4.2 那张表），是本页最容易讲错的一件事。
  */
 
-import { Alert, Button, Popconfirm, Table, Tag, type TableColumnsType } from 'antd'
+import { Alert, Button, Popconfirm, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
@@ -54,7 +55,9 @@ import { useMcpServers, useMyCredentials, useRemoveMcpServer, useTestMcpServer }
 import { credentialCell, formatToolCount, serverStatusView, unconfiguredCount } from './mcpModel.js'
 import { McpServerFormModal } from './McpServerFormModal.js'
 import { McpServerToolsModal } from './McpServerToolsModal.js'
+import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { CREDENTIALS_PATH, credentialsPath } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
 import type { McpServerItem } from '@doubulea/shared'
@@ -69,6 +72,7 @@ export function McpServersPage() {
   const [editing, setEditing] = useState<McpServerItem | null>(null)
   const [formOpen, setFormOpen] = useState(false)
   const [toolsFor, setToolsFor] = useState<McpServerItem | null>(null)
+  const [transferFor, setTransferFor] = useState<McpServerItem | null>(null)
 
   const items = servers.data?.items ?? []
   const total = servers.data?.total ?? 0
@@ -135,14 +139,30 @@ export function McpServersPage() {
       title: '所属人',
       dataIndex: 'creatorName',
       width: 130,
-      render: (_, server) => (
+      render: (_, server) =>
         // ⚠️ 这一格**不只是**"谁建的这个 server"（P0-2-12）：**连通测试与工具列表都用这位的凭据**。
         //    所以放**名字**（`creatorName`，昵称优先回落用户名）而不是 uuid，并把"探测主语"
         //    写在 title 上 —— 用户问"测试报凭据无效，我该改哪儿"时，答案是这里。
-        <span title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据">
-          {server.creatorName}
-        </span>
-      ),
+        // P1-18（2026-10-16 修订）：去掉操作列的「转移所属人」按钮，把这一列做成入口 ——
+        //    只有所属人/管理员（`canEdit`）能点；其余人只显示名字（带同一句说明）。
+        server.canEdit ? (
+          <Tooltip title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据。点击转移所属人">
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(server)}>
+              {server.creatorName}
+            </Button>
+          </Tooltip>
+        ) : (
+          <span title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据">
+            {server.creatorName}
+          </span>
+        ),
+    },
+    {
+      // P1-13：可见性徽标（判据来自服务端下发的 `visibility`，前端不自己算）
+      title: '可见性',
+      dataIndex: 'visibility',
+      width: 100,
+      render: (_, server) => <VisibilityBadge visibility={server.visibility} />,
     },
     {
       title: '我的凭据',
@@ -165,41 +185,43 @@ export function McpServersPage() {
     {
       title: '操作',
       key: 'actions',
-      width: 220,
+      width: 280,
       align: 'right',
       render: (_, server) => (
         // ⚠️ §七「表格规范」：操作列固定右侧、**文字链按钮**（`type="link"`，
         //    不自己发明外观类 —— P0-1-35 的教训）、危险操作红色、**删除放最后**。
         //    `/mcp` 一行只有三个操作（测试 / 编辑 / 删除），所以**不**用"更多"菜单
         //    （那条规则的门槛是 >3）。
+        // ⚠️ **2026-10-16 修订（用户定案）：「测试」也只给所属人或 ADMIN**（服务端已 403）——
+        //    测试用**所属人的凭据**，让任何人点等于"拿别人的凭据去探活"。故它与编辑/删除同门禁。
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
-          <Button
-            type="link"
-            size="small"
-            style={{ padding: 0 }}
-            loading={testServer.isPending && testServer.variables === server.id}
-            onClick={() => {
-              testServer.mutate(server.id, {
-                onSuccess: (result) => {
-                  if (result.ok) {
-                    feedback.ok(`握手成功：拿到 ${result.tools.length} 个工具`)
-                    // 握手就是"重新拉一次工具列表" ⇒ 顺手把清单弹窗打开，让结论有可见的落点
-                    setToolsFor(server)
-                  } else {
-                    // 恒 200 的**结论**（不是异常）⇒ 中性通道，见文件头 ③
-                    feedback.note(`握手失败：${result.error}`)
-                  }
-                },
-                onError: (error) => {
-                  feedback.fail(error, '连通测试失败')
-                },
-              })
-            }}
-          >
-            测试
-          </Button>
           {server.canEdit ? (
             <>
+              <Button
+                type="link"
+                size="small"
+                style={{ padding: 0 }}
+                loading={testServer.isPending && testServer.variables === server.id}
+                onClick={() => {
+                  testServer.mutate(server.id, {
+                    onSuccess: (result) => {
+                      if (result.ok) {
+                        feedback.ok(`握手成功：拿到 ${result.tools.length} 个工具`)
+                        // 握手就是"重新拉一次工具列表" ⇒ 顺手把清单弹窗打开，让结论有可见的落点
+                        setToolsFor(server)
+                      } else {
+                        // 恒 200 的**结论**（不是异常）⇒ 中性通道，见文件头 ③
+                        feedback.note(`握手失败：${result.error}`)
+                      }
+                    },
+                    onError: (error) => {
+                      feedback.fail(error, '连通测试失败')
+                    },
+                  })
+                }}
+              >
+                测试
+              </Button>
               <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openEdit(server)}>
                 编辑
               </Button>
@@ -224,9 +246,8 @@ export function McpServersPage() {
           ) : (
             // ⚠️ 判据是**服务端给的 `canEdit`**（P0-2-12），不自己拿 `createdBy` 跟当前用户 id 比 ——
             //    那样 ADMIN 会在界面上连自己的编辑入口都没有，而服务端允许他改 ⇒ 两边对不上。
-            //    ⚠️「测试」**不在这里**：它对全员开放（用的是所属人凭据），收窄它只会让人没法排查。
-            //    文案与 `/agents` 列表页保持一致（同一件事在两个页面说法不同最容易被当成 bug）。
-            <span className="ratio" title="只有该 server 的所属人或管理员可以编辑 / 删除">
+            //    ⚠️ 2026-10-16 修订：「测试」也已归入本门禁（用所属人凭据，见上）。
+            <span className="ratio" title="测试 / 编辑 / 删除都需要该 server 的所属人或管理员权限">
               无编辑权限
             </span>
           )}
@@ -271,15 +292,14 @@ export function McpServersPage() {
         </div>
       </div>
 
-      {/* 权限口径在 P0-2-12 **收窄过** —— 界面必须如实转述**当前**那一条（原文是
-          "任何登录用户都可以注册、修改、删除"）。现在：**建/看/测/调用**全员可用，
-          **改/删**只有「所属人」或管理员。⚠️ 顺带把"测试用**所属人**的凭据"说出来 ——
-          不然用户会拿自己的凭据去解释测试结果（P0-2-12 的实测就是这么翻车的）。 */}
+      {/* 权限口径在 P0-2-12 收窄过、2026-10-16 又收窄了「测试」—— 界面必须如实转述**当前**那一条
+          （原文是"任何登录用户都可以注册、修改、删除"）。现在：**建/看/调用**全员可用，
+          **测试 / 改 / 删**只有「所属人」或管理员（测试用**所属人**的凭据，见文件头 ④）。 */}
       <Alert
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="任何人登录后都能注册 server、测试连通、调用工具；但只有「所属人」或管理员能编辑 / 删除"
+        message="任何人登录后都能注册 server、调用工具；但「测试连通 / 编辑 / 删除」只有「所属人」或管理员能操作"
         description="连通测试与工具列表用的是「所属人」的凭据（工具缓存是全员共享的一份）—— 所以测试若报「凭据无效 / 尚未配置」，该找的是所属人而不是你自己。而调用工具注入的是「你自己」的凭据。删除一台被智能体绑定的 server 会被后端拒绝（409），需要先去编辑页解绑。"
       />
 
@@ -339,6 +359,14 @@ export function McpServersPage() {
 
       <McpServerFormModal server={editing} open={formOpen} onClose={() => setFormOpen(false)} />
       <McpServerToolsModal server={toolsFor} onClose={() => setToolsFor(null)} />
+      <TransferOwnershipModal
+        open={transferFor !== null}
+        assetKind="MCP"
+        assetId={transferFor?.id ?? ''}
+        assetName={transferFor?.name ?? ''}
+        currentOwnerName={transferFor?.creatorName ?? ''}
+        onClose={() => setTransferFor(null)}
+      />
     </>
   )
 }

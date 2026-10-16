@@ -21,6 +21,7 @@ import type {
   AgentComponentInput,
   AgentItem,
   AgentType,
+  AssetVisibility,
   CreateAgentBody,
   UpdateAgentBody,
 } from '@doubulea/shared'
@@ -92,6 +93,10 @@ export interface AgentFormValues {
   systemPrompt: string
   openingRemarks: string
   guideQuestions: string[]
+  /** P1-18：可见范围（三档：私有 / 指定用户 / 公开） */
+  visibility: AssetVisibility
+  /** P1-18：受众（仅 `visibility=SHARED` 时有效）——直接指定的用户 ∪ 组 */
+  audience: { userIds: string[]; groupIds: string[] }
 }
 
 /**
@@ -110,6 +115,9 @@ export const EMPTY_AGENT_FORM_VALUES: AgentFormValues = {
   systemPrompt: '',
   openingRemarks: '',
   guideQuestions: [],
+  // 安全默认：新建时私有（与后端"省略 ⇒ PRIVATE"同口径，避免用户没注意就公开出去）
+  visibility: 'PRIVATE',
+  audience: { userIds: [], groupIds: [] },
 }
 
 /** 服务端投影 → 表单值（`null` → `''`，见 {@link AgentFormValues}） */
@@ -127,6 +135,11 @@ export function valuesFromAgent(item: AgentItem): AgentFormValues {
     openingRemarks: item.openingRemarks ?? '',
     // 拷贝一份：表单会原地改这个数组（Form.List 的增删），不能与 query 缓存共享引用
     guideQuestions: [...item.guideQuestions],
+    visibility: item.visibility,
+    audience: {
+      userIds: item.audience.users.map((u) => u.id),
+      groupIds: item.audience.groups.map((g) => g.id),
+    },
   }
 }
 
@@ -281,6 +294,18 @@ function modelChanged(baseline: AgentFormValues, values: AgentFormValues): boole
   return values.modelId !== baseline.modelId || !sameStringSet(values.modelIds, baseline.modelIds)
 }
 
+/** P1-18：受众（用户 / 组两个集合）是否有变化 */
+function audienceChanged(baseline: AgentFormValues, values: AgentFormValues): boolean {
+  // ⚠️ 防御性：`audience` 是**条件渲染**字段（仅 `visibility=SHARED` 挂 `Form.Item`）。曾经因为
+  // `AgentFormPage` 的 `onValuesChange` 用了"仅注册字段"的残缺对象，把 `values.audience` 覆盖成
+  // `undefined` ⇒ 这里读 `.userIds` 抛 TypeError、React 卸载整棵子树 = 整页白屏。调用侧已修
+  //（改用 `form.getFieldsValue(true)`），但**相等判定是纯函数，不该因为一个字段缺失就炸整页**：
+  // 缺失一律按"空受众"算（与 `EMPTY_AGENT_FORM_VALUES` 同口径）。
+  const left = values.audience ?? { userIds: [], groupIds: [] }
+  const right = baseline.audience ?? { userIds: [], groupIds: [] }
+  return !sameStringSet(left.userIds, right.userIds) || !sameStringSet(left.groupIds, right.groupIds)
+}
+
 /**
  * 把默认模型并入模型池（去重）——**提交口径**：默认模型恒为池成员（后端也会补，
  * 但前端先补一遍能让 `POST`/`PATCH` 的请求体自洽，也让 superRefine 不会因"默认不在池里"报错）。
@@ -314,7 +339,14 @@ function guidesChanged(baseline: AgentFormValues, values: AgentFormValues): bool
  */
 export function changedSections(baseline: AgentFormValues, values: AgentFormValues): AgentSectionKey[] {
   const changed = new Set<AgentSectionKey>()
-  if (values.name !== baseline.name || textChanged(BASIC_TEXT_FIELDS, baseline, values)) changed.add('basic')
+  if (
+    values.name !== baseline.name ||
+    textChanged(BASIC_TEXT_FIELDS, baseline, values) ||
+    values.visibility !== baseline.visibility ||
+    audienceChanged(baseline, values)
+  ) {
+    changed.add('basic')
+  }
   if (modelChanged(baseline, values)) changed.add('model')
   if (textChanged(PROMPT_TEXT_FIELDS, baseline, values) || guidesChanged(baseline, values)) changed.add('prompt')
   return AGENT_SECTIONS.filter((section) => changed.has(section))
@@ -341,6 +373,16 @@ export function buildUpdateBody(baseline: AgentFormValues, values: AgentFormValu
     body.modelIds = poolForSubmit(values)
   }
   if (guidesChanged(baseline, values)) body.guideQuestions = normalizeGuideQuestionsForSubmit(values.guideQuestions)
+  // 可见范围（P1-18）：只在与基线不同时带上（`undefined` 视为"没给"，不凭空造键）
+  const visibilityChanged = values.visibility !== baseline.visibility
+  if (values.visibility !== baseline.visibility) {
+    body.visibility = values.visibility
+  }
+  // 受众（整体替换）：仅在 SHARED 且（受众变了 或 刚切到 SHARED）时带上。
+  // 切离 SHARED 时**不带** audience —— 后端会在可见范围变为非 SHARED 时自动清空受众。
+  if (values.visibility === 'SHARED' && (visibilityChanged || audienceChanged(baseline, values))) {
+    body.audience = { userIds: values.audience.userIds, groupIds: values.audience.groupIds }
+  }
 
   return Object.keys(body).length === 0 ? null : body
 }
@@ -357,6 +399,12 @@ export function buildCreateBody(values: AgentFormValues): CreateAgentBody {
     modelId: values.modelId,
     // 模型池：默认模型并入去重；池为空（旧表单）时退化成 `[modelId]`（与后端"省略即 [modelId]"一致）
     modelIds: poolForSubmit(values),
+    // 可见范围（P1-18）：显式带上（表单上是个明确的开关）；`undefined`（旧调用方）则不带
+    ...(values.visibility === undefined ? {} : { visibility: values.visibility }),
+    // 受众（仅 SHARED）：`SHARED` 至少要有一个主体，否则后端 400（此处照实提交，让后端给字段级文案）
+    ...(values.visibility === 'SHARED'
+      ? { audience: { userIds: values.audience.userIds, groupIds: values.audience.groupIds } }
+      : {}),
   }
 }
 
@@ -367,7 +415,14 @@ export function buildCreateBody(values: AgentFormValues): CreateAgentBody {
  */
 export function sectionsOfUpdateBody(body: UpdateAgentBody): AgentSectionKey[] {
   const sections = new Set<AgentSectionKey>()
-  if (body.name !== undefined || BASIC_TEXT_FIELDS.some((field) => body[field] !== undefined)) sections.add('basic')
+  if (
+    body.name !== undefined ||
+    body.visibility !== undefined ||
+    body.audience !== undefined ||
+    BASIC_TEXT_FIELDS.some((field) => body[field] !== undefined)
+  ) {
+    sections.add('basic')
+  }
   if (body.modelId !== undefined || body.modelIds !== undefined) sections.add('model')
   if (PROMPT_TEXT_FIELDS.some((field) => body[field] !== undefined) || body.guideQuestions !== undefined) {
     sections.add('prompt')

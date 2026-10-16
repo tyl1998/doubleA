@@ -27,6 +27,7 @@ import {
   MCP_SERVER_NAME_MAX,
   diffCredentialSchema,
   validateCredentialSchema,
+  type KbMcpVisibility,
   type CredentialInjectLocation,
   type CredentialSchema,
   type CredentialSchemaEntry,
@@ -95,6 +96,10 @@ export type CredentialCell =
  * 表格这一格，三处都由同一个投影派生（`06` P0-2-11 坑预判 4：
  * "未配置红点/计数只有一个来源"）。
  *
+ * ⚠️ 2026-10-16 修订：`configured` 现在是"**我是否真的填过值**"（按人判，见
+ * `shared#isCredentialConfigured`）—— 这台 server 对**每个人**给出各自答案，"别人配过"
+ * 不再让你这里显示"已配置"。`missingKeys`（必填缺哪些）只并入提示文案，不再决定分支。
+ *
  * `item === undefined`（清单里没有这台 server ⇒ 请求还没回来/读失败）时**返回 `none` 之外的
  * 一个中性读数**：说不出来就说"未知"，不拿"未配置"去冒充（那会是一批假警报）。
  */
@@ -107,12 +112,22 @@ export function credentialCell(item: McpCredentialItem | undefined): CredentialC
     return { kind: 'none', label: '无需凭据', hint: '这台 server 的模板里没有需要用户填写的参数' }
   }
   if (item.configured) {
-    return { kind: 'configured', label: '已配置', hint: '必填参数都已有值（值不会回显给任何人）' }
+    return {
+      kind: 'configured',
+      label: '已配置',
+      hint:
+        item.missingKeys.length === 0
+          ? '你已填写过参数（值不会回显给任何人）'
+          : `你已填写过参数，但还缺必填：${item.missingKeys.join('、')}`,
+    }
   }
   return {
     kind: 'missing',
     label: '未配置',
-    hint: `还缺：${item.missingKeys.join('、')}`,
+    hint:
+      item.missingKeys.length === 0
+        ? '你还没有为这台 server 填写凭据；点「未配置」去「我的凭据」里配你自己的那一份'
+        : `你还没有填写凭据；还缺：${item.missingKeys.join('、')}`,
     missingKeys: item.missingKeys,
   }
 }
@@ -417,11 +432,14 @@ export function serverFormDraftFrom(server: McpServerItem): ServerFormDraft {
  * ——"这台 server 不向用户要任何东西" —— 比"省略"更清楚（省略与 `[]` 归一化后等价，
  * 但这个键存在与否在界面上有区别：空模板的凭据格显示「无需凭据」）。
  */
-export function buildCreateServerBody(draft: ServerFormDraft): CreateMcpServerBody {
+export function buildCreateServerBody(draft: ServerFormDraft, visibility?: KbMcpVisibility): CreateMcpServerBody {
   return {
     name: draft.name.trim(),
     endpointUrl: draft.endpointUrl.trim(),
     credentialSchema: templateRowsToSchema(draft.credentialSchema),
+    // P1-13：可见性由表单单独维护（`ServerFormDraft` 不含它，见 `McpServerFormModal`）。
+    // `undefined` ⇒ 不带（契约里省略即 PRIVATE）
+    ...(visibility === undefined ? {} : { visibility }),
   }
 }
 
@@ -439,6 +457,7 @@ export function buildCreateServerBody(draft: ServerFormDraft): CreateMcpServerBo
 export function buildServerUpdateBody(
   server: McpServerItem,
   draft: ServerFormDraft,
+  visibility?: KbMcpVisibility,
 ): UpdateMcpServerBody | null {
   const body: UpdateMcpServerBody = {}
 
@@ -453,6 +472,9 @@ export function buildServerUpdateBody(
   if (diff.removedKeys.length > 0 || diff.addedKeys.length > 0 || diff.retargetedKeys.length > 0) {
     body.credentialSchema = nextSchema
   }
+
+  // P1-13：可见性只在真的变了时带上；`undefined`（旧调用方）视为"没给"，不凭空造键
+  if (visibility !== undefined && visibility !== server.visibility) body.visibility = visibility
 
   return Object.keys(body).length === 0 ? null : body
 }

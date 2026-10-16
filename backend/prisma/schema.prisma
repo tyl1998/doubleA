@@ -262,6 +262,46 @@ enum EgressScope {
   @@map("egress_scope")
 }
 
+/// 资产可见范围（P1-13 初版 + **P1-18 重设计**；`子方案/资产共享与用户组标签.md` §三）
+///
+/// 三类可复用资产（Agent / 知识库 / MCP Server）共用这一个枚举（Provider 已无可见范围）。
+/// · `PRIVATE`（新行默认，安全默认）= 仅**所属人**（+ ADMIN）可看可用；
+/// · `SHARED`（**Agent + 知识库**，2026-10-16 起知识库也开放）= 所属人 + **受众**
+///   （`agent_audiences` / `knowledge_base_audiences`：用户 ∪ 组）+ ADMIN；
+/// · `PUBLIC` = 全部登录用户可**看**可**用**。
+/// ⚠️ MCP Server 只接受 `PRIVATE`/`PUBLIC`（服务层/契约拒绝 `SHARED`）；
+/// ⚠️ `models` **不加**这一列 —— Model 随 Provider 访问（Provider 判据 = 所属人 + ADMIN）。
+enum AssetVisibility {
+  PRIVATE
+  SHARED
+  PUBLIC
+
+  @@map("asset_visibility")
+}
+
+/// 受众主体类型（P1-18；`AgentAudience.subject_type`）
+///
+/// `USER` = 单个用户（`subject_id` → `users.id`）；`GROUP` = 用户组（`subject_id` → `user_groups.id`）。
+/// ⚠️ `subject_id` 是**多态外键、无 FK**（同 `agent_components.ref_id` 的口径）：删组/删用户时
+/// 由服务层清理（删组清 `agent_audiences`；删用户清成员行），不依赖数据库级联。
+enum AudienceSubjectType {
+  USER
+  GROUP
+
+  @@map("audience_subject_type")
+}
+
+/// Provider 凭据模式（P1-18 · 子批 C；与可见范围正交）
+///
+/// · `SHARED`（默认）= 用 Provider 自己的 `api_key_enc`（既有行为）；
+/// · `PER_USER` = 每个调用者用自己的 Key（`provider_user_credentials`）；缺 ⇒ 424 `NEED_CREDENTIAL`。
+enum ProviderCredentialMode {
+  SHARED
+  PER_USER
+
+  @@map("provider_credential_mode")
+}
+
 // ───────────────────────────── 表 ─────────────────────────────
 
 /// users —— 认证与用户（`02` §三 / §4.1 / §4.2）
@@ -306,6 +346,14 @@ model User {
   scheduledTasks ScheduledTask[]
   memories       Memory[]
   gitCredentials GitCredential[]
+  /// P1-13：知识库的**所属人**（新增 `created_by` 列）
+  knowledgeBases KnowledgeBase[]
+  /// P1-13：模型池 Provider 的**所属人**（新增 `created_by` 列）
+  modelProviders ModelProvider[]
+  /// P1-18：本用户所在的用户组（受众圈选；见 `UserGroupMember`）
+  userGroupMembers UserGroupMember[]
+  /// P1-18：本用户的 **per-user Provider 凭据**（各自 Key；见 `ProviderUserCredential`）
+  providerUserCredentials ProviderUserCredential[]
 
   @@map("users")
 }
@@ -328,13 +376,51 @@ model ModelProvider {
   /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`
   protocol  UpstreamProtocol @default(OPENAI_COMPAT)
   enabled   Boolean   @default(true)
+  /// P1-13：**所属人**（新增 `created_by`）。语义 = 权限判据的唯一主体：
+  /// 编/删/转移 = 所属人 + ADMIN；**系统级 Provider（`created_by` 是 ADMIN）只有 ADMIN 能改/删**。
+  createdBy String    @map("created_by") @db.Uuid
+  /// ⚠️ P1-18（用户定案）：Provider **没有可见范围、也没有定向分享** —— 模型只能通过 Agent
+  /// 被使用，全局"曝光"不承担访问控制（归 Agent 可见范围）。
+  /// **读 = 全体登录用户**（默认 2026-10-16 修订：Provider/Model 即"平台模型池"，人人可见、只读）；
+  /// **写（编/删/转移）= 所属人 + ADMIN**（见 `shared/src/assetAcl.ts` 文件头 ①）。
+  /// **凭据模式**（P1-18）：`SHARED` 用本行 `api_key_enc`；`PER_USER` 用调用者自己的 Key。
+  credentialMode ProviderCredentialMode @default(SHARED) @map("credential_mode")
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   models Model[]
+  /// P1-18：**各自 Key**（`credentialMode=PER_USER` 时生效）——每用户一把，加密存储
+  userCredentials ProviderUserCredential[]
+  creator User @relation(fields: [createdBy], references: [id], onDelete: Restrict)
 
   @@index([type, enabled])
+  @@index([createdBy])
   @@map("model_providers")
+}
+
+/// provider_user_credentials —— Provider 的**用户级凭据**（P1-18 · 子批 C；各自 Key）
+///
+/// 语义：`(providerId, userId)` 一行 = 该用户为这个 Provider 配的**自己的** Key。
+/// · 仅在 `provider.credential_mode = PER_USER` 时被使用；缺行 ⇒ 调用时 **424 `NEED_CREDENTIAL`**；
+/// · 密文用 AES-256-GCM，AAD = `user:provider:<userId>:<providerId>`（与 Provider 共享 Key 的
+///   `providerKeyAad` **分开**，避免两处密文互相串用）；
+/// · **凭据是个人隐私**：ADMIN **也没有后门**（读不到、解不开别人的 Key）。
+/// · 删 Provider / 硬删用户 ⇒ 行随之消失（`onDelete: Cascade`）。
+model ProviderUserCredential {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  providerId String   @map("provider_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  /// AES-256-GCM 密文（AAD 见文件头）
+  apiKeyEnc  String   @map("api_key_enc") @db.Text
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, userId])
+  @@index([userId])
+  @@map("provider_user_credentials")
 }
 
 /// models —— 模型（`02` §三 / §4.3）
@@ -404,7 +490,11 @@ model Agent {
   openingRemarks String?   @map("opening_remarks") @db.Text
   guideQuestions Json      @default("[]") @map("guide_questions") @db.JsonB
   modelId        String?   @map("model_id") @db.Uuid
+  /// P1-13：**所属人**（复用 `created_by`，语义由"创建者"扩为"所属人"）。转移时更新此列。
   createdBy      String    @map("created_by") @db.Uuid
+  /// P1-18：可见范围（新行默认 `PRIVATE`，存量回填 `PUBLIC`）。判据见 `shared/src/assetAcl.ts`。
+  /// `SHARED` 时受众来自 `audiences`（用户 ∪ 组）；`PUBLIC` 全员；`PRIVATE` 仅所属人 + ADMIN。
+  visibility     AssetVisibility @default(PRIVATE)
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
@@ -412,6 +502,8 @@ model Agent {
   model         Model?            @relation(fields: [modelId], references: [id], onDelete: SetNull)
   creator       User              @relation(fields: [createdBy], references: [id], onDelete: Restrict)
   components    AgentComponent[]
+  /// P1-18：**受众**（仅 `visibility=SHARED` 时有行）——`visibility≠SHARED` 时不写、并把旧行清空
+  audiences     AgentAudience[]
   pool          AgentModel[]
   conversations Conversation[]
   usageRecords  UsageRecord[]
@@ -420,6 +512,7 @@ model Agent {
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
+  @@index([visibility])
   @@map("agents")
 }
 
@@ -469,6 +562,84 @@ model AgentComponent {
 
   @@unique([agentId, componentType, refId])
   @@map("agent_components")
+}
+
+/// agent_audiences —— Agent 的**受众主体**（P1-18；仅 `visibility=SHARED` 的 Agent 有行）
+///
+/// 受众 = 若干受众主体的**并集**：`subject_type=USER` 指向用户、`GROUP` 指向用户组。
+/// ⚠️ `subject_id` 是**多态外键、无 FK**（同 `agent_components.ref_id`）：删组/删用户时由服务层
+/// 清理（删组清指向它的受众行，删用户清成员行）。`agent_id` 有 FK（删 Agent/软删时服务层显式删）。
+/// 服务层在写 Agent 的可见范围时**整体替换**受众（`SHARED` 写行、非 `SHARED` 清空）。
+model AgentAudience {
+  id          String              @id @default(uuid(7)) @db.Uuid
+  agentId     String              @map("agent_id") @db.Uuid
+  subjectType AudienceSubjectType @map("subject_type")
+  /// `USER` → `users.id`；`GROUP` → `user_groups.id`（多态、无 FK）
+  subjectId   String              @map("subject_id") @db.Uuid
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, subjectType, subjectId])
+  @@index([subjectType, subjectId])
+  @@map("agent_audiences")
+}
+
+/// knowledge_base_audiences —— 知识库的**受众主体**（P1-18.x，2026-10-16；仅 `SHARED` 的库有行）
+///
+/// 与 `AgentAudience` 同构：知识库也开放「指定用户」档，受众 = 用户 ∪ 组（并集）。
+/// ⚠️ `subject_id` 是**多态外键、无 FK**（同 `agent_audiences` / `agent_components.ref_id`）：
+/// 删组/删用户时由服务层清理。`knowledge_base_id` 有 FK（删库 ⇒ 受众行 `Cascade`）。
+/// 服务层在写可见范围时**整体替换**受众（`SHARED` 写行、非 `SHARED` 清空）。
+model KnowledgeBaseAudience {
+  id              String              @id @default(uuid(7)) @db.Uuid
+  knowledgeBaseId String              @map("knowledge_base_id") @db.Uuid
+  subjectType     AudienceSubjectType @map("subject_type")
+  /// `USER` → `users.id`；`GROUP` → `user_groups.id`（多态、无 FK）
+  subjectId       String              @map("subject_id") @db.Uuid
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  knowledgeBase KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  /// ⚠️ 显式命名（Postgres 标识符上限 63 字节；默认名 `knowledge_base_audiences_...` 会超长被截断）
+  @@unique([knowledgeBaseId, subjectType, subjectId], map: "kb_audiences_kb_subject_type_subject_key")
+  @@index([subjectType, subjectId], map: "kb_audiences_subject_type_subject_idx")
+  @@map("knowledge_base_audiences")
+}
+
+/// user_groups —— **用户组**（P1-18 · 子批 B；ADMIN 维护）
+///
+/// 组 = 显式成员集合（`UserGroupMember`），是 Agent「指定用户」受众的**主授权单位**（稳定、可审计）。
+/// · `name` 唯一（`@@unique`），便于 ADMIN 与受众选择器识别；
+/// · **本表没有 owner 列**：维护是 ADMIN 的职责（`/api/admin/groups`），不做自组织。
+model UserGroup {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  name        String   @unique @db.VarChar(64)
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  members UserGroupMember[]
+
+  @@map("user_groups")
+}
+
+/// user_group_members —— 用户组成员（P1-18；`(groupId, userId)` 唯一）
+///
+/// 显式成员表：`PUT /api/admin/groups/:id/members` **整体替换**（全量提交）。
+/// 删组/硬删用户 ⇒ 行随之消失（`onDelete: Cascade`）。
+model UserGroupMember {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  groupId   String   @map("group_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  group UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@map("user_group_members")
 }
 
 /// conversations —— 会话（`02` §三 / §4.5）
@@ -626,15 +797,24 @@ model KnowledgeBase {
   chunkOverlap   Int      @default(64) @map("chunk_overlap")
   /// 形状见 `子方案①` §二：`{topK, score, mode, splitStrategy, rrfK, weights:{vector,fulltext}}`
   retrievalConfig Json    @default("{\"topK\":5,\"score\":0.3,\"mode\":\"HYBRID\",\"splitStrategy\":\"hybrid\",\"rrfK\":60,\"weights\":{\"vector\":1.0,\"fulltext\":1.0}}") @map("retrieval_config") @db.JsonB
+  /// P1-13：**所属人**（新增列）。权限判据的唯一主体：编/删/改可见性/转移 = 所属人 + ADMIN。
+  createdBy      String   @map("created_by") @db.Uuid
+  /// P1-13：可见性（新行默认 `PRIVATE`，存量回填 `PUBLIC`）。判据见 `shared/src/assetAcl.ts`
+  visibility     AssetVisibility @default(PRIVATE)
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   documents Document[]
+  creator   User     @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  /// P1-18.x（2026-10-16）：知识库的**受众**（仅 `visibility=SHARED` 时有行）—— 用户 ∪ 组
+  audiences KnowledgeBaseAudience[]
   /// 选定的 embedding 模型（删模型时不删库，只把引用置空 ⇒ 该库退化为纯全文检索，需重建）
   embeddingModelRef Model? @relation("KnowledgeBaseEmbeddingModel", fields: [embeddingModelId], references: [id], onDelete: SetNull)
   /// 选定的图片描述模型（P1-11）：删模型时置空 ⇒ 之后的文档不再产出图片描述（不影响入库）
   captionModelRef Model? @relation("KnowledgeBaseCaptionModel", fields: [captionModelId], references: [id], onDelete: SetNull)
 
+  @@index([visibility])
+  @@index([createdBy])
   @@map("knowledge_bases")
 }
 
@@ -761,6 +941,10 @@ model McpServer {
   /// （`tool_cache` 是 server 级共享的 ⇒ 主语必须唯一确定，不能是"谁点的测试"）；
   /// 而 `tools/call` 仍用**调用者自己**的凭据。
   createdBy        String          @map("created_by") @db.Uuid
+  /// P1-13：可见性（新行默认 `PRIVATE`，存量回填 `PUBLIC`）。判据见 `shared/src/assetAcl.ts`。
+  /// `PRIVATE` server 对他人**不可见**（列表无、直连 404）；`PUBLIC` server 全员可看可绑可用
+  /// （`tools/call` 仍用**调用者自己**的凭据）。
+  visibility       AssetVisibility @default(PRIVATE)
   createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -769,6 +953,7 @@ model McpServer {
   credentials McpCredential[]
 
   @@index([createdBy])
+  @@index([visibility])
   @@map("mcp_servers")
 }
 

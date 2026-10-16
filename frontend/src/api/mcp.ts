@@ -57,12 +57,14 @@ import type {
   McpCredentialItem,
   McpCredentialListResult,
   McpServerCreateResult,
+  McpServerItem,
   McpServerListResult,
   McpServerTestResult,
   McpServerToolsResult,
   PutMyCredentialBody,
   RemoveMcpServerResult,
   RemoveMyCredentialResult,
+  TransferAssetBody,
   UpdateMcpServerBody,
   UpdateMcpServerResult,
 } from '@doubulea/shared'
@@ -146,6 +148,24 @@ export function useUpdateMcpServer() {
     mutationFn: ({ id, body }: { id: string; body: UpdateMcpServerBody }) =>
       request<UpdateMcpServerResult>(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
     // 模板变更会让凭据页的 `fields` / `missingKeys` 全变 ⇒ 两棵树一起失效（文件头 ③）
+    onSuccess: () => invalidateMcpViews(queryClient),
+  })
+}
+
+/**
+ * 转移所属人（P1-13，`POST /api/mcp/servers/:id/transfer`，**所属人或 ADMIN**）。
+ *
+ * 请求体 `{ toUserId }`，响应是**更新后的裸 `McpServerItem`**（同一套投影）。
+ * ⚠️ `created_by` 同时是**探测主语**（测试 / 工具列表用所属人的凭据）—— 界面上要显式提示。
+ */
+export function useTransferMcpServer() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, toUserId }: { id: string; toUserId: string }) =>
+      request<McpServerItem>(`/api/mcp/servers/${encodeURIComponent(id)}/transfer`, {
+        method: 'POST',
+        body: { toUserId } satisfies TransferAssetBody,
+      }),
     onSuccess: () => invalidateMcpViews(queryClient),
   })
 }

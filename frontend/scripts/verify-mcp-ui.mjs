@@ -810,11 +810,12 @@ await it('I2 `/mcp` 两条路由指向真页面，**不再**是占位页', () =>
 
 await it('I3 「从别处跳到凭据页」只有**一个**构造点（`app/paths.ts#credentialsPath`）', () => {
   const files = sourceFiles()
-  const withQuery = files.filter(({ source }) => source.includes('?serverId='))
+  // 2026-10-16：凭据页分区后地址形如 `?section=mcp&serverId=…`，故按 `serverId=` 判（`?serverId=` 不再出现）
+  const withQuery = files.filter(({ source }) => source.includes('serverId='))
   assertDeepEqual(
     withQuery.map((file) => file.name),
     ['app/paths.ts'],
-    '`?serverId=` 这个字面只能出现在 paths.ts（三处入口都调那个函数）',
+    '`serverId=` 这个字面只能出现在 paths.ts（三处入口都调那个函数）',
   )
 })
 
@@ -865,6 +866,16 @@ await it('I8 两个纯逻辑文件都**不 import React / antd / api**（否则�
     assertExcludes(file.source, '/api/', `${name} 不该 import api 层`)
     assertExcludes(file.source, '/styles/', `${name} 不该 import 样式`)
   }
+})
+
+await it('I9 「测试」按钮也归入 canEdit 门禁（2026-10-16：测试用所属人凭据，只有所属人/ADMIN 能点）', () => {
+  const page = sourceFiles().find(({ name }) => name === 'pages/mcp/McpServersPage.tsx')
+  assert(page !== undefined, '找不到 MCP 列表页')
+  const canEditAt = page.source.indexOf('server.canEdit ? (')
+  const testAt = page.source.indexOf('testServer.mutate(')
+  assert(canEditAt >= 0, 'canEdit 门禁必须存在')
+  assert(testAt > canEditAt, '测试按钮要落在 `server.canEdit ? (` 之后（同门禁），不能无条件渲染')
+  assertIncludes(page.source, '测试 / 编辑 / 删除都需要', '无权限的说明要涵盖测试')
 })
 
 // ───────────────────────────── 汇总 ─────────────────────────────

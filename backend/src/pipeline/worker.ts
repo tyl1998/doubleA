@@ -92,6 +92,8 @@ const JOB_DOCUMENT_SELECT = {
       embeddingDim: true,
       // 该库选定的图片描述模型（P1-11；可空 = 该库不产出图片描述）
       captionModelId: true,
+      // P1-18：embedding / caption 上游凭据的主语 = 库所属人（PER_USER 的 Provider 取他的 Key）
+      createdBy: true,
     },
   },
 } as const
@@ -396,7 +398,7 @@ async function handleJob(job: PipelineJob): Promise<void> {
     try {
       // 解析该库**选定**的 embedding 模型（入库用它，而不是进程级环境变量）——
       // 查库 + 解密 Key 都在这里；失败按"文档处理失败"落库（消息可展示），不是基础设施故障。
-      const target = await resolveEmbeddingTarget(row.kb.embeddingModelId)
+      const target = await resolveEmbeddingTarget(row.kb.embeddingModelId, row.kb.createdBy)
       // 防御性复核：勾了「图片向量化」要求该库模型支持多模态端点（上传时已校验过一次，
       // 但模型可能在文档排队期间被改过 —— 这里再拦一道，避免图片被当文本静默吞掉）
       if (row.imageVectorize && !target.embeddingMultimodal) {
@@ -428,6 +430,7 @@ async function handleJob(job: PipelineJob): Promise<void> {
         row.kb.captionModelId,
         row.imageRecognize,
         log,
+        row.kb.createdBy,
       )
 
       for (const stage of state.stages) await stage.run(ctx)
@@ -504,10 +507,11 @@ async function resolveCaptionTarget(
   modelId: string | null,
   imageRecognize: ImageRecognition,
   log: Logger,
+  subjectUserId: string | null,
 ): Promise<LlmTarget | undefined> {
   if (modelId === null || imageRecognize !== 'LLM') return undefined
   try {
-    const target = await resolveChatTarget(modelId)
+    const target = await resolveChatTarget(modelId, subjectUserId)
     if (!target.supportsVision) {
       log.warn(
         { modelId, modelName: target.modelName },

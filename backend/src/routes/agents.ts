@@ -45,11 +45,13 @@ import {
   listAgentsQuerySchema,
   ok,
   replaceAgentComponentsBodySchema,
+  transferAssetBodySchema,
   updateAgentBodySchema,
   type AgentIdParams,
   type CreateAgentBody,
   type ListAgentsQuery,
   type ReplaceAgentComponentsBody,
+  type TransferAssetBody,
   type UpdateAgentBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -62,6 +64,7 @@ import {
   listAgents,
   removeAgent,
   replaceAgentComponents,
+  transferAgent,
   updateAgent,
   type AgentViewer,
 } from '../services/agent.service.js'
@@ -123,6 +126,20 @@ export function registerAgentRoutes(app: FastifyInstance): void {
     '/api/agents/:id/copy',
     { preHandler: app.requireAuth, schema: { params: agentIdParamsSchema } },
     async (request) => ok(await copyAgent(request.params.id, viewerOf(request))),
+  )
+
+  /**
+   * 转移所属人（P1-13，**所属人或 ADMIN**）。`{ toUserId }`；接收方须为 ACTIVE 用户、不能转给自己。
+   * 转移后 `createdBy` 改为新所属人，权限随新所属人（无需接收方确认，用户 2026-10-16 定案）。
+   */
+  app.post<{ Params: AgentIdParams; Body: TransferAssetBody }>(
+    '/api/agents/:id/transfer',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: agentIdParamsSchema, body: transferAssetBodySchema },
+    },
+    async (request) =>
+      ok(await transferAgent(request.params.id, request.body.toUserId, viewerOf(request))),
   )
 
   /** 编辑（**登录即可进入，行级判定：创建者或 ADMIN**，否则 403） */

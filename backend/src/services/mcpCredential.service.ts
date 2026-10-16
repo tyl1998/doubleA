@@ -40,9 +40,12 @@
  *    `encryptSecret('')` 会得到结构合法的 `v1.iv.tag.`，那会让"已配置"永远为真）；
  *    **全部 key 都被清空 ⇒ 整行删掉**（"有行"本身就是"我配过"的证据）。
  *
- * **⑤ `configured` 按当前模板逐 key 判，不是"表里有没有行"**（坑预判 2）。
- *    合并语义 ⇒ 注册者后来给模板新增一个 `required` 参数时，老用户的行还在、那个 key 却没值。
- *    判据收在 `shared#isCredentialConfigured`（唯一实现），本文件只提供"当前有哪些 key 有值"。
+ * **⑤ `configured` 按"我是否真的填过值"判、**按人**（2026-10-16 修订）**。
+ *    原判据是"当前模板的必填项是否齐全"，后果是：注册者没勾必填时，**每个人**（含从没配过的）
+ *    都会被算成"已配置" —— 而凭据是 `(server,user)` 一份的，于是看起来像"别人配的凭据对我也生效"。
+ *    改用"我这边至少有一个模板内的值"（判据收在 `shared#isCredentialConfigured`，唯一实现）：
+ *    `configured === true` ⟺ 我填过；模板无参数时恒 `true`（没有东西要他填）。
+ *    `missingKeys`（必填缺哪些）仍照算，只作界面提示用，不再参与 `configured`。
  *
  * **⑥ 日志只写 key 名与真假，绝不整体序列化含值的对象**（坑预判 4 / `02` §十三）。
  *    本文件的每条 `logger` 调用都只带 `serverId` / `userId` / `keys[]` / `clearedKeys[]` 这类
@@ -221,7 +224,7 @@ function toCredentialItem(
     })),
     missingKeys,
     configured: isCredentialConfigured(schema, presentKeys),
-    // ⚠️ 与 `configured` **不是**同一件事：模板没有必填项时"从没写过"也是已配置
+    // ⚠️ 与 `configured` **大致同向但不完全等价**：空模板（无参数）时"从没写过"也是 `configured:true`
     updatedAt: row === null ? null : row.updatedAt.toISOString(),
   }
 }

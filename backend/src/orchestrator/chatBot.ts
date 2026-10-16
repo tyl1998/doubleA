@@ -238,7 +238,8 @@ export const chatBotProducer: ChatProducer = async (input) => {
     // ── ②″ 会话行（owner + 会话级「不记入记忆」；长期记忆注入与收尾提取都要用）──
     const conversationRow = await db.conversation.findUnique({
       where: { id: conversationId },
-      select: { userId: true, memoryExcluded: true },
+      // `user.role` 供 P1-13 的运行时可见性过滤（ADMIN 见全部组件）
+      select: { userId: true, memoryExcluded: true, user: { select: { role: true } } },
     })
     if (conversationRow === null) throw AppError.notFound('会话不存在')
     // 长期记忆 v2（P1-8a）：② USER 画像**常驻** + ③ AGENT 记忆**极简目录 TOC**（不含正文）；
@@ -260,12 +261,19 @@ export const chatBotProducer: ChatProducer = async (input) => {
     })
     // 走到这里还查不到 = 软删与发消息的竞态（`assertConversationSendable` 已用 409 挡过一次）
     if (agent === null) throw AppError.notFound('智能体不存在')
-    const kbIds = agent.components
+    const kbIdsRaw = agent.components
       .filter((component) => component.componentType === 'KNOWLEDGE')
       .map((component) => component.refId)
-    const mcpServerIds = agent.components
+    const mcpServerIdsRaw = agent.components
       .filter((component) => component.componentType === 'MCP')
       .map((component) => component.refId)
+
+    // ── ②·bis P1-18：**不再按可见范围过滤组件** ──
+    // 组件通过 Agent 被使用时，授权来自 **Agent 的受众**（"谁能用这个 Agent 就能用它的组件"）；
+    // 组件自身的可见范围只表达"愿不愿意被别人独立发现并复用"，不参与这里的装配。
+    // 想收回某个组件 = 从 Agent 解绑（`filterVisibleAssetIds` 已随 P1-18 删除）。
+    const kbIds = kbIdsRaw
+    const mcpServerIds = mcpServerIdsRaw
 
     // ── ②′ 可用知识库清单（库名 + 文档名）──
     /**

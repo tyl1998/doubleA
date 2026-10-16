@@ -196,7 +196,9 @@ async function writeExplicitMemories(input: RunMemoryExtractionInput): Promise<v
     let statements: ProfileStatement[] | null = null
     try {
       const target =
-        input.modelId === undefined || input.modelId === null ? null : await resolveChatTarget(input.modelId)
+        input.modelId === undefined || input.modelId === null
+          ? null
+          : await resolveChatTarget(input.modelId, input.userId)
       if (target !== null) statements = await extractMemoryProfileStatements(target, input.userText)
     } catch (error) {
       getLogger().warn(

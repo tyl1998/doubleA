@@ -46,31 +46,58 @@ export const MCP_PATH = '/mcp'
  *
  * ⚠️ 它是**个人凭据页**，与 MCP 解耦 —— 「代表你调用工具」是个人设置，
  * 归入 `/settings` 一族（与 `/settings/password` 同族），后续可扩展别的凭据类型。
- * 页面**内容**仍是按 MCP server 分组的表单，后端端点也仍是 `/api/mcp/credentials`。
- * Git 凭据（P1-9 · R11）不再是独立路由，作为本页内嵌的 `GitCredentialsSection` 区块呈现。
+ * 页面**内容**分三个分区（MCP 工具凭据 / 模型 Provider 凭据 / Git 凭据），
+ * 后端端点也仍是 `/api/mcp/credentials`、`/api/model-providers/my-*`、`/api/git-credentials`。
  */
 export const CREDENTIALS_PATH = '/settings/credentials'
+
+/**
+ * 「我的凭据」页的分区键（2026-10-16 修订：Provider 凭据与 MCP 工具凭据原先**堆叠**在一页，
+ * 现分成分区；跨页深链用 `?section=` 直接落到对应分区）。
+ *   · `mcp`      —— MCP 工具凭据（按 server 分组的长表单；默认分区）
+ *   · `provider` —— 模型 Provider 凭据（各自 Key 可配 / 共享 Key 只读）
+ *   · `git`      —— Git 凭据与 Git 身份（Code 模式容器内 `git clone` 用）
+ */
+export const CREDENTIALS_SECTIONS = ['mcp', 'provider', 'git'] as const
+export type CredentialsSection = (typeof CREDENTIALS_SECTIONS)[number]
+
+/** 分区锚点 id（分区 `<section>` 与跳转共用；**唯一构造点**） */
+export function credentialsSectionAnchorId(section: CredentialsSection): string {
+  return `credentials-${section}`
+}
+
+/**
+ * 「我的凭据」地址，可带 `?serverId=` 定位到某一台 server 的分组（`03` §二 的引注、§4.5）。
+ *
+ * ⚠️ **这是"从别处跳到凭据页 MCP 分区"的唯一构造点**，三个入口共用（`03` §4.5 的原文就点了三个）：
+ *   · Agent 编辑页 MCP 多选框旁的「未配置」红点（`03` §4.2 第 4 区）；
+ *   · 会话里失败工具卡的「去配置凭据」（`02` §9.3，`errorCode === 'NEED_CREDENTIAL'`）；
+ *   · MCP 管理页「我的凭据」列（未配置时）。
+ *
+ * 不传 `serverId` ⇒ **裸路径**（不是 `?serverId=`）：凭据页据此区分"要定位到某台"与"就看看全部"，
+ * 而空串会让它去 `document.getElementById('cred-')` 找一个不存在的锚点（静默什么都不发生）。
+ */
+export function credentialsPath(serverId?: string): string {
+  return serverId === undefined
+    ? CREDENTIALS_PATH
+    : `${CREDENTIALS_PATH}?section=mcp&serverId=${encodeURIComponent(serverId)}`
+}
+
+/**
+ * 跳到「我的凭据」的某个分区（`provider` / `git`）。
+ *
+ * ⚠️ 与 {@link credentialsPath} 的分工：那个专供 MCP（可带 server 锚点），这个供其余分区 ——
+ * 于是"从外部跳到对应的地方"有了两条语义清楚的构造点，而不是让调用方自己拼查询串。
+ */
+export function credentialsSectionPath(section: Exclude<CredentialsSection, 'mcp'>): string {
+  return `${CREDENTIALS_PATH}?section=${section}`
+}
 
 /** 会话产物（跨会话汇总本人全部产物，含删除会话后保留的那些；登录即可、仅本人可见） */
 export const ARTIFACT_COLLECTION_PATH = '/artifacts'
 
 /** 任务中心（`03` §二：`/tasks`，登录即可 —— **定时任务**管理；P1-6） */
 export const TASKS_PATH = '/tasks'
-
-/**
- * 「我的凭据」地址，可带 `?serverId=` 定位到某一台 server 的分组（`03` §二 的引注、§4.5）。
- *
- * ⚠️ **这是"从别处跳到凭据页"的唯一构造点**，三个入口共用（`03` §4.5 的原文就点了三个）：
- *   · Agent 编辑页 MCP 多选框旁的「未配置」红点（`03` §4.2 第 4 区）；
- *   · 会话里失败工具卡的「去配置凭据」（`02` §9.3，`errorCode === 'NEED_CREDENTIAL'`）；
- *   · 顶部「我的凭据」入口（不带 `serverId`，落在全清单上）。
- *
- * 不传 `serverId` ⇒ **裸路径**（不是 `?serverId=`）：凭据页据此区分"要定位到某台"与"就看看全部"，
- * 而空串会让它去 `document.getElementById('cred-')` 找一个不存在的锚点（静默什么都不发生）。
- */
-export function credentialsPath(serverId?: string): string {
-  return serverId === undefined ? CREDENTIALS_PATH : `${CREDENTIALS_PATH}?serverId=${encodeURIComponent(serverId)}`
-}
 
 /**
  * 知识库详情（`03` §二 的 `/knowledge/:id`）。

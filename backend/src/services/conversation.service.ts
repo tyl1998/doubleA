@@ -86,6 +86,7 @@
 
 import {
   AppError,
+  canViewAsset,
   EMPTY_ACTIVE_SNAPSHOT,
   isConversationReadOnly,
   parseActiveSnapshot,
@@ -101,6 +102,7 @@ import {
   type RecallConversationResult,
   type RemoveConversationResult,
   type RenameConversationBody,
+  type UserRole,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -119,8 +121,17 @@ import { resolveChatTarget } from './model.service.js'
  * 与 `AgentViewer`（`{ id, role }`）的差别不是省事：那个资源要按角色判权，这个资源**不该按角色判**
  * —— 少一个字段，就越权实现无处落脚。
  */
+/**
+ * 调用者 —— 会话资源本身**只按 `id` 收窄**（见文件头 ①：所有查询一律带 `userId: viewer.id`）。
+ *
+ * `role` 是 **P1-13 加的、可选**：会话的归属判定**不用**它（那条纪律不变）；它只用于
+ * **"这一轮所选模型对该用户是否可见"** 这一条**资产**可见性判据（私有 Provider 的模型对
+ * 非所属人 / 非 ADMIN 不可用，防"公开 Agent 引用事后被收窄为私有的模型"时把别人的 Key 用掉）。
+ * 不传时按 `MEMBER` 兜底（定时任务等后台路径），需要更准的角色时服务层会现查一次。
+ */
 export interface ConversationViewer {
   id: string
+  role?: UserRole
 }
 
 /** 会话行的查询字段（列表 / 建 / 改名共用；`agent` 是**快照** join，见 `shared/src/conversation.ts` 文件头 ②） */
@@ -290,9 +301,23 @@ export async function createConversation(
   const db = getPrisma()
   const agent = await db.agent.findFirst({
     where: { id: input.agentId, deletedAt: null },
-    select: { id: true },
+    select: { id: true, createdBy: true, visibility: true },
   })
   if (agent === null) throw AppError.notFound('智能体不存在')
+  // P1-13：私有智能体对他人 **404**（不泄漏存在性）—— 与列表/详情同判据。
+  // 路由层一般会带 `role`；不带（后台路径）时现查一次。
+  const viewerRole =
+    viewer.role ??
+    (await db.user.findUnique({ where: { id: viewer.id }, select: { role: true } }))?.role ??
+    'MEMBER'
+  if (
+    !canViewAsset(
+      { ownerId: agent.createdBy, visibility: agent.visibility },
+      { id: viewer.id, role: viewerRole },
+    )
+  ) {
+    throw AppError.notFound('智能体不存在')
+  }
 
   const created = await db.conversation.create({
     // P1-17a：可选的运行时不传就走 Prisma 默认（**空串 = 空环境**）—— 显式展开避免把 `undefined` 写进去。
@@ -942,7 +967,11 @@ export async function assertConversationSendable(
     chosenModelId = requestedModelId
   }
 
-  const target = await resolveChatTarget(chosenModelId)
+  // ⚠️ P1-13 修订（2026-10-16）：**不再有"模型对我可见"这道闸** —— Provider 已无可见性，
+  // 模型只能通过 Agent 被使用 ⇒ "能否用到"由 **Agent 可见性**决定（本函数已保证请求的 modelId
+  // 是该 Agent 池的成员）。公开 Agent 引用 SHARED Provider 等于所属人自愿共享 Key 额度（用户定案）。
+  // P1-18：模型上游凭据的主语 = **会话发起者**（`PER_USER` 模式的 Provider 取他的 Key，缺 ⇒ 424）
+  const target = await resolveChatTarget(chosenModelId, viewer.id)
 
   // ③″ 附件（P1-4）：整段解析（归属校验 + 取对象 + 图片 base64 / 文本解析）都在服务层完成，
   //     编排层只拿结果 —— 于是"附件能不能用"的失败走**前置信封**（在写出任何 SSE 帧之前）。
