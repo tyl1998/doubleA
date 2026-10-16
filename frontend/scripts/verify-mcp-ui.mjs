@@ -475,7 +475,7 @@ await it('D10 契约形态 → 草稿能往返（编辑一个已注册的 server
 
 // ═════════════════════════════ E 组：server 表单的请求体 ═════════════════════════════
 
-groupStart('E', '注册 / 编辑的请求体（"没改就不发" + 集合语义判等）')
+groupStart('E', '注册 / 编辑的请求体（"没改就不发" + 模板整体结构判等）')
 
 await it('E1 新建：`authType` **不提交**、模板空数组也照提交', () => {
   const draft = emptyServerFormDraft()
@@ -500,7 +500,7 @@ await it('E3 只改 endpoint ⇒ 只带那一个键（模板不跟着发）', ()
   assertDeepEqual(buildServerUpdateBody(server, draft), { endpointUrl: 'https://mcp.internal/git2' }, '只带 endpointUrl')
 })
 
-await it('E4 **换了两行的顺序**不算改动（集合语义判等，别用 `JSON.stringify` 直比）', () => {
+await it('E4 **换了两行的顺序** ⇒ 带上整份模板（顺序即界面顺序，是刻意保留的事实 —— 2026-10-17 修订）', () => {
   const server = makeServer({
     credentialSchema: [
       { key: 'a', label: 'A', type: 'string', inject: 'HEADER' },
@@ -509,16 +509,59 @@ await it('E4 **换了两行的顺序**不算改动（集合语义判等，别用
   })
   const draft = serverFormDraftFrom(server)
   draft.credentialSchema = [draft.credentialSchema[1], draft.credentialSchema[0]]
-  assertEqual(buildServerUpdateBody(server, draft), null, '顺序变了不该发 PATCH（更不该弹"影响了 N 份凭据"）')
+  assertDeepEqual(
+    buildServerUpdateBody(server, draft),
+    {
+      credentialSchema: [
+        { key: 'b', label: 'B', type: 'string', inject: 'QUERY' },
+        { key: 'a', label: 'A', type: 'string', inject: 'HEADER' },
+      ],
+    },
+    '调了行序就该照提交（不提交 = 调序保存不了）',
+  )
 })
 
-await it('E5 **只改 label** 也不算改动（改文案对已存的值没有任何影响）', () => {
+await it('E5 **只改 label（参数提示）⇒ 带上整份模板**（本 bug：旧判据把它静默丢弃）', () => {
   const server = makeServer({
     credentialSchema: [{ key: 'a', label: 'A', type: 'string', inject: 'HEADER' }],
   })
   const draft = serverFormDraftFrom(server)
   draft.credentialSchema = updateTemplateRow(draft.credentialSchema, 0, { label: '改个说明' })
-  assertEqual(buildServerUpdateBody(server, draft), null, 'label 不参与差异判定')
+  assertDeepEqual(
+    buildServerUpdateBody(server, draft),
+    { credentialSchema: [{ key: 'a', label: '改个说明', type: 'string', inject: 'HEADER' }] },
+    'label 是「我的凭据」页的参数提示，漏发 = 改了等于没改',
+  )
+})
+
+await it('E5b **只改 placeholder / required** 同样要提交（模板整体判等，不止 key 级）', () => {
+  const server = makeServer({
+    credentialSchema: [{ key: 'a', label: 'A', type: 'string', inject: 'HEADER' }],
+  })
+  const draftForPlaceholder = serverFormDraftFrom(server)
+  draftForPlaceholder.credentialSchema = updateTemplateRow(draftForPlaceholder.credentialSchema, 0, {
+    placeholder: '粘贴个人令牌',
+  })
+  assertDeepEqual(
+    buildServerUpdateBody(server, draftForPlaceholder),
+    { credentialSchema: [{ key: 'a', label: 'A', type: 'string', inject: 'HEADER', placeholder: '粘贴个人令牌' }] },
+    'placeholder 变了也要发',
+  )
+  const draftForRequired = serverFormDraftFrom(server)
+  draftForRequired.credentialSchema = updateTemplateRow(draftForRequired.credentialSchema, 0, { required: true })
+  assertDeepEqual(
+    buildServerUpdateBody(server, draftForRequired),
+    { credentialSchema: [{ key: 'a', label: 'A', type: 'string', inject: 'HEADER', required: true }] },
+    'required 变了也要发',
+  )
+})
+
+await it('E5c 键序不同的两份模板判**等**（jsonb 往返会重排对象键，直比会出假阳性）', () => {
+  const server = makeServer({
+    credentialSchema: [{ required: true, inject: 'HEADER', type: 'string', label: 'A', key: 'a' }],
+  })
+  const draft = serverFormDraftFrom(server)
+  assertEqual(buildServerUpdateBody(server, draft), null, '键序差异不算改动')
 })
 
 await it('E6 删掉一个 key ⇒ 带上整份模板（整体替换语义）', () => {

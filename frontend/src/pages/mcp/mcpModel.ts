@@ -25,7 +25,6 @@ import {
   MCP_CREDENTIAL_KEY_MAX,
   MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES,
   MCP_SERVER_NAME_MAX,
-  diffCredentialSchema,
   validateCredentialSchema,
   type KbMcpVisibility,
   type CredentialInjectLocation,
@@ -444,12 +443,51 @@ export function buildCreateServerBody(draft: ServerFormDraft, visibility?: KbMcp
 }
 
 /**
+ * 模板**整体判等**（2026-10-17 修订）：键序无关（jsonb 往返会重排对象键，直比会出假阳性）、
+ * **行序有关**（顺序即界面顺序，是刻意保留的事实 —— 调了行序却"没改"等于白调）。
+ *
+ * 为什么**不能用** `shared#diffCredentialSchema` 做这个判定：它回答的是
+ * "**已存凭据会受什么影响**"（只看 key 的增/删/换注入位置，`label`/`placeholder`/`required`
+ * 按定义不参与）。拿它当"用户改没改模板"的判据，症状就是本 bug：
+ * **只改参数提示（label）⇒ diff 为空 ⇒ `credentialSchema` 不进请求体 ⇒ 改动静默丢失**
+ * —— 弹窗里看着改了、保存也"成功"，重开弹窗还是旧文案（backend 的 `sameJson` 本来
+ * 就预期收下并处理它，见 `shared` 文件头 ④"连 label 改了也清缓存"）。
+ *
+ * 三个判据各答各的问题，别互相合并（`docs/06` §六 第 ⑰ 条）：
+ *   · 本函数 → "**用户这次改没改模板**"（决定发不发 `credentialSchema`）；
+ *   · 服务层 `sameJson` → "**模板整体变没变**"（决定清不清工具缓存）；
+ *   · `diffCredentialSchema` → "**已存凭据受什么影响**"（决定 impact 提示，服务端算）。
+ *
+ * 实现 = 一份规范化序列化：对象键排序、跳过 `undefined` 值（与"可省键"等价）、数组保持顺序。
+ * 两侧都是**归一化后**的形状（服务端投影过 `normalizeCredentialSchema`、草稿经
+ * {@link templateRowsToSchema} trim），因此不需要再做语义层折算。
+ */
+function canonicalTemplateJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalTemplateJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined)
+    entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalTemplateJson(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/** {@link canonicalTemplateJson} 的判等出口（true = 两份模板**没有**任何差异） */
+export function credentialSchemaEquals(
+  a: readonly CredentialSchemaEntry[],
+  b: readonly CredentialSchemaEntry[],
+): boolean {
+  return canonicalTemplateJson(a) === canonicalTemplateJson(b)
+}
+
+/**
  * 编辑请求体：**只带真改过的字段**；一个都没改 ⇒ 返回 `null`（调用方不发请求）。
  *
- * ⚠️ `credentialSchema` 的比较用的是**集合语义 + 注入位置**（`shared#diffCredentialSchema`），
- * **不是** `JSON.stringify` 的逐字比较：后者会把"换了两行的顺序"也算成改动，
- * 于是一次纯粹的视觉调整会发出一个 `PATCH`，并把 `credentialSchemaImpact`
- * （"哪些已存凭据受影响"）算一遍 —— 而那里根本没有任何影响。
+ * ⚠️ `credentialSchema` 的比较是**整体结构判等**（{@link credentialSchemaEquals}）：
+ * `label`（参数提示）/ `placeholder` / `required` / **行序**的任何差异都要提交 ——
+ * 这份模板就是"我的凭据"页的表单定义，漏发它们 = 用户改了等于没改（本函数 2026-10-16 之前
+ * 的行为，即本 bug）。反过来，纯粹的视觉调整（改 label）也**不会**误弹"影响了 N 份凭据"：
+ * 那条提示由服务端按 `diffCredentialSchema`（key 级）计算，文案级改动 ⇒ diff 为空 ⇒ `null`。
  *
  * ⚠️ 三个字段的"清空"形态：`credentialSchema` 的清空就是提交 `[]`（数组语义）；
  * `name` / `endpointUrl` 都是必填，**不存在清空**（空了就是本地校验拦下的非法输入）。
@@ -468,8 +506,7 @@ export function buildServerUpdateBody(
   if (endpointUrl !== server.endpointUrl) body.endpointUrl = endpointUrl
 
   const nextSchema = templateRowsToSchema(draft.credentialSchema)
-  const diff = diffCredentialSchema(server.credentialSchema, nextSchema)
-  if (diff.removedKeys.length > 0 || diff.addedKeys.length > 0 || diff.retargetedKeys.length > 0) {
+  if (!credentialSchemaEquals(server.credentialSchema, nextSchema)) {
     body.credentialSchema = nextSchema
   }
 
