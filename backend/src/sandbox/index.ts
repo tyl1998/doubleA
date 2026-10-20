@@ -34,6 +34,17 @@ export {
   type SandboxStats,
 } from './manager.js'
 
+// 节点自检/自举（P1-14 部署优化）：后端进程内检测本机能否当沙箱实例、并按平台补齐依赖
+export {
+  bootstrapNode,
+  inspectNode,
+  type NodeBootstrapResult,
+  type NodeBootstrapStep,
+  type NodeCheckItem,
+  type NodeReport,
+  type NodeRoleName,
+} from './nodeBootstrap.js'
+
 // LLM 注入（P0-3-4）：把 `agents.model_id` 解析成"要注入容器的那组环境变量"
 export { resolveSandboxLlm, type SandboxLlmFailureCode, type SandboxLlmResult } from './llm.js'
 
@@ -165,7 +176,7 @@ export {
 export { sandboxQueueDepth, sandboxQueueKey, sandboxQueuePosition } from './queue.js'
 
 // 多机归属（P1-14；P1-9 · R9 复用）：会话→实例目录 + 实例在线注册表 + 实例心跳
-// ｜ 进程入口（`index.ts`） | `claimInstanceIdentity`（启动同名自检）/ `startInstanceHeartbeat` / `stopInstanceHeartbeat`
+// ｜ 进程入口（`index.ts`） | `claimInstanceIdentity`（启动同名自检）/ `startInstanceHeartbeat` / `markInstanceStartupReady`（对账完成后再报就绪）/ `stopInstanceHeartbeat`
 // ｜ 编排层（`manager.ts`） | `registerSandboxOwner` / `clearSandboxOwner`
 // ｜ 工作区（`workspace/service.ts` / `routes/conversations.ts`） | `ensureWorkspaceOwner`（寿命跟随工作区）
 // ｜ 诊断 / 纯函数核对 | `instanceAdvertiseAddr` / `workspaceOwnerTtlSec` / `instanceRegistrationTtlSec`
@@ -175,12 +186,26 @@ export {
   ensureWorkspaceOwner,
   instanceAdvertiseAddr,
   instanceRegistrationTtlSec,
+  isSandboxStartupReady,
+  markInstanceStartupReady,
   readSandboxOwner,
   registerSandboxOwner,
   startInstanceHeartbeat,
   stopInstanceHeartbeat,
   workspaceOwnerTtlSec,
 } from './owner.js'
+
+// 沙箱角色（P1-14 · R1 部署编排）：网关与后端**同一个镜像** ⇒ 网关进程要能声明"我不是沙箱宿主"
+// ｜ 进程入口（`index.ts`） | `applySandboxRoleOverride`（在第一次读 `config.sandbox.enabled` 之前）
+// ｜ 诊断 / 纯函数核对 | `detectSandboxRole` / `SANDBOX_ROLES`
+export {
+  applySandboxRoleOverride,
+  detectSandboxRole,
+  SANDBOX_ROLES,
+  type SandboxRole,
+  type SandboxRoleDecision,
+  type SandboxRoleOverride,
+} from './roleOverride.js'
 
 // 名字与标签契约（纯函数；"哪些容器是我们的"**只**由它们回答）
 export {

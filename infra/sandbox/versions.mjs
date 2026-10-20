@@ -222,3 +222,53 @@ export const toolkitImageRef = () => `${TOOLKIT_IMAGE_NAME}:${TOOLKIT_LAYER_VERS
  *    变体名自己可以含 `-`（组合名 `node22-python38`），故用**最后一个 `-v<数字>`** 切变体名。
  */
 export const runtimeImageRef = (runtime) => `${RUNTIME_IMAGE_NAME}:${runtime}-v${RUNTIME_LAYER_VERSION}`
+
+// ───────────────── 平台镜像：业务后端 / 路由网关（P1-14 · R1；2026-10-19 拆成两个）─────────────
+//
+// 依据：`docs/子方案/沙箱多机部署.md` §八 1/§八 2/§八 4。
+//
+// ★ **两个独立镜像**：
+//   · `doubulea-backend:<ver>` —— 业务后端（`node dist/backend/src/index.js`）：全量依赖 + Prisma。
+//   · `doubulea-gateway:<ver>` —— 路由网关（`node dist/backend/src/router/main.js`）：**只装**
+//     fastify / ioredis / zod 及其运行期闭包（见 `infra/gateway/Dockerfile`）。
+//
+// ⚠️ 为什么拆（2026-10-19 实测）：共用平台镜像时镜像 813MB，其中 `node_modules` 一人 531MB
+//   —— `@prisma/*` ~330MB、`antd` ~120MB、`vite`/`typescript` 等构建期依赖，网关一个都加载不到。
+//   角色判据仍只有一处（`backend/src/sandbox/roleOverride.ts`）；⚠️ 网关容器仍要写
+//   `DOUBULEA_SANDBOX_ROLE=router`（否则会抢实例名、把自己登记成上游 ⇒ 回环）。
+//
+// ⚠️ 兼容：R1 最初的 `doubulea-router:<ver>`（"一个镜像两个角色"）保留为**后端镜像**的旧名。
+
+export const BACKEND_IMAGE_NAME = 'doubulea-backend'
+export const GATEWAY_IMAGE_NAME = 'doubulea-gateway'
+export const FRONTEND_IMAGE_NAME = 'doubulea-frontend'
+
+/** 旧名（R1 的"一个镜像两个角色"）：**仍指业务后端镜像**，只作兼容 */
+export const PLATFORM_IMAGE_NAME = 'doubulea-router'
+
+/**
+ * 平台层**内容版本**（两个镜像共用）。⚠️ 改 `infra/router/Dockerfile` / `infra/gateway/Dockerfile` /
+ * `.dockerignore` / 依赖（`pnpm-lock.yaml`）时 +1。
+ *
+ * ⚠️ 不 +1 的症状是"部署了却没换代码"：各台机器上的旧 tag 还在，compose 只 `build` 不 `pull` 时
+ *   尤其容易（无 registry 的多机形态靠 `docker save/load` 分发）。
+ */
+export const PLATFORM_LAYER_VERSION = '2'
+
+/** 业务后端的启动命令（后端镜像的 CMD） */
+export const BACKEND_START_COMMAND = 'node dist/backend/src/index.js'
+
+/** 路由网关的启动命令（网关镜像的 CMD；compose 一般不必再覆盖） */
+export const ROUTER_START_COMMAND = 'node dist/backend/src/router/main.js'
+
+/** `doubulea-backend:<ver>` —— 业务后端镜像 */
+export const backendImageRef = () => `${BACKEND_IMAGE_NAME}:${PLATFORM_LAYER_VERSION}`
+
+/** `doubulea-gateway:<ver>` —— 路由网关镜像 */
+export const gatewayImageRef = () => `${GATEWAY_IMAGE_NAME}:${PLATFORM_LAYER_VERSION}`
+
+/** `doubulea-frontend:<ver>` —— 前端静态站点（nginx；局域网里反代到网关） */
+export const frontendImageRef = () => `${FRONTEND_IMAGE_NAME}:${PLATFORM_LAYER_VERSION}`
+
+/** 兼容旧名：= {@link backendImageRef}（R1 的 `BACKEND_IMAGE=doubulea-router:1` 仍可用） */
+export const platformImageRef = () => `${PLATFORM_IMAGE_NAME}:${PLATFORM_LAYER_VERSION}`

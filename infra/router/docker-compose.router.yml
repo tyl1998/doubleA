@@ -1,0 +1,80 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 路由网关（P1-14 · R1；唯一入口）
+#
+# 依据：`docs/子方案/沙箱多机部署.md` §八 3（拓扑）/ §八 4（网关配置 + 实例发现）/ §九（网关是新增单点）。
+#
+# 【它是什么】**网关专用镜像** `doubulea-gateway:<ver>`（2026-10-19 从平台镜像拆出：
+#   只装 fastify / ioredis / zod，不含 Prisma / antd / vite，镜像约为原来的 1/3）。职责只有一件：
+#   对粘性路由查目录（Redis `sandbox:owner:*`）转发到 owner，其余轮询 / 按负载 P2C。
+#
+# 【它不是什么】不挂 docker.sock、不设 SANDBOX_INSTANCE_ID、`DOUBULEA_SANDBOX_ROLE=router`
+#   ⇒ 不抢实例名、不登记心跳、不起对账器 / 出口② listener（见 `backend/src/sandbox/roleOverride.ts`）。
+#   ⚠️ 这三条**必须成立**：网关若把自己登记进实例表，自动发现会把**网关自己**当成上游（回环）。
+#
+# 【端口】网关 **不用 13000**：13000 是每台**实例后端**的端口（`SANDBOX_INSTANCE_ADVERTISE_ADDR` /
+#   `ROUTER_UPSTREAMS` 都指向它）。同机起后端与网关时，两者抢同一个宿主端口在 macOS 上直接失败
+#   （host 网络 vs 端口转发），因此网关默认 **13100**（`ROUTER_PORT`）。改了它要同步前端 `ROUTER_UPSTREAM`。
+#
+# 【用法】
+#   docker compose -f infra/router/docker-compose.router.yml --env-file infra/router/.env.router up -d
+#   （镜像先 `pnpm gateway:build`；无 registry 的多机：`--save` → scp → `docker load`）
+#
+# 【单点】网关自身无状态、可跑 **≥2 副本**，前面挂 LB；全部副本读同一个 Redis。
+#   ⚠️ **当前按 1 副本部署**（2026-10-19 决定：先用单网关跑通，副本编排见 `子方案` §八·补，
+#      未做之前**不要** `--scale router=N`：本文件固定了 `container_name`、且 `ROUTER_PORT` 发布到
+#      宿主 ⇒ 第二个副本会撞名/撞端口）。要上多副本：删 `container_name`、`ports` 改 `expose`、
+#      前面挂 `least_conn` LB，详见 §八·补 2。
+# ═══════════════════════════════════════════════════════════════════════
+
+name: doubulea-router
+
+services:
+  router:
+    image: ${GATEWAY_IMAGE:-doubulea-gateway:2}
+    container_name: doubulea-router
+    restart: unless-stopped
+    # ⚠️ 网关**不需要** host 网络：它只接 HTTP 并连 Redis / 各实例的 advertise 地址。
+    #    容器网络能到这些地址即可（同内网 / 同 docker 网络靠 DNS）。
+    # 网关镜像的默认 CMD 就是 `router/main.js`；这里显式写出只为"即使有人改了镜像也仍在跑网关"
+    command: ['node', '/app/backend/dist/backend/src/router/main.js']
+    environment:
+      # ★ 角色声明（安全网：即使有人把上一行的 command 改回后端，也不会抢实例名 —— 但它仍会连 DB）
+      DOUBULEA_SANDBOX_ROLE: router
+      NODE_ENV: production
+      # 对外入口（生产由 nginx 把 /api、/health 反代到这里）
+      ROUTER_PORT: ${ROUTER_PORT:-13100}
+      ROUTER_HOST: 0.0.0.0
+      # 静态种子（冷启动兜底）。开了自动发现后仍建议写：Redis 抖动时它就是全部
+      ROUTER_UPSTREAMS: ${ROUTER_UPSTREAMS:?必须设（如 a:3000,b:3000,c:3000）}
+      # 自动发现：周期扫 sandbox:instance:*（后端心跳写的）→ 上游表 = 静态种子 ∪ 发现的实例
+      # `0` = 关闭（此时 ROUTER_UPSTREAMS 必填）
+      ROUTER_DISCOVERY_SEC: ${ROUTER_DISCOVERY_SEC:-10}
+      # 负载感知（P1-14 · R3）：无 owner 时按 P2C 挑较空的实例；粘性命中永远优先
+      ROUTER_LOAD_AWARE: ${ROUTER_LOAD_AWARE:-true}
+      # 新鲜度阈值（毫秒）；不写 = 2× 心跳（默认 60s）。负载过期该台退回轮询次序
+      # （compose 不会丢弃空串的取值，所以留空时用 `*default` 兜底）
+      ROUTER_LOAD_STALE_MS: ${ROUTER_LOAD_STALE_MS:-60000}
+      # 与后端**同名同值**（推导"注册项过期"：3× 心跳 / "负载过期"：2× 心跳）
+      SANDBOX_INSTANCE_HEARTBEAT_SEC: ${SANDBOX_INSTANCE_HEARTBEAT_SEC:-30}
+      REDIS_URL: ${REDIS_URL:?必须设（与后端同一个 Redis）}
+      # 与后端**同名同值**（会话→实例目录的前缀）
+      SANDBOX_OWNER_KEY_PREFIX: ${SANDBOX_OWNER_KEY_PREFIX:-sandbox:owner}
+      # ⚠️ 注册值里 advertiseAddr 缺端口时补的端口（正常心跳都带端口；只兼容手工配置）
+      BACKEND_PORT: ${BACKEND_PORT:-3000}
+      ROUTER_UPSTREAM_TIMEOUT_MS: ${ROUTER_UPSTREAM_TIMEOUT_MS:-30000}
+      # 长任务路由（POST /api/admin/node/bootstrap 一键初始化）的「到响应头」上限：
+      # handler 同步等 Docker 拉镜像/建镜像/起容器，默认 15 分钟（与 nodeOps 跨实例转发上限对齐）
+      ROUTER_UPSTREAM_TIMEOUT_LONG_MS: ${ROUTER_UPSTREAM_TIMEOUT_LONG_MS:-900000}
+      LOG_PRETTY: 'false'
+    ports:
+      - '${ROUTER_PORT:-13100}:${ROUTER_PORT:-13100}'
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:'+(process.env.ROUTER_PORT||13100)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

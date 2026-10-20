@@ -906,6 +906,23 @@ export async function assertConversationOwner(
 }
 
 /**
+ * 取会话的**运行时设置**（归属校验 + 只读两列），供"用户点名实例"这类需要先看 runtime 的端点用。
+ *
+ * 口径与其余会话端点一致：别人的会话与不存在的 id 回同一个 404（见文件头 ①）。
+ */
+export async function getConversationRuntimeForViewer(
+  conversationId: string,
+  viewer: ConversationViewer,
+): Promise<{ id: string; runtime: string; codeMode: boolean }> {
+  const row = await getPrisma().conversation.findFirst({
+    where: { id: conversationId, userId: viewer.id },
+    select: { id: true, runtime: true, codeMode: true },
+  })
+  if (row === null) throw AppError.notFound('会话不存在')
+  return { id: row.id, runtime: row.runtime, codeMode: row.codeMode }
+}
+
+/**
  * 发消息的前置闸门（`POST /:id/chat` 的第一步，**在写出任何 SSE 帧之前**跑完）。
  *
  * 四道判据，**顺序即用户看到什么**：

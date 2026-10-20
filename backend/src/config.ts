@@ -972,6 +972,16 @@ export interface AppConfig {
    * （`sandbox/proxy.ts` 的两个 MCP 代理端点 + `sandbox/token.ts` 的令牌长度）。
    */
   sandbox: {
+    /**
+     * 本实例是否是**沙箱宿主**（P1-14 · R1）。
+     *
+     * 由 `sandbox/roleOverride.ts#applySandboxRoleOverride` 在进程入口**就地改写** ——
+     * 路由网关与后端共用一个镜像，网关进程（`DOUBULEA_SANDBOX_ROLE=router`）必须把自己关成
+     * `false`，否则它会抢实例名、起对账器、起 listener（全是**别的机器的**活）。
+     * ⚠️ 它**不是** env 的直接投影：初值恒为 `true`（"本进程是业务后端"），
+     *    真正的判据在 `roleOverride.ts`（显式声明优先，其次推断 Docker 可达 + 配了镜像）。
+     */
+    enabled: boolean
     /** 空闲回收（分钟）。判据是**最后一次引擎事件的时间**，不是 CPU 占用 */
     idleTtlMin: number
     /** 最终镜像（= toolkit 层）；值来自 `pnpm sandbox:build` 的打印 */
@@ -1343,6 +1353,8 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       pipeline: vars.PIPELINE_CONCURRENCY,
     },
     sandbox: {
+      // ⚠️ 初值恒为 `true`：角色判据在 `sandbox/roleOverride.ts`，由进程入口改写（见该模块文件头）
+      enabled: true,
       idleTtlMin: vars.SANDBOX_IDLE_TTL_MIN,
       image: vars.SANDBOX_IMAGE,
       imageBase: vars.SANDBOX_IMAGE_BASE,

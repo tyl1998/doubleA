@@ -39,6 +39,11 @@ export interface HealthSummary {
   env: string
   port: number
   uptimeSec: number
+  /**
+   * 承接该响应的后端实例 id（`null` = 非沙箱宿主角色）。
+   * 可选：老版本后端不返回该字段；消费方必须容忍 `undefined`。
+   */
+  instanceId?: string | null
   checks: HealthCheck[]
 }
 
@@ -58,6 +63,16 @@ export const HEALTH_TARGET_LABEL: Readonly<Record<HealthTarget, string>> = {
  * 服务信息取不到时应当安静地少显示几行，而不是让登录页在那里转圈重试。
  * 后端不可达时用户马上就会从"点了登录没反应"得到更直接的结论。
  */
+/**
+ * 读一次服务信息（非 hook；给"这条响应由哪台后端发出"这类一次性判断用）。
+ *
+ * 与 {@link useHealth} 的区别只有缓存口径：这里不节流、不重试，调用方自己决定缓存多久
+ * （管理页把它钉成 `staleTime: Infinity`，见 `SandboxInstancesPage` 文件头 ★）。
+ */
+export function fetchHealth(signal?: AbortSignal): Promise<HealthSummary> {
+  return request<HealthSummary>('/health', signal === undefined ? {} : { signal })
+}
+
 export function useHealth() {
   return useQuery({
     queryKey: HEALTH_QUERY_KEY,

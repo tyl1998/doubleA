@@ -33,7 +33,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$INFRA_DIR/.." && pwd)"
 ENV_FILE="$INFRA_DIR/.env"
-RELAY_SRC="$SCRIPT_DIR/sandbox-relay.mjs"
+# ★ 容器内自举：`-v` 由**宿主** docker 解析，而本脚本可能跑在后端容器里（`/app/infra/scripts` 是
+#   容器内路径，宿主上不存在）⇒ 后端正向挂载时用 `DOUBULEA_HOST_INFRA_DIR` 传宿主路径。
+DOUBULEA_MOUNT_DIR="${DOUBULEA_HOST_INFRA_DIR:-$SCRIPT_DIR}"
+RELAY_SRC="$DOUBULEA_MOUNT_DIR/sandbox-relay.mjs"
 
 NAME=doubulea-sandbox-relay
 PORT=13001
@@ -92,7 +95,10 @@ cd "$REPO_ROOT" || fail "无法进入仓库根: $REPO_ROOT"
 
 step 'Preflight'
 
-DOCKER_BIN="$(command -v docker 2>/dev/null || true)"
+# ★ 容器内自举（P1-14 部署优化）：镜像里没有 docker CLI，后端把 CLI 以只读卷挂到
+#   `SANDBOX_DOCKER_BIN`（/opt/doubulea-docker-bin/docker）⇒ 优先用它；宿主上该变量通常为空。
+DOCKER_BIN="${SANDBOX_DOCKER_BIN:-}"
+[ -n "$DOCKER_BIN" ] && [ -x "$DOCKER_BIN" ] || DOCKER_BIN="$(command -v docker 2>/dev/null || true)"
 if [ -z "$DOCKER_BIN" ] && [ -x /usr/local/bin/docker ]; then
   DOCKER_BIN=/usr/local/bin/docker
   export PATH="/usr/local/bin:$PATH"
@@ -101,7 +107,8 @@ fi
 "$DOCKER_BIN" info >/dev/null 2>&1 || fail "docker daemon 不通（Docker Desktop / OrbStack 起了吗？）"
 ok "docker 可用：$DOCKER_BIN"
 
-[ -f "$RELAY_SRC" ] || fail "缺中转实现 $RELAY_SRC"
+# ⚠️ 存在性检查用**容器内**的副本（$SCRIPT_DIR）；`-v` 的源用宿主路径（$DOUBULEA_MOUNT_DIR）
+[ -f "$SCRIPT_DIR/$(basename "$RELAY_SRC")" ] || fail "缺中转实现 $RELAY_SRC"
 ok "中转实现：$RELAY_SRC"
 
 "$DOCKER_BIN" image inspect "$IMAGE" >/dev/null 2>&1 || fail "本地没有镜像 ${IMAGE}（本脚本刻意不联网拉：它必须离线可跑）"
@@ -125,6 +132,15 @@ if "$DOCKER_BIN" container inspect "$NAME" >/dev/null 2>&1; then
   "$DOCKER_BIN" rm -f "$NAME" >/dev/null 2>&1 || fail "删不掉旧容器 $NAME"
 fi
 
+# ⚠️ 不要用 `${VAR:+...}` 拼 `-v`：sh(dash) 下引号内嵌无法组合成"一个参数"，
+#    会把 `-v doubulea-node-infra:/app` 拆成两个词 ⇒ `doubulea-node-infra` 被当成**镜像名**。
+#    用数组逐个追加参数。
+MOUNT_ARGS=( -v )
+if [ -n "${DOUBULEA_MOUNT_VOLUME:-}" ]; then
+  MOUNT_ARGS+=( "${DOUBULEA_MOUNT_VOLUME}:/app" )
+else
+  MOUNT_ARGS+=( "${RELAY_SRC}:/app/sandbox-relay.mjs:ro" )
+fi
 "$DOCKER_BIN" run -d --name "$NAME" \
   --network bridge --restart unless-stopped \
   --add-host "host.docker.internal:host-gateway" \
@@ -132,7 +148,7 @@ fi
   -e "RELAY_LISTEN_PORT=${PORT}" \
   -e "RELAY_TARGET_HOST=${TARGET}" \
   -e "RELAY_TARGET_PORT=${TARGET_PORT}" \
-  -v "$RELAY_SRC:/app/sandbox-relay.mjs:ro" \
+  "${MOUNT_ARGS[@]}" \
   "$IMAGE" node /app/sandbox-relay.mjs >/dev/null || fail "容器起不来（$DOCKER_BIN logs $NAME 看原因）"
 ok "已启动（后端腿 = 默认 bridge）"
 

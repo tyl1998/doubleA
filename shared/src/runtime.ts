@@ -184,8 +184,44 @@ export const sandboxRuntimeLanguageSchema = z.object({
 export type SandboxRuntimeLanguageInfo = z.infer<typeof sandboxRuntimeLanguageSchema>
 
 /** `GET /api/sandbox/runtimes` 的响应 */
+/** 单个实例的运行时能力（P1-14 多机：让用户在"这台有 / 那台要构建"之间选） */
+export const sandboxInstanceRuntimeItemSchema = z.object({
+  instanceId: z.string().min(1),
+  /** 网关回连地址（`host:port`），与 `sandbox:instance:*` 的 `advertiseAddr` 同值 */
+  advertiseAddr: z.string().min(1),
+  /** 该实例**已就绪**的运行时 */
+  runtimes: z.array(sandboxRuntimeSchema),
+  /** 该实例能否**按需构建**（构建上下文 + docker 可用）；`false` 时只能选它已就绪的 */
+  canBuild: z.boolean(),
+  /**
+   * 该实例**是否就绪**（节点自检：docker / 沙箱网 / egress / relay / toolkit / 工作区）。
+   * `false` ⇒ 可见但**不可选**（前端灰显并提示缺什么）。`null` = 未上报（老版本实例）。
+   */
+  ready: z.boolean().nullable(),
+  /** 未就绪的必需项（给人看的一句话；`ready` 为真或未知时为空数组） */
+  missing: z.array(z.string()),
+  /** 该实例的**负载快照**（繁忙度展示用）；`null` = 心跳没带负载（例如刚启动的第一拍） */
+  load: z
+    .object({
+      slotsUsed: z.number().int().nonnegative(),
+      slotsTotal: z.number().int().nonnegative(),
+      queueDepth: z.number().int().nonnegative(),
+    })
+    .nullable(),
+  /**
+   * 这份能力是否**已知**：本机 = `true`；远端实例 = 它在心跳里报了 `runtimes` 才为 `true`。
+   * `false` ⇒ 前端显示"能力未知"，不要据此说"这台没有"。
+   */
+  known: z.boolean(),
+})
+export type SandboxInstanceRuntimeItem = z.infer<typeof sandboxInstanceRuntimeItemSchema>
+
 export const listSandboxRuntimesResultSchema = z.object({
-  /** 本机**已就绪**的运行时（有镜像才算） */
+  /**
+   * 本机**已就绪**的运行时（有镜像才算）。
+   * ⚠️ 多机下的语义 = "**承接本次请求的那台**"（`instances[].instanceId === servedBy` 那一项）；
+   *    要按机器看，用 {@link instances} —— 顶层这两组字段保留是为兼容旧前端。
+   */
   runtimes: z.array(sandboxRuntimeSchema),
   /** **语言清单**（UI 据此渲染"勾选语言 + 填版本"；勾完的组合若不在 runtimes 里 ⇒ 可按需构建） */
   languages: z.array(sandboxRuntimeLanguageSchema),
@@ -193,6 +229,14 @@ export const listSandboxRuntimesResultSchema = z.object({
   fallbackImage: z.string().nullable(),
   /** 后端能否**按需构建**（构建上下文存在 + docker 可用）；`false` 时前端只让选已就绪的 */
   canBuild: z.boolean(),
+  /**
+   * 在线实例及各自的运行时能力（P1-14；按 `instanceId` 升序）。
+   * ⚠️ 能力来自实例心跳（`sandbox:instance:*` 的 `runtimes`）—— 老实例没报时 `runtimes` 为空、
+   *    `known=false`，前端应显示"未知"而不是"没有"。本进程自己的那项恒为实时探测结果。
+   */
+  instances: z.array(sandboxInstanceRuntimeItemSchema),
+  /** 本次请求由哪台实例承接（= `instances` 里"本机"那一项；取不到实例 id 时为 `null`） */
+  servedBy: z.string().nullable(),
 })
 export type ListSandboxRuntimesResult = z.infer<typeof listSandboxRuntimesResultSchema>
 
@@ -208,6 +252,12 @@ export const buildSandboxRuntimeBodySchema = z.object({
     )
     .min(1, '至少选一个语言')
     .max(8, '语言过多'),
+  /**
+   * 期望在**哪台实例**上构建（P1-14）。省略 = 接住本次请求的那台（旧行为）。
+   * ⚠️ 任务只存在于发起它的进程 ⇒ 请求被网关路由到别的实例时，后端会回一个 `failed` 快照
+   *   （`instanceId` 会如实写"实际接住的那台"），前端据此提示"重试"。
+   */
+  instanceId: z.string().trim().min(1).max(64).nullable().optional(),
 })
 export type BuildSandboxRuntimeBody = z.infer<typeof buildSandboxRuntimeBodySchema>
 
@@ -250,6 +300,11 @@ export const SANDBOX_BUILD_PHASE_LABELS: Readonly<Record<SandboxBuildPhase, stri
 export const sandboxBuildJobSchema = z.object({
   /** 任务 id（前端轮询用） */
   buildId: z.string(),
+  /**
+   * **在哪台实例上构建**（P1-14：任务只存在于发起它的那个进程 —— 进度/取消都要路由回这一台）。
+   * 老版本后端不返回该字段 ⇒ `null`（前端按"未知"展示）。
+   */
+  instanceId: z.string().nullable(),
   /** 目标变体 id 与显示名 */
   variant: z.string(),
   label: z.string(),

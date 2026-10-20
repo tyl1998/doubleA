@@ -3,11 +3,14 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1
-#   powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1 -Purge
-#   powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1 -Purge -RemoveImages
+#   powershell -ExecutionPolicy Bypass -File infra/scripts/dev-down.ps1 -RemoveImages
 #
-# -Purge deletes pgdata / redisdata / miniodata.
-#   Database, queue and uploaded files are gone for good. Use with care.
+# This script NEVER deletes data volumes (pgdata / redisdata / miniodata).
+#   Database, queue and uploaded files live there and cannot be recovered.
+#   A plain "dev-down" must not have that kind of destructive power
+#   (requested 2026-10-20). To wipe data, run the two commands printed below
+#   deliberately:
+#     docker compose -f infra/docker-compose.yml --env-file infra/.env down -v
 #
 # NOTE: ASCII-only on purpose - Windows PowerShell 5.1 reads .ps1 in the
 #   system ANSI codepage unless a UTF-8 BOM is present.
@@ -40,16 +43,17 @@ function Invoke-Compose {
 }
 
 if ($Purge) {
-    Write-Host 'WARNING: stopping services AND deleting all data volumes' -ForegroundColor Red
-    Write-Host '         (PG data / Redis AOF / MinIO objects). This cannot be undone.' -ForegroundColor Red
-    Write-Host '         Starting in 3 seconds; press Ctrl+C to cancel...' -ForegroundColor Red
-    Start-Sleep -Seconds 3
-    Invoke-Compose @('down', '-v', '--remove-orphans')
-    Write-Host '[OK] services stopped, data volumes removed' -ForegroundColor Green
-} else {
-    Invoke-Compose @('down', '--remove-orphans')
-    Write-Host '[OK] services stopped (data volumes kept)' -ForegroundColor Green
+    # Kept only to reject the old flag loudly instead of silently ignoring it.
+    Write-Host '-Purge is no longer supported: this script does not delete data volumes.' -ForegroundColor Red
+    Write-Host '  To wipe data on purpose (IRREVERSIBLE):' -ForegroundColor Red
+    Write-Host '    docker compose -f infra/docker-compose.yml --env-file infra/.env down -v' -ForegroundColor Red
+    exit 2
 }
+
+# NOTE: deliberately no '-v'. Containers stop, volumes stay, so the next
+#   dev-up brings back the same database. '-v' is a one-way door.
+Invoke-Compose @('down', '--remove-orphans')
+Write-Host '[OK] services stopped (data volumes kept)' -ForegroundColor Green
 
 if ($RemoveImages) {
     Write-Host '[*] removing project images ...' -ForegroundColor Cyan

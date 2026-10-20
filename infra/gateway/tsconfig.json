@@ -1,0 +1,16 @@
+{
+  // 只编译**路由网关**需要的两个入口图（`backend/src/router/*` + 它引用到的 shared 模块）。
+  // ⚠️ 不能用 `backend/tsconfig.json`：那个包含全部后端源码，其中 workspace / 任务链路的类型依赖
+  //    Prisma 生成物（本镜像刻意不跑 `prisma generate`）。网关不碰这些文件。
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    // 与 backend 同口径：rootDir = monorepo 根 ⇒ 产物落在 `dist/backend/src/router/**`
+    "rootDir": "../..",
+    "outDir": "../../backend/dist-gateway",
+    "tsBuildInfoFile": "../../backend/dist-gateway/.tsbuildinfo"
+  },
+  "include": ["../../backend/src/router/**/*.ts"],
+  "exclude": ["../../node_modules", "../../backend/dist", "../../backend/dist-gateway"]
+}

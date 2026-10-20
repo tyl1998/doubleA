@@ -32,6 +32,12 @@ ARG NPM_REGISTRY
 # Debian 源的**主机名**（可空 = 用官方 deb.debian.org）。见 sandbox-build.mjs 的 `--apt-mirror`：
 # 本机（内网）实测 `deb.debian.org` 只 ~0.4MB/s，而 `mirrors.tuna.tsinghua.edu.cn` ~6MB/s。
 ARG APT_MIRROR
+# apt 的网速下限（KB/s；0 = 关）。见 apt-source.sh：慢到不达标的源会被判"不可用"而不是干等。
+ARG APT_MIN_BPS=32
+
+# 换源 / IPv4 兜底 / 不通回落 —— **一份脚本三处共用**（base / toolkit / runtime，见 apt-source.sh 文件头）。
+# ⚠️ 必须 COPY 在 `apt-get` 所在的 RUN **之前**（同一 RUN 里没法先 COPY 再执行）。
+COPY apt-source.sh /usr/local/bin/apt-source.sh
 
 # ── 1. 系统依赖 ──────────────────────────────────────────────────────────
 #   bash             → pi 的 `bash` 工具要用它（slim 镜像只有 sh）
@@ -52,12 +58,7 @@ ARG APT_MIRROR
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     set -eux; \
-    if [ -n "${APT_MIRROR:-}" ]; then \
-      echo "把 Debian 源换成 ${APT_MIRROR}（本机实测快十几倍）"; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
-    fi; \
-    apt-get update; \
+    sh /usr/local/bin/apt-source.sh "${APT_MIRROR:-}"; \
     apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \

@@ -16,7 +16,7 @@
 
 import type { UserRole } from '@doubulea/shared'
 
-import { ADMIN_EGRESS_PATH, AGENTS_PATH, HOME_PATH } from './paths.js'
+import { ADMIN_EGRESS_PATH, ADMIN_SANDBOX_INSTANCES_PATH, AGENTS_PATH, HOME_PATH } from './paths.js'
 
 export interface NavItem {
   /** 导航项的稳定标识（本仓用它映射图标；原型里是左侧栏上的等宽字形） */
@@ -83,6 +83,8 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池' },
   // 出网策略（egress 黑白名单；平台级，仅 ADMIN）—— 排在模型池之后
   { code: 'EG', label: '出网策略', path: ADMIN_EGRESS_PATH, serial: 'S-07d · 出网', adminOnly: true },
+  // 沙箱实例（P1-14 · R5；实例在线注册表只读视图，平台级运维事实，仅 ADMIN）
+  { code: 'SI', label: '沙箱实例', path: ADMIN_SANDBOX_INSTANCES_PATH, serial: 'S-07e · 沙箱实例', adminOnly: true },
 ] as const
 
 /**

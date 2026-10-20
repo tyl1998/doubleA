@@ -125,5 +125,15 @@ export const authUserSchema = z.object({
   role: z.enum(USER_ROLES),
   /** 首登强制改密标记：true 时前端必须把用户导到改密页（后端也会 403 兜住） */
   mustChangePassword: z.boolean(),
+  /**
+   * **本次响应由哪台实例的后端进程发出**（`null` = 非沙箱宿主角色，或未上报）。
+   *
+   * ⚠️ 它是**这份响应**的属性，不是用户的属性：
+   *   · `/api/auth/me` 是**非粘性**路由（落到哪台都正确，见 `shared/router.ts` ①），
+   *     多实例下连续的两次 `/me` 可能来自不同实例 ⇒ 这个值**会变**，这是事实而不是抖动；
+   *   · 界面要显示"当前后端是谁"应**固定首屏那一次**（管理页），不要每次轮询跟着它跳。
+   * 可选：老版本后端不返回该字段（`undefined`）。
+   */
+  instanceId: z.string().nullable().optional(),
 })
 export type AuthUser = z.infer<typeof authUserSchema>

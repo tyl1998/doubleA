@@ -47,7 +47,11 @@ import {
   renameConversationBodySchema,
   setConversationAutoApproveBodySchema,
   setConversationCodeModeBodySchema,
+  getConversationInstanceResultSchema,
+  setConversationInstanceBodySchema,
   setConversationRuntimeBodySchema,
+  SANDBOX_INSTANCE_KEY_PREFIX,
+  parseInstanceRegistrationWithPort,
   steerConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
@@ -61,6 +65,7 @@ import {
   type RenameConversationBody,
   type SetConversationAutoApproveBody,
   type SetConversationCodeModeBody,
+  type SetConversationInstanceBody,
   type SetConversationRuntimeBody,
   type SteerConversationBody,
   type SseEvent,
@@ -79,12 +84,16 @@ import {
   SSE_RESPONSE_HEADERS,
   streamChatReply,
 } from '../orchestrator/sse.js'
+import { AppError } from '@doubulea/shared'
 import { requireAuthContext } from '../plugins/session.js'
-import { ensureWorkspaceOwner } from '../sandbox/owner.js'
+import { readInstanceRegistrations } from '../router/discovery.js'
+import { ensureRedisConnected } from '../infra/redis.js'
+import { ensureWorkspaceOwner, pinSandboxOwner, readSandboxOwner } from '../sandbox/owner.js'
 import { getLogger } from '../infra/logger.js'
 import {
   assertConversationOwner,
   assertConversationRegenerable,
+  getConversationRuntimeForViewer,
   assertConversationSendable,
   createConversation,
   getConversationActive,
@@ -98,6 +107,91 @@ import {
   setConversationRuntime,
   type ConversationViewer,
 } from '../services/conversation.service.js'
+
+/** 在线实例的能力快照（读 `sandbox:instance:*`，与网关自动发现同一份判据） */
+interface OnlineInstance {
+  instanceId: string
+  advertiseAddr: string
+  runtimes: string[] | undefined
+  canBuild: boolean | undefined
+  load: { slotsUsed: number; slotsTotal: number; queueDepth: number } | undefined
+  /**
+   * 节点自检是否通过：`false` = 明确未就绪（**不进自动落点候选**，与网关同一判据）；
+   * `undefined` = 未上报（老版本 / 非 taskAgent 档位）⇒ 按"未知"照旧参与。
+   */
+  ready: boolean | undefined
+}
+
+async function readOnlineInstances(): Promise<OnlineInstance[]> {
+  const redis = await ensureRedisConnected()
+  const { keys, values } = await readInstanceRegistrations(redis)
+  const items: OnlineInstance[] = []
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]
+    if (key === undefined) continue
+    const prefix = `${SANDBOX_INSTANCE_KEY_PREFIX}:`
+    if (!key.startsWith(prefix)) continue
+    const registration = parseInstanceRegistrationWithPort(values[index] ?? null, config.port, key.slice(prefix.length))
+    if (registration === undefined) continue
+    items.push({
+      instanceId: registration.instanceId,
+      advertiseAddr: registration.advertiseAddr,
+      runtimes: registration.runtimes,
+      canBuild: registration.canBuild,
+      ready: registration.ready,
+      load:
+        registration.load === undefined
+          ? undefined
+          : {
+              slotsUsed: registration.load.slotsUsed,
+              slotsTotal: registration.load.slotsTotal,
+              queueDepth: registration.load.queueDepth,
+            },
+    })
+  }
+  return items
+}
+
+/**
+ * 自动落点的候选（P1-14 × P1-17a）：
+ *   · 空环境（`''`）⇒ 所有在线实例；
+ *   · 有该运行时 ⇒ 只留**已具备**它的实例；
+ *   · 都没有、但有实例 `canBuild` ⇒ 留那些能构建的实例（前端随后会带着选中的实例去构建）；
+ *   · 能力未知（老注册值）⇒ 保守**不算具备**，但也不排除（否则老实例永远不可选）。
+ */
+function pickInstancesForRuntime(items: readonly OnlineInstance[], runtime: string): OnlineInstance[] {
+  // ★ 未就绪（节点自检失败）的实例不参与自动落点：它连容器/网络都还没就绪，派过去只会失败。
+  //   ⚠️ 全都未就绪 ⇒ 退回原表（"自动"宁可挑一台也许刚好好了的，也不要直接拒绝用户）。
+  const routable = items.filter((item) => item.ready !== false)
+  const pool = routable.length > 0 ? routable : [...items]
+  if (runtime === '') return pool
+  const hasRuntime = pool.filter((item) => item.runtimes?.includes(runtime) === true)
+  if (hasRuntime.length > 0) return hasRuntime
+  const buildable = pool.filter((item) => item.canBuild === true)
+  if (buildable.length > 0) return buildable
+  return pool.filter((item) => item.runtimes === undefined)
+}
+
+/**
+ * 从候选里挑**较空闲**的一台（与网关 P2C 的排序口径一致：占用率 → 队深，平手按 id 稳定）。
+ *
+ * ⚠️ 这里不是替代网关的 P2C（那是**请求路由**的选择），只是"用户点了自动、且需要重选 owner 时"
+ *    这一次落点的判断；之后仍由网关按目录转发。
+ */
+function pickLeastBusy(items: readonly OnlineInstance[]): OnlineInstance {
+  const score = (item: OnlineInstance): [number, number, string] => {
+    const load = item.load
+    if (load === undefined || load.slotsTotal <= 0) return [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, item.instanceId]
+    return [load.slotsUsed / load.slotsTotal, load.queueDepth, item.instanceId]
+  }
+  return [...items].sort((left, right) => {
+    const [la, qa, ia] = score(left)
+    const [lb, qb, ib] = score(right)
+    if (la !== lb) return la - lb
+    if (qa !== qb) return qa - qb
+    return ia.localeCompare(ib)
+  })[0] as OnlineInstance
+}
 
 /**
  * 取调用者 —— **只取 `id`**（见服务层文件头 ①：本资源不按角色判权）。
@@ -574,6 +668,125 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     async (request) => {
       const runtime = await setConversationRuntime(request.params.id, viewerOf(request), request.body.runtime)
       return ok({ id: request.params.id, runtime })
+    },
+  )
+
+  /**
+   * `POST /api/conversations/:id/instance` —— **用户点名**会话跑在哪台实例（P1-14 多机 · 落点控制）。
+   *
+   * 三条刻意规则：
+   *   ① **只点名、不迁移**：目录（`sandbox:owner:*`）已指向别的实例时**拒绝**（409），因为容器与
+   *      Code 工作区字节都在原机上；换机要原实例回收后再来（自动迁移不在本批）。
+   *   ② **校验在线 + 能力**：目标实例必须在在线注册表里；会话当前 `runtime` 必须在那台的
+   *      `runtimes` 里，或那台 `canBuild=true`（可以先构建）。**能力未知**（老注册值没上报）按"未知"
+   *      处理 —— 不拦（否则老实例永远选不了），但要由前端提示。
+   *   ③ `instanceId: null` = 交还自动落点：按 `runtime`（缺省 = 会话当前运行时）挑一台具备它的实例；
+   *      **原 owner 仍满足 ⇒ 不动目录**（`auto`），不满足 ⇒ 覆盖 owner 重选（`auto-reselected`，B 方案）。
+   *      ⚠️ 覆盖只换目录，**不跨机清理**原实例的容器/工作区（那是原机自己的回收职责）。
+   *
+   * 网关不需要改：粘性命中永远优先，用户点名的实例就是目录里的 owner。
+   */
+  /**
+   * `GET /api/conversations/:id/instance` —— 这条会话**此刻**落在哪台实例（P1-14 · 落点对齐）。
+   *
+   * 只读目录（`sandbox:owner:*`）+ 一次注册表查询：前端用它把选择器对齐到**实际落点**，
+   * 而不是"我点过谁"。新会话的首轮落点是网关选的，没有这个端点就只能靠猜。
+   * ⚠️ 不写目录、不挑实例：`instanceId: null` 如实表示"还没钉机"。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/instance',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      // 先按 viewer 校验会话归属（不存在 ⇒ 404，与其它端点一致）
+      await getConversationRuntimeForViewer(request.params.id, viewerOf(request))
+      // 目录不可读（Redis 抖动）⇒ 与网关同一口径：当作"没有 owner"（`gateway.ts#resolveOwnerSafely`），
+      // 不能因为这层只读探测把页面打成 5xx。
+      const owner = await readSandboxOwner(request.params.id).catch(() => undefined)
+      let ready: boolean | null = null
+      if (owner !== undefined) {
+        const found = (await readOnlineInstances()).find((item) => item.instanceId === owner)
+        ready = found?.ready ?? null
+      }
+      return ok(getConversationInstanceResultSchema.parse({ id: request.params.id, instanceId: owner ?? null, ready }))
+    },
+  )
+
+  app.post<{ Params: ConversationIdParams; Body: SetConversationInstanceBody }>(
+    '/api/conversations/:id/instance',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: setConversationInstanceBodySchema },
+    },
+    async (request) => {
+      const conversation = await getConversationRuntimeForViewer(request.params.id, viewerOf(request))
+      // ① 交还自动（P1-14 × P1-17a）：按 `runtime` 挑一台**具备该环境（否则能构建）**的实例；
+      //    原 owner 仍满足 ⇒ 不动目录（`auto`）；不满足 ⇒ 重选并覆盖（`auto-reselected`，B 方案）。
+      if (request.body.instanceId === null) {
+        const wanted = request.body.runtime === undefined ? conversation.runtime : request.body.runtime
+        const online = await readOnlineInstances()
+        const current = await readSandboxOwner(request.params.id)
+        const candidates = pickInstancesForRuntime(online, wanted)
+        if (candidates.length === 0) {
+          throw AppError.conflict(
+            wanted === ''
+              ? '当前没有在线实例'
+              : `没有在线实例具备「${wanted}」且能构建它 —— 请先在有构建上下文的实例上构建该环境`,
+          )
+        }
+        // 原 owner 仍满足 ⇒ 不动（"自动"不代表"每次重挑"）
+        if (current !== undefined && candidates.some((item) => item.instanceId === current)) {
+          return ok({ id: request.params.id, instanceId: current, action: 'auto', hint: null })
+        }
+        // 按 P2C 挑较空闲的一台（与网关同一套判据；单台/无负载 ⇒ 就是它）
+        const picked = pickLeastBusy(candidates)
+        const pinned = await pinSandboxOwner(request.params.id, picked.instanceId, {
+          allowReselect: current !== undefined,
+        })
+        if (pinned.status === 'conflict') {
+          throw AppError.conflict(`该会话已被钉在实例 ${pinned.current} 上，且自动重选失败，请重试`)
+        }
+        return ok({
+          id: request.params.id,
+          instanceId: picked.instanceId,
+          action: pinned.status === 'reselected' ? 'auto-reselected' : 'auto',
+          hint:
+            pinned.status === 'reselected'
+              ? `原实例 ${current ?? ''} 不具备「${wanted === '' ? '空环境' : wanted}」⇒ 已自动改到实例 ${picked.instanceId}`
+              : null,
+        })
+      }
+      const target = request.body.instanceId
+
+      // ② 目标必须在线（读的是**此刻**的注册表，与网关自动发现同一份判据）
+      const online = await readOnlineInstances()
+      const found = online.find((item) => item.instanceId === target)
+      if (found === undefined) {
+        throw AppError.conflict(`实例 ${target} 不在线（网关此刻看不见它），请稍后重试或选择别的实例`)
+      }
+      // ★ 明确的未就绪（节点自检没过）⇒ 现在就拒绝：选它在选择器里本就不该出现，
+      //   网关也不给它派活（`router/gateway.ts`），先写目录只会在首轮派活时失败。
+      if (found.ready === false) {
+        throw AppError.conflict(`实例 ${target} 尚未就绪（节点自检未通过），请等它就绪后再选或选择别的实例`)
+      }
+      // ③ 能力校验：有该运行时镜像，或那台可以构建；能力未知（未上报）不拦截，交给前端提示
+      const runtime = conversation.runtime
+      if (runtime !== '' && found.runtimes !== undefined && !found.runtimes.includes(runtime) && found.canBuild !== true) {
+        throw AppError.conflict(
+          `实例 ${target} 没有「${runtime}」的运行时镜像，且该实例不能按需构建 —— 请在那台机器上构建后再选`,
+        )
+      }
+
+      const pinned = await pinSandboxOwner(request.params.id, target)
+      if (pinned.status === 'conflict') {
+        throw AppError.conflict(
+          `该会话已被钉在实例 ${pinned.current} 上（容器/工作区在那台）；要换到 ${target} 需先让原实例回收该会话`,
+        )
+      }
+      return ok({
+        id: request.params.id,
+        instanceId: target,
+        action: pinned.status === 'written' ? 'pinned' : 'already',
+      })
     },
   )
 }

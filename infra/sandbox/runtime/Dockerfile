@@ -32,6 +32,7 @@ FROM ${BASE_IMAGE}
 
 ARG COMPONENTS
 ARG APT_MIRROR
+ARG APT_MIN_BPS=32
 # Node 发行站（装非自带 node 版本时用）。默认官方；可指向镜像站（如
 # `https://registry.npmmirror.com/-/binary/node`），见 `install-node-version.sh` 文件头。
 ARG NODE_DIST_MIRROR
@@ -42,6 +43,9 @@ ARG RUST_DIST_MIRROR
 # base 层结尾是 `USER agent` ⇒ 装包前必须切回 root；装完再切回去（理由同 toolkit/Dockerfile）。
 USER root
 
+# 换源 / IPv4 兜底 / 不通回落（与 base/toolkit **同一份**脚本，见 apt-source.sh 文件头）
+COPY apt-source.sh /usr/local/bin/apt-source.sh
+
 # 版本化运行时的安装脚本。
 # ⚠️ 必须**先 COPY、后那条 apt RUN** —— 同一个 RUN 里没法先 COPY 再执行，故脚本单独提前 COPY。
 COPY install-python-version.sh install-node-version.sh install-go-version.sh install-java-version.sh install-rust-version.sh /tmp/
@@ -51,11 +55,7 @@ RUN set -eux; chmod 0755 /tmp/install-*.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     set -eux; \
-    if [ -n "${APT_MIRROR:-}" ]; then \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
-    fi; \
-    apt-get update; \
+    sh /usr/local/bin/apt-source.sh "${APT_MIRROR:-}"; \
     if [ -z "${COMPONENTS:-}" ]; then \
       echo 'COMPONENTS 为空：不额外装语言运行时（只有 toolkit）'; \
     else \

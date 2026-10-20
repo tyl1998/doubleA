@@ -7,7 +7,7 @@
 # 用法：
 #   bash infra/scripts/dev-stop.sh              # 停后端 + 前端
 #   bash infra/scripts/dev-stop.sh --infra      # 连依赖服务一起停（保留数据卷）
-#   bash infra/scripts/dev-stop.sh --purge      # 再删数据卷（⚠️ PG/Redis/MinIO 数据全丢）
+#   bash infra/scripts/dev-stop.sh --purge      # 已废弃（不会删数据卷，见 dev-down.sh 文件头）
 #   bash infra/scripts/dev-stop.sh --force      # pid 文件丢了也按端口强收
 #
 # 收进程的顺序：按**进程树**（pid 文件里的 pid + 它的全部后代）先 SIGINT（后端 SIGINT 是
@@ -157,11 +157,13 @@ stop_one '后端' "$PID_DIR/backend.pid"  "$BACKEND_PORT"
 
 if [ "$DO_INFRA" -eq 1 ]; then
   step '停止依赖服务'
+  # ⚠️ 不再把 --purge 往下传：dev-down.sh 已经不删数据卷（2026-10-20）。
+  #    这条分支保留只是为了不再接受一个"看起来会删数据"的参数却静默不删。
   if [ "$DO_PURGE" -eq 1 ]; then
-    bash "$SCRIPT_DIR/dev-down.sh" --purge || exit 1
-  else
-    bash "$SCRIPT_DIR/dev-down.sh" || exit 1
+    printf '%s[!!]%s --purge 已废弃：不会删除数据卷。要清空数据请手动：\n' "$C_Y" "$C_X"
+    printf '     docker compose -f infra/docker-compose.yml --env-file infra/.env down -v\n'
   fi
+  bash "$SCRIPT_DIR/dev-down.sh" || exit 1
   printf '\n'
 else
   step '依赖服务'

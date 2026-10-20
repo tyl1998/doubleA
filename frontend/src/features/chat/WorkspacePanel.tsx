@@ -195,6 +195,9 @@ export interface WorkspaceRuntimeControls {
   runtimePending: boolean
   /** `ready` = 目标组合本机已有镜像（true）/ 需要先构建（false）；见 `RuntimeSelectProps#onSelect` */
   onSelectRuntime: (runtime: string, ready: boolean) => void
+  /** 用户点名的实例（P1-14 多机；`null` = 自动） */
+  preferredInstance?: string | null
+  onPreferredInstanceChange?: (instanceId: string | null) => void
 }
 
 export function WorkspacePanelPlaceholder(props: WorkspaceRuntimeControls) {
@@ -207,7 +210,13 @@ export function WorkspacePanelPlaceholder(props: WorkspaceRuntimeControls) {
         <span className="ws__title">工作区</span>
         <div className="u-right">
           {/* 新会话态也能选运行时：会话建出来前先记意图、开流前落地（见 ChatPage#runtimePresetRef） */}
-          <RuntimeSelect runtime={props.runtime} pending={props.runtimePending} onSelect={props.onSelectRuntime} />
+          <RuntimeSelect
+            runtime={props.runtime}
+            pending={props.runtimePending}
+            onSelect={props.onSelectRuntime}
+            preferredInstance={props.preferredInstance ?? null}
+            onPreferredInstanceChange={props.onPreferredInstanceChange}
+          />
         </div>
       </header>
       <div className="ws__body">
@@ -703,6 +712,8 @@ export function WorkspacePanel({
             runtime={runtimeControls.runtime}
             pending={runtimeControls.runtimePending}
             onSelect={runtimeControls.onSelectRuntime}
+            preferredInstance={runtimeControls.preferredInstance ?? null}
+            onPreferredInstanceChange={runtimeControls.onPreferredInstanceChange}
           />
           <Popconfirm
             title="撤销本轮？"

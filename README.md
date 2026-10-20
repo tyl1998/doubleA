@@ -92,6 +92,221 @@ bash infra/scripts/egress-down.sh             # 收工（只删代理容器，�
 > 白名单默认自动取库里 `enabled` 的 `model_providers` 主机名（**空白名单 = 拒启**，不是全放行）。
 > 完整形态要求（两条腿 / 无鉴权）、验证三条、macOS 两堵墙，见「阶段三出口验收」前置 ③。
 
+### 多机部署：构建两个平台镜像 + 两套 compose（P1-14 · R1 起；2026-10-19 拆成后端 / 网关两个镜像）
+
+```bash
+pnpm backend:build-image               # 业务后端 doubulea-backend:2（全量依赖 + Prisma，813MB）
+pnpm gateway:build                     # 路由网关 doubulea-gateway:2（只装 fastify / ioredis / zod，273MB）
+pnpm frontend:build-image              # 前端静态站点 doubulea-frontend:2（nginx + dist，64MB）
+pnpm backend:build-image -- --save out.tar   # 无 registry 的多机分发：scp 到各台后 docker load -i
+pnpm gateway:build -- --save gateway.tar     # 同上（三个镜像各自分发）
+pnpm router:config                     # 两套 compose 的配置自检（不需要 daemon 起来）
+```
+
+```bash
+# 每台机器（A / B / C）：backend + egress
+cp infra/router/.env.node.example infra/router/.env.node     # 改 SANDBOX_INSTANCE_ID / ADVERTISE_ADDR
+cp <三台共用那份 env> infra/router/.env.node.shared          # DATABASE_URL / REDIS_URL / S3_* / SANDBOX_IMAGE …
+docker compose -f infra/router/docker-compose.host.yml --env-file infra/router/.env.node up -d
+
+# 网关（一个入口；**当前按 1 副本部署**，多副本经决定暂不做，见 子方案 §八·补）
+cp infra/router/.env.router.example infra/router/.env.router # 改 ROUTER_UPSTREAMS / REDIS_URL
+
+# 前端（nginx 托管 SPA，并把 /api、/health 反代到网关）
+cp infra/frontend/.env.frontend.example infra/frontend/.env.frontend # 改 ROUTER_UPSTREAM（指向网关，**不是**后端）
+docker compose -f infra/frontend/docker-compose.yml --env-file infra/frontend/.env.frontend up -d
+docker compose -f infra/router/docker-compose.router.yml --env-file infra/router/.env.router up -d
+```
+
+> **两个镜像**（2026-10-19 拆分）：`doubulea-backend:2` 跑业务后端（`node /app/backend/dist/backend/src/index.js`）；
+> `doubulea-gateway:2` 跑路由网关（`node /app/backend/dist/backend/src/router/main.js`，只装 fastify/ioredis/zod，
+> 不含 Prisma / antd / vite —— 原"一个镜像两个角色"时网关镜像 813MB，其中 531MB 是它永远加载不到的依赖）。
+> 网关容器仍**必须**带 `DOUBULEA_SANDBOX_ROLE=router`。
+> 网关是**非沙箱宿主**：不抢 `sandbox:instance:{id}`、不登记心跳、不对账、不起出口② listener
+> （判据见 `backend/src/sandbox/roleOverride.ts`；不配该 env 时"配了 `SANDBOX_IMAGE` 且本机有 Docker"才算宿主）。
+> **上游表** = 静态 `ROUTER_UPSTREAMS` ∪ 自动发现（`ROUTER_DISCOVERY_SEC`，默认 10s 扫 `sandbox:instance:*`）；
+> 网关 `/health` 的 `discovery` 段能直接看出"看见了哪几台、哪台被判过期"。
+> **负载感知（R3/R4）**：实例心跳把 `slotsUsed/slotsTotal/queueDepth/chatbotInFlight` 写进注册值；网关对**新落点**
+> 按 P2C 挑较空的实例（`ROUTER_LOAD_AWARE`，默认开；`false` = 纯轮询），粘性命中的会话永远回原机；
+> `/health` 的 `load` 段给出每台上游的占用 / 队深 / 负载年龄 `ageMs` / 是否 `stale`（阈值 `ROUTER_LOAD_STALE_MS`，缺省 2× 心跳）。
+> **运行时与实例（P1-17a × P1-14，2026-10-19）**：实例心跳带上 `runtimes`（本机已就绪的变体 id）与
+> `canBuild`；`GET /api/sandbox/runtimes` 的 `instances[]` 给出**每台**的能力（`known=false` = 该实例没上报，显示"未知"）。
+> Code 会话在工作区头部**一个按钮**打开「运行位置与环境」弹窗（按实例列卡片、显示繁忙度与环境并集）。
+> 点环境 = 选「实例 + 运行时」→ `POST /api/conversations/:id/runtime` + `POST /:id/instance`（点名，已有 owner 指向别台时 409）。
+> 选「自动」= `instanceId: null` + `runtime`：后端挑一台**具备该环境（否则能构建）**的实例并按较空闲（占用率→队深）选点；
+> **原 owner 仍满足 ⇒ 不动目录**（`auto`），不满足 ⇒ 覆盖 owner 重选（`auto-reselected` + `hint`，B 方案）。
+> ⚠️ 覆盖只换目录，不跨机清理原实例的容器/工作区（由原实例的空闲回收/启动对账兜底）。
+> 按需构建要求后端容器能读到 `infra/sandbox`：`docker-compose.host.yml` 已把它挂到 `/app/infra/sandbox:ro`
+> 并设 `SANDBOX_RUNTIME_BUILD_CONTEXT=/app/infra/sandbox/runtime`，否则页面上的「+ 去创建环境」不会出现。
+> **在哪台构建**：构建任务是**进程内**的 ⇒ 任务状态/取消走 `/api/sandbox/runtimes/build/<instanceId>/<buildId>`，
+> 启动请求带 `?instanceId=`（网关对这两个位置做**点名路由**：粘性 > 点名 > P2C；点名不在上游表里则忽略）。
+> 后端容器里没有 docker CLI、而 macOS 宿主的 docker 是 Mach-O ⇒ compose 里加了 `docker-cli` 侧车，
+> 把 Linux 版 `docker` 与 `docker-buildx` 复制进命名卷，backend 只读挂 `/opt/doubulea-docker-bin` 与
+> `/usr/local/libexec/docker/cli-plugins`；构建强制 `DOCKER_BUILDKIT=1`（Dockerfile 有 `RUN --mount=type=cache`）。
+> 多机端到端（`子方案` §八 6 R1~R6 + §九·补 6 R7~R10）需 ≥2 台宿主。
+> ⚠️ 后端容器必须 `network_mode: host` + 挂 `/var/run/docker.sock`（见 `infra/router/docker-compose.host.yml` 文件头）。
+
+#### 第二台机器接入步骤（以 10.73.100.153 为 A、10.73.100.195 为 B，共享 A 上的 PG/Redis/MinIO）
+
+> 前置：A 的 `infra/.env` 已能起依赖服务；A 上三件套已跑通（`:8080` 能登录、`/health` 的
+> `discovery` 至少有一台）。B 只需要**后端 + egress**，网关与前端仍是**一份**（在 A 上）。
+
+```bash
+# —— B 上 ——（以下命令按顺序粘贴即可；会交互的两步写在注解里）
+# ① 代码 + 依赖（Node ≥22：pnpm 的 prepare 会跑 Prisma，Node 20 会 ERR_REQUIRE_ESM）
+git clone <仓库地址> doubleA && cd doubleA
+nvm use 22 || nvm install 22          # .nvmrc 已是 22
+corepack enable pnpm && pnpm install
+pnpm -r build
+
+# ② 沙箱镜像：B 必须**与本机同版本线**（versions.mjs 的 base/toolkit/runtime 层版本）
+pnpm sandbox:build                     # 内网先 export SANDBOX_NPM_REGISTRY=https://registry.npmmirror.com
+#    或者从 A 导出后拷贝：docker save doubulea/sandbox-base:6 doubulea/sandbox-toolkit:8 \
+#      doubulea/sandbox-runtime:node22-python310-v2 | ssh 用户@10.73.100.195 'docker load'
+
+# ③ 三份 env（都不进 git）
+#    .env.node.shared：与 A **同一份**（含 CREDENTIAL_MASTER_KEY / S3_*）；
+#      ⚠️ 容器内不能用 127.0.0.1 ⇒ 宿主侧依赖一律写 10.73.100.153
+#    .env.node：SANDBOX_INSTANCE_ID=b、SANDBOX_INSTANCE_ADVERTISE_ADDR=10.73.100.195:13000
+#    DOCKER_SOCKET_GID：stat -c '%g' /var/run/docker.sock（macOS 用 stat -f '%g'）
+
+# ④ 后端（+ egress 容器）
+docker compose -f infra/router/docker-compose.host.yml --env-file infra/router/.env.node up -d backend
+
+# ⑤ 出口①：网由后端启动时创建 ⇒ 必须**在后端起来之后**再起
+bash infra/scripts/egress-up.sh --allow-all
+
+# —— A 上验证 ——
+curl -s http://127.0.0.1:13100/health      # 网关 /health：discovery.discovered 应出现 10.73.100.195:13000
+curl -s http://127.0.0.1:8080/health | node -e '…'  # load 段应同时有 A、B 两台
+```
+
+踩过的坑（两台都会遇到，已修进 compose / 脚本）：
+
+| 症状 | 原因 | 修法（已落地） |
+|---|---|---|
+| `EACCES /var/run/docker.sock`，沙箱起不来 | 容器内 uid 10001，宿主 socket 是 `root:docker 660`（Ubuntu）或 `root:root 660` | `docker-compose.host.yml` 的 `group_add: ${DOCKER_SOCKET_GID}`；每台用 `stat` 填 |
+| 容器内后端监听 3000，healthcheck 打 13000 失败 | `environment:` 不自动透传 `--env-file` 的键 | 已显式 `BACKEND_PORT: ${BACKEND_PORT:-13000}` |
+| Code 模式报 `EACCES: permission denied, mkdir '/var/lib/doubulea'` | 同上：`WORKSPACE_ROOT` 没透传，回落到 Linux 默认且容器内 uid 10001 建不了 `/var/lib` | 已显式 `WORKSPACE_ROOT: ${WORKSPACE_ROOT:-…}`（且与 bind mount 源路径逐字一致） |
+| 同一台起网关时端口冲突 | `network_mode: host` 与发布端口都想占 13000 | 网关放 A（或换 `ROUTER_PORT`），后端 13000 只留给实例 |
+| `SANDBOX_INSTANCE_ID 与在线的另一实例冲突 ⇒ 拒绝启动` | 同 id 的旧心跳 TTL 未过期（3× 心跳） | 等 ~90s；确属旧实例残留再 `DEL sandbox:instance:<id>` |
+| 冒烟对话能过、Code 沙箱里模型 `EAI_AGAIN` | 沙箱 `fetch()` 默认不吃 `HTTP(S)_PROXY`（Node 内置 undici 不读） | 见「已知问题」——引擎侧用 `EnvHttpProxyAgent` 时不受影响 |
+
+> **端口口径（2026-10-19 定）**：`13000` 是**每台实例后端**的端口（`SANDBOX_INSTANCE_ADVERTISE_ADDR`、
+> `ROUTER_UPSTREAMS` 都指向它）；**网关默认 `13100`**（`ROUTER_PORT`），前端 `ROUTER_UPSTREAM` 指 `http://<网关>:13100`。
+> 同一台机器同时跑后端与网关时，两者若都用 13000，在 macOS 上会因 host 网络与端口转发争用而失败。
+>
+> ⚠️ **本机（macOS + OrbStack）的实测边界**（2026-10-19）：`network_mode: host`、DooD 起兄弟容器、
+> 宿主同名路径 bind mount 三项**成立**；但后端容器**不能**与网关/宿主共用 13000（OrbStack 的端口转发
+> 与 host 网络争用），因此 153 上实证验收用的是「后端进程 + 网关容器 + 前端容器」。Linux 上以 compose 形态为常态。
+
+#### 节点档位与实例管理（2026-10-19 起；部署减负）
+
+每台节点只需起**一个后端容器**，角色由 env 决定：
+
+| `DOUBULEA_NODE_ROLE` | 起什么 | 是否需要 docker.sock / egress / relay | 进实例列表 |
+|---|---|---|---|
+| `chatbot` | 只起后端 | **都不需要** | 否（不登记心跳） |
+| `taskAgent` | 后端 + 沙箱依赖 | 需要（可在管理页一键补齐） | 是 |
+
+**镜像里已自带运维脚本**：`infra/scripts` 与 `infra/sandbox`（构建上下文）打进 `doubulea-backend:2` 的
+`/app/infra/`，因此新节点**只需要 `docker load` 这一个后端镜像**，不必再拷源码目录；自举要用脚本时
+后端会把它们写进命名卷 `doubulea-node-infra`（容器内 `/opt/node-infra`），兄弟容器用同一个卷挂到 `/app`。
+只有想"热修脚本不重建镜像"时才用覆盖文件：
+`docker compose -f docker-compose.host.yml -f docker-compose.host.dev.yml ... up -d backend`。
+
+`/admin/sandbox-instances` 是**实例管理**页：每台实例一行，展开即见该实例的自检结果
+（Docker / 沙箱网 / egress / relay / 构建上下文 / toolkit / 运行时 / 工作区），并可在**那一行**上
+点「一键初始化」。**未就绪的实例可见但不可选**（表格标「未就绪」，会话的「运行位置与环境」弹窗里置灰）。
+
+```bash
+# 只做对话的节点：不用挂 socket
+docker run -d --name doubulea-backend -p 13000:13000 --env-file infra/.env \
+  -e DOUBULEA_NODE_ROLE=chatbot doubulea-backend:2
+
+# 沙箱宿主节点：两种起法（效果等价）
+#   ① 一条命令（推荐；新机器只有镜像时用这个）——读 .env.node + .env.node.shared，
+#      自动建命名卷、准备 docker CLI、起后端并等 /health 就绪
+#      ⚠️ 2026-10-20 起它是**兼容入口**：实际执行的是 deploy/scripts/up.sh（只保留一份实现，
+#         避免 socket gid / 卷 / 侧车在两处漂移 —— 之前就因此漏修过一次）
+bash infra/scripts/node-up.sh
+#   ② compose（会带出 docker-cli 侧车）
+docker compose -f infra/router/docker-compose.host.yml --env-file infra/router/.env.node up -d backend
+# 停止：bash infra/scripts/node-down.sh（不动 egress/relay/卷）
+
+# 管理任意实例（本机直跑；远端经签名转发到那台执行）
+curl -s -b cookies.txt 'http://10.73.100.153:8080/api/admin/node/self?instanceId=b' | jq '.data.ready, .data.items'
+curl -s -b cookies.txt -X POST -H 'content-type: application/json' \
+  -d '{"instanceId":"b"}' http://10.73.100.153:8080/api/admin/node/bootstrap | jq '.data.steps'
+```
+
+**一键初始化只修未就绪的项**（幂等；健康的项显示"跳过"，不会重建容器；全部健康时按钮禁用，防误触）：
+① 建沙箱网 ② `docker-cli` 侧车检查（缺镜像先 `docker pull $DOCKER_CLI_IMAGE`）③ **toolkit**：缺了才先
+`docker pull ${SANDBOX_TOOLKIT_PULL_FROM}`（配置了才拉）、拉不到再用仓库脚本 `--toolkit-only` 构建
+④ `egress` 未运行/未接沙箱网时重建（缺 `$EGRESS_IMAGE` 先拉）⑤ macOS/Windows 的 `relay` 未运行才拉起
+（缺 `$RELAY_IMAGE` 先拉；Linux 判定为"不需要"）。
+> 脚本本身刻意"离线可跑"（不拉镜像）；**拉取只发生在初始化**这一步，走宿主 Docker 网络。拉不到如实报
+> "请离线导入或配置内网镜像源"（`EGRESS_IMAGE` / `RELAY_IMAGE` / `DOCKER_CLI_IMAGE` 都可改指向内网）。
+> **四个命名卷**（`node-up.sh` 会建好）：`doubulea-docker-bin`（构建用 CLI）、`doubulea-docker-buildx`、
+> `doubulea-node-infra`（内置脚本中转，兄弟容器挂 `/app`）、`doubulea-egress-policy`（出网策略中转，
+> egress 挂 `/egress-allow`）。后两个存在的原因：脚本可能运行在**后端容器内**，而 `docker run -v` 的源
+> 由**宿主**解析 —— 用卷才能让"写策略的那一方"和"读策略的容器"看到同一份文件。
+
+**跨实例**：A 的后端用 `NODE_OPS_SECRET`（三台**同一份**）签发一次性令牌，转发到目标实例的
+`/internal/node/*`；目标校验签名 + 消费 nonce（Redis `SET NX`，防重放）后执行。未配置该密钥 ⇒
+只能管理本机（错误里会写明）。内部端点**只做自检/自举**，不接受任意命令。
+
+镜像只需 **toolkit**（空环境）+ 按需构建的语言运行时；`sandbox-base` 只在构建 toolkit 时用到。
+
+#### 新节点需要哪些镜像（2026-10-19）
+
+一台新节点**只靠后端镜像不够**：容器里没有 docker CLI，自举/按需构建都要它。清单：
+
+| 镜像 | 是否必需 | 153 上导出 | 195 上导入 |
+|---|---|---|---|
+| `doubulea-backend:2` | 必需 | `docker save doubulea-backend:2 -o backend.tar` | `docker load -i backend.tar` |
+| `docker:27-cli` | **必需**（`node-up` 用它填 `doubulea-docker-bin` 卷） | `docker save docker:27-cli -o docker-cli.tar` | `docker load -i docker-cli.tar` |
+| `node:22-bookworm-slim` | 必需（egress / relay 的运行时） | `docker save node:22-bookworm-slim -o node22.tar` | `docker load -i node22.tar`；能联网时初始化会自动拉 |
+| `doubulea/sandbox-toolkit:8` | 建议（空环境） | `docker save doubulea/sandbox-toolkit:8 -o toolkit.tar` | 或者在初始化时按 `SANDBOX_TOOLKIT_PULL_FROM` 拉 / 本地构建 |
+| `doubulea/sandbox-runtime:*` | 可选（语言运行时） | 按需 | 按需；也可在实例上「构建新环境」 |
+
+`node-up.sh` / `node-up.ps1` 在拉不到 `$DOCKER_CLI_IMAGE` 时会直接打印这份清单与两条命令（不静默失败）。
+内网有镜像源时，把 `.env.node` 的 `DOCKER_CLI_IMAGE` / `EGRESS_IMAGE` / `RELAY_IMAGE` 改成内网地址即可。
+
+> **`node-up` 也会带出 `docker-cli` 侧车**（`nodeBootstrap.ts#DOCKER_HOST_NAME` 按**容器名**
+> `doubulea-docker-cli` 认它；`bootstrapNode` 刻意不就地起它，见该函数注释）。侧车已在跑 ⇒ 幂等跳过；
+> 构建侧按需的 `sandbox-build.mjs` 在容器里**只认 `DOCKER_BIN` / `SANDBOX_DOCKER_BIN`**（后者即卷里那个
+> 二进制），所以 `node-up` 同时给后端注入 `PATH=/opt/doubulea-docker-bin:…` —— 缺了它，「一键初始化」
+> 的 toolkit 构建会报「找不到 docker 可执行文件」，页面则显示「侧车未运行」。
+
+#### Windows 节点（`node-up.ps1`）
+
+Windows 上 `node-up.sh` 跑不了（没有 bash），而且 **Linux 容器不支持 `--network host`**（Docker Desktop
+的已知限制），所以 `node-up.ps1` 走的是另一条腿：**发布端口** + `host.docker.internal` + relay。
+
+```powershell
+# 前提：Docker Desktop 已开「Settings → General → Expose daemon on tcp://localhost:2375 without TLS」
+docker load -i backend.tar
+powershell -ExecutionPolicy Bypass -File infra\scripts\node-up.ps1 `
+  -EnvFile infra\router\.env.node -SharedFile infra\router\.env.node.shared
+# 停止
+powershell -ExecutionPolicy Bypass -File infra\scripts\node-down.ps1
+```
+
+与 macOS/Linux 的差异（`node-up.ps1` 已内置）：
+
+| 项 | macOS / Linux | Windows |
+|---|---|---|
+| 网络 | `--network host` | `-p 13000:13000 -p 13001:13001` |
+| 后端访问宿主 Docker | 挂 `/var/run/docker.sock` | **不挂**（宿主是 named pipe）；`DOCKER_HOST=tcp://host.docker.internal:2375` |
+| socket gid | `--group-add <gid>` | 不需要（走 TCP） |
+| 出口② | listener 绑沙箱网桥网关 | relay（`DOUBULEA_HOST_PLATFORM=win32` ⇒ 自举判定需要 relay） |
+| 工作区 | `$HOME/doubulea/workspaces` | `%USERPROFILE%\doubulea\workspaces`（bind mount 必须是 Windows 绝对路径） |
+
+> ⚠️ Windows 这条路径**尚未在真机上验证**（本仓库只在 macOS/OrbStack 上跑过）：代码里
+> `needsRelayFor()` 已按 `win32` 判定、脚本已按上表实现，但 2375 的 daemon 暴露与 named pipe 的
+> 差异只有在 Windows 机器上才能最终确认。首次使用请先跑 `docker run --rm alpine nc -zv host.docker.internal 2375`。
+
 ### 起依赖服务（postgres / redis / minio）
 
 ```bash
@@ -200,13 +415,21 @@ pnpm sandbox:build -- --toolkit-only --runtime python310,node22-python38
 **构建提速与清理（P0-3-14 起）**：
 
 - ⭐ **换 Debian 源**（本机最大的提速点）：官方 `deb.debian.org` 本机实测只 **~0.4MB/s**，而清华源
-  `mirrors.tuna.tsinghua.edu.cn` **~6MB/s**（十几倍）。`--registry` 一旦是 `npmmirror`，脚本会**自动**
-  把 Debian 源也换成清华；也可显式给：
+  `mirrors.tuna.tsinghua.edu.cn` **~6MB/s**（十几倍）⇒ **默认就用清华源**；海外/CI 用
+  `--apt-mirror ''`（或 `SANDBOX_APT_MIRROR=`）显式回到官方：
   ```bash
   pnpm sandbox:build -- --registry https://registry.npmmirror.com --apt-mirror mirrors.tuna.tsinghua.edu.cn
   # 等价环境变量：SANDBOX_APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
   # 显式留空（--apt-mirror ''）就是走官方源（CI / 海外环境用这个）
   ```
+- ⭐ **apt 的三道保险**（2026-10-20；`infra/sandbox/apt-source.sh`，base/toolkit/runtime **共用一份**）：
+  ① **IPv6 兜底** —— 构建容器没有 v6 默认路由时写 `Acquire::ForceIPv4`（否则 AAAA 先解析，
+  apt 会 `Ign:` 重试 3×60s，一条 update 就是 12 分钟）；② **网速闸门** —— apt 对"慢"没有超时语义
+  （实测官方源在只放行 443 的出口上 **28 KB/s**、一条 update 5 分半，看起来就是卡死），低于
+  `--apt-min-bps`（`SANDBOX_APT_MIN_BPS`，默认 32 KB/s）就判该源不可用；③ **不通/不达标自动回落**
+  —— 替换源不行就回镜像自带的官方源再试一次，都不行才失败，并打印"该配哪个变量 / 或离线导入镜像"。
+  ⚠️ 新节点**一键初始化**构建 toolkit 时同样生效：在 `infra/router/.env.node` 里设
+  `SANDBOX_APT_MIRROR=<host>`（如内网 mirror:8080）后重启后端，再点「一键初始化」。
 - ⭐ **BuildKit 缓存挂载**：base / toolkit 的 `apt` 与 `npm` 步骤改成 `RUN --mount=type=cache` ⇒
   包里与索引留在**构建缓存**、不进镜像层；改了扩展导致 toolkit 重跑时，**不再重新下载**同样的 deb。
   ⚠️ 它**不需要** `# syntax=docker/dockerfile:1`（仍是刻意不写，见 Dockerfile 头部）；但要求 daemon 开 BuildKit（现代 Docker 默认开）。
@@ -1561,7 +1784,7 @@ bash infra/scripts/egress-down.sh             # 收工（只删代理容器，�
 | `docs/子方案/沙箱与引擎集成.md` | 引擎定案 Pi（直连 `pi --mode rpc`）/ 容器生命周期 / 事件映射 / 产物收集 / MCP 后端代理 | ✅ 已完成（2026-09-25，P0-3-0a） |
 | `docs/子方案/文件预览.md` | MD/HTML/图片/CSV/PDF 五格式预览 + 安全处理（两条出口：下载 `attachment` / 预览 `inline`；**六条安全判据** + 逐格式落法） | ✅ 已完成（2026-09-26，P0-3-0b） |
 | `docs/子方案/Code模式工作区.md` | **Code 模式**：人机共享工作区（共享 FS + DB 版本索引 + S3 冷备）/ agent 文件 I/O 中介 / 四层并发防护（串行 · claim · CAS · 三方合并）/ CodeMirror 6 前端 | 📝 设计讨论稿（2026-10-08） |
-| `docs/子方案/沙箱多机部署.md` | **沙箱多机部署（路线 A）**：每机一实例 + 按会话路由（`SANDBOX_INSTANCE_ID` 实例身份 / `Sandbox.instanceId` 归属列 / 三处对账按本机过滤 / 队列键按实例隔离 / Redis 会话→实例目录 / 路由网关） | 📝 设计稿（2026-10-10） |
+| `docs/子方案/沙箱多机部署.md` | **沙箱多机部署（路线 A）**：每机一实例 + 按会话路由（`SANDBOX_INSTANCE_ID` 实例身份 / `Sandbox.instanceId` 归属列 / 三处对账按本机过滤 / 队列键按实例隔离 / Redis 会话→实例目录 / 路由网关）；**R1 部署编排（后端/网关两个镜像 + 两套 compose）+ R2① 自动发现 + R3 负载感知 + R4 全局可观测 + R5 实例注册表已落地（2026-10-19）**，余网关多副本编排 / 负载感知 / 全局可观测 | 🚧 部分落地（核心 2026-10-12 · R1/R2① 2026-10-19） |
 
 ### 缺陷与踩坑归档
 

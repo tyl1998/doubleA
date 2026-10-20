@@ -1,0 +1,14 @@
+# 可选覆盖：**热修运维脚本**（不重建镜像，直接用宿主上的 `infra/scripts` + `infra/sandbox`）。
+#
+# 用法（只在需要改脚本时）：
+#   docker compose -f infra/router/docker-compose.host.yml -f infra/router/docker-compose.host.dev.yml \
+#     --env-file infra/router/.env.node up -d backend
+#
+# ⚠️ 默认**不要**用这份：脚本已打进镜像，`docker load` 一台新节点即可自举，不需要源码目录。
+services:
+  backend:
+    volumes:
+      - ../../infra/scripts:/app/infra/scripts:ro
+      - ../../infra/sandbox:/app/infra/sandbox:ro
+    environment:
+      DOUBULEA_HOST_INFRA_DIR: /Users/along/Desktop/work/vscode_js/doubleA/infra/scripts

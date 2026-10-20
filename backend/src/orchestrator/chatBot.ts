@@ -149,8 +149,8 @@ import {
 } from './mcpGatewayTools.js'
 import { runMemoryExtraction } from './memoryExtract.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from './memoryTools.js'
+import { chatBotSlots } from './load.js'
 import { persistRoundQuietly } from './persist.js'
-import { createSemaphore } from './semaphore.js'
 import { createToolTextOffsetTracker } from './toolTextOffset.js'
 import {
   ChatStoppedError,
@@ -160,11 +160,8 @@ import {
   type ConfirmDecision,
 } from './sse.js'
 
-/**
- * 进程级并发闸（`02` §六 第 1 步）。**模块级单例**：名额是"这个进程同时在跑几轮生成"，
- * 每轮各造一个信号量等于没有闸门。
- */
-const chatBotSlots = createSemaphore(config.concurrency.chatbot)
+// 进程级并发闸（`02` §六 第 1 步）的**唯一实例**在 `orchestrator/load.ts`：名额是"这个进程同时在跑
+// 几轮生成"，每轮各造一个信号量等于没有闸门；心跳采样（P1-14 · R3）也要读同一个闸门。
 
 /**
  * ⚠️ `abortReasonOf(signal)` 自 **P0-3-6** 起搬到了 `sse.ts`（它有了第二个调用方 ——

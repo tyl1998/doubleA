@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 平台镜像（`infra/router/Dockerfile`；P1-14 · R1）的构建上下文黑名单
+#
+# ⚠️ **构建上下文是仓库根**（要 `pnpm-lock.yaml` 与三包源码）⇒ 这份文件必须放在根目录。
+# ⚠️ 第一条纪律：**任何 `.env` / 密钥都不得进镜像**（`infra/.env` 由 compose 在运行期注入）。
+# ═══════════════════════════════════════════════════════════════════════
+
+# 依赖与产物：镜像里**重新装、重新构建**，不搬本机的（也避免 GLIBC/架构不一致）
+node_modules
+**/node_modules
+dist
+**/dist
+backend/generated
+
+# 密钥 / 本机环境（绝不允许进镜像）
+infra/.env
+**/.env
+.env
+.env.*
+!**/.env.example
+# 部署包的运行时产物与实际配置（`.generated` 里有种子账号的初始密码、迁移日志）
+deploy/deploy.env
+deploy/.generated
+
+# 仓库卫生（与构建无关）
+.git
+.github
+.vscode
+.idea
+.kilo
+.workbuddy
+.pids
+.dev-logs
+logs
+*.log
+docs
+design
+issue_fix
+README.md
+
+# 运行时数据（沙箱镜像是独立构建，但 `infra/sandbox` 的 **Dockerfile/脚本**要随平台镜像分发：
+# 节点自举会在目标机上用它们构建 toolkit/运行时 ⇒ 不能排除；只排除构建产物）
+infra/data
+infra/volumes
+
+# 本机平台产物（macOS / Windows）
+.DS_Store
+Thumbs.db
+desktop.ini

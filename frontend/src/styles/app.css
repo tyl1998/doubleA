@@ -2201,3 +2201,90 @@
   color: var(--ink); font: inherit;
 }
 .usage-range__field input[type='date']:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }
+
+/* ── 运行位置与环境弹窗（P1-17a × P1-14）：按实例列卡片）────────────────── */
+.ws-env-list { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 52vh; overflow: auto; }
+.ws-env-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  cursor: pointer;
+}
+.ws-env-card.is-selected { border-color: var(--accent); }
+.ws-env-card.is-disabled { opacity: 0.55; cursor: not-allowed; }
+.ws-env-card--auto { background: var(--accent-wash); }
+.ws-env-card__body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ws-env-card__title { font-weight: 600; font-size: var(--fs-sm); }
+.ws-env-card__meta { color: var(--muted); font-size: 12px; }
+.ws-env-card__envs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+/* ── 节点初始化任务（2026-10-20）：步骤时间线 + 动效 ────────────────────────
+   动效**只挂在两个地方**：①「执行中」那一行的图标旋转；② 该行说明文字的一道扫光。
+   其余行保持静止 —— 目的是"一眼看出卡在哪一步"，而不是整块在闪。
+   ⚠️ 尊重 `prefers-reduced-motion`：关掉动画后仍能靠图标与文案分辨状态。         */
+.node-job {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.node-job__head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); }
+.node-job__meta { color: var(--muted); font-size: var(--fs-xs); }
+.node-job__meta--dim { margin-left: auto; font-family: var(--font-mono, ui-monospace, monospace); opacity: 0.7; }
+.node-job__hint { color: var(--muted); font-size: var(--fs-xs); }
+
+.node-steps { display: flex; flex-direction: column; gap: 2px; }
+.node-step {
+  position: relative;
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-5);
+  border-left: 2px solid var(--rule);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+/* 执行中的行：左侧竖线加粗成强调色（配合图标旋转，指向当前步骤） */
+.node-step.is-active { border-left-color: var(--accent); background: var(--accent-wash); }
+.node-step.is-failed { border-left-color: var(--danger); }
+.node-step__head { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); }
+.node-step__label { font-weight: 500; color: var(--ink); }
+.node-step__badge {
+  padding: 0 6px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: #fff;
+  font-size: var(--fs-2xs);
+  line-height: 18px;
+}
+.node-step__badge--muted { background: var(--surface-3); color: var(--muted); }
+.node-step__time { margin-left: auto; color: var(--muted-2); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+.node-step__detail { margin-top: 2px; font-size: var(--fs-xs); color: var(--ink-2); word-break: break-word; }
+.node-step__detail-text.is-running {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 35%, var(--accent) 50%, var(--muted) 65%, var(--muted) 100%);
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: node-step-shimmer 2.4s linear infinite;
+}
+@keyframes node-step-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -150% 0; }
+}
+.node-step__events {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-4);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.node-step__events li { list-style: '· '; }
+.node-step__events li.is-latest { color: var(--accent-ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  .node-step__detail-text.is-running { animation: none; color: var(--muted); background: none; }
+}

@@ -334,12 +334,69 @@ export const setConversationRuntimeBodySchema = z.object({
 })
 export type SetConversationRuntimeBody = z.infer<typeof setConversationRuntimeBodySchema>
 
+/**
+ * `POST /api/conversations/:id/instance` 的请求体（P1-14 多机：**用户点名**会话跑在哪台实例上）。
+ *
+ * `instanceId: null` = 清掉"用户点名"意图之外的说明：**不删已有 owner**（那是运行期事实），
+ * 只是把"用户的显式选择"置空（= 交还给自动落点）。真正换机要由原实例回收，见后端实现。
+ */
+export const setConversationInstanceBodySchema = z.object({
+  instanceId: z
+    .string({ required_error: '缺少 instanceId（在线实例 id；null = 交还自动落点）' })
+    .trim()
+    .min(1, 'instanceId 不能为空（要交还自动落点请传 null）')
+    .max(64, 'instanceId 过长')
+    .nullable(),
+  /**
+   * 自动落点时**必须满足的运行时**（P1-14 × P1-17a）：后端据此挑一台"有该环境、否则能构建该环境"
+   * 的实例，并让 owner 指向它；`''`（空环境）恒满足。省略 = 只看在线 + 当前负载（不做能力过滤）。
+   *
+   * ⚠️ 只对 `instanceId: null`（自动）有意义：点名实例时用户已经指定了机器，不再替它挑。
+   */
+  runtime: z.string().max(120).optional(),
+})
+export type SetConversationInstanceBody = z.infer<typeof setConversationInstanceBodySchema>
+
+/** `POST /api/conversations/:id/instance` 的响应（回带落定值 = 目录里此刻的 owner） */
+export const setConversationInstanceResultSchema = z.object({
+  id: z.string(),
+  /** 目录里此刻的 owner（`null` = 还没有 owner，下一次派活时按 P2C 落点） */
+  instanceId: z.string().nullable(),
+  /**
+   * `pinned` = 本次由用户点名写入 / `already` = 本来就在这台 /
+   * `auto` = 交还自动且**原实例仍满足**（未改动目录）/ `auto-reselected` = 自动重选了落点（原实例不满足）
+   */
+  action: z.enum(['pinned', 'already', 'auto', 'auto-reselected']),
+  /** `auto-reselected` 时给出的原因（给用户看的） */
+  hint: z.string().nullable().optional(),
+})
+export type SetConversationInstanceResult = z.infer<typeof setConversationInstanceResultSchema>
+
 /** `POST /api/conversations/:id/runtime` 的响应（回带落定值） */
 export const setConversationRuntimeResultSchema = z.object({
   id: z.string(),
   runtime: z.string(),
 })
 export type SetConversationRuntimeResult = z.infer<typeof setConversationRuntimeResultSchema>
+
+/**
+ * `GET /api/conversations/:id/instance` 的响应 —— 会话**此刻**落在哪台实例（P1-14 · 落点对齐）。
+ *
+ * ⚠️ 这是**唯一**能回答"这条会话实际在哪"的地方：前端此前只知道"我点过谁"
+ *    （`ChatPage#preferredInstanceId`），新会话的首轮落点由网关选的，界面上看不见
+ *    ⇒ 出现"选的是 a、实际跑在 jiaxie"却无人能发现的错位。
+ */
+export const getConversationInstanceResultSchema = z.object({
+  id: z.string(),
+  /** 目录（`sandbox:owner:*`）里的 owner；`null` = 还没钉机（下一轮派活时由网关选） */
+  instanceId: z.string().nullable(),
+  /**
+   * 该实例此刻在注册表里的自检结论：
+   * `false` = 明确未就绪；`null` = 未上报（老版本 / 非 taskAgent 档位）或该实例离线。
+   */
+  ready: z.boolean().nullable(),
+})
+export type GetConversationInstanceResult = z.infer<typeof getConversationInstanceResultSchema>
 
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 

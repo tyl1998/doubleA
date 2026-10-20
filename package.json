@@ -38,6 +38,7 @@
     "verify:artifact-preview": "pnpm --filter @doubulea/frontend verify:artifact-preview",
     "verify:artifact-panel": "pnpm --filter @doubulea/frontend verify:artifact-panel",
     "verify:usage-ui": "pnpm --filter @doubulea/frontend verify:usage-ui",
+    "verify:sandbox-instances-ui": "pnpm --filter @doubulea/frontend verify:sandbox-instances-ui",
     "verify:memory-ui": "pnpm --filter @doubulea/frontend verify:memory-ui",
     "cron:regression": "pnpm --filter @doubulea/backend cron:regression",
     "notify:regression": "pnpm --filter @doubulea/backend notify:regression",
@@ -69,7 +70,12 @@
     "infra:logs": "docker compose -f infra/docker-compose.yml --env-file infra/.env logs -f --tail=100",
     "infra:ps": "docker compose -f infra/docker-compose.yml --env-file infra/.env ps",
     "infra:verify": "node infra/scripts/pg-verify.mjs",
-    "sandbox:build": "node infra/scripts/sandbox-build.mjs"
+    "sandbox:build": "node infra/scripts/sandbox-build.mjs",
+    "backend:build-image": "node infra/scripts/router-image.mjs",
+    "gateway:build": "node infra/scripts/gateway-image.mjs",
+    "frontend:build-image": "node infra/scripts/frontend-image.mjs",
+    "router:build": "node infra/scripts/router-image.mjs",
+    "router:config": "node infra/scripts/router-compose-check.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -6,4 +6,20 @@
  */
 
 export { buildRouterApp, splitHostPort, UPSTREAM_COOLDOWN_MS, type RouterDeps } from './gateway.js'
-export { loadRouterConfig, parseUpstream, type RouterConfig, type RouterConfigResult } from './config.js'
+export {
+  loadRouterConfig,
+  loadRouterEnvFile,
+  parseUpstream,
+  resolveRouterEnvFile,
+  type RouterConfig,
+  type RouterConfigResult,
+  type RouterEnvFileInfo,
+} from './config.js'
+export {
+  buildDiscoverySnapshot,
+  InstanceDiscovery,
+  readInstanceRegistrations,
+  type DiscoveryOptions,
+  type DiscoverySnapshot,
+  type InstanceRegistryReader,
+} from './discovery.js'

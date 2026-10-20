@@ -59,7 +59,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$INFRA_DIR/.." && pwd)"
 ENV_FILE="$INFRA_DIR/.env"
-PROXY_SRC="$SCRIPT_DIR/egress-proxy.mjs"
+# ★ 容器内自举：`-v` 由**宿主** docker 解析 ⇒ 用 `DOUBULEA_HOST_INFRA_DIR` 传宿主侧的 scripts 目录
+DOUBULEA_MOUNT_DIR="${DOUBULEA_HOST_INFRA_DIR:-$SCRIPT_DIR}"
+PROXY_SRC="$DOUBULEA_MOUNT_DIR/egress-proxy.mjs"
 
 NAME=doubulea-egress
 PORT=3128
@@ -79,7 +81,21 @@ DEFAULT_REGISTRY_HOSTS='registry.npmjs.org,registry.yarnpkg.com,pypi.org,files.p
 DEFAULT_GIT_HOSTS='github.com,*.github.com,gitlab.com,*.gitlab.com,bitbucket.org,*.bitbucket.org'
 
 # 策略文件（挂进代理容器，代理每 5s 轮询热更新 —— 改平台策略不用重启代理）
-ALLOW_DIR_HOST="${TMPDIR:-/tmp}/doubulea-egress-allow"
+# ★ 策略目录（2026-10-19 实测坑，两次踩）：
+#   ① **不能跟 `TMPDIR` 走**：宿主上 `TMPDIR=/var/folders/.../T`，容器内自举时没有它 ⇒ 取 `/tmp`
+#      ⇒ 写文件的目录与挂载的目录不是同一个，代理每 5s 报 `ENOENT`。
+#   ② **也不能用宿主 `/tmp` 路径**：脚本可能跑在后端**容器**里，那时 `/tmp/doubulea-egress-allow`
+#      写的是**容器自己的** `/tmp`，而 `-v` 的源由宿主解析 ⇒ 依旧空目录。
+#   正解 = **命名卷**：脚本把策略写进卷挂载点（容器内 `/opt/egress-policy`），
+#   egress 容器用**同一个卷**挂到 `/egress-allow`。卷名与挂载点都可用 `EGRESS_POLICY_VOLUME` /
+#   `EGRESS_POLICY_DIR` 覆盖（两者必须与容器内挂载点一致）。
+if [ -n "${DOUBULEA_MOUNT_VOLUME:-}" ] || [ -n "${EGRESS_POLICY_VOLUME:-}" ]; then
+  POLICY_VOLUME="${EGRESS_POLICY_VOLUME:-doubulea-egress-policy}"
+  ALLOW_DIR_HOST="${EGRESS_POLICY_DIR:-/opt/egress-policy}"
+else
+  POLICY_VOLUME=""
+  ALLOW_DIR_HOST="${EGRESS_ALLOW_DIR:-/tmp/doubulea-egress-allow}"
+fi
 POLICY_FILE_HOST="$ALLOW_DIR_HOST/policy.json"
 POLICY_FILE_CONTAINER=/egress-allow/policy.json
 
@@ -138,7 +154,10 @@ cd "$REPO_ROOT" || fail "无法进入仓库根: $REPO_ROOT"
 
 step 'Preflight'
 
-DOCKER_BIN="$(command -v docker 2>/dev/null || true)"
+# ★ 容器内自举（P1-14 部署优化）：镜像里没有 docker CLI，后端把 CLI 以只读卷挂到
+#   `SANDBOX_DOCKER_BIN`（/opt/doubulea-docker-bin/docker）⇒ 优先用它；宿主上该变量通常为空。
+DOCKER_BIN="${SANDBOX_DOCKER_BIN:-}"
+[ -n "$DOCKER_BIN" ] && [ -x "$DOCKER_BIN" ] || DOCKER_BIN="$(command -v docker 2>/dev/null || true)"
 if [ -z "$DOCKER_BIN" ] && [ -x /usr/local/bin/docker ]; then
   DOCKER_BIN=/usr/local/bin/docker
   export PATH="/usr/local/bin:$PATH"
@@ -147,7 +166,8 @@ fi
 "$DOCKER_BIN" info >/dev/null 2>&1 || fail "docker daemon 不通（OrbStack 起了吗？）"
 ok "docker 可用：$DOCKER_BIN"
 
-[ -f "$PROXY_SRC" ] || fail "缺代理实现 $PROXY_SRC"
+# ⚠️ 存在性检查用**容器内**的副本（$SCRIPT_DIR）；`-v` 的源用宿主路径（$DOUBULEA_MOUNT_DIR）
+[ -f "$SCRIPT_DIR/$(basename "$PROXY_SRC")" ] || fail "缺代理实现 $PROXY_SRC"
 ok "代理实现：$PROXY_SRC"
 
 "$DOCKER_BIN" image inspect "$IMAGE" >/dev/null 2>&1 || fail "本地没有镜像 ${IMAGE}（本脚本刻意不联网拉：它必须离线可跑）"
@@ -382,8 +402,9 @@ write_policy_file() {
   [ "${#ALLOW[@]}" -gt 0 ] && allow_json="$(json_host_array "${ALLOW[@]}")"
   [ "${#DENY[@]}" -gt 0 ] && deny_json="$(json_host_array "${DENY[@]}")"
   [ "${#MODEL[@]}" -gt 0 ] && model_json="$(json_host_array "${MODEL[@]}")"
-  printf '{"allow":%s,"deny":%s,"modelHosts":%s}\n' "$allow_json" "$deny_json" "$model_json" > "$tmp"
-  mv "$tmp" "$POLICY_FILE_HOST"
+  printf '{"allow":%s,"deny":%s,"modelHosts":%s}\n' "$allow_json" "$deny_json" "$model_json" > "$tmp" \
+    || fail "策略文件写不进去：$tmp（卷/目录不可写？容器内是 uid 10001）"
+  mv "$tmp" "$POLICY_FILE_HOST" || fail "策略文件落位失败：$POLICY_FILE_HOST"
 }
 
 compute_policy
@@ -423,13 +444,30 @@ if "$DOCKER_BIN" container inspect "$NAME" >/dev/null 2>&1; then
   "$DOCKER_BIN" rm -f "$NAME" >/dev/null 2>&1 || fail "删不掉旧容器 $NAME"
 fi
 
+# ⚠️ 不要用 `${VAR:+...}` 拼 `-v`：sh(dash) 下引号内嵌无法组合成"一个参数"，
+#    会把 `-v doubulea-node-infra:/app` 拆成两个词 ⇒ `doubulea-node-infra` 被当成**镜像名**。
+#    用数组逐个追加参数。
+MOUNT_ARGS=( -v )
+if [ -n "${DOUBULEA_MOUNT_VOLUME:-}" ]; then
+  MOUNT_ARGS+=( "${DOUBULEA_MOUNT_VOLUME}:/app" )
+else
+  MOUNT_ARGS+=( "${PROXY_SRC}:/app/egress-proxy.mjs:ro" )
+fi
+# ⚠️ 同 MOUNT_ARGS：用数组，避免 `${VAR:+...}` 在 sh 下被拆词。
+#   有中转卷（= 脚本跑在容器里）⇒ 策略也走卷；否则退回宿主绑定挂载（本机直接跑脚本的场景）。
+if [ -n "${POLICY_VOLUME}" ]; then
+  "${DOCKER_BIN}" volume create "${POLICY_VOLUME}" >/dev/null 2>&1 || true
+  POLICY_ARGS=( -v "${POLICY_VOLUME}:/egress-allow" )
+else
+  POLICY_ARGS=( -v "${ALLOW_DIR_HOST}:/egress-allow:ro" )
+fi
 "$DOCKER_BIN" run -d --name "$NAME" \
   --network bridge --restart unless-stopped \
   -e "EGRESS_PORT=${PORT}" \
   -e "EGRESS_POLICY_FILE=${POLICY_FILE_CONTAINER}" \
   -e "EGRESS_MODEL_IDLE_TIMEOUT_MS=${MODEL_IDLE_TIMEOUT_MS}" \
-  -v "$PROXY_SRC:/app/egress-proxy.mjs:ro" \
-  -v "$ALLOW_DIR_HOST:/egress-allow:ro" \
+  "${MOUNT_ARGS[@]}" \
+  "${POLICY_ARGS[@]}" \
   "$IMAGE" node /app/egress-proxy.mjs >/dev/null || fail "容器起不来（$DOCKER_BIN logs $NAME 看原因）"
 ok "已启动（公网腿 = 默认 bridge）"
 

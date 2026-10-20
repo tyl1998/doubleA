@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 前端站点 nginx 配置模板（P1-14 · R1，2026-10-19）
+#
+# 由镜像入口的 `envsubst` 在**容器启动时**展开 `${ROUTER_UPSTREAM}` /
+# `${CLIENT_MAX_BODY_MB}`（见 `infra/frontend/Dockerfile`）。
+#
+# ⚠️ 这里**不做会话粘性**：粘性由路由网关查目录（`sandbox:owner:*`）决定。
+#    nginx 再加 `ip_hash` / sticky cookie 只会在网关副本挂掉时把流量钉死在死副本上
+#    （`子方案` §八·补 1 已写明）。
+#
+# ⚠️ SSE 三处必须对：`proxy_buffering off`（不攒着发）、`proxy_read_timeout` 放长
+#    （模型静默期不是错误）、`proxy_http_version 1.1` + 清空 `Connection`（保持长连接语义）。
+#    与 `docs/02` §五 的心跳前提（`proxy_read_timeout ≥ 120s`）一致。
+# ═══════════════════════════════════════════════════════════════════════
+
+# ⚠️ nginx 的 `upstream` 里**不能带 scheme**（`http://`）—— 带上的症状是启动即
+#    `[emerg] invalid host in upstream`（容器直接退出）。协议在这里写死为 http。
+#    若要 HTTPS 上游，改用 `proxy_pass https://...` 并去掉 upstream 块（本仓网关是内网明文）。
+upstream doubulea_router {
+  server ${ROUTER_HOSTPORT};
+  keepalive 32;
+}
+
+server {
+  listen 80;
+  server_name _;
+
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # 上传（产物 / 文件 / 知识库文档）走这里；与后端 `FILES_MAX_MB` 保持同量级
+  client_max_body_size ${CLIENT_MAX_BODY_MB}m;
+
+  # ── 安全响应头（静态站点自己给；后端信封不受影响）────────────────────
+  add_header X-Content-Type-Options nosniff always;
+  add_header X-Frame-Options SAMEORIGIN always;
+  add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+  # ── 构建产物：文件名带内容哈希 ⇒ 可长缓存 ─────────────────────────────
+  location /assets/ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+    try_files $uri =404;
+  }
+
+  # `index.html` 不放缓存：否则发版后浏览器会继续引用旧哈希的 assets（白屏）
+  location = /index.html {
+    add_header Cache-Control "no-store";
+  }
+
+  # ── API：反代到路由网关 ──────────────────────────────────────────────
+  # `/api/sandbox/*` 是**容器回调（出口②）**专用的端点，公网 listener 上不存在；
+  # 但这里把整个 `/api` 都反代出去只是"多一层可达"，真正的 404 由后端路由决定。
+  location /api/ {
+    proxy_pass http://doubulea_router;
+    proxy_http_version 1.1;
+    proxy_set_header Connection '';
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+  }
+
+  # `/health` **不带 `/api` 前缀**（`docs/02` §四）：漏了它会打到 SPA 兜底、返回 200 的 index.html，
+  # 登录页识别板永远显示"服务信息未取到"（vite.config.ts 那条注释踩过同一个坑）
+  location = /health {
+    proxy_pass http://doubulea_router;
+    proxy_http_version 1.1;
+    proxy_set_header Connection '';
+    proxy_set_header Host $host;
+    proxy_read_timeout 60s;
+  }
+
+  # ── SPA：history 路由兜底 ────────────────────────────────────────────
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}

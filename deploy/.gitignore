@@ -1,0 +1,3 @@
+# 部署包不需要的东西别进 git
+.generated/
+deploy.env

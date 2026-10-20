@@ -43,6 +43,9 @@ import { registerUserRoutes } from './routes/users.js'
 import { registerUserGroupRoutes } from './routes/userGroups.js'
 import { registerWorkspaceRoutes } from './routes/workspace.js'
 import { registerSandboxRoutes } from './routes/sandbox.js'
+import { registerSandboxInstanceRoutes } from './routes/sandboxInstances.js'
+import { registerNodeRoutes } from './routes/node.js'
+import { registerNodeInternalRoutes } from './routes/nodeInternal.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -214,6 +217,12 @@ export function buildApp(): FastifyInstance {
   //    ⚠️ `/file/raw` 是**不套信封**的字节出口（本仓第四个，同产物下载/预览）；⚠️ 多机下全部粘性。
   registerWorkspaceRoutes(app)
   registerSandboxRoutes(app)
+  // P1-14 · R5：沙箱实例注册表（只读，**仅 ADMIN**）—— 后台回答"现在有哪些实例注册、各自多忙"。
+  registerSandboxInstanceRoutes(app)
+  // 节点自检 / 自举（P1-14 部署优化）：只作用于本进程所在节点，仅 ADMIN
+  registerNodeRoutes(app)
+  // 内部节点运维（只认 NODE_OPS_SECRET 签名；供其它实例代发自检/自举）
+  registerNodeInternalRoutes(app)
 
   // ㉑ git 凭据（P1-9 · R11）：`/api/git-credentials` 四条（列表 / 建 / 改 / 删）。权限与会话同族
   //    （**仅本人**，`git_credentials.user_id`，ADMIN 无后门）；凭据按用户加密存平台、派活时解密

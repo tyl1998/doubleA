@@ -21,6 +21,7 @@
 import { ok, changePasswordBodySchema, loginBodySchema, type ChangePasswordBody, type LoginBody } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
 
+import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { endSession, issueSession, requireAuthContext } from '../plugins/session.js'
 import { changePassword, login, toAuthUser } from '../services/auth.service.js'
@@ -48,9 +49,15 @@ export function registerAuthRoutes(app: FastifyInstance): void {
     return ok(null)
   })
 
-  /** 当前用户（含 `mustChangePassword`，`02` §4.1）。数据直接取自 `requireAuth` 已解析的用户快照 */
+  /**
+   * 当前用户（含 `mustChangePassword`，`02` §4.1）。数据直接取自 `requireAuth` 已解析的用户快照。
+   *
+   * ⚠️ 额外带 `instanceId`（**这份响应**由哪台实例发出）：`/me` 是路由表里**刻意不粘性**的一条
+   *    （落到哪台都正确），多实例下浏览器连着打两次就可能由不同实例作答。界面需要"这台是谁"时
+   *    只有这里和 `/health` 是**同源同进程**的证据 —— 注册表里的任何时刻字段都不代表本进程。
+   */
   app.get('/api/auth/me', { preHandler: app.requireAuth }, async (request) =>
-    ok(toAuthUser(requireAuthContext(request).user)),
+    ok({ ...toAuthUser(requireAuthContext(request).user), instanceId: config.sandbox.enabled ? config.sandbox.instanceId : null }),
   )
 
   /**

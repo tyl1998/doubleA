@@ -12,7 +12,9 @@
 import { useQuery, type UseQueryResult } from '@tanstack/react-query'
 
 import type {
+  GetConversationInstanceResult,
   SetConversationCodeModeResult,
+  SetConversationInstanceResult,
   SetConversationRuntimeResult,
   WorkspaceChangesResult,
   WorkspaceDeleteDirResult,
@@ -273,6 +275,38 @@ export function setConversationRuntime(
     `/api/conversations/${encodeURIComponent(conversationId)}/runtime`,
     { method: 'POST', body: { runtime } },
   )
+}
+
+/**
+ * 把会话**点名**到某台实例（`POST /api/conversations/:id/instance`，P1-14 多机）。
+ *
+ * `instanceId: null` = 交还自动落点（不删已有 owner）。已有 owner 且指向别的实例时后端回 409
+ * （容器/工作区在那台）—— 调用方按 `feedback.fail` 展示即可。
+ */
+export function setConversationInstance(
+  conversationId: string,
+  instanceId: string | null,
+  runtime?: string,
+): Promise<SetConversationInstanceResult> {
+  return request<SetConversationInstanceResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/instance`,
+    // `runtime` 只在 `instanceId === null`（自动落点）时有意义：让后端挑一台具备该环境的实例
+    { method: 'POST', body: runtime === undefined ? { instanceId } : { instanceId, runtime } },
+  )
+}
+
+/**
+ * 这条会话**此刻**落在哪台实例（`GET /api/conversations/:id/instance`，P1-14）。
+ *
+ * 唯一能回答"实际在哪"的读端点：前端只能知道"我点过谁"，新会话首轮落点由网关选的。
+ */
+export function fetchConversationInstance(conversationId: string): Promise<GetConversationInstanceResult> {
+  return request<GetConversationInstanceResult>(`/api/conversations/${encodeURIComponent(conversationId)}/instance`)
+}
+
+/** 落点查询键（切换实例 / 派活后失效，让选择器对齐到实际 owner） */
+export function conversationInstanceQueryKey(conversationId: string | undefined): readonly unknown[] {
+  return ['conversation-instance', conversationId ?? null]
 }
 
 export interface WorkspaceStreamHandlers {

@@ -112,6 +112,8 @@ export async function canBuildSandboxRuntime(): Promise<boolean> {
  */
 interface BuildJobState {
   buildId: string
+  /** 发起构建的实例（任务只在**这个进程**里存在；多实例下用于提示与路由） */
+  instanceId: string
   variant: string
   label: string
   tag: string
@@ -142,6 +144,7 @@ let buildChain: Promise<unknown> = Promise.resolve()
 function snapshot(job: BuildJobState): SandboxBuildJob {
   return {
     buildId: job.buildId,
+    instanceId: job.instanceId,
     variant: job.variant,
     label: job.label,
     status: job.status,
@@ -169,6 +172,7 @@ function settleImmediately(partial: {
 }): SandboxBuildJob {
   const job: BuildJobState = {
     buildId: randomUUID(),
+    instanceId: config.sandbox.instanceId,
     variant: partial.variant,
     label: partial.label,
     tag: partial.tag,
@@ -324,7 +328,21 @@ function finishJob(job: BuildJobState, status: 'succeeded' | 'failed' | 'cancele
  */
 export async function startSandboxRuntimeBuild(
   components: readonly SandboxRuntimeSelection[],
+  options: { expectedInstanceId?: string } = {},
 ): Promise<SandboxBuildJob> {
+  // 多实例：请求被路由到了"不是用户点名的那台" ⇒ 不起构建（否则用户以为在 B 构建，实际在 A）
+  if (options.expectedInstanceId !== undefined && options.expectedInstanceId !== config.sandbox.instanceId) {
+    return settleImmediately({
+      variant: sandboxVariantIdFromSelection(components),
+      label: sandboxVariantLabel(sandboxVariantIdFromSelection(components)),
+      tag: '',
+      status: 'failed',
+      phase: 'done',
+      progress: 1,
+      image: null,
+      error: `构建请求落到了实例 ${config.sandbox.instanceId}，但目标是 ${options.expectedInstanceId}；请重试（网关下次可能路由到目标实例）`,
+    })
+  }
   const variant = sandboxVariantIdFromSelection(components)
   const label = sandboxVariantLabel(variant)
 
@@ -383,6 +401,7 @@ export async function startSandboxRuntimeBuild(
 
   const job: BuildJobState = {
     buildId: randomUUID(),
+    instanceId: config.sandbox.instanceId,
     variant,
     label,
     tag,
@@ -431,7 +450,12 @@ function runBuildProcess(
       '--build-arg',
       `COMPONENTS=${componentsArg}`,
       '--build-arg',
+      // ⚠️ 空串会让 apt-source.sh 回落到镜像自带的官方源（`deb.debian.org`）—— 在只能慢速出网的
+      //    环境下那就是"卡在 apt"的来源；`.env.node` 里配 `SANDBOX_APT_MIRROR` 才是正解。
       `APT_MIRROR=${process.env.SANDBOX_APT_MIRROR ?? ''}`,
+      '--build-arg',
+      // 网速闸门（KB/s；0 = 关）：低于它就不再干等，换源/报清楚原因。见 infra/sandbox/apt-source.sh。
+      `APT_MIN_BPS=${process.env.SANDBOX_APT_MIN_BPS ?? '32'}`,
       '--build-arg',
       `NODE_DIST_MIRROR=${process.env.SANDBOX_NODE_DIST_MIRROR ?? ''}`,
       '--build-arg',
@@ -442,7 +466,12 @@ function runBuildProcess(
 
     let child: ChildProcessWithoutNullStreams
     try {
-      child = spawn(config.sandbox.dockerBin, args, { cwd: context, env: process.env })
+      // ⚠️ 强制 BuildKit：Dockerfile 里有 `RUN --mount=type=cache`（apt 缓存），经典构建器会直接报
+      //   `the --mount option requires BuildKit`。与 `pnpm sandbox:build` 的口径一致（那边也带这个变量）。
+      child = spawn(config.sandbox.dockerBin, args, {
+        cwd: context,
+        env: { ...process.env, DOCKER_BUILDKIT: '1' },
+      })
     } catch (error) {
       finishJob(job, 'failed', `docker build 启动失败：${error instanceof Error ? error.message : String(error)}`)
       resolvePromise()
@@ -494,10 +523,17 @@ function runBuildProcess(
   })
 }
 
-/** 端点用：拿一个构建任务的当前快照；查不到返回 `undefined` */
-export function getSandboxBuildJob(buildId: string): SandboxBuildJob | undefined {
+/**
+ * 端点用：拿一个构建任务的当前快照；查不到返回 `undefined`。
+ *
+ * @param expectedInstanceId 给了就**只认**这台实例上的任务（多实例下：防止同一个 buildId 的
+ *        轮询被路由到别的实例后，恰好撞上它自己那条无关任务 —— 概率极低，但判据应当是显式的）
+ */
+export function getSandboxBuildJob(buildId: string, expectedInstanceId?: string): SandboxBuildJob | undefined {
   const job = jobs.get(buildId)
-  return job === undefined ? undefined : snapshot(job)
+  if (job === undefined) return undefined
+  if (expectedInstanceId !== undefined && job.instanceId !== expectedInstanceId) return undefined
+  return snapshot(job)
 }
 
 /**
@@ -505,9 +541,10 @@ export function getSandboxBuildJob(buildId: string): SandboxBuildJob | undefined
  *
  * ⚠️ 幂等：终态（或查不到）时不报错，回当前快照（或 `undefined`）—— 前端点两次取消不该炸。
  */
-export function cancelSandboxBuild(buildId: string): SandboxBuildJob | undefined {
+export function cancelSandboxBuild(buildId: string, expectedInstanceId?: string): SandboxBuildJob | undefined {
   const job = jobs.get(buildId)
   if (job === undefined) return undefined
+  if (expectedInstanceId !== undefined && job.instanceId !== expectedInstanceId) return undefined
   if (job.status === 'running') {
     appendLog(job, '\n[build] 用户取消，已终止\n')
     // 先定状态再杀进程：close 回调看见 status !== running 就不再改结局

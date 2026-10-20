@@ -56,3 +56,13 @@ infra/volumes/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== P1-14 · R1 部署编排（每台实例 / 网关的私有 env 与镜像导出包）=====
+infra/router/.env.node
+infra/router/.env.node.shared
+infra/router/.env.router
+infra/frontend/.env.frontend
+infra/router/*.tar
+
+# 本机单机形态的运行脚本与日志（容器化前的过渡态，不入库）
+.run-logs/

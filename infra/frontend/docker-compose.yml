@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 前端静态站点（P1-14 · R1，2026-10-19）
+#
+# 依据：`docs/子方案/沙箱多机部署.md` §八 3（拓扑：nginx 托管 SPA + 反代 /api、/health）。
+#
+# 【它是什么】`doubulea-frontend:<ver>`：nginx 托管 `frontend/dist`，并把 `/api/*` 与 `/health`
+#   反代到**路由网关**。浏览器只认这一个同源入口，不需要知道有几台后端。
+#
+# 【用法】（镜像先 `pnpm frontend:build-image`）
+#   ROUTER_UPSTREAM=http://10.73.100.153:13000 \
+#     docker compose -f infra/frontend/docker-compose.yml --env-file infra/frontend/.env.frontend up -d
+#   ⚠️ `ROUTER_UPSTREAM` 在容器启动时展开进 nginx 配置（`envsubst`）⇒ 改上游只重启容器，不用重建镜像
+#
+# 【不做的事】不做会话粘性（粘性由网关查目录决定）；不作为网关的替代（它只反代，不路由）。
+# ═══════════════════════════════════════════════════════════════════════
+
+name: doubulea-frontend
+
+services:
+  frontend:
+    image: ${FRONTEND_IMAGE:-doubulea-frontend:2}
+    container_name: doubulea-frontend
+    restart: unless-stopped
+    environment:
+      # 路由网关的可达地址（同机 / 同内网）。⚠️ 不要指向某台业务后端 —— 会绕过粘性与负载感知
+      ROUTER_UPSTREAM: ${ROUTER_UPSTREAM:?必须设路由网关地址（如 http://10.73.100.153:13000）}
+      # 上传上限（MB），与后端 `FILES_MAX_MB` 同量级
+      CLIENT_MAX_BODY_MB: ${CLIENT_MAX_BODY_MB:-100}
+    ports:
+      - '${FRONTEND_PORT:-8080}:80'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1/']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s

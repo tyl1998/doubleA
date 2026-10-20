@@ -125,6 +125,11 @@ let dockerDownNotified = false
  *      配置缺失是"服务不该跑"，Docker 不可达是"这项能力暂时不可用"。
  */
 export async function reconcileOnBoot(): Promise<ReconcileReport | undefined> {
+  // ★ P1-14 · R1：非沙箱宿主（路由网关）不做任何对账 —— 它既没有本机容器，也不该替别人清账本。
+  if (!config.sandbox.enabled) {
+    getLogger().info('非沙箱宿主 ⇒ 跳过沙箱启动对账')
+    return undefined
+  }
   if (config.sandbox.image === undefined) {
     getLogger().info(
       '未配置 SANDBOX_IMAGE ⇒ 跳过沙箱启动对账（镜像未构建时不可能有遗留容器；构建后见 README「构建沙箱镜像」）',
@@ -222,6 +227,7 @@ export async function reconcileOnBoot(): Promise<ReconcileReport | undefined> {
  * 留着它们等于给自己留一份"看得见、判不了、删不了"的永久残留。
  */
 export async function reapOrphans(): Promise<ReapReport | undefined> {
+  if (!config.sandbox.enabled) return undefined
   if (config.sandbox.image === undefined) return undefined
   if ((await reachableDockerVersion()) === undefined) return undefined
 
@@ -305,6 +311,7 @@ export async function reapOrphans(): Promise<ReapReport | undefined> {
  * @returns 真的回收了几个（`recycleSandbox` 说"动了东西"才算）
  */
 export async function reapIdleSandboxes(): Promise<number> {
+  if (!config.sandbox.enabled) return 0
   if (config.sandbox.image === undefined) return 0
   if ((await reachableDockerVersion()) === undefined) return 0
 
@@ -398,6 +405,10 @@ export async function auditWorkVolumes(): Promise<WorkVolumeAudit | undefined> {
  */
 export function startSandboxReaper(): boolean {
   if (timer !== undefined) return false
+  if (!config.sandbox.enabled) {
+    getLogger().info('非沙箱宿主 ⇒ 不启动沙箱周期对账器')
+    return false
+  }
   if (config.sandbox.image === undefined) {
     getLogger().info('未配置 SANDBOX_IMAGE ⇒ 不启动沙箱周期对账器')
     return false

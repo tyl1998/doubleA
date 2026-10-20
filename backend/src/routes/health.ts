@@ -51,6 +51,14 @@ export interface HealthReport {
   checkedAt: string
   /** 单项探活超时预算（毫秒）——出现「超时」类 detail 时可直接对照 */
   timeoutMs: number
+  /**
+   * **承接本次请求的后端实例 id**（多机诊断的锚点：`null` = 该进程不是沙箱宿主，如网关角色）。
+   *
+   * 为什么放在这里：多机下"这台是谁"是排查"会话跑到哪、为什么这台说就绪/那台说未就绪"的
+   * 第一手证据，而网关对 `/health` 是**轮询**（不查目录）⇒ 每次响应都可能来自不同实例。
+   * 管理页据此把「本机」固定成**当前进程**，不再用注册表里的任何时刻字段去猜。
+   */
+  instanceId: string | null
   checks: HealthCheck[]
 }
 
@@ -134,6 +142,7 @@ export function registerHealthRoutes(app: FastifyInstance): void {
         uptimeSec: Math.round((Date.now() - PROCESS_STARTED_AT) / 1000),
         checkedAt: new Date().toISOString(),
         timeoutMs,
+        instanceId: config.sandbox.enabled ? config.sandbox.instanceId : null,
         checks,
       }
 

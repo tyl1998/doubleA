@@ -39,11 +39,15 @@ FROM ${BASE_IMAGE}
 
 # Debian 源主机名（可空 = 官方）。由 sandbox-build.mjs 的 `--apt-mirror` 注入，理由同 base。
 ARG APT_MIRROR
+ARG APT_MIN_BPS=32
 
 # base 层结尾是 `USER agent` ⇒ 装包前必须切回 root（apt 不能以非 root 跑）。装完再切回去，
 # 这样 toolkit 的**镜像默认用户**与 base 一致 —— 别忘了这一句，否则容器默认以 root 跑（§四 2 的
 # "非 root"要求会静默失效，而 `--cap-drop ALL` 的意义也随之减半）。
 USER root
+
+# 换源 / IPv4 兜底 / 不通回落（与 base **同一份**脚本，见 apt-source.sh 文件头）
+COPY apt-source.sh /usr/local/bin/apt-source.sh
 
 # ⚠️ BuildKit **缓存挂载**（与 base 同款，见 `infra/sandbox/base/Dockerfile` 那一段的完整理由）：
 #    这一层是本仓最慢的网络段（`python3-pandas` / `numpy` / `openpyxl` 加起来上百 MB），而它**每次
@@ -54,12 +58,7 @@ USER root
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     set -eux; \
-    if [ -n "${APT_MIRROR:-}" ]; then \
-      echo "把 Debian 源换成 ${APT_MIRROR}（本机实测快十几倍）"; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
-    fi; \
-    apt-get update; \
+    sh /usr/local/bin/apt-source.sh "${APT_MIRROR:-}"; \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-numpy \

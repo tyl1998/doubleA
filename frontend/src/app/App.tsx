@@ -35,6 +35,7 @@ import { RequireAuth } from './RequireAuth.js'
 import { conversationPath, newConversationPath } from './paths.js'
 import { NotFoundPage } from '../pages/NoticePage.js'
 import { EgressPolicyPage } from '../pages/admin/EgressPolicyPage.js'
+import { SandboxInstancesPage } from '../pages/admin/SandboxInstancesPage.js'
 import { ModelsPage } from '../pages/admin/ModelsPage.js'
 import { UsagePage } from '../pages/admin/UsagePage.js'
 import { UsersListPage } from '../pages/admin/UsersListPage.js'
@@ -107,6 +108,7 @@ export function App() {
           <Route element={<RequireAdmin />}>
             <Route path="/admin/users" element={<UsersListPage />} />
             <Route path="/admin/egress" element={<EgressPolicyPage />} />
+            <Route path="/admin/sandbox-instances" element={<SandboxInstancesPage />} />
           </Route>
 
           <Route path="*" element={<NotFoundPage />} />

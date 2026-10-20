@@ -1036,6 +1036,7 @@ function toEngineUsage(total: ChatUsage | null): EngineUsage | null {
  * | `MODEL_NOT_AVAILABLE` | `CONFLICT` 409 | 目标（模型/Provider）不可用 —— 与 `resolveChatTarget` 的"模型已停用 409"同族；文案已指向"去改智能体的模型" |
  * | `CONVERSATION_NOT_FOUND` | `CONFLICT` 409 | 撞到的是"会话已结束（只读）"这个**状态**问题（真不存在的情况路由层已经 404 挡过），与 `assertConversationSendable` 的只读 409 口径一致 |
  * | `CREATE_FAILED` | `INTERNAL` 500 | 建容器失败（镜像缺失 / 卷建不出来 / Docker 不可达）：基础设施故障 |
+ * | `STARTING` | `BUSY` 429 | 实例刚重启、启动对账未完成：**可自愈**，等几十秒重发（不是配置错） |
  * | `ABORTED` | `BUSY` 429 | ⚠️ **理论上不可达**：取消一定经 `signal` ⇒ 调用方在 `!acquired.ok` 那一支已经先按"用户已停止"处理。真到了这里说明有人绕过了信号，按"暂时不可用"报（比编一个"已取消"更像事实） |
  *
  * ⚠️ `message` **原样透传**：`ensureSandbox` 的文案本来就是写给用户的中文（哪一项没配、
@@ -1053,6 +1054,9 @@ export function sandboxAcquireError(code: SandboxAcquireFailure, message: string
       return AppError.conflict(message)
     case 'CREATE_FAILED':
       return AppError.internal(message)
+    // ★ 实例刚重启、对账还没跑完：可自愈（等几十秒重发），与 QUEUE_TIMEOUT 同族（429 BUSY）
+    case 'STARTING':
+      return AppError.busy(message)
     case 'ABORTED':
       return AppError.busy(message)
   }

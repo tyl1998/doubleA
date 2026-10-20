@@ -59,7 +59,7 @@
 
 import { DownOutlined, SettingOutlined } from '@ant-design/icons'
 import { Button, Tag, Tooltip } from 'antd'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
@@ -80,7 +80,13 @@ import {
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { uploadChatFile } from '../../api/files.js'
 import { setConversationMemoryExcluded } from '../../api/memory.js'
-import { setConversationCodeMode, setConversationRuntime } from '../../api/workspace.js'
+import {
+  conversationInstanceQueryKey,
+  fetchConversationInstance,
+  setConversationCodeMode,
+  setConversationInstance,
+  setConversationRuntime,
+} from '../../api/workspace.js'
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -220,6 +226,19 @@ export function ChatPage({
       onConversationCreated: async (created) => {
         // 这是"新建会话"而不是"切换会话"：别让 reset effect 把用户此刻选的模型清掉
         preserveSelectionRef.current = true
+        // 新会话态下预置过**实例**（P1-14）⇒ 必须**最先**落地、且在开流前：首轮 `/chat` 是粘性路由，
+        // 目录里没有这条会话时网关会自己挑一台（P2C / 轮询）并把它写成 owner —— 晚一步，
+        // 用户选的实例就永远追不回来（`pinSandboxOwner` 遇到已有 owner 只会回 conflict）。
+        // 失败（目标此刻未就绪 / 离线 / 缺运行时）不拦发送：这一轮退回网关自动落点，用户可在选择器里看到实际落点。
+        const instancePreset = instancePresetRef.current
+        instancePresetRef.current = null
+        if (instancePreset !== null) {
+          try {
+            await setConversationInstance(created.id, instancePreset)
+          } catch (error: unknown) {
+            feedback.fail(error, '所选实例没有生效，这一轮按自动落点')
+          }
+        }
         // 新会话态下预置过自动审批 ⇒ 会话一建出来就先落地到服务端，再导航开流
         // （顺序是关键：写在 `performStream` 之前，第一轮才吃得到）。
         // 消费掉意图后立刻清，避免它被下一条新会话误用。
@@ -388,12 +407,27 @@ export function ChatPage({
    * ⚠️ 只在 Code 会话里可选（**工作区面板头部**，见 `RuntimeSelect` / `WorkspacePanel`）：非 Code 会话不建容器，运行时不生效。
    */
   const [runtime, setRuntime] = useState<string>('')
+  /**
+   * 用户**点名**的实例（P1-14 多机）：`null` = 自动（网关按 P2C 挑）。
+   * ⚠️ 只是"下一轮想跑在哪台"的意图；真正落点由 `POST /:id/instance` 写目录决定
+   * （已有 owner 时后端回 409，见 `handleSelectInstance`）。切换会话时按 owner 重新对齐。
+   */
+  const [preferredInstanceId, setPreferredInstanceId] = useState<string | null>(null)
   const [runtimePending, setRuntimePending] = useState(false)
   /**
    * 新会话态下用户**预置**的运行时意图（与 Code 模式预置同款）：`null` = 没预置。
    * 会话要等首条消息才建出来 ⇒ 新会话态选运行时先记在这里、`onConversationCreated` 再落地。
    */
   const runtimePresetRef = useRef<string | null>(null)
+  /**
+   * 新会话态下用户**点名**的实例（与运行时预置同款）：`null` = 没预置（= 自动，交给网关）。
+   *
+   * ⚠️ **必须在开流前落地**（见 `onConversationCreated`）：首轮 `/chat` 是粘性路由，但它查的是
+   *    目录（`sandbox:owner:*`）——目录里没有这条会话时网关会**自己挑一台**（P2C / 轮询），
+   *    挑到谁就由谁 `SET NX` 写下 owner，用户在界面上选的实例从没离开过浏览器。
+   *    这正是"选了 a、新会话却跑到 jiaxie"的成因：选择器在新会话态只改了本地状态。
+   */
+  const instancePresetRef = useRef<string | null>(null)
   useEffect(() => {
     setAutoApprove(false)
     setMemoryExcluded(false)
@@ -411,6 +445,7 @@ export function ChatPage({
       memoryExcludedPresetRef.current = false
       codeModePresetRef.current = false
       runtimePresetRef.current = null
+      instancePresetRef.current = null
       return
     }
     let cancelled = false
@@ -430,6 +465,26 @@ export function ChatPage({
       cancelled = true
     }
   }, [conversationId])
+  /**
+   * **落点对齐**（P1-14）：选择器要显示"这条会话实际在哪台"，而不是"我点过谁"。
+   *
+   * 为什么必须有这一步：新会话的首轮落点由**网关**选（P2C / 轮询），随后由那台 `SET NX` 写下
+   * 目录；用户在选择器里点名只会在"已有会话"时下发。没有这条对齐，界面会一直显示"自动"，
+   * "会话跑到了别台"就完全不可见（真凶是首轮 `/chat` 先到、owner 已被写死）。
+   * 每轮结束 `useChatStream` 会失效 `conversationInstanceQueryKey`，所以这里跟着重取即可。
+   */
+  const instanceQuery = useQuery({
+    queryKey: conversationInstanceQueryKey(conversationId),
+    queryFn: () => fetchConversationInstance(conversationId as string),
+    enabled: conversationId !== undefined,
+    staleTime: 30_000,
+  })
+  useEffect(() => {
+    if (conversationId === undefined) return
+    const data = instanceQuery.data
+    if (data === undefined || data.id !== conversationId) return
+    setPreferredInstanceId(data.instanceId)
+  }, [conversationId, instanceQuery.data])
   /**
    * Code 模式第三列（IDE 面板）的宽度拖拽（P1-9 · R12）。
    * ⚠️ 宽度经 CSS 变量 `--panel-w` 注入（见下面的 `style`）——**不能直接写 `grid-template-columns`**：
@@ -1061,6 +1116,48 @@ export function ChatPage({
    * 等首条消息建出会话、开流前再落地（见 `onConversationCreated` / `runtimePresetRef`）。
    * ⚠️ 运行时**下次派活生效**（`ensureSandbox` 按 `doubulea.runtime` 标签比对，不一致就回收重建）。
    */
+  /**
+   * 用户切换实例：新会话态先记进 `instancePresetRef`（会话建出来的那一刻、开流前下发）；
+   * 已有会话立刻下发。失败（409：已被钉在别台 / 目标未就绪或离线 / 该台缺能力）由后端文案说明，
+   * 本地状态**回滚**到实际 owner。
+   */
+  const handleSelectInstance = useCallback(
+    (next: string | null): void => {
+      const previous = preferredInstanceId
+      setPreferredInstanceId(next)
+      if (conversationId === undefined) {
+        // 新会话态：会话还不存在，只能先记意图 —— 由 `onConversationCreated` 在**开流前**落地
+        // （见 `instancePresetRef` 的说明：不落地就等于没选，首轮落点会被网关的 P2C 抢走）。
+        instancePresetRef.current = next
+        return
+      }
+      if (next === null) {
+        // 自动（B 方案）：后端按**当前运行时**挑一台具备它的实例；原实例不满足则覆盖 owner（auto-reselected）
+        void setConversationInstance(conversationId, null, runtime)
+          .then((result) => {
+            setPreferredInstanceId(result.instanceId)
+            if (result.action === 'auto-reselected') feedback.note(result.hint ?? `已自动改到实例 ${result.instanceId}`)
+            else feedback.ok(`自动：当前在实例 ${result.instanceId ?? '（未钉机，首轮派活时按负载选择）'}`)
+          })
+          .catch((error: unknown) => {
+            setPreferredInstanceId(previous)
+            feedback.fail(error, '自动落点没有生效')
+          })
+        return
+      }
+      void setConversationInstance(conversationId, next)
+        .then((result) => {
+          setPreferredInstanceId(result.instanceId)
+          feedback.ok(result.action === 'already' ? `该会话已在实例 ${next} 上` : `已指定实例 ${next}（下一次派活生效）`)
+        })
+        .catch((error: unknown) => {
+          setPreferredInstanceId(previous)
+          feedback.fail(error, '实例没有切换')
+        })
+    },
+    [conversationId, preferredInstanceId, runtime, feedback],
+  )
+
   const handleSelectRuntime = useCallback(
     (next: string, ready: boolean): void => {
       if (conversationId === undefined) {
@@ -1070,8 +1167,18 @@ export function ChatPage({
       }
       setRuntimePending(true)
       void setConversationRuntime(conversationId, next)
-        .then((result) => {
+        .then(async (result) => {
           setRuntime(result.runtime)
+          // ★ 自动落点（B 方案）：运行时变了 ⇒ 原实例可能不具备它 ⇒ 让后端重挑（原实例仍满足则不动）
+          if (preferredInstanceId === null) {
+            const placement = await setConversationInstance(conversationId, null, result.runtime).catch(() => undefined)
+            if (placement !== undefined) {
+              setPreferredInstanceId(placement.instanceId)
+              if (placement.action === 'auto-reselected') {
+                feedback.note(placement.hint ?? `已自动改到实例 ${placement.instanceId}`)
+              }
+            }
+          }
           // 区分三种情形：空环境（不选语言）/ 镜像已就绪 / 本机没有（需先构建）。
           // （选择本身只是持久化意图，真正的建容器/换镜在**下次派活**时发生，见 ensureSandbox 的 runtime 标签比对。）
           if (result.runtime === '') {
@@ -1379,6 +1486,8 @@ export function ChatPage({
                   runtime={runtime}
                   runtimePending={runtimePending}
                   onSelectRuntime={handleSelectRuntime}
+                  preferredInstance={preferredInstanceId}
+                  onPreferredInstanceChange={handleSelectInstance}
                 />
               </aside>
             ) : (
@@ -1389,6 +1498,8 @@ export function ChatPage({
                   runtime={runtime}
                   runtimePending={runtimePending}
                   onSelectRuntime={handleSelectRuntime}
+                  preferredInstance={preferredInstanceId}
+                  onPreferredInstanceChange={handleSelectInstance}
                 />
               </aside>
             )

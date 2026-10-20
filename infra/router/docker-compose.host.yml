@@ -1,0 +1,223 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 每台机器上的后端 + 出口①（P1-14 · R1）
+#
+# 依据：`docs/子方案/沙箱多机部署.md` §八 1（后端容器硬约束）/ §八 2（每台机器上跑什么）/ §八 3（拓扑）。
+#
+# 【每台机器跑什么】backend 容器（经宿主 docker.sock 起沙箱）+ egress 代理容器（沙箱出公网）。
+#   路由网关**不在这里**（它只有一个入口，见 `docker-compose.router.yml`）。
+#
+# 【用法】每台机器上（先把镜像分发布好）：
+#   1) 共用 env：三台**同一份**（DATABASE_URL / REDIS_URL / S3_* / SANDBOX_IMAGE / SANDBOX_EGRESS_PROXY_URL …）
+#      ⇒ `SHARED_ENV_FILE` 指向它（默认 `infra/router/.env.node.shared`，gitignore）
+#   2) 每台 `.env.node` 设两项：`SANDBOX_INSTANCE_ID`（a / b / c）与 `SANDBOX_INSTANCE_ADVERTISE_ADDR`（如 b:3000）
+#   3) `docker compose -f infra/router/docker-compose.host.yml --env-file infra/router/.env.node up -d`
+#
+# ⚠️ 三处**硬约束**（代码层只能告警、不能强制）：
+#   · `network_mode: host`：出口② 的 listener 绑的是**沙箱网桥的网关地址**（宿主接口），非 host 网络绑不上；
+#   · 挂 `/var/run/docker.sock`：后端经**宿主** daemon 起沙箱（兄弟容器，不是容器内嵌套 Docker）；
+#   · 宿主的 `WORKSPACE_ROOT` 与容器内**同一路径**（工作区 bind mount 直接传给宿主 daemon）。
+#
+# ⚠️ 起停顺序：`doubulea-sandbox` 网由**后端启动时**的 listener 创建 ⇒ 先起 backend、再起 egress。
+#   本文件用 `depends_on` 表达不了（网是运行期建的）⇒ egress 的启动脚本先等网出现再接网。
+#   ⚠️ `EGRESS_ALLOW=*` 只适合本方案（不限制出网，见 `子方案` §九）；要收窄就改用
+#      `bash infra/scripts/egress-up.sh --daemon`（读平台 `egress_policy` + 模型池，落策略文件）。
+# ═══════════════════════════════════════════════════════════════════════
+
+name: doubulea-host
+
+services:
+  backend:
+    # 镜像由 `pnpm backend:build-image` 产出（tag 来自 `infra/sandbox/versions.mjs#backendImageRef`；
+    # ⚠️ 2026-10-19 起后端与网关是**两个镜像**：这里只跑业务后端）。
+    # ⚠️ 多机**必须**各台跑同一份镜像：一台构建、`--save` 分发（`docker load`）或推私有 registry。
+    #    这里的 `build:` 只服务**单机自测**（不想先发布镜像时可直接 `up -d --build`）。
+    build:
+      context: ../..
+      dockerfile: infra/router/Dockerfile
+    image: ${BACKEND_IMAGE:-doubulea-backend:2}
+    container_name: doubulea-backend
+    restart: unless-stopped
+    # ★ 见文件头：出口② 需要一个能绑宿主接口的进程
+    network_mode: host
+    depends_on:
+      - docker-cli
+    volumes:
+      # ★ 见文件头：驱动**宿主** daemon 起沙箱（DooD）
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ★ 工作区：宿主路径 → 容器内**同一路径**（容器里的 WORKSPACE_ROOT 值因此仍指向宿主盘）
+      - ${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}:${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}
+      # ★ 运维脚本 / 构建上下文（2026-10-19 起**已打进镜像**，`/app/infra/{scripts,sandbox}`）⇒
+      #   **默认不挂**。compose 没有条件挂载，因此这两条只在"热修脚本"时由可选 override 文件提供：
+      #     docker compose -f docker-compose.host.yml -f docker-compose.host.dev.yml up -d backend
+      #   （见 `infra/router/docker-compose.host.dev.yml`）
+      # ★ 内置脚本的中转卷：自举会把 `/app/infra/scripts` 里的脚本写进它，兄弟容器（egress/relay）用同一个卷
+      #   挂到 `/app` ⇒ 脚本里的 `-v` 源在**宿主**上始终有效（容器内 `/tmp` 与宿主 `/tmp` 并不相同）。
+      - doubulea-node-infra:/opt/node-infra
+      # ★ egress 策略卷：脚本在**容器内**跑时把策略写进它，egress 容器用同一个卷挂 `/egress-allow`
+      #   （否则写的是容器自己的 /tmp，宿主侧的 -v 源是空目录 ⇒ 代理每 5s 报 ENOENT）
+      #   ⚠️ 卷默认 `root:root 755` 而容器内是 uid 10001 ⇒ 后端启动时会把它 chmod 0777（见
+      #      `sandbox/nodeBootstrap.ts#ensureSharedVolumesWritable`），`deploy/scripts/up.sh` 也在启动前放权。
+      - doubulea-egress-policy:/opt/egress-policy
+      # ★ 按需构建用的 docker CLI（见下方 `docker-cli` 服务）：只读共享**那一个二进制**
+      #   ⚠️ 用命名卷而不是 `volumes_from`：后者会把对方的**全部**挂载（含 docker.sock）一起继承。
+      #   ⚠️ 命名卷**总是按目录**挂载（单文件映射会被当成目录）⇒ 挂到独立目录，再由镜像入口的
+      #      `SANDBOX_DOCKER_BIN` 直接指卷里那个文件（不依赖 PATH）。
+      - doubulea-docker-bin:/opt/doubulea-docker-bin:ro
+      # buildx（Dockerfile 里 `RUN --mount=type=cache` 需要 BuildKit；纯 CLI 镜像不带 buildx 独立文件时，
+      # 这一项会在启动时被跳过 —— 见 `docker-cli` 的入口脚本）
+      - doubulea-docker-buildx:/opt/docker-cli-plugins:ro
+      # ⚠️ 命名卷不能直接挂到 docker 的插件目录（单文件/目录映射会被整目录覆盖）⇒ 指向真实目录
+      - doubulea-docker-buildx:/usr/local/libexec/docker/cli-plugins:ro
+    # ★ 镜像内以 uid 10001(doubulea) 运行，而宿主 docker.sock 通常是 `root:docker 660`（Debian/Ubuntu）
+    #   或 `root:root 660`（macOS OrbStack）⇒ 不补组就是 `EACCES /var/run/docker.sock`（起不了沙箱）。
+    #   取值：宿主 `stat -c %g /var/run/docker.sock`（macOS：`stat -f %g /var/run/docker.sock`）⇒ 写进 `.env.node`
+    # ⚠️ Linux 上服务账号必须在 docker 组里，`stat` 才读得到 660；否则请把 socket 的组显式列进这里。
+    group_add:
+      - '${DOCKER_SOCKET_GID:?每台必须设（宿主 docker.sock 的 gid，如 0 或 999）}'
+    env_file:
+      # 三台共用那份（含 DATABASE_URL / REDIS_URL / S3_* / SANDBOX_IMAGE / SANDBOX_EGRESS_PROXY_URL …）
+      - ${SHARED_ENV_FILE:-./.env.node.shared}
+    environment:
+      NODE_ENV: production
+      # ★ 业务端口：compose 的 `environment:` 只透传这里列出的键，`--env-file` 里的 BACKEND_PORT **不会**
+      #   自动进容器（缺了就是镜像默认 3000，而 healthcheck / advertiseAddr 都按 13000 算）。
+      BACKEND_PORT: ${BACKEND_PORT:-13000}
+      # ★ 工作区根：同理必须显式透传。缺了会回落成镜像默认 `/var/lib/doubulea/workspaces`，
+      #   而容器内以 uid 10001 运行 ⇒ 建工作区时报 `EACCES: permission denied, mkdir '/var/lib/doubulea'`。
+      #   它还必须与上面那条 bind mount 的源路径**逐字一致**（否则容器写的是容器自己的层）。
+      WORKSPACE_ROOT: ${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}
+      # ★ 按需构建上下文（见上面 volumes；推理不出时容器里落成 undefined ⇒ canBuild=false，会如实反映）
+      SANDBOX_RUNTIME_BUILD_CONTEXT: /app/infra/sandbox/runtime
+      # ★ 按需构建用的 docker CLI（由 `docker-cli` 侧车经 `volumes_from` 提供）
+      SANDBOX_DOCKER_BIN: /opt/doubulea-docker-bin/docker
+      # ★ 节点自举脚本按 PATH 找 docker（`command -v docker`）⇒ 把卷里那个二进制链进 PATH
+      PATH: /opt/doubulea-docker-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # ★ 脚本里 `docker run -v` 的**源**由**宿主** docker 解析；镜像内置脚本时它不在宿主路径上 ⇒
+      #   自举会先把脚本 `docker cp` 到一个宿主可见的临时目录再起容器（见 nodeBootstrap#materializeInfra）。
+      #   指定了宿主路径（热修模式）时直接用，不再拷贝。
+      DOUBULEA_HOST_INFRA_DIR: ${INFRA_SCRIPTS_HOST_ABS:-}
+      # ★ 自举要把**镜像内置**的运维脚本拷到宿主可见目录时，用它定位"自己这个容器"。
+      #   （容器内 `HOSTNAME` 在 macOS/OrbStack 里是 `orbstack`，不能用）
+      DOUBULEA_CONTAINER_NAME: doubulea-backend
+      # ★ 自举时缺镜像就先拉（内网可指向自己的镜像源；外网不通时如实报"请离线导入"）
+      EGRESS_IMAGE: ${EGRESS_IMAGE:-node:22-bookworm-slim}
+      RELAY_IMAGE: ${RELAY_IMAGE:-node:22-bookworm-slim}
+      DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:27-cli}
+      # ★ 构建期换源（可选；内网机器直连官方源通常不通）：自举调 `sandbox-build.mjs` 时它按这几个
+      #   环境变量决定 npm / apt / node / rust 源。留空 = 官方源（脚本里的默认行为）。
+      SANDBOX_NPM_REGISTRY: ${SANDBOX_NPM_REGISTRY:-}
+      SANDBOX_APT_MIRROR: ${SANDBOX_APT_MIRROR:-}
+      SANDBOX_APT_MIN_BPS: ${SANDBOX_APT_MIN_BPS:-}
+      SANDBOX_NODE_DIST_MIRROR: ${SANDBOX_NODE_DIST_MIRROR:-}
+      SANDBOX_RUST_DIST_MIRROR: ${SANDBOX_RUST_DIST_MIRROR:-}
+      # 让 CLI 明确走挂进来的宿主 socket（不要读 DOCKER_HOST 之外的东西）
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # 本实例唯一 id（三台各不同：a / b / c）。★ 必须唯一：同 id 两实例 ⇒ 对账互相误杀 ⇒ 拒启
+      SANDBOX_INSTANCE_ID: ${SANDBOX_INSTANCE_ID:?每台必须设（a / b / c）}
+      # 网关回连本实例的地址；也是心跳注册值（自动发现的上游表来源）
+      SANDBOX_INSTANCE_ADVERTISE_ADDR: ${SANDBOX_INSTANCE_ADVERTISE_ADDR:?每台必须设（如 b:3000）}
+      # 沙箱宿主（显式声明：不依赖"Docker 可达"的推断，见 backend/src/sandbox/roleOverride.ts）
+      DOUBULEA_SANDBOX_ROLE: backend
+      # 沙箱出网：**同名值**（`doubulea-egress` 在每台上解析到**本机**的代理容器）
+      SANDBOX_EGRESS_PROXY_URL: http://doubulea-egress:3128
+      # 容器里日志走 stdout（采集侧取 JSON 行）
+      LOG_PRETTY: 'false'
+    healthcheck:
+      # 只判"起来了没有"；业务健康语义仍归 `/health`
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:'+(process.env.BACKEND_PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    ulimits:
+      # 沙箱引擎每轮都要 fork/attach；默认 nofile 在部分发行版上偏小
+      nofile: 65535
+
+  # ── 按需构建运行时镜像用的 docker CLI（P1-17a；与 backend 共享 socket）────────
+  # 为什么单独一个容器：backend 镜像里没有 docker CLI，而 macOS 宿主的 `docker` 是 **Mach-O**
+  # （OrbStack），挂进 Linux 容器不可执行（实测 `Permission denied`）。这里用官方 CLI 镜像里的
+  # **Linux 静态二进制**（`/usr/local/bin/docker`）在启动时复制进命名卷 `doubulea-docker-bin`，
+  # backend 只读挂**那一个文件**到 `/usr/local/bin/docker`（不用 `volumes_from`：它会把对方的全部挂载、
+  # 包括 docker.sock，一起继承）。
+  docker-cli:
+    image: ${DOCKER_CLI_IMAGE:-docker:27-cli}
+    container_name: doubulea-docker-cli
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        mkdir -p /opt/bin /opt/plugins /usr/local/libexec/docker/cli-plugins
+        cp /usr/local/bin/docker /opt/bin/docker && chmod 0755 /opt/bin/docker
+        if [ -f /usr/local/libexec/docker/cli-plugins/docker-buildx ]; then
+          cp /usr/local/libexec/docker/cli-plugins/docker-buildx /opt/plugins/docker-buildx && chmod 0755 /opt/plugins/docker-buildx
+        fi
+        exec sleep infinity
+    network_mode: none
+    volumes:
+      - doubulea-docker-bin:/opt/bin
+      - doubulea-docker-buildx:/opt/plugins
+
+  # ── 出口①：egress 正向代理（**每台一个**）──────────────────────────────
+  # 为什么必须每台一个：`doubulea-sandbox` 网是**各 daemon 本地的**，代理也得在同一张网里。
+  # 单机自测（macOS / Docker Desktop）用 `bash infra/scripts/egress-up.sh --allow-all` 更省事
+  # （那份脚本负责接网与探活）；多机 Linux 宿主用下面这个容器形态。
+  egress:
+    image: ${EGRESS_IMAGE:-node:22-bookworm-slim}
+    container_name: doubulea-egress
+    restart: unless-stopped
+    # 公网腿 = 默认 bridge；沙箱腿在网出现后由启动脚本接上（见 depends_on 注释）
+    entrypoint: ['/bin/sh', '-lc']
+    command:
+      - |
+        for i in $$(seq 1 120); do
+          [ -S /var/run/docker.sock ] && break
+          sleep 2
+        done
+        set -e
+        echo "等待 doubulea-sandbox 网（后端启动时创建）…"
+        DOCKER=/usr/bin/docker
+        if ! $DOCKER version >/dev/null 2>&1; then
+          echo "宿主 docker CLI 不可用（未挂载 / 跨平台不可执行）⇒ 跳过自动接网" >&2
+          DOCKER=
+        fi
+        if [ -n "$$DOCKER" ]; then
+          for i in $$(seq 1 150); do
+            if $DOCKER network inspect doubulea-sandbox >/dev/null 2>&1; then
+              $DOCKER network connect doubulea-sandbox $$(hostname) 2>/dev/null || true
+              echo "已接入 doubulea-sandbox"
+              break
+            fi
+            sleep 2
+          done
+        fi
+        exec node /app/egress-proxy.mjs
+    # 与 backend 同一份 socket ⇒ 同一个 gid 问题（egress 只是调 CLI，不需要沙箱网之外的权限）
+    group_add:
+      - '${DOCKER_SOCKET_GID:?每台必须设（宿主 docker.sock 的 gid，如 0 或 999）}'
+    volumes:
+      # 接网需要 docker CLI：用宿主二进制（只读）+ socket（与后端同一份）
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ⚠️ 路径按宿主而定：Linux = /usr/bin/docker；macOS OrbStack = /usr/local/bin/docker（→ OrbStack.app 内的
+      #    **Mach-O** 二进制）—— 后者挂进 Linux 容器**不可执行**（`Permission denied`）。macOS 上请留空该变量、
+      #    用 `bash infra/scripts/egress-up.sh --allow-all`（它在宿主侧完成接网），或换成镜像内自带的 CLI。
+      - ${EGRESS_DOCKER_BIN:-/usr/bin/docker}:/usr/bin/docker:ro
+      - ../scripts/egress-proxy.mjs:/app/egress-proxy.mjs:ro
+    environment:
+      EGRESS_PORT: '3128'
+      EGRESS_ALLOW: '*'
+    expose:
+      - '3128'
+
+# ── 命名卷：只放按需构建用的 docker CLI 二进制（由 `docker-cli` 服务在启动时写入）──
+volumes:
+  doubulea-docker-bin:
+  # 自举脚本中转（见 backend 的 `/opt/node-infra`）
+  doubulea-node-infra:
+  # egress 出网策略中转（见 backend 的 `/opt/egress-policy` 与 egress-up.sh）
+  doubulea-egress-policy:
+  doubulea-docker-buildx:

@@ -35,6 +35,14 @@
  *   SEED_RESET_PASSWORD(空)
  */
 
+// ⚠️ **相对 import 只有一份，靠"这个文件被编到哪"自动正确**（2026-10-20）
+//
+//   仓库里：`tsx prisma/seed.ts` ⇒ `../src/*` 解析到 **TS 源码**（`tsx` 会即时转译）。
+//   镜像里：`backend/dist` 建出来之后，本文件也被 `tsc` 编到 `dist/backend/prisma/seed.js`
+//     （部署镜像只带 `dist`，没有 `backend/src`）⇒ 同一个 `../src/*` 解析到 **`dist/backend/src/*.js`**，
+//     正好是编译产物。
+//   ⇒ 两种运行形态共用一份 import，不需要为部署另加一份脚本；代价是 `build` 要连 `prisma/` 一起编
+//     （见 `backend/tsconfig.build.json`）。
 import { config } from '../src/config.js'
 import { generateInitialPassword, hashPassword } from '../src/infra/crypto.js'
 import { closePrisma, getPrisma, UserRole, type PrismaClientInstance } from '../src/infra/prisma.js'

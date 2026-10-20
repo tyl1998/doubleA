@@ -1,0 +1,20 @@
+#!/bin/sh
+# 把 `ROUTER_UPSTREAM`（带 scheme，如 http://10.73.100.153:13000）折算成 nginx `upstream` 需要的
+# 纯 `host:port`，写进 `ROUTER_HOSTPORT` 再交给 nginx 官方镜像的 envsubst 流程。
+#
+# ⚠️ 为什么不能直接用 `ROUTER_UPSTREAM`：nginx 的 `upstream { server ... }` 不接受 scheme，
+#    带上的症状是启动即 `[emerg] invalid host in upstream`（容器直接退出，日志只有一行）。
+set -eu
+if [ -n "${ROUTER_UPSTREAM:-}" ]; then
+  # 去掉 scheme 与尾部斜杠：http://a:3000/ → a:3000
+  hostport=$(printf '%s' "$ROUTER_UPSTREAM" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/+$##')
+  case "$hostport" in
+    *:*) ;;
+    *) hostport="${hostport}:80" ;;
+  esac
+  export ROUTER_HOSTPORT="$hostport"
+  # ⚠️ 本文件必须是 `.envsh`（入口脚本 source 它，与 `.sh` 的子 shell 不同）：
+  #    在子 shell 里 `export` 传不回父进程 ⇒ 后面的 envsubst 仍拿到镜像默认值
+  #    ⇒ nginx 报 `host not found in upstream "doubulea-router:13000"`、容器直接退出。
+fi
+echo "[frontend] router upstream = ${ROUTER_HOSTPORT:-（未设置）}"

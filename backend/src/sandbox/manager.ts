@@ -66,7 +66,7 @@ import { listSandboxRuntimes, resolveSandboxRuntimeImage } from './runtimeImages
 import { clearCredentialPhase } from './credentialPhase.js'
 import { bindSandboxToken, revokeSandboxToken } from './token.js'
 import { clearSandboxMcpMap } from './mcpMap.js'
-import { clearSandboxOwner, ensureWorkspaceOwner, registerSandboxOwner } from './owner.js'
+import { clearSandboxOwner, ensureWorkspaceOwner, isSandboxStartupReady, registerSandboxOwner } from './owner.js'
 import { ensureWorkspace } from '../workspace/service.js'
 import { startWorkspaceWatcher } from '../workspace/watcher.js'
 
@@ -119,6 +119,14 @@ export type SandboxAcquireFailure =
   | 'ABORTED'
   /** 建容器失败（镜像缺失、卷建不出来、Docker 不可达…）—— `message` 是给人看的原因 */
   | 'CREATE_FAILED'
+  /**
+   * **实例刚重启、沙箱还没就绪**（启动对账还没跑完）。
+   *
+   * 为什么单独一个码：这不是"配置错"也不是"容量满"，而是**可自愈的几十秒**——
+   * 用户重发一次就有机会成功，网关侧也会把未就绪实例从候选里剔除（`router/gateway.ts`）。
+   * 与 `QUEUE_TIMEOUT` 同族语义（`BUSY` 429：等一等再来），修法也相同。
+   */
+  | 'STARTING'
 
 export type SandboxAcquireResult =
   | { ok: true; sandbox: SandboxHandle }
@@ -152,6 +160,25 @@ export async function ensureSandbox(
   //   没有 egress 代理就必然调不到模型池。**在这里拦住**，而不是让容器建起来再在容器里失败 ——
   //   同一个判据见 P0-2-9 的"被拦下的危险调用不发 RUNNING 卡"（不为必然失败的调用付交互成本），
   //   以及 `resolveChatTarget()` 没 Key 直接 424。
+  // ★ P1-14 · R1：本进程被声明为「非沙箱宿主」（路由网关与后端共用镜像，见 `sandbox/roleOverride.ts`）
+  //   ⇒ 这里显式拒绝并说明原因。没有这一道的话，网关进程会一路走到 `docker.ts` ——
+  //   而网关容器**没有挂 docker.sock**，症状会是"建容器失败"这种指错方向的基础设施报错。
+  if (!config.sandbox.enabled) {
+    return fail(
+      'NOT_CONFIGURED',
+      '本进程未启用沙箱（DOUBULEA_SANDBOX_ROLE=router 或本机不可达 Docker）：' +
+        'TaskAgent 需要落到**沙箱宿主**实例上执行。请检查网关的 ROUTER_UPSTREAMS 与各实例的 SANDBOX_INSTANCE_ID。',
+    )
+  }
+
+  // ★ 启动闸（2026-10-20）：端口先于沙箱启动对账打开（`app.listen` 早于 `reconcileOnBoot`），
+  //   这期间心跳报 `ready=false`、网关会剔除本机；但**已有的粘性请求**（owner 指向本机）仍可能打进来。
+  //   在这里拦住而不是让它去碰 Docker：启动对账会**删掉本机全部遗留容器**，此时建出来的容器
+  //   可能正好被对账删掉（"刚建就没了"），比直接告诉用户"正在重启"更糟。
+  if (!isSandboxStartupReady()) {
+    return fail('STARTING', '本实例正在重启（沙箱启动对账进行中），请稍后重发这一轮')
+  }
+
   const proxyUrl = config.sandbox.egressProxyUrl
   if (proxyUrl === undefined) {
     return fail(

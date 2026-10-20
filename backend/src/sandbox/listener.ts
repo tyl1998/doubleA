@@ -69,6 +69,12 @@ let boundHost: string | undefined
  */
 export async function startSandboxListener(): Promise<boolean> {
   if (instance !== undefined) return true
+  // ★ P1-14 · R1：非沙箱宿主（路由网关与后端共用镜像）不起这条 listener —— 它绑定的是
+  //   **沙箱网桥的网关地址**（宿主接口），网关容器既不需要、也不该占用这个端口。
+  if (!config.sandbox.enabled) {
+    pinoLogger.info('非沙箱宿主（DOUBULEA_SANDBOX_ROLE=router）⇒ 不启动沙箱代理 listener（出口②）')
+    return false
+  }
   if (config.sandbox.image === undefined) {
     pinoLogger.info('未配置 SANDBOX_IMAGE ⇒ 不启动沙箱代理 listener（出口②，只服务于 MCP 代理）')
     return false

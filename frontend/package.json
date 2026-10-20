@@ -17,6 +17,7 @@
     "verify:artifact-preview": "node --import tsx scripts/verify-artifact-preview.mjs",
     "verify:artifact-panel": "node --import tsx scripts/verify-artifact-panel.mjs",
     "verify:usage-ui": "node --import tsx scripts/verify-usage-ui.mjs",
+    "verify:sandbox-instances-ui": "node --import tsx scripts/verify-sandbox-instances-ui.mjs",
     "verify:memory-ui": "node --import tsx scripts/verify-memory-ui.mjs",
     "verify:workspace-ui": "node --import tsx scripts/verify-workspace-ui.mjs",
     "verify:git-credentials-ui": "node --import tsx scripts/verify-git-credentials-ui.mjs",

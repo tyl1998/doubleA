@@ -77,6 +77,7 @@ import {
 } from '../../api/conversations.js'
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
+import { conversationInstanceQueryKey } from '../../api/workspace.js'
 import {
   disconnectOf,
   roundOf,
@@ -361,6 +362,9 @@ export function useChatStream(
         // 不多打请求；写在这里而不是在 TaskAgent 分支里，是为了让"一轮结束要失效什么"
         // 只出现在一个地方（漏一处就是这个面板停在旧数据上的那种静默错）。
         void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(targetId) })
+        // 落点（P1-14）：新会话的首轮落点是网关选的（P2C/轮询），选择器此前只知道"我点过谁"。
+        // 这一轮跑完 /chat 时 owner 已经写进目录 ⇒ 重取一次，界面才对得上**实际**在哪台。
+        void queryClient.invalidateQueries({ queryKey: conversationInstanceQueryKey(targetId) })
       }
     },
     [agentId, queryClient],

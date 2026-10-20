@@ -34,29 +34,51 @@ export function useSandboxRuntimes(): UseQueryResult<ListSandboxRuntimesResult> 
   })
 }
 
-/** **启动**一个运行时构建任务（P1-17a 定案 B）；立刻回 `buildId` 供轮询 */
-export function startSandboxBuild(components: SandboxRuntimeSelection[]): Promise<StartSandboxBuildResult> {
-  return request<StartSandboxBuildResult>('/api/sandbox/runtimes/build', {
+/**
+ * **启动**一个运行时构建任务（P1-17a 定案 B）；立刻回 `buildId` 供轮询。
+ *
+ * `targetInstanceId`：期望在**哪台实例**上构建（P1-14）。同时放进 query 与 body —— query 是给
+ * **网关**点名路由用的（网关不解析 body），body 是给**后端**校验落地是否为目标实例用的。
+ */
+export function startSandboxBuild(
+  components: SandboxRuntimeSelection[],
+  targetInstanceId?: string | null,
+): Promise<StartSandboxBuildResult> {
+  const query = targetInstanceId === undefined || targetInstanceId === null ? '' : `?instanceId=${encodeURIComponent(targetInstanceId)}`
+  return request<StartSandboxBuildResult>(`/api/sandbox/runtimes/build${query}`, {
     method: 'POST',
-    body: { components },
+    body: { components, instanceId: targetInstanceId ?? null },
   })
 }
 
-/** 拿一个构建任务的当前状态（前端轮询它画进度条） */
-export function fetchSandboxBuildJob(buildId: string): Promise<SandboxBuildJob> {
-  return request<SandboxBuildJob>(`/api/sandbox/runtimes/build/${buildId}`)
+/**
+ * 拿一个构建任务的当前状态（前端轮询它画进度条）。
+ *
+ * `instanceId`：**哪台实例上的任务**（任务只存在于那个进程）。路径形态
+ * `/build/:instanceId/:buildId` 会被网关点名路由到该实例；省略时走旧路径（单实例/直连）。
+ */
+export function fetchSandboxBuildJob(buildId: string, instanceId?: string | null): Promise<SandboxBuildJob> {
+  const path =
+    instanceId === undefined || instanceId === null
+      ? `/api/sandbox/runtimes/build/${encodeURIComponent(buildId)}`
+      : `/api/sandbox/runtimes/build/${encodeURIComponent(instanceId)}/${encodeURIComponent(buildId)}`
+  return request<SandboxBuildJob>(path)
 }
 
-/** 取消一个构建任务（杀 docker build 进程；幂等） */
-export function cancelSandboxBuildJob(buildId: string): Promise<SandboxBuildJob> {
-  return request<SandboxBuildJob>(`/api/sandbox/runtimes/build/${buildId}/cancel`, { method: 'POST' })
+/** 取消一个构建任务（杀 docker build 进程；幂等）。`instanceId` 的语义同 {@link fetchSandboxBuildJob} */
+export function cancelSandboxBuildJob(buildId: string, instanceId?: string | null): Promise<SandboxBuildJob> {
+  const path =
+    instanceId === undefined || instanceId === null
+      ? `/api/sandbox/runtimes/build/${encodeURIComponent(buildId)}/cancel`
+      : `/api/sandbox/runtimes/build/${encodeURIComponent(instanceId)}/${encodeURIComponent(buildId)}/cancel`
+  return request<SandboxBuildJob>(path, { method: 'POST' })
 }
 
 /** 启动构建任务的 mutation（成功后失效运行时列表，让新镜像出现在下拉里） */
 export function useStartSandboxBuild() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: startSandboxBuild,
+    mutationFn: (components: SandboxRuntimeSelection[]) => startSandboxBuild(components),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: sandboxRuntimesQueryKey })
     },

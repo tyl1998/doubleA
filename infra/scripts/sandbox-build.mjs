@@ -62,12 +62,17 @@ const SANDBOX_DIR = join(INFRA_DIR, 'sandbox')
 // ── 参数解析 ─────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2)
 const flags = new Set(argv.filter((a) => a.startsWith('--')))
+// ⚠️ compose / `docker run -e KEY=` 会把未配置的键传成**空串**（不是 undefined）⇒ 这里统一把空串
+//   视为"没配"，否则 `?? 默认值` 会拿到 ''，构建就悄悄退回官方源（内网直接卡死）。
+const envText = (key) => {
+  const value = process.env[key]
+  return value === undefined || value.trim() === '' ? undefined : value
+}
 const registryIndex = argv.indexOf('--registry')
 // registry 优先级：`--registry` > `SANDBOX_NPM_REGISTRY` 环境变量 > `versions.mjs` 的默认值。
 // 为什么给一个环境变量：本机（内网）**容器直连 registry.npmjs.org 不通**（见 versions.mjs 的注释），
 // 而"每次都记得加 --registry"是靠不住的 —— 环境变量可以直接写在 shell profile 里。
-const npmRegistry =
-  registryIndex >= 0 ? argv[registryIndex + 1] : (process.env.SANDBOX_NPM_REGISTRY ?? DEFAULT_NPM_REGISTRY)
+const npmRegistry = registryIndex >= 0 ? argv[registryIndex + 1] : (envText('SANDBOX_NPM_REGISTRY') ?? DEFAULT_NPM_REGISTRY)
 
 const aptMirrorIndex = argv.indexOf('--apt-mirror')
 // Debian 源主机名优先级：`--apt-mirror` > `SANDBOX_APT_MIRROR` > 自动（换了 npmmirror 就用清华源）> ''。
@@ -75,15 +80,24 @@ const aptMirrorIndex = argv.indexOf('--apt-mirror')
 //    —— 两个 Dockerfile 的 apt 步骤占了沙箱构建的大头，这条是本机提速最有效的一处。
 // ⚠️ 默认值仍**不写死**国内源（CI / 海外环境用官方是对的）；"本机内网"这个事实由调用方给。
 // ⚠️ 显式传空串（`--apt-mirror ''` 或 `SANDBOX_APT_MIRROR=`）**就是**用官方源（`??` 不会把空串当缺省）。
-const explicitAptMirror = aptMirrorIndex >= 0 ? argv[aptMirrorIndex + 1] : process.env.SANDBOX_APT_MIRROR
-const aptMirror =
-  explicitAptMirror ?? (npmRegistry.includes('npmmirror') ? 'mirrors.tuna.tsinghua.edu.cn' : '')
+const explicitAptMirror = aptMirrorIndex >= 0 ? argv[aptMirrorIndex + 1] : envText('SANDBOX_APT_MIRROR')
+// ★ 2026-10-20：默认**跟着 npm 源走**（npmmirror ⇒ 清华 Debian 源）。
+//   理由是一条实测：官方 `deb.debian.org` 在"只放行 443"的公司出口上并不报错，只是 **28 KB/s**
+//   ⇒ 一条 `apt-get update` 5 分半、toolkit 层能挂到十几分钟，看起来就是"卡死在 On Build"。
+//   自动换源的代价（国内镜像 vs 海外环境）由 `--apt-mirror ''` / `SANDBOX_APT_MIRROR=` 显式覆盖。
+const aptMirror = explicitAptMirror ?? 'mirrors.tuna.tsinghua.edu.cn'
+
+// apt 的**网速闸门**（KB/s；`--apt-min-bps` > `SANDBOX_APT_MIN_BPS` > 60）：见 `infra/sandbox/apt-source.sh`。
+// 低于它就换候选源 / 直接失败并说清楚 —— 比"静静地慢 12 分钟"好得多。
+const aptMinBpsIndex = argv.indexOf('--apt-min-bps')
+const aptMinBps =
+  aptMinBpsIndex >= 0 ? argv[aptMinBpsIndex + 1] : (envText('SANDBOX_APT_MIN_BPS') ?? '32')
 
 // Node 发行站（装 node 18/20 时用；见 `runtime/install-node-version.sh`）。
 // 优先级：`SANDBOX_NODE_DIST_MIRROR` 环境变量 > 按 npm 源推断 > 官方。
 // 换源的理由同 apt/npm：本机内网直连 nodejs.org 可能慢/不通，而 npmmirror 有 node 二进制镜像。
 const nodeDistMirror =
-  process.env.SANDBOX_NODE_DIST_MIRROR ??
+  envText('SANDBOX_NODE_DIST_MIRROR') ??
   (npmRegistry.includes('npmmirror')
     ? 'https://registry.npmmirror.com/-/binary/node'
     : 'https://nodejs.org/dist')
@@ -92,7 +106,7 @@ const nodeDistMirror =
 // ⚠️ 官方 `static.rust-lang.org` 在本机实测被限速到 **几十 KB/s**（rust 包 ~345MB ⇒ 会挂很久），
 //    而 USTC 镜像 ~2.3MB/s ⇒ 内网构建务必换镜像。优先级：`SANDBOX_RUST_DIST_MIRROR` > 按 npm 源推断 > 官方。
 const rustDistMirror =
-  process.env.SANDBOX_RUST_DIST_MIRROR ??
+  envText('SANDBOX_RUST_DIST_MIRROR') ??
   (npmRegistry.includes('npmmirror')
     ? 'https://mirrors.ustc.edu.cn/rust-static/dist'
     : 'https://static.rust-lang.org/dist')
@@ -101,7 +115,8 @@ if (flags.has('--help') || flags.has('-h')) {
   console.log(
     '用法: pnpm sandbox:build [-- --no-cache|--base-only|--toolkit-only|--runtime <name[,name]>|--registry <url>|--apt-mirror <host>|--dry-run|--prune]\n' +
       '环境变量: SANDBOX_NPM_REGISTRY=<url>   （等价于 --registry；本机需要换源，见 README）\n' +
-      '          SANDBOX_APT_MIRROR=<host>    （等价于 --apt-mirror；只换 Debian 源主机名，留空 = 官方）',
+      '          SANDBOX_APT_MIRROR=<host>    （等价于 --apt-mirror；只换 Debian 源主机名，留空 = 官方）\n' +
+      '          SANDBOX_APT_MIN_BPS=<n>      （等价于 --apt-min-bps；apt 网速下限 KB/s，默认 32，0 = 关闭）',
   )
   process.exit(0)
 }
@@ -111,6 +126,10 @@ if (registryIndex >= 0 && (npmRegistry === undefined || npmRegistry.startsWith('
 }
 if (aptMirrorIndex >= 0 && (explicitAptMirror === undefined || explicitAptMirror.startsWith('--'))) {
   console.error('--apt-mirror 后面要跟一个主机名（如 mirrors.tuna.tsinghua.edu.cn），或用空串走官方源')
+  process.exit(2)
+}
+if (!/^\d+$/.test(aptMinBps)) {
+  console.error(`--apt-min-bps 要一个非负整数（KB/s，0 = 关闭），收到：${aptMinBps}`)
   process.exit(2)
 }
 
@@ -164,6 +183,20 @@ function resolveDockerBin() {
       process.exit(2)
     }
     return override
+  }
+  // ⚠️ 容器内自举（`backend/src/sandbox/nodeBootstrap.ts#buildToolkit`）用 `process.execPath` 起本脚本，
+  //    **不传** `DOCKER_BIN`，而容器里的 CLI 在 `/opt/doubulea-docker-bin/docker`（不在 PATH）⇒
+  //    这里必须也认 `SANDBOX_DOCKER_BIN`（`deploy/scripts/up.sh` / `docker-compose.host.yml` 都设了它；
+  //    另两条脚本 `egress-up.sh` / `relay-up.sh` 早就是这个口径）。
+  const fromSandboxEnv = (process.env.SANDBOX_DOCKER_BIN ?? '').trim()
+  if (fromSandboxEnv !== '') {
+    if (!existsSync(fromSandboxEnv)) {
+      console.error(
+        `SANDBOX_DOCKER_BIN 指向的文件不存在：${fromSandboxEnv}（容器里应为 /opt/doubulea-docker-bin/docker，卷没挂上？）`,
+      )
+      process.exit(2)
+    }
+    return fromSandboxEnv
   }
   const fromPath = spawnSync('docker', ['--version'], { stdio: 'ignore' })
   if (!fromPath.error && fromPath.status === 0) return 'docker'
@@ -256,18 +289,54 @@ info(`npm 源：${npmRegistry}`)
 if (npmRegistry !== DEFAULT_NPM_REGISTRY) {
   info('（已换源：本机容器直连 registry.npmjs.org 不通，见 versions.mjs 的注释）')
 }
-info(`Debian 源：${aptMirror === '' ? '官方 deb.debian.org' : aptMirror}`)
+info(`Debian 源：${aptMirror === '' ? '官方 deb.debian.org' : aptMirror}（网速下限 ${aptMinBps === '0' ? '关闭' : `${aptMinBps} KB/s`}）`)
 if (aptMirror !== '') {
   info('（换源：本机实测官方源只 ~0.4MB/s，清华源 ~6MB/s —— 两个 Dockerfile 的 apt 步骤是大头）')
+}
+// ⚠️ `apt-source.sh` 在三个构建上下文里各有一份副本（docker build 不跟随软链、不许 COPY ../x），
+//    ⇒ 这里校验三份**逐字相同**。不一致的症状很隐晦：某一层仍走旧换源写法（例如把主机名直接
+//    写进 deb822 的 `URIs:` ⇒ apt 报 Malformed entry ⇒ 悄悄回落到官方源 ⇒ "换源没生效"）。
+{
+  const copies = ['base', 'toolkit', 'runtime'].map((layer) => {
+    const file = join(SANDBOX_DIR, layer, 'apt-source.sh')
+    return { layer, file, text: existsSync(file) ? readFileSync(file, 'utf8') : null }
+  })
+  const missing = copies.filter((c) => c.text === null).map((c) => c.file)
+  if (missing.length > 0) {
+    console.error(`${C.red}[fail]${C.x} 缺构建脚本：${missing.join('、')}`)
+    process.exit(1)
+  }
+  const [first, ...rest] = copies
+  const drifted = rest.filter((c) => c.text !== first.text).map((c) => c.file)
+  if (drifted.length > 0) {
+    console.error(`${C.red}[fail]${C.x} apt-source.sh 三份副本不一致（应与 ${first.file} 逐字相同）：`)
+    console.error(`       ${drifted.join('\n       ')}`)
+    console.error('       修法：cp infra/sandbox/base/apt-source.sh infra/sandbox/<上面这些层>/apt-source.sh')
+    process.exit(1)
+  }
+  ok('apt-source.sh 三份副本一致（base / toolkit / runtime）')
 }
 info(`Node 发行站：${nodeDistMirror}`)
 info(`Rust 发行站：${rustDistMirror}`)
 info(`base 标签：${baseImageRef()} ｜ toolkit 标签：${toolkitImageRef()}`)
 info(`运行时标签：${SANDBOX_RUNTIMES.map((r) => runtimeImageRef(r)).join('、')}`)
 
+// ★ `--toolkit-only` 的前提是 base **已经在本机**：BuildKit 解析 `FROM <base>` 时若本地没有该 tag，
+//   会去 registry 拉 —— 无外网/镜像源不认私有 tag 时报的是与"构建 toolkit"毫不相干的 403
+//   （实测：`docker.m.daocloud.io` 对 `doubulea/sandbox-base` 返回 403 Forbidden）。
+//   ⚠️ 后端「一键初始化」走的就是 `--toolkit-only`（`nodeBootstrap.ts#buildToolkit`），新节点上
+//   base 必然缺失 ⇒ 这里**就地补建 base**（只建 base，不连带 11 个运行时变体），而不是让整条
+//   自举链路死在一个镜像源 403 上。想省时间仍可先 `docker load` 一份 base tar。
+function hasLocalImage(ref) {
+  return spawnSync(dockerBin, ['image', 'inspect', ref], { stdio: 'ignore', env: childEnv }).status === 0
+}
+
+const needBase = !toolkitOnly || !hasLocalImage(baseImageRef())
+
 // ── 1. base 层 ───────────────────────────────────────────────────────────
-if (!toolkitOnly) {
+if (needBase) {
   step('构建 base 层（Node + pin 版 pi + 桥扩展 + 非 root 用户 + 只读层里的 pi 配置）')
+  if (toolkitOnly) info(`--toolkit-only 但本机没有 ${baseImageRef()} ⇒ 先补建 base（否则 FROM 会去 registry 找）`)
   const args = [
     'build',
     '-f',
@@ -284,6 +353,8 @@ if (!toolkitOnly) {
     `NPM_REGISTRY=${npmRegistry}`,
     '--build-arg',
     `APT_MIRROR=${aptMirror}`,
+    '--build-arg',
+    `APT_MIN_BPS=${aptMinBps}`,
   ]
   if (noCache) args.push('--no-cache')
   args.push(join(SANDBOX_DIR, 'base'))
@@ -291,7 +362,7 @@ if (!toolkitOnly) {
   ok(`base 层完成 → ${baseImageRef()}`)
 } else {
   step('构建 base 层')
-  info('已跳过（--toolkit-only）')
+  info(`已跳过（本机已有 ${baseImageRef()}）`)
 }
 
 // ── 2. toolkit 层 ────────────────────────────────────────────────────────
@@ -307,6 +378,8 @@ if (!baseOnly) {
     `BASE_IMAGE=${baseImageRef()}`,
     '--build-arg',
     `APT_MIRROR=${aptMirror}`,
+    '--build-arg',
+    `APT_MIN_BPS=${aptMinBps}`,
   ]
   if (noCache) args.push('--no-cache')
   args.push(join(SANDBOX_DIR, 'toolkit'))
@@ -320,7 +393,9 @@ if (!baseOnly) {
 // ── 2.4 运行时层（P1-17a）─────────────────────────────────────────────────
 // 一变体一份镜像（`FROM toolkit`），只装语言运行时、不装依赖。运行时**不写进 .env** —— 后端扫
 // 本机镜像（`SANDBOX_RUNTIME_REPO` 前缀 + tag 约定 `<repo>:<id>-v<层版本>`）得到可选运行时。
-if (!baseOnly) {
+// ⚠️ `--toolkit-only` 也跳过这一层：后端「一键初始化」只缺空环境，顺带建 11 个变体
+//   （每个几百 MB、都要拉 node/rust/python 发行包）会让"补个 toolkit"变成小时级任务。
+if (!baseOnly && !toolkitOnly) {
   const runtimesToBuild = selectedRuntimes.length > 0 ? selectedRuntimes : SANDBOX_RUNTIMES
   step(`构建运行时层（${runtimesToBuild.join('/')}；只装运行时、不装依赖）`)
   for (const runtime of runtimesToBuild) {
@@ -337,6 +412,8 @@ if (!baseOnly) {
       '--build-arg',
       `APT_MIRROR=${aptMirror}`,
       '--build-arg',
+      `APT_MIN_BPS=${aptMinBps}`,
+      '--build-arg',
       `NODE_DIST_MIRROR=${nodeDistMirror}`,
       '--build-arg',
       `RUST_DIST_MIRROR=${rustDistMirror}`,
@@ -348,7 +425,7 @@ if (!baseOnly) {
   }
 } else {
   step('构建运行时层')
-  info('已跳过（--base-only）')
+  info(toolkitOnly ? '已跳过（--toolkit-only）' : '已跳过（--base-only）')
 }
 
 // ── 2.5 回收（--prune）────────────────────────────────────────────────────
@@ -366,8 +443,9 @@ if (doPrune && !dryRun) {
   step('回收（--prune）：旧 sandbox 镜像 tag / 悬空镜像 / 已停容器 / 旧构建缓存')
 
   const keep = new Set()
-  if (!toolkitOnly) keep.add(baseImageRef())
+  if (needBase) keep.add(baseImageRef())
   if (!baseOnly) keep.add(toolkitImageRef())
+  // 运行时这层即使本次没建也要保护：`--toolkit-only --prune` 不该顺手删掉已有的 11 个变体
   if (!baseOnly) for (const runtime of SANDBOX_RUNTIMES) keep.add(runtimeImageRef(runtime))
   const envFile = join(INFRA_DIR, '.env')
   if (existsSync(envFile)) {
@@ -420,7 +498,8 @@ if (!dryRun) {
   }
 }
 // 本次构建的运行时变体（`--runtime` 子集时只列这几栈；否则全部）
-const builtRuntimes = baseOnly ? [] : selectedRuntimes.length > 0 ? selectedRuntimes : SANDBOX_RUNTIMES
+const builtRuntimes =
+  baseOnly || toolkitOnly ? [] : selectedRuntimes.length > 0 ? selectedRuntimes : SANDBOX_RUNTIMES
 console.log(`
   把下面两行写进 infra/.env（.env 已被 gitignore，模板见 infra/.env.example）：
 ${C.yellow}    SANDBOX_IMAGE_BASE=${baseImageRef()}${C.x}
