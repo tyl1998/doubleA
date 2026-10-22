@@ -167,6 +167,25 @@ export async function listRuntimeImages(repo: string): Promise<string[]> {
   }
 }
 
+/**
+ * 本机全部镜像的 `repo:tag`（P1-21 的"回退镜像存在性"判据用）。
+ *
+ * 与 {@link listRuntimeImages} 的差别只有"不按仓库前缀过滤"；`dangling`（`<none>:<none>` 之类）直接跳过。
+ * ⚠️ Docker 不可达时**抛**（与 `listRuntimeImages` 同一口径，由调用方决定降级）。
+ */
+export async function listLocalImageRefs(): Promise<string[]> {
+  try {
+    const images = await getDocker().listImages({})
+    const refs: string[] = []
+    for (const image of images) {
+      for (const tag of image.RepoTags ?? []) if (tag !== '<none>:<none>') refs.push(tag)
+    }
+    return refs
+  } catch (error) {
+    throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
 /** 建具名卷（带 label —— 对账器靠它找回这个卷，见 `spec.ts` 文件头） */
 export async function createSandboxVolume(input: {
   name: string

@@ -57,6 +57,11 @@ export const sandboxInstanceItemSchema = z.object({
       missing: z.array(z.string()),
     })
     .nullable(),
+  /**
+   * 是否**已摘流**（`sandbox:drain:{id}` 存在；2026-10-21）：`true` = 不再成为新会话的 owner，
+   * 已钉在本机的会话仍可继续。`false` = 正常接新会话。
+   */
+  drained: z.boolean(),
 })
 
 /** 读出口响应的 `data` */
@@ -79,3 +84,21 @@ export const sandboxInstancesResultSchema = z.object({
 
 export type SandboxInstanceItem = z.infer<typeof sandboxInstanceItemSchema>
 export type SandboxInstancesResult = z.infer<typeof sandboxInstancesResultSchema>
+
+/**
+ * 摘流/恢复的请求体（`POST /api/admin/sandbox/instances/:id/drain`，仅 ADMIN）。
+ *
+ * `drained=true` 写标记；`false` 清标记。标记**不设 TTL**（运维忘了恢复是可见的，不该自己长回来）——
+ * 真正下线的机器由注册键 TTL 摘除，标记留着也只是脏键。
+ */
+export const sandboxDrainBodySchema = z.object({
+  drained: z.boolean(),
+})
+export type SandboxDrainBody = z.infer<typeof sandboxDrainBodySchema>
+
+/** 摘流/恢复的响应 `data` */
+export const sandboxDrainResultSchema = z.object({
+  instanceId: z.string().min(1),
+  drained: z.boolean(),
+})
+export type SandboxDrainResult = z.infer<typeof sandboxDrainResultSchema>

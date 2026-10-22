@@ -830,6 +830,22 @@ flowchart LR
 - **剩余动作（唯一）**：在 pin 版 `0.87.1` 容器里做一个**最小原型** —— 注册一个同名 `read` 覆盖、发一条 `steer`，确认行为与 `main` 文档一致。这是**复核**不是**可行性验证**。
 - ✅ **复核结论 · `steer`（2026-10-12）**：在 `doubulea/sandbox-toolkit:5`（pi `0.87.1`）里对 `pi --mode rpc --no-approve` 发 `{"id":"r2","type":"steer","message":"hello from probe"}`，回 `{"id":"r2","type":"response","command":"steer","success":true}`，且流上出现 `{"type":"queue_update","steering":["hello from probe"],"followUp":[]}`（**入队确认**）；`get_state` 回 `steeringMode:"one-at-a-time"`。命令形状与 `docs/rpc-commands.md#steer` 逐字一致 ⇒ **R1 已落地**（`06` §五·补 P1-9 · P4 R1）。
 - ✅ **复核结论 · 同名工具覆盖（R8，2026-10-12）**：在 pin `0.87.1` 容器里 `DOUBULEA_WORKSPACE_MEDIATION=1` 起 pi、用假上游逼模型调一次 `write`/`edit`，**同名覆盖确认生效**（发给 LLM 的 `tools` 里 `read`/`write`/`edit` 是本扩展的定义，不是内置；工具真的执行、写真的经 `/api/sandbox/workspace/*` 带 `baseVersion` 走 CAS、`CONFLICT` 文案作为失败结果回喂模型）。复核同时校正两处**实现与 pin 的偏差**：①内置 `edit` 的形状是 `{ path, edits: [{ oldText, newText }] }`（**不是** Claude 系的 `old_string`/`new_string`）⇒ 本扩展与代理端点按 `0.87.1` 对齐（`edit.ts#applyWorkspaceEdits` 原子多改）；②覆盖内置工具时若不给 `promptSnippet`/`promptGuidelines`，会**连带丢掉**内置工具在系统提示里的条目与用法提示 ⇒ 三个工具都补上（并补 `constrainedSampling`）。⚠️ 复核还当场发现宿主 `toolkit:5` 里**根本没有该扩展**（P2 加文件却漏升层版本）⇒ 本批升到 `6` 并重建。详见 `06` §五·补 P1-9 · P2 R8 落地记录。
+- ✅ **插话二期（2026-10-21，用户反馈驱动）**：三条改动，落点与判据都记在这里，避免以后"再改一处就散"。
+  1. **渲染位置**：插话气泡从"助手消息之前"移到**本轮末尾（助手消息之后）** —— 用户原话："插话发起后应该是直接在本轮末尾添加的，而不是放到本轮的回复前"。流式（`roundReducer#roundToViews`）与历史（`messageModel#messagesToViews` 从助手消息 `content.steers` 展开）**同一顺序**。
+  2. **投递状态 + 撤回**：`steer` 帧载荷加 `id`（服务端入队生成，`POST /:id/steer` 响应回 `steerId`）；新增 `steer_queue` 帧 = 引擎 `queue_update.steering` 的原文快照 ⇒ **不在快照里 = 已被模型读走**（前端把插话从「待接收」翻成「已投递」，并收起「取回编辑」）。撤回走 `POST /:id/steer/cancel`（`{id}`）：还没被通道取走 ⇒ `LREM` 精确移除（`scope:'one'`）；已被取走 ⇒ 推**取消哨兵**、由通道调 `bridge#clearQueue`（pi `clear_queue`，只能整体清空 ⇒ `scope:'all'`）；已读走 ⇒ `cancelled:false`（不是错误）。撤回成功后文本回输入框（「取回编辑」）。
+  3. **落库**：助手消息 `content.steers[]`（`shared#steerRecordSchema`：`{id, message, at}`）—— 只落**真的进了引擎队列且没被撤回**的那些（TaskAgent 以 `engineSteering` 快照判定"还在排队"；ChatBot 以"已注入 `messages`"判定）。刷新后插话气泡仍在，且与流式同一位置。
+  ⚠️ **已知边界**：`clear_queue` 没有"删指定一条" ⇒ 撤回单条时若同轮还有别的未投递插话，它们**一并作废**（响应 `scope:'all'`，界面同步移除并提示）；Cancel 与"引擎刚好在这一瞬间读走"存在竞态，前端以 `steer_queue` 状态为准（不显示「取回编辑」就无从触发）。
+- ✅ **思考分段 + 内联排序（2026-10-21，用户反馈驱动，两轮修正）**：一轮里模型每请求一次（工具调用之后的"重新推理"）在界面上是**各自独立的折叠块**，并且**按发生顺序插在正文/工具卡之间**（思考 A → 工具卡 → 思考 B → 正文）。
+  实现：
+  · 分段信号 = `thinking.newSegment`（`map.ts` 在新 turn 的**第一帧**思考上标，惰性；ChatBot 同口径）；
+  · 位置 = `(textOffset, seq)`：`textOffset` 与工具卡同口径（条目出现时的正文字符数），`seq` 是**思考段与工具卡共用**的递增序号（同一偏移时定先后）——由 `toolTextOffset.ts#createToolTextOffsetTracker#positionFor` 分配，落库进 `content.thinking_segments[] / tool_calls[].seq`；
+  · 渲染 = `AssistantMarkdown#remarkInlineBlocks` 把「思考段 + 工具卡」合成一条内联时间线，按 `(offset, seq)` 插进 markdown 块之间（`ThinkingBlock` 与 `ToolCard` 都是占位节点换出来的）；
+  · 只有**最后一段**带 `streaming`（前面的段落自动折叠）；旧消息的单段 `thinking` 字符串回落成"一段、位置 0"。
+  ⚠️ 曾走过两版弯路，都**已废弃**：①把新推理直接接到旧推理块里（用户否）；②在推理文本里插「── 继续推理 ──」分隔线（仍是并回旧块，用户否）。契约里 `thinking` 单段字段现仅作**只读兼容**。
+  ⚠️ **落地后仍有两个真 bug（2026-10-21 二次修正，用户报"先思考→工具，下一轮又变了"）**：
+  ① **段 key 冲突**：段 key 用 `round.thinkingSegments.length`，而位置在 `events.map` 里分配、push 在其后的同步循环 ⇒ 首段与新段算出**同一个** `think-0` ⇒ 第二段复用第一段的 `(offset, seq)`，于是「重新推理」和工具卡**换位**。修法 = 独立单调段号计数器（`nextThinkingSegmentKey` / ChatBot 的 `thinkingSegmentNo`），与 push 时机解耦；同一批里只认第一帧为段首。
+  ② **前端丢 `seq` / upsert 抹位置**：`toolViewFromEvent` 早先没带 `seq` ⇒ 工具卡退化成"按数组下标"，与思考段的全局 `seq` 混排后顺序随到达变化（下一步又变）；`tool_call` 的 RUNNING→SUCCESS upsert 用 `next` 整体覆盖，后到帧不带位置时会把首次位置**抹掉** ⇒ 卡片流式中跳位。修法 = 带上 `seq`；upsert 时 `textOffset`/`seq` **只增不减**；前端再维护 `nextInlineSeq` 兜底，没带 `seq` 的条目按到达顺序补，显式 `seq` 优先并把兜底计数器推到其后。
+  回归：`verify:chat-sse#D17`（无 seq / upsert 不抹位置 / 显式优先）+ `tool-text-offset:regression`（段 key 唯一、三段序号严格递增）。
 
 ---
 

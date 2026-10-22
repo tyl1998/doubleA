@@ -36,6 +36,13 @@ export function createQueryClient(): QueryClient {
          */
         staleTime: 30_000,
         refetchOnWindowFocus: false,
+        /**
+         * 5 分钟（与库里默认值一致，但**写出来**）：长会话里真正会囤积的不是"过期多久"，
+         * 而是"没人再看的数据要多久才能被回收"—— 内存优化 P5 的实测口径要求这一项是**显式的**
+         * （`docs/子方案/前端长会话内存优化.md`）。单个查询另有更短的 `gcTime` 时以自己的为准
+         * （例如工作区文件正文是 60s，见 `WorkspacePanel`）。
+         */
+        gcTime: 5 * 60_000,
       },
       mutations: {
         // 写操作**绝不自动重试**：POST /api/auth/login 重试会白白多消耗一次限速额度

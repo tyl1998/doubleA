@@ -46,6 +46,7 @@ import {
   clearSteerSignal,
   clearStopSignal,
   drainSteerSignals,
+  type SteerSignalEntry,
   readStopSignal,
   releaseConversationLock,
   updateActiveSnapshot,
@@ -112,7 +113,9 @@ export async function runScheduledTaskTurn(input: {
   //   —— 否则 `POST /:id/steer` 会 `accepted:true`（本运行确实持锁、`streaming` 为真）却永远没人读，
   //   症状是"插了话、界面说已送达、agent 却不知道"（静默丢弃，最难查的一类）。
   //   机制与通道同款：producer 注册监听器（TaskAgent 转投引擎 `steer`），心跳里 `LPOP` 派发。
-  const steerListeners = new Set<(message: string) => void>()
+  const steerListeners = new Set<(entry: SteerSignalEntry) => void>()
+  /** 撤回插话的监听器（2026-10-21） */
+  const steerCancelListeners = new Set<() => void>()
   // 残留插话（上一轮没消费完的）先清掉，别被这一轮读到（与 `streamChatReply` ② 同款）
   await clearSteerSignal(conversationId)
 
@@ -130,10 +133,16 @@ export async function runScheduledTaskTurn(input: {
       })
       .catch(() => undefined)
     void drainSteerSignals(conversationId)
-      .then((messages) => {
-        if (messages.length === 0 || steerListeners.size === 0) return
-        for (const message of messages) {
-          for (const listener of [...steerListeners]) listener(message)
+      .then((items) => {
+        if (steerListeners.size === 0) return
+        // ⚠️ 严格按 FIFO 顺序处理（2026-10-21；与交互式出口层 `#pollSteering` 同一条纪律）：
+        //    `[插话, 取消]` 与 `[取消, 插话]` 的语义完全不同（见 `SteerDrainItem`）。
+        for (const item of items) {
+          if (item.kind === 'cancel') {
+            for (const listener of [...steerCancelListeners]) listener()
+            continue
+          }
+          for (const listener of [...steerListeners]) listener(item.entry)
         }
       })
       .catch(() => undefined)
@@ -166,6 +175,13 @@ export async function runScheduledTaskTurn(input: {
           steerListeners.delete(listener)
         }
       },
+      // ④ 撤回插话（2026-10-21）：headless 没有 SSE 出口层，心跳里的 `cancels` 直接派到这里
+      onSteerCancel: (listener) => {
+        steerCancelListeners.add(listener)
+        return () => {
+          steerCancelListeners.delete(listener)
+        }
+      },
     })
     // ★ 终帧：观察者靠它收口（否则会永远停在"运行中"，用户实测即此）。
     //   交互式那条路由出口层 `SseChannel#finish` 发 `done`；headless 绕过了出口层 ⇒ 自己发。
@@ -196,6 +212,7 @@ export async function runScheduledTaskTurn(input: {
     await clearStopSignal(conversationId).catch(() => undefined)
     await clearSteerSignal(conversationId).catch(() => undefined)
     steerListeners.clear()
+    steerCancelListeners.clear()
     await releaseConversationLock(conversationId, startedAt).catch(() => undefined)
     closeRun(conversationId)
   }

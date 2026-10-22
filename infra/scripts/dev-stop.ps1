@@ -2,7 +2,14 @@
 # dev-stop.ps1 - stop the dev-run.ps1 background processes (Windows)
 #
 # Windows counterpart of infra/scripts/dev-stop.sh. By default stops only
-# the application layer (backend + frontend); dependency services stay up.
+# the application layer (frontend + gateway + backend); dependency services
+# stay up. Frontend first, then the gateway, then the backend, so the entry
+# point is gone before the process behind it.
+#
+# Ports match dev-run.ps1: with the gateway on (default) the backend listens
+# on BACKEND_PORT+1 (internal) and the gateway on ROUTER_PORT (or
+# BACKEND_PORT when ROUTER_PORT is unset). The backend stop covers both ports
+# so a -NoGateway layout is cleaned up as well.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File infra/scripts/dev-stop.ps1
@@ -47,6 +54,8 @@ $PidDir    = Join-Path $RepoRoot '.pids'
 
 $FrontendPort = 5174
 $BackendPort  = 13000
+$BackendInternalPort = $BackendPort + 1
+$GatewayPort  = $BackendPort
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
@@ -108,12 +117,26 @@ function Get-DescendantPids($root) {
     return $result
 }
 
-function Stop-One($name, $pidFile, $port) {
+# owner pids listening on ANY of $ports (deduped): the backend lives on a
+# different port depending on whether the gateway layout is in use.
+function Test-PortsPids($ports) {
+    $all = @()
+    foreach ($p in $ports) { if ($p) { $all += Test-PortPids $p } }
+    return ($all | Where-Object { $_ } | Sort-Object -Unique)
+}
+function Test-AnyPortBusy($ports) {
+    foreach ($p in $ports) { if ($p -and (Test-PortBusy $p)) { return $true } }
+    return $false
+}
+
+function Stop-One($name, $pidFile, $ports) {
+    $ports = @($ports | Where-Object { $_ })
+    $portList = $ports -join ','
     $svcPid = $null
     if (Test-Path $pidFile) { $svcPid = (Get-Content $pidFile -Raw).Trim() }
     $alive = Test-PidAlive $svcPid
     $tree = if ($alive) { @($svcPid) + (Get-DescendantPids $svcPid) } else { @() }
-    $portPids = Test-PortPids $port
+    $portPids = Test-PortsPids $ports
     $targets = (@($tree) + $portPids) | Sort-Object -Unique
 
     if ($targets.Count -eq 0) {
@@ -124,7 +147,7 @@ function Stop-One($name, $pidFile, $port) {
 
     # pid file missing/invalid but port occupied: another project / manual -> do not touch unless -Force
     if (-not $alive -and $portPids -and -not $Force) {
-        Write-Warn2 "$name : no valid pid file, but port $port occupied ($($portPids -join ','))"
+        Write-Warn2 "$name : no valid pid file, but port $portList occupied ($($portPids -join ','))"
         Write-Warn2 "  not touching it (could be another project / manual) -> skipped. Use -Force to override"
         return
     }
@@ -136,31 +159,31 @@ function Stop-One($name, $pidFile, $port) {
     while ($i -lt 10) {
         $still = $false
         if ($alive -and (Test-PidAlive $svcPid)) { $still = $true }
-        if (-not $still -and (Test-PortBusy $port)) { $still = $true }
+        if (-not $still -and (Test-AnyPortBusy $ports)) { $still = $true }
         if (-not $still) { break }
         Start-Sleep -Seconds 1; $i++
     }
 
     # 2. force kill tree (+ any new children tsx watch may have spawned)
-    if (($alive -and (Test-PidAlive $svcPid)) -or (Test-PortBusy $port)) {
+    if (($alive -and (Test-PidAlive $svcPid)) -or (Test-AnyPortBusy $ports)) {
         if ($alive) { $tree = @($svcPid) + (Get-DescendantPids $svcPid) }
-        $targets = (@($tree) + (Test-PortPids $port)) | Sort-Object -Unique
+        $targets = (@($tree) + (Test-PortsPids $ports)) | Sort-Object -Unique
         Write-Warn2 "$name : graceful failed -> force kill -> $($targets -join ' ')"
         foreach ($t in $targets) { try { Stop-Process -Id $t -Force -ErrorAction SilentlyContinue -Confirm:$false } catch {} }
         Start-Sleep -Seconds 2
     }
 
-    # 3. still holding the port? nuke port owners
-    if (Test-PortBusy $port) {
+    # 3. still holding a port? nuke port owners
+    if (Test-AnyPortBusy $ports) {
         Write-Warn2 "$name : still up -> force kill port owners"
-        foreach ($t in (Test-PortPids $port)) { try { Stop-Process -Id $t -Force -ErrorAction SilentlyContinue -Confirm:$false } catch {} }
+        foreach ($t in (Test-PortsPids $ports)) { try { Stop-Process -Id $t -Force -ErrorAction SilentlyContinue -Confirm:$false } catch {} }
         Start-Sleep -Seconds 1
     }
 
     # 4. path-scoped cleanup: catch orphans (parent died, reparented to 1)
-    if ((Test-PidAlive $svcPid) -or (Test-PortBusy $port)) {
+    if ((Test-PidAlive $svcPid) -or (Test-AnyPortBusy $ports)) {
         Write-Warn2 "$name : still not clean -> path-scoped cleanup"
-        $markers = @('tsx watch', 'vite', 'dev:backend', 'dev:frontend')
+        $markers = @('tsx watch', 'vite', 'dev:backend', 'dev:frontend', 'router:dev', 'router/main.ts')
         Get-CimInstance Win32_Process | Where-Object {
             $_.CommandLine -and $_.CommandLine.Contains($RepoRoot) -and
             ($markers | Where-Object { $_.CommandLine.Contains($_) })
@@ -171,9 +194,9 @@ function Stop-One($name, $pidFile, $port) {
     }
 
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-    if ((Test-PidAlive $svcPid) -or (Test-PortBusy $port)) {
-        $owners = (Test-PortPids $port) -join ','
-        Write-Warn2 "$name : still not clean (pid=$svcPid, port $port owners=$owners)"
+    if ((Test-PidAlive $svcPid) -or (Test-AnyPortBusy $ports)) {
+        $owners = (Test-PortsPids $ports) -join ','
+        Write-Warn2 "$name : still not clean (pid=$svcPid, port $portList owners=$owners)"
         return
     }
     Write-Ok "$name stopped"
@@ -181,13 +204,20 @@ function Stop-One($name, $pidFile, $port) {
 
 Set-Location $RepoRoot
 $BackendPort = [int](Get-EnvValue 'BACKEND_PORT' '13000')
+$routerPortEnv = Get-EnvValue 'ROUTER_PORT' ''
+$GatewayPort = if ($routerPortEnv) { [int]$routerPortEnv } else { $BackendPort }
+$BackendInternalPort = $BackendPort + 1
 
 $frontendPidFile = Join-Path $PidDir 'frontend.pid'
+$gatewayPidFile  = Join-Path $PidDir 'gateway.pid'
 $backendPidFile  = Join-Path $PidDir 'backend.pid'
 
 Write-Step 'Stopping application layer'
-Stop-One 'frontend' $frontendPidFile $FrontendPort
-Stop-One 'backend'  $backendPidFile  $BackendPort
+Stop-One 'frontend' $frontendPidFile @($FrontendPort)
+Stop-One 'gateway'  $gatewayPidFile  @($GatewayPort)
+# backend: gateway layout listens on BACKEND_PORT+1, -NoGateway layout on
+# BACKEND_PORT -- cover both; with a valid pid file the tree decides.
+Stop-One 'backend'  $backendPidFile  @($BackendInternalPort, $BackendPort)
 
 if ($Infra) {
     Write-Step 'Stopping dependency services'

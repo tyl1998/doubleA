@@ -14,7 +14,7 @@
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File infra/scripts/relay-up.ps1
 #   powershell -ExecutionPolicy Bypass -File infra/scripts/relay-up.ps1 -WriteEnv
-#   powershell -ExecutionPolicy Bypass -File infra/scripts/relay-up.ps1 -Target 10.0.0.5:13001
+#   powershell -ExecutionPolicy Bypass -File infra/scripts/relay-up.ps1 -Target 10.0.0.5:14001
 #
 # NOTE: this file is intentionally ASCII-only.
 #   Windows PowerShell 5.1 reads .ps1 as the system ANSI codepage unless the
@@ -29,7 +29,10 @@
 [CmdletBinding()]
 param(
     [string]$Name = 'doubulea-sandbox-relay',
-    [int]$Port = 13001,
+    # 0 = read SANDBOX_CALLBACK_PORT from infra/.env (see below). Both the
+    # relay listen port and its target port use this same value, exactly like
+    # relay-up.sh, so the two can never drift apart.
+    [int]$Port = 0,
     [string]$Network = 'doubulea-sandbox',
     [string]$Image = 'node:22-bookworm-slim',
     [string]$Target = 'host.docker.internal',
@@ -44,6 +47,26 @@ $InfraDir  = Split-Path -Parent $ScriptDir
 $RepoRoot  = Split-Path -Parent $InfraDir
 $EnvFile   = Join-Path $InfraDir '.env'
 $RelaySrc  = Join-Path $ScriptDir 'sandbox-relay.mjs'
+
+# Read KEY=value from infra/.env (first match, last value wins -> use last).
+# Returns an empty string when the file or the key is missing.
+function Get-EnvValue($key) {
+    if (-not (Test-Path $EnvFile)) { return '' }
+    $pattern = '^\s*' + [regex]::Escape($key) + '\s*=(.*)$'
+    $value = ''
+    foreach ($line in @(Get-Content $EnvFile)) {
+        if ($line -match $pattern) { $value = $Matches[1].Trim() }
+    }
+    return $value
+}
+
+# Port resolution: explicit -Port wins, otherwise infra/.env's
+# SANDBOX_CALLBACK_PORT (the backend sandbox listener reads the very same key),
+# otherwise the historical default 13001.
+if ($Port -eq 0) {
+    $envPort = Get-EnvValue 'SANDBOX_CALLBACK_PORT'
+    if ($envPort -match '^\d+$' -and [int]$envPort -gt 0) { $Port = [int]$envPort } else { $Port = 13001 }
+}
 
 if ($TargetPort -eq 0) { $TargetPort = $Port }
 
@@ -181,6 +204,10 @@ Write-Host "  SANDBOX_LISTEN_HOST=0.0.0.0`n" -ForegroundColor Green
 if ($WriteEnv) {
     Set-EnvValue 'SANDBOX_BACKEND_URL' $Url
     Set-EnvValue 'SANDBOX_LISTEN_HOST' '0.0.0.0'
+    # Also persist the port: the backend listener and this relay both read
+    # SANDBOX_CALLBACK_PORT, so writing only the URL would let the next run
+    # (with no -Port) pick a different value from .env and drift apart again.
+    Set-EnvValue 'SANDBOX_CALLBACK_PORT' ([string]$Port)
     Write-Ok 'written to infra/.env'
     Write-Warn2 'the backend reads env at STARTUP => restart it: pnpm dev:stop ; pnpm dev'
 } else {

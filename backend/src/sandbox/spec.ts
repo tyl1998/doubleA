@@ -296,6 +296,21 @@ export const SANDBOX_TOKEN_ENV = 'SANDBOX_TOKEN'
 export const SANDBOX_PROXY_TIMEOUT_ENV = 'SANDBOX_PROXY_TIMEOUT_MS'
 
 /**
+ * **工具清单热更新**命令（P1-21）—— 跨边界契约，与容器侧 `mcp-bridge` 扩展
+ * `REFRESH_COMMAND_NAME` 以及 `backend/src/sandbox/proxy.ts#refreshSandboxMcpCatalog` **逐字相同**。
+ *
+ * 用法：派活时若检测到 Agent 的绑定 / 工具缓存变过，就在**这一轮 prompt 开头**注入一行
+ * `/doubulea:mcp-refresh`（pi 的 prompt 预处理把它当扩展命令执行），命令执行完再读真正的用户消息。
+ * ⚠️ 名字带 `doubulea:` 前缀 ⇒ 与用户自己的 prompt 模板不会撞名。
+ */
+export const SANDBOX_MCP_REFRESH_COMMAND = 'doubulea:mcp-refresh'
+
+/** 注入给引擎的那一行（前面加 `/` 才是命令；单独成行，后面空一行再接用户正文） */
+export function sandboxMcpRefreshPromptLine(): string {
+  return `/${SANDBOX_MCP_REFRESH_COMMAND}`
+}
+
+/**
  * 代理令牌的 **HTTP 头名**（跨边界契约的另一半，与 {@link SANDBOX_TOKEN_ENV} 同族）。
  *
  * 用自定义头而不是 `Authorization: Bearer`：这一侧的客户端只有我们的扩展，

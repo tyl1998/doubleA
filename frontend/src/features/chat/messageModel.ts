@@ -11,7 +11,7 @@
  * ─────────────────────────────────────────────────────────────────────
  *   · **历史**：`GET /api/conversations/:id/messages` 的 `MessageItem[]`
  *     （`content` 是 jsonb，服务端**原样透出**，见 `shared/src/conversation.ts` 文件头 ⑥）；
- *   · **流式**：SSE 的 `delta` / `thinking` / `tool_call` / `citations` / `artifact` 事件
+ *   · **流式**：SSE 的 `delta` / `thinking`（分段） / `tool_call` / `citations` / `artifact` / `steer` 事件
  *     （见 `roundReducer.ts` 的归约态）。
  * 若让 `MessageList` 分别接两种输入，就会出现"流里有的卡片、刷新之后没有"或"同一张卡两种样子"
  * —— 那是 `03` §六 明令避免的漂移，而且**没有编译期错误**、只有肉眼能发现。
@@ -20,8 +20,9 @@
  * ─────────────────────────────────────────────────────────────────────
  * ⚠️ 历史里只读**已定义**的段，未定义的段原样留着（不猜形状）
  * ─────────────────────────────────────────────────────────────────────
- * `content` 的写入端契约（`messageContentSchema`）当前声明五段：`text` / `thinking` /
- * `citations` / `tool_calls`（**P0-2-8 定型、P0-2-11 接回**）/ `attachments`（**P1-4 定型**）。
+ * `content` 的写入端契约（`messageContentSchema`）当前声明的段：`text` / `thinking`（**遗留单段，只读**）
+ * / `thinking_segments`（**2026-10-21 定型，一轮多段**）/ `citations` / `tool_calls`
+ * （**P0-2-8 定型、P0-2-11 接回**）/ `attachments`（**P1-4 定型**）/ `steers`（**2026-10-21 定型**）。
  * 本文件在解包历史 `content` 时**严格按已定义的那几段取值**，其余键既不读也不删
  * （原样留在视图模型之外的原始对象里）。附件正是这条纪律的收益兑现：P1-4 定型后
  * **只在本文件的 {@link messageToView} 里加了一行映射**（`pickAttachments`），渲染组件一行都不用改。
@@ -37,12 +38,15 @@ import {
   ERROR_CODES,
   attachmentItemSchema,
   citationItemSchema,
+  steerRecordSchema,
+  thinkingSegmentSchema,
   toolCallRecordSchema,
   type ChatAttachmentKind,
   type CitationItem,
   type ErrorCode,
   type MessageItem,
   type MessageModelSegment,
+  type SteerRecord,
 } from '@doubulea/shared'
 import type {
   ChatFinishReason,
@@ -73,6 +77,11 @@ export interface ToolCallView {
   inputSummary: string
   /** 工具卡在助手正文中的 UTF-16 字符偏移；旧消息缺省时按正文前渲染。 */
   textOffset?: number
+  /**
+   * 本轮**内联时间线**上的出现序号（2026-10-21；与思考段的 `seq` 共用同一序列）。
+   * 偏移相同时靠它定先后 —— 例如"思考 A 之后紧接着一次工具调用"（两者偏移相同）。
+   */
+  seq?: number
   output?: string
   /**
    * 工具**执行中**的实时输出快照（`tool_output` 事件；**覆盖**语义）。
@@ -162,14 +171,31 @@ export interface AttachmentView {
  * `status` 的四态对应四种收尾：`complete`（正常）/ `streaming`（在写）/ `stopped`（用户停止）/
  * `error`（流内 `error` 事件或网络层失败）。历史消息恒为 `complete`。
  */
+/**
+ * 一段思考（2026-10-21）：与工具卡**同一条内联时间线**。
+ *
+ * `textOffset` = 这一段开始时正文写到第几个字符；`seq` = 本轮内联序号（思考段与工具卡共用）。
+ * 两者一起决定它插在正文/卡片的哪个位置（见 `AssistantMarkdown#orderedInlineEntries`）。
+ * 旧消息（只有 `thinking` 字符串）没有位置 ⇒ 按 `(0, 0)` 处理（渲染在正文之上，历史口径）。
+ */
+export interface ThinkingSegmentView {
+  text: string
+  textOffset?: number
+  seq?: number
+}
+
 export interface ChatMessageView {
   /** React key。历史用真实消息 id；流式用 `stream:` 前缀（见 `roundReducer.ts`） */
   key: string
   role: 'USER' | 'ASSISTANT' | 'SYSTEM'
   /** 正文（助手走 Markdown；用户气泡是纯文本） */
   text: string
-  /** 思考过程（空串 = 这一段本来就没有 ⇒ 不渲染折叠块） */
-  thinking: string
+  /**
+   * 思考过程**分段**（2026-10-21）：一段 = 一次模型请求里的推理（工具调用之后重新推理是新的一段）。
+   * 空数组 = 本轮本来就没有思考 ⇒ 不渲染任何折叠块（`03` §4.1 的"可选而非默认"口径）。
+   * 渲染上每段是**各自独立**的折叠块（见 `AssistantMessage`）。
+   */
+  thinkingSegments: readonly ThinkingSegmentView[]
   /** `null` = 本轮没有引用（未命中知识库时后端**不发** `citations` 事件，见 P0-1-29 决策 12） */
   citations: readonly CitationItem[] | null
   tools: readonly ToolCallView[]
@@ -217,6 +243,25 @@ export interface ChatMessageView {
    * 变成斜体与标题（配置者的本意肯定是原样显示）。其余助手消息恒为 Markdown。
    */
   plain?: boolean
+  /**
+   * `true` = 这条 USER 气泡是**本轮中途插话**（2026-10-21；`content.steers` / `steer` 事件）。
+   *
+   * 存在的理由有两条：
+   *   · 渲染上要和真·用户消息区分开（气泡头部标「插话」、末尾带投递状态）；
+   *   · **语义上不是"一轮的起点"** —— `recallable` / `regenerable` / `dropLastRound` 的
+   *     "最后一轮"判据必须跳过它（否则撤回/重新生成会瞄到一条插话上）。
+   */
+  steer?: boolean
+  /**
+   * 插话的稳定标识（服务端入队时生成；`steer` / `steer_queue` / 取消端点同源）——
+   * 「取回编辑」靠它定位要撤哪一条。**只在 `steer === true` 时有值**。
+   */
+  steerId?: string
+  /**
+   * 插话的投递状态（**只在流式侧有意义**）：`queued` = 引擎还没读到（可「取回编辑」）；
+   * `delivered` = 已被读走。历史消息没有这个字段（那一轮已经结束，状态没有意义）。
+   */
+  steerState?: 'queued' | 'delivered'
 }
 
 /** 从 `tool_call` 事件构造工具卡；同一 `callId` 的后续推送由归约层做 upsert */
@@ -233,6 +278,10 @@ export function toolViewFromEvent(payload: SseToolCallPayload): ToolCallView {
     status: payload.status,
     inputSummary: payload.inputSummary,
     ...(payload.textOffset === undefined ? {} : { textOffset: payload.textOffset }),
+    // ⚠️ `seq` 必须带（2026-10-21 漏过一处）：内联时间线靠它定"同偏移时谁先谁后"。
+    //    丢掉它 ⇒ 工具卡退化成"按数组下标"排序，而思考段用的是全局 seq ⇒ 流式中就能看到
+    //    「思考 A → 工具卡」在下一轮变成「工具卡 → 思考 A」这种跳变（用户报的现象）。
+    ...(payload.seq === undefined ? {} : { seq: payload.seq }),
     ...(payload.output === undefined ? {} : { output: payload.output }),
     ...(payload.errorCode === undefined ? {} : { errorCode: payload.errorCode }),
   }
@@ -311,6 +360,7 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
       status: record.status,
       inputSummary: record.inputSummary,
       ...(record.textOffset === undefined ? {} : { textOffset: record.textOffset }),
+      ...(record.seq === undefined ? {} : { seq: record.seq }),
       ...(record.output === undefined ? {} : { output: record.output }),
       ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
     })
@@ -331,6 +381,44 @@ function pickAttachments(source: Record<string, unknown>): AttachmentView[] {
     if (parsed.success) items.push(parsed.data)
   }
   return items
+}
+
+/**
+ * 插话段（2026-10-21）：逐项过 `steerRecordSchema`（与写入口同一个 schema）。
+ * 坏的一项丢弃；全坏 ⇒ 空数组（与 `pickAttachments` 同款处置）。
+ */
+function pickSteers(source: Record<string, unknown>): SteerRecord[] {
+  const value = source['steers']
+  if (!Array.isArray(value)) return []
+  const items: SteerRecord[] = []
+  for (const entry of value) {
+    const parsed = steerRecordSchema.safeParse(entry)
+    if (parsed.success) items.push(parsed.data)
+  }
+  return items
+}
+
+/**
+ * 插话段 → 视图（排在助手消息**之后**，与流式侧 `roundToViews` 同一顺序）。
+ *
+ * ⚠️ 历史侧不显示投递状态（`steerState` 缺省）：「这一轮已经结束」之后，"是否被模型读到"
+ * 对用户没有意义，显示一个永远停在「已投递」的角标只会增加噪音。
+ */
+function steerViewsOf(item: MessageItem, steers: readonly SteerRecord[]): ChatMessageView[] {
+  return steers.map((steer) => ({
+    key: `${item.id}:steer:${steer.id}`,
+    role: 'USER' as const,
+    text: steer.message,
+    thinkingSegments: [],
+    citations: null,
+    tools: [],
+    artifacts: [],
+    attachments: [],
+    createdAt: steer.at,
+    status: 'complete' as const,
+    steer: true as const,
+    steerId: steer.id,
+  }))
 }
 
 /**
@@ -400,7 +488,7 @@ export function messageToView(item: MessageItem): ChatMessageView {
     key: item.id,
     role: item.role,
     text: pickString(content, 'text'),
-    thinking: pickString(content, 'thinking'),
+    thinkingSegments: pickThinkingSegments(content),
     citations: pickCitations(content),
     // 工具卡的历史还原（P0-2-11 接回，见 `pickToolCalls`）。
     // 产物卡仍恒空：它的写入端（沙箱产物，P0-3）还没有，见文件头。
@@ -418,6 +506,30 @@ export function messageToView(item: MessageItem): ChatMessageView {
 }
 
 /**
+ * 思考段（2026-10-21）：历史取 `thinking_segments` 数组（`{text, textOffset, seq}`），
+ * 旧消息回落单段 `thinking` 字符串（位置按 `(0,0)` —— 渲染在正文之上，与当时一致）。
+ */
+function pickThinkingSegments(source: Record<string, unknown>): ThinkingSegmentView[] {
+  const value = source['thinking_segments']
+  if (Array.isArray(value)) {
+    const segments: ThinkingSegmentView[] = []
+    for (const entry of value) {
+      const parsed = thinkingSegmentSchema.safeParse(entry)
+      if (parsed.success && parsed.data.text !== '') {
+        segments.push({
+          text: parsed.data.text,
+          ...(parsed.data.textOffset === undefined ? {} : { textOffset: parsed.data.textOffset }),
+          ...(parsed.data.seq === undefined ? {} : { seq: parsed.data.seq }),
+        })
+      }
+    }
+    if (segments.length > 0) return segments
+  }
+  const legacy = pickString(source, 'thinking')
+  return legacy === '' ? [] : [{ text: legacy }]
+}
+
+/**
  * 助手消息是否"什么都还没有"（正文 / 思考 / 卡片全空）。
  *
  * 三种情形会走到这里，界面文案各不相同（由渲染层决定），故只做判据、不给文案：
@@ -431,16 +543,34 @@ export function messageToView(item: MessageItem): ChatMessageView {
 export function isAssistantEmpty(view: ChatMessageView): boolean {
   return (
     view.text === '' &&
-    view.thinking === '' &&
+    view.thinkingSegments.length === 0 &&
     view.tools.length === 0 &&
     view.artifacts.length === 0 &&
     view.citations === null
   )
 }
 
-/** 历史列表 → 视图列表（保持服务端给的时间正序，见 `messagePageResultSchema` 的注释） */
+/**
+ * 历史列表 → 视图列表（保持服务端给的时间正序，见 `messagePageResultSchema` 的注释）。
+ *
+ * ⚠️ 助手消息的 `content.steers` 会**再展开出几条 USER 视图**（排在它之后）—— 插话在
+ * 界面上的位置与流式侧一致（本轮末尾），而它挂在助手消息上是为了"一轮一起落库"
+ * （见 `shared#steerRecordSchema`）。
+ */
 export function messagesToViews(items: readonly MessageItem[]): ChatMessageView[] {
-  return items.map(messageToView)
+  const views: ChatMessageView[] = []
+  for (const item of items) {
+    views.push(messageToView(item))
+    if (item.role !== 'ASSISTANT') continue
+    const raw = item.content
+    const content: Record<string, unknown> =
+      typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : {}
+    const steers = pickSteers(content)
+    if (steers.length > 0) views.push(...steerViewsOf(item, steers))
+  }
+  return views
 }
 
 /**
@@ -459,7 +589,8 @@ export function messagesToViews(items: readonly MessageItem[]): ChatMessageView[
  */
 export function dropLastRound(views: readonly ChatMessageView[]): ChatMessageView[] {
   for (let index = views.length - 1; index >= 0; index--) {
-    if (views[index]?.role === 'USER') return views.slice(0, index)
+    // ⚠️ 跳过插话气泡（`steer`）：它们不是"一轮的起点"，否则重新生成会把它们当成用户消息留下
+    if (views[index]?.role === 'USER' && views[index]?.steer !== true) return views.slice(0, index)
   }
   return [...views]
 }
@@ -482,7 +613,7 @@ export function openingView(openingRemarks: string | null | undefined): ChatMess
     key: 'opening',
     role: 'ASSISTANT',
     text: openingRemarks,
-    thinking: '',
+    thinkingSegments: [],
     citations: null,
     tools: [],
     artifacts: [],

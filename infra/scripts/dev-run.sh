@@ -2,14 +2,19 @@
 # =====================================================================
 # dev-run.sh — 一键拉起「浏览器能打开」的完整开发环境
 #
-# 覆盖四步（每步都可单独跳过）：
+# 覆盖五步（每步都可单独跳过）：
 #   ① 依赖服务 postgres / redis / minio —— 复用 dev-up.sh，已在跑则跳过
 #   ② 建表 + 种子账号 + 分区续期 —— db:deploy / db:seed / db:partitions（全部幂等）
-#   ③ 后端  tsx watch  → http://127.0.0.1:<BACKEND_PORT>（默认 13000）
-#   ④ 前端  vite       → http://localhost:5174（自动带 VITE_DEV_PROXY_TARGET）
+#   ③ 后端  tsx watch  → http://127.0.0.1:<BACKEND_INTERNAL_PORT>（默认 BACKEND_PORT+1）
+#   ④ 路由网关 router:dev → http://127.0.0.1:<ROUTER_PORT>（默认 13000；只走 /api）
+#   ⑤ 前端  vite       → http://localhost:5174（dev 代理目标 = 网关）
 #
-# ③④ 在**后台**跑；日志 → .dev-logs/{backend,frontend,db,seed}.log
-#                      pid  → .pids/{backend,frontend}.pid
+# ★ 为什么要网关（2026-10-21）：调试「多机 / 沙箱流路由 / 粘性 / 负载感知 / 实例发现」时，
+#   浏览器必须经网关进；不经网关时那一整层代码根本不参与，权限/路由问题在 dev 里看不见。
+#   后端因此**退到内网端口**（`ROUTER_UPSTREAMS` 指向它，网关再对外），与 compose 形态一致。
+#
+# ③④⑤ 在**后台**跑；日志 → .dev-logs/{backend,gateway,frontend,db,seed}.log
+#                      pid  → .pids/{backend,gateway,frontend}.pid
 # （两个目录都在 .gitignore 里；不要往里放别的东西）
 #
 # 停止：bash infra/scripts/dev-stop.sh（只收应用层，依赖服务留着）
@@ -20,6 +25,7 @@
 #   bash infra/scripts/dev-run.sh --no-infra     # 依赖服务已在跑，跳过 ①
 #   bash infra/scripts/dev-run.sh --no-db        # 跳过 ②（不想每次跑迁移/种子）
 #   bash infra/scripts/dev-run.sh --no-install   # 不自动补 pnpm install
+#   bash infra/scripts/dev-run.sh --no-gateway   # 跳过 ④，前端直连后端（单机最小调试）
 #   bash infra/scripts/dev-run.sh --force        # 已在跑？先停再起
 #   bash infra/scripts/dev-run.sh --timeout 180  # 单步等待上限（秒，默认 90）
 #
@@ -37,11 +43,14 @@ LOG_DIR="$REPO_ROOT/.dev-logs"
 PID_DIR="$REPO_ROOT/.pids"
 
 FRONTEND_PORT=5174
-BACKEND_PORT=13000
+BACKEND_PORT=13000      # infra/.env 的值；网关开启时它是**网关对外端口**
+BACKEND_INTERNAL_PORT='' # 网关模式下后端实际监听（= BACKEND_PORT + 1），下面算
+GATEWAY_PORT=''          # = BACKEND_PORT；仅在网关开启时占用
 
 DO_INFRA=1
 DO_DB=1
 DO_INSTALL=1
+DO_GATEWAY=1
 FORCE=0
 TIMEOUT_SEC=90
 
@@ -50,10 +59,11 @@ while [ $# -gt 0 ]; do
     --no-infra)   DO_INFRA=0 ;;
     --no-db)      DO_DB=0 ;;
     --no-install) DO_INSTALL=0 ;;
+    --no-gateway) DO_GATEWAY=0 ;;
     --force)      FORCE=1 ;;
     --timeout)    shift; TIMEOUT_SEC="${1:-90}" ;;
     --)           : ;;   # `pnpm dev -- --no-infra` 会把孤立 -- 传进来，忽略
-    -h|--help)    sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
   shift
@@ -98,7 +108,8 @@ wait_until() { # <描述> <秒> <判定命令…>
   return 1
 }
 
-backend_up()  { [ "$(http_code "http://127.0.0.1:${BACKEND_PORT}/health")" = '200' ]; }
+backend_up()  { [ "$(http_code "http://127.0.0.1:${BACKEND_INTERNAL_PORT}/health")" = '200' ]; }
+gateway_up()  { [ "$(http_code "http://127.0.0.1:${GATEWAY_PORT}/health")" = '200' ]; }
 frontend_up() {
   [ "$(http_code "http://localhost:${FRONTEND_PORT}/")" = '200' ] && return 0
   # vite 只绑 IPv6 [::1]：localhost 解析到 127.0.0.1 优先时要补这一发
@@ -145,7 +156,34 @@ fi
 ok "env 文件: infra/.env"
 
 env_port="$(env_value BACKEND_PORT)"; [ -n "$env_port" ] && BACKEND_PORT="$env_port"
-ok "后端端口: ${BACKEND_PORT}（来自 infra/.env） 前端端口: ${FRONTEND_PORT}（vite strictPort）"
+
+if [ "$DO_GATEWAY" -eq 1 ]; then
+  # 端口三者必须两两不同：网关对外 = BACKEND_PORT（infra/.env 的口径，被 `pnpm router:dev` 直接读到），
+  # 后端**退到内网** BACKEND_PORT+1（`ROUTER_UPSTREAMS` 指向它），前端 5174。
+  GATEWAY_PORT="$BACKEND_PORT"
+  BACKEND_INTERNAL_PORT=$((BACKEND_PORT + 1))
+  [ "$BACKEND_INTERNAL_PORT" -le 65535 ] || fail "BACKEND_PORT=${BACKEND_PORT} 太大：网关模式下后端要用 +1 端口"
+  ok "后端内网端口: ${BACKEND_INTERNAL_PORT}（+1，网关回连它） 网关端口: ${GATEWAY_PORT}（= infra/.env 的 BACKEND_PORT）"
+else
+  GATEWAY_PORT=''
+  BACKEND_INTERNAL_PORT="$BACKEND_PORT"
+  ok "后端端口: ${BACKEND_INTERNAL_PORT}（来自 infra/.env；--no-gateway：前端直连）"
+fi
+ok "前端端口: ${FRONTEND_PORT}（vite strictPort）"
+
+# 沙箱代理 listener（出口②）的端口必须与业务/网关/前端错开：
+#   `backend/src/index.ts` 是 `app.listen(BACKEND_PORT)` 之后才 `startSandboxListener()`，
+#   两者撞口时**业务 app 先绑成功**、listener 只 warn 一句 `EADDRINUSE` 就放弃
+#   ⇒ 容器里的 git 凭据 / workspace / mcp 代理全部打到一个不认识它们的 app 上（统一信封 404），
+#   表面症状是"git clone 失败 / 没有工具"，而日志里只有一行 WARN。见 docs/06。
+SANDBOX_CALLBACK_PORT="$(env_value SANDBOX_CALLBACK_PORT)"; [ -n "$SANDBOX_CALLBACK_PORT" ] || SANDBOX_CALLBACK_PORT=13001
+[ "$SANDBOX_CALLBACK_PORT" -gt 0 ] 2>/dev/null || fail "SANDBOX_CALLBACK_PORT 非法：${SANDBOX_CALLBACK_PORT}"
+if [ "$SANDBOX_CALLBACK_PORT" = "$BACKEND_INTERNAL_PORT" ] || [ "$SANDBOX_CALLBACK_PORT" = "$GATEWAY_PORT" ] || [ "$SANDBOX_CALLBACK_PORT" = "$FRONTEND_PORT" ]; then
+  fail "SANDBOX_CALLBACK_PORT=${SANDBOX_CALLBACK_PORT} 与业务端口冲突（后端 ${BACKEND_INTERNAL_PORT}${GATEWAY_PORT:+ / 网关 $GATEWAY_PORT} / 前端 ${FRONTEND_PORT}）。
+      沙箱 listener 会以 EADDRINUSE 静默失败 ⇒ 容器侧 git 凭据与 workspace/mcp 代理全部 404。
+      改 infra/.env 的 SANDBOX_CALLBACK_PORT（推荐 14001），并把 SANDBOX_BACKEND_URL 的端口一起改。"
+fi
+ok "沙箱回调端口: ${SANDBOX_CALLBACK_PORT}（与业务端口错开）"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -153,24 +191,27 @@ mkdir -p "$LOG_DIR" "$PID_DIR"
 
 already=0
 pid_alive "$PID_DIR/backend.pid"  && { warn "后端已在跑（pid $(cat "$PID_DIR/backend.pid")）";  already=1; }
+pid_alive "$PID_DIR/gateway.pid"  && { warn "网关已在跑（pid $(cat "$PID_DIR/gateway.pid")）";  already=1; }
 pid_alive "$PID_DIR/frontend.pid" && { warn "前端已在跑（pid $(cat "$PID_DIR/frontend.pid")）"; already=1; }
 if [ "$already" -eq 1 ]; then
   if [ "$FORCE" -eq 1 ]; then
-    info '--force：先停掉这两个进程再起'
+    info '--force：先把已有的进程停掉再起'
     bash "$SCRIPT_DIR/dev-stop.sh" || fail 'dev-stop.sh 失败，先手工收干净再重试'
   else
     fail "已在运行。要重启：bash infra/scripts/dev-run.sh --force（或先跑 dev-stop.sh）"
   fi
 fi
 
-for p in "$BACKEND_PORT" "$FRONTEND_PORT"; do
+# 注意后端不再用 BACKEND_PORT 直接监听（网关模式下它是网关的端口）
+for p in "$BACKEND_INTERNAL_PORT" "$GATEWAY_PORT" "$FRONTEND_PORT"; do
+  [ -n "$p" ] || continue
   if port_busy "$p"; then
     warn "端口 $p 已被别的进程占用：$(port_pids "$p")"
-    warn "（前端是 strictPort，占了会直接退出；多半是别的项目或上次没收干净）"
+    warn "（前端是 strictPort，占了会直接退出；网关/后端占了多半是别的项目或上次没收干净）"
     fail "端口冲突，先处理掉占用再重试（或 bash infra/scripts/dev-stop.sh --force）"
   fi
 done
-ok "端口 ${BACKEND_PORT} / ${FRONTEND_PORT} 空闲"
+ok "端口 $(printf '%s ' "$BACKEND_INTERNAL_PORT" ${GATEWAY_PORT:+"$GATEWAY_PORT"} "$FRONTEND_PORT")空闲"
 
 # -- 依赖安装（首次） ---------------------------------------------------
 
@@ -255,19 +296,47 @@ fi
 
 # -- ③ 后端 ------------------------------------------------------------
 
-step "③ 后端（tsx watch）→ http://127.0.0.1:${BACKEND_PORT}"
+step "③ 后端（tsx watch）→ http://127.0.0.1:${BACKEND_INTERNAL_PORT}"
 
 : >"$LOG_DIR/backend.log"
 # ⚠️ 顺手接走 stdin（</dev/null）：vite 把 stdin 的 EOF 当作 Ctrl+D，stdin 一关它就退出
 #    （症状 = 日志 "VITE ready" 之后紧跟 [ELIFECYCLE] Command failed）。backend 是 tsx watch、
 #    不理会 stdin，一并接走以保持一致。
-nohup pnpm dev:backend >>"$LOG_DIR/backend.log" 2>&1 </dev/null &
+# ⚠️ 端口用**进程环境**覆盖 `infra/.env`（后端配置是"进程环境优先、文件只补缺"）：
+#    网关模式下后端退到 +1，否则 `ROUTER_UPSTREAMS` 与网关自己抢同一个端口。
+#    `SANDBOX_INSTANCE_ADVERTISE_ADDR` 一并指向真实端口（默认是 hostname:BACKEND_PORT，
+#    那会让网关回连到网关自己）；地址可由 infra/.env 覆盖。
+adv_env="$(env_value SANDBOX_INSTANCE_ADVERTISE_ADDR)"
+if [ -n "$adv_env" ]; then
+  host_part="${adv_env%%:*}"
+else
+  host_part="$(hostname)"
+fi
+BACKEND_ADVERTISE_ADDR="${host_part}:${BACKEND_INTERNAL_PORT}"
+
+# ⚠️ 实例 id 默认是 `os.hostname()`，而宿主机上常已跑着**部署形态**的后端（`deploy/scripts/up.sh`，
+#    见 `deploy/scripts/_lib.sh`：`SANDBOX_INSTANCE_ADVERTISE_ADDR=host.docker.internal:<BACKEND_PORT>`）。
+#    它占着 `sandbox:instance:<hostname>` 的抢注 → dev 后端会以"同名实例在线"拒启。
+#    ⇒ dev 后端换一个 `-dev` 后缀的实例名（`infra/.env` 显式配了 SANDBOX_INSTANCE_ID 就尊重它）。
+#    代价：本机 dev 起的沙箱账本/队列与部署实例不同名，正好互不干扰。
+inst_env="$(env_value SANDBOX_INSTANCE_ID)"
+if [ -n "$inst_env" ]; then
+  BACKEND_INSTANCE_ID="$inst_env"
+else
+  BACKEND_INSTANCE_ID="$(hostname)"
+fi
+
+BACKEND_PORT="$BACKEND_INTERNAL_PORT" \
+SANDBOX_INSTANCE_ID="$BACKEND_INSTANCE_ID" \
+SANDBOX_INSTANCE_ADVERTISE_ADDR="$BACKEND_ADVERTISE_ADDR" \
+  nohup pnpm dev:backend >>"$LOG_DIR/backend.log" 2>&1 </dev/null &
 BACKEND_PID=$!
 echo "$BACKEND_PID" >"$PID_DIR/backend.pid"
 info "已后台启动（pid ${BACKEND_PID}，日志 ${LOG_DIR}/backend.log）"
+info "监听端口 ${BACKEND_INTERNAL_PORT}；实例 ${BACKEND_INSTANCE_ID} 上报地址 ${BACKEND_ADVERTISE_ADDR}"
 
 if wait_until '后端 /health = 200' "$TIMEOUT_SEC" backend_up; then
-  ok "后端就绪 —— http://127.0.0.1:${BACKEND_PORT}/health"
+  ok "后端就绪 —— http://127.0.0.1:${BACKEND_INTERNAL_PORT}/health"
 else
   printf '\n%s--- backend.log 末尾 ---%s\n' "$C_D" "$C_X"
   tail -25 "$LOG_DIR/backend.log"
@@ -275,17 +344,67 @@ else
   fail "后端 ${TIMEOUT_SEC}s 内没起来（配置校验失败？见上面的日志）"
 fi
 
-# -- ④ 前端 ------------------------------------------------------------
+# -- ④ 网关 ------------------------------------------------------------
 
-step "④ 前端（vite）→ http://localhost:${FRONTEND_PORT}"
+if [ "$DO_GATEWAY" -eq 1 ]; then
+  step "④ 路由网关（tsx）→ http://127.0.0.1:${GATEWAY_PORT}"
+
+  : >"$LOG_DIR/gateway.log"
+  # 端口/上游走进程环境，和 compose 一样优先于 infra/.env：
+  #   · `ROUTER_PORT` = BACKEND_PORT（.env 里多半也是这个值，显式传只为防 dev 内网端口被误用）
+  #   · `ROUTER_UPSTREAMS` = 本机后端；留空 = 网关不知道转给谁（config.ts 直接拒启）
+  #   · `ROUTER_DISCOVERY_SEC=0` —— **dev 里默认关掉自动发现**（可用 `DEV_ROUTER_DISCOVERY_SEC` 打开）：
+  #     本机的 Redis 常与**部署形态**共用（`infra/.env` 的 REDIS_URL），注册表里有
+  #     `host.docker.internal:13000` / 别的机器 `a`、`jiaxie` 之类**从宿主机根本连不上的地址**；
+  #     开着发现，10s 后上游表就被这些地址污染，/api 一半请求 502，看起来像"网关坏了"。
+  #     要调"实例发现/负载感知"就把 `DEV_ROUTER_DISCOVERY_SEC=10` 传进来（并确认注册表里的地址可回连）。
+  discovery_sec="$(env_value DEV_ROUTER_DISCOVERY_SEC)"
+  [ -n "$discovery_sec" ] || discovery_sec=0
+  ROUTER_HOST=127.0.0.1 \
+  ROUTER_PORT="$GATEWAY_PORT" \
+  ROUTER_UPSTREAMS="127.0.0.1:${BACKEND_INTERNAL_PORT}" \
+  ROUTER_DISCOVERY_SEC="$discovery_sec" \
+  BACKEND_PORT="$BACKEND_INTERNAL_PORT" \
+    nohup pnpm router:dev >>"$LOG_DIR/gateway.log" 2>&1 </dev/null &
+  GATEWAY_PID=$!
+  echo "$GATEWAY_PID" >"$PID_DIR/gateway.pid"
+  info "已后台启动（pid ${GATEWAY_PID}，日志 ${LOG_DIR}/gateway.log）"
+  info "ROUTER_UPSTREAMS=127.0.0.1:${BACKEND_INTERNAL_PORT}（静态种子）；自动发现 ROUTER_DISCOVERY_SEC=${discovery_sec}（0 = 关闭；要调实例发现/负载感知：DEV_ROUTER_DISCOVERY_SEC=10 再跑）"
+
+  if wait_until "网关 ${GATEWAY_PORT} /health = 200" "$TIMEOUT_SEC" gateway_up; then
+    ok "网关就绪 —— http://127.0.0.1:${GATEWAY_PORT}/health"
+  else
+    printf '\n%s--- gateway.log 末尾 ---%s\n' "$C_D" "$C_X"
+    tail -25 "$LOG_DIR/gateway.log"
+    printf '\n'
+    warn "后端还在后台跑（pid $(cat "$PID_DIR/backend.pid" 2>/dev/null)）"
+    warn "整体收掉：bash infra/scripts/dev-stop.sh"
+    fail "网关 ${TIMEOUT_SEC}s 内没起来（${GATEWAY_PORT} 被占 / ROUTER_* 配置非法？见上面的日志）"
+  fi
+else
+  step '④ 路由网关'
+  info '已跳过（--no-gateway）—— 前端直连后端，路由/粘性那一层不参与调试'
+fi
+
+# -- ⑤ 前端 ------------------------------------------------------------
+
+# 前端 dev 代理目标：网关开启时 = 网关（浏览器请求也走网关：/api 粘性、/health，
+# 正是生产 nginx 的形态）；--no-gateway 时退回后端。
+if [ "$DO_GATEWAY" -eq 1 ]; then
+  PROXY_TARGET_PORT="$GATEWAY_PORT"
+else
+  PROXY_TARGET_PORT="$BACKEND_INTERNAL_PORT"
+fi
+
+step "⑤ 前端（vite）→ http://localhost:${FRONTEND_PORT}"
 
 : >"$LOG_DIR/frontend.log"
-VITE_DEV_PROXY_TARGET="http://127.0.0.1:${BACKEND_PORT}" \
+VITE_DEV_PROXY_TARGET="http://127.0.0.1:${PROXY_TARGET_PORT}" \
   nohup pnpm dev:frontend >>"$LOG_DIR/frontend.log" 2>&1 </dev/null &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" >"$PID_DIR/frontend.pid"
 info "已后台启动（pid ${FRONTEND_PID}，日志 ${LOG_DIR}/frontend.log）"
-info "VITE_DEV_PROXY_TARGET=http://127.0.0.1:${BACKEND_PORT}（不传会静默串到别的项目）"
+info "VITE_DEV_PROXY_TARGET=http://127.0.0.1:${PROXY_TARGET_PORT}（不传会静默串到别的项目）"
 
 if wait_until '前端 5174 可访问' "$TIMEOUT_SEC" frontend_up; then
   ok "前端就绪 —— http://localhost:${FRONTEND_PORT}/"
@@ -293,7 +412,7 @@ else
   printf '\n%s--- frontend.log 末尾 ---%s\n' "$C_D" "$C_X"
   tail -25 "$LOG_DIR/frontend.log"
   printf '\n'
-  warn "后端这时候已经起来了、还在后台跑（pid $(cat "$PID_DIR/backend.pid" 2>/dev/null)）"
+  warn "后端/网关这时候已经起来了、还在后台跑"
   warn "整体收掉：bash infra/scripts/dev-stop.sh"
   fail "前端 ${TIMEOUT_SEC}s 内没起来（5174 被占 / 依赖没装？见上面的日志）"
 fi
@@ -305,13 +424,21 @@ step 'Ready'
 pg_port="$(env_value POSTGRES_PORT)";        printf '  %sPostgreSQL   127.0.0.1:%s%s\n' "$C_D" "${pg_port:-5432}" "$C_X"
 redis_port="$(env_value REDIS_PORT)";        printf '  %sRedis        127.0.0.1:%s%s\n' "$C_D" "${redis_port:-6379}" "$C_X"
 minio_api="$(env_value MINIO_API_PORT)";     printf '  %sMinIO API    127.0.0.1:%s%s\n' "$C_D" "${minio_api:-9000}" "$C_X"
-printf '  %s后端         http://127.0.0.1:%s%s\n' "$C_D" "$BACKEND_PORT" "$C_X"
+printf '  %s后端         http://127.0.0.1:%s%s\n' "$C_D" "$BACKEND_INTERNAL_PORT" "$C_X"
+if [ "$DO_GATEWAY" -eq 1 ]; then
+  printf '  %s网关         http://127.0.0.1:%s（/api 走这里）%s\n' "$C_D" "$GATEWAY_PORT" "$C_X"
+else
+  printf '  %s网关         ——（--no-gateway，前端直连后端）%s\n' "$C_D" "$C_X"
+fi
 printf '  %s前端         http://localhost:%s/%s\n' "$C_G" "$FRONTEND_PORT" "$C_X"
 
-printf '\n  %s日志%s  tail -f .dev-logs/backend.log   /   tail -f .dev-logs/frontend.log\n' "$C_D" "$C_X"
+printf '\n  %s日志%s  tail -f .dev-logs/backend.log   /   tail -f .dev-logs/gateway.log   /   tail -f .dev-logs/frontend.log\n' "$C_D" "$C_X"
 printf '  %s账号%s  admin / member（初始密码见 .dev-logs/seed.log；俩都是首登改密态）\n' "$C_D" "$C_X"
 printf '  %s停止%s  bash infra/scripts/dev-stop.sh\n' "$C_D" "$C_X"
 printf '  %s提示%s  代理没串对？curl -s --noproxy '"'"'*'"'"' http://localhost:%s/api/auth/me 应返回本项目 401 信封\n' "$C_D" "$C_X" "$FRONTEND_PORT"
+if [ "$DO_GATEWAY" -eq 1 ]; then
+  printf '  %s提示%s  网关看见哪些上游：curl -s --noproxy '"'"'*'"'"' http://127.0.0.1:%s/health | jq .discovery\n' "$C_D" "$C_X" "$GATEWAY_PORT"
+fi
 if [ "$INFRA_READY" -eq 1 ]; then
   printf '  %s注意%s  要往沙箱派活还得先把镜像推到对应 tag：pnpm sandbox:build（README「阶段三出口验收」前置 ②③）\n' "$C_Y" "$C_X"
 fi

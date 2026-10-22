@@ -28,7 +28,7 @@
  *     换一台后端不影响任何一行的内容（注册表在 Redis 里，读谁都一样）。
  */
 
-import { Alert, Button, Space, Spin, Table, Tag, Tooltip, Typography, type TableColumnsType } from 'antd'
+import { Alert, Button, Modal, Space, Spin, Table, Tag, Tooltip, Typography, type TableColumnsType } from 'antd'
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ReloadOutlined } from '@ant-design/icons'
@@ -36,10 +36,11 @@ import type { NodeCheckItem, SandboxInstanceItem } from '@doubulea/shared'
 
 import { fetchCurrentUser } from '../../api/auth.js'
 import { useNodeBootstrapJob, useNodeSelf, useStartBootstrapJob } from '../../api/node.js'
-import { SANDBOX_INSTANCES_QUERY_KEY, useSandboxInstances } from '../../api/sandboxInstances.js'
+import { SANDBOX_INSTANCES_QUERY_KEY, useSandboxInstances, useSetSandboxDrained } from '../../api/sandboxInstances.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { NodeBootstrapProgressPanel } from './NodeBootstrapProgress.js'
 import {
+  drainActionView,
   heartbeatText,
   loadAgeText,
   SANDBOX_INSTANCE_STATE_LABELS,
@@ -75,10 +76,19 @@ function columnsFor(args: {
     {
       title: '状态',
       key: 'state',
-      width: 110,
+      width: 160,
       render: (_, item) => {
         const view = sandboxInstanceState(item, { now: args.now, loadStaleMs: args.loadStaleMs })
-        return <Tag color={STATE_COLOR[view.state]}>{SANDBOX_INSTANCE_STATE_LABELS[view.state]}</Tag>
+        return (
+          <Space size={4} wrap>
+            <Tag color={STATE_COLOR[view.state]}>{SANDBOX_INSTANCE_STATE_LABELS[view.state]}</Tag>
+            {item.drained && (
+              <Tooltip title="已摘流：不再接收**新**会话；已钉在它上面的会话仍继续服务">
+                <Tag color="default">已摘流</Tag>
+              </Tooltip>
+            )}
+          </Space>
+        )
       },
     },
     {
@@ -100,12 +110,16 @@ function columnsFor(args: {
     {
       title: '管理',
       key: 'manage',
-      width: 110,
-      render: (_, item) =>
-        // 展开行里有「一键初始化 / 重新自检」；这里给一个直达入口（展开由 antd 的 expandable 负责）
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          {item.readiness === null ? '展开查看' : item.readiness.ready ? '展开查看' : '展开后初始化（仅修坏项）'}
-        </Typography.Text>,
+      width: 190,
+      render: (_, item) => (
+        <Space size={4} wrap>
+          {/* 「展开」只是提示（展开由 antd 的 expandable 负责，行展开后才有初始化/自检） */}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {item.readiness === null ? '展开查看' : item.readiness.ready ? '展开查看' : '展开后初始化'}
+          </Typography.Text>
+          <DrainButton item={item} />
+        </Space>
+      ),
     },
     {
       title: '沙箱槽位',
@@ -216,7 +230,8 @@ export function SandboxInstancesPage() {
           <h1>沙箱实例</h1>
           <p className="page__lead">
             读实例在线注册表 <code>sandbox:instance:*</code>（各实例心跳写入，TTL = 3× 心跳）——
-            与路由网关的自动发现<strong>同源同判据</strong>。这里是只读视图，上下线由实例自身决定。
+            与路由网关的自动发现<strong>同源同判据</strong>。「摘流」写 <code>sandbox:drain:*</code>（只挡新会话），
+            <strong>不等于下线</strong>：注册键照常续期，已钉在这台的会话继续服务。
           </p>
         </div>
         <Button onClick={refresh} loading={query.isFetching}>
@@ -253,6 +268,11 @@ export function SandboxInstancesPage() {
             </li>
             <li>
               <strong>心跳超时</strong>：注册项已超过 TTL，网关通常已经看不见它；本节点的出现说明该实例正在停止或被 Redis 侧残留。
+            </li>
+            <li>
+              <strong>摘流</strong>（行内按钮）：只让网关<strong>不再为它分配新会话</strong>；已钉在它上面的会话
+              <strong>仍会继续服务</strong>
+              （容器与工作区都在它本地盘）。<strong>不是下线</strong> —— 想彻底停掉一台请停它的进程。生效：本机立即，其它机器 ≤ 3× 心跳。
             </li>
             <li>
               当前进程角色：<strong>{data?.role === 'router' ? '网关（不登记实例）' : '沙箱宿主'}</strong>
@@ -316,6 +336,50 @@ export function SandboxInstancesPage() {
   )
 }
 
+
+/**
+ * 摘流 / 恢复按钮（2026-10-21 用户反馈"页面上没有按钮"）。
+ *
+ * 为什么需要**确认框**：摘流是"静默生效"的运维动作 —— 点完当前页面不会有任何明显变化
+ * （它只影响**下一条**新会话落到哪），误触的代价是"新会话全挤到另外几台"。确认框里把
+ * "会 / 不会发生什么"写清楚（文案在 `sandboxInstanceModel.ts#drainActionView`，与按钮同源）。
+ */
+function DrainButton({ item }: { item: SandboxInstanceItem }) {
+  const mutation = useSetSandboxDrained()
+  const view = drainActionView(item)
+  const confirmDrain = (): void => {
+    Modal.confirm({
+      title: view.confirmTitle,
+      content: view.confirmBody,
+      okText: view.drained ? '恢复接收' : '摘流',
+      okButtonProps: view.drained ? {} : { danger: true },
+      cancelText: '取消',
+      onOk: () => mutation.mutateAsync({ instanceId: item.instanceId, drained: !view.drained }),
+    })
+  }
+  return (
+    <>
+      <Button
+        size="small"
+        // 已摘流用实心（"需要你处理"），未摘流是普通按钮（运维动作，不该显眼到误触）
+        type={view.drained ? 'primary' : 'default'}
+        danger={!view.drained}
+        loading={mutation.isPending}
+        onClick={confirmDrain}
+        data-testid={`drain-${item.instanceId}`}
+      >
+        {view.actionLabel}
+      </Button>
+      {mutation.isError && (
+        <Tooltip title={mutation.error instanceof Error ? mutation.error.message : String(mutation.error)}>
+          <Typography.Text type="danger" style={{ fontSize: 12 }}>
+            失败
+          </Typography.Text>
+        </Tooltip>
+      )}
+    </>
+  )
+}
 
 /**
  * 实例管理（P1-14 部署优化；2026-10-19 用户定稿 · 2026-10-20 进度任务化）：

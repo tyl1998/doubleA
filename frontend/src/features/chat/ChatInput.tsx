@@ -206,7 +206,16 @@ export function ChatInput({
             {attachments.map((item) => (
               <span key={item.fileId} className="attachment-chip" data-attachment-kind={item.kind}>
                 {item.kind === 'IMAGE' ? (
-                  <img className="attachment-chip__thumb" src={fileContentUrl(item.fileId)} alt={item.name} />
+                  // `loading/decoding/尺寸` 理由同 `MessageList` 的附件缩略图（内存优化 P1）
+                  <img
+                    className="attachment-chip__thumb"
+                    src={fileContentUrl(item.fileId)}
+                    alt={item.name}
+                    loading="lazy"
+                    decoding="async"
+                    width={26}
+                    height={26}
+                  />
                 ) : (
                   <span className="attachment-chip__doc" aria-hidden="true" />
                 )}

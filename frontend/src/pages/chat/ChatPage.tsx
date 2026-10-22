@@ -105,6 +105,7 @@ import { MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
 import { WorkspacePanel, WorkspacePanelPlaceholder } from '../../features/chat/WorkspacePanel.js'
 import { useWorkspacePanelResize } from '../../features/chat/useWorkspacePanelResize.js'
 import { MessageList } from '../../features/chat/MessageList.js'
+import { windowMessages } from '../../features/chat/messageWindow.js'
 import { RecallConversationModal, type RecallTarget } from '../../features/chat/RecallConversationModal.js'
 import {
   dropLastRound,
@@ -218,7 +219,7 @@ export function ChatPage({
    */
   const preserveSelectionRef = useRef(false)
 
-  const { round, sending, stopping, disconnect, send, regenerate, stop, steer, align } = useChatStream(
+  const { round, sending, stopping, disconnect, send, regenerate, stop, steer, cancelSteer, align } = useChatStream(
     agentId,
     conversationId,
     {
@@ -301,6 +302,14 @@ export function ChatPage({
   // P1-6 方案 A：观察这条会话"不是本页发起的那一轮"（定时任务后台运行的实时视图）
   useConversationWatch(conversationId)
 
+  /**
+   * 服务端侧"正在跑"的轮次（2026-10-21）：本页可能**画不出**它（切到别的会话后就没了 `rounds`），
+   * 但侧栏的灯必须继续亮，且主区要如实显示"另一条流还在跑"。
+   */
+  const serverRun = useChatStreamStore((state) => state.serverRun)
+  const serverRunning = round === null && conversationId !== undefined && serverRun[conversationId] !== undefined
+  const serverRunStartedAt = conversationId === undefined ? null : (serverRun[conversationId] ?? null)
+
   const [draft, setDraft] = useState('')
   const [aligning, setAligning] = useState(false)
   /**
@@ -323,6 +332,8 @@ export function ChatPage({
    * `preserveSelectionRef`）—— 那时重置会把用户刚选的模型丢掉，而历史还没加载、回显也补不上。
    */
   const [selectedModelId, setSelectedModelId] = useState<string | undefined>(undefined)
+  /** 渲染窗口的"展开"（内存优化 P5a）：`true` = 用户点过"显示更早的消息"，本次会话内不再设上限 */
+  const [historyExpanded, setHistoryExpanded] = useState(false)
   useEffect(() => {
     if (preserveSelectionRef.current) {
       preserveSelectionRef.current = false
@@ -331,6 +342,9 @@ export function ChatPage({
     setSelectedModelId(undefined)
     // 切换会话时清掉上一个会话选的附件（附件是"这一条消息"的，不该跨会话留着）
     setAttachments([])
+    // 渲染窗口的"展开"（内存优化 P5a）同样是"这一屏的选择"：切会话要收回默认窗口，
+    // 否则下一条会话会莫名其妙地把几千条历史全画出来。
+    setHistoryExpanded(false)
   }, [conversationId])
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
@@ -456,6 +470,9 @@ export function ChatPage({
         setMemoryExcluded(active.memoryExcluded)
         setCodeMode(active.codeMode)
         setRuntime(active.runtime)
+        // 这一步同时也回答"服务端此刻在跑吗"（`/active.streaming`）⇒ 记进流 store：
+        // 刚切进来时就能把侧栏的灯点亮（`useConversationActiveWatch` 会继续按节拍刷新）
+        useChatStreamStore.getState().noteServerRun(conversationId, active.streaming, active.startedAt ?? null)
       })
       .catch(() => {
         // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
@@ -613,7 +630,7 @@ export function ChatPage({
     [agent?.models, availableModelsQuery.data],
   )
 
-  const messages = useMemo(() => {
+  const allMessages = useMemo(() => {
     const all = [...history, ...streamViews]
     if (all.length > 0) return all
     // 一条消息都没有 ⇒ 新会话态：展示开场白（`03` §4.1 第一行）。开场白恒在**最前**，
@@ -621,6 +638,25 @@ export function ChatPage({
     const opening = openingView(agent?.openingRemarks)
     return opening === null ? [] : [opening]
   }, [history, streamViews, agent?.openingRemarks])
+
+  /**
+   * **渲染窗口**（内存优化 P5a，`docs/子方案/前端长会话内存优化.md`）。
+   *
+   * 一个聊得很久的会话有几千条视图；`MessageList` 全量渲染时，流式每帧、每次滚动都要在这一整棵
+   * DOM 树上做样式 / 布局 / GC —— 这是"聊几小时后 tab 越用越大、越用越卡"的第二个大头。
+   * 这里只决定**画多少**：默认最近 `HISTORY_RENDER_LIMIT` 条（`messageWindow.ts`），更早的收成顶部一条占位
+   * （与"加载更早的消息"同一位置、同一手势），点开后在本次会话内保持展开。
+   *
+   * ⚠️ 截的是**头部**（更早的历史），尾部（最新一轮 / 流式 / 贴底跟随 / 撤回与重新生成的判据）
+   * 一个字都不动 —— 那四件事全挂在尾部。
+   * ⚠️ `allMessages` 仍然是全量：判据类 memo（`recallable` / `regenerable` / `lastUsedModel`/
+   * 流式让位 effect）继续用全量，否则"最新一轮"的判据会因为我们只是少画了几条而变化。
+   */
+  const messageWindow = useMemo(
+    () => windowMessages(allMessages, { expanded: historyExpanded }),
+    [allMessages, historyExpanded],
+  )
+  const messages = messageWindow.visible as ChatMessageView[]
 
   /**
    * 可撤回的"最新一轮"（产品优化 2026-09-29；产品口径：只能对最新的一轮撤回/修改重发）。
@@ -639,7 +675,9 @@ export function ChatPage({
     let lastUserIndex = -1
     for (let index = history.length - 1; index >= 0; index--) {
       const view = history[index]
-      if (view !== undefined && view.role === 'USER') {
+      // ⚠️ 跳过插话气泡（2026-10-21）：它们排在助手消息之后、角色也是 USER，
+      //    但**不是一轮的起点** —— 否则「撤回 / 修改重发」会瞄到一条插话上
+      if (view !== undefined && view.role === 'USER' && view.steer !== true) {
         lastUser = view
         lastUserIndex = index
         break
@@ -667,11 +705,19 @@ export function ChatPage({
   const regenerable = useMemo(() => {
     if (conversationId === undefined) return null
     if (round !== null) return null
-    const last = allHistory[allHistory.length - 1]
-    if (last === undefined || last.role !== 'ASSISTANT') return null
-    for (let index = allHistory.length - 2; index >= 0; index--) {
+    // ⚠️ 找出**最后一条助手回答**（跳过它后面可能跟着的插话气泡 —— 2026-10-21）
+    let lastAssistant: { key: string; index: number } | null = null
+    for (let index = allHistory.length - 1; index >= 0; index--) {
       const view = allHistory[index]
-      if (view?.role === 'USER') return { key: last.key, userText: view.text }
+      if (view === undefined || view.steer === true) continue
+      if (view.role !== 'ASSISTANT') break
+      lastAssistant = { key: view.key, index }
+      break
+    }
+    if (lastAssistant === null) return null
+    for (let index = lastAssistant.index - 1; index >= 0; index--) {
+      const view = allHistory[index]
+      if (view?.role === 'USER' && view.steer !== true) return { key: lastAssistant.key, userText: view.text }
     }
     return null
   }, [conversationId, allHistory, round])
@@ -938,6 +984,35 @@ export function ChatPage({
         setSteerPending(false)
       })
   }, [draft, feedback, steer])
+
+  /**
+   * 点插话气泡上的「取回编辑」（2026-10-21）：撤回这条插话，并把正文放回输入框。
+   *
+   * 两种结局都如实说（服务端是**尽力撤回**，见 `useChatStream#cancelSteer`）：
+   *   · `cancelled:true` ⇒ 文本回输入框（用户可以改完再发）；
+   *   · `cancelled:false` ⇒ 已经被模型读走（或这一轮刚结束）⇒ 撤回无效，**不清空气泡**。
+   */
+  const handleRecallSteer = useCallback(
+    (steerId: string, text: string): void => {
+      void cancelSteer(steerId).then((outcome) => {
+        if (!outcome.ok) {
+          feedback.fail(outcome.error, '取回失败')
+          return
+        }
+        if (!outcome.cancelled) {
+          feedback.note('这条插话已被 agent 读到，撤不回来了')
+          return
+        }
+        setDraft(text)
+        feedback.ok(
+          outcome.scope === 'all'
+            ? '已取回（本轮其他还没投递的插话也一并撤回）'
+            : '已取回，内容在输入框里',
+        )
+      })
+    },
+    [cancelSteer, feedback],
+  )
 
   /**
    * 点「重新生成」（P1-3）：**重跑最新一轮的问题、替换当前回答**。
@@ -1288,6 +1363,18 @@ export function ChatPage({
               </Tag>
             ) : null}
 
+            {/* 服务端侧仍在生成（2026-10-21）：本页**没有**这一轮的事件流（切走再切回、刷新后进入、
+                或在别的窗口发起），但那一边确实还在跑 ⇒ 如实说出来。
+                ⚠️ 只给一句状态（`/active` 只回答"在不在跑"，给不出进度）；细说与已用时贴在
+                消息流末尾那句上（`MessageList` 的 `serverRunning`）—— 用户要的是"往下看就能看见"。
+                ⚠️ 没有"停止"按钮：停止走的是本页那条流的 abort 收口（`stopController`），
+                这里没有可收口的流；点了只会发一个信号而界面无从确认。 */}
+            {serverRunning ? (
+              <Tag className="tag--warn" title="服务端仍在生成这一轮（可能是别的窗口发起，或刚切回来）">
+                <span className="led led--run" aria-hidden="true" /> 服务端仍在生成
+              </Tag>
+            ) : null}
+
             {/* 标题栏右侧只留一枚**设置图标**（R4 / 用户反馈：直接进编辑智能体） */}
             <div className="chat__head-right">
               {agent === undefined ? null : (
@@ -1355,6 +1442,25 @@ export function ChatPage({
               {/* 向历史深处翻页。契约：`items` 正序、`nextCursor` 指向**更早**一页
                   （`shared/src/conversation.ts#messagePageResultSchema`）—— 展平顺序由
                   `flattenMessagePages` 负责，别在这里自己拼页。 */}
+              {/* 渲染窗口占位（内存优化 P5a）：更早的视图被收起时，先请用户把它们放回来。
+                  ⚠️ 与下面的分页按钮**并存**：收起的是"已经在内存里的视图"，分页按钮取的是
+                  "还没从服务端拿过的页" —— 两件事，不能合并成一个按钮（否则用户点了"加载更早"
+                  却发现只是一次纯客户端的展开，会以为服务端没数据）。 */}
+              {messageWindow.hiddenCount > 0 ? (
+                <div style={{ textAlign: 'center' }} data-testid="history-collapsed-notice">
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setHistoryExpanded(true)
+                    }}
+                  >
+                    显示更早的 {messageWindow.hiddenCount} 条消息
+                  </Button>
+                  <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                    为保持长时间对话流畅，更早的消息暂时收起（数据都在，点开后本次会话内保持展开）
+                  </p>
+                </div>
+              ) : null}
               {messagesQuery.hasNextPage ? (
                 <div style={{ textAlign: 'center' }}>
                   <Button
@@ -1362,6 +1468,8 @@ export function ChatPage({
                     loading={messagesQuery.isFetchingNextPage}
                     onClick={() => {
                       void messagesQuery.fetchNextPage()
+                      // 取到了新的更早一页 ⇒ 也要展开，否则用户"点了没反应"（新页同样被窗口挡在外面）
+                      setHistoryExpanded(true)
                     }}
                   >
                     加载更早的消息
@@ -1376,6 +1484,9 @@ export function ChatPage({
                 onResend={(text, hadTools) => openRecall(text, hadTools, true)}
                 regenerable={regenerable}
                 onRegenerate={handleRegenerate}
+                onRecallSteer={handleRecallSteer}
+                serverRunning={serverRunning}
+                serverStartedAt={serverRunStartedAt}
               />
             </StreamFrame>
           )}

@@ -23,7 +23,7 @@
 
 import { randomBytes } from 'node:crypto'
 
-import { sandboxInstanceKey, sandboxOwnerKey as buildSandboxOwnerKey } from '@doubulea/shared'
+import { sandboxDrainKey, sandboxInstanceKey, sandboxOwnerKey as buildSandboxOwnerKey } from '@doubulea/shared'
 
 import { Redis } from 'ioredis'
 
@@ -642,6 +642,17 @@ export function sandboxOwnerKey(conversationId: string): string {
  * 值与 TTL 由 `sandbox/owner.ts` 管理（`SET NX EX` + 周期续期 + 退出 `DEL`）。
  */
 export { sandboxInstanceKey }
+
+/**
+ * `sandbox:drain:{instanceId}` —— **摘流标记**（2026-10-21；运维从实例页写入，被摘那台的心跳读）。
+ *
+ * 写入口两处、口径一致：本实例自己的心跳**读到它就上报** `drained=true`；ADMIN 端点在
+ * `sandboxInstance.service.ts#setSandboxInstanceDrained` 里写/删，并**尽力**让本机立刻刷新一次注册值
+ * （摘自己时页面 10s 内就能看到，摘别的机器时靠对方下一拍心跳，≤ 3 × 心跳）。
+ */
+export function sandboxDrainedKey(instanceId: string): string {
+  return sandboxDrainKey(instanceId)
+}
 
 // ═══════════════════════════ 登录限速（P0-1-7）═══════════════════════════
 //

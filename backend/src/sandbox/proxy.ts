@@ -120,6 +120,36 @@ export async function buildSandboxMcpCatalog(
   conversationId: string,
   agentId: string,
 ): Promise<SandboxMcpCatalog> {
+  const catalog = await computeSandboxMcpCatalog(conversationId, agentId)
+  await writeSandboxMcpCatalog(conversationId, catalog)
+  const toolCount = Object.keys(catalog.tools).length
+  getLogger().info(
+    {
+      conversationId,
+      agentId,
+      serverCount: catalog.servers.length,
+      toolCount,
+      inlineToolCount: catalog.inlineTools.length,
+      gatewayActive: catalog.builtins.some((tool) => tool.name === MCP_LIST_TOOLS_TOOL_NAME),
+      builtinToolCount: catalog.builtins.length,
+    },
+    '已为沙箱下发工具清单（MCP 别名 s1…sN + 知识库内置工具；清单内容与别名映射都已发布）',
+  )
+  return catalog
+}
+
+/**
+ * "**这一轮该下发什么**"的纯计算（不写 Redis）—— `buildSandboxMcpCatalog` 与
+ * {@link buildSandboxMcpCatalogPreview} 共用同一份实现。
+ *
+ * ⚠️ 拆出来的唯一理由（P1-21）：派活前要**比对**"已发布的那份"与"现在算出来的这份"，
+ * 而比对**不该顺手把新清单写进 Redis**（写下去就等于宣布"容器已经按它注册了"，而容器其实还没有）。
+ * ⇒ 比对用 {@link buildSandboxMcpCatalogPreview}（只算不写），确认变了再 `republishSandboxMcpCatalog`。
+ */
+async function computeSandboxMcpCatalog(
+  conversationId: string,
+  agentId: string,
+): Promise<SandboxMcpCatalog> {
   const db = getPrisma()
   const logger = getLogger()
 
@@ -240,20 +270,21 @@ export async function buildSandboxMcpCatalog(
   if (getNotifyTarget(conversationId) !== undefined) builtins.push(notifyBuiltinDescriptor())
   catalog.builtins = builtins
 
-  await writeSandboxMcpCatalog(conversationId, catalog)
-  logger.info(
-    {
-      conversationId,
-      agentId,
-      serverCount: catalog.servers.length,
-      toolCount: Object.keys(catalog.tools).length,
-      inlineToolCount: catalog.inlineTools.length,
-      gatewayActive: selection.gatewayActive,
-      builtinToolCount: catalog.builtins.length,
-    },
-    '已为沙箱下发工具清单（MCP 别名 s1…sN + 知识库内置工具；清单内容与别名映射都已发布）',
-  )
   return catalog
+}
+
+/**
+ * **只算不写**（P1-21）：给"派活前比对指纹"用。
+ *
+ * 为什么不能直接 `buildSandboxMcpCatalog`：那个函数算完就**发布**（写 Redis），而发布意味着
+ * "容器那边已经是这份清单了" —— 派活前那一步比对恰恰**还不知道**容器的状态，写下去会让后续的
+ * `readSandboxMcpCatalog` 拿到一份"其实没人注册过"的表（调用时反查得到、容器里却没有这个名字）。
+ */
+export async function buildSandboxMcpCatalogPreview(
+  conversationId: string,
+  agentId: string,
+): Promise<SandboxMcpCatalog> {
+  return computeSandboxMcpCatalog(conversationId, agentId)
 }
 
 /**
@@ -330,6 +361,54 @@ export async function ensureSandboxMcpCatalog(
   const published = await readSandboxMcpCatalog(conversationId)
   if (published !== null) return published
   return buildSandboxMcpCatalog(conversationId, agentId)
+}
+
+/**
+ * **重算并重新发布**清单（P1-21）—— 给"容器活着期间绑定 / 工具缓存变了"用。
+ *
+ * 与 {@link ensureSandboxMcpCatalog} 的区别只有一句：**不读已有的那份**（它就是来顶掉它的）。
+ * 谁在什么时候调它（唯一入口，避免每个调用点各写一遍判据）：
+ *   ① `backend/src/sandbox/catalogSync.ts` —— 绑定变了（`agent_components` 写入）或工具缓存
+ *      刷新（`?refresh=1` / 管理页「测试」）之后，给**这个 agent 名下活着的会话**逐个重发；
+ *   ② 派活前（`taskAgent.ts`）发现"已发布清单的指纹 ≠ 现在算出来的" ⇒ 重发一次并把
+ *      `/doubulea:mcp-refresh` 注入这一轮 prompt（容器侧照新清单做增删）。
+ *
+ * ★ **别名稳定性**：`buildSandboxMcpCatalog` 的别名来自 `(serverName, id)` 升序序号
+ *   （`sandboxMcpAliasAt`），与"哪台 server 有没有工具缓存"无关 ⇒ 只要绑定集不变，重算出来的
+ *   `alias` 与工具名**逐个不变**（历史消息里引用的 `toolName` 仍然解析得到）。
+ *   ⚠️ 绑定集**变了**（增删 server）⇒ 后面的别名会顺移，这是刻意接受的：历史卡片显示的是当时的
+ *     名字，而 `catalog.tools` 只在**当下**用于反查与调用（调用走的是名字 → 现在的表）。
+ *
+ * @returns 新旧两次的差异摘要（供日志 / 调用方决定要不要推热更新）
+ */
+export async function republishSandboxMcpCatalog(
+  conversationId: string,
+  agentId: string,
+): Promise<{ catalog: SandboxMcpCatalog; changed: boolean; added: string[]; removed: string[] }> {
+  const previous = await readSandboxMcpCatalog(conversationId)
+  const catalog = await buildSandboxMcpCatalog(conversationId, agentId)
+  const before = new Set(previous === null ? [] : Object.keys(previous.tools))
+  const after = new Set(Object.keys(catalog.tools))
+  const prevBuiltins = new Set(previous === null ? [] : previous.builtins.map((tool) => tool.name))
+  const nextBuiltins = new Set(catalog.builtins.map((tool) => tool.name))
+  const added = [
+    ...[...after].filter((name) => !before.has(name)),
+    ...[...nextBuiltins].filter((name) => !prevBuiltins.has(name)),
+  ]
+  const removed = [
+    ...[...before].filter((name) => !after.has(name)),
+    ...[...prevBuiltins].filter((name) => !nextBuiltins.has(name)),
+  ]
+  // "变了"的判据**只看名字集合**：工具描述/schema 的细微变化（上游改了说明）不值得让容器
+  // 重注册一遍（模型下一轮照样能用，只是说明旧了一点点）；而增删是"能不能用"的问题。
+  const changed = added.length > 0 || removed.length > 0
+  if (changed) {
+    getLogger().info(
+      { conversationId, agentId, added, removed },
+      '沙箱工具清单已重算并重发（绑定或工具缓存变化）',
+    )
+  }
+  return { catalog, changed, added, removed }
 }
 
 // ───────────────────────────── 端点 ─────────────────────────────

@@ -36,7 +36,15 @@ import { create } from 'zustand'
 
 import type { ClientErrorCode } from '../api/client.js'
 import type { AttachmentView } from '../features/chat/messageModel.js'
-import { beginRound, reduceRound, withInterjection, type RoundKind, type StreamRound } from '../features/chat/roundReducer.js'
+import {
+  beginRound,
+  reduceRound,
+  withInterjection,
+  withoutInterjection,
+  withoutQueuedInterjections,
+  type RoundKind,
+  type StreamRound,
+} from '../features/chat/roundReducer.js'
 
 /**
  * 顶部黄条（`03` §4.1："断线 → 顶部黄条提示，**点击黄条 = 立即拉取历史对齐**"）。
@@ -62,6 +70,18 @@ interface ChatStreamState {
    */
   rounds: Record<string, StreamRound>
   /**
+   * 服务端侧**正在跑**的会话（`conversationId → startedAt | null`）—— 2026-10-21 增。
+   *
+   * ⚠️ 与 `rounds` 是**两个来源**，不能合并：
+   *   · `rounds` = 本页**画得出这一轮**（有完整事件流，能渲染正文 / 工具卡）；只覆盖"本页发起的流"
+   *     与"本页正在观察的当前会话"；
+   *   · `serverRun` = **`/active` 说它在跑**。切到别的会话、刷新后进入、或在另一台机器上发起时，
+   *     store 里没有 `rounds[那个会话]`，但 Redis 的活跃锁是真的 —— 会话栏的"生成中"灯必须认这个
+   *     （否则症状正是用户 2026-10-21 报的："A 正在生成 → 切到 B → A 变成可继续"）。
+   * 值里的 `startedAt` 是服务端那条流的开始时刻（`/active` 回带），拿不到的 `null`。
+   */
+  serverRun: Record<string, string | null>
+  /**
    * 每个会话的顶部黄条（`conversationId → DisconnectState`）。
    * **按会话存**：A 断线亮条不该在 B 的画面上出现（多流之后这是必须的）。
    */
@@ -82,13 +102,31 @@ interface ChatStreamState {
   /** 喂一帧到**指定会话**（该会话没开轮时静默忽略：`done` 之后仍可能有尾帧，那是正常现象） */
   apply: (conversationId: string, event: SseEvent) => void
   /**
+   * 记下"服务端这一刻是否在跑这个会话"（`GET /:id/active` 的结论）—— `streaming:true` ⇒ 记下，
+   * `false` ⇒ 收掉这个键。只影响**会话栏的灯**与"没有本页轮次时的生成中气泡"，
+   * 不碰 `rounds`（那是本页自己的事件流，见 `serverRun` 的注释）。
+   */
+  noteServerRun: (conversationId: string, streaming: boolean, startedAt: string | null) => void
+  /**
    * 往指定会话这一轮**乐观地**追加一条用户插话（P1-20）—— `POST /:id/steer` 成功后调它。
    *
    * ⚠️ 存在的理由：插话常常发生在轮次的最后几秒，出口层的 `steer` 回帧依赖"通道轮询在轮次结束前
    * 取到"，可能整个落空 ⇒ 界面上"插话直接消失了"。**用户说过的话必须看得见** ⇒ 展示以本地为准；
-   * 出口层若真回了帧，归约层按正文去重（见 `withInterjection`）。已收口 / 没开轮时静默忽略。
+   * 出口层若真回了帧，归约层按 **id** 去重（见 `withInterjection`）。已收口 / 没开轮时静默忽略。
    */
-  addInterjection: (conversationId: string, text: string, at: string) => void
+  addInterjection: (conversationId: string, entry: { id: string; text: string; at: string }) => void
+  /**
+   * 撤回一条插话（2026-10-21）：取消端点返回 `scope:'one'` 时调它 —— 从本轮插话清单里精确移除。
+   * ⚠️ 与服务端**尽力撤回**配套：若消息其实已被模型读走，服务端会回 `cancelled:false`，
+   * 调用方**不该**再调本方法（否则界面说"撤回了"、模型却已经读过 —— 诚实优先）。
+   */
+  removeInterjection: (conversationId: string, steerId: string) => void
+  /**
+   * 撤掉本轮**所有还没投递**的插话（取消端点返回 `scope:'all'` 时调它）：
+   * pi 的 `clear_queue` 只能整体清空 ⇒ "还在排队"的那几条都已作废，本地必须同步。
+   * 已投递的保留（模型读过，撤不回来）。
+   */
+  removeQueuedInterjections: (conversationId: string) => void
   /**
    * **客户端侧**的收口失败（连接中断 / 读流抛错）—— 与流内 `error` 事件落到同一个出口
    * （消息流内错误卡），只是错误码可能来自 `api/client.ts` 的伪码 `NETWORK`。
@@ -159,15 +197,22 @@ export function disconnectOf(
 /**
  * 正在生成的会话 id 集合（P0-1-34 的侧栏要给**每一条**点亮"生成中"灯，多流之后可能同时有多个）。
  *
+ * 两个来源取**并集**（2026-10-21）：本页画得出的流式轮次（`rounds`）+ 服务端说在跑的会话
+ * （`serverRun`，来自 `/active`）。后者是"切到别的会话 / 刷新后进入 / 别处发起"时唯一不撒谎的判据
+ * —— 那时 store 里根本没有那一条的 `rounds`，只靠 `rounds` 就会把一条正在跑的会话显示成"可继续"。
+ *
  * ⚠️ **纯函数**（不在 store 里当场算，也不在组件里当 zustand 选择器直接返回新 `Set`）：
  * 每次调用都新建一个 `Set` ⇒ 直接用 `useChatStreamStore(streamingIdsOf)` 会**无限重渲染**。
- * 组件侧的正确用法是选 `rounds`（引用稳定）再 `useMemo(..., [rounds])` 调它（见 `ConvRail`）。
+ * 组件侧的正确用法是选 `rounds` / `serverRun`（引用稳定）再 `useMemo(..., [...])` 调它（见 `ConvRail`）。
  */
-export function streamingIdsOf(state: Pick<ChatStreamState, 'rounds'>): ReadonlySet<string> {
+export function streamingIdsOf(
+  state: Pick<ChatStreamState, 'rounds'> & { serverRun?: ChatStreamState['serverRun'] },
+): ReadonlySet<string> {
   const ids = new Set<string>()
   for (const [id, round] of Object.entries(state.rounds)) {
     if (round.status === 'streaming') ids.add(id)
   }
+  for (const id of Object.keys(state.serverRun ?? {})) ids.add(id)
   return ids
 }
 
@@ -182,6 +227,7 @@ function without<T>(record: Record<string, T>, key: string): Record<string, T> {
 export const useChatStreamStore = create<ChatStreamState>((set) => ({
   rounds: {},
   disconnects: {},
+  serverRun: {},
 
   begin: (conversationId, userText, startedAt, kind, userAttachments) => {
     // 开新一轮 ⇒ 该会话上一轮的黄条自动消失（`03` §4.1 的状态机里，`idle → streaming` 是一个
@@ -189,6 +235,9 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
     set((state) => ({
       rounds: { ...state.rounds, [conversationId]: beginRound(userText, startedAt, kind, userAttachments) },
       disconnects: without(state.disconnects, conversationId),
+      // 本页自己发起的这一轮同样是"服务端在跑"：记进 `serverRun`，切走时侧栏的灯才不会灭
+      // （它的收口与清除统一走 `noteServerRun(false)`，见 `useChatStream` 的 `finally`）
+      serverRun: { ...state.serverRun, [conversationId]: startedAt },
     }))
   },
 
@@ -197,17 +246,49 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
       const round = state.rounds[conversationId]
       if (round === undefined) return state
       const next = reduceRound(round, event)
-      // 归约层对 `ping` 等返回**同一引用** ⇒ 这里也返回同一 `state`，不触发任何重渲染
+      // 归约层对 `ping` / 空 `delta` 等返回**同一引用** ⇒ 这里也返回同一 `state`，不触发任何重渲染
+      // （内存优化 P5：流式期间一次白重渲染 = 整棵消息列表重走一遍元素树，长会话里代价可观）
       if (next === round) return state
       return { rounds: { ...state.rounds, [conversationId]: next } }
     })
   },
 
-  addInterjection: (conversationId, text, at) => {
+  noteServerRun: (conversationId, streaming, startedAt) => {
+    set((state) => {
+      if (!streaming) {
+        if (!(conversationId in state.serverRun)) return state
+        return { serverRun: without(state.serverRun, conversationId) }
+      }
+      if (conversationId in state.serverRun && state.serverRun[conversationId] === startedAt) return state
+      return { serverRun: { ...state.serverRun, [conversationId]: startedAt } }
+    })
+  },
+
+  addInterjection: (conversationId, entry) => {
     set((state) => {
       const round = state.rounds[conversationId]
       if (round === undefined) return state
-      const next = withInterjection(round, { text, at })
+      const next = withInterjection(round, entry)
+      if (next === round) return state
+      return { rounds: { ...state.rounds, [conversationId]: next } }
+    })
+  },
+
+  removeInterjection: (conversationId, steerId) => {
+    set((state) => {
+      const round = state.rounds[conversationId]
+      if (round === undefined) return state
+      const next = withoutInterjection(round, steerId)
+      if (next === round) return state
+      return { rounds: { ...state.rounds, [conversationId]: next } }
+    })
+  },
+
+  removeQueuedInterjections: (conversationId) => {
+    set((state) => {
+      const round = state.rounds[conversationId]
+      if (round === undefined) return state
+      const next = withoutQueuedInterjections(round)
       if (next === round) return state
       return { rounds: { ...state.rounds, [conversationId]: next } }
     })
@@ -228,9 +309,14 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
 
   stoppedLocally: (conversationId) => {
     set((state) => {
+      // 点了停止、服务端也收到了信号 ⇒ 这个会话不再算"在跑"（灯随之熄灭；真收口由 `done` 决定内容）
+      const serverRun = without(state.serverRun, conversationId)
       const round = state.rounds[conversationId]
-      if (round === undefined) return state
+      if (round === undefined) {
+        return serverRun === state.serverRun ? state : { serverRun }
+      }
       return {
+        serverRun,
         rounds: {
           ...state.rounds,
           [conversationId]: {
@@ -276,6 +362,8 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
   },
 
   resetAll: () => {
-    set({ rounds: {}, disconnects: {} })
+    // `serverRun` 也清：对话页卸载后没有人在看这些灯，留着"某个会话在跑"只会在下次进页面时
+    // 与 `/active` 的结论打架（下次进页面会重新问一次）
+    set({ rounds: {}, disconnects: {}, serverRun: {} })
   },
 }))

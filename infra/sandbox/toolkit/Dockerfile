@@ -77,8 +77,15 @@ RUN set -eux; chmod 0755 /opt/sandbox-selfcheck.sh
 # git 凭据 helper（P1-9 · R11 修订）：**按需拉取** —— 容器侧两个无状态脚本，git 用时才回调平台
 # 换凭据（详见各自文件头）。不落任何秘密、不受只读 rootfs 限制（SSH 私钥写到可写的 /tmp）。
 # 属主 root、全局可读可执行：它们本身不含凭据。
-COPY git-credential-doubulea.mjs git-ssh-doubulea.mjs /opt/sandbox-git/
-RUN set -eux; chmod 0755 /opt/sandbox-git/git-credential-doubulea.mjs /opt/sandbox-git/git-ssh-doubulea.mjs
+# ★ P1-21：第三个脚本 `ssh-proxy-doubulea.mjs` 是 SSH 的 `ProxyCommand` —— 把 ssh 的 stdio
+#   接到 egress 代理的 `CONNECT` 隧道上（容器没 DNS、没公网路由，SSH 又不读 HTTPS_PROXY）
+#   ⇒ `git clone git@内网域名:…` 不再需要模型自己写包装脚本。
+COPY git-credential-doubulea.mjs git-ssh-doubulea.mjs ssh-proxy-doubulea.mjs /opt/sandbox-git/
+RUN set -eux; \
+    chmod 0755 \
+        /opt/sandbox-git/git-credential-doubulea.mjs \
+        /opt/sandbox-git/git-ssh-doubulea.mjs \
+        /opt/sandbox-git/ssh-proxy-doubulea.mjs
 
 USER agent
 

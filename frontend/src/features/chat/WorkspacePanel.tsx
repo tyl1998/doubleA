@@ -76,6 +76,7 @@ import {
   useWorkspaceGit,
   useWorkspaceTree,
   workspaceFileDiffQueryKey,
+  workspaceFileQueryKey,
   workspaceGitQueryKey,
   workspaceRawUrl,
   workspaceTreeQueryKey,
@@ -267,15 +268,40 @@ export function WorkspacePanel({
 
   // ── 当前标签的读 ──
   const fileQuery = useQuery({
-    queryKey: ['workspace-file', conversationId, activePath ?? ''],
+    queryKey: workspaceFileQueryKey(conversationId, activePath ?? ''),
     queryFn: ({ signal }) => fetchWorkspaceFile(conversationId, activePath ?? '', { signal }),
     enabled: codeMode && activePath !== null,
+    // 内存优化 P4（`docs/子方案/前端长会话内存优化.md`）：一份正文最大 1 MiB —— 标签关掉之后
+    // 没有任何人还会读它，别让它在缓存里躺满全局默认的 5 分钟。
+    gcTime: 60_000,
   })
 
   // ── 按路径的编辑态 ──
   const [docs, setDocs] = useState<Record<string, WorkspaceDoc>>({})
   const [savingPath, setSavingPath] = useState<string | null>(null)
   const [reverting, setReverting] = useState(false)
+
+  /**
+   * 草稿只保留**还开着的标签**（内存优化 P4）。
+   *
+   * `docs` 里每条都是**两份**整篇正文（`text` + `baseText`）。标签被关掉之后它们没人读 ——
+   * 但 `closeFile` 只是 store 上的一个动作，页面这边的 `docs` 不会自己变小（agent 侧删文件、
+   * 「删除文件夹」、改名等路径都会让 `openPaths` 变短）。所以判据挂在 `openPaths` 上：
+   * 它一变就裁一次，**一处覆盖所有"标签消失"的路径**。
+   */
+  useEffect(() => {
+    setDocs((prev) => {
+      const alive = new Set(openPaths)
+      const keys = Object.keys(prev)
+      if (keys.every((path) => alive.has(path))) return prev
+      const next: Record<string, WorkspaceDoc> = {}
+      for (const path of keys) {
+        const doc = prev[path]
+        if (alive.has(path) && doc !== undefined) next[path] = doc
+      }
+      return next
+    })
+  }, [openPaths])
 
   // 读回结果（首次 / 服务端版本前进）⇒ 铺草稿；有草稿且服务端也前进 ⇒ 只挂冲突，不覆盖
   useEffect(() => {
@@ -595,6 +621,29 @@ export function WorkspacePanel({
       cancelled = true
     }
   }, [conversationId, codeMode])
+  /**
+   * 切会话 / 面板卸载时把**本会话的正文缓存整份收掉**（内存优化 P4）。
+   *
+   * 三层都要清，缺一层就漏：
+   *   · 页面里的 `docs`（草稿 + 基线，两份整篇）；
+   *   · react-query 的 `['workspace-file', conversationId, *]`（每打开过一个文件就有一份）；
+   *   · 差异查询 `['workspace-diff', conversationId, *]`（行级差异也不小）。
+   * 切走再回来是重新读一次文件 —— 这是**正确的**：回来时服务端可能已经变了，缓存本来也不该
+   * 跨"离开"这一段时间被当成真相。
+   */
+  useEffect(() => {
+    // ⚠️ 先清掉**上一个会话**留下的那一份（effect 重跑时闭包里拿到的仍是旧 `conversationId`，
+    //    这正是我们要清的那一份）；本次会话那份由**下一次**重跑 / 卸载负责。
+    setDocs({})
+    queryClient.removeQueries({ queryKey: ['workspace-file', conversationId] })
+    queryClient.removeQueries({ queryKey: ['workspace-diff', conversationId] })
+    return () => {
+      setDocs({})
+      queryClient.removeQueries({ queryKey: ['workspace-file', conversationId] })
+      queryClient.removeQueries({ queryKey: ['workspace-diff', conversationId] })
+    }
+  }, [conversationId, queryClient])
+
   const activePathRef = useRef<string | null>(activePath)
   activePathRef.current = activePath
   useEffect(() => {
@@ -1211,7 +1260,8 @@ function WorkspaceImagePreview({ url, alt }: { url: string; alt: string }) {
   }
   return (
     <div className="ws__image">
-      <img src={url} alt={alt} loading="lazy" onError={() => setFailed(true)} />
+      {/* `decoding="async"`：内存优化 P1（同 `MessageList` 附件缩略图）—— 预览需要解码，只能异步化 */}
+      <img src={url} alt={alt} loading="lazy" decoding="async" onError={() => setFailed(true)} />
     </div>
   )
 }

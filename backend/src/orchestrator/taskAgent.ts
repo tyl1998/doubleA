@@ -113,6 +113,12 @@
 
 import {
   AppError,
+  MCP_CALL_TOOL_TOOL_NAME,
+  MCP_LIST_TOOLS_TOOL_NAME,
+  MEMORY_TOOL_SERVER_NAME,
+  RECALL_MEMORY_TOOL_NAME,
+  REMEMBER_TOOL_NAME,
+  SEND_NOTIFICATION_TOOL_NAME,
   type ArtifactItem,
   type ConversationActiveSnapshot,
   type SseEvent,
@@ -123,10 +129,12 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { sumUsages, type ChatUsage } from '../llm/protocol.js'
 import {
+  buildSandboxMcpCatalogPreview,
   closeSandboxRpc,
   collectRoundArtifacts,
   ensureSandbox,
   ensureSandboxMcpCatalog,
+  republishSandboxMcpCatalog,
   getSandboxRpc,
   recycleSandbox,
   resolveSandboxMcpTool,
@@ -138,6 +146,8 @@ import {
   type TurnFailureReason,
   type TurnOutcome,
 } from '../sandbox/index.js'
+import { catalogFingerprint } from '../sandbox/catalogSync.js'
+import { sandboxMcpRefreshPromptLine } from '../sandbox/spec.js'
 import {
   createEngineEventMapper,
   engineTurnBoundaryOf,
@@ -157,11 +167,18 @@ import {
   formatKnowledgeCatalog,
 } from './chatContext.js'
 import { taskAttachmentPromptBlock, writeAttachmentFiles } from './attachmentFiles.js'
-import { boundKnowledgeBaseIds, loadKnowledgeCatalog } from './knowledgeTools.js'
+import { boundKnowledgeBaseIds, isKnowledgeToolName, loadKnowledgeCatalog } from './knowledgeTools.js'
 import { runMemoryExtraction } from './memoryExtract.js'
 import { buildMemoryDoc, memoryDocReadInstruction, writeMemoryDoc } from './memoryDoc.js'
 import { persistRoundQuietly, type UsageRecordInput } from './persist.js'
-import { attachToolTextOffsets, createToolTextOffsetTracker } from './toolTextOffset.js'
+import {
+  attachThinkingPosition,
+  attachToolTextOffsets,
+  createToolTextOffsetTracker,
+  upsertToolRecord,
+} from './toolTextOffset.js'
+import { MCP_GATEWAY_TOOL_SERVER_NAME } from './mcpGatewayTools.js'
+import { NOTIFY_TOOL_SERVER_NAME } from '../notify/index.js'
 import { getMemorySettings } from '../services/memory.service.js'
 import {
   recordWorkspaceRoundEnd,
@@ -191,6 +208,41 @@ import { ChatStoppedError, abortReasonOf, type ChatProducer } from './sse.js'
  */
 const MODEL_SILENCE_NOTICE_MS = 60_000
 
+/**
+ * 思考段号计数器（2026-10-21）。
+ *
+ * ⚠️ **不能**用 `round.thinkingSegments.length` 当段 key：位置是在 `events.map` 里分配的，
+ * 而 push 发生在**之后的同步循环**里 ⇒ 同一事件里的多帧、乃至"首段"与"新段"会算出**同一个 key**
+ * （`think-0`），于是第二段直接复用第一段的内联位置（`seq` 也复用）⇒ 前端看到
+ * 「重新推理」和工具卡**换位**（用户报的现象）。
+ * 这里用独立单调计数器，只在新段首帧 +1，与 push 时机解耦。
+ */
+function nextThinkingSegmentKey(state: { seq: number }): string {
+  const key = `think-${state.seq}`
+  state.seq += 1
+  return key
+}
+
+/**
+ * 内置工具卡上的「来自哪」（`toolCallRecordSchema.serverName`）。
+ *
+ * ⚠️ **不能一律写"知识库"**：`catalog.builtins` 里除知识库一族外，还会有工具网关
+ * （`mcp_list_tools` / `mcp_call_tool`，P1-19）、记忆（`remember` / `recall_memory`，P1-8）与
+ * 通知（P1-6）。按名字分流，标签与 ChatBot 路径的那几条（`chatBot.ts` 里的 `serverName`）同源。
+ * 未来新增内置工具时落到「内置工具」而不是被误标成知识库。
+ */
+function builtinToolServerName(toolName: string): string {
+  if (isKnowledgeToolName(toolName)) return KNOWLEDGE_TOOL_SERVER_NAME
+  if (toolName === MCP_LIST_TOOLS_TOOL_NAME || toolName === MCP_CALL_TOOL_TOOL_NAME) {
+    return MCP_GATEWAY_TOOL_SERVER_NAME
+  }
+  if (toolName === REMEMBER_TOOL_NAME || toolName === RECALL_MEMORY_TOOL_NAME) {
+    return MEMORY_TOOL_SERVER_NAME
+  }
+  if (toolName === SEND_NOTIFICATION_TOOL_NAME) return NOTIFY_TOOL_SERVER_NAME
+  return '内置工具'
+}
+
 export const taskAgentProducer: ChatProducer = async (input) => {
   const logger = getLogger()
   const { conversationId, agentId, content, signal, startedAt } = input
@@ -210,8 +262,12 @@ export const taskAgentProducer: ChatProducer = async (input) => {
   const round = {
     /** 助手正文（引擎的 `text_delta` 逐条累加；落库后是助手消息的 `content.text`） */
     assistantText: '',
-    /** 思考过程（引擎的 `thinking_delta`；`01` 决策 · 可折叠渲染） */
-    thinkingText: '',
+    /**
+     * 思考过程**分段**（2026-10-21；`01` 决策 · 每段一个可折叠块）。
+     * 一段 = 一次模型请求里的推理 —— 「工具调用之后的重新推理」是**新的一段**，不追加到旧段
+     *（用户明确要求）。判据见下面 `thinking` 帧的处理：引擎给的 `newSegment` 标记。
+     */
+    thinkingSegments: [] as { text: string; textOffset: number; seq: number }[],
     /** 工具调用记录（落库那份**带 `arguments`** —— 见 `map.ts#EngineEventMapping.toolRecord`） */
     toolRecords: [] as ToolCallRecord[],
     /**
@@ -230,6 +286,19 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     turns: 0,
     /** 收到的正文增量条数（日志用；也是 TTFT 的判据） */
     deltaCount: 0,
+    /**
+     * 本轮**真的投递过**的插话（2026-10-21；落库进助手消息的 `content.steers`）。
+     *
+     * ⚠️ 只放"进了引擎队列"的那些：还没被通道取走就被撤回的插话根本不会走到这里
+     * （`signalSteerCancel` 在 Redis 列表里就把它删掉了）；被 `clear_queue` 清掉的那些
+     * 由取消钩子在这里摘掉（见 {@link unsubscribeSteerCancel} 的注册处）。
+     */
+    steers: [] as { id: string; message: string; at: string }[],
+    /**
+     * 引擎侧插话队列的**当前快照**（`queue_update.steering`，原始文本）。
+     * 撤回时用它判断"哪些插话还没被模型读走"（不在队列里 = 已读走，撤不回来，也不该从落库清单里摘）。
+     */
+    engineSteering: [] as string[],
     // ── 引擎事件的"可解释性"计数器（`map.ts` 文件头的 known / anomaly）──
     /** 引擎发过、但映射表里没有的事件名（版本漂移）。**只留痕**，不进事件流 */
     unknownEventTypes: new Set<string>(),
@@ -242,6 +311,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
    * 与 ChatBot **同一份实现**（`toolTextOffset.ts`）；`getTextLength` 读本轮的正文累积。
    */
   const toolTextOffsets = createToolTextOffsetTracker(() => round.assistantText.length)
+  /** 思考段号（**与 push 时机解耦**，见 `nextThinkingSegmentKey` 的注释） */
+  const thinkingSegmentState = { seq: 0 }
 
   /**
    * 把"当前 turn"的用量并进总数（判据 ③ 的后半句）。
@@ -380,8 +451,11 @@ export const taskAgentProducer: ChatProducer = async (input) => {
    *   · {@link unsubscribeSteer} —— **用户主动插话**（`POST /:id/steer` → Redis → 通道 → 这里）；
    *   · {@link unsubscribeWorkspaceEdits} —— **工作区主动感知**（人在 agent 跑的时候改了文件
    *     ⇒ 投一句"用户修改了 X（vN），请重读后再继续"）。见下方挂载处的注释。
+   *   · {@link unsubscribeSteerCancel} —— **撤回插话**（2026-10-21；`POST /:id/steer/cancel`
+   *     → 取消哨兵 → 通道 → 这里）：清引擎队列 + 把还没读走的插话从落库清单里摘掉。
    */
   let unsubscribeSteer: (() => void) | null = null
+  let unsubscribeSteerCancel: (() => void) | null = null
   let unsubscribeWorkspaceEdits: (() => void) | null = null
   let outcome: TurnOutcome | null = null
   let failure: unknown = null
@@ -402,8 +476,9 @@ export const taskAgentProducer: ChatProducer = async (input) => {
    */
   let roundStartedAt: Date | null = null
   /**
-   * **发给引擎**的这一轮消息（默认 = 用户原文）。记忆文档有内容时会被前置一条"先读记忆"的指令
-   * （`TaskAgent记忆与产物` 块 1 的读取触发点；见 `memoryDoc.ts#memoryDocReadInstruction`）。
+   * **发给引擎**的这一轮消息（默认 = 用户原文）。容器新建那一轮且记忆文档有内容时会被前置
+   * 一条"先读记忆"的指令（`TaskAgent记忆与产物` 块 1 的读取触发点；见
+   * `memoryDoc.ts#memoryDocReadInstruction`）。
    * ⚠️ **只改这一份** —— 落库仍用 `content` 原文（`persistRoundQuietly`），用户看不到这条指令。
    */
   let engineContent = content
@@ -453,8 +528,18 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       //   插话是锦上添花，投不进去不该把已经跑起来的一轮搞成故障。
       // ⚠️ **注册必须早于派活**（与 ③ 的订阅同一条纪律）：晚一秒，那段窗口里的插话会漏。
       const engine = bridge
-      unsubscribeSteer = input.onSteer((message) => {
-        void engine.steer(message)
+      unsubscribeSteer = input.onSteer((entry) => {
+        // 记进本轮落库清单（`content.steers`）：**真的交给引擎了**才记（见 `round.steers` 的注释）
+        round.steers.push({ id: entry.id, message: entry.message, at: entry.at })
+        void engine.steer(entry.message)
+      })
+      unsubscribeSteerCancel = input.onSteerCancel(() => {
+        // 撤回（2026-10-21）：引擎侧只能整体清空（pi `clear_queue` 没有"删指定一条"），
+        // 所以**还在队列里**的插话全部作废 —— 落库清单里也要同步摘掉（它们没进模型上下文，
+        // 不该出现在历史里）。已经在 `engineSteering` 之外的 = 已被模型读走，撤不回来、保留。
+        const queued = new Set(round.engineSteering)
+        round.steers = round.steers.filter((item) => !queued.has(item.message))
+        void engine.clearQueue()
       })
       unsubscribeWorkspaceEdits = subscribeWorkspaceEvents(conversationId, (event) => {
         const steerMessage = workspaceEditSteerMessage(event)
@@ -468,33 +553,40 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       //     之前**拍，不许收尾之后补 —— 否则"基线"里已经混进了这一轮的产物，对照出来永远为空）
       // ═════════════════════════════════════════════════════════════
       // ★ 「TaskAgent 记忆与产物」块 1：容器回收后 /work 与 pi 的临时记忆都会清空 ⇒ agent 失忆。
-      //   每次派活前**从 DB 现组装**一份记忆（最近几轮对话 + 产物清单）写进容器，
-      //   容器重建 / 复用都能拿到最新的。⚠️ **必须排在拍基线之前**：记忆文件每次都会变，
-      //   写在基线之前它才落在基线里、不会被当成本轮新产物（另有一道隐藏目录兜底，见 memoryDoc.ts）。
+      //   记忆文档是**恢复用的快照**（真值永远在 DB，随时可重新推导）⇒ 只在**真正需要恢复**的
+      //   那一刻写：`handle.reused === false`（容器新建、该轮第一轮）。
+      //   ⚠️ **必须排在拍基线之前**：写在基线之前它才落在基线里、不会被当成本轮新产物
+      //   （另有一道隐藏目录兜底，见 memoryDoc.ts）。
       //   ⚠️ 失败只 warn 不落轮：记忆是本轮的赠品，写不进去 agent 照样能干活。
       //
-      //   ★ P1-17a 修订（2026-10-14）：**只在容器新建那一轮**才让引擎读它。
+      //   ★ P1-17a / P1-21 修订（2026-10-21）：**写与读合并成同一个判断**。
       //     判据 = `handle.reused`：复用同一容器时 pi 的 session（`/tmp/pi-sessions`，tmpfs）
-      //     仍活着、自己持有完整会话状态（工具调用 / thinking / compaction 摘要）⇒ 每轮再读
-      //     memory.md 是冗余的（白烧一次 read 的 token、也让 agent 每轮多一个多余动作）。
+      //     仍活着、自己持有完整会话状态（工具调用 / thinking / compaction 摘要）⇒ 上下文不缺，
+      //     **既不重写文件、也不让引擎读**。pi 是容器主进程（pi 死容器就退，见 `manager.ts`
+      //     的 `engine-exited` 分支）⇒ 容器复用即 session 活着，"新建容器"就等价于"需要恢复"。
       //     容器新建（`reused === false`）时 session 已随之消失 ⇒ 这一轮才是真需要"先读记忆"
       //     以恢复"聊过什么、产出过哪些文件、附件怎么取回"的时刻。
-      //     ⚠️ 文件**照样每轮写**（内容随对话/产物变化，且是 session 卷缺失/损坏时的兜底），
-      //        只是**读取指令**的触发时机收窄到"新建容器那一轮"。
-      //     ⚠️ `hasContent === false`（全新会话第一轮）时仍不加（那句话只会是"读一个空文件"）。
-      try {
-        const memory = await buildMemoryDoc(conversationId)
-        await writeMemoryDoc(handle.containerId, memory.markdown)
-        // 写入成功 + 确有内容 + **本容器是新起的** ⇒ 让引擎先读它。
-        // ⚠️ 只改发给引擎的那份；落库仍是 `content` 原文（见 engineContent 的注释）。
-        if (memory.hasContent && !handle.reused) {
-          engineContent = `${memoryDocReadInstruction()}\n\n${content}`
+      //     ⚠️ 原先的"每轮照样写、只在新建轮读"是自相矛盾的半套设计：多轮里记忆文档每轮都变，
+      //        容器内 hash 去重几乎永不命中，却每轮白付一次 build（7 条查询）+ exec，还把 mtime
+      //        刷成"刚刚更新"（模型最信的"有新东西"线索）。写成"少写一次"没用，**不写**才是对的。
+      //     ⚠️ 代价：复用期间磁盘上的 memory.md 停在容器启动那一刻。它不参与读取判据，只是快照，
+      //        而恢复场景必然伴随新容器重建 —— 届时会从 DB 重新生成，不会丢信息。
+      //     ⚠️ `hasContent === false`（全新会话第一轮）时不加读指令（那只会是"读一个空文件"）。
+      if (!handle.reused) {
+        try {
+          const memory = await buildMemoryDoc(conversationId)
+          await writeMemoryDoc(handle.containerId, memory.markdown)
+          // 确有内容 ⇒ 让引擎先读它。
+          // ⚠️ 只改发给引擎的那份；落库仍是 `content` 原文（见 engineContent 的注释）。
+          if (memory.hasContent) {
+            engineContent = `${memoryDocReadInstruction()}\n\n${content}`
+          }
+        } catch (error) {
+          logger.warn(
+            { err: error, conversationId, containerId: handle.containerId },
+            '记忆文档写入失败（本轮 agent 看不到会话历史与产物清单；派活不受影响）',
+          )
         }
-      } catch (error) {
-        logger.warn(
-          { err: error, conversationId, containerId: handle.containerId },
-          '记忆文档写入失败（本轮 agent 看不到会话历史与产物清单；派活不受影响）',
-        )
       }
 
       // ★ 知识库概览（绑定知识库时）—— 与 ChatBot 的 system prompt **同一段口径**
@@ -564,9 +656,35 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       // ⚠️ **失败不落轮**：拿不到清单只意味着 MCP 工具卡少填一个 `serverId`
       // （`map.ts` 退回 `kind: SANDBOX`），而工具**本身照样能调** ——
       // 容器侧的注册与实际调用都走代理端点，不依赖后端这份内存副本。
+      //
+      // ★ P1-21（2026-10-21）：**活着的容器也要能拿到新清单**。
+      //   已发布的清单可能是"上一轮算的"，而这期间绑定 / 工具缓存可能变过（或是广播那一路漏了）。
+      //   这里的判据是**指纹**（工具名集合，见 `sandbox/catalogSync.ts#catalogFingerprint`）：
+      //     · 指纹一致 ⇒ 什么都不做（最常见的路径，一次 DB 读 + 一次比较）；
+      //     · 指纹不一致 ⇒ **重算并重发布**（`republishSandboxMcpCatalog`），并给这一轮 prompt
+      //       前面注入 `/doubulea:mcp-refresh` —— 容器侧的桥扩展会按新清单 `registerTool` 增删，
+      //       于是"新绑的 MCP / 知识库、刚刷新的工具缓存"**不用重建会话**就能用。
+      //   ⚠️ 注入只影响发给引擎的那份（`engineContent`），落库仍是用户原文（与记忆指令同款手法）。
       let mcpCatalog: SandboxMcpCatalog | null = null
       try {
-        mcpCatalog = await ensureSandboxMcpCatalog(conversationId, agentId)
+        const published = await ensureSandboxMcpCatalog(conversationId, agentId)
+        const publishedNames = [
+          ...Object.keys(published.tools),
+          ...published.builtins.map((tool) => tool.name),
+        ]
+        const fresh = await buildSandboxMcpCatalogPreview(conversationId, agentId)
+        const freshNames = [...Object.keys(fresh.tools), ...fresh.builtins.map((tool) => tool.name)]
+        if (catalogFingerprint(publishedNames) === catalogFingerprint(freshNames)) {
+          mcpCatalog = published
+        } else {
+          const result = await republishSandboxMcpCatalog(conversationId, agentId)
+          mcpCatalog = result.catalog
+          engineContent = `${sandboxMcpRefreshPromptLine()}\n\n${engineContent}`
+          logger.info(
+            { conversationId, agentId, added: result.added, removed: result.removed },
+            '本轮工具清单与容器已注册的不一致 ⇒ 已重发清单并在 prompt 前注入热更新命令',
+          )
+        }
       } catch (error) {
         logger.warn(
           { err: error, conversationId, agentId },
@@ -586,30 +704,62 @@ export const taskAgentProducer: ChatProducer = async (input) => {
             }
 
       /**
-       * 内置工具（知识库）的反查：**认名字**（`knowledge_search` / `list_knowledge` / `read_document`）—— 它们
-       * 不是 MCP、没有 `alias`，判据只有"清单里下发过它"这一条（`resolverCatalog.builtins`）。
-       * 认出来 ⇒ 卡片 `kind: BUILTIN` + 展示名"知识库"（与 ChatBot 路径同一个 kind）。
+       * 内置工具的反查：**先认"清单里下发过它"**（`resolverCatalog.builtins`），再按名字给
+       * `serverName` 分流（知识库 / MCP 工具 / 记忆 / 通知）—— 见 {@link builtinToolServerName}。
+       * 认出来 ⇒ 卡片 `kind: BUILTIN`；认不出 ⇒ 照旧 `kind: SANDBOX`。
+       * ⚠️ 知识库一族与 ChatBot 路径同一个 kind + 同一个展示名；工具网关**不是**知识库。
        */
       const resolveBuiltinTool =
         resolverCatalog === null
           ? undefined
           : (engineToolName: string): EngineBuiltinToolCard | undefined =>
               resolverCatalog.builtins.some((tool) => tool.name === engineToolName)
-                ? { serverName: KNOWLEDGE_TOOL_SERVER_NAME, toolName: engineToolName }
+                ? { serverName: builtinToolServerName(engineToolName), toolName: engineToolName }
                 : undefined
 
       const mapper = createEngineEventMapper({ resolveMcpTool, resolveBuiltinTool })
       unsubscribe = bridge.onEvent((event) => {
         // ★ 先记相位与静默看门狗（只读这一条事件的类型/角色，不影响下面的映射）
         noteEnginePhase(event)
+        // 插话队列快照（2026-10-21）：撤回时用它区分"还在排队"与"已被模型读走"
+        //（`map.ts` 把同一条事件映射成 `steer_queue` 给前端；这里留一份原文给落库清单用）
+        if (event.type === 'queue_update') {
+          const steering = event.steering
+          if (Array.isArray(steering)) {
+            round.engineSteering = steering.filter((item): item is string => typeof item === 'string')
+          }
+        }
         const mapped = mapper.map(event)
         // ── 工具卡**内联定位**：给 `tool_call` 帧（进 SSE 流）与 `toolRecord`（进库）各补一份
         //   `textOffset`。同一 `callId` 的 start/end 两帧共用同一偏移（追踪器记忆）⇒ 卡片流转不跳位置；
         //   落库那份也带 ⇒ 刷新后历史里的卡片仍插在正文对应处。与 ChatBot 共用 `toolTextOffset.ts`。
         const { events, toolRecord } = attachToolTextOffsets(mapped.events, mapped.toolRecord, toolTextOffsets)
+        // ── 思考段**内联定位**（2026-10-21）：段首帧补 `textOffset` / `seq`，与工具卡共用同一条
+        //   内联序列 ⇒ 前端把「思考 A → 工具卡 → 思考 B」按发生顺序排（用户报的正是这一处错位）。
+        //   段 key = `think-{段号}`，只用一次（后续增量沿用首帧位置）。
+        /** 本批里已经分配过段 key 的"段首帧"标记（`events` 里可能有多帧 thinking） */
+        let segmentAssignedInBatch = false
+        const positionedEvents = events.map((frame) => {
+          if (frame.name !== 'thinking') return frame
+          // 段首 = 显式 `newSegment`，或本轮还没有任何思考段（首段不带标记）；
+          // 同一批里只认**第一帧**，其余增量属于该段（避免一次 map 里重复分配段号）
+          const startsSegment =
+            !segmentAssignedInBatch &&
+            (frame.data.newSegment === true || round.thinkingSegments.length === 0)
+          if (!startsSegment) return frame
+          segmentAssignedInBatch = true
+          return {
+            ...frame,
+            data: attachThinkingPosition(
+              { ...frame.data, newSegment: true },
+              nextThinkingSegmentKey(thinkingSegmentState),
+              toolTextOffsets,
+            ),
+          }
+        })
 
         // ── 同步那一半：把"这一轮发生过什么"记下来 ──
-        for (const frame of events) {
+        for (const frame of positionedEvents) {
           if (frame.name === 'delta') {
             round.assistantText += frame.data.text
             round.deltaCount += 1
@@ -627,7 +777,17 @@ export const taskAgentProducer: ChatProducer = async (input) => {
               )
             }
           } else if (frame.name === 'thinking') {
-            round.thinkingText += frame.data.text
+            // 分段累积（2026-10-21）：`newSegment` ⇒ 另起一段（带内联位置），否则接到最后一段
+            if (frame.data.newSegment === true || round.thinkingSegments.length === 0) {
+              round.thinkingSegments.push({
+                text: frame.data.text,
+                textOffset: frame.data.textOffset ?? round.assistantText.length,
+                seq: frame.data.seq ?? round.thinkingSegments.length,
+              })
+            } else {
+              const last = round.thinkingSegments[round.thinkingSegments.length - 1]!
+              last.text += frame.data.text
+            }
           }
         }
         // ── 用量：按引擎的 turn 归集（判据 ③）──
@@ -644,7 +804,10 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         // 同一 turn 内覆盖（`null` 表示这一帧没带，**不该盖掉**已有值）；跨 turn 靠上面那次归位
         if (mapped.usage !== null) round.currentTurnUsage = mapped.usage
         if (toolRecord !== undefined) {
-          round.toolRecords.push(toolRecord)
+          // ⚠️ **同一 `callId` 覆盖、不追加**（P1-21）：引擎的 start/end 是两条事件、各带一条
+          //    `toolRecord`，原先这里 `push` ⇒ 库里一张卡落**两行**（前一行是 `ERROR`、没有 `output`），
+          //    刷新后前端逐条渲染、不合并，卡片就停在"失败/运行中"（用户看到的是"卡住但文件其实改完了"）。
+          round.toolRecords = upsertToolRecord(round.toolRecords, toolRecord)
           // ★ P1-17c（凭据隔离 · 分相）：`bash` 工具一跑"装依赖 / 跑项目"命令，就把这个会话钉进
           //   `run` 相 ⇒ 之后的 git 凭据请求被后端拒绝（`gitProxy.ts` 消费）。异步、尽力而为，
           //   不阻塞本轮回调（写失败只 warn，下次命令还会再试）。
@@ -667,7 +830,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         }
 
         // ── 异步那一半：排队发出去（判据 ②）──
-        enqueue(events, mapped.snapshot)
+        enqueue(positionedEvents, mapped.snapshot)
       })
 
       // ═════════════════════════════════════════════════════════════
@@ -707,6 +870,7 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       stopSilenceWatchdog()
       // 中途插话的两条订阅（P1-9 · P4 · R1）：同款理由 —— 通道与工作区事件总线都活得比一轮久
       unsubscribeSteer?.()
+      unsubscribeSteerCancel?.()
       unsubscribeWorkspaceEdits?.()
       // 工作区**轮次终点**（P1-9 · P4 · R2）：圈定本轮窗口右界（含异常/被停止的轮）。
       // ⚠️ 即便起点没记成（Redis 失败），这里也照记 —— 端点会据"无起点"报明确错误，不会误撤。
@@ -876,7 +1040,10 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     // 附件（P1-4）：随用户消息落库（刷新后气泡上仍能看到当时带过什么）
     attachments: attachmentItemsOf(input.attachments),
     assistantText: round.assistantText,
-    thinkingText: round.thinkingText,
+    thinkingSegments: round.thinkingSegments,
+    // 本轮**真的投递过**的中途插话（2026-10-21）：落进助手消息的 `content.steers`，
+    // 刷新后仍能看到"这一轮我中途补过什么"（撤回掉的已在取消钩子里摘除）
+    steers: round.steers,
     // TaskAgent **不发引用卡**（那一族是 ChatBot 的 rendering）：知识库走**内置工具卡**
     // （`knowledge_search` / `list_knowledge` / `read_document` 经 `/api/sandbox/builtin/call`，见 `proxy.ts`），
     // 结果以 `tool_calls` 落库/展示 ⇒ `citations` 恒为空。这是刻意的口径，不是漏接。

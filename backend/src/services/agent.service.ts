@@ -90,6 +90,7 @@ import {
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
+import { broadcastAgentMcpCatalogChange } from '../sandbox/catalogSync.js'
 import { getPrisma } from '../infra/prisma.js'
 
 /**
@@ -1225,6 +1226,13 @@ export async function replaceAgentComponents(
       { agentId: id, from: current.length, to: desired.length },
       '已整体替换智能体组件绑定',
     )
+    // ★ P1-21：绑定变了 ⇒ 给**这个 Agent 名下活着的会话**重发工具清单（容器下一次派活时
+    //   会看到指纹不一致、注入 `/doubulea:mcp-refresh`，于是新绑的 MCP / 知识库**不用重建会话**）。
+    //   写在事务**之后**、且异步不等待（尽力而为）：广播失败只影响"要不要等下次容器重建"，
+    //   而写库本身必须已经成功。
+    void broadcastAgentMcpCatalogChange(id).catch((error: unknown) => {
+      getLogger().warn({ err: error, agentId: id }, '工具清单广播失败（派活前仍会兜底比对）')
+    })
   } else {
     // ⑤ 没有变化时不写库（这句日志是"确实没写"的可观测痕迹，验收靠行 id 取证，不靠它）
     getLogger().info({ agentId: id, count: desired.length }, '组件绑定未变化，不写库')

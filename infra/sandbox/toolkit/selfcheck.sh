@@ -199,6 +199,29 @@ check 'ripgrep 可跑' bash -c 'rg --version | head -n 1'
 # git 凭据 helper（P1-9 · R11 修订）：两个按需拉取的脚本必须在位且可执行。
 check 'git credential helper 就位可执行' bash -c 'test -x /opt/sandbox-git/git-credential-doubulea.mjs && echo ok'
 check 'git ssh 包装器就位可执行' bash -c 'test -x /opt/sandbox-git/git-ssh-doubulea.mjs && echo ok'
+# ★ P1-21：SSH 的 ProxyCommand 助手（把 ssh 的 stdio 接到 egress 代理的 CONNECT 隧道上）。
+#   容器没有 DNS、没有到公网/内网的路由，SSH 又不读 HTTPS_PROXY ⇒ 没有它，`git clone git@…`
+#   只能靠模型临场写包装脚本（2026-10-19 会话 `01a1386e` 就是这么绕过的）。
+check 'ssh proxy 助手就位可执行' bash -c 'test -x /opt/sandbox-git/ssh-proxy-doubulea.mjs && echo ok'
+# 负向：**没有代理地址**时必须非 0 退出且把原因说出来（绝不能静默"连上了"那种假象）
+if out="$(env -u SANDBOX_SSH_PROXY_URL -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+            /opt/sandbox-git/ssh-proxy-doubulea.mjs example.invalid 22 2>&1)"; then
+  bad '反例不成立：没有代理地址时 ssh proxy 助手居然退出码 0'
+else
+  if printf '%s\n' "$out" | grep -q 'no proxy configured'; then
+    ok '反例成立：没有代理地址 ⇒ 助手非 0 退出并说明原因'
+  else
+    bad '反例不成立：退出码非 0 但没说明"没有代理配置"'
+    printf '%s\n' "$out" | head -n 3 | indent
+  fi
+fi
+# 负向：代理不可达时同样要**明确失败**（而不是挂着等 180s 超时）
+if out="$(SANDBOX_SSH_PROXY_URL='http://127.0.0.1:1' SANDBOX_PROXY_TIMEOUT_MS=2000 \
+            /opt/sandbox-git/ssh-proxy-doubulea.mjs example.invalid 22 2>&1)"; then
+  bad '反例不成立：代理不可达时 ssh proxy 助手居然退出码 0'
+else
+  ok '反例成立：代理不可达 ⇒ 助手失败退出（不静默挂起）'
+fi
 # 行为级负向：没有后端 env 时 helper 必须**安静退出**（绝不吐半截凭据 / 不报错到 stdout）
 check 'helper 无后端 env 时安静退出（不输出任何凭据）' \
   bash -c 'out="$(printf "protocol=https\nhost=x\n" | env -u SANDBOX_BACKEND_URL -u SANDBOX_TOKEN /opt/sandbox-git/git-credential-doubulea.mjs get)"; test -z "$out" && echo ok'

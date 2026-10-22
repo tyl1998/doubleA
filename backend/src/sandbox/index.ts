@@ -27,6 +27,8 @@ export {
   getSandboxStats,
   recycleSandbox,
   touchSandbox,
+  listLiveSandboxConversations,
+  listLiveConversationsOfAgent,
   type AcquireSandboxOptions,
   type SandboxAcquireFailure,
   type SandboxAcquireResult,
@@ -149,8 +151,10 @@ export {
 //    （`02` §4.10），这里导出只为让"这个 listener 上挂了什么"有一个可读的清单。
 export {
   buildSandboxMcpCatalog,
+  buildSandboxMcpCatalogPreview,
   ensureSandboxMcpCatalog,
   registerSandboxProxyRoutes,
+  republishSandboxMcpCatalog,
 } from './proxy.js'
 
 // 别名映射的**纯函数与存取**（P0-3-9b）—— `alias ⇄ serverId` 这张表的唯一读法

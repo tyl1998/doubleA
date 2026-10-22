@@ -49,6 +49,42 @@ export const SANDBOX_INSTANCE_STATE_LABELS: Readonly<Record<SandboxInstanceState
   stale: '心跳超时',
 }
 
+/**
+ * 摘流按钮该显示什么（2026-10-21）：**只挡新会话**，已钉在它上面的会话照常接。
+ *
+ * 抽成纯函数是为了让「按钮文案 / 确认框文案 / 后果说明」三处永远一致 —— 这三处在三个组件里，
+ * 各写一遍就会出现"按钮说恢复、弹窗还说摘流"这类只靠肉眼才能发现的错。
+ */
+export function drainActionView(item: SandboxInstanceItem): {
+  /** `true` = 当前已摘流（按钮应该是「恢复接收」） */
+  drained: boolean
+  /** 按钮文案 */
+  actionLabel: string
+  /** 确认框标题 */
+  confirmTitle: string
+  /** 确认框正文（说清"会发生什么、不会发生什么"） */
+  confirmBody: string
+} {
+  if (item.drained) {
+    return {
+      drained: true,
+      actionLabel: '恢复接收',
+      confirmTitle: `让实例 ${item.instanceId} 重新接收新会话？`,
+      confirmBody:
+        '恢复后网关会重新把它列入新会话的候选（按负载 P2C 挑选）。它名下的已有会话不受影响。生效时间：本机立即，其它机器 ≤ 3× 心跳。',
+    }
+  }
+  return {
+    drained: false,
+    actionLabel: '摘流',
+    confirmTitle: `把实例 ${item.instanceId} 从新会话里摘掉？`,
+    confirmBody:
+      '摘流后网关不再把**新会话**派给它（例如你要手工换镜像、腾空这台机器）。' +
+      '已钉在这台上的会话（容器与工作区都在它本地盘）**仍会继续服务**，不会掉线；' +
+      '这台机器也不会下线（注册键继续续期）。生效时间：本机立即，其它机器 ≤ 3× 心跳。',
+  }
+}
+
 /** 占用率的展示文案（`3/10 · 30%`）；没有负载时说"未知"而不是 `0%` */
 export function slotRatioText(item: SandboxInstanceItem): string {
   if (item.load === null) return '未知'

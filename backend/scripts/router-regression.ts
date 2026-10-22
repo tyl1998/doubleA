@@ -19,13 +19,16 @@ import {
   isAdvertiseAddr,
   instanceTargetOf,
   isLongRunningRoute,
+  isReplayableBodyRoute,
   isSandboxInstanceId,
   mergeUpstreams,
   parseInstanceRegistration,
   parseInstanceRegistrationWithPort,
   parseInstanceLoad,
+  SANDBOX_DRAIN_KEY_PREFIX,
   SANDBOX_INSTANCE_KEY_PREFIX,
   SANDBOX_OWNER_KEY_PREFIX_DEFAULT,
+  sandboxDrainKey,
   sandboxInstanceKey,
   sandboxOwnerKey,
   selectUpstream,
@@ -102,6 +105,14 @@ it('A6 近似路径不误判（/workspaces、/chatty 不是工作区/chat）', (
   eq(classifyRoute('GET', `/api/conversations/${CID}/workspaces`), { kind: 'round-robin' }, 'workspaces')
   eq(classifyRoute('POST', `/api/conversations/${CID}/chatty`), { kind: 'round-robin' }, 'chatty')
 })
+it('★ A8 可重放 body（shared#isReplayableBodyRoute）：只有 POST /chat', () => {
+  eq(isReplayableBodyRoute('POST', `/api/conversations/${CID}/chat`), true, '/chat')
+  eq(isReplayableBodyRoute('post', `/api/conversations/${CID}/chat?x=1`), true, '方法小写 + query')
+  eq(isReplayableBodyRoute('GET', `/api/conversations/${CID}/chat`), false, 'GET 不算')
+  eq(isReplayableBodyRoute('POST', `/api/conversations/${CID}/regenerate`), false, '/regenerate 不带 body，重放＝重跑一轮')
+  eq(isReplayableBodyRoute('PUT', `/api/conversations/${CID}/workspace/file`), false, '工作区写不缓冲（可能几 MB + 丢改风险）')
+  eq(isReplayableBodyRoute('POST', '/api/files'), false, '上传绝不缓冲')
+})
 it('★ A7 长任务路由（shared#isLongRunningRoute）：只有清单内的 POST 才放宽超时', () => {
   eq(isLongRunningRoute('POST', '/api/admin/node/bootstrap'), true, '一键初始化')
   eq(isLongRunningRoute('POST', '/api/admin/node/bootstrap?x=1'), true, '带 query')
@@ -122,6 +133,11 @@ it('B1 会话目录键 = {prefix}:{conversationId}', () => {
 it('B2 实例注册键 = sandbox:instance:{id}', () => {
   eq(sandboxInstanceKey('b'), `${SANDBOX_INSTANCE_KEY_PREFIX}:b`, '实例键')
   eq(SANDBOX_INSTANCE_KEY_PREFIX, 'sandbox:instance', '前缀常量')
+})
+it('★ B2b 摘流标记键 = sandbox:drain:{id}（与注册键**不同族**，心跳不会覆盖它）', () => {
+  eq(sandboxDrainKey('b'), `${SANDBOX_DRAIN_KEY_PREFIX}:b`, '摘流键')
+  eq(SANDBOX_DRAIN_KEY_PREFIX, 'sandbox:drain', '前缀常量')
+  assert(sandboxDrainKey('b') !== sandboxInstanceKey('b'), '两个键不能相同（否则删注册键会顺手恢复摘流）')
 })
 it('B3 实例 id 合法性（非空/无空白/≤120）', () => {
   eq(isSandboxInstanceId('b'), true, '普通')
@@ -289,8 +305,44 @@ it('★ F4 未就绪（ready=false）进 snapshot.unready：网关据此剔除�
   eq(snapshot.upstreams, ['a:13000', 'b:13000', 'c:13000'], '未就绪**仍在上游表**里（摘不摘由网关决定）')
 })
 
-// ───────────────────────────── G 沙箱角色（R1：同一镜像跑后端与网关）─────────────────────────────
+it('★ F5 摘流：由 `sandbox:drain:{id}` 的 **id 列表**映射成地址（不经过注册值）', () => {
+  const reg = (id: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ instanceId: id, advertiseAddr: `${id}:13000`, pid: 1, host: `h-${id}`, startedAt: 1, ...extra })
+  const { snapshot } = buildDiscoverySnapshot(
+    { seed: [] as string[], fallbackPort: 3000, ttlMs: 90_000, now: () => 1_000_000 },
+    [`${SANDBOX_INSTANCE_KEY_PREFIX}:a`, `${SANDBOX_INSTANCE_KEY_PREFIX}:b`, `${SANDBOX_INSTANCE_KEY_PREFIX}:c`],
+    [reg('a'), reg('b'), reg('c', { ready: false })],
+    new Map(),
+    ['b', 'c'],
+  )
+  eq(snapshot.drained, ['b:13000', 'c:13000'], 'id → 地址')
+  eq(snapshot.unready, ['c:13000'], '未就绪与摘流各报各的')
+  eq(snapshot.upstreams, ['a:13000', 'b:13000', 'c:13000'], '摘流**仍在**上游表里（已钉在它上面的会话还要转发过去）')
+})
+it('★ F6 摘流对**旧版本**实例同样生效（这正是 2026-10-21 的实测缺陷）', () => {
+  // 旧版本注册值里没有、也不会读任何摘流字段 —— 摘流必须**不依赖**它自报
+  const legacy = JSON.stringify({ instanceId: 'b', advertiseAddr: 'b:13000', pid: 1, host: 'h', startedAt: 1 })
+  const { snapshot } = buildDiscoverySnapshot(
+    { seed: [] as string[], fallbackPort: 3000, ttlMs: 90_000, now: () => 1_000_000 },
+    [`${SANDBOX_INSTANCE_KEY_PREFIX}:b`],
+    [legacy],
+    new Map(),
+    ['b'],
+  )
+  eq(snapshot.drained, ['b:13000'], '旧注册值照样能被摘流')
+})
+it('★ F7 摘流 id 映射不到地址（实例已下线）⇒ 忽略，不污染 drained', () => {
+  const { snapshot } = buildDiscoverySnapshot(
+    { seed: [], fallbackPort: 3000, ttlMs: 90_000, now: () => 1_000_000 },
+    [`${SANDBOX_INSTANCE_KEY_PREFIX}:a`],
+    [JSON.stringify({ instanceId: 'a', advertiseAddr: 'a:13000', pid: 1, host: 'h', startedAt: 1 })],
+    new Map(),
+    ['gone'],
+  )
+  eq(snapshot.drained, [], '不在线的实例没有可摘的地址')
+})
 
+// ───────────────────────────── G 沙箱角色（R1：同一镜像跑后端与网关）─────────────────────────────
 console.log('── G 沙箱角色（sandbox/roleOverride.ts）──')
 it('★ G1 显式声明优先（compose 给网关写 router）', () => {
   const router = detectSandboxRole({ DOUBULEA_SANDBOX_ROLE: 'router', SANDBOX_IMAGE: 'x:1' }, () => true)

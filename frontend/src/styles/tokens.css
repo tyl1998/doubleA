@@ -46,7 +46,9 @@
   /* --- 字体 ------------------------------------------------------------------------ */
   /* 展示（拉丁）：Archivo —— 无衬线但带工业骨架，避开 Inter/Roboto 一类默认脸 */
   --font-display: "Archivo", "PingFang SC", "Hiragino Sans GB", sans-serif;
-  /* 正文（中文优先）：思源黑体 + IBM Plex Sans */
+  /* 正文（中文优先）：IBM Plex Sans + 系统中文栈。
+     ⚠️ `Noto Sans SC` 仍在链里**纯属兜底**（装了它的机器会更统一），但**不再从 Google Fonts 拉**
+     —— 见 `styles/webfonts.ts` 文件头（内存优化 P6：全量中文字体让每个 tab 付出可观的常驻内存）。 */
   --font-body: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", sans-serif;
   /* 数据/标签/状态/序列号：等宽，全部走 tabular-nums */

@@ -44,6 +44,9 @@ export function ImagePreview({ artifactId, fileName }: ImagePreviewProps) {
         src={artifactContentUrl(artifactId)}
         alt={fileName}
         loading="lazy"
+        // 内存优化 P1（`docs/子方案/前端长会话内存优化.md`）：解码不阻塞渲染。
+        // 弹层里的图**不解码就没得看**，故这里只能做到"异步解码"，懒加载保留（打开前不请求）。
+        decoding="async"
         onError={() => setFailed(true)}
       />
     </div>

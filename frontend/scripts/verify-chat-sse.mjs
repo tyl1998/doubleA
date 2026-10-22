@@ -228,13 +228,23 @@ async function eventNamesOf(response) {
 
 const { SseFrameParser, parseSseFrame, parseSseText } = await import('../src/features/chat/sseParser.ts')
 const { readChatEventStream } = await import('../src/features/chat/chatStream.ts')
-const { beginRound, isSettled, reduceRound, roundToViews, withInterjection } = await import(
+const {
+  beginRound,
+  isSettled,
+  reduceRound,
+  roundToViews,
+  withInterjection,
+  withoutInterjection,
+  withoutQueuedInterjections,
+} = await import(
   '../src/features/chat/roundReducer.ts'
 )
 const { isAssistantEmpty, messageToView, messagesToViews, openingView } = await import(
   '../src/features/chat/messageModel.ts'
 )
-const { remarkToolCards } = await import('../src/features/chat/AssistantMarkdown.tsx')
+const { remarkInlineBlocks, remarkToolCards } = await import(
+  '../src/features/chat/AssistantMarkdown.tsx'
+)
 const { disconnectOf, roundOf, streamingIdsOf, useChatStreamStore } = await import('../src/stores/chatStream.ts')
 const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
@@ -303,7 +313,10 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
   queued: { position: 2 },
   status: { text: '沙箱已就绪，正在启动引擎…' },
   // P1-20：中途插话已投递（发帧让界面看得见）—— 样本必须与 `shared#sseSteerPayloadSchema` 同步
-  steer: { message: '先别改 X，改 Y', at: '2026-09-23T00:00:30.000Z' },
+  // ⚠️ 2026-10-21 起载荷多了 `id`（乐观插入 / 出口帧按 id 去重、取消端点也用它定位）
+  steer: { id: 'steer-1', message: '先别改 X，改 Y', at: '2026-09-23T00:00:30.000Z' },
+  // 2026-10-21：引擎插话队列快照（`queue_update.steering` → `steer_queue`）
+  steer_queue: { messages: ['先别改 X，改 Y'] },
   ping: { ts: '2026-09-23T00:00:00.000Z' },
   done: { messageId: 'msg-1', finishReason: 'COMPLETE', usage: { tokensIn: 10, tokensOut: 20 } },
   error: { code: 'CONFLICT', message: '该会话正在生成中' },
@@ -552,13 +565,30 @@ await it('D2 `delta` 逐字追加（每一步都是新对象）', () => {
   assertEqual(round.status, 'streaming', '仍在流中')
 })
 
-await it('D3 `thinking` 追加到独立字段（与正文互不污染）', () => {
+await it('D3 `thinking` 分段累积（与正文互不污染；`newSegment` 另起一段）', () => {
   let round = beginRound('问题', STARTED_AT)
   round = reduceRound(round, eventOf('thinking', { text: '先' }))
   round = reduceRound(round, eventOf('thinking', { text: '想' }))
   round = reduceRound(round, eventOf('delta', { text: '答案' }))
-  assertEqual(round.assistant.thinking, '先想', '思考段')
+  assertDeepEqual(round.assistant.thinkingSegments.map((segment) => segment.text), ['先想'], '同一段内逐字拼接（一段）')
   assertEqual(round.assistant.text, '答案', '正文段')
+
+  // ★ 2026-10-21：工具调用之后的重新推理 = **新的一段**（不追加到旧段 —— 用户明确要求）
+  round = reduceRound(round, eventOf('tool_call', { callId: 'c-1', toolName: 'read', kind: 'SANDBOX', serverName: '', status: 'SUCCESS' }))
+  round = reduceRound(round, eventOf('thinking', { text: '再想', newSegment: true, textOffset: 2, seq: 1 }))
+  round = reduceRound(round, eventOf('thinking', { text: '想' }))
+  assertDeepEqual(
+    round.assistant.thinkingSegments.map((segment) => segment.text),
+    ['先想', '再想想'],
+    '重新推理另起一段，旧段一字不动',
+  )
+  assertEqual(round.assistant.thinkingSegments[1].seq, 1, '新段带内联序号（与工具卡同一条序列）')
+  assertEqual(round.assistant.thinkingSegments[1].textOffset, 2, '新段带内联偏移（插在工具卡之后）')
+
+  // 渲染：每段一个折叠块；只有最后一段在流式（前面的段落已完成、应自动折叠）
+  const view = roundToViews(round)[1]
+  assertDeepEqual(view.thinkingSegments.map((segment) => segment.text), ['先想', '再想想'], '视图带出分段')
+  assertEqual(view.thinkingSegments.length, 2, '两块（不是一坨）')
 })
 
 await it('D4 `tool_call` 按 callId upsert，且 `RUNNING` 那一帧的缺省 output 不覆盖已有值', () => {
@@ -830,34 +860,69 @@ await it('D12 `roundToViews` 产出"用户 + 助手"两条，顺序与角色正�
   assertEqual(views[1].persisted, true, '持久化判据带出')
 })
 
-await it('D13 `steer` ⇒ 追加用户插话，并在 roundToViews 里渲染成用户气泡（P1-20）', () => {
+await it('D13 `steer` ⇒ 追加用户插话，且渲染在**本轮末尾**（P1-20；2026-10-21 改位置）', () => {
   let round = beginRound('问', STARTED_AT)
   round = reduceRound(round, eventOf('delta', { text: '答' }))
-  round = reduceRound(round, eventOf('steer', { message: '再补一句', at: '2026-09-23T10:00:05.000Z' }))
-  round = reduceRound(round, eventOf('steer', { message: '还有一句', at: '2026-09-23T10:00:06.000Z' }))
+  round = reduceRound(round, eventOf('steer', { id: 's-1', message: '再补一句', at: '2026-09-23T10:00:05.000Z' }))
+  round = reduceRound(round, eventOf('steer', { id: 's-2', message: '还有一句', at: '2026-09-23T10:00:06.000Z' }))
   assertEqual(round.interjections.length, 2, '两条插话都落到 round 上')
   const views = roundToViews(round)
-  assertEqual(views.length, 4, '用户 + 两条插话 + 助手')
-  assertEqual(views.map((view) => view.role).join(','), 'USER,USER,USER,ASSISTANT', '插话渲染成用户气泡（看得见）')
-  assertEqual(views[1].text, '再补一句', '插话正文')
-  assertEqual(views[1].createdAt, '2026-09-23T10:00:05.000Z', '插话时间')
-  assertEqual(views[3].text, '答', '助手仍是最后一条')
+  assertEqual(views.length, 4, '用户 + 助手 + 两条插话')
+  assertEqual(
+    views.map((view) => view.role).join(','),
+    'USER,ASSISTANT,USER,USER',
+    '插话排在助手回答**之后**（用户原话：应该直接在本轮末尾添加，而不是放到回复前）',
+  )
+  assertEqual(views[2].text, '再补一句', '插话正文')
+  assertEqual(views[2].createdAt, '2026-09-23T10:00:05.000Z', '插话时间')
+  assertEqual(views[2].steer, true, '标记为插话（撤回/重新生成的"一轮"判据要跳过它）')
+  assertEqual(views[2].steerId, 's-1', '插话 id 带出（取回编辑靠它定位）')
+  assertEqual(views[2].steerState, 'queued', '流式中默认待接收')
+  assertEqual(views[1].text, '答', '助手正文')
 })
 
-await it('D14 `withInterjection`：乐观插入 + 出口层回帧按正文去重（不显示两遍）', () => {
+await it('D14 `withInterjection`：乐观插入 + 出口层回帧**按 id** 去重（同文不同 id 不吞）', () => {
   let round = beginRound('问', STARTED_AT)
-  // 前端在 `POST /:id/steer` 成功后乐观插入
-  round = withInterjection(round, { text: '补一句', at: '2026-09-23T10:00:05.000Z' })
+  // 前端在 `POST /:id/steer` 成功后乐观插入（用服务端回的 steerId）
+  round = withInterjection(round, { id: 's-1', text: '补一句', at: '2026-09-23T10:00:05.000Z' })
   assertEqual(round.interjections.length, 1, '乐观插入一条')
-  // 出口层随后（真的轮询到）又回同一帧 ⇒ 去重，不追加
-  round = reduceRound(round, eventOf('steer', { message: '补一句', at: '2026-09-23T10:00:05.200Z' }))
-  assertEqual(round.interjections.length, 1, '同正文去重')
-  // 不同的插话照常追加
-  round = reduceRound(round, eventOf('steer', { message: '再补一句', at: '2026-09-23T10:00:06.000Z' }))
-  assertEqual(round.interjections.length, 2, '不同正文追加')
+  // 出口层随后（真的轮询到）又回同一帧 ⇒ 按 id 去重，不追加
+  round = reduceRound(
+    round,
+    eventOf('steer', { id: 's-1', message: '补一句', at: '2026-09-23T10:00:05.000Z' }),
+  )
+  assertEqual(round.interjections.length, 1, '同 id 去重')
+  // 同一句话再插一次是**另一条**（id 不同）⇒ 不吞
+  round = reduceRound(
+    round,
+    eventOf('steer', { id: 's-2', message: '补一句', at: '2026-09-23T10:00:06.000Z' }),
+  )
+  assertEqual(round.interjections.length, 2, '同文不同 id 追加（早先按正文去重会吞掉一条）')
   // 已收口 ⇒ 乐观插入也忽略（收口后不再接受任何内容）
   const done = reduceRound(round, eventOf('done', { messageId: 'm', finishReason: 'COMPLETE', usage: null }))
-  assertSameRef(withInterjection(done, { text: '迟到', at: '2026-09-23T10:00:07.000Z' }), done, '收口后忽略')
+  assertSameRef(withInterjection(done, { id: 's-3', text: '迟到', at: '2026-09-23T10:00:07.000Z' }), done, '收口后忽略')
+})
+
+await it('D15 `steer_queue` ⇒ 不在快照里的插话翻成「已投递」；撤回只动未投递的', () => {
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('steer', { id: 's-1', message: '第一句', at: '2026-09-23T10:00:01.000Z' }))
+  round = reduceRound(round, eventOf('steer', { id: 's-2', message: '第二句', at: '2026-09-23T10:00:02.000Z' }))
+  assertEqual(round.interjections.every((item) => item.state === 'queued'), true, '初始都是待接收')
+  // 引擎队列里只剩第一句 ⇒ 第二句已被读走
+  round = reduceRound(round, eventOf('steer_queue', { messages: ['第一句'] }))
+  assertEqual(round.interjections[0].state, 'queued', '仍在队列 = 待接收')
+  assertEqual(round.interjections[1].state, 'delivered', '不在队列 = 已投递')
+  // 状态只单向翻转：再来一帧把两句都列出来，也不会把已投递的翻回去
+  round = reduceRound(round, eventOf('steer_queue', { messages: ['第一句', '第二句'] }))
+  assertEqual(round.interjections[1].state, 'delivered', '已投递不翻回')
+  // 撤回（scope:one）⇒ 精确移除
+  const one = withoutInterjection(round, 's-1')
+  assertEqual(one.interjections.length, 1, '移除一条')
+  assertEqual(one.interjections[0].id, 's-2', '留下的是另一条')
+  // 撤回（scope:all）⇒ 只清未投递的（已投递的模型读过，撤不回来）
+  const all = withoutQueuedInterjections(round)
+  assertEqual(all.interjections.length, 1, '只剩已投递那条')
+  assertEqual(all.interjections[0].id, 's-2', '已投递的保留')
 })
 
 // ═════════════════════════════ E 组：历史 vs 流式（单一渲染路径）═════════════════════════
@@ -879,6 +944,76 @@ await it('E1 开场白：空白 ⇒ null（不显示空气泡）；有值 ⇒ pl
   assertEqual(view.text, '# 我可以帮你查手册\n* 提问即可', '原文一字不改')
 })
 
+await it('D17 流式不跳位：缺 `seq` 走前端兜底、工具卡 upsert 不抹位置（2026-10-21 用户报"下一轮又变了"）', () => {
+  // ① 旧服务端（帧里完全没有 seq）⇒ 前端按到达顺序兜底，顺序仍与真实发生一致
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('thinking', { text: 'A' }))
+  round = reduceRound(
+    round,
+    eventOf('tool_call', { callId: 'c1', toolName: 'read', serverName: '', kind: 'SANDBOX', status: 'RUNNING', inputSummary: '', textOffset: 0 }),
+  )
+  round = reduceRound(round, eventOf('thinking', { text: 'B', newSegment: true }))
+  assertEqual(round.assistant.thinkingSegments[0].seq, 0, '首段兜底序号 0')
+  assertEqual(round.assistant.tools[0].seq, 1, '工具卡兜底序号 1（在思考 A 之后）')
+  assertEqual(round.assistant.thinkingSegments[1].seq, 2, '思考 B 兜底序号 2（在工具卡之后）')
+
+  // ② 后续帧（SUCCESS）不带位置 ⇒ 不能把首次位置抹掉，否则卡片会在流式中跳位
+  round = reduceRound(
+    round,
+    eventOf('tool_call', { callId: 'c1', toolName: 'read', serverName: '', kind: 'SANDBOX', status: 'SUCCESS', inputSummary: '', output: 'ok' }),
+  )
+  assertEqual(round.assistant.tools[0].seq, 1, 'upsert 后序号保留')
+  assertEqual(round.assistant.tools[0].textOffset, 0, 'upsert 后偏移保留')
+  assertEqual(round.assistant.tools[0].output, 'ok', '输出照常更新')
+
+  // ③ 显式 seq 优先于兜底（服务端给了就以它为准）
+  let withSeq = beginRound('问', STARTED_AT)
+  withSeq = reduceRound(withSeq, eventOf('thinking', { text: 'A', textOffset: 0, seq: 5 }))
+  withSeq = reduceRound(
+    withSeq,
+    eventOf('tool_call', { callId: 'c9', toolName: 'read', serverName: '', kind: 'SANDBOX', status: 'RUNNING', inputSummary: '', textOffset: 0, seq: 9 }),
+  )
+  assertEqual(withSeq.assistant.thinkingSegments[0].seq, 5, '服务端 seq 优先')
+  assertEqual(withSeq.assistant.tools[0].seq, 9, '服务端 seq 优先（工具卡）')
+  assertEqual(withSeq.nextInlineSeq, 10, '兜底计数器被推到显式序号之后')
+})
+
+await it('D16 内联时间线：思考 A → 工具卡 → 思考 B 按 (textOffset, seq) 排（2026-10-21 用户报错位）', () => {
+  const makeTool = (callId, textOffset, seq) => ({
+    callId, textOffset, seq, toolName: 'read_file', serverName: 'fs', kind: 'MCP',
+    status: 'SUCCESS', inputSummary: '/tmp/a', output: 'ok',
+  })
+  const render = (text, tools, segments) => renderToStaticMarkup(React.createElement(Markdown, {
+    remarkPlugins: [remarkGfm, remarkInlineBlocks(tools, segments)],
+    components: {
+      div: ({ node }) => {
+        if (node?.properties?.dataToolId !== undefined) {
+          return React.createElement('aside', { 'data-tool': node.properties.dataToolId })
+        }
+        return React.createElement('section', { 'data-think': node.properties.dataThinkIndex })
+      },
+    },
+  }, text))
+  // 用户描述的场景：发起会话 → 思考A → 调工具 → 重新思考B → 正文
+  const tools = [makeTool('call-1', 0, 1)]
+  const segments = [
+    { text: '思考A', textOffset: 0, seq: 0 },
+    { text: '思考B', textOffset: 0, seq: 2 },
+  ]
+  const html = render('最终回答', tools, segments)
+  assert(html.indexOf('data-think="0"') < html.indexOf('data-tool="call-1"'), '思考 A 在工具卡**之前**')
+  assert(html.indexOf('data-tool="call-1"') < html.indexOf('data-think="1"'), '思考 B 在工具卡**之后**（用户要求的顺序）')
+  assert(html.indexOf('data-think="1"') < html.indexOf('最终回答'), '思考 B 仍在正文之前')
+
+  // 正文增长后的段：插在对应正文位置
+  const html2 = render('前文后文', [], [
+    { text: '思考A', textOffset: 0, seq: 0 },
+    { text: '思考B', textOffset: 2, seq: 1 },
+  ])
+  assert(html2.indexOf('data-think="0"') < html2.indexOf('前文'), '第一段在正文前')
+  assert(html2.indexOf('前文') < html2.indexOf('data-think="1"'), '第二段在前文之后')
+})
+
 await it('E2 历史消息：按 text / thinking / citations 三段取值，坏的一段不炸也不猜', () => {
   const good = messageToView({
     id: 'm-100',
@@ -895,7 +1030,25 @@ await it('E2 历史消息：按 text / thinking / citations 三段取值，坏�
   })
   assertEqual(good.key, 'm-100', 'key 用真实消息 id')
   assertEqual(good.text, '答案', '正文')
-  assertEqual(good.thinking, '想了想', '思考段')
+  assertDeepEqual(good.thinkingSegments.map((segment) => segment.text), ['想了想'], '遗留单段 `thinking` 字符串回落成一段')
+  // 新形态：`thinking_segments` 数组（一轮多段）
+  assertDeepEqual(
+    messageToView({
+      id: 'm-101',
+      conversationId: 'c-1',
+      role: 'ASSISTANT',
+      content: {
+        text: '答案',
+        thinking_segments: [
+          { text: '第一段', textOffset: 0, seq: 0 },
+          { text: '第二段', textOffset: 3, seq: 2 },
+        ],
+      },
+      createdAt: '2026-09-23T09:00:00.000Z',
+    }).thinkingSegments.map((segment) => segment.text),
+    ['第一段', '第二段'],
+    '分段数组原样带出',
+  )
   assertEqual(good.citations.length, 1, '引用段')
   assertEqual(good.status, 'complete', '历史消息恒为 complete')
   assertDeepEqual(good.tools, [], '工具卡历史还原属 P0-2')
@@ -980,7 +1133,7 @@ await it('E3 同一轮对话：流式渲染的形状 == 刷新后从库里读回
     role: 'ASSISTANT',
     content: {
       text: streamed.text,
-      thinking: streamed.thinking,
+      thinking_segments: [...streamed.thinkingSegments],
       citations: streamed.citations ?? undefined,
     },
     createdAt: '2026-09-23T10:00:03.000Z',
@@ -990,7 +1143,7 @@ await it('E3 同一轮对话：流式渲染的形状 == 刷新后从库里读回
   })
 
   // **归一的三个字段必须逐字相等** —— 它们决定"渲染出哪些块、每块写什么"。
-  for (const field of ['role', 'text', 'thinking', 'citations', 'tools', 'artifacts']) {
+  for (const field of ['role', 'text', 'thinkingSegments', 'citations', 'tools', 'artifacts']) {
     assertDeepEqual(persisted[field], streamed[field], `同名字段 ${field}`)
   }
   // ⚠️ `usage` 自 **P1-7** 起**两个来源都有**（流式来自 `done.usage`、历史来自消息行 `tokensIn/Out`）

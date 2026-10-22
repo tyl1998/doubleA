@@ -9,7 +9,7 @@
  * ① 归一化的意义：两条链路 → 同一套事件
  * ─────────────────────────────────────────────────────────────────────
  * ChatBot 走"后端 RAG 编排 + MCP 工具"，TaskAgent 走"沙箱 ACP 引擎 + bash/read/write 工具"
- * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 **13 个**事件 ——
+ * （`01` 决策 5）。两者在**编排层**完成映射，中间层（SSE 出口）只认下面这 **14 个**事件 ——
  * 于是前端只有一套渲染路径，将来接新引擎也不必动前端。
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -109,6 +109,16 @@ export const SSE_EVENT_NAMES = [
    * agent 也像收到了，但聊天界面上看不到 ⇒ "像丢消息"。前端据此在消息流里补一条用户气泡。
    */
   'steer',
+  /**
+   * 引擎侧**插话队列的当前快照**（`steer_queue`，2026-10-21）。
+   *
+   * `messages` = 引擎 `queue_update` 里 `steering` 数组的**原文**（还排队、尚未被模型读到的
+   * 插话正文）。前端据此把插话气泡从「待接收」翻成「已投递」：**不在这个数组里 = 已被读走**。
+   *
+   * ⚠️ 语义与 `tool_output` 同族：**覆盖、纯展示、不落库、不进上下文**。没有它时前端只能
+   * 一直显示"待接收"（引擎何时读到无从得知），"取回编辑"也就无从判断是否还来得及。
+   */
+  'steer_queue',
   /** 心跳（空闲期保活；前端静默忽略） */
   'ping',
   /** 流结束 */
@@ -135,14 +145,35 @@ export type ChatFinishReason = (typeof CHAT_FINISH_REASONS)[number]
 /** SSE 响应的 Content-Type（含 charset —— 中文增量必须明确编码，否则有的客户端按 latin-1 解） */
 export const SSE_CONTENT_TYPE = 'text/event-stream; charset=utf-8'
 
-// ───────────────────────────── 13 个事件的 payload ─────────────────────────────
+// ───────────────────────────── 14 个事件的 payload ─────────────────────────────
 
 /** `delta`：助手回答文本增量 */
 export const sseDeltaPayloadSchema = z.object({ text: z.string() })
 export type SseDeltaPayload = z.infer<typeof sseDeltaPayloadSchema>
 
-/** `thinking`：思考过程增量（`reasoning_content` / `reasoning` 两种上游写法的归一化结果，见 `llm/client.ts`） */
-export const sseThinkingPayloadSchema = z.object({ text: z.string() })
+/**
+ * `thinking`：思考过程增量（`reasoning_content` / `reasoning` 两种上游写法的归一化结果，见 `llm/client.ts`）。
+ *
+ * `newSegment`（2026-10-21）：这一帧的文本属于**新的思考段** —— 一轮里模型每请求一次就是一段
+ * （工具调用之后的"重新推理"是**独立的一段**，不是接着上一段写）。前端据此另起一个折叠块，
+ * 落库按段存（`conversation.ts#messageContentSchema` 的 `thinking_segments`）。
+ *
+ * ⚠️ 为什么不在文案里插一条"分隔线"了：那是把新推理**并回旧块**（用户明确否决："重新推理
+ * 不该追加到之前的旧推理窗口上"）。分段是结构，不是文案。
+ */
+export const sseThinkingPayloadSchema = z.object({
+  text: z.string(),
+  /** `true` = 这一帧开启新的思考段（工具调用之后的重新推理）；只在段首帧出现 */
+  newSegment: z.boolean().optional(),
+  /**
+   * 段首帧的**内联位置**（2026-10-21）：`textOffset` = 这一段开始时的正文字符数、
+   * `seq` = 出现在本轮内联时间线上的序号。与 `tool_call.textOffset/seq` **同一条序列**
+   * ⇒ 前端能把「思考 A → 工具卡 → 思考 B」按发生顺序插进正文（用户要求）。
+   * 只在**段首帧**带（后续增量沿用段首位置）。
+   */
+  textOffset: z.number().int().nonnegative().optional(),
+  seq: z.number().int().nonnegative().optional(),
+})
 export type SseThinkingPayload = z.infer<typeof sseThinkingPayloadSchema>
 
 /**
@@ -270,12 +301,27 @@ export type SseStatusPayload = z.infer<typeof sseStatusPayloadSchema>
 /**
  * `steer`：一条**已投递给运行中 agent 的用户插话**（P1-9 · P4 · R1）。
  *
+ * `id` = 这条插话的稳定标识（服务端在入队时生成，`POST /:id/steer` 的响应带回同一个值）——
+ * 前端的乐观插入与这一帧据此**按 id 去重**（早先按正文去重：同一句话插两次会被吞掉一条）。
  * `message` = 插话正文原文（与 `POST /api/conversations/:id/steer` 的请求体一致）；
- * `at` = 出口层派发这一刻（ISO 8601，前端当用户气泡的时间）。⚠️ 它是**一次性事件**、不落库：
- * 插话是"投给引擎的一句话"，落库属另一件事（`done` 时整条落库不含它，见 `status` 的同款说明）。
+ * `at` = 入队时刻（ISO 8601，前端当用户气泡的时间；早先是"派发这一刻"，会晚一个轮询周期）。
  */
-export const sseSteerPayloadSchema = z.object({ message: z.string(), at: z.string() })
+export const sseSteerPayloadSchema = z.object({
+  id: z.string(),
+  message: z.string(),
+  at: z.string(),
+})
 export type SseSteerPayload = z.infer<typeof sseSteerPayloadSchema>
+
+/**
+ * `steer_queue`：引擎侧插话队列的**当前快照**（2026-10-21）。
+ *
+ * 来源 = pi 的 `queue_update.steering`（`docs/rpc-commands.md#steer` 对应的入队/出队确认事件）。
+ * 前端只做一件事：**不在 `messages` 里的插话 = 已被模型读走** ⇒ 气泡从「待接收」翻成「已投递」，
+ * 并收起「取回编辑」（读走之后引擎不支持撤回）。
+ */
+export const sseSteerQueuePayloadSchema = z.object({ messages: z.array(z.string()) })
+export type SseSteerQueuePayload = z.infer<typeof sseSteerQueuePayloadSchema>
 
 /**
  * `ping`：心跳。
@@ -336,6 +382,7 @@ export const SSE_PAYLOAD_SCHEMAS = {
   queued: sseQueuedPayloadSchema,
   status: sseStatusPayloadSchema,
   steer: sseSteerPayloadSchema,
+  steer_queue: sseSteerQueuePayloadSchema,
   ping: ssePingPayloadSchema,
   done: sseDonePayloadSchema,
   error: sseErrorPayloadSchema,
@@ -463,11 +510,41 @@ export type SteerConversationBody = z.infer<typeof steerConversationBodySchema>
  * **幂等**（与 `/stop` 同款）：`accepted:false` = "当前没有正在生成的回答"（流刚好结束的竞态码必然存在），
  * **不是错误** —— 做成 4xx 只会让用户看到一条没有信息量的报错。
  * `accepted:true` = 这条插话确实写给了**一个正在跑的流**（它会在下一个助手 turn 边界读到）。
+ * `steerId` = 入队时生成的稳定标识（`accepted:false` 时为 `null`）；前端乐观插入与
+ * 出口层 `steer` 帧按它去重，取消端点也用它定位。
  */
 export const steerConversationResultSchema = z.object({
   id: z.string(),
   accepted: z.boolean(),
+  steerId: z.string().nullable(),
 })
+
+/**
+ * `POST /api/conversations/:id/steer/cancel` 请求体（**2026-10-21，插话撤回**）。
+ *
+ * 定位一条插话并尽量撤回。撤回是**尽力而为**——引擎侧的插话队列只支持整体清空
+ * （pi `clear_queue`，没有"删指定一条"），所以：
+ *   · 还没被通道取走 ⇒ 精确移除这一条（`scope:'one'`）；
+ *   · 已被取走、还在引擎队列里 ⇒ 清空整个插话队列（`scope:'all'`，同轮的其他未投递插话**也会被清**）；
+ *   · 已经被模型读走 ⇒ 撤不回来（`cancelled:false`）。
+ */
+export const steerCancelBodySchema = z.object({
+  id: z.string({ required_error: '缺少插话标识' }).min(1, '缺少插话标识'),
+})
+export type SteerCancelBody = z.infer<typeof steerCancelBodySchema>
+
+/**
+ * `POST /api/conversations/:id/steer/cancel` 的响应。
+ *
+ * `cancelled:false` = 没有可撤的（流已结束 / 这条已被模型读走），**不是错误**（与 `/steer` 幂等同款）。
+ * `scope`：`one` = 只撤了这一条；`all` = 清空了整个引擎插话队列（同轮其他未投递插话一并失效）。
+ */
+export const steerCancelResultSchema = z.object({
+  id: z.string(),
+  cancelled: z.boolean(),
+  scope: z.enum(['one', 'all']),
+})
+export type SteerCancelResult = z.infer<typeof steerCancelResultSchema>
 export type SteerConversationResult = z.infer<typeof steerConversationResultSchema>
 
 // ───────────────────────────── 确认应答（P0-2-10）─────────────────────────────

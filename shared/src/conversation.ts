@@ -600,6 +600,15 @@ export const toolCallRecordSchema = z.object({
    * 省略时兼容旧消息，前端按历史口径将其放在正文前。
    */
   textOffset: z.number().int().min(0).optional(),
+  /**
+   * 本轮**内联时间线**上的出现序号（2026-10-21；与 `thinkingSegmentSchema.seq` **共用同一序列**）。
+   *
+   * 与 {@link textOffset} 的分工：偏移决定"插在哪段正文之间"，序号决定"**同一偏移**时谁先谁后"。
+   * 典型场景 = 思考 A 之后紧接着一次工具调用（此时正文还没动，两者偏移相同）——
+   * 没有 `seq` 就只能按数组顺序碰运气（用户报的就是"思考 B 跑到工具卡前面"）。
+   * 省略 = 旧消息（前端回落到"偏移相同则工具卡在前"的历史口径）。
+   */
+  seq: z.number().int().min(0).optional(),
   /** 结果文本（`RUNNING` 时没有；与回填给模型的**是同一份**，见 `chatContext#truncateToolResult`） */
   output: z.string().optional(),
   /**
@@ -908,13 +917,34 @@ export const fileIdParamsSchema = z.object({
 export type FileIdParams = z.infer<typeof fileIdParamsSchema>
 
 /**
+ * 一条**本轮中途插话**（`steer`）的落库形态（2026-10-21）。
+ *
+ * 落点 = **助手消息**的 `content.steers[]`（插话语义上属于"这一轮"，而一轮的落库行就是那条助手消息；
+ * 用户消息行只有一条、且早于插话发生）。渲染时它排在助手气泡**之后**（与流式侧
+ * `roundToViews` 的顺序一致 —— 同一轮"我说了什么、它答了什么、我中途补了什么"可读）。
+ *
+ * · `id` = 服务端入队时生成的稳定标识（与 `steer` 事件帧、取消端点同源）；
+ * · `message` = 插话正文原文；`at` = 入队时刻（ISO 8601）。
+ *
+ * ⚠️ 只落**真的投递过**的插话（被撤回且未投递的不在此列）；"是否已被模型读走"不落库
+ * （历史视图不显示投递状态 —— 那一轮已经结束，状态没有意义）。
+ */
+export const steerRecordSchema = z.object({
+  id: z.string().min(1),
+  message: z.string(),
+  at: z.string(),
+})
+export type SteerRecord = z.infer<typeof steerRecordSchema>
+
+/**
  * 一条消息的 `content`（jsonb）—— **写入与读取的唯一形态**（`02` §三：`content(jsonb)`）。
  *
  * 设计口径（三条，都是"改了就会让历史读不出来"的）：
  *   · **`text` 必填**（可以是空串）：它是历史重建时唯一进入 LLM 上下文的部分
  *     （`orchestrator/chatContext.ts#selectHistoryMessages`）—— 缺了它，多轮对话就断了。
- *   · `thinking` / `citations` / `tool_calls` / `artifacts` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
+ *   · `thinking_segments` / `citations` / `tool_calls` / `artifacts` **可选而非默认 `[]`/`''`**：省掉这个键表示"这一段本来就没有"，
  *     与"它有但是空的"在界面上是两件事（思考折叠区 / 引用区 / 工具区该不该出现）。
+ *     （`thinking` 是它的**遗留单段形态**，只读兼容，见字段注释。）
  *   · `attachments` 已在 **P1-4** 定型（见 {@link attachmentItemSchema}）：只出现在 USER 消息上，
  *     `files` 表 + 上传端点 + 前端渲染三处都落地。`tool_calls` 已在 **P0-2-8** 定型
  *     （见 {@link toolCallRecordSchema}）、`artifacts` 已在 **P0-3-7** 定型（见 {@link artifactItemSchema}）
@@ -925,15 +955,51 @@ export type FileIdParams = z.infer<typeof fileIdParamsSchema>
  *     见文件头 ⑥）⇒ 将来加段不必回头改这里，也不会有"刷新之后卡片少了一块"的风险。
  *     本 schema 的用途因此收窄为：**写入端**（`chatBot.ts#buildAssistantContent`）的形态约束。
  */
+/**
+ * 一段思考在**内联时间线**上的位置（2026-10-21）。
+ *
+ * 一轮里模型可能请求多次，正文、思考段、工具卡在同一轮里交替出现；三者要按发生顺序插进
+ * 同一条流里，靠的就是这一对 `(textOffset, seq)`：
+ *   · `textOffset` = 这一段开始时**正文写到第几个字符**（与 `toolCallRecordSchema.textOffset` 同口径）；
+ *   · `seq` = 本轮内联条目的**出现序号**（思考段与工具卡**共用一个递增序列**）——
+ *     同偏移时的先后只靠它（典型：思考 A 与紧随其后的工具卡偏移相同，A 必须先出）。
+ *
+ * 落库后刷新仍按同一顺序渲染（读取端 `messageModel` 把两族条目合成一条时间线）。
+ */
+export const thinkingSegmentSchema = z.object({
+  text: z.string(),
+  // ⚠️ 可省：旧消息 / 手工构造的数据可能没有位置信息 ⇒ 渲染端按 `(0, 0)` 兜底
+  textOffset: z.number().int().nonnegative().optional(),
+  seq: z.number().int().nonnegative().optional(),
+})
+export type ThinkingSegment = z.infer<typeof thinkingSegmentSchema>
+
 export const messageContentSchema = z.object({
   text: z.string(),
+  /**
+   * ⚠️ **遗留字段（只读兼容）**：P0-1-29 起的"一整段思考"。2026-10-21 起新写入只写
+   * {@link thinking_segments}（一轮多段）—— 读取端（`messageModel`）两条路都认：
+   * 数组走分段、字符串当"单段"。**不要**再往这里写新数据。
+   */
   thinking: z.string().optional(),
+  /**
+   * 本轮思考的**分段**（2026-10-21 定型；每段一次模型请求里的推理，顺序 = 发生顺序）。
+   * 省键 = 本轮没有思考。为什么是数组：一轮里模型可能请求多次（工具调用后重新推理），
+   * 每一段在界面上是**各自独立的折叠块**，且**与工具卡同一条内联时间线**（见
+   * {@link thinkingSegmentSchema} —— 用户要求"思考 B 应排在工具卡之后"）。
+   */
+  thinking_segments: z.array(thinkingSegmentSchema).optional(),
   citations: z.array(citationItemSchema).optional(),
   tool_calls: z.array(toolCallRecordSchema).optional(),
   /** 本轮产出文件（P0-3-7；TaskAgent 专属 —— ChatBot 恒省略这个键） */
   artifacts: z.array(artifactItemSchema).optional(),
   /** 本轮用户消息携带的附件（**P1-4 定型**；只出现在 USER 消息上，见 {@link attachmentItemSchema}） */
   attachments: z.array(attachmentItemSchema).optional(),
+  /**
+   * 本轮**中途插话**（2026-10-21 定型；只出现在 ASSISTANT 消息上，见 {@link steerRecordSchema}）。
+   * 省键 = 本轮没有插话。
+   */
+  steers: z.array(steerRecordSchema).optional(),
   /** 本轮实际使用的模型（产品优化 2026-09-29；ChatBot 写入，见 {@link messageModelSegmentSchema}） */
   model: messageModelSegmentSchema.optional(),
 })

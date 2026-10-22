@@ -23,7 +23,13 @@
  *   （Redis `SCAN` + 定时轮询），因此回归脚本可以只测纯函数、不必起 Redis。
  */
 
-import { mergeUpstreams, parseInstanceRegistrationWithPort, SANDBOX_INSTANCE_KEY_PREFIX } from '@doubulea/shared'
+import {
+  isSandboxInstanceId,
+  mergeUpstreams,
+  parseInstanceRegistrationWithPort,
+  SANDBOX_DRAIN_KEY_PREFIX,
+  SANDBOX_INSTANCE_KEY_PREFIX,
+} from '@doubulea/shared'
 import type { InstanceLoad, InstanceRegistration, UpstreamCandidate } from '@doubulea/shared'
 
 /**
@@ -71,6 +77,15 @@ export interface DiscoverySnapshot {
    * ⚠️ 只收 `ready === false`；`undefined`（老版本没上报 / 非 taskAgent 档位）**不算**未就绪。
    */
   unready: string[]
+  /**
+   * **已摘流**的地址（注册值 `drained === true`；2026-10-21 运维摘流）。
+   *
+   * ⚠️ 与 {@link unready} 刻意分开：两者都"不接**新**会话"，但
+   *    · `unready` 里全是未就绪时，网关会**退回完整表**（`gateway.ts`：宁可试一台也不 503）；
+   *    · 摘流不能走那条退路 —— 运维按着不让它接新活时，把它塞回候选等于**点了没反应**。
+   *    所以 `gateway.ts` 只把摘流项从 **owner 候选**里剔除（粘性命中仍然照常转发，见那里的注释）。
+   */
+  drained: string[]
   /** 本轮成功解析出的实例注册项数（`/health` 用：读的人要能看出"自动发现到底看见了几台"） */
   registrations: number
   /** 最近一次成功扫描的时刻（epoch ms）；从未成功为 `undefined` */
@@ -102,6 +117,15 @@ export function buildDiscoverySnapshot(
   keys: readonly string[],
   values: ReadonlyArray<string | null>,
   seenAt: ReadonlyMap<string, number>,
+  /**
+   * 本轮 `SCAN sandbox:drain:*` 读到的**实例 id**（2026-10-21 运维摘流）。
+   *
+   * ⚠️ 摘流**不经过**注册值（不是被摘那台"自报"）：标记键在共享 Redis 里，网关与后台页
+   *    各自直接读它 ⇒ ① 被摘那台跑的是**旧版本**也立刻生效（它不会读标记、不会上报）；
+   *    ② 不依赖心跳节奏（少一拍就少延迟一个周期）；③ 判据只有一处（键在不在）。
+   *    曾经让心跳把 `drained` 写进注册值的做法已废弃（2026-10-21 实测：容器里的旧实例永不生效）。
+   */
+  drainedInstanceIds: readonly string[] = [],
 ): { snapshot: DiscoverySnapshot; nextSeenAt: Map<string, number> } {
   const now = (options.now ?? Date.now)()
   const nextSeenAt = new Map(seenAt)
@@ -132,6 +156,7 @@ export function buildDiscoverySnapshot(
   const targets: Record<string, string> = {}
   const loads: Record<string, { load: InstanceLoad; stale: boolean }> = {}
   const unready: string[] = []
+  const drained: string[] = []
   const loadStaleMs = options.loadStaleMs ?? 0
   for (const registration of registrations) {
     targets[registration.instanceId] = registration.advertiseAddr
@@ -142,12 +167,18 @@ export function buildDiscoverySnapshot(
     //    前者才是负载的年龄（心跳停了但键还没 TTL 掉时，负载会如实变旧）。
     loads[registration.advertiseAddr] = { load: registration.load, stale: now - registration.load.sampledAt > loadStaleMs }
   }
+  // 摘流 id → 地址（地址映射不到 = 该实例已不在线，摘流无从生效，忽略）
+  for (const instanceId of drainedInstanceIds) {
+    const target = targets[instanceId]
+    if (target !== undefined && !drained.includes(target)) drained.push(target)
+  }
   return {
     snapshot: {
       upstreams: ordered,
       discovered: merged.discovered,
       stale,
       unready,
+      drained,
       registrations: registrations.length,
       lastScanAt: now,
       targets,
@@ -159,6 +190,28 @@ export function buildDiscoverySnapshot(
     },
     nextSeenAt,
   }
+}
+
+/**
+ * 读一遍**摘流标记**（`SCAN sandbox:drain:*`；返回实例 id 列表）。
+ *
+ * ⚠️ 只 `SCAN` 不 `GET`：标记的语义就是"键在不在"，值内容不参与判定（值是 `1`，但没人读它）。
+ * ⚠️ 与 {@link readInstanceRegistrations} 分成两个函数：**标记的读者不该依赖注册值能不能解析**
+ *    —— 一台注册值写坏了也该能被摘流排除。
+ */
+export async function readInstanceDrainMarks(redis: InstanceRegistryReader): Promise<string[]> {
+  const pattern = `${SANDBOX_DRAIN_KEY_PREFIX}:*`
+  const ids: string[] = []
+  let cursor = '0'
+  do {
+    const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', '100')
+    cursor = next
+    for (const key of batch) {
+      const instanceId = key.slice(SANDBOX_DRAIN_KEY_PREFIX.length + 1)
+      if (isSandboxInstanceId(instanceId) && !ids.includes(instanceId)) ids.push(instanceId)
+    }
+  } while (cursor !== '0')
+  return ids
 }
 
 /** 读一遍注册表（`SCAN` 全量；数量级 = 实例数，几十个以内） */
@@ -198,6 +251,7 @@ export class InstanceDiscovery {
       discovered: [],
       stale: [],
       unready: [],
+      drained: [],
       registrations: 0,
       targets: {},
       loads: {},
@@ -214,7 +268,13 @@ export class InstanceDiscovery {
   async refresh(): Promise<DiscoverySnapshot> {
     try {
       const { keys, values } = await readInstanceRegistrations(this.reader)
-      const { snapshot, nextSeenAt } = buildDiscoverySnapshot(this.options, keys, values, this.seenAt)
+      // 摘流标记：单独一次 SCAN（同一连接、同一轮）。失败 ⇒ 当作"没有摘流"，
+      // **不**让整轮发现失败（看见实例比尊重摘流更基础：Redis 抖一下不该让上游表空掉）。
+      const drainedInstanceIds = await readInstanceDrainMarks(this.reader).catch((error: unknown) => {
+        this.log({ scope: 'router', level: 'warn', event: 'drain-scan-failed', err: describeError(error) })
+        return [] as string[]
+      })
+      const { snapshot, nextSeenAt } = buildDiscoverySnapshot(this.options, keys, values, this.seenAt, drainedInstanceIds)
       this.seenAt = nextSeenAt
       const changed =
         snapshot.upstreams.length !== this.snapshot.upstreams.length ||
@@ -246,4 +306,9 @@ export class InstanceDiscovery {
     if (this.timer !== undefined) clearInterval(this.timer)
     this.timer = undefined
   }
+}
+
+/** 错误 → 单行（日志里不带堆栈） */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

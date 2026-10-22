@@ -70,6 +70,7 @@ import {
   fetchConversationActive,
   flattenMessagePages,
   invalidateMyConversations,
+  cancelSteerConversation,
   steerConversation,
   stopConversation,
   streamChat,
@@ -101,6 +102,16 @@ export type SendOutcome = { ok: true } | { ok: false; error: unknown }
  * `signaled: false` 同款。`ok: false` 才是真失败（网络 / 信封错误），调用方给一句提示并把正文还回输入框。
  */
 export type SteerOutcome = { ok: true; accepted: boolean } | { ok: false; error: unknown }
+
+/**
+ * `cancelSteer`（撤回插话，2026-10-21）的结果。
+ *
+ * `cancelled:false` **不是错误**（幂等）：流刚好结束 / 这条已被模型读走。
+ * `scope:'all'` = 引擎侧队列被整体清空（同轮其他未投递插话一并作废，见 `shared#steerCancelResultSchema`）。
+ */
+export type CancelSteerOutcome =
+  | { ok: true; cancelled: boolean; scope: 'one' | 'all' }
+  | { ok: false; error: unknown }
 
 /**
  * "新会话态"在闸门 / 发送中标记里用的**哨兵键**（`conversationId` 还是 `undefined` 时）。
@@ -165,6 +176,12 @@ export interface UseChatStreamResult {
    * 返回 `{ ok:true, accepted:false }` = 流刚好结束（**幂等，不是错误**）。
    */
   steer: (message: string) => Promise<SteerOutcome>
+  /**
+   * 撤回一条插话（2026-10-21；插话气泡上的「取回编辑」）。
+   * 只在**还没被模型读走**时提供入口（判据在前端：`steerState === 'queued'`）。
+   * 成功时同步把本轮插话清单里对应条目移除（`scope:'all'` 时移除所有未投递的）。
+   */
+  cancelSteer: (steerId: string) => Promise<CancelSteerOutcome>
   /**
    * 拉取历史对齐（`03` §4.1："点击黄条 = 立即拉取历史对齐"）。
    * 返回值是**对齐的结论**（服务端存下来了 / 没有这一轮 / 服务端还在生成），页面据此提示；
@@ -579,11 +596,44 @@ export function useChatStream(
       // ★ 乐观插入（P1-20）：插话常常发生在轮次的最后几秒，出口层的 `steer` 回帧依赖"通道轮询在
       //   轮次结束前取到"，可能整个落空 ⇒ 界面上"插话直接消失了"。用户说过的话必须看得见 ⇒
       //   **展示以本地为准**（`accepted:true` = 确实写给了一个正在跑的流）。出口层若真回了帧，
-      //   归约层按正文去重（`withInterjection`），不会显示两遍。
-      if (result.accepted) {
-        useChatStreamStore.getState().addInterjection(targetId, text, new Date().toISOString())
+      //   归约层按 **id** 去重（`withInterjection`，2026-10-21 起；早先按正文去重会吞掉同句两插），
+      //   不会显示两遍。
+      // 乐观插入用**服务端给的 id**（2026-10-21）：出口层 `steer` 帧随后按同一个 id 去重；
+      // 「取回编辑」也用它定位。`steerId` 为 null（理论上只有 `accepted:false` 才会）⇒ 不插入。
+      if (result.accepted && result.steerId !== null) {
+        useChatStreamStore.getState().addInterjection(targetId, {
+          id: result.steerId,
+          text,
+          at: new Date().toISOString(),
+        })
       }
       return { ok: true, accepted: result.accepted }
+    } catch (error) {
+      return { ok: false, error }
+    }
+  }, [])
+
+  /**
+   * 撤回一条插话（2026-10-21）。**服务端尽力撤回**（见 `cancelSteerConversation`）：
+   *   · `scope:'one'` ⇒ 只移除这一条；
+   *   · `scope:'all'` ⇒ 引擎队列整体清空 ⇒ 本轮所有**未投递**的插话一起移除；
+   *   · `cancelled:false` ⇒ 撤不回来（已被模型读走 / 流已结束）—— **本地也不删**（诚实优先）。
+   *
+   * ⚠️ 与 `steer` 不同，它**不乐观**：只有服务端确认撤回成功才动本地清单 —— 否则会出现
+   * "界面上没了、模型却已经读过"（用户会以为 agent 不该知道那句话）。
+   */
+  const cancelSteer = useCallback(async (steerId: string): Promise<CancelSteerOutcome> => {
+    const targetId = conversationIdRef.current
+    if (targetId === undefined) {
+      return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法撤回插话', 0) }
+    }
+    try {
+      const result = await cancelSteerConversation(targetId, steerId)
+      const store = useChatStreamStore.getState()
+      if (!result.cancelled) return { ok: true, cancelled: false, scope: result.scope }
+      if (result.scope === 'all') store.removeQueuedInterjections(targetId)
+      else store.removeInterjection(targetId, steerId)
+      return { ok: true, cancelled: true, scope: result.scope }
     } catch (error) {
       return { ok: false, error }
     }
@@ -629,6 +679,7 @@ export function useChatStream(
     regenerate,
     stop,
     steer,
+    cancelSteer,
     align: alignAndClear,
   }
 }

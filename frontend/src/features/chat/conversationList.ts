@@ -179,6 +179,19 @@ export function groupConversationViews(
   items: readonly ConversationItem[],
   now: Date,
   streamingIds: ReadonlySet<string>,
+  /**
+   * 上一轮的分组结果（可选；内存优化 P6）。给出来时**只重建有变化的组与行**：
+   *   · 某个分组一行都没变 ⇒ 返回**同一个对象**，渲染时整组 `memo` 命中、DOM 不动；
+   *   · 某一行长得一样 ⇒ 返回**同一个视图对象**，行组件 `memo` 命中。
+   *
+   * ⚠️ 为什么需要它：`ConvRail` 每 60s（`useMinuteTick`）以及**任何一轮流式帧**（`rounds`
+   * 变化 ⇒ `streamingIds` 重算）都会重跑本函数 —— 按旧写法这一圈会为 100 条会话**新建 100 个
+   * 视图对象**，于是每行都重渲染一次、每个 `<Tooltip>` / `<Tag>` 都重走一遍。长会话里
+   * 流式期间这是每秒几十次的纯浪费（还会产生大量短命对象给 GC）。
+   *
+   * ⚠️ 判据必须逐字段比较（不能用引用比较）：`items` 来自网络，翻页 / 失效重取后是全新对象。
+   */
+  previous?: readonly ConversationGroup[],
 ): ConversationGroup[] {
   const today: ConversationListItemView[] = []
   const earlier: ConversationListItemView[] = []
@@ -187,13 +200,67 @@ export function groupConversationViews(
     const reference = item.lastMessageAt ?? item.createdAt
     const at = new Date(reference)
     const isToday = Number.isNaN(at.getTime()) || calendarDayDiff(now, at) <= 0
-    ;(isToday ? today : earlier).push(conversationItemView(item, now, streamingIds))
+    ;(isToday ? today : earlier).push(
+      reuseListItemView(conversationItemView(item, now, streamingIds), previous),
+    )
   }
 
   const groups: ConversationGroup[] = []
-  if (today.length > 0) groups.push({ label: CONVERSATION_GROUP_TODAY, items: today })
-  if (earlier.length > 0) groups.push({ label: CONVERSATION_GROUP_EARLIER, items: earlier })
+  if (today.length > 0) groups.push(reuseGroup(CONVERSATION_GROUP_TODAY, today, previous))
+  if (earlier.length > 0) groups.push(reuseGroup(CONVERSATION_GROUP_EARLIER, earlier, previous))
+  // 整体没变 ⇒ 返回上一份（让 `useMemo` 的消费者也停在同一个引用上）
+  if (previous !== undefined && sameGroups(groups, previous)) return previous as ConversationGroup[]
   return groups
+}
+
+/** 行视图的**逐字段**相等（见 {@link groupConversationViews} 的 `previous`） */
+function sameListItemView(a: ConversationListItemView, b: ConversationListItemView): boolean {
+  return (
+    a.id === b.id &&
+    a.title === b.title &&
+    a.led === b.led &&
+    a.state === b.state &&
+    a.time === b.time &&
+    a.agentId === b.agentId &&
+    a.agentName === b.agentName &&
+    a.agentType === b.agentType
+  )
+}
+
+/** 在上一轮结果里找到同 id 且逐字段相同的行，复用它的对象引用 */
+function reuseListItemView(
+  next: ConversationListItemView,
+  previous: readonly ConversationGroup[] | undefined,
+): ConversationListItemView {
+  if (previous === undefined) return next
+  for (const group of previous) {
+    for (const item of group.items) {
+      if (item.id === next.id && sameListItemView(item, next)) return item
+    }
+  }
+  return next
+}
+
+/** 组内逐项引用都相同 ⇒ 复用上一轮的组对象（`label` 由调用方保证同源） */
+function reuseGroup(
+  label: string,
+  items: ConversationListItemView[],
+  previous: readonly ConversationGroup[] | undefined,
+): ConversationGroup {
+  if (previous === undefined) return { label, items }
+  const before = previous.find((group) => group.label === label)
+  if (before === undefined) return { label, items }
+  if (before.items.length !== items.length) return { label, items }
+  for (let index = 0; index < items.length; index += 1) {
+    if (before.items[index] !== items[index]) return { label, items }
+  }
+  return before
+}
+
+/** 两组列表是否"长得一样"（组数、标签、每项引用） */
+function sameGroups(next: readonly ConversationGroup[], previous: readonly ConversationGroup[]): boolean {
+  if (next.length !== previous.length) return false
+  return next.every((group, index) => group === previous[index])
 }
 
 /** 行内重命名的校验结果：`null` 表示"这次提交不成立"（按钮该是灰的、且不发请求） */

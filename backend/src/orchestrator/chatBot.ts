@@ -89,6 +89,7 @@ import {
   type RetrievalHit,
   type SseEvent,
   type SseToolCallPayload,
+  type SteerRecord,
   type ToolCallRecord,
   type ToolCallStatus,
 } from '@doubulea/shared'
@@ -151,7 +152,11 @@ import { runMemoryExtraction } from './memoryExtract.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from './memoryTools.js'
 import { chatBotSlots } from './load.js'
 import { persistRoundQuietly } from './persist.js'
-import { createToolTextOffsetTracker } from './toolTextOffset.js'
+import {
+  attachThinkingPosition,
+  createToolTextOffsetTracker,
+  type ToolTextOffsetTracker,
+} from './toolTextOffset.js'
 import {
   ChatStoppedError,
   abortReasonOf,
@@ -197,7 +202,17 @@ export const chatBotProducer: ChatProducer = async (input) => {
    * —— 标志位与"到底哪条路走到了哪里"容易对不上，而控制流不会。
    */
   let assistantText = ''
-  let thinkingText = ''
+  /**
+   * 本轮思考**分段**（2026-10-21）：一段 = 一次上游调用里的推理。
+   * 「工具循环之后的下一次上游调用」的推理是**新的一段**（不追加到旧段）。
+   */
+  const thinkingSegments: { text: string; textOffset: number; seq: number }[] = []
+  /**
+   * 思考段号计数器（2026-10-21）：**不能**用 `thinkingSegments.length` 当段 key ——
+   * 段号与 push 时机耦合时，"首段"与"新段"可能算出同一个 key，导致后一段复用前一段的内联位置
+   * （前端表现为「重新推理」与工具卡换位，与 TaskAgent 的 `nextThinkingSegmentKey` 同一修法）。
+   */
+  let thinkingSegmentNo = 0
   /**
    * 本轮引用卡条目。
    *
@@ -222,6 +237,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
    * 对 bridge/通道订阅同一条纪律（通道活得比一轮久，不退就是漏监听器）。
    */
   let unsubscribeSteer: (() => void) | null = null
+  /** 撤回插话的退订句柄（2026-10-21；同款"注册在 try 内、退订在 finally"） */
+  let unsubscribeSteerCancel: (() => void) | null = null
+  /**
+   * 本轮已经**真的注入上下文**的插话（2026-10-21；落进助手消息的 `content.steers`）。
+   * ChatBot 的"投递"= 塞进 `messages` —— 攒在 `steerInbox` 里只是"待投递"，不算数
+   * （撤回的就是这一批，见取消钩子）。
+   */
+  const steers: SteerRecord[] = []
 
   try {
     const db = getPrisma()
@@ -237,9 +260,16 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 就没有"下一步"可注入 —— 与 pi 的 steer 一致（没有下个 turn 就不投）；界面那一帧 `steer`
      * 已经由通道发出（用户仍看得到自己插的话）。
      */
-    const steerInbox: string[] = []
-    unsubscribeSteer = input.onSteer((message) => {
-      steerInbox.push(message)
+    const steerInbox: { id: string; message: string; at: string }[] = []
+    unsubscribeSteer = input.onSteer((entry) => {
+      steerInbox.push(entry)
+    })
+    /**
+     * 撤回插话（2026-10-21）：ChatBot 的"引擎队列"就是 `steerInbox` —— 还没注入上下文的
+     * 全部作废即可（已注入的不回收：模型可能已经读过，回滚上下文会与后续回答对不上）。
+     */
+    unsubscribeSteerCancel = input.onSteerCancel(() => {
+      steerInbox.length = 0
     })
 
     // ── ②″ 会话行（owner + 会话级「不记入记忆」；长期记忆注入与收尾提取都要用）──
@@ -414,11 +444,15 @@ export const chatBotProducer: ChatProducer = async (input) => {
     }
 
     /** 发一张工具卡（同一 `callId` 多次推送 = 状态机流转；前端按 `callId` upsert） */
-    const toolTextOffsets = createToolTextOffsetTracker(() => assistantText.length)
-    const withToolTextOffset = <T extends { callId: string }>(payload: T): T & { textOffset: number } => ({
-      ...payload,
-      textOffset: toolTextOffsets.offsetFor(payload.callId),
-    })
+    // 内联定位追踪器与**思考段共用**（2026-10-21）：`seq` 在同一条序列上递增 ⇒
+    // 前端能把「思考 A → 工具卡 → 思考 B」按发生顺序排（同偏移时序号定先后）。
+    const toolTextOffsets: ToolTextOffsetTracker = createToolTextOffsetTracker(() => assistantText.length)
+    const withToolTextOffset = <T extends { callId: string }>(
+      payload: T,
+    ): T & { textOffset: number; seq: number } => {
+      const { textOffset, seq } = toolTextOffsets.positionFor(payload.callId)
+      return { ...payload, textOffset, seq }
+    }
     const emitToolCard = (payload: SseToolCallPayload): void => {
       enqueue({ name: 'tool_call', data: withToolTextOffset(payload) })
     }
@@ -496,10 +530,21 @@ export const chatBotProducer: ChatProducer = async (input) => {
     try {
       for (;;) {
         const limit = config.limits.toolLoopLimit
+        /**
+         * 本次上游调用不是本轮第一次（前面跑过工具循环）⇒ 它的思考是**新的一段**。
+         * 惰性（见 `onThinking`）：这一轮没有思考就没有新段，不会凭空造出空折叠块。
+         */
+        let pendingThinkingSegment = upstreamRounds > 0
         // 中途插话（P1-20）：把这一轮以来收到的插话在**下一次 LLM 调用前**注入（= 助手 turn 边界）。
         // ⚠️ 排在拼本轮 `messages` 之后、`chatStream` 之前 —— 顺序即"模型看得到"。
+        // 注入即"投递"：记进本轮落库清单（`content.steers`），并告诉界面队列已清空
+        // （`steer_queue` 快照 —— 前端据此把「待接收」翻成「已投递」、收起「取回编辑」）。
         if (steerInbox.length > 0) {
-          for (const message of steerInbox.splice(0)) messages.push({ role: 'user', content: message })
+          for (const entry of steerInbox.splice(0)) {
+            messages.push({ role: 'user', content: entry.message })
+            steers.push({ id: entry.id, message: entry.message, at: entry.at })
+          }
+          enqueue({ name: 'steer_queue', data: { messages: [] } })
         }
         /**
          * "还允不允许要工具"（见文件头 ④①）：到上限后就**当轮撤掉 `tools`** + 注入提示。
@@ -552,7 +597,24 @@ export const chatBotProducer: ChatProducer = async (input) => {
               enqueue({ name: 'delta', data: { text: clean } })
             },
             onThinking: (text) => {
-              thinkingText += text
+              // 分段（2026-10-21）：这一轮不是首次上游调用 ⇒ 本次的第一帧标 `newSegment` 并带
+              // **内联位置**（与工具卡共用追踪器），前端另起一个折叠块、插在正文/卡片之间，
+              // 不追加到上一次推理（与 TaskAgent 的 `map.ts` 同一口径）。
+              const startsSegment = pendingThinkingSegment || thinkingSegments.length === 0
+              if (pendingThinkingSegment) pendingThinkingSegment = false
+              if (startsSegment) {
+                const positioned = attachThinkingPosition(
+                  { text, newSegment: true },
+                  `think-${thinkingSegmentNo}`,
+                  toolTextOffsets,
+                )
+                thinkingSegmentNo += 1
+                thinkingSegments.push(positioned)
+                enqueue({ name: 'thinking', data: positioned })
+                return
+              }
+              const last = thinkingSegments[thinkingSegments.length - 1]!
+              last.text += text
               enqueue({ name: 'thinking', data: { text } })
             },
             /**
@@ -1134,9 +1196,11 @@ export const chatBotProducer: ChatProducer = async (input) => {
       // 附件（P1-4）：随用户消息落库，刷新后用户气泡里仍能看到当时带过什么
       attachments: attachmentItemsOf(input.attachments),
       assistantText,
-      thinkingText,
+      thinkingSegments,
       citations,
       toolRecords,
+      // 本轮真的注入过上下文的插话（2026-10-21；撤回的从未进这里）
+      steers,
       // 产品优化 2026-09-29：把"本轮实际用的模型"记进助手消息的 content.model 段，
       // 重进会话时头部模型选择器据此回显（`input.target` 就是闸门解析出来的那个目标）。
       model: {
@@ -1225,6 +1289,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
   } finally {
     // 中途插话（P1-20）：通道活得比一轮久 ⇒ 本轮收尾必须退订（与 TaskAgent 退订 bridge 订阅同款）。
     unsubscribeSteer?.()
+    unsubscribeSteerCancel?.()
     release()
   }
 }

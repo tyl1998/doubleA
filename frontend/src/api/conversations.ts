@@ -47,6 +47,7 @@ import type {
   RemoveConversationResult,
   SetConversationAutoApproveResult,
   SseEvent,
+  SteerCancelResult,
   SteerConversationResult,
   StopConversationResult,
 } from '@doubulea/shared'
@@ -333,6 +334,23 @@ export function steerConversation(conversationId: string, message: string): Prom
   return request<SteerConversationResult>(
     `/api/conversations/${encodeURIComponent(conversationId)}/steer`,
     { method: 'POST', body: { message } },
+  )
+}
+
+/**
+ * 撤回一条中途插话（`POST /api/conversations/:id/steer/cancel`，**2026-10-21**）。
+ *
+ * 用户侧 = 插话气泡上的「取回编辑」（只在**还没被模型读走**时提供）。
+ * 服务端尽力撤回：`scope:'one'` = 只撤了这一条；`scope:'all'` = 清空了引擎插话队列
+ * （同轮其他未投递插话一并作废）；`cancelled:false` = 流已结束 / 已被读走（**不是错误**）。
+ */
+export function cancelSteerConversation(
+  conversationId: string,
+  steerId: string,
+): Promise<SteerCancelResult> {
+  return request<SteerCancelResult>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/steer/cancel`,
+    { method: 'POST', body: { id: steerId } },
   )
 }
 

@@ -16,19 +16,22 @@
  */
 
 import {
+  AppError,
   mergeUpstreams,
   parseInstanceRegistrationWithPort,
   SANDBOX_INSTANCE_KEY_PREFIX,
   sandboxInstancesResultSchema,
+  type SandboxDrainResult,
   type SandboxInstanceItem,
   type SandboxInstancesResult,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { resolveEnvFile } from '../config.js'
-import { ensureRedisConnected } from '../infra/redis.js'
+import { getLogger } from '../infra/logger.js'
+import { ensureRedisConnected, sandboxDrainedKey, sandboxInstanceKey } from '../infra/redis.js'
 import { loadRouterConfig, resolveRouterEnvFile } from '../router/config.js'
-import { readInstanceRegistrations } from '../router/discovery.js'
+import { readInstanceDrainMarks, readInstanceRegistrations } from '../router/discovery.js'
 import { detectSandboxRole } from '../sandbox/roleOverride.js'
 
 /**
@@ -49,6 +52,10 @@ export async function listSandboxInstances(
   try {
     const redis = await ensureRedisConnected()
     const { keys, values } = await readInstanceRegistrations(redis)
+    // ★ 摘流标记**直接读键**（2026-10-21 修正）：不依赖被摘那台的心跳上报 ——
+    //   容器里的实例可能跑的是旧版本（不会读标记），页面也必须立刻显示"已摘流"。
+    //   读失败 ⇒ 空集（页面不因此报错：摘流状态读不到比"实例列表读不到"轻得多）。
+    const drainMarks = new Set(await readInstanceDrainMarks(redis).catch(() => [] as string[]))
     for (let index = 0; index < keys.length; index += 1) {
       const key = keys[index]
       if (key === undefined) continue
@@ -76,6 +83,8 @@ export async function listSandboxInstances(
                 needsRelay: registration.needsRelay === true,
                 missing: registration.missing ?? [],
               },
+        // 摘流 = `sandbox:drain:{id}` 键存在（与网关自动发现**同一个事实来源**）
+        drained: drainMarks.has(registration.instanceId),
       })
     }
     items = items.sort((left, right) => left.instanceId.localeCompare(right.instanceId))
@@ -103,6 +112,46 @@ export async function listSandboxInstances(
     loadStaleMs,
     error,
   })
+}
+
+/**
+ * 摘流 / 恢复（`POST /api/admin/sandbox/instances/:id/drain`，**仅 ADMIN**；2026-10-21）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么不能直接删 `sandbox:instance:{id}`
+ * ─────────────────────────────────────────────────────────────────────
+ * 那个键由**那台实例自己**的心跳续期：删掉后一个心跳周期就长回来了 —— 删键不是"摘流"，
+ * 只是一次会自愈的抖动。真正能"留住"的只有两种写法：
+ *   · 在**被摘那台自己**的进程里改状态（要么重启，要么有端点打到它）；
+ *   · 写一个**它每拍心跳都会读**的外部标记 —— 就是这里做的（`sandbox:drain:{id}`）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 语义刻意收窄：只挡**新会话**
+ * ─────────────────────────────────────────────────────────────────────
+ * `drained` 只让网关**不再把它当新 owner 的候选**；已钉在这台的会话（`sandbox:owner:*` 指向它、
+ * 工作区/容器都在它本地盘）仍照常接。想连它们也挪走，要等空闲回收或重启这台 ——
+ * 那是"迁移"（§4 的 P3），不是"摘流"。
+ *
+ * ⚠️ **摘流不等于下线**：它的注册键继续续期（网关仍然"看得见"它），`/health` 仍会轮到它。
+ *    这是刻意的：摘流是运维的**软手段**（比如要手工换镜像、不想接新活），不是故障。
+ *
+ * @returns 写完之后**目标实例**的摘流状态
+ * @throws `AppError.notFound`（404）：目标实例不在注册表里。摘一台不存在的机器没有意义，
+ *   而且十有八九是 id 敲错了 —— 静默写入只会留下一个永远没人读的脏键。
+ */
+export async function setSandboxInstanceDrained(instanceId: string, drained: boolean): Promise<SandboxDrainResult> {
+  const redis = await ensureRedisConnected()
+  const registered = await redis.exists(sandboxInstanceKey(instanceId))
+  if (registered === 0) {
+    throw AppError.notFound(`实例 ${instanceId} 不在在线注册表里（可能已下线，或 id 写错）`)
+  }
+  const key = sandboxDrainedKey(instanceId)
+  if (drained) await redis.set(key, '1')
+  else await redis.del(key)
+  getLogger().info({ instanceId, drained }, '实例摘流标记已更新（drained=true ⇒ 网关不再派新会话给它）')
+  // ⚠️ 不需要"让被摘那台刷新注册值"：摘流状态由 `sandbox:drain:{id}` 这个**键**直接表达，
+  //   页面（本接口）与网关（自动发现）各自读它 ⇒ 写完立刻可见，与对方的版本/心跳无关。
+  return { instanceId, drained }
 }
 
 /** 网关的静态种子（`ROUTER_UPSTREAMS`）。读不到 / 没配 ⇒ 空数组（不报错：本端点仍要能列发现的实例） */

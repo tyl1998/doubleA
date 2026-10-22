@@ -8,6 +8,15 @@
  * 先用系统栈把界面画出来，字体到了再升级 —— 而不是让首屏等它。
  *
  * 落地形态：React 挂载后再插 `<link>`。脚本插入的样式表**不参与首屏阻塞**。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ⚠️ **不再拉 Noto Sans SC**（内存优化 P6，`docs/子方案/前端长会话内存优化.md`）
+ * ─────────────────────────────────────────────────────────────────────
+ * 它是**全量中文字体**（Google 的 css2 会按 `unicode-range` 拆成上百个分片，实际下载量
+ * 在几 MB 量级），而且中文本来就由系统字体承接（见上段与 `design/README.md` §八 的回退链）。
+ * 拉它的唯一收益是"少数没装中文系统字体的环境字形更统一"，代价是每个 tab 都要为它付出
+ * 字体解码 / 缓存的常驻内存 —— 长会话场景下这笔交换不成立。中文栈原样保留在 `tokens.css`
+ * （`PingFang SC` / `Microsoft YaHei` …），观感不受影响。
  */
 
 /** 字形来源与 `design/*.html` 的 `<link>` 完全一致（改这里就等于改全部页面的字体口径） */
@@ -15,7 +24,7 @@ const WEBFONT_HREF =
   'https://fonts.googleapis.com/css2?family=Archivo:wght@700;800' +
   '&family=IBM+Plex+Mono:wght@400;500;600' +
   '&family=IBM+Plex+Sans:wght@400;500;600' +
-  '&family=Noto+Sans+SC:wght@400;500;700&display=swap'
+  '&display=swap'
 
 /**
  * 幂等：重复调用只插一次（React StrictMode 下 effect 会跑两遍）。

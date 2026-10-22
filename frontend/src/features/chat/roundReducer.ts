@@ -53,7 +53,16 @@ export type RoundStatus = 'streaming' | 'stopped' | 'complete' | 'error'
 /** 流式助手消息的累积内容（一帧一帧长出来） */
 export interface StreamAssistant {
   text: string
-  thinking: string
+  /**
+   * 思考过程**分段**（2026-10-21）：一段 = 一次模型请求里的推理。`thinking` 帧带 `newSegment`
+   * 时另起一段（「工具调用之后的重新推理」不追加到旧段），并带**内联位置**
+   * （`textOffset` / `seq`，与工具卡共用一条序列）⇒ 渲染时按发生顺序插在正文/卡片之间。
+   */
+  thinkingSegments: {
+    text: string
+    textOffset?: number
+    seq?: number
+  }[]
   /** `null` = 还没有 `citations` 事件（**与"有引用但为空"不同**，见 `messageModel.ts`） */
   citations: CitationItem[] | null
   tools: ToolCallView[]
@@ -154,13 +163,26 @@ export interface StreamRound {
    */
   statusText: string | null
   /**
+   * 本轮内联时间线的**下一个兜底序号**（2026-10-21）。
+   *
+   * 服务端会给思考段/工具卡带 `seq`（二者共用一条序列）；但旧服务端、或某帧漏带时前端不能
+   * 退回"按数组下标"——那会随 upsert / 到达顺序变化，表现就是**块在流式中跳位置**。
+   * 兜底 = 前端自己也维护一个单调计数器：没带 `seq` 的条目取 `nextInlineSeq`，带了就以其为准
+   * 并把计数器推到它之后（保证后续兜底值不会插到已有序号前面）。
+   */
+  nextInlineSeq: number
+  /**
    * 本轮**投递给运行中 agent 的用户插话**（`steer` 事件，P1-9 · P4 · R1；P1-20 起发帧）。
    *
    * ⚠️ 存在的唯一理由：**让插话在聊天界面看得见**。产品反馈："插话发出去后 agent 像收到了，
    * 但聊天界面看不到这条插话（像丢消息）"。每条插话在消息流里渲染成一条用户气泡
    * （见 `roundToViews`），于是"我插了这句话"与 agent 的后续回答对得上。
+   *
+   * `state`（2026-10-21）：`queued` = 还在引擎插话队列里（前端显示「待接收」+「取回编辑」）；
+   * `delivered` = 不在 `steer_queue` 快照里了（模型读走 / ChatBot 注入完毕）⇒ 状态翻成「已投递」、
+   * 收起「取回编辑」（引擎不支持回滚已投递的消息）。
    */
-  interjections: { text: string; at: string }[]
+  interjections: { id: string; text: string; at: string; state: 'queued' | 'delivered' }[]
 }
 
 /** 开一轮（用户按下发送、且流已经成功建立时调用） */
@@ -175,7 +197,8 @@ export function beginRound(
     userText,
     userAttachments,
     startedAt,
-    assistant: { text: '', thinking: '', citations: null, tools: [], artifacts: [] },
+    assistant: { text: '', thinkingSegments: [], citations: null, tools: [], artifacts: [] },
+    nextInlineSeq: 0,
     status: 'streaming',
     error: null,
     errorSource: null,
@@ -204,10 +227,59 @@ export function isSettled(round: StreamRound): boolean {
  *    `clearSteerSignal` 把积压清掉 ⇒ 既没投给模型、也没发帧 ⇒ 界面上"插话直接消失了"。
  *    所以**展示以本地为准**（用户说过的话一定要看得见），出口层那一帧只当"确认送达"的第二次来源。
  */
-export function withInterjection(round: StreamRound, item: { text: string; at: string }): StreamRound {
+export function withInterjection(
+  round: StreamRound,
+  item: { id: string; text: string; at: string },
+): StreamRound {
   if (isSettled(round)) return round
-  if (round.interjections.some((existing) => existing.text === item.text)) return round
-  return { ...round, interjections: [...round.interjections, item] }
+  // ⚠️ **按 id 去重**（2026-10-21 起）：早先按正文去重 ⇒ 同一句话插两次会被吞掉一条。
+  const existing = round.interjections.find((entry) => entry.id === item.id)
+  if (existing !== undefined) {
+    // 已存在（乐观插入先到 / 或反过来）：只补/刷新状态，不重复追加
+    return round
+  }
+  return {
+    ...round,
+    interjections: [...round.interjections, { ...item, state: round.status === 'streaming' ? 'queued' : 'delivered' }],
+  }
+}
+
+/**
+ * 用引擎插话队列快照（`steer_queue`）刷新每条插话的投递状态（2026-10-21）。
+ *
+ * 判据只有一条：**不在队列里 = 已被模型读走**（`delivered`）。
+ * ⚠️ 只做单向翻转（queued → delivered）：引擎不会把已投递的再放回队列；
+ * 反过来写会让状态在两次快照之间来回跳。
+ */
+export function withSteerQueue(round: StreamRound, queued: readonly string[]): StreamRound {
+  if (isSettled(round)) return round
+  if (round.interjections.length === 0) return round
+  const pending = new Set(queued)
+  let changed = false
+  const next = round.interjections.map((entry) => {
+    if (entry.state === 'delivered') return entry
+    if (pending.has(entry.text)) return entry
+    changed = true
+    return { ...entry, state: 'delivered' as const }
+  })
+  return changed ? { ...round, interjections: next } : round
+}
+
+/** 撤回一条插话（2026-10-21；取消端点返回 `scope:'one'` 时用）。找不到 = 原样返回 */
+export function withoutInterjection(round: StreamRound, id: string): StreamRound {
+  const next = round.interjections.filter((entry) => entry.id !== id)
+  if (next.length === round.interjections.length) return round
+  return { ...round, interjections: next }
+}
+
+/**
+ * 撤掉**所有还没投递**的插话（取消端点返回 `scope:'all'` 时用：引擎只支持整体清空，
+ * 所以"还在排队"的那几条都已作废；已投递的保留 —— 模型读过，撤不回来）。
+ */
+export function withoutQueuedInterjections(round: StreamRound): StreamRound {
+  const next = round.interjections.filter((entry) => entry.state === 'delivered')
+  if (next.length === round.interjections.length) return round
+  return { ...round, interjections: next }
 }
 
 /**
@@ -230,37 +302,79 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
       return round
 
     case 'delta':
+      // ⚠️ 空增量**不产生新对象**（内存优化 P5）：`apply` 用 `next === round` 判"没有可见变化"，
+      //    返回同一引用就一次重渲染都不会发生。上游偶尔会发 `delta{text:''}`（心跳式的保活帧），
+      //    早先它会让整棵消息列表白重渲染一次 —— 长会话里这类白帧是纯浪费。
+      if (event.data.text === '') {
+        return round.statusText === null ? round : { ...round, statusText: null }
+      }
       return {
         ...round,
         statusText: null,
         assistant: { ...round.assistant, text: round.assistant.text + event.data.text },
       }
 
-    case 'thinking':
+    case 'thinking': {
+      // 分段累积（2026-10-21）：`newSegment` ⇒ 另起一段（带内联位置）；否则接到最后一段。
+      // 段内仍是字符串拼接（同一段内本来就是逐字增量）。
+      const segments = round.assistant.thinkingSegments
+      const startsSegment = event.data.newSegment === true || segments.length === 0
+      // 段首的序号：服务端给的为准；没给就用前端的兜底计数器（见 `nextInlineSeq` 的注释）
+      const seq = startsSegment ? (event.data.seq ?? round.nextInlineSeq) : null
+      const nextInlineSeq = seq === null ? round.nextInlineSeq : Math.max(round.nextInlineSeq, seq + 1)
+      const next = startsSegment
+        ? [
+            ...segments,
+            {
+              text: event.data.text,
+              ...(event.data.textOffset === undefined ? {} : { textOffset: event.data.textOffset }),
+              ...(seq === null ? {} : { seq }),
+            },
+          ]
+        : [
+            ...segments.slice(0, -1),
+            { ...segments[segments.length - 1]!, text: segments[segments.length - 1]!.text + event.data.text },
+          ]
       return {
         ...round,
         statusText: null,
-        assistant: { ...round.assistant, thinking: round.assistant.thinking + event.data.text },
+        nextInlineSeq,
+        assistant: { ...round.assistant, thinkingSegments: next },
       }
+    }
 
     case 'tool_call': {
       // 同一个 `callId` 多次推送 = 状态机流转（RUNNING → SUCCESS/ERROR）⇒ **upsert**，不是追加
       const next = toolViewFromEvent(event.data)
       const index = round.assistant.tools.findIndex((tool) => tool.callId === next.callId)
       if (index === -1) {
+        // 首次见到这张卡：序号以服务端为准，缺省用前端的兜底计数器（同 `nextInlineSeq`）
+        const seq = next.seq ?? round.nextInlineSeq
         return {
           ...round,
           statusText: null,
-          assistant: { ...round.assistant, tools: [...round.assistant.tools, next] },
+          nextInlineSeq: Math.max(round.nextInlineSeq, seq + 1),
+          assistant: {
+            ...round.assistant,
+            tools: [...round.assistant.tools, { ...next, seq }],
+          },
         }
       }
       const tools = [...round.assistant.tools]
-      // `output` 可省：`RUNNING` 那一帧没有它 ⇒ **保留旧值**，别把它抹成 undefined
       const previous = tools[index]
-      tools[index] =
-        next.output === undefined && previous?.output !== undefined
-          ? { ...next, output: previous.output }
-          : next
+      // ⚠️ 内联位置**只增不减**（2026-10-21）：`textOffset` / `seq` 在首次出现时定死，
+      //    后续帧（RUNNING → SUCCESS）若没带或带了不同的值，都不能让卡片"跳位置"
+      //    —— 这正是流式中看到"卡一下跑到上面去"的来源之一。`output` 同款：可省。
+      tools[index] = {
+        ...next,
+        ...(next.textOffset === undefined && previous?.textOffset !== undefined
+          ? { textOffset: previous.textOffset }
+          : {}),
+        ...(next.seq === undefined && previous?.seq !== undefined ? { seq: previous.seq } : {}),
+        ...(next.output === undefined && previous?.output !== undefined
+          ? { output: previous.output }
+          : {}),
+      }
       return { ...round, statusText: null, assistant: { ...round.assistant, tools } }
     }
 
@@ -310,8 +424,16 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
     case 'steer':
       // 中途插话（P1-20）：**追加**一条用户插入（不清 `statusText`、不动助手内容）——
       // 它由出口层在"把插话投递给 agent"时发来，是"用户确实插了这句话"的第二重证据；
-      // 与前端乐观插入的那条**按正文去重**（见 `withInterjection`）。
-      return withInterjection(round, { text: event.data.message, at: event.data.at })
+      // 与前端乐观插入的那条**按 id 去重**（见 `withInterjection`）。
+      return withInterjection(round, {
+        id: event.data.id,
+        text: event.data.message,
+        at: event.data.at,
+      })
+
+    case 'steer_queue':
+      // 引擎插话队列快照（2026-10-21）：不在快照里的插话 = 已被模型读走（见 `withSteerQueue`）
+      return withSteerQueue(round, event.data.messages)
 
     case 'done':
       return {
@@ -351,14 +473,14 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
   }
 }
 
-/** 一轮对话 → 消息列表（**用户 + 本轮插话 + 助手**），顺序与流里出现的顺序一致 */
+/** 一轮对话 → 消息列表（**用户 + 助手 + 本轮插话**），顺序与用户在界面上期待的阅读顺序一致 */
 export function roundToViews(round: StreamRound): ChatMessageView[] {
   return [
     {
       key: 'stream:user',
       role: 'USER',
       text: round.userText,
-      thinking: '',
+      thinkingSegments: [],
       citations: null,
       tools: [],
       artifacts: [],
@@ -366,27 +488,11 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       createdAt: null,
       status: 'complete',
     },
-    // 中途插话（P1-20）：每条渲染成一条用户气泡 ⇒ 用户看得见"我插了这句话"（不再像丢消息）。
-    // ⚠️ 放在主用户消息之后、助手消息之前：它们是**本轮运行中**陆续插入的，但助手正文在这里是
-    //    一坨整篇（`round.assistant.text`）⇒ 无法按时刻插进它内部；排在它前面是"这轮我先后说了
-    //    这几句，然后它给了回答"的可读近似。
-    ...round.interjections.map((item, index) => ({
-      key: `stream:steer:${index}`,
-      role: 'USER' as const,
-      text: item.text,
-      thinking: '',
-      citations: null,
-      tools: [],
-      artifacts: [],
-      attachments: [],
-      createdAt: item.at,
-      status: 'complete' as const,
-    })),
     {
       key: 'stream:assistant',
       role: 'ASSISTANT',
       text: round.assistant.text,
-      thinking: round.assistant.thinking,
+      thinkingSegments: round.assistant.thinkingSegments,
       citations: round.assistant.citations,
       tools: round.assistant.tools,
       artifacts: round.assistant.artifacts,
@@ -400,6 +506,27 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       ...(round.error === null ? {} : { error: round.error }),
       persisted: round.persisted,
     },
+    // 中途插话（P1-20；**2026-10-21 起改放本轮末尾**）：每条渲染成一条用户气泡 ⇒
+    // 用户看得见"我插了这句话"（不再像丢消息）。
+    // ⚠️ 为什么在助手消息**之后**：插话的语义是"边跑边补一句"，它属于**本轮尾部**——
+    //    用户原话："插话发起后应该是直接在本轮末尾添加的，而不是放到本轮的回复前"。
+    //    助手正文在这里是一坨整篇（`round.assistant.text`）⇒ 无法按时刻插进它内部；
+    //    放在末尾是"这一轮完整回答 + 我中途补的话"的可读近似（历史侧同一顺序，见 `messageModel`）。
+    ...round.interjections.map((item) => ({
+      key: `stream:steer:${item.id}`,
+      role: 'USER' as const,
+      text: item.text,
+      thinkingSegments: [],
+      citations: null,
+      tools: [],
+      artifacts: [],
+      attachments: [],
+      createdAt: item.at,
+      status: 'complete' as const,
+      steer: true as const,
+      steerId: item.id,
+      steerState: item.state,
+    })),
   ]
 }
 

@@ -18,7 +18,7 @@
  */
 
 import { Button, Tag } from 'antd'
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import {
@@ -51,7 +51,12 @@ export interface ToolCardProps {
   tool: ToolCallView
 }
 
-export function ToolCard({ tool }: ToolCardProps) {
+/**
+ * ⚠️ `memo`（2026-10-21）：正文流式期间父组件每帧重渲染，而绝大多数卡片的 `tool` 引用没变
+ * （`roundReducer` 按 `callId` upsert，只有被更新的那一张换了对象）⇒ memo 让其余卡片整块跳过，
+ * 展开/收起状态与滚动位置都不会被无谓刷新。
+ */
+export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const presentation = STATUS_PRESENTATION[tool.status]
   // 运行中的卡默认展开（用户此刻最想知道它在干什么）；终态默认折叠，把空间还给正文
   const [userChoice, setUserChoice] = useState<boolean | null>(null)
@@ -138,4 +143,4 @@ export function ToolCard({ tool }: ToolCardProps) {
       </div>
     </details>
   )
-}
+})

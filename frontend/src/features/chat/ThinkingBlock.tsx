@@ -16,7 +16,7 @@
  * 不挡 React 的 prop 更新 —— 语义正好。
  */
 
-import { useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 
 export interface ThinkingBlockProps {
   /** 思考过程全文（累积的 `thinking` 增量） */
@@ -30,10 +30,23 @@ function charCount(text: string): number {
   return [...text].length
 }
 
-export function ThinkingBlock({ text, streaming }: ThinkingBlockProps) {
+/**
+ * ⚠️ `memo`（内存优化 P2/P3，`docs/子方案/前端长会话内存优化.md`）：历史消息的思考段引用稳定，
+ * 流式期间父组件每帧重渲染时不该跟着重走一遍；流式那一轮里只有**正在增长的那一段**会换 `text`。
+ *
+ * ⚠️ **折叠时不挂正文**（内存优化 P3）：早先无论开合都把整段思考挂在 `.think__body` 里，
+ * `<details>` 只负责隐藏 —— 几万字的思考在 DOM 里始终占着一棵文本节点树（而且是在长会话里
+ * 累积的）。现在只有展开时才渲染正文；`charCount` 也只在 `text` 变化时算一次（`useMemo`），
+ * 而不是每次渲染都 `[...text]` 展开成数组。
+ *
+ * 口径不变：头部那行"思考过程 · N 字"仍然报**真实字数**（折叠时也算得出来 —— 它来自 `text`，
+ * 不是来自 DOM）。
+ */
+export const ThinkingBlock = memo(function ThinkingBlock({ text, streaming }: ThinkingBlockProps) {
   // `null` = 用户还没碰过（跟随流式状态）；`true/false` = 用户的明确选择，一直生效
   const [userChoice, setUserChoice] = useState<boolean | null>(null)
   const open = userChoice ?? streaming
+  const chars = useMemo(() => charCount(text), [text])
 
   return (
     <details className="think" open={open} data-testid="thinking-block">
@@ -47,7 +60,7 @@ export function ThinkingBlock({ text, streaming }: ThinkingBlockProps) {
       >
         {/* ⚠️ 原型这里是「思考过程 · 4 步 · 2.1s」，而本仓的 `thinking` 事件只给文本增量
             —— 没有"步数"、也没有分段时刻。**不编造**：只报真实可算的那个数（字数）。 */}
-        <span>思考过程 · {charCount(text)} 字{streaming ? ' · 生成中' : ''}</span>
+        <span>思考过程 · {chars} 字{streaming ? ' · 生成中' : ''}</span>
         <span className="think__caret" aria-hidden="true">
           ›
         </span>
@@ -55,9 +68,11 @@ export function ThinkingBlock({ text, streaming }: ThinkingBlockProps) {
       {/* 思考过程刻意**不解析 Markdown**：它往往是模型的原始推理碎片，渲染成 Markdown 反而
           更容易出现"半截列表/半截表格"（流式期间每一帧都可能切断语法结构）。
           用 `white-space: pre-wrap` 保留换行即可。 */}
-      <div className="think__body" style={{ whiteSpace: 'pre-wrap' }}>
-        {text}
-      </div>
+      {open ? (
+        <div className="think__body" style={{ whiteSpace: 'pre-wrap' }}>
+          {text}
+        </div>
+      ) : null}
     </details>
   )
-}
+})

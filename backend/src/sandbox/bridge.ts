@@ -202,6 +202,11 @@ export interface SandboxRpc {
    * ⚠️ 只投递、不等待它被模型读到 —— "成功"这件事由下一轮 `read` 拿到的版本体现。
    */
   steer(message: string): Promise<void>
+  /**
+   * 清空引擎侧**还没投递**的插话队列（pi RPC `clear_queue`；2026-10-21）。
+   * 语义 = 撤回：已投递给模型的不受影响，排队中的作废。尽力而为（失败只记 debug）。
+   */
+  clearQueue(): Promise<void>
   /** 拆掉连接（不关容器；幂等 —— 收尾路径与进程退出路径各会调一次） */
   close(reason?: string): void
   /** 脱敏后的 stderr 尾巴（排障用：引擎抱怨了什么，看这里） */
@@ -435,6 +440,21 @@ class SandboxRpcSession implements SandboxRpc {
     if (!this.#alive) return
     await this.send({ type: 'steer', message }).catch((error: unknown) => {
       getLogger().debug({ err: error, conversationId: this.conversationId }, '发中途插话失败（尽力而为，忽略）')
+    })
+  }
+
+  /**
+   * 清空引擎侧的插话队列（pi RPC `clear_queue`；2026-10-21，配合"撤回插话"）。
+   *
+   * pi `docs/rpc-commands.md` 的命令表里 `clear_queue` 与 `steer` 同族（`set_steering_mode` 旁边），
+   * 语义 = 清掉**还没投递**的 steering / followUp 队列；**已经投递给模型的不受影响**
+   * （所以撤回只在"仍待接收"时才有意义，前端据 `steer_queue` 快照判断）。
+   * ⚠️ 与 {@link steer} 同款"尽力而为"：失败只记 debug，不抛。
+   */
+  async clearQueue(): Promise<void> {
+    if (!this.#alive) return
+    await this.send({ type: 'clear_queue' }).catch((error: unknown) => {
+      getLogger().debug({ err: error, conversationId: this.conversationId }, '清空插话队列失败（尽力而为，忽略）')
     })
   }
 

@@ -19,7 +19,8 @@
 
 import type { SseEvent, ToolCallRecord } from '@doubulea/shared'
 
-const { createToolTextOffsetTracker, attachToolTextOffsets } = await import('../src/orchestrator/toolTextOffset.js')
+const { createToolTextOffsetTracker, attachToolTextOffsets, attachThinkingPosition, upsertToolRecord } =
+  await import('../src/orchestrator/toolTextOffset.ts')
 
 let passed = 0
 let failed = 0
@@ -56,6 +57,40 @@ function toolRecord(callId: string, status: 'RUNNING' | 'SUCCESS'): ToolCallReco
   check('新 callId 取新的正文长度', tracker.offsetFor('B') === 10, `实得 ${tracker.offsetFor('B')}`)
 }
 
+// ①′ 内联序列（2026-10-21）：思考段与工具卡**共用**一个递增序号，同 key 复用
+{
+  let text = ''
+  const tracker = createToolTextOffsetTracker(() => text.length)
+  const thinkA = tracker.positionFor('think-0')
+  const toolA = tracker.positionFor('call-A')
+  text = '前半'
+  const thinkB = tracker.positionFor('think-1')
+  check('思考 A 序号 0', thinkA.seq === 0, `实得 ${thinkA.seq}`)
+  check('工具卡与思考段共用序列（紧随其后 = 1）', toolA.seq === 1, `实得 ${toolA.seq}`)
+  check('正文增长后新段序号继续递增 = 2', thinkB.seq === 2, `实得 ${thinkB.seq}`)
+  check('新段偏移 = 当时正文长度', thinkB.textOffset === 2, `实得 ${thinkB.textOffset}`)
+  check('同一 key 复用（不重复分配序号）', tracker.positionFor('think-0').seq === 0, '重复分配了')
+  const stamped = attachThinkingPosition({ text: 'x', newSegment: true }, 'think-2', tracker)
+  check('段首帧补上 textOffset + seq', stamped.seq === 3 && stamped.textOffset === 2, JSON.stringify(stamped))
+}
+
+// ①″ 段 key 唯一性（2026-10-21 的真 bug）：首段与新段**绝不能**拿到同一个 key
+//     （早先用 `segments.length` 当 key，而 push 在 map 之后 ⇒ 两段都是 `think-0` ⇒
+//       第二段复用第一段的 `seq` ⇒ 前端「重新推理」与工具卡换位）
+{
+  const text = ''
+  const tracker = createToolTextOffsetTracker(() => text.length)
+  const seg = { seq: 0 }
+  const nextKey = () => `think-${seg.seq++}`
+  const a = tracker.positionFor(nextKey())
+  const tool = tracker.positionFor('call-1')
+  const b = tracker.positionFor(nextKey())
+  check('首段 seq = 0', a.seq === 0, `实得 ${a.seq}`)
+  check('工具卡 seq = 1（夹在两段之间）', tool.seq === 1, `实得 ${tool.seq}`)
+  check('重新推理段 seq = 2（不复用首段）', b.seq === 2, `实得 ${b.seq}`)
+  check('三段序号严格递增', a.seq < tool.seq && tool.seq < b.seq, `${a.seq},${tool.seq},${b.seq}`)
+}
+
 // ② attach：tool_call 帧 + toolRecord 两份都补、且同偏移；其它帧不动；不改入参
 {
   const tracker = createToolTextOffsetTracker(() => 7)
@@ -82,6 +117,33 @@ function toolRecord(callId: string, status: 'RUNNING' | 'SUCCESS'): ToolCallReco
   const tracker = createToolTextOffsetTracker(() => 0)
   const out = attachToolTextOffsets([], undefined, tracker)
   check('无 toolRecord ⇒ 仍 undefined；空事件 ⇒ 空数组', out.toolRecord === undefined && out.events.length === 0)
+}
+
+// ④ 同一 callId 落库**只留一条**（P1-21：start/end 两条记录不许都进 `tool_calls`）
+{
+  const start: ToolCallRecord = {
+    ...toolRecord('X', 'RUNNING'),
+    arguments: '{"path":"a.md"}',
+    textOffset: 3,
+  }
+  const end: ToolCallRecord = {
+    ...toolRecord('X', 'SUCCESS'),
+    output: '已编辑 a.md（v2）',
+    textOffset: 3,
+  }
+  const records = upsertToolRecord(upsertToolRecord([], start), end)
+  check('同一 callId 只留一条（不追加）', records.length === 1, `实得 ${records.length}`)
+  check('终态覆盖（SUCCESS + 输出）', records[0]?.status === 'SUCCESS' && records[0]?.output === '已编辑 a.md（v2）')
+  check('end 没带的 arguments / textOffset 从 start 继承', records[0]?.arguments === '{"path":"a.md"}' && records[0]?.textOffset === 3)
+
+  // 顺序反了（end 先到）也不该被 start 抹掉输出
+  const reversed = upsertToolRecord(upsertToolRecord([], end), start)
+  check('乱序到达时 output 不被抹掉', reversed.length === 1 && reversed[0]?.output === '已编辑 a.md（v2）')
+
+  // 两次不同的调用仍然是两条
+  const two = upsertToolRecord(records, { ...toolRecord('Y', 'SUCCESS') })
+  check('不同 callId 各占一条', two.length === 2)
+  check('纯函数：不改入参数组', records.length === 1)
 }
 
 console.log('')

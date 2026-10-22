@@ -46,6 +46,23 @@ export function sandboxInstanceKey(instanceId: string): string {
   return `${SANDBOX_INSTANCE_KEY_PREFIX}:${instanceId}`
 }
 
+/**
+ * **摘流标记**的键前缀（`sandbox:drain:{instanceId}`）。
+ *
+ * 为什么不能直接删 `sandbox:instance:{id}`：注册键由**那台实例自己**的心跳续期，删掉后一个心跳周期
+ * 就长回来了 —— "从服务里摘掉"必须是一个**别人写入、被摘的那台自己读到并上报**的标记，
+ * 而不是一次会自愈的删除。
+ *
+ * 语义（刻意收窄）：`drained=true` = **不再成为新会话的 owner**。已钉在这台的会话仍可继续
+ * （它们的字节/容器本来就在本机），运维想让它们也走开就等空闲回收或重启。
+ */
+export const SANDBOX_DRAIN_KEY_PREFIX = 'sandbox:drain'
+
+/** 摘流标记的键（`sandbox:drain:{instanceId}`） */
+export function sandboxDrainKey(instanceId: string): string {
+  return `${SANDBOX_DRAIN_KEY_PREFIX}:${instanceId}`
+}
+
 /** 在线的实例 id 是否合法（非空、无空白、不太长）—— 网关与自检都按它筛 */
 export function isSandboxInstanceId(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 120 && !/\s/u.test(value)
@@ -111,8 +128,28 @@ export function classifyRoute(method: string, pathname: string): RouteDispatch {
   return { kind: 'round-robin' }
 }
 
-// ═════════════════════════════ 长任务路由 ═════════════════════════════
+// ═════════════════════════════ 可重放的请求体 ═════════════════════════════
 
+/**
+ * 哪些路由的请求体**可以在网关里缓冲后再转发**（2026-10-21：实例不可达时的一次重试）。
+ *
+ * ★ 为什么只放 `/chat`：
+ *   · 网关默认**不缓冲**请求体（SSE 透传 + 几十 MB 上传都不许过内存，见 `router/gateway.ts` 文件头）；
+ *   · 但 `/chat` 的 body 是一个**小的 JSON**（一条用户消息），而它恰恰是最"尴尬"的那条 ——
+ *     上游实例刚死时用户会看到一个 502，再手点一次才行。缓冲它就能自动重试一次。
+ *   · **不放** `/regenerate`：它不带 body（重放等于重跑一轮，语义不同）；
+ *   · **不放** `/workspace*`：写操作可能带几 MB 内容，且重放有丢改风险（落点变化）。
+ *
+ * ⚠️ 只按**方法 + 路径**判定，不看 body 大小：真正的大小上限由网关的常量把着
+ *    （超限 ⇒ 退回"不缓冲、不重试"的旧行为，而不是 413）。
+ */
+export function isReplayableBodyRoute(method: string, pathname: string): boolean {
+  if (method.toUpperCase() !== 'POST') return false
+  const matched = CONVERSATION_ENDPOINT.exec(pathnameOnly(pathname))
+  return matched !== null && matched[2] === 'chat' && matched[1] !== undefined
+}
+
+// ═════════════════════════════ 长任务路由 ═════════════════════════════
 /**
  * **长任务路由清单**（2026-10-20：一键初始化 30s 超时坑）。
  *

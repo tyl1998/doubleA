@@ -119,6 +119,17 @@ export function useWorkspaceTree(
   })
 }
 
+/**
+ * 单个文件正文的 query key（`["workspace-file", conversationId, path]`）。
+ *
+ * ⚠️ 内存优化 P4（`docs/子方案/前端长会话内存优化.md`）：一份正文最大 1 MiB，挂在缓存里就是
+ * 一份常驻字符串。**关标签 / 切会话时要能精确回收它** ⇒ key 必须有构造器（而不是调用点
+ * 各写一遍字面量），否则"回收"那条路会静默漏掉某个前缀写错的 key。
+ */
+export function workspaceFileQueryKey(conversationId: string, path: string): readonly [string, string, string] {
+  return ['workspace-file', conversationId, path]
+}
+
 /** 读文件（文本内联 `text`；二进制 / 大文件 `text=null`，改走 {@link workspaceRawUrl}） */
 export function fetchWorkspaceFile(
   conversationId: string,

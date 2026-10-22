@@ -116,7 +116,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    /**
+     * `'hidden'`（内存优化 P6，`docs/子方案/前端长会话内存优化.md`）：仍然产出 `.map` 文件
+     * （排障 / 上传给错误监控用），但**不在产物里写 `//# sourceMappingURL`** ——
+     * 浏览器于是不会自动加载它们。早先的 `true` 会让 Chrome 把这几个 2～3MB 的 map
+     * 整份解析进内存并常驻在 tab 里（`.map` 不进 JS 堆快照，但确实算在这个 tab 上）。
+     */
+    sourcemap: 'hidden',
     target: 'es2022',
     rollupOptions: {
       output: {

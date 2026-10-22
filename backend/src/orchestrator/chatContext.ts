@@ -34,6 +34,8 @@ import {
   type MessageContent,
   type MessageModelSegment,
   type RetrievalHit,
+  type SteerRecord,
+  type ThinkingSegment,
   type ToolCallRecord,
 } from '@doubulea/shared'
 
@@ -1014,7 +1016,11 @@ export function attachmentItemsOf(
 /** {@link buildAssistantContent} 的入参 */
 export interface AssistantContentInput {
   text: string
-  thinking: string
+  /**
+   * 本轮思考的**分段**（2026-10-21）：一段 = 一次模型请求里的推理（工具调用之后重新推理
+   * 就是新的一段）。**空数组 / 全空串 ⇒ 不写这个键**（与 `citations` 同款省键口径）。
+   */
+  thinkingSegments: readonly ThinkingSegment[]
   citations: readonly CitationItem[]
   /** 本轮的**工具调用记录**（按发生顺序；P0-2-8 起定型，见 `shared#toolCallRecordSchema`） */
   toolCalls?: readonly ToolCallRecord[]
@@ -1028,6 +1034,11 @@ export interface AssistantContentInput {
    * ChatBot 写入；TaskAgent 不传 ⇒ 省键即"没记录"，前端回落到默认模型。
    */
   model?: MessageModelSegment
+  /**
+   * 本轮**中途插话**（2026-10-21；见 `shared#steerRecordSchema`）。
+   * 只放真的投递过、且没被撤回的（判据在编排层）；不传 / 空数组 ⇒ 省键即"本轮没有插话"。
+   */
+  steers?: readonly SteerRecord[]
 }
 
 /**
@@ -1044,7 +1055,15 @@ export interface AssistantContentInput {
  */
 export function buildAssistantContent(input: AssistantContentInput): MessageContent {
   const content: MessageContent = { text: input.text }
-  if (input.thinking !== '') content.thinking = input.thinking
+  // 分段写（2026-10-21）：丢空段；一段都没有 ⇒ 省键（"本来就没有思考"与"有但是空的"是两件事）
+  const segments = input.thinkingSegments.filter((segment) => segment.text !== '')
+  if (segments.length > 0) {
+    content.thinking_segments = segments.map((segment) => ({
+      text: segment.text,
+      textOffset: segment.textOffset,
+      seq: segment.seq,
+    }))
+  }
   if (input.citations.length > 0) content.citations = [...input.citations]
   if (input.toolCalls !== undefined && input.toolCalls.length > 0) {
     content.tool_calls = [...input.toolCalls]
@@ -1053,5 +1072,8 @@ export function buildAssistantContent(input: AssistantContentInput): MessageCont
     content.artifacts = [...input.artifacts]
   }
   if (input.model !== undefined) content.model = { ...input.model }
+  if (input.steers !== undefined && input.steers.length > 0) {
+    content.steers = [...input.steers]
+  }
   return content
 }

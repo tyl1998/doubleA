@@ -19,14 +19,13 @@
  * 失败时不静默：复制不到就得告诉用户（他要的是那段文字，而不是"我点了按钮"）。
  */
 
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 
 import { useFeedback } from '../../app/feedback.js'
 import { ArtifactCard } from './ArtifactCard.js'
 import { AssistantMarkdown } from './AssistantMarkdown.js'
 import { CitationCard } from './CitationCard.js'
 import { ErrorCard } from './ErrorCard.js'
-import { ThinkingBlock } from './ThinkingBlock.js'
 import { isAssistantEmpty, type ChatMessageView } from './messageModel.js'
 
 export interface AssistantMessageProps {
@@ -40,6 +39,14 @@ export interface AssistantMessageProps {
    * 需求："重跑最后一轮用户消息，替换原回答"。按钮挂在这条**回答**上，因为被替换的正是它。
    */
   onRegenerate?: (() => void) | undefined
+  /**
+   * 服务端侧仍在生成（2026-10-21）：本页**没有**这一轮的事件流（切走再切回 / 刷新后进入 /
+   * 在别的窗口发起），所以只能如实说"还在生成"，**不编造**正文与工具进度。
+   * 与 `view.status === 'streaming'` 互斥（流式时本页画得出来，不必走这一条）。
+   */
+  serverRunning?: boolean
+  /** 服务端那条流的开始时刻（ISO；`null`/缺省 ⇒ 只显示"正在生成"，不算已用时） */
+  serverStartedAt?: string | null
 }
 
 /** token 用量 → 一行文案；两个数各自可空（`usage.tokensIn` 是 `number | null`） */
@@ -74,7 +81,21 @@ function headLedClass(view: ChatMessageView): string {
   return 'led led--ok'
 }
 
-export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMessageProps) {
+/**
+ * ⚠️ `memo`（内存优化 P2，`docs/子方案/前端长会话内存优化.md`）：流式期间父组件（`MessageList`）
+ * 每一帧 `delta` 都重渲染一次，而**历史消息的 `view` 引用是稳定的**（`ChatPage` 的
+ * `messagesToViews` 结果按 `messagesQuery.data` 缓存）⇒ memo 让它们整块跳过。
+ * 没有它时，一轮回答流几分钟 = 历史上每一条助手消息都跟着重走一遍元素树（含 `react-markdown`）。
+ *
+ * 前提（写在这里以免被改坏）：`ChatPage` 传下来的回调必须引用稳定，否则 memo 会被击穿。
+ */
+export const AssistantMessage = memo(function AssistantMessage({
+  view,
+  agentName,
+  onRegenerate,
+  serverRunning = false,
+  serverStartedAt = null,
+}: AssistantMessageProps) {
   const feedback = useFeedback()
   const [copying, setCopying] = useState(false)
 
@@ -102,23 +123,12 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
         {agentName}
       </p>
 
-      {/* 流式进度行：`statusText` + 已用时。比"只在空内容时给占位"更早、更持久 ——
-          工具参数生成期（可 20s+）里没有任何正文事件，这一行是唯一在动的东西。 */}
-      {view.status === 'streaming' ? (
-        <StreamingStatusLine statusText={view.statusText} startedAt={view.startedAt} />
-      ) : null}
-
-      {/* 思考块：`thinking` 为空串 = 这一段本来就没有 ⇒ 不渲染（`03` §4.1 的"可选而非默认"口径） */}
-      {view.thinking === '' ? null : (
-        <ThinkingBlock text={view.thinking} streaming={view.status === 'streaming'} />
-      )}
-
       {empty ? (
         <p className="ratio" data-testid="assistant-placeholder">
           {view.status === 'streaming' ? (
-            // 流式但**一个字都还没到**：**只留打字光标**。生命周期文案（`status` 事件）已由上面的
+            // 流式但**一个字都还没到**：**只留打字光标**。生命周期文案（`status` 事件）已由本轮末尾的
             // `StreamingStatusLine`（"模型正在思考… · 已用时 Ns"）呈现 —— 这里再写一句"正在等待上游响应…"
-            // 就是**两条提示叠一起**，用户看起来像两件事（产品反馈题 3：只保留上面那一条）。
+            // 就是**两条提示叠一起**，用户看起来像两件事（产品反馈题 3：只保留那一条）。
             <span className="caret" aria-hidden="true" />
           ) : view.status === 'stopped' ? (
             '已停止：本轮没有产生内容'
@@ -128,7 +138,22 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
         </p>
       ) : (
         <>
-          {view.text !== '' || view.tools.length > 0 ? <AssistantMarkdown text={view.text} tools={view.tools} /> : null}
+          {view.text !== '' || view.tools.length > 0 || view.thinkingSegments.length > 0 ? (
+            // 思考段与工具卡**一起**交给 markdown：二者在内联时间线上按 (offset, seq) 排
+            // （2026-10-21 —— 用户报"思考 B 跑到了工具卡前面"，根因是思考原先整块堆在正文上方）。
+            // 只有**最后一段**带 streaming（它才是此刻还在长的那个；前面的段落已完成、自动折叠）。
+            <AssistantMarkdown
+              text={view.text}
+              tools={view.tools}
+              thinkingSegments={view.thinkingSegments}
+              // 内存优化 P3：流式期间走"稳定前缀 + 尾巴"两段渲染（见 `markdownChunks.ts`），
+              // 收尾后整篇解析一次 —— 与历史消息逐字同款
+              streaming={view.status === 'streaming'}
+              {...(view.status === 'streaming'
+                ? { streamingThinkingIndex: view.thinkingSegments.length - 1 }
+                : {})}
+            />
+          ) : null}
           {view.status === 'streaming' ? (
             // 流式光标：`design/styles/components.css` 的 `.caret`（块状、闪烁，暗示"打字机"）
             <span className="caret" aria-hidden="true" />
@@ -142,6 +167,24 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
       {view.artifacts.map((artifact) => (
         <ArtifactCard key={artifact.artifactId} artifact={artifact} />
       ))}
+
+      {/* 流式进度行：`statusText` + 已用时。比"只在空内容时给占位"更早、更持久 ——
+          工具参数生成期（可 20s+）里没有任何正文事件，这一行是唯一在动的东西。
+          ⚠️ 位置在**本轮的末尾**（正文 / 工具卡 / 引用 / 产物之后，用户反馈 2026-10-21）：
+              放在开头时，回答一长就把这一行顶出视口，"正在生成 / 已用时 50s"用户看不到；
+              贴底则始终可见（流式期间视口也是贴底跟随的，见 `ChatPage` 的 `pinnedRef`）。 */}
+      {view.status === 'streaming' ? (
+        <StreamingStatusLine statusText={view.statusText} startedAt={view.startedAt} />
+      ) : null}
+
+      {/* 服务端侧仍在生成（本页没有这一轮的事件流）—— 同上，贴在本轮末尾，最先被看到。
+          只说"还在跑"，不编造正文 / 工具进度（那些帧没有经过本页）。 */}
+      {serverRunning && view.status !== 'streaming' ? (
+        <p className="msg__streaming ratio" data-testid="server-streaming-status">
+          服务端仍在生成这一轮
+          <ServerElapsed startedAt={serverStartedAt} />
+        </p>
+      ) : null}
 
       {view.status === 'error' && view.error !== undefined ? (
         <ErrorCard code={view.error.code} message={view.error.message} />
@@ -179,7 +222,7 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
       </div>
     </article>
   )
-}
+})
 
 /**
  * 流式进度行：`statusText`（后端 `status` 事件：模型在思考 / 根据工具结果继续…）+ 秒级计时器。
@@ -187,19 +230,44 @@ export function AssistantMessage({ view, agentName, onRegenerate }: AssistantMes
  * 只在**流式中**渲染。为什么单独一行而不是并进占位：占位只在"一个字都还没有"时出现，而真正
  * 安静的是**工具参数生成期**（正文/思考已经出现过、参数还在流，可能 20s+）—— 那时占位早就不在了。
  * 这一行在整段流式期间都在，且每秒自增，是"还在动"最直接的证据。
+ *
+ * ⚠️ 它渲染在**本轮末尾**（不是开头）：开头那一个位置会被长回答顶出视口，用户就看不到"还在生成"。
+ * 与末尾那条流式光标同处一屏，读起来是"内容 + 此刻状态"。
  */
-function StreamingStatusLine({ statusText, startedAt }: { statusText?: string; startedAt?: string }) {
+const StreamingStatusLine = memo(function StreamingStatusLine({
+  statusText,
+  startedAt,
+}: {
+  statusText?: string
+  startedAt?: string
+}) {
+  return (
+    <p className="msg__streaming ratio" data-testid="streaming-status">
+      {statusText ?? '正在生成…'}
+      <Elapsed startedAt={startedAt} />
+    </p>
+  )
+})
+
+/**
+ * 「 · 已用时 Ns」（每秒自增）。`startedAt` 缺省 / 不是合法时刻 ⇒ 什么都不显示
+ * （**不知道就不说**：编一个 0s 会让用户以为刚发出）。
+ */
+function Elapsed({ startedAt }: { startedAt?: string | null }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(id)
   }, [])
-  const start = startedAt === undefined ? Number.NaN : Date.parse(startedAt)
-  const elapsedSec = Number.isNaN(start) ? null : Math.max(0, Math.floor((now - start) / 1000))
-  return (
-    <p className="msg__streaming ratio" data-testid="streaming-status">
-      {statusText ?? '正在生成…'}
-      {elapsedSec === null ? null : ` · 已用时 ${elapsedSec}s`}
-    </p>
-  )
+  const start = startedAt === undefined || startedAt === null ? Number.NaN : Date.parse(startedAt)
+  if (Number.isNaN(start)) return null
+  return <>{` · 已用时 ${Math.max(0, Math.floor((now - start) / 1000))}s`}</>
+}
+
+/**
+ * 服务端侧那条流的已用时（`/active.startedAt`）。没有开始时刻 ⇒ 不显示
+ * （见 {@link Elapsed}：不知道就不说）。
+ */
+function ServerElapsed({ startedAt }: { startedAt?: string | null }) {
+  return <Elapsed startedAt={startedAt} />
 }

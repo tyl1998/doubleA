@@ -225,14 +225,20 @@ export async function ensureSandbox(
   //   位置在"动容器之前"：镜像选不出来时还什么都没建（同上面两条配置校验的纪律）。
   const conversationRuntime = conversation.runtime
   const availableRuntimes = await listAvailableSandboxRuntimes()
-  const image = resolveSandboxRuntimeImage(conversationRuntime, availableRuntimes, config.sandbox.image)
+  // ★ P1-21：回退镜像**必须在本机真的存在**。`infra/.env` 的 `SANDBOX_IMAGE` 是"构建产物"的名字，
+  //   升级层版本（如 toolkit 9 → 10）之后若还没重建，直接把这个名字塞给 Docker 只会得到一句
+  //   `pull access denied` / `No such image`——而真正该说的是"先构建镜像"。这里预检一次，
+  //   不存在就退回**本机已有的**同名旧 tag（`<repo>:<任意 tag>` 里版本号最大的那个），并留一条 warn；
+  //   一个都没有才显式失败。⚠️ 只在本机探测（一次本地镜像列表），不联网、不拉取。
+  const fallbackImage = await pickExistingFallbackImage(config.sandbox.image)
+  const image = resolveSandboxRuntimeImage(conversationRuntime, availableRuntimes, fallbackImage)
   if (image === undefined) {
     return fail(
       'NOT_CONFIGURED',
       '未配置 SANDBOX_IMAGE（回退镜像）。先构建镜像（pnpm sandbox:build），再把它打印的值写进 infra/.env',
     )
   }
-  if (image === config.sandbox.image && !availableRuntimes.some((item) => item.id === conversationRuntime)) {
+  if (image === fallbackImage && !availableRuntimes.some((item) => item.id === conversationRuntime)) {
     getLogger().warn(
       { conversationId, runtime: conversationRuntime, available: availableRuntimes.map((item) => item.id) },
       '会话运行时在本机没有对应镜像 ⇒ 回退 SANDBOX_IMAGE（toolkit）起容器（P1-17a）',
@@ -446,6 +452,44 @@ export async function listAvailableSandboxRuntimes(): Promise<SandboxRuntimeItem
   } catch (error) {
     getLogger().warn({ err: error }, '列举沙箱运行时镜像失败（Docker 不可达？）⇒ 视为"没有可选运行时"')
     return []
+  }
+}
+
+/**
+ * 回退镜像的**存在性裁决**（P1-21）—— 纯本地探测，不联网。
+ *
+ * 输入 = `infra/.env` 的 `SANDBOX_IMAGE`（构建脚本打印的那个名字）。两种情形要区分开：
+ *   · **本机有** ⇒ 原样返回（正常路径）；
+ *   · **本机没有**（典型：层版本刚 +1 但还没 `pnpm sandbox:build`）⇒ 退回**同仓库、tag 里版本号最大**
+ *     的既有镜像（`doubulea/sandbox-toolkit:9` 之于 `:10`），并 warn 一句"该构建了"；
+ *     这样"改完后端但还没重建镜像"时，会话仍然能跑（拿的是旧扩展），而不是建容器时炸在 Docker 上。
+ *   · 同仓库一个都没有 ⇒ `undefined`（调用方走既有的显式失败文案）。
+ *
+ * ⚠️ 只认 **`repo:tag`** 形态的最后一个数字做比较；非数字 tag（`latest`）按 `0` 处理，
+ *    但仍然可以兜底（比"直接失败"好）。
+ */
+async function pickExistingFallbackImage(configured: string | undefined): Promise<string | undefined> {
+  if (configured === undefined) return undefined
+  try {
+    const refs = await docker.listLocalImageRefs()
+    if (refs.includes(configured)) return configured
+    const repo = configured.split(':')[0] ?? configured
+    const candidates = refs
+      .filter((ref) => ref.startsWith(`${repo}:`))
+      .map((ref) => ({ ref, version: Number.parseInt(ref.slice(ref.lastIndexOf(':') + 1), 10) }))
+      .map((item) => ({ ...item, version: Number.isFinite(item.version) ? item.version : 0 }))
+      .sort((a, b) => b.version - a.version)
+    const picked = candidates[0]?.ref
+    getLogger().warn(
+      { configured, picked: picked ?? null, available: candidates.map((item) => item.ref) },
+      picked === undefined
+        ? 'SANDBOX_IMAGE 指向的镜像本机不存在，且同仓库没有其它 tag ⇒ 无法起容器（先 pnpm sandbox:build）'
+        : 'SANDBOX_IMAGE 指向的镜像本机不存在（还没重建镜像？）⇒ 临时回退到本机已有的旧 tag',
+    )
+    return picked
+  } catch (error) {
+    getLogger().warn({ err: error, configured }, '列举本机镜像失败 ⇒ 直接使用配置的 SANDBOX_IMAGE')
+    return configured
   }
 }
 
@@ -776,6 +820,35 @@ export async function touchSandbox(conversationId: string, at: Date = new Date()
     data: { lastActiveAt: at },
   })
   return updated.count > 0
+}
+
+/**
+ * 本机**活着**的会话 id 列表（P1-21 的工具清单广播用）。
+ *
+ * 判据取**本实例在册名额**（`slots`）而不是"DB 里 status=RUNNING" —— 与空闲回收、对账同一条口径
+ * （多机部署下每台只管自己那几台，见 `docs/子方案/沙箱多机部署.md`）：拿 DB 全表会在别的实例上
+ * 反复重发清单（每次都白查一次 Prisma + 写一次 Redis）。
+ *
+ * ⚠️ **不发起 IO**：调用方能安全地在任意写路径之后调它（失败也只会是空数组）。
+ */
+export function listLiveSandboxConversations(): string[] {
+  return slots.conversations()
+}
+
+/**
+ * 某个 Agent 名下**活着**的会话 id（工具清单广播用）。
+ *
+ * 与 {@link listLiveSandboxConversations} 的关系：先取本实例在册的会话，再问 DB"其中哪些属于这个
+ * Agent"（一次 `in` 查询）。Agent 与会话的归属只存 DB（`conversations.agent_id`），内存里没有。
+ */
+export async function listLiveConversationsOfAgent(agentId: string): Promise<string[]> {
+  const live = listLiveSandboxConversations()
+  if (live.length === 0) return []
+  const rows = await getPrisma().conversation.findMany({
+    where: { id: { in: live }, agentId },
+    select: { id: true },
+  })
+  return rows.map((row) => row.id)
 }
 
 /** 观测用快照（启动日志 / 对账日志 / 将来的 `GET /api/tasks`） */

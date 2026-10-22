@@ -19,7 +19,15 @@
  * `artifacts` 段，写入端就是这里）；ChatBot 不传该参数 ⇒ 它的落库口径与从前**逐字不变**。
  */
 
-import type { ArtifactItem, AttachmentItem, CitationItem, MessageModelSegment, ToolCallRecord } from '@doubulea/shared'
+import type {
+  ArtifactItem,
+  AttachmentItem,
+  CitationItem,
+  MessageModelSegment,
+  SteerRecord,
+  ThinkingSegment,
+  ToolCallRecord,
+} from '@doubulea/shared'
 import { deriveConversationTopic } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
@@ -77,7 +85,11 @@ export interface PersistRoundInput {
    */
   attachments?: readonly AttachmentItem[]
   assistantText: string
-  thinkingText: string
+  /**
+   * 本轮思考的**分段文本**（2026-10-21；每段一次模型请求里的推理）。
+   * 空数组 ⇒ 落库不写 `thinking_segments` 键（与 `citations` 同款口径）。
+   */
+  thinkingSegments: readonly ThinkingSegment[]
   citations: CitationItem[]
   /** 本轮的工具调用记录（P0-2-8 起：ChatBot 是 `kind=MCP`，P0-3-6 起 TaskAgent 是 `kind=SANDBOX`） */
   toolRecords: readonly ToolCallRecord[]
@@ -92,6 +104,11 @@ export interface PersistRoundInput {
    * `shared#messageModelSegmentSchema`）。
    */
   model?: MessageModelSegment
+  /**
+   * 本轮**中途插话**（2026-10-21；落进助手消息的 `content.steers` 段）。
+   * 不传 / 空数组 ⇒ 省键（本轮没有投递过的插话）。被撤回的插话由编排层摘掉后再传（见 `taskAgent.ts`）。
+   */
+  steers?: readonly SteerRecord[]
   usage: RoundUsage | null
   /**
    * 本轮的计量行（**P0-3-12**；TaskAgent 专属）。
@@ -168,21 +185,25 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
     content,
     attachments,
     assistantText,
-    thinkingText,
+    thinkingSegments,
     citations,
     toolRecords,
     artifacts,
     model,
+    steers,
     usage,
     usageRecord,
     logger,
   } = input
   const hasAssistantContent =
     assistantText !== '' ||
-    thinkingText !== '' ||
+    thinkingSegments.length > 0 ||
     citations.length > 0 ||
     toolRecords.length > 0 ||
-    (artifacts?.length ?? 0) > 0
+    (artifacts?.length ?? 0) > 0 ||
+    // 本轮只有插话、没有正文（用户插话后立刻停止）：插话也是"这一轮发生的事"，
+    // 不写助手行的话这几条插话刷新后就消失了（它们挂在助手消息的 `content.steers` 上）
+    (steers?.length ?? 0) > 0
   try {
     const db = getPrisma()
     return await db.$transaction(async (tx) => {
@@ -211,11 +232,12 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
             content: stripNulChars(
               buildAssistantContent({
                 text: assistantText,
-                thinking: thinkingText,
+                thinkingSegments,
                 citations,
                 toolCalls: toolRecords,
                 artifacts,
                 ...(model === undefined ? {} : { model }),
+                ...(steers === undefined ? {} : { steers }),
               }),
             ),
             // `tokens_*` 可空（`schema.prisma` 的说明：上游不给 usage 时就是不知道，不编一个 0）

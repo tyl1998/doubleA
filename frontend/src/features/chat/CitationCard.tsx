@@ -23,6 +23,7 @@
  * 会高亮出与检索无关的词，反而误导用户核对"模型到底看到了什么"）。
  */
 
+import { memo } from 'react'
 import type { CitationItem } from '@doubulea/shared'
 
 export interface CitationCardProps {
@@ -34,7 +35,12 @@ function formatScore(score: number): string {
   return score.toFixed(4)
 }
 
-export function CitationCard({ items }: CitationCardProps) {
+/**
+ * ⚠️ `memo`（内存优化 P2，`docs/子方案/前端长会话内存优化.md`）：流式期间父组件每帧重渲染，
+ * 而历史消息的 `items` 引用稳定（`messageToView` 按查询数据缓存）⇒ 整块跳过。
+ * 流式那一轮的引用卡只在 `citations` 帧到达时换一次引用，所以也只重渲染一次。
+ */
+export const CitationCard = memo(function CitationCard({ items }: CitationCardProps) {
   if (items.length === 0) return null
 
   return (
@@ -63,4 +69,4 @@ export function CitationCard({ items }: CitationCardProps) {
       ))}
     </div>
   )
-}
+})

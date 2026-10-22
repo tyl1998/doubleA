@@ -34,8 +34,14 @@
  *   ② **`message_update` 的 `toolcall_*` 子类型** —— 它是"模型**打算**调这个工具"，
  *      而卡片表达的是"这个工具**正在跑**"（`tool_execution_*`）。两处都发会造出**两张卡**，
  *      且它们的 `callId` 相同 ⇒ 前端按 id upsert 时状态来回跳。
- *   ③ **会话内部状态类**（`queue_update` / `thinking_level_changed` / `session_info_changed` /
+ *      ⚠️ **2026-10-21 起 `toolcall_start` 会发一条 `status`**（不是卡）：写文件时"模型正在生成
+ *      工具参数"这一段可能长达几十秒，而卡片要到参数流完（`tool_execution_start`）才出现
+ *      ⇒ 用户看到的是"文件在改、聊天窗口一片空白，改完才蹦出一张卡"。`status` 不进卡片、
+ *      不落库，不违反上面那条"不许两张卡"的纪律。
+ *   ③ **会话内部状态类**（`thinking_level_changed` / `session_info_changed` /
  *      `entry_appended`）—— 界面上没有对应的卡。
+ *      ⚠️ **`queue_update` 自 2026-10-21 起改判为发**（映射成 `steer_queue`）：它是**插话队列**
+ *      的入队/出队确认，前端据此把插话气泡从「待接收」翻成「已投递」并收起「取回编辑」。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ★ `tool_execution_update`（`partialResult`）—— **自本批起不再"刻意不发"**
@@ -227,6 +233,8 @@ const ENGINE_MESSAGE_UPDATE = 'message_update'
 const ENGINE_TOOL_EXECUTION_START = 'tool_execution_start'
 const ENGINE_TOOL_EXECUTION_UPDATE = 'tool_execution_update'
 const ENGINE_TOOL_EXECUTION_END = 'tool_execution_end'
+/** 插话队列的入队/出队确认（`{steering: string[], followUp: string[]}`） */
+const ENGINE_QUEUE_UPDATE = 'queue_update'
 
 /**
  * turn 边界（P0-3-12）：**一个 turn = 一次模型请求**（pi `how-pi-works.md`）。
@@ -238,6 +246,9 @@ const ENGINE_TURN_END = 'turn_end'
 /** `message_update.assistantMessageEvent` 里我们真的要用的两个子类型 */
 const ASSISTANT_TEXT_DELTA = 'text_delta'
 const ASSISTANT_THINKING_DELTA = 'thinking_delta'
+/** 工具参数开始生成（只用来发一条进度 `status`，不发卡片 —— 见文件头 ②） */
+const ASSISTANT_TOOLCALL_START = 'toolcall_start'
+
 
 // ───────────────────────────── 形状 ─────────────────────────────
 
@@ -406,6 +417,15 @@ export function engineTurnBoundaryOf(event: PiSessionEvent): 'start' | 'end' | n
 export function createEngineEventMapper(options: EngineEventMapperOptions = {}): EngineEventMapper {
   /** `callId → 卡片那一行摘要 + 完整入参`（end 帧要用回它） */
   const memo = new Map<string, { inputSummary: string; args: string }>()
+  /** 已经见过 `turn_start` 没有（第一个 turn 的思考就是第 1 段，无需标 `newSegment`） */
+  let seenTurnStart = false
+  /**
+   * 新 turn 的**第一条** `thinking_delta` 还没到（到了要把它标成**新的一段**）。
+   *
+   * ⚠️ 惰性而不是在 `turn_start` 立刻发一个"空段"：该 turn 若压根没有思考，空段会凭空造出
+   * 一个空折叠块；只在这条 turn 真的有思考时把**它的第一帧**标成新段即可。
+   */
+  let pendingThinkingSegment = false
 
   /**
    * 同一张卡的**两帧必须用同一个身份**（start 与 end 各算一次 ⇒ 万一解析结果不稳定，
@@ -464,7 +484,34 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
       return { events: [deltaEvent(stringOf(inner?.delta) ?? '')], usage, known: true }
     }
     if (innerType === ASSISTANT_THINKING_DELTA) {
-      return { events: [thinkingEvent(stringOf(inner?.delta) ?? '')], usage, known: true }
+      const delta = stringOf(inner?.delta) ?? ''
+      // 新 turn 的第一段思考：把这一帧标成**新段的开始**（前端另起一个折叠块，
+      // 而不是接着上一段写 —— 用户明确要求"重新推理不要追加到旧推理窗口上"）
+      if (pendingThinkingSegment) {
+        pendingThinkingSegment = false
+        return { events: [thinkingEvent(delta, true)], usage, known: true }
+      }
+      return { events: [thinkingEvent(delta)], usage, known: true }
+    }
+    if (innerType === ASSISTANT_TOOLCALL_START) {
+      // 工具**参数生成期**的进度提示（不是卡片，见文件头 ②）：写文件的参数可能要流几十秒，
+      // 这期间没有任何 delta / 卡片，界面唯一在动的就是 `status` 那一行。
+      const toolName = inner === null ? null : stringOf(inner.toolName)
+      return {
+        events: [
+          {
+            name: 'status',
+            data: {
+              text:
+                toolName === null
+                  ? '模型正在生成工具调用参数…'
+                  : `模型正在生成 ${toolName} 的工具调用参数…`,
+            },
+          },
+        ],
+        usage,
+        known: true,
+      }
     }
     /**
      * 其余子类型：`*_start` / `*_end` / `toolcall_*` / provider 级的 `done`·`error`。
@@ -602,6 +649,24 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
     }
   }
 
+  /**
+   * `queue_update` → 插话队列快照（`steer_queue`，2026-10-21）。
+   *
+   * 形状（pin `0.87.1` 运行时原型已复现）：`{ type:'queue_update', steering: string[], followUp: [] }`。
+   * 前端只拿 `steering`：**不在数组里 = 已经被模型读走**。
+   * ⚠️ 载荷不认识（`steering` 不是数组）时**不发**也不报 anomaly —— 它是纯展示用的旁路信息，
+   * 坏一帧不值得在日志里喊（与 `tool_execution_update` 的空快照同款处置）。
+   */
+  function mapQueueUpdate(event: PiSessionEvent): EngineEventMapping {
+    const steering = event.steering
+    if (!Array.isArray(steering)) return { events: [], usage: null, known: true }
+    const messages: string[] = []
+    for (const item of steering) {
+      if (typeof item === 'string' && item !== '') messages.push(item)
+    }
+    return { events: [{ name: 'steer_queue', data: { messages } }], usage: null, known: true }
+  }
+
   return {
     map(event: PiSessionEvent): EngineEventMapping {
       switch (event.type) {
@@ -613,8 +678,17 @@ export function createEngineEventMapper(options: EngineEventMapperOptions = {}):
           return mapToolExecutionUpdate(event)
         case ENGINE_TOOL_EXECUTION_END:
           return mapToolExecutionEnd(event)
+        case ENGINE_TURN_START: {
+          // 第一个 turn 的思考就是第 1 段；之后的 turn 等它的第一段思考到了再标（惰性，见字段注释）
+          const first = !seenTurnStart
+          seenTurnStart = true
+          if (!first) pendingThinkingSegment = true
+          return { events: [], usage: null, known: true }
+        }
+        case ENGINE_QUEUE_UPDATE:
+          return mapQueueUpdate(event)
         default:
-          // 认识但刻意不发（`agent_end` / `turn_*` / `message_*` / `compaction_*` …）
+          // 认识但刻意不发（`agent_end` / `turn_end` / `message_*` / `compaction_*` …）
           // 与"完全不认识"（版本漂移）在这里合流 —— 区别只有 `known` 这一个布尔
           return { events: [], usage: null, known: isKnownEngineEventType(event.type) }
       }
@@ -628,8 +702,11 @@ function deltaEvent(text: string): SseEvent {
   return { name: 'delta', data: { text } }
 }
 
-function thinkingEvent(text: string): SseEvent {
-  return { name: 'thinking', data: { text } }
+/** 思考增量帧；`newSegment` = 这一帧开启新的一段（工具调用之后的重新推理） */
+function thinkingEvent(text: string, newSegment = false): SseEvent {
+  return newSegment
+    ? { name: 'thinking', data: { text, newSegment: true } }
+    : { name: 'thinking', data: { text } }
 }
 
 /** 收敛成"普通对象"（数组与 `null` 都不算；与 `chatContext#textOfHistoryRow` 同款口径） */

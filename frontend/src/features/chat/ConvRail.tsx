@@ -23,7 +23,7 @@
 
 import { DownOutlined, MenuOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
 import { Button, Input, Tag, Tooltip } from 'antd'
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { CONVERSATION_TOPIC_MAX_CHARS, type ConversationItem, type RemoveConversationResult } from '@doubulea/shared'
 
@@ -41,7 +41,13 @@ import { useUiStore } from '../../stores/ui.js'
 import { useWorkspaceStore } from '../../stores/workspace.js'
 import { AgentPicker } from './AgentPicker.js'
 import { DeleteConversationModal } from './DeleteConversationModal.js'
-import { groupConversationViews, normalizeTopicDraft } from './conversationList.js'
+import {
+  groupConversationViews,
+  normalizeTopicDraft,
+  type ConversationGroup,
+  type ConversationListItemView,
+} from './conversationList.js'
+import { useConversationActiveWatch } from './useConversationActiveWatch.js'
 import { useMinuteTick } from './useMinuteTick.js'
 
 /**
@@ -69,11 +75,30 @@ export function ConvRail({ conversationId }: ConvRailProps) {
    * P1-19 多流后可能**同时**有多条在生成（每行各自点亮）。
    */
   const rounds = useChatStreamStore((state) => state.rounds)
-  const streamingIds = useMemo(() => streamingIdsOf({ rounds }), [rounds])
+  const serverRun = useChatStreamStore((state) => state.serverRun)
+  const streamingIds = useMemo(() => streamingIdsOf({ rounds, serverRun }), [rounds, serverRun])
 
   const listQuery = useMyConversations({ offset: 0, limit: MY_CONVERSATIONS_PAGE_LIMIT_MAX })
   const items = listQuery.data?.items
-  const groups = useMemo(() => groupConversationViews(items ?? [], now, streamingIds), [items, now, streamingIds])
+
+  /**
+   * 服务端侧活跃判据（2026-10-21）：本页画不出的那些轮次（切走后 / 刷新后进入 / 别的窗口发起）
+   * 只有 `/active` 知道，所以这里按列表成员轮询一次。见 `useConversationActiveWatch` 的文件头。
+   */
+  const listedIds = useMemo(() => (items ?? []).map((item) => item.id), [items])
+  useConversationActiveWatch(listedIds)
+
+  /**
+   * 分组（内存优化 P6）：把上一轮结果交给纯函数做**逐字段复用** —— 没变化的会话行 / 分组
+   * 会拿到**同一个视图对象**，于是下面的 `ConvGroup` / `ConvRow` 的 `memo` 才真的命中。
+   * 60s tick 与流式帧（`streamingIds` 重算）在本会话之外就**不再引起任何重渲染**。
+   */
+  const groupsRef = useRef<readonly ConversationGroup[]>([])
+  const groups = useMemo(() => {
+    const next = groupConversationViews(items ?? [], now, streamingIds, groupsRef.current)
+    groupsRef.current = next
+    return next
+  }, [items, now, streamingIds])
 
   /** 行内重命名：同时只能有一条在编辑（判据在 `normalizeTopicDraft`） */
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -136,6 +161,34 @@ export function ConvRail({ conversationId }: ConvRailProps) {
     (item): item is NavItem => item !== undefined,
   )
   const manageItems = navItems.filter((item) => !PLATFORM_NAV_CODES.includes(item.code))
+
+  /**
+   * 行级回调的**稳定引用包**（内存优化 P6）：会话行组件是 `memo` 的，而下面这些 lambda
+   * 每次渲染都是新函数 —— 不包一层的话 memo 会被逐个击穿，等于没做。所有回调内部只读
+   * `ref` 里的最新值（会话项本身由行组件传回），所以包一次就够、不必进依赖。
+   */
+  const renameRef = useRef(submitRename)
+  renameRef.current = submitRename
+  const rowHandlers = useMemo<RowHandlers>(
+    () => ({
+      navigate,
+      onStartRename: (item: ConversationItem) => {
+        setEditingId(item.id)
+        setDraft(item.topic ?? '')
+      },
+      onCancelRename: () => setEditingId(null),
+      onDraftChange: setDraft,
+      onSubmitRename: (item: ConversationItem) => renameRef.current(item),
+      onRequestDelete: (item: ConversationItem) => setPendingDelete(item),
+    }),
+    [navigate],
+  )
+  /** `id → 会话项`（早先在每一行的渲染里 `items.find(...)`：100 条会话 = 100×100 次扫描/帧） */
+  const itemById = useMemo(() => {
+    const map = new Map<string, ConversationItem>()
+    for (const item of items ?? []) map.set(item.id, item)
+    return map
+  }, [items])
 
   return (
     <aside className="convrail" aria-label="平台功能与会话历史">
@@ -234,119 +287,19 @@ export function ConvRail({ conversationId }: ConvRailProps) {
           <p className="convrail__hint">还没有会话。点上方「新对话」选一个智能体开始。</p>
         ) : (
           <ul className="convrail__list">
-            {groups.map((group) => {
-              const collapsed = collapsedGroups.includes(group.label)
-              return (
-                <li key={group.label}>
-                  <button
-                    type="button"
-                    className="convrail__group"
-                    aria-expanded={!collapsed}
-                    title={collapsed ? `展开「${group.label}」` : `收缩「${group.label}」`}
-                    onClick={() => toggleGroup(group.label)}
-                  >
-                    <RightOutlined className="convrail__group-caret" data-open={!collapsed} />
-                    <span className="convrail__group-label">{group.label}</span>
-                    <span className="convrail__group-count num">{group.items.length}</span>
-                  </button>
-                  {collapsed ? null : (
-                    <ul className="convrail__group-list">
-                      {group.items.map((view) => {
-                        const item = items?.find((candidate) => candidate.id === view.id)
-                        if (item === undefined) return null
-                        const current = item.id === conversationId
-                        const editing = editingId === item.id
-                        return (
-                          <li className="conv" data-current={current} key={item.id}>
-                            {editing ? (
-                              <div className="conv__edit">
-                                <Input
-                                  size="small"
-                                  aria-label="会话名称"
-                                  value={draft}
-                                  maxLength={CONVERSATION_TOPIC_MAX_CHARS}
-                                  autoFocus
-                                  onChange={(event) => setDraft(event.target.value)}
-                                  onKeyDown={(event) => {
-                                    if (event.key === 'Escape') {
-                                      setEditingId(null)
-                                      return
-                                    }
-                                    if (event.key !== 'Enter') return
-                                    if (event.nativeEvent.isComposing) return
-                                    submitRename(item)
-                                  }}
-                                />
-                                <div className="conv__edit-ops">
-                                  <Button
-                                    size="small"
-                                    type="primary"
-                                    disabled={normalizeTopicDraft(draft, item.topic) === null}
-                                    onClick={() => submitRename(item)}
-                                  >
-                                    保存
-                                  </Button>
-                                  <Button size="small" onClick={() => setEditingId(null)}>
-                                    取消
-                                  </Button>
-                                </div>
-                              </div>
-                            ) : (
-                              <button
-                                className="conv__open"
-                                type="button"
-                                aria-current={current ? 'true' : undefined}
-                                onClick={() => {
-                                  if (!current) navigate(conversationPath(item.id))
-                                }}
-                              >
-                                <span className="conv__title">{view.title}</span>
-                                <span className="conv__meta">
-                                  <span className={`led led--${view.led}`} aria-hidden="true" />
-                                  <span>{view.state}</span>
-                                  {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
-                                  <Tag className="conv__agent" title={view.agentName}>
-                                    {AGENT_TYPE_LABEL[view.agentType]}
-                                  </Tag>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="num">{view.time}</span>
-                                </span>
-                              </button>
-                            )}
-
-                            {editing ? null : (
-                              <span className="conv__ops">
-                                <Tooltip title="重命名">
-                                  <button
-                                    type="button"
-                                    aria-label={`重命名会话「${view.title}」`}
-                                    onClick={() => {
-                                      setEditingId(item.id)
-                                      setDraft(item.topic ?? '')
-                                    }}
-                                  >
-                                    ✎
-                                  </button>
-                                </Tooltip>
-                                <Tooltip title="删除">
-                                  <button
-                                    type="button"
-                                    aria-label={`删除会话「${view.title}」`}
-                                    onClick={() => setPendingDelete(item)}
-                                  >
-                                    ✕
-                                  </button>
-                                </Tooltip>
-                              </span>
-                            )}
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
-                </li>
-              )
-            })}
+            {groups.map((group) => (
+              <ConvGroup
+                key={group.label}
+                group={group}
+                collapsed={collapsedGroups.includes(group.label)}
+                onToggle={toggleGroup}
+                itemById={itemById}
+                conversationId={conversationId}
+                editingId={editingId}
+                draft={draft}
+                handlers={rowHandlers}
+              />
+            ))}
           </ul>
         )}
       </section>
@@ -385,3 +338,174 @@ function pendingRenameAgentId(items: readonly ConversationItem[] | undefined, ed
   if (editingId === null) return ''
   return items?.find((item) => item.id === editingId)?.agentId ?? ''
 }
+/**
+ * 会话行的回调包（内存优化 P6）。
+ *
+ * ⚠️ 做成**一个稳定对象**而不是逐个传 lambda：`ConvRow` 是 `memo` 的，任何一次新函数引用都会
+ * 让 100 行全部重渲染 —— 而那正是"60s tick / 每个流式帧"在做的事。
+ * 所有回调都只接收"被点的那一行"（`item`），不闭包任何会变的状态。
+ */
+interface RowHandlers {
+  navigate: ReturnType<typeof useNavigate>
+  onStartRename: (item: ConversationItem) => void
+  onCancelRename: () => void
+  onDraftChange: (value: string) => void
+  onSubmitRename: (item: ConversationItem) => void
+  onRequestDelete: (item: ConversationItem) => void
+}
+
+/** 一个分组（标题 + 行）。`memo`：分组视图引用不变时整组跳过（见 `groupConversationViews` 的复用口径） */
+const ConvGroup = memo(function ConvGroup({
+  group,
+  collapsed,
+  onToggle,
+  itemById,
+  conversationId,
+  editingId,
+  draft,
+  handlers,
+}: {
+  group: ConversationGroup
+  collapsed: boolean
+  onToggle: (label: string) => void
+  itemById: ReadonlyMap<string, ConversationItem>
+  conversationId: string | undefined
+  editingId: string | null
+  draft: string
+  handlers: RowHandlers
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        className="convrail__group"
+        aria-expanded={!collapsed}
+        title={collapsed ? `展开「${group.label}」` : `收缩「${group.label}」`}
+        onClick={() => onToggle(group.label)}
+      >
+        <RightOutlined className="convrail__group-caret" data-open={!collapsed} />
+        <span className="convrail__group-label">{group.label}</span>
+        <span className="convrail__group-count num">{group.items.length}</span>
+      </button>
+      {collapsed ? null : (
+        <ul className="convrail__group-list">
+          {group.items.map((view) => {
+            const item = itemById.get(view.id)
+            if (item === undefined) return null
+            return (
+              <ConvRow
+                key={item.id}
+                view={view}
+                item={item}
+                current={item.id === conversationId}
+                editing={editingId === item.id}
+                draft={draft}
+                handlers={handlers}
+              />
+            )
+          })}
+        </ul>
+      )}
+    </li>
+  )
+})
+
+/** 一行会话（`memo`：视图对象 / 当前态 / 编辑态都没变时整行跳过） */
+const ConvRow = memo(function ConvRow({
+  view,
+  item,
+  current,
+  editing,
+  draft,
+  handlers,
+}: {
+  view: ConversationListItemView
+  item: ConversationItem
+  current: boolean
+  editing: boolean
+  draft: string
+  handlers: RowHandlers
+}) {
+  return (
+    <li className="conv" data-current={current}>
+      {editing ? (
+        <div className="conv__edit">
+          <Input
+            size="small"
+            aria-label="会话名称"
+            value={draft}
+            maxLength={CONVERSATION_TOPIC_MAX_CHARS}
+            autoFocus
+            onChange={(event) => handlers.onDraftChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                handlers.onCancelRename()
+                return
+              }
+              if (event.key !== 'Enter') return
+              if (event.nativeEvent.isComposing) return
+              handlers.onSubmitRename(item)
+            }}
+          />
+          <div className="conv__edit-ops">
+            <Button
+              size="small"
+              type="primary"
+              disabled={normalizeTopicDraft(draft, item.topic) === null}
+              onClick={() => handlers.onSubmitRename(item)}
+            >
+              保存
+            </Button>
+            <Button size="small" onClick={handlers.onCancelRename}>
+              取消
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <button
+          className="conv__open"
+          type="button"
+          aria-current={current ? 'true' : undefined}
+          onClick={() => {
+            if (!current) handlers.navigate(conversationPath(item.id))
+          }}
+        >
+          <span className="conv__title">{view.title}</span>
+          <span className="conv__meta">
+            <span className={`led led--${view.led}`} aria-hidden="true" />
+            <span>{view.state}</span>
+            {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
+            <Tag className="conv__agent" title={view.agentName}>
+              {AGENT_TYPE_LABEL[view.agentType]}
+            </Tag>
+            <span aria-hidden="true">·</span>
+            <span className="num">{view.time}</span>
+          </span>
+        </button>
+      )}
+
+      {editing ? null : (
+        <span className="conv__ops">
+          <Tooltip title="重命名">
+            <button
+              type="button"
+              aria-label={`重命名会话「${view.title}」`}
+              onClick={() => handlers.onStartRename(item)}
+            >
+              ✎
+            </button>
+          </Tooltip>
+          <Tooltip title="删除">
+            <button
+              type="button"
+              aria-label={`删除会话「${view.title}」`}
+              onClick={() => handlers.onRequestDelete(item)}
+            >
+              ✕
+            </button>
+          </Tooltip>
+        </span>
+      )}
+    </li>
+  )
+})

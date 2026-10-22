@@ -87,6 +87,8 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
   //    那样这个 effect 会每次重跑（预览区一直闪 loading）。
   useEffect(() => {
     if (!open || artifactId === '' || view === null || !view.available || view.kind !== 'text') {
+      // 关弹层 / 切走 ⇒ **丢掉已取回的正文**（内存优化 P6）：文本预览最多 2 MiB，
+      // 留着它没有任何用处（下次打开会重新取），而它会一直挂在组件的 state 里直到下一次预览。
       setText({ phase: 'idle' })
       return
     }
@@ -155,6 +157,11 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
       open={open}
       onClose={onClose}
       width="min(1080px, 92vw)"
+      // 内存优化 P6（`docs/子方案/前端长会话内存优化.md`）：收起后**销毁内容**。
+      // `iframe`（PDF 浏览器内置 viewer / HTML 沙箱）在隐藏状态下仍占着一整份文档的内存，
+      // 而这弹层在会话存续期间一直是挂载着的 —— 每次预览过的 PDF 都会留下一个活的 iframe。
+      // AntD 5.29 起用 `destroyOnHidden`（`destroyOnClose` 已弃用，此处按新名写）。
+      destroyOnHidden
       title={fileName === '' ? '产物预览' : fileName}
       extra={
         <Button

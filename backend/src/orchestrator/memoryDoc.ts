@@ -14,17 +14,18 @@
  * ★ 判据：**记忆内容随时可从 DB 推导 ⇒ 不挑时机、不存状态。**
  *   有两种"放错地方"的写法，都会被这条判据否掉：
  *     · **回收时生成** —— 回收连同 `/work` 卷一起删，文件放容器里等于白生成；
- *     · **只在建容器时写一次** —— 复用容器跑第二轮时记忆是旧的。
- *   ⇒ 正确做法是**每次派活前从 DB 现组装**（`buildMemoryDoc`）再写进容器
- *   （`writeMemoryDoc`）：容器重建后照样写入，复用容器时也是最新的。
+ *     · **把文件当成唯一记忆来源** —— 它只是**恢复用的快照**，真值永远在 DB。
+ *   ⇒ 正确做法是**需要恢复时**（容器新建，pi session 随之消失）从 DB 现组装
+ *   （`buildMemoryDoc`）再写进容器（`writeMemoryDoc`）；复用容器时 session 还活着、上下文不缺
+ *   ⇒ **既不重写也不让引擎读**（判据在 `taskAgent.ts` 的 `handle.reused` 分支）。
  *
  * ═══════════════════════════════════════════════════════════════════════
  * ★ 顺序：写记忆 → 对账 + 记轮次起点 → 派活 → 收产物（`taskAgent.ts` 的硬约束）
  * ═══════════════════════════════════════════════════════════════════════
- * 记忆文档每次派活都会变（对话又多了几轮）。P1-9 · R4 起，产物判据是**本轮工作区变更集**
- * （窗口 `[轮次起点, now]`）⇒ 必须在写它**之后**先 `reconcileWorkspaceOnce`（把记忆文档写进
- * 工作区索引/事件）、再记**轮次起点**，它才落在窗口之外、不会被当成本轮新产物收集。
- * 顺序必须钉死（调用点是 `taskAgent.ts`）。
+ * 记忆文档只在**新容器第一轮**写入（内容是那一刻的 DB 快照；复用容器时不写，见 `taskAgent.ts`）。
+ * P1-9 · R4 起，产物判据是**本轮工作区变更集**（窗口 `[轮次起点, now]`）⇒ 必须在写它**之后**先
+ * `reconcileWorkspaceOnce`（把记忆文档写进工作区索引/事件）、再记**轮次起点**，它才落在窗口之外、
+ * 不会被当成本轮新产物收集。顺序必须钉死（调用点是 `taskAgent.ts`）。
  * ⚠️ 另有一道**结构性**保险：文件写在 `/work/.doubulea/` 下，路径里带 `.` 开头的段
  * ⇒ `sandbox/artifactChanges.ts#filterArtifactPaths` 的"隐藏文件跳过"规则天然排除它 ——
  * 即便顺序写反，它也不会被当产物上传。两道一起，任一道单独失效都还有另一道兜着。
@@ -35,6 +36,8 @@
  * 写不进去（容器刚好卡死 / 卷只读 / exec 超时）只 warn：agent 这一轮少看到一份记忆，
  * 但它照样能干活。把它升级成"这一轮失败"会把一个可降级的功能变成一次不可用。
  */
+
+import { createHash } from 'node:crypto'
 
 import type { AttachmentItem } from '@doubulea/shared'
 
@@ -182,8 +185,19 @@ export async function buildMemoryDoc(conversationId: string): Promise<MemoryDocR
  *   · 所以可靠的触发点只有一个：**每次派活时把"先读这份记忆"作为指令带进 prompt**。
  *     它只影响发给引擎的那份消息，**不落库**（落库仍是用户原文，见 `taskAgent.ts` 的接线）。
  *
- * 只给**路径与理由**、不把正文塞进 prompt：正文可能有几 KB，塞进每轮会平白烧 token；
+ * 只给**路径与规则**、不把正文塞进 prompt：正文可能有几 KB，塞进每轮会平白烧 token；
  * 而 pi 的 `read` 工具读一个小文件很便宜。`hasContent === false`（全新会话第一轮）时不加。
+ *
+ * ★ **P1-21 修订（2026-10-21，真机取证）**：原先这里写的是"**在开始处理下面这条消息前，
+ *   请先读取该文件**" —— 那是一道**无条件指令**，于是**每一轮**模型都会 `read` 一次
+ *   `memory.md`（实测同容器连跑 3 轮、3 轮都读；`/tmp/probe4 rewrite → reads-per-round [1,2,3]`）。
+ *   P1-17a 只把"新建容器那一轮才让引擎读"这个**触发时机**收窄了，但**复用容器的那一轮也
+ *   仍然带着这句话**，等于每轮都催一次。而容器复用时 pi 的 session 还活着、记忆根本不需要重建。
+ *   ⇒ 两头一起改：① 调用方（`taskAgent.ts`）现在**只在容器新建那一轮**既写文件、又拼这段指令
+ *   （复用容器一次 exec 都不做）；② 这句话本身也降级成**条件指令**：只有确实缺上下文时
+ *   （容器刚重建 / 换新 session / `/clear` 之后）才读，其余情况模型自己判断
+ *   （`recall_memory` 仍然可随时查）。
+ *   ⚠️ 判据仍由 `taskAgent.ts` 决定**要不要把这段拼进 prompt**；本函数只负责"拼进去时说什么"。
  */
 export function memoryDocReadInstruction(): string {
   return (
@@ -193,8 +207,9 @@ export function memoryDocReadInstruction(): string {
     '`（**工作区相对路径**，即 `/work/` 下的 ' +
     MEMORY_DOC_RELATIVE_PATH +
     '）。\n' +
-    '在开始处理下面这条消息前，请先用 read 工具读取该文件，以便了解本会话之前发生过什么、' +
-    '已经产出过哪些文件、以及用户上传过哪些附件（需要时可按文档里的命令把它们取回 /work）。\n' +
+    '**何时读它**：只有当这一轮你**缺少**此前对话/产物的上下文时（例如容器刚重建、这是本次运行的第一轮、' +
+    '或用户提到的内容在上下文里找不到）才用 read 工具读一次；**上下文还在时不要重复读** —— 它在同一轮内' +
+    '不会变化，重复读只会浪费 token。需要回忆具体事实时优先用 `recall_memory` 按关键词检索。\n' +
     '⚠️ read 工具只接受**工作区相对路径**：请传 `' +
     MEMORY_DOC_RELATIVE_PATH +
     '`，不要传 `/work/.doubulea/memory.md` 这类绝对路径（会被拒绝）。'
@@ -393,19 +408,53 @@ export const NODE_FETCH_ATTACHMENT_COMMAND =
  * 这里再叠一层"正文只在位置参数里出现" ⇒ 正文里的任何字节都到不了 shell 的解析面。
  * （`base64` 来自 Debian 的 coreutils，本仓镜像必有。）
  *
+ * ★ **P1-21（2026-10-21）：内容没变就不写**。
+ *   ⚠️ 先说清调用时机：`taskAgent.ts` 现在**只在容器新建那一轮**调它（复用容器既不写也不读，
+ *   见文件头与 `handle.reused` 注释）。正常路径上新容器的 `/work` 是空的，不存在"重复写"。
+ *   保留这道判据是为了**卷没删干净**的兜底（`docker volume rm` 失败 → 对账器稍后清；此时新容器
+ *   可能挂到同一份旧卷）：若旧文件内容恰好与本次完全一致，重复覆盖只会把 mtime 刷成"刚刚更新"，
+ *   而 mtime 是**模型最信的一条"有新东西"线索**（真机取证：`/work` 里唯一的变动就是它，
+ *   模型下一轮就去 `read` 一遍，`ls -la /work/.doubulea` 也出现在轨迹里）。
+ *   ⇒ 先比**内容哈希**（同一份字节才保证内容相同，不比对 mtime/大小之类的弱判据）：
+ *     相同 ⇒ **一次写都不做**，原文件连 mtime 都不动；不同 ⇒ 覆盖写。
+ *   ⚠️ 判据放在**容器内**（`md5sum` 现算现比）而不是后端内存里记一张表：后端重启、换实例、
+ *      容器被外部改过，都会让内存表说假话，而 `md5sum` 读的是那份真文件的真内容。
+ *   ⚠️ `md5sum` 缺失（精简镜像）时 `$same` 为空 ⇒ 按"变了"处理（写一次），功能不受影响。
+ *
  * @throws Error exec 失败 / 非 0 退出（调用方 `taskAgent.ts` 会吞成 warn，见文件头）
  */
-export async function writeMemoryDoc(containerId: string, doc: string): Promise<void> {
+export async function writeMemoryDoc(
+  containerId: string,
+  doc: string,
+): Promise<{ written: boolean }> {
   const encoded = Buffer.from(doc, 'utf8').toString('base64')
+  // 期望哈希以**位置参数**传入（32 位十六进制，直接拼也安全 —— 但仍走位置参数，
+  // 保持"正文与判据都到不了 shell 的解析面"这一条）
+  const expected = createHash('md5').update(doc, 'utf8').digest('hex')
   const result = await execInSandbox(
     containerId,
     [
       'sh',
       '-c',
-      'mkdir -p "$1" && printf %s "$2" | base64 -d > "$1/memory.md"',
+      [
+        'set -e',
+        'mkdir -p "$1"',
+        'same=""',
+        'if [ -f "$1/memory.md" ]; then',
+        '  cur=$(md5sum "$1/memory.md" | cut -d" " -f1) || cur=""',
+        '  [ "$cur" = "$3" ] && same=1',
+        'fi',
+        'if [ -z "$same" ]; then',
+        '  printf %s "$2" | base64 -d > "$1/memory.md"',
+        '  echo wrote',
+        'else',
+        '  echo unchanged',
+        'fi',
+      ].join('\n'),
       'sh',
       MEMORY_DOC_DIR,
       encoded,
+      expected,
     ],
     { timeoutMs: ARTIFACT_EXEC_TIMEOUT_MS },
   )
@@ -414,10 +463,19 @@ export async function writeMemoryDoc(containerId: string, doc: string): Promise<
       `写入记忆文档失败（exitCode=${String(result.exitCode)}）：${result.stderr.toString('utf8').slice(0, 300)}`,
     )
   }
+  const written = result.stdout.toString('utf8').trim() === 'wrote'
   getLogger().debug(
-    { containerId, path: MEMORY_DOC_PATH, bytes: Buffer.byteLength(doc, 'utf8') },
-    '记忆文档已写入容器 /work（本轮 agent 会看到会话历史与产物清单）',
+    {
+      containerId,
+      path: MEMORY_DOC_PATH,
+      bytes: Buffer.byteLength(doc, 'utf8'),
+      written,
+    },
+    written
+      ? '记忆文档已写入容器 /work（本轮 agent 会看到会话历史与产物清单）'
+      : '记忆文档内容未变，跳过重写（保留原文件的 mtime，避免被当成“有新内容”）',
   )
+  return { written }
 }
 
 // ───────────────────────────── 内部小工具 ─────────────────────────────

@@ -1613,6 +1613,17 @@
   flex-direction: column;
   gap: var(--sp-6);
 }
+/* 内存优化 P3/P5a（`docs/子方案/前端长会话内存优化.md`）：把"整条消息"声明成一个可以跳过
+   渲染工作量的小岛。视口外的消息由浏览器**跳过样式 / 布局 / 绘制**（DOM 仍在，脚本状态也还在），
+   长会话里滚动时不至于每次滚动都重新算几百条消息的布局。
+   `contain-intrinsic-size` 给一个估计高度，避免"跳过时高度塌成 0 ⇒ 滚动条抖动"：
+   `auto` 关键字会记住上一次真实测量到的高度（Chrome 已支持），首次渲染才用估计值。
+   ⚠️ 不用 `contain: strict`（那会裁掉工具卡的 popover / 详情展开），只用 `content-visibility`
+   —— 它自带的包含范围已经足够，且不会裁切溢出内容以外的交互。 */
+.stream__inner > .msg {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
+}
 
 .msg { display: flex; flex-direction: column; gap: var(--sp-2); }
 .msg__head {

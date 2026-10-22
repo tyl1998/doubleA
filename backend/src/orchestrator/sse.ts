@@ -265,22 +265,77 @@ export async function readStopSignal(conversationId: string): Promise<boolean> {
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * 写一条插话信号，返回"是否确实有一个正在跑的流"。
+ * 一条插话信号（写进 `chat.steer:{id}` 列表的 JSON 形态）。
+ *
+ * `id` 由**入队时**生成（`randomUUID`）：前端乐观插入与出口层 `steer` 帧按它去重，
+ * 取消端点也用它精确移除（2026-10-21）。
+ */
+export interface SteerSignalEntry {
+  id: string
+  message: string
+  at: string
+}
+
+/** 取消哨兵：通道按 FIFO 取到它时，调 producer 的取消钩子（清空引擎插话队列） */
+const STEER_CANCEL_TOKEN = JSON.stringify({ __cancel: true })
+
+/**
+ * 写一条插话信号，返回"是否确实有一个正在跑的流"与这条插话的 id。
  *
  * 调用方（路由）已经用 `/active` 判过一遍 `streaming`，这里再判一次 `EXISTS` 是**刻意的重复**
  * （与 {@link signalStop} 同一条理由）：键的消失只可能是"流刚结束"，那样写进去就是一条
  * **没人消费的残留**（`RPUSH` 后没人 `LPOP`，要等 TTL 才清）。
  */
-export async function signalSteer(conversationId: string, message: string): Promise<boolean> {
+export async function signalSteer(
+  conversationId: string,
+  message: string,
+): Promise<{ accepted: boolean; steerId: string | null }> {
   const redis = await ensureRedisConnected()
   const exists = await redis.exists(chatActiveKey(conversationId))
-  if (exists === 0) return false
+  if (exists === 0) return { accepted: false, steerId: null }
   const key = chatSteerKey(conversationId)
-  // 值放 JSON（message + 入队时刻）：`redis-cli LRANGE` 一眼能看出"谁在什么时候插的话"
-  await redis.rpush(key, JSON.stringify({ message, at: new Date().toISOString() }))
+  const entry: SteerSignalEntry = { id: randomUUID(), message, at: new Date().toISOString() }
+  // 值放 JSON（id + message + 入队时刻）：`redis-cli LRANGE` 一眼能看出"谁在什么时候插的话"
+  await redis.rpush(key, JSON.stringify(entry))
   // 每次入队都续期：列表活得比单条信号久，TTL 只兜"流死了、键没人清"
   await redis.expire(key, CHAT_STEER_TTL_SEC)
-  return true
+  return { accepted: true, steerId: entry.id }
+}
+
+/**
+ * 撤回一条插话（2026-10-21）。返回撤回范围；`null` = 当前没有在跑的流（无可撤）。
+ *
+ * 两段式（顺序即正确性）：
+ *   ① **还没被通道取走** ⇒ 在列表里按 id 找到原始行、`LREM` 精确移除（`'one'`）；
+ *   ② **已被通道取走**（正在引擎的插话队列里）⇒ pi 只支持整体清空（`clear_queue`，没有"删指定一条"），
+ *      所以推一个**取消哨兵**。列表是 FIFO ⇒ 哨兵一定排在所有更晚入队的插话之后，
+ *      通道取到它时清空引擎队列，语义是"这些还没投递的插话都作废"（`'all'`）。
+ *
+ * ⚠️ 第 ③ 种结局"已经被模型读走"**无法从这一层判断**（引擎队列的真相在容器里）——
+ * 前端据 `steer_queue` 快照把「取回编辑」收掉，只在"仍待接收"时才让人点。
+ */
+export async function signalSteerCancel(
+  conversationId: string,
+  steerId: string,
+): Promise<'one' | 'all' | null> {
+  const redis = await ensureRedisConnected()
+  const exists = await redis.exists(chatActiveKey(conversationId))
+  if (exists === 0) return null
+  const key = chatSteerKey(conversationId)
+  // ① 精确移除（尚在列表里 = 通道还没取走）
+  const rows = await redis.lrange(key, 0, -1)
+  for (const raw of rows) {
+    const entry = parseSteerEntry(raw)
+    if (entry === null || entry.id !== steerId) continue
+    // `LREM` 的返回值是"真的删掉几条"：0 = LRANGE 之后被通道取走了 ⇒ 落到 ② 的清队列
+    const removed = await redis.lrem(key, 1, raw)
+    if (removed > 0) return 'one'
+    break
+  }
+  // ② 已交给引擎：推取消哨兵，由通道按顺序清空引擎插话队列
+  await redis.rpush(key, STEER_CANCEL_TOKEN)
+  await redis.expire(key, CHAT_STEER_TTL_SEC)
+  return 'all'
 }
 
 /**
@@ -297,33 +352,56 @@ export async function clearSteerSignal(conversationId: string): Promise<void> {
 }
 
 /**
- * 取走该会话**当前积压**的全部插话（`LPOP` 到空）。
+ * 一次轮询取到的条目（2026-10-21）：**保持 FIFO 顺序**。
+ *
+ * ⚠️ 顺序有意义，不能拆成"先撤全部、再投全部"两趟：
+ *   · `[插话 A, 取消]` ⇒ 必须"先投 A、再清队列"（A 也被撤掉）—— 反了就变成 A 被清后又投回去；
+ *   · `[取消, 插话 B]` ⇒ 必须"先清、再投 B"（B 是撤回之后新插的）—— 反了 B 会被一起清掉。
+ */
+export type SteerDrainItem = { kind: 'steer'; entry: SteerSignalEntry } | { kind: 'cancel' }
+
+/**
+ * 取走该会话**当前积压**的全部插话与取消信号（`LPOP` 到空，保留原顺序）。
  *
  * ⚠️ **只在"有 steer 监听器"时调用**（见 {@link SseChannel} 的 `#pollSteering`）—— 没有消费者时
  * 消息要留在列表里，否则"流还没接上 steer"这段窗口里的插话会被白白取走丢掉。
  * 解析失败（值坏）**跳过该条**（不抛错）：坏值不该让整轮插话失效。
  */
-export async function drainSteerSignals(conversationId: string): Promise<string[]> {
+export async function drainSteerSignals(conversationId: string): Promise<SteerDrainItem[]> {
   const redis = await ensureRedisConnected()
   const key = chatSteerKey(conversationId)
-  const messages: string[] = []
+  const items: SteerDrainItem[] = []
   // 有上界：一次最多取 50 条，防止"有人刷了一万条"在一帧里全投进引擎
   for (let i = 0; i < 50; i += 1) {
     const raw = await redis.lpop(key)
     if (raw === null) break
-    const text = parseSteerSignal(raw)
-    if (text !== null) messages.push(text)
+    if (raw === STEER_CANCEL_TOKEN) {
+      items.push({ kind: 'cancel' })
+      continue
+    }
+    const entry = parseSteerEntry(raw)
+    if (entry !== null) items.push({ kind: 'steer', entry })
   }
-  return messages
+  return items
 }
 
-/** 解析一条插话信号（**不抛错**：坏值返回 `null`，调用方跳过） */
-function parseSteerSignal(raw: string): string | null {
+/**
+ * 解析一条插话信号（**不抛错**：坏值返回 `null`，调用方跳过）。
+ *
+ * `id` 缺失时用 `at#message` 合成一个确定性标识（旧版写入的残留值 / 手工塞的测试值）——
+ * 宁可给一个合成 id，也不要丢掉用户说过的话。
+ */
+function parseSteerEntry(raw: string): SteerSignalEntry | null {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return null
-    const message = (parsed as { message?: unknown }).message
-    return typeof message === 'string' && message.trim() !== '' ? message : null
+    const record = parsed as { id?: unknown; message?: unknown; at?: unknown }
+    const message = record.message
+    if (typeof message !== 'string' || message.trim() === '') return null
+    const at = typeof record.at === 'string' ? record.at : new Date().toISOString()
+    const id =
+      typeof record.id === 'string' && record.id !== '' ? record.id : `${at}#${message}`
+    return { id, message, at }
   } catch {
     return null
   }
@@ -736,7 +814,16 @@ export interface ChatProducerInput {
    * ⚠️ 回调是**同步**的（与 `emit` 的异步不同）：producer 自己决定要不要 `await`
    * （TaskAgent 用 `void bridge.steer(...)` 尽力而为 —— 投不进去只记日志，不中断这一轮）。
    */
-  onSteer: (listener: (message: string) => void) => () => void
+  onSteer: (listener: (entry: SteerSignalEntry) => void) => () => void
+  /**
+   * 注册一个"**撤回插话**"的监听器（2026-10-21）。返回退订函数。
+   *
+   * 触发路径 = `POST /:id/steer/cancel` → 列表里出现取消哨兵 → 通道轮询取到 → 本钩子。
+   * producer 侧语义：**清空引擎侧还没投递的插话队列**（pi `clear_queue`；ChatBot = 清空 `steerInbox`），
+   * 并把"还没投递的插话"从本轮待落库的清单里摘掉（它们既没进模型上下文、也不该留在历史里）。
+   * ⚠️ 已经被模型读走的插话**撤不回来**（引擎不支持回滚已投递的消息）—— 那时前端已经不显示「取回」。
+   */
+  onSteerCancel: (listener: () => void) => () => void
 }
 
 /** 编排循环（P0-1-27）要实现的形状；本批的占位实现见 `orchestrator/index.ts` */
@@ -767,7 +854,9 @@ class SseChannel {
    * {@link ChatProducerInput.onSteer} 注册（TaskAgent 把它转投给引擎）。
    * **空集合 = 没人消费** ⇒ {@link #pollSteering} 不 `LPOP`（消息留在 Redis 列表里，见其注释）。
    */
-  readonly #steerListeners = new Set<(message: string) => void>()
+  readonly #steerListeners = new Set<(entry: SteerSignalEntry) => void>()
+  /** 撤回插话的监听器（2026-10-21）；与 {@link #steerListeners} 同一条"没人消费就不取"的纪律 */
+  readonly #steerCancelListeners = new Set<() => void>()
 
   constructor(raw: ServerResponse, conversationId: string, startedAt: string) {
     this.#raw = raw
@@ -818,10 +907,20 @@ class SseChannel {
    * 一经注册，{@link #pollSteering} 就会在每次轮询把积压的插话派发过来。producer 在
    * 收尾的 `finally` 里必须退订（与 {@link SandboxRpc.onEvent} 同款纪律：桥/通道活得比一轮久）。
    */
-  onSteer(listener: (message: string) => void): () => void {
+  onSteer(listener: (entry: SteerSignalEntry) => void): () => void {
     this.#steerListeners.add(listener)
     return () => {
       this.#steerListeners.delete(listener)
+    }
+  }
+
+  /**
+   * 注册"撤回插话"监听器（2026-10-21）。返回退订函数；收尾的 `finally` 里必须退订（同款纪律）。
+   */
+  onSteerCancel(listener: () => void): () => void {
+    this.#steerCancelListeners.add(listener)
+    return () => {
+      this.#steerCancelListeners.delete(listener)
     }
   }
 
@@ -991,31 +1090,51 @@ class SseChannel {
   async #pollSteering(): Promise<void> {
     if (this.#closed || this.#controller.signal.aborted) return
     if (this.#steerListeners.size === 0) return
-    let messages: string[]
+    let items: SteerDrainItem[]
     try {
-      messages = await drainSteerSignals(this.#conversationId)
+      items = await drainSteerSignals(this.#conversationId)
     } catch (error) {
       getLogger().warn({ err: error, conversationId: this.#conversationId }, '读取插话信号失败（本轮跳过，下轮再试）')
       return
     }
-    if (messages.length === 0) return
-    getLogger().info(
-      { conversationId: this.#conversationId, count: messages.length },
-      '收到中途插话，转交给本轮编排（投给运行中的引擎）',
-    )
-    for (const message of messages) {
+    if (items.length === 0) return
+    // ⚠️ 严格按 FIFO 顺序处理（见 `SteerDrainItem` 的注释：先撤后投 / 先投后撤语义完全不同）
+    for (const item of items) {
+      if (item.kind === 'cancel') {
+        getLogger().info(
+          { conversationId: this.#conversationId },
+          '收到插话撤回信号，转交给本轮编排（清空引擎插话队列）',
+        )
+        for (const listener of [...this.#steerCancelListeners]) {
+          try {
+            listener()
+          } catch (error) {
+            getLogger().warn(
+              { err: error, conversationId: this.#conversationId },
+              '插话撤回监听器抛错（只忽略该监听器本次回调）',
+            )
+          }
+        }
+        continue
+      }
+      const { entry } = item
+      getLogger().info(
+        { conversationId: this.#conversationId, steerId: entry.id },
+        '收到中途插话，转交给本轮编排（投给运行中的引擎）',
+      )
       // ★ 先让界面**看得见**这条插话（P1-20，产品反馈："发出去了但聊天界面上看不到，像丢消息"）：
       //   发一帧 `steer`（进本连接 SSE 流 + 帧总线），前端在消息流里补一条用户气泡；
       //   **再**派发给编排层（TaskAgent 投引擎 / ChatBot 在下一次上游调用前注入）。
       //   ⚠️ 顺序是刻意的：先发帧，即便随后的投递失败（尽力而为），用户也已经看到"我插了这句话"。
+      //   `id` / `at` 用**入队时**那一份（早先 `at` 取的是派发时刻，比真实插话时间晚一个轮询周期）。
       try {
-        await this.emit({ name: 'steer', data: { message, at: new Date().toISOString() } })
+        await this.emit({ name: 'steer', data: { id: entry.id, message: entry.message, at: entry.at } })
       } catch (error) {
         getLogger().warn({ err: error, conversationId: this.#conversationId }, '插话事件发帧失败（不影响投递）')
       }
       for (const listener of [...this.#steerListeners]) {
         try {
-          listener(message)
+          listener(entry)
         } catch (error) {
           getLogger().warn(
             { err: error, conversationId: this.#conversationId },
@@ -1541,6 +1660,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
         updateSnapshot: (patch) => channel?.updateSnapshot(patch) ?? Promise.resolve(),
         awaitConfirm: (question) => activeChannel.awaitConfirm(question),
         onSteer: (listener) => activeChannel.onSteer(listener),
+        onSteerCancel: (listener) => activeChannel.onSteerCancel(listener),
       })
       // ⚠️ producer **正常返回**不等于"流正常结束"：锁在生成过程中丢掉时，producer 可能压根没察觉
       //    （占位实现就只是等 abort；真实的编排循环也可能把中断吞在某个 `catch` 里）。

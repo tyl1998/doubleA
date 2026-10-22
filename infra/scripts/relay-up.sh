@@ -6,7 +6,7 @@
 #   Windows（Docker Desktop）上 Docker 跑在 Linux VM 里，bridge 网关是那台
 #   VM，容器到不了跑后端的宿主（P0-3-3 实测 `ENETUNREACH`）。
 #   生产（后端与 Docker 同宿主）**不需要**它：`manager.ts` 会把
-#   `SANDBOX_BACKEND_URL` 兜底成 `http://<沙箱网网关>:13001`。
+#   `SANDBOX_BACKEND_URL` 兜底成 `http://<沙箱网网关>:<SANDBOX_CALLBACK_PORT>`。
 #
 # 【两条腿】沙箱容器挂在 `doubulea-sandbox`（`Internal: true`）上：
 #   · 默认 bridge          → 够得着 host.docker.internal（后端那条腿）
@@ -18,10 +18,10 @@
 #   网不在时会直接告诉你。
 #
 # 用法：
-#   bash infra/scripts/relay-up.sh                    # 默认 host.docker.internal:13001
+#   bash infra/scripts/relay-up.sh                    # 默认端口取 infra/.env 的 SANDBOX_CALLBACK_PORT
 #   bash infra/scripts/relay-up.sh --write-env        # 顺便把两个 env 写进 infra/.env
-#   bash infra/scripts/relay-up.sh --target 10.0.0.5:13001   # 后端在别的机器
-#   bash infra/scripts/relay-up.sh --port 13001 --name doubulea-sandbox-relay
+#   bash infra/scripts/relay-up.sh --target 10.0.0.5:14001   # 后端在别的机器
+#   bash infra/scripts/relay-up.sh --port 14001 --name doubulea-sandbox-relay
 #
 # 停止：bash infra/scripts/relay-down.sh
 # Windows：infra/scripts/relay-up.ps1（同一套逻辑）
@@ -39,7 +39,10 @@ DOUBULEA_MOUNT_DIR="${DOUBULEA_HOST_INFRA_DIR:-$SCRIPT_DIR}"
 RELAY_SRC="$DOUBULEA_MOUNT_DIR/sandbox-relay.mjs"
 
 NAME=doubulea-sandbox-relay
+# 默认端口 = `infra/.env` 的 SANDBOX_CALLBACK_PORT（下面 Preflight 后按 env 覆盖）；
+# 这里的 13001 只是"env 里没有这一项"时的历史缺省值。
 PORT=13001
+PORT_FROM_CLI=''
 NET=doubulea-sandbox
 IMAGE=node:22-bookworm-slim
 TARGET=host.docker.internal
@@ -49,7 +52,7 @@ WRITE_ENV=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --name)      shift; NAME="${1:-doubulea-sandbox-relay}" ;;
-    --port)      shift; PORT="${1:-13001}" ;;
+    --port)      shift; PORT="${1:-13001}"; PORT_FROM_CLI=1 ;;
     --network)   shift; NET="${1:-doubulea-sandbox}" ;;
     --image)     shift; IMAGE="${1:-node:22-bookworm-slim}" ;;
     --target)    shift
@@ -64,6 +67,14 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# ★ 端口以 `infra/.env` 的 SANDBOX_CALLBACK_PORT 为准（与后端 listener 同一处口径）：
+#   relay 是**纯 TCP 转发**，listen 与 target 都是这个口 ⇒ 两边读同一个 env 才不会漂。
+#   显式传了 `--port` 就以命令行为准（给"后端在别的机器/别的端口"那种场景留口子）。
+if [ -z "$PORT_FROM_CLI" ]; then
+  env_cb="$(awk -F= '$1=="SANDBOX_CALLBACK_PORT" {print $2}' "$ENV_FILE" 2>/dev/null | tail -1)"
+  [ -n "$env_cb" ] && PORT="$env_cb"
+fi
 
 [ -n "$TARGET_PORT" ] || TARGET_PORT="$PORT"
 
@@ -210,6 +221,9 @@ printf '  %sSANDBOX_LISTEN_HOST=0.0.0.0%s\n\n' "$C_G" "$C_X"
 if [ "$WRITE_ENV" -eq 1 ]; then
   env_upsert SANDBOX_BACKEND_URL "$URL"
   env_upsert SANDBOX_LISTEN_HOST "0.0.0.0"
+  # 端口也写回去：后端 listener 与 relay 读的是**同一个键**，只写 URL 会让下一个不传 --port
+  # 的人按 .env 里那个（可能过期的）端口起 relay，两边又错开。
+  env_upsert SANDBOX_CALLBACK_PORT "$PORT"
   ok "已写进 infra/.env"
   warn "后端是**启动时读 env** 的 ⇒ 要重启才生效：bash infra/scripts/dev-stop.sh && bash infra/scripts/dev-run.sh"
 else

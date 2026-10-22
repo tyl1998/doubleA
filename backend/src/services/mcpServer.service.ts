@@ -91,6 +91,7 @@ import {
 } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
+import { broadcastMcpServerToolCacheChange } from '../sandbox/catalogSync.js'
 import { getPrisma, Prisma } from '../infra/prisma.js'
 import { McpClient } from '../mcp/client.js'
 import { buildCredentialInjection, createCredentialFetch } from '../mcp/inject.js'
@@ -377,6 +378,14 @@ async function refreshServerTools(server: {
 }): Promise<{ test: McpServerTestResult; row: McpServerRow }> {
   const test = await probeServer(server)
   const row = await applyProbeResult(server.id, test, new Date().toISOString())
+  // ★ P1-21：缓存变了 ⇒ 绑了这台 server 的 Agent 名下**活着的会话**重发清单（容器下一次派活时
+  //   会按新清单热更新工具）。只在**成功**时广播：失败时 `tool_cache` 一字节没动（文件头 ④），
+  //   清单自然也没变。异步不等待 —— 广播失败只影响"要不要等下次容器重建"。
+  if (test.ok) {
+    void broadcastMcpServerToolCacheChange(server.id).catch((error: unknown) => {
+      getLogger().warn({ err: error, mcpServerId: server.id }, '工具缓存变化广播失败（派活前仍会兜底比对）')
+    })
+  }
   return { test, row }
 }
 

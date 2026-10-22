@@ -105,8 +105,13 @@ export const RUNTIME_IMAGE_NAME = 'doubulea/sandbox-runtime'
  * `doubulea/sandbox-toolkit:5` 里**根本没有这个扩展**（`exec pi` 只加载 mcp-bridge），
  * 症状是"开了 Code 模式，agent 的文件读写完全没走中介"，而后端一条错都没有。R8 的最小原型
  * 复核在真实 `:5` 镜像里当场撞见（该文件缺失）⇒ 本批 +1 并重建，让扩展真的进镜像。
+ *
+ * ⚠️ **P1-21 起为 `7`**：`extensions/mcp-bridge/index.ts` 加了**工具清单热更新**
+ * （`registerCommand('doubulea:mcp-refresh')` + 运行期 `registerTool` 增删）。不重建的症状与
+ * P1-9 R8 同款：后端一切正常、热更新命令注入了，而容器里的扩展**不认识这条命令**
+ * ⇒ 模型看不到新绑的 MCP / 知识库（"必须重建会话"的老症状原样还在）。
  */
-export const BASE_LAYER_VERSION = '6'
+export const BASE_LAYER_VERSION = '7'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -134,8 +139,16 @@ export const BASE_LAYER_VERSION = '6'
  * "按需拉取"的两个脚本）⇒ 只读层内容又变了。不 +1 的症状：宿主上的 toolkit 没有 helper，
  * 而容器 env 里的 `credential.helper` / `GIT_SSH_COMMAND` 指向不存在的脚本
  * ⇒ `git clone` 认证静默失败（git 对缺失的 helper 只在 stderr 提一句，很容易看漏）。
+ *
+ * ⚠️ **P1-21 起为 `9`**：本层多了第三个脚本 `ssh-proxy-doubulea.mjs`（SSH 的 `ProxyCommand`，
+ * 走 egress 代理 CONNECT），且 `git-ssh-doubulea.mjs` 默认会追加 `-o ProxyCommand=…`。
+ * 不 +1 的症状最阴：宿主上还是 v8 的 toolkit ⇒ 旧包装器**不会**加隧道参数，而 SSH 又解析不了
+ * 内网域名 ⇒ `git clone git@…` 依旧 `Could not resolve hostname`，看起来像"这次改动没生效"。
+ *
+ * ⚠️ **P1-21b 起为 `10`**：同"base 变了就换 tag"那条 —— base 升到 `7`（mcp-bridge 加了热更新），
+ * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-6 的那一份。
  */
-export const TOOLKIT_LAYER_VERSION = '8'
+export const TOOLKIT_LAYER_VERSION = '10'
 
 /**
  * 运行时层内容版本（P1-17a；加/换一个语言运行时、或改 runtime Dockerfile 时 +1）

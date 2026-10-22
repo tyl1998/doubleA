@@ -206,6 +206,9 @@ async function refreshInstanceRegistration(scope: string): Promise<void> {
       startedAt: Date.now(),
     }
     const registration = startupReady ? await withInstanceLoad(record) : { ...record, ready: false, missing: ['startup'] }
+    // ⚠️ 摘流（`sandbox:drain:{id}`）**不经过**心跳：网关的自动发现与后台页各自直接读那个键
+    //   （2026-10-21 修正）。曾经让心跳把 `drained` 写进注册值 —— 实测在容器里跑旧版本的实例上
+    //   永远不生效（它根本不会读标记），于是"点了摘流但页面没反应"。判据只有一处：键在不在。
     await redis.set(sandboxInstanceKey(config.sandbox.instanceId), JSON.stringify(registration), 'EX', instanceRegistrationTtlSec())
   } catch (error) {
     getLogger().warn({ err: error, scope }, '实例注册续期失败（网关可能把本实例当离线，下一拍再试）')

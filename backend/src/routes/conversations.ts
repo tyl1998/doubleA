@@ -52,6 +52,7 @@ import {
   setConversationRuntimeBodySchema,
   SANDBOX_INSTANCE_KEY_PREFIX,
   parseInstanceRegistrationWithPort,
+  steerCancelBodySchema,
   steerConversationBodySchema,
   agentIdParamsSchema,
   type AgentIdParams,
@@ -67,6 +68,7 @@ import {
   type SetConversationCodeModeBody,
   type SetConversationInstanceBody,
   type SetConversationRuntimeBody,
+  type SteerCancelBody,
   type SteerConversationBody,
   type SseEvent,
 } from '@doubulea/shared'
@@ -80,6 +82,7 @@ import {
   serializeSseFrame,
   setAutoApprove,
   signalSteer,
+  signalSteerCancel,
   signalStop,
   SSE_RESPONSE_HEADERS,
   streamChatReply,
@@ -548,8 +551,39 @@ export function registerConversationRoutes(app: FastifyInstance): void {
     },
     async (request) => {
       const active = await getConversationActive(request.params.id, viewerOf(request))
-      if (!active.streaming) return ok({ id: request.params.id, accepted: false })
-      return ok({ id: request.params.id, accepted: await signalSteer(request.params.id, request.body.message) })
+      if (!active.streaming) return ok({ id: request.params.id, accepted: false, steerId: null })
+      const result = await signalSteer(request.params.id, request.body.message)
+      return ok({ id: request.params.id, accepted: result.accepted, steerId: result.steerId })
+    },
+  )
+
+  /**
+   * 撤回一条中途插话（`POST /api/conversations/:id/steer/cancel`，**2026-10-21**）。
+   *
+   * 用户侧是插话气泡上的「取回编辑」：只在**还没被模型读走**时提供（前端据 `steer_queue`
+   * 快照判断）。服务端尽力撤回：
+   *   · 还没被通道取走 ⇒ 从 Redis 列表里精确删掉这一条（`scope:'one'`）；
+   *   · 已交给引擎、还在队列里 ⇒ 清空引擎插话队列（`scope:'all'`，同轮其他未投递插话一并作废）；
+   *   · 流已结束 / 已被模型读走 ⇒ `cancelled:false`（**不是错误**，与 `/steer` 的幂等口径一致）。
+   *
+   * ⚠️ 与 `/steer` 同样的判据顺序（先读 `/active`，顺带完成"这不是我的会话就 404"）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SteerCancelBody }>(
+    '/api/conversations/:id/steer/cancel',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: steerCancelBodySchema },
+    },
+    async (request) => {
+      const active = await getConversationActive(request.params.id, viewerOf(request))
+      if (!active.streaming) {
+        return ok({ id: request.params.id, cancelled: false, scope: 'one' as const })
+      }
+      const scope = await signalSteerCancel(request.params.id, request.body.id)
+      if (scope === null) {
+        return ok({ id: request.params.id, cancelled: false, scope: 'one' as const })
+      }
+      return ok({ id: request.params.id, cancelled: true, scope })
     },
   )
 

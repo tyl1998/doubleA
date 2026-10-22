@@ -41,7 +41,7 @@ import {
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
-import { getPrisma } from '../infra/prisma.js'
+import { Prisma, getPrisma } from '../infra/prisma.js'
 import { putWorkspaceBlob, readWorkspaceBlob } from './blob.js'
 import { restoreWorkspaceFromCold, scheduleWorkspaceBlobBackup } from './cold.js'
 import { lineDiffWorkspace } from './diff.js'
@@ -80,6 +80,42 @@ export interface WorkspaceWriteActor {
 /** sha256（内容寻址 / 判"是否真变"） */
 export function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex')
+}
+
+/**
+ * 同一个会话里"写索引"的**互斥**（P1-21）。
+ *
+ * ★ 为什么需要（2026-10-21 真机复现）：中介写（agent 的 `write`/`edit`）与 watcher 的
+ *   `reconcileWorkspaceOnce`（1 秒一轮）都会在**事务外**算 `nextVersion = 当前版本 + 1`，再在事务里
+ *   写 `workspace_files` 与 `workspace_file_versions`。两者交错时，后进事务的一方仍拿旧版本号去
+ *   `create` ⇒ 撞唯一约束 `(file_id, version)`（Prisma `P2002`），整笔写 **500**。
+ *   盘上字节其实已经写下去了（`writeWorkspaceBytes` 在事务之前）⇒ 症状正是"agent 明明改了文件，
+ *   界面没有任何变化、还报错"。
+ *
+ * 口径：**同一个会话内的写索引串行化**（进程内排队）——
+ *   · 粒度是"会话"而不是"文件"：会话内的写量很小（一次写几个 ms），串行不会成为瓶颈；
+ *   · 只包住"算版本 → 事务 → 发事件"这一段，**不包**读盘/写盘/存历史字节（那些是慢 IO）；
+ *   · 多实例部署时进程内锁管不到另一台 —— 所以版本行插入仍走
+ *     {@link createVersionRowIfAbsent}（撞了就当"对方已记下"，不把写打成 500）。两道一起上：
+ *     同机不撞、跨机撞了也不炸。
+ */
+const writeIndexLocks = new Map<string, Promise<unknown>>()
+
+async function withWorkspaceWriteLock<T>(conversationId: string, run: () => Promise<T>): Promise<T> {
+  const previous = writeIndexLocks.get(conversationId) ?? Promise.resolve()
+  // `then(run, run)`：前一个写失败也要继续跑下一个（队列不能被一次失败堵死）
+  const next = previous.then(run, run)
+  const tail = next.then(
+    () => undefined,
+    () => undefined,
+  )
+  writeIndexLocks.set(conversationId, tail)
+  try {
+    return await next
+  } finally {
+    // 队尾仍是我 ⇒ 清键（不清的话这张 Map 会随会话数无限增长；有后来者时由后来者清）
+    if (writeIndexLocks.get(conversationId) === tail) writeIndexLocks.delete(conversationId)
+  }
 }
 
 /**
@@ -521,6 +557,47 @@ async function applyRevertEntry(
   return { ...base, action: 'restored', toVersion: written.version }
 }
 
+
+/**
+ * 写一条文件历史（`workspace_file_versions`），**容忍 (fileId, version) 的唯一约束冲突**。
+ *
+ * ★ **P1-21 修的是真实故障（2026-10-21，真机复现）**：中介写（agent 的 `write`/`edit`）与
+ *   watcher 的 `reconcileWorkspaceOnce`（1 秒一轮，读盘 → `syncFileFromDisk`）会**同时**推进同一个
+ *   文件：两边各自读到 `version = N`、都打算写 `N+1`，后者在 `create` 上撞
+ *   `workspace_file_versions_file_id_version_key`（Prisma `P2002`）。
+ *   症状是中介写**整笔 500**（工作区代理回 500 → 引擎的 `write` 失败 → 前端看到"agent 在改文件
+ *   但修改没落地"），而盘上的字节其实已经写下去了（`writeWorkspaceBytes` 在事务之前）——
+ *   于是"文件变了、索引没变、版本表炸了"。
+ *
+ * 口径：
+ *   · **版本行已存在**（同一个 `(fileId, version)`）⇒ 说明另一个写者已经把它记下了，
+ *     **跳过**即可：这一行的语义是"这个文件曾有过这个版本"，重复记录没有信息增量；
+ *   · 其它错误照旧抛出（不能把真正的写失败悄悄吞掉）。
+ *
+ * ⚠️ 行内容（hash）可能与本事务算出来的不同：那正是竞态的另一个写者赢了的证据，
+ *   而这恰恰是我们要的结果（先写赢的一方已经被记录）。
+ */
+async function createVersionRowIfAbsent(
+  tx: Pick<Prisma.TransactionClient, 'workspaceFileVersion'>,
+  data: { fileId: string; version: number; contentHash: string; actor: WorkspaceActor; actorId: string | null },
+): Promise<void> {
+  try {
+    await tx.workspaceFileVersion.create({ data })
+  } catch (error) {
+    if (isUniqueViolation(error)) return
+    throw error
+  }
+}
+
+/** Prisma `P2002`（唯一约束）判定 —— 只认这一种，别的错误一律往外抛 */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'P2002'
+  )
+}
+
 /**
  * 写入字节（文本写 / 上传两条入口共用的核心）—— **CAS 是核心**。
  *
@@ -547,9 +624,9 @@ async function writeWorkspaceFileBytes(
   //   否则会出现"盘上有、文件树里没有"的第三态（最难解释）。
   assertNotDependencyPath(relative)
 
-  const existing = await findRow(conversationId, relative)
+  const existingRow = await findRow(conversationId, relative)
   // 墓碑行按"已删除"处理：它的 version 照样参与 CAS（写回需带该版本，与 `delete` 的语义对齐）
-  const currentVersion = existing === null ? 0 : existing.version
+  const currentVersion = existingRow === null ? 0 : existingRow.version
   // `overwrite`（上传）不做 CAS：目标已存在就直接覆盖（文件管理器"上传"的常见语义）；
   // 文本保存（默认）仍严格 CAS，冲突即 409。
   if (options.overwrite !== true && baseVersion !== currentVersion) {
@@ -563,13 +640,12 @@ async function writeWorkspaceFileBytes(
   // 更严的写闸门（P1-9 · P6 · R6）：二进制类型闸门 + 单文件大小 / 活文件数 / 行数（含墓碑）/ 总字节。
   // ⚠️ 必须在 ④ 落字节**之前**判（见文件头 ②/③）：先判后写，否则是"写进去了才发现超限"。
   await assertWithinQuota(conversationId, data.byteLength, {
-    isNewFile: existing === null || existing.deletedAt !== null,
-    createsRow: existing === null,
+    isNewFile: existingRow === null || existingRow.deletedAt !== null,
+    createsRow: existingRow === null,
     binary: options.allowBinary === true ? false : workspaceContentIsBinary(data),
   })
 
   const hash = sha256(data)
-  const nextVersion = currentVersion + 1
   // 历史字节（P4 · R2）：先把将被覆盖的旧内容存档，再落新内容（两个版本都可还原）
   await stashCurrentFileIfAny(conversationId, absolute)
   await writeWorkspaceBytes(absolute, data)
@@ -577,58 +653,64 @@ async function writeWorkspaceFileBytes(
 
   const mime = workspaceMimeOf(relative)
   const now = new Date()
-  const event = await getPrisma().$transaction(async (tx) => {
-    const file = await tx.workspaceFile.upsert({
-      where: { conversationId_path: { conversationId, path: relative } },
-      create: {
-        conversationId,
-        path: relative,
-        size: BigInt(data.byteLength),
-        mime,
-        contentHash: hash,
-        version: nextVersion,
-        updatedBy: author.actor,
-        updatedById: author.actorId ?? null,
-        deletedAt: null,
-      },
-      update: {
-        size: BigInt(data.byteLength),
-        mime,
-        contentHash: hash,
-        version: nextVersion,
-        updatedBy: author.actor,
-        updatedById: author.actorId ?? null,
-        deletedAt: null,
-      },
-      select: { id: true },
-    })
-    await tx.workspaceFileVersion.create({
-      data: {
+  // ★ P1-21：**版本号必须在锁内重读**。锁外那次读（`currentVersion`）只用于 CAS 校验 ——
+  //   在"读盘 → 写盘 → 落索引"这段窗口里，watcher 可能已经把同一个文件推进了一版；
+  //   若这里仍用锁外那个数算 `nextVersion`，就会与 watcher 的记录撞唯一约束（整笔 500）。
+  const event = await withWorkspaceWriteLock(conversationId, async () => {
+    const latest = await findRow(conversationId, relative)
+    const nextVersion = (latest?.version ?? 0) + 1
+    return await getPrisma().$transaction(async (tx) => {
+      const file = await tx.workspaceFile.upsert({
+        where: { conversationId_path: { conversationId, path: relative } },
+        create: {
+          conversationId,
+          path: relative,
+          size: BigInt(data.byteLength),
+          mime,
+          contentHash: hash,
+          version: nextVersion,
+          updatedBy: author.actor,
+          updatedById: author.actorId ?? null,
+          deletedAt: null,
+        },
+        update: {
+          size: BigInt(data.byteLength),
+          mime,
+          contentHash: hash,
+          version: nextVersion,
+          updatedBy: author.actor,
+          updatedById: author.actorId ?? null,
+          deletedAt: null,
+        },
+        select: { id: true },
+      })
+      // ⚠️ 与 watcher 对账并发时这一步会撞唯一约束 ⇒ 走容忍版（见 `createVersionRowIfAbsent`）
+      await createVersionRowIfAbsent(tx, {
         fileId: file.id,
         version: nextVersion,
         contentHash: hash,
         actor: author.actor,
         actorId: author.actorId ?? null,
-      },
+      })
+      const created = await tx.workspaceEvent.create({
+        data: workspaceEventCreateData({
+          conversationId,
+          type: currentVersion === 0 ? 'created' : 'updated',
+          path: relative,
+          version: nextVersion,
+          actor: author.actor,
+          actorId: author.actorId ?? null,
+          at: now,
+        }),
+        select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
+      })
+      await tx.workspace.updateMany({ where: { conversationId }, data: { headVersion: { increment: 1 } } })
+      return { event: toWorkspaceEventItem(created), version: nextVersion }
     })
-    const created = await tx.workspaceEvent.create({
-      data: workspaceEventCreateData({
-        conversationId,
-        type: currentVersion === 0 ? 'created' : 'updated',
-        path: relative,
-        version: nextVersion,
-        actor: author.actor,
-        actorId: author.actorId ?? null,
-        at: now,
-      }),
-      select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
     })
-    await tx.workspace.updateMany({ where: { conversationId }, data: { headVersion: { increment: 1 } } })
-    return toWorkspaceEventItem(created)
-  })
-  publishWorkspaceEventItem(conversationId, event)
+    publishWorkspaceEventItem(conversationId, event.event)
 
-  return { path: relative, size: data.byteLength, mime, version: nextVersion, updatedBy: author.actor, updatedAt: now.toISOString() }
+  return { path: relative, size: data.byteLength, mime, version: event.version, updatedBy: author.actor, updatedAt: now.toISOString() }
 }
 
 /** 写文件（`PUT .../workspace/file?path=`）—— **文本入口**，等价于"字节核心 + UTF-8 编码"，拒收二进制 */
@@ -891,63 +973,65 @@ export async function syncFileFromDisk(
   const hash = sha256(data)
   // 历史字节（P4 · R2）：watcher 捕获的**新**内容先存档（旧内容已被外部改动覆盖、不可得）
   await stashWorkspaceBytes(conversationId, data)
-  const existing = await findRow(conversationId, relative)
-  if (existing !== null && existing.deletedAt === null && existing.contentHash === hash && Number(existing.size) === data.byteLength) {
-    return null
-  }
-  const nextVersion = (existing?.version ?? 0) + 1
   const mime = workspaceMimeOf(relative)
-  const event = await getPrisma().$transaction(async (tx) => {
-    const file = await tx.workspaceFile.upsert({
-      where: { conversationId_path: { conversationId, path: relative } },
-      create: {
-        conversationId,
-        path: relative,
-        size: BigInt(data.byteLength),
-        mime,
-        contentHash: hash,
-        version: nextVersion,
-        updatedBy: author.actor,
-        updatedById: author.actorId ?? null,
-        deletedAt: null,
-      },
-      update: {
-        size: BigInt(data.byteLength),
-        mime,
-        contentHash: hash,
-        version: nextVersion,
-        updatedBy: author.actor,
-        updatedById: author.actorId ?? null,
-        deletedAt: null,
-      },
-      select: { id: true },
-    })
-    await tx.workspaceFileVersion.create({
-      data: {
+  // ★ P1-21：与中介写共用同一把会话锁 —— 版本号在锁内重读（见 `withWorkspaceWriteLock`）
+  const outcome = await withWorkspaceWriteLock(conversationId, async () => {
+    const existing = await findRow(conversationId, relative)
+    if (existing !== null && existing.deletedAt === null && existing.contentHash === hash && Number(existing.size) === data.byteLength) {
+      return null
+    }
+    const nextVersion = (existing?.version ?? 0) + 1
+    return await getPrisma().$transaction(async (tx) => {
+      const file = await tx.workspaceFile.upsert({
+        where: { conversationId_path: { conversationId, path: relative } },
+        create: {
+          conversationId,
+          path: relative,
+          size: BigInt(data.byteLength),
+          mime,
+          contentHash: hash,
+          version: nextVersion,
+          updatedBy: author.actor,
+          updatedById: author.actorId ?? null,
+          deletedAt: null,
+        },
+        update: {
+          size: BigInt(data.byteLength),
+          mime,
+          contentHash: hash,
+          version: nextVersion,
+          updatedBy: author.actor,
+          updatedById: author.actorId ?? null,
+          deletedAt: null,
+        },
+        select: { id: true },
+      })
+      await createVersionRowIfAbsent(tx, {
         fileId: file.id,
         version: nextVersion,
         contentHash: hash,
         actor: author.actor,
         actorId: author.actorId ?? null,
-      },
+      })
+      const created = await tx.workspaceEvent.create({
+        data: workspaceEventCreateData({
+          conversationId,
+          type: existing === null || existing.deletedAt !== null ? 'created' : 'updated',
+          path: relative,
+          version: nextVersion,
+          actor: author.actor,
+          actorId: author.actorId ?? null,
+          at,
+        }),
+        select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
+      })
+      await tx.workspace.updateMany({ where: { conversationId }, data: { headVersion: { increment: 1 } } })
+      return { event: toWorkspaceEventItem(created), version: nextVersion }
     })
-    const created = await tx.workspaceEvent.create({
-      data: workspaceEventCreateData({
-        conversationId,
-        type: existing === null || existing.deletedAt !== null ? 'created' : 'updated',
-        path: relative,
-        version: nextVersion,
-        actor: author.actor,
-        actorId: author.actorId ?? null,
-        at,
-      }),
-      select: { id: true, type: true, path: true, version: true, actor: true, actorId: true, at: true },
     })
-    await tx.workspace.updateMany({ where: { conversationId }, data: { headVersion: { increment: 1 } } })
-    return toWorkspaceEventItem(created)
-  })
-  publishWorkspaceEventItem(conversationId, event)
-  return { path: relative, size: data.byteLength, mime, version: nextVersion, updatedBy: author.actor, updatedAt: at.toISOString() }
+    if (outcome === null) return null
+  publishWorkspaceEventItem(conversationId, outcome.event)
+  return { path: relative, size: data.byteLength, mime, version: outcome.version, updatedBy: author.actor, updatedAt: at.toISOString() }
 }
 
 /** 索引里有、盘上没了 ⇒ 软删 + `deleted` 事件（watcher 用）。无变化返回 `null` */

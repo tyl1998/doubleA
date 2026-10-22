@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   SANDBOX_INSTANCE_STATE_LABELS,
+  drainActionView,
   loadAgeText,
   sandboxInstanceState,
   slotRatioText,
@@ -81,6 +82,7 @@ const item = (extra = {}) => ({
   host: 'host-a',
   startedAt: NOW - 5_000,
   load: load(NOW - 3_000),
+  drained: false,
   ...extra,
 })
 
@@ -161,10 +163,30 @@ it('★ B2 读失败显示错误条，而不是渲染成空表', () => {
   assert(page.includes('data?.error != null'), '应有 error 分支')
   assert(page.includes('不是「零台实例」'), '错误条文案应点明不是零台')
 })
-it('B3 注册表只读：页面不直接写实例注册表（2026-10-19 起唯一写操作是「一键初始化」）', () => {
-  assert(!/\/api\/admin\/sandbox\/instances/.test(page), '页面不应直接调注册表写端点')
-  assert(page.includes('useStartBootstrapJob'), '唯一的写操作应来自 node 初始化任务 hook')
+it('★ B3 写操作清单收敛：只有「一键初始化」与「摘流」，且都走封装好的 hook', () => {
+  // 2026-10-21：摘流是**新**的写操作（用户反馈"页面上没有按钮"）。但它不允许页面自己拼 URL、
+  // 手发 PUT/DELETE —— 一律走 `api/sandboxInstances.ts#useSetSandboxDrained`（契约与后端同源）。
+  assert(!/\/api\/admin\/sandbox\/instances\/\$\{/.test(page), '页面不应自己拼注册表端点')
+  assert(page.includes('useStartBootstrapJob'), '一键初始化应走 node 初始化任务 hook')
+  assert(page.includes('useSetSandboxDrained'), '摘流应走 useSetSandboxDrained hook')
   assert(!/method: 'PUT'|method: 'DELETE'/.test(page), '页面不应发 PUT/DELETE')
+})
+it('★ B6 摘流按钮：有确认框、文案与纯函数同源、不把「摘流」说成「下线」', () => {
+  assert(page.includes('Modal.confirm'), '摘流是静默生效的运维动作，必须有确认框')
+  assert(page.includes('drainActionView('), '按钮文案与确认框文案应共用 drainActionView')
+  assert(page.includes('data-testid={`drain-${item.instanceId}`}'), '按钮应有稳定 testid')
+  for (const word of ['已摘流', '不等于下线', '仍会继续服务']) {
+    assert(page.includes(word), `页面应写明「${word}」的语义边界`)
+  }
+})
+it('★ B7 摘流纯函数：未摘流 ⇒ 按钮是「摘流」；已摘流 ⇒ 按钮是「恢复接收」（且文案说清新会话/已有会话的区别）', () => {
+  const off = drainActionView(item({ drained: false }))
+  eq([off.drained, off.actionLabel], [false, '摘流'], '未摘流')
+  assert(off.confirmBody.includes('新会话'), '确认框应说明只挡新会话')
+  assert(off.confirmBody.includes('仍会继续服务'), '确认框应说明已有会话不受影响')
+  const on = drainActionView(item({ drained: true }))
+  eq([on.drained, on.actionLabel], [true, '恢复接收'], '已摘流')
+  assert(on.confirmTitle.includes('重新接收新会话'), '恢复确认框标题')
 })
 it('★ B5 一键初始化：健康时禁用、只修坏项', () => {
   assert(page.includes('disabled={report.data === undefined || report.data.ready || running}'), '健康/执行中时按钮应禁用')

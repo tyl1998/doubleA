@@ -33,13 +33,16 @@
  *         不影响任何契约、服务端或数据。所以"暂缓"是可逆的 —— 这也是能安心定案的前提。
  */
 
+import { useMemo, useRef } from 'react'
 import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { PhrasingContent, Root, RootContent } from 'mdast'
 import type { Plugin } from 'unified'
 
+import { ThinkingBlock } from './ThinkingBlock.js'
 import { ToolCard } from './ToolCard.js'
-import type { ToolCallView } from './messageModel.js'
+import { shouldParseTail, streamingMarkdownChunks } from './markdownChunks.js'
+import type { ThinkingSegmentView, ToolCallView } from './messageModel.js'
 
 /** 工具卡的占位节点：渲染器按 `dataToolId` 把它换成 `ToolCard`（见 {@link AssistantMarkdown}）。 */
 function toolCardNode(callId: string): RootContent {
@@ -48,6 +51,53 @@ function toolCardNode(callId: string): RootContent {
     children: [],
     data: { hName: 'div', hProperties: { dataToolId: callId } },
   }
+}
+
+/** 思考段的占位节点：渲染器按 `dataThinkIndex` 把它换成 `ThinkingBlock`。 */
+function thinkingNode(index: number): RootContent {
+  return {
+    type: 'paragraph',
+    children: [],
+    data: { hName: 'div', hProperties: { dataThinkIndex: String(index) } },
+  }
+}
+
+/**
+ * 内联时间线上的一个条目（2026-10-21：**思考段与工具卡共用一条线**）。
+ *
+ * 用户报的问题：思考 A → 工具调用 → 思考 B 时，B 被渲染到了卡片**前面**（因为思考是整体
+ * 堆在正文上方的）。修法 = 给二者同一套位置（`offset` 决定插在哪段正文之间、`order` 决定
+ * 同偏移时的先后），按 `(offset, order)` 排成一条线再插。
+ */
+type InlineEntry =
+  | { kind: 'tool'; callId: string; offset: number; order: number }
+  | { kind: 'think'; index: number; offset: number; order: number }
+
+/**
+ * 把内联条目排成一条线。`offset` 缺省（旧消息）按 0；`order` 缺省时用"同类数组下标"兜底，
+ * 并让**旧消息**里思考排在工具卡之前（P0-1 时代的历史口径：思考在上、卡片在下）。
+ * ⚠️ 显式 `seq` 一定优先 —— 那是新数据里跨两类**共用**的递增序号（唯一可靠的先后判据）。
+ */
+function orderedInlineEntries(
+  tools: readonly ToolCallView[],
+  segments: readonly ThinkingSegmentView[],
+): InlineEntry[] {
+  const entries: InlineEntry[] = []
+  tools.forEach((tool, index) => {
+    entries.push({ kind: 'tool', callId: tool.callId, offset: tool.textOffset ?? 0, order: tool.seq ?? index })
+  })
+  segments.forEach((segment, index) => {
+    // 旧消息（只有 `thinking` 字符串、既无偏移也无序号）保持历史口径：**排在所有卡片之前**
+    //（那时思考块整体渲染在正文与卡片之上）；新数据的段一定带 `seq`，走正常排序。
+    const legacy = segment.textOffset === undefined && segment.seq === undefined
+    entries.push({
+      kind: 'think',
+      index,
+      offset: segment.textOffset ?? 0,
+      order: segment.seq ?? (legacy ? -1 : index),
+    })
+  })
+  return entries.sort((a, b) => a.offset - b.offset || a.order - b.order)
 }
 
 /**
@@ -112,57 +162,78 @@ function splitTextBlockAt(
 }
 
 /**
- * Parse the whole document first, then place each card before the first complete block after its offset.
+ * Parse the whole document first, then place each entry before the first complete block after its offset.
  *
- * ⚠️ 先按偏移把「卡落在块内部」的文本块切开（{@link splitTextBlockAt}），再插卡 —— 两步缺一不可，
- * 否则同一段里的多张卡会叠在一起（见该函数的说明）。切开之后每张卡都落在块边界上，
- * 插入规则仍是"插在**第一个起始偏移 ≥ 它的块**之前"；落在不可切分块（列表 / 代码围栏）内部的卡
- * 自然落到该块之后（与原行为一致）。
+ * ⚠️ 先按偏移把「条目落在块内部」的文本块切开（{@link splitTextBlockAt}），再插入 —— 两步缺一不可，
+ * 否则同一段里的多个条目会叠在一起（见该函数的说明）。切开之后每个条目都落在块边界上，
+ * 插入规则仍是"插在**第一个起始偏移 ≥ 它的块**之前"；落在不可切分块（列表 / 代码围栏）内部的
+ * 条目自然落到该块之后（与原行为一致）。
+ *
+ * ⚠️ 顺序完全由 {@link orderedInlineEntries} 决定（`(offset, order)`）—— 插入循环只按那个顺序
+ * 往同一个位置 `splice`，所以**同偏移时先出的一定先插**（这正是"思考 A 在工具卡前"的判据）。
  */
+function insertInlineEntries(tree: Root, entries: readonly InlineEntry[]): void {
+  if (entries.length === 0) return
+  const positioned: { node: RootContent; start: number }[] = []
+  for (const block of tree.children) {
+    const start = block.position?.start.offset
+    const end = block.position?.end.offset
+    if (start === undefined || end === undefined) {
+      positioned.push({ node: block, start: Number.POSITIVE_INFINITY })
+      continue
+    }
+    const inside = entries
+      .filter((item) => item.offset > start && item.offset < end)
+      .map((item) => item.offset)
+    const parts = inside.length === 0 ? null : splitTextBlockAt(block, inside)
+    if (parts === null) {
+      positioned.push({ node: block, start })
+      continue
+    }
+    positioned.push(...parts)
+  }
+
+  tree.children = positioned.map((item) => item.node)
+  let entryIndex = 0
+  let inserted = 0
+  for (const item of positioned) {
+    while (entryIndex < entries.length && entries[entryIndex]!.offset <= item.start) {
+      const entry = entries[entryIndex]!
+      tree.children.splice(
+        inserted,
+        0,
+        entry.kind === 'tool' ? toolCardNode(entry.callId) : thinkingNode(entry.index),
+      )
+      inserted += 1
+      entryIndex += 1
+    }
+    inserted += 1
+  }
+  while (entryIndex < entries.length) {
+    const entry = entries[entryIndex]!
+    tree.children.push(entry.kind === 'tool' ? toolCardNode(entry.callId) : thinkingNode(entry.index))
+    entryIndex += 1
+  }
+}
+
+/** 只插工具卡（保留给产物预览等"没有思考段"的调用点；行为与 2026-10-21 之前逐字一致） */
 export function remarkToolCards(tools: readonly ToolCallView[]): Plugin<[], Root> {
   return () => (tree) => {
     if (tools.length === 0) return
-    // 旧消息没有 `textOffset` ⇒ 按 0 处理（放在正文最前，见 `messageModel#ToolCallView`）
-    const ordered = [...tools]
-      .map((tool) => ({ callId: tool.callId, offset: tool.textOffset ?? 0 }))
-      .sort((a, b) => a.offset - b.offset)
+    insertInlineEntries(tree, orderedInlineEntries(tools, []))
+  }
+}
 
-    // ① 切分：块的位置信息在切分后不再可靠（同一段的各片共享原位置）⇒ 显式带着 `start` 边界走
-    const positioned: { node: RootContent; start: number }[] = []
-    for (const block of tree.children) {
-      const start = block.position?.start.offset
-      const end = block.position?.end.offset
-      if (start === undefined || end === undefined) {
-        positioned.push({ node: block, start: Number.POSITIVE_INFINITY })
-        continue
-      }
-      const inside = ordered
-        .filter((item) => item.offset > start && item.offset < end)
-        .map((item) => item.offset)
-      const parts = inside.length === 0 ? null : splitTextBlockAt(block, inside)
-      if (parts === null) {
-        positioned.push({ node: block, start })
-        continue
-      }
-      positioned.push(...parts)
-    }
-
-    // ② 插卡：每张卡插在"第一个起始偏移 ≥ 它的块"之前
-    tree.children = positioned.map((item) => item.node)
-    let toolIndex = 0
-    let inserted = 0
-    for (const item of positioned) {
-      while (toolIndex < ordered.length && ordered[toolIndex]!.offset <= item.start) {
-        tree.children.splice(inserted, 0, toolCardNode(ordered[toolIndex]!.callId))
-        inserted += 1
-        toolIndex += 1
-      }
-      inserted += 1
-    }
-    while (toolIndex < ordered.length) {
-      tree.children.push(toolCardNode(ordered[toolIndex]!.callId))
-      toolIndex += 1
-    }
+/**
+ * 把**思考段与工具卡**按内联时间线插进正文（2026-10-21；`AssistantMarkdown` 用它）。
+ * 二者共用一个 `(offset, seq)` 序列 ⇒「思考 A → 工具卡 → 思考 B → 正文」按发生顺序落位。
+ */
+export function remarkInlineBlocks(
+  tools: readonly ToolCallView[],
+  segments: readonly ThinkingSegmentView[],
+): Plugin<[], Root> {
+  return () => (tree) => {
+    insertInlineEntries(tree, orderedInlineEntries(tools, segments))
   }
 }
 
@@ -170,6 +241,22 @@ export interface AssistantMarkdownProps {
   text: string
   /** Optional tool cards positioned among complete Markdown blocks. */
   tools?: readonly ToolCallView[]
+  /**
+   * 思考段（2026-10-21）：与工具卡**同一条内联时间线** —— 按 `(textOffset, seq)` 一起插进正文。
+   * 这样「思考 A → 工具卡 → 思考 B」才会按发生顺序出现（用户报的正是 B 跑到卡片前面）。
+   */
+  thinkingSegments?: readonly ThinkingSegmentView[]
+  /** 思考段里**仍在生成**的那一段（其余段落已完成、默认折叠）；不传 = 都当已完成 */
+  streamingThinkingIndex?: number
+  /**
+   * 这一条消息**正在流式生成**（内存优化 P3，`docs/子方案/前端长会话内存优化.md`）。
+   *
+   * `true` 时正文走"稳定前缀 + 尾巴"两段渲染（见 `markdownChunks.ts`）：
+   * 已完成的块只解析一次，末尾还在长的部分按纯文本渲染 —— 于是**一帧不再全量重解析**。
+   * 收尾（`false` / 不传）时整篇解析一次，与历史消息逐字同款。
+   * 默认 `false`：历史消息、产物预览等"一次性渲染"的调用点不需要它。
+   */
+  streaming?: boolean
   /**
    * 渲染器覆盖（**P0-3-10 新增，默认不给**）。
    *
@@ -184,27 +271,136 @@ export interface AssistantMarkdownProps {
   components?: Components
 }
 
-export function AssistantMarkdown({ text, tools, components }: AssistantMarkdownProps) {
-  const toolById = new Map(tools?.map((tool) => [tool.callId, tool]))
-  const renderers: Components | undefined = tools === undefined || tools.length === 0 ? components : {
-    ...components,
-    div: ({ node, ...props }) => {
-      const id = node?.properties?.['dataToolId']
-      const tool = id === undefined ? undefined : toolById.get(String(id))
-      if (tool !== undefined) return <ToolCard tool={tool} />
-      return <div {...props} />
-    },
+/**
+ * ⚠️ **renderers 必须稳定**（2026-10-21，修"流式期间点不开工具卡"）：
+ *
+ * react-markdown 每次渲染都会重建整棵元素树，而 `div` 覆盖件的**函数引用就是元素 type**。
+ * 早先这个闭包在每次渲染时新建 ⇒ 每次 delta/thinking 帧（一轮几千次）都让 React 认为
+ * "组件类型变了" ⇒ **整棵 markdown 子树卸载重挂** ⇒ `ToolCard` 的 `userChoice` 状态
+ * 几十毫秒内被重置回默认值（表现：点了「展开」又自己弹回去、根本点不开），
+ * 顺带把 CPU 花在全量重解析 + 重挂上。
+ *
+ * 修法：闭包**只建一次**（依赖只有"有没有工具卡"），工具数据经 `ref` 取最新 ——
+ * 于是 type 稳定、ToolCard 实例得以保留（再配合 `ToolCard` 的 `memo`，未变化的卡片连重渲染都省掉）。
+ * `tools` 的引用在 `roundReducer` 的 `delta`/`thinking` 分支是**保留**的（只有工具帧才换数组），
+ * 所以这层 memo 在正文流式期间不会失效。
+ */
+export function AssistantMarkdown({
+  text,
+  tools,
+  thinkingSegments,
+  streamingThinkingIndex,
+  streaming = false,
+  components,
+}: AssistantMarkdownProps) {
+  const hasTools = tools !== undefined && tools.length > 0
+  const hasThinking = thinkingSegments !== undefined && thinkingSegments.length > 0
+  const hasInline = hasTools || hasThinking
+  /** 最新一份 `callId → 工具`（渲染期写入，闭包里读 —— 见上面的说明） */
+  const toolByIdRef = useRef<Map<string, ToolCallView>>(new Map())
+  toolByIdRef.current = new Map((tools ?? []).map((tool) => [tool.callId, tool]))
+  /** 最新一份思考段（同款：闭包里读 ref，保证 renderer 的 type 稳定） */
+  const segmentsRef = useRef<readonly ThinkingSegmentView[]>([])
+  segmentsRef.current = thinkingSegments ?? []
+  const streamingThinkingRef = useRef<number | undefined>(undefined)
+  streamingThinkingRef.current = streamingThinkingIndex
+
+  const renderers = useMemo<Components | undefined>(() => {
+    if (!hasInline) return components
+    return {
+      ...components,
+      div: ({ node, ...props }) => {
+        const toolId = node?.properties?.['dataToolId']
+        if (toolId !== undefined) {
+          const tool = toolByIdRef.current.get(String(toolId))
+          if (tool !== undefined) return <ToolCard tool={tool} />
+        }
+        const thinkIndex = node?.properties?.['dataThinkIndex']
+        if (thinkIndex !== undefined) {
+          const index = Number(thinkIndex)
+          const segment = segmentsRef.current[index]
+          if (segment !== undefined) {
+            return <ThinkingBlock text={segment.text} streaming={streamingThinkingRef.current === index} />
+          }
+        }
+        return <div {...props} />
+      },
+    }
+  }, [components, hasInline])
+
+  // 插件数组本身不参与元素 type 判定（同步版 Markdown 每帧都会重跑解析），
+  // 但它决定"条目插在哪" ⇒ 只在清单变化时重建（正文增量不重建）。
+  // ⚠️ 思考段的 text 会随时增长，而位置在段首就定死了 ⇒ 插件只需拿到 (offset, seq)；
+  //    这里仍按引用重建（数组变了才重建），代价只是重新插一遍，不影响元素 type。
+  const remarkPlugins = useMemo(
+    () =>
+      hasInline
+        ? [remarkGfm, remarkInlineBlocks(tools ?? [], thinkingSegments ?? [])]
+        : [remarkGfm],
+    [hasInline, tools, thinkingSegments],
+  )
+
+  /**
+   * 流式分块（内存优化 P3）：见 `markdownChunks.ts`。`stable` 在未跨过新的块边界时**是同一个字符串**
+   * ⇒ `Markdown` 的 children 引用不变 ⇒ 已完成的部分不再重新解析。
+   *
+   * ⚠️ 内联条目（工具卡 / 思考段）在分块期间**由尾巴那一次解析承载**：`markdownChunks.ts` 的
+   * 边界取"最后一个空行之后"，而条目到达的那一刻，它锚定的正文块**已经写完**（后端按
+   * `textOffset` 定位，正文先到、卡片随后）⇒ 条目的偏移必然 ≥ 尾巴的起点。
+   * 于是：
+   *   · 稳定段（纯正文前缀）用**没有条目**的插件解析 —— 它的结果因此与条目无关、可稳定复用；
+   *   · 尾巴用**全量条目**的插件解析 —— 条目落在尾巴内部（`insertInlineEntries` 只看相对位置），
+   *     落在尾巴之前的条目会被它插在尾巴开头（视觉上就在"正文之间"，与一次性解析一致）。
+   * 收尾时（`streaming === false`）走整篇解析，所以最终形态与历史消息逐字同款。
+   */
+  const chunks = useMemo(
+    () => (streaming ? streamingMarkdownChunks(text) : { stable: text, tail: '' }),
+    [streaming, text],
+  )
+  /** 尾巴是否交给解析器（极长且没有空行的正文，见 `shouldParseTail`） */
+  const parseTail = chunks.tail !== '' && shouldParseTail(chunks.tail)
+  /** 稳定段：纯正文前缀 ⇒ 插件里**不带**条目（见上面 ⚠️ 第三条） */
+  const stablePlugins = useMemo(() => [remarkGfm], [])
+
+  if (!streaming || chunks.tail === '') {
+    return (
+      // `.md` 的样式在 `styles/base.css`（P0-1-30 从 `design/styles/base.css` 搬入），
+      // 含 `pre` / `code` / `table` / `blockquote` 的完整口径 —— 这里不重复写任何样式
+      <div className="md">
+        <Markdown
+          remarkPlugins={remarkPlugins}
+          {...(renderers === undefined ? {} : { components: renderers })}
+        >
+          {text}
+        </Markdown>
+      </div>
+    )
   }
+
   return (
-    // `.md` 的样式在 `styles/base.css`（P0-1-30 从 `design/styles/base.css` 搬入），
-    // 含 `pre` / `code` / `table` / `blockquote` 的完整口径 —— 这里不重复写任何样式
     <div className="md">
-      <Markdown
-        remarkPlugins={tools === undefined || tools.length === 0 ? [remarkGfm] : [remarkGfm, remarkToolCards(tools)]}
-        {...(renderers === undefined ? {} : { components: renderers })}
-      >
-        {text}
-      </Markdown>
+      {chunks.stable === '' ? null : (
+        <Markdown
+          remarkPlugins={stablePlugins}
+          {...(renderers === undefined ? {} : { components: renderers })}
+        >
+          {chunks.stable}
+        </Markdown>
+      )}
+      {chunks.tail === '' ? null : parseTail ? (
+        <Markdown
+          remarkPlugins={remarkPlugins}
+          {...(renderers === undefined ? {} : { components: renderers })}
+        >
+          {chunks.tail}
+        </Markdown>
+      ) : (
+        // 尾巴按纯文本（`pre-wrap` 保留换行）：它可能是一个还没写完的代码围栏 / 表格，
+        // 解析出来只会是"半截语法"。收尾时整篇解析一次，立刻恢复正常渲染。
+        <div className="md md--tail" style={{ whiteSpace: 'pre-wrap' }}>
+          {chunks.tail}
+        </div>
+      )}
     </div>
   )
 }

@@ -38,7 +38,7 @@
  */
 
 import { Button, Checkbox, Popconfirm } from 'antd'
-import { useState } from 'react'
+import { memo, useState } from 'react'
 
 import { formatBytes } from '../../app/format.js'
 import { useArtifactDownload } from '../../components/ArtifactPreview/useArtifactDownload.js'
@@ -78,7 +78,17 @@ function kindOf(fileName: string): string {
   return fileName.slice(dot + 1).toUpperCase().slice(0, 4)
 }
 
-export function ArtifactCard({ artifact, timeText = null, onDelete, selected = false, onSelectedChange }: ArtifactCardProps) {
+/**
+ * ⚠️ `memo`（内存优化 P2，`docs/子方案/前端长会话内存优化.md`）：流式期间父组件每帧重渲染，
+ * 而历史消息的 `artifact` 引用稳定 ⇒ 整块跳过。
+ */
+export const ArtifactCard = memo(function ArtifactCard({
+  artifact,
+  timeText = null,
+  onDelete,
+  selected = false,
+  onSelectedChange,
+}: ArtifactCardProps) {
   const openPreview = useArtifactPreviewStore((state) => state.openPreview)
   const { downloading, download } = useArtifactDownload()
   const [deleting, setDeleting] = useState(false)
@@ -155,4 +165,4 @@ export function ArtifactCard({ artifact, timeText = null, onDelete, selected = f
       </div>
     </div>
   )
-}
+})
