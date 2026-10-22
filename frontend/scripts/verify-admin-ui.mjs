@@ -158,11 +158,9 @@ const {
   providerKeyIntent,
   buildCreateProviderBody,
   buildProviderUpdateBody,
-  providerTypeChangeBlocked,
   protocolOptionsFor,
-  protocolAfterTypeChange,
   protocolBaseUrlHint,
-  PROTOCOL_LOCKED_BY_TYPE_REASON,
+  PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON,
   EMPTY_MODEL_FORM_VALUES,
   modelEditValuesOf,
   validateMaxContext,
@@ -178,6 +176,7 @@ const {
   summarizeModels,
   remoteModelRows,
   remoteModelNotice,
+  guessModelType,
   modelEditAffectsVectors,
   knowledgeBasesUsingModel,
 } = await import('../src/pages/admin/adminModel.ts')
@@ -206,8 +205,8 @@ function makeProvider(overrides = {}) {
     name: 'OpenAI 生产',
     baseUrl: 'https://api.openai.com/v1',
     customUrl: false,
-    type: 'CHAT',
     protocol: 'OPENAI_COMPAT',
+    hasEmbeddingModel: false,
     enabled: true,
     hasKey: true,
     apiKeyPreview: 'sk-****abcd',
@@ -240,6 +239,8 @@ function makeModel(overrides = {}) {
     enabled: true,
     agentCount: 0,
     knowledgeBaseCount: 0,
+    captionKnowledgeBaseCount: 0,
+    usedAsTitleModel: false,
     createdAt: '2026-09-23T10:00:00.000Z',
     updatedAt: '2026-09-23T10:00:00.000Z',
     ...overrides,
@@ -252,7 +253,6 @@ function makeProviderForm(overrides = {}) {
     name: 'OpenAI 生产',
     baseUrl: 'https://api.openai.com/v1',
     customUrl: false,
-    type: 'CHAT',
     protocol: 'OPENAI_COMPAT',
     enabled: true,
     apiKey: '',
@@ -464,50 +464,43 @@ await it('D10 建 Provider：Key 可留空（先建后配是正常流程），�
   assertEqual(without.enabled, true, 'enabled 总要带（表单上是个明确的开关）')
 })
 
-// ───────────────────────────── E 改类型与迁移的守卫 ─────────────────────────────
+// ───────────────────────────── E 模型类型与迁移的守卫 ─────────────────────────────
 
-groupStart('E', '三处"必然 409"的守卫：Provider.type / 模型 type / 模型 providerId', '判据：`providerTypeChangeBlocked` / `buildProviderUpdateBody` / `buildModelUpdateBody`')
+groupStart(
+  'E',
+  '两条"必然 409"的守卫：模型 type / 模型 providerId（⚠️ 2026-10-22：Provider.type 守护已废除）',
+  '判据：`buildProviderUpdateBody`（不再带 type）/ `buildModelUpdateBody` / `modelTypeChangeBlocked`',
+)
 
-await it('E1 Provider 下**有模型** ⇒ type 锁；没有模型 ⇒ 可改', () => {
-  assertEqual(providerTypeChangeBlocked(makeProvider({ modelCount: 3 })), true, '有模型 ⇒ 锁')
-  assertEqual(providerTypeChangeBlocked(makeProvider({ modelCount: 0 })), false, '空 Provider 可以改类型')
-})
-
-await it('E2 有模型时改 type ⇒ **不进请求体**；但同时改的名字照进（不是整个请求被吞掉）', () => {
-  const body = buildProviderUpdateBody(
-    makeProvider({ modelCount: 2 }),
-    makeProviderForm({ type: 'EMBEDDING', name: '新名字' }),
-    false,
-  )
-  assertDeepEqual(body, { name: '新名字' }, 'type 被丢弃、name 保留 —— 而不是干脆不发请求')
-})
-
-await it('E3 空 Provider 改 type ⇒ 正常带上', () => {
-  const body = buildProviderUpdateBody(
-    makeProvider({ modelCount: 0 }),
-    makeProviderForm({ type: 'EMBEDDING' }),
-    false,
-  )
-  assertEqual(body?.type, 'EMBEDDING', '没有模型时允许改类型')
-})
-
-await it('E4 模型被智能体引用 ⇒ type 锁（`agentCount > 0`）', () => {
+await it('E1 模型被智能体引用 ⇒ type 锁（`agentCount > 0`）', () => {
   assertEqual(modelTypeChangeBlocked(makeModel({ agentCount: 1 })), true, '被引用 ⇒ 锁')
   assertEqual(modelTypeChangeBlocked(makeModel({ agentCount: 0 })), false, '没被引用 ⇒ 可改')
 })
 
-await it('E5 被引用的模型改 type ⇒ 丢弃该键，但**别的改动照带**', () => {
+await it('E2 被引用的模型改 type ⇒ 丢弃该键，但**别的改动照带**', () => {
   const model = makeModel({ agentCount: 2 })
   const body = buildModelUpdateBody(model, makeModelForm({ type: 'EMBEDDING', label: '新别名' }))
   assertDeepEqual(body, { label: '新别名' }, 'type 丢弃、label 保留')
 })
 
-await it('E6 `buildModelUpdateBody` **永不构造 `providerId`**（迁移是 409，界面上不给入口）', () => {
+await it('E3 `buildModelUpdateBody` **永不构造 `providerId`**（迁移是 409，界面上不给入口）', () => {
   const model = makeModel()
-  // 即使把表单里的 providerId 改成别的值，也不会进请求体
   const body = buildModelUpdateBody(model, makeModelForm({ providerId: 'p-other', label: '新别名' }))
   assertEqual(body !== null && 'providerId' in body, false, '不带 providerId')
   assertDeepEqual(body, { label: '新别名' }, '其余照带')
+})
+
+await it('E4 ⚠️ Provider 已无 type：改 Provider 体**绝不构造 `type`**（列已删除）', () => {
+  const provider = makeProvider({ modelCount: 3 })
+  // 表单里塞一个 type（模拟嘴硬的调用方）也必须被无视 —— 契约里根本没这个字段了
+  const body = buildProviderUpdateBody(provider, makeProviderForm({ name: '新名字', type: 'EMBEDDING' }), false)
+  assertDeepEqual(body, { name: '新名字' }, 'type 不进请求体、别的照带')
+})
+
+await it('E5 ⚠️ "有模型"**不再**拦任何 Provider 改动（原 409 已随方案A废除）', () => {
+  const provider = makeProvider({ modelCount: 5 })
+  const body = buildProviderUpdateBody(provider, makeProviderForm({ baseUrl: 'https://api.openai.com/v2' }), false)
+  assertDeepEqual(body, { baseUrl: 'https://api.openai.com/v2' }, '有模型也能改 baseUrl/协议等，不返回 null')
 })
 
 // ───────────────────────────── F maxContext 三态 ─────────────────────────────
@@ -649,7 +642,13 @@ await it('G7 源码级：模型表**不给 Provider 列开 `sorter`**（排序�
 groupStart('H', '删除分级：Provider 走级联档、用户没有删除接口', '判据：`modelDeleteBlockedNotice` + 源码级')
 
 await it('H3 删模型：没被引用 ⇒ 没有阻力（走 Popconfirm 那一档）', () => {
-  assertEqual(modelDeleteBlockedNotice(makeModel({ agentCount: 0 })), null, '可以删')
+  assertEqual(
+    modelDeleteBlockedNotice(
+      makeModel({ agentCount: 0, knowledgeBaseCount: 0, captionKnowledgeBaseCount: 0, usedAsTitleModel: false }),
+    ),
+    null,
+    '可以删',
+  )
 })
 
 await it('H4 删模型：被在线智能体引用 ⇒ 文案带数字 + 409（只算在线，不含软删）', () => {
@@ -658,6 +657,33 @@ await it('H4 删模型：被在线智能体引用 ⇒ 文案带数字 + 409（�
   assertIncludes(notice, '3', '要说清几个')
   assertIncludes(notice, '409', '要说清后端会拒')
   assertIncludes(notice, '在线', '`agentCount` 只算在线智能体（删智能体已自动解绑）')
+})
+
+await it('H4b 删模型：被知识库用作**向量模型** ⇒ 也要拦（否则静默清空该库的绑定）', () => {
+  const notice = modelDeleteBlockedNotice(makeModel({ agentCount: 0, knowledgeBaseCount: 2 }))
+  assert(notice !== null, '知识库引用也要有提示')
+  assertIncludes(notice, '2', '要说清几个库')
+  assertIncludes(notice, '知识库', '要点明是知识库在用')
+  assertIncludes(notice, '409', '要说清后端会拒')
+
+  const both = modelDeleteBlockedNotice(makeModel({ agentCount: 1, knowledgeBaseCount: 1 }))
+  assertIncludes(both ?? '', '智能体', '两处引用都要说')
+  assertIncludes(both ?? '', '知识库', '两处引用都要说')
+})
+
+await it('H4c 删模型：被知识库用作**图片描述模型** ⇒ 也要拦（2026-10-22 同族补漏）', () => {
+  const notice = modelDeleteBlockedNotice(makeModel({ captionKnowledgeBaseCount: 2 }))
+  assert(notice !== null, '图片描述模型引用也要有提示（caption_model_id 也是 SetNull）')
+  assertIncludes(notice, '2', '要说清几个库')
+  assertIncludes(notice, '图片描述', '要点明是图片描述用途')
+  assertIncludes(notice, '409', '要说清后端会拒')
+})
+
+await it('H4d 删模型：被平台用作**会话标题模型** ⇒ 也要拦（2026-10-22 同族补漏）', () => {
+  const notice = modelDeleteBlockedNotice(makeModel({ usedAsTitleModel: true }))
+  assert(notice !== null, '标题模型引用也要有提示（title_model_config.model_id 也是 SetNull）')
+  assertIncludes(notice, '标题', '要点明是标题模型用途')
+  assertIncludes(notice, '409', '要说清后端会拒')
 })
 
 await it('H5 源码级：Provider 删除弹窗是**级联那一档**（危险标签 + 危险按钮 + 明示影响 + 无逐字确认）', () => {
@@ -737,50 +763,62 @@ await it('I6 一切正常 ⇒ `null`（不多话）', () => {
   assertEqual(remoteModelNotice(makeRemoteResult(), true), null, '没有需要提醒的边界')
 })
 
+await it('I7 上游清单行只带上游真实读数 + 一个**推测类型**（默认值，不是判据）', () => {
+  const row = remoteModelRows(makeRemoteResult())[0]
+  assertEqual(
+    Object.keys(row).sort().join(','),
+    'contextLength,guessedType,id,ownedBy',
+    '行只有上游真实字段 + guessedType（推测作下拉默认值）',
+  )
+})
+
+await it('I8 类型推测：命中向量特征才猜 EMBEDDING，其余一律 CHAT（保守，可逐行改）', () => {
+  assertEqual(guessModelType('text-embedding-3-small'), 'EMBEDDING', 'text-embedding ⇒ 向量')
+  assertEqual(guessModelType('bge-m3'), 'EMBEDDING', 'bge ⇒ 向量')
+  assertEqual(guessModelType('gte-large'), 'EMBEDDING', 'gte ⇒ 向量')
+  assertEqual(guessModelType('BAAI/bge-m3'), 'EMBEDDING', '带命名空间前缀也命中')
+  assertEqual(guessModelType('voyage-3'), 'EMBEDDING', 'voyage ⇒ 向量')
+  assertEqual(guessModelType('gpt-4o-mini'), 'CHAT', '普通对话型号 ⇒ 对话')
+  assertEqual(guessModelType('qwen2.5:7b'), 'CHAT', '未知一律猜对话（保守：猜错成对话只是再改一次）')
+  assertEqual(remoteModelRows(makeRemoteResult())[0]?.guessedType, 'CHAT', '行上带的是推测结果')
+})
+
 // ───────────────────────────── K 上游协议（P0-1-37）─────────────────────────────
 // ⚠️ 排在 J 组之前是**刻意**的：J 组是本档的"源码级守门"，按惯例收尾。
 
 groupStart(
   'K',
-  '上游协议：可选值由类型决定、改类型要把协议收回默认值、请求体只在真变了才带',
-  '判据：`protocolOptionsFor` / `protocolAfterTypeChange` / `buildCreateProviderBody` / `buildProviderUpdateBody`',
+  '上游协议：可选值由"该 Provider 有没有向量模型"决定、请求体只在真变了才带',
+  '判据：`protocolOptionsFor` / `buildCreateProviderBody` / `buildProviderUpdateBody`',
 )
 
-await it('K1 可选协议由**类型**过滤：`CHAT` 三种都能选，`EMBEDDING` 只剩默认那一种', () => {
+await it('K1 可选协议由**有没有向量模型**过滤：无向量 ⇒ 三种都能选，有向量 ⇒ 只剩默认那一种', () => {
   assertEqual(
-    protocolOptionsFor('CHAT')
+    protocolOptionsFor(false)
       .map((option) => option.value)
       .join(','),
     'OPENAI_COMPAT,OPENAI_RESPONSES,ANTHROPIC_MESSAGES',
-    '对话 Provider 的三种协议',
+    '没有向量模型的 Provider 三种协议都能选',
   )
   assertEqual(
-    protocolOptionsFor('EMBEDDING')
+    protocolOptionsFor(true)
       .map((option) => option.value)
       .join(','),
     'OPENAI_COMPAT',
-    '向量 Provider 只允许默认协议 —— 与后端 `protocolAllowedForType` 同一判据（前端不另写一遍）',
+    '有向量模型 ⇒ 只允许默认协议 —— 与后端 `vectorModelRequiresCompatProtocol` 同一判据（前端不另写一遍）',
   )
   assert(
-    PROTOCOL_LOCKED_BY_TYPE_REASON.includes('embedding'),
+    PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON.includes('embedding'),
     '锁住时的说明必须点明"embedding 只有一条路"，否则用户只看到灰掉的下拉',
   )
 })
 
-await it('K2 ⚠️ 改类型必须把协议收回默认值 —— 否则"CHAT+Anthropic 改成 EMBEDDING"是一次**必然 400** 的提交', () => {
-  assertEqual(
-    protocolAfterTypeChange('EMBEDDING', 'ANTHROPIC_MESSAGES'),
-    'OPENAI_COMPAT',
-    'CHAT+Anthropic → EMBEDDING：协议必须收回默认值（那个下拉在 EMBEDDING 下是灰的，用户没碰过它）',
-  )
-  assertEqual(
-    protocolAfterTypeChange('EMBEDDING', 'OPENAI_RESPONSES'),
-    'OPENAI_COMPAT',
-    'Responses 同理',
-  )
-  assertEqual(protocolAfterTypeChange('CHAT', 'ANTHROPIC_MESSAGES'), 'ANTHROPIC_MESSAGES', '合法的组合不该被改动')
-  assertEqual(protocolAfterTypeChange('CHAT', 'OPENAI_COMPAT'), 'OPENAI_COMPAT', '默认值不动')
-  assertEqual(protocolAfterTypeChange('EMBEDDING', 'OPENAI_COMPAT'), 'OPENAI_COMPAT', '已经合法就保持')
+await it('K2 ⚠️ 判据的输入是"有没有向量模型"而**不是** Provider 的 type（Provider 已无 type 列）', () => {
+  // 同一个 boolean 入参决定可选集；不存在"传 type 进去"的重载
+  const withVector = protocolOptionsFor(true)
+  const without = protocolOptionsFor(false)
+  assert(withVector.length < without.length, '有向量模型的可用集必须更小')
+  assertEqual(withVector[0].value, 'OPENAI_COMPAT', '唯一合法值是默认协议')
 })
 
 await it('K3 ⚠️ 编辑态：`protocol` **要回填**、`apiKey` **绝不回填**（两者刻意相反）', () => {
@@ -795,7 +833,6 @@ await it('K4 建 Provider **总是**带上 `protocol`（用户明确选过，不
   const body = buildCreateProviderBody({
     name: '  OpenAI 生产  ',
     baseUrl: ' https://api.openai.com/v1/ ',
-    type: 'CHAT',
     protocol: 'OPENAI_COMPAT',
     enabled: true,
     apiKey: '',
@@ -803,11 +840,11 @@ await it('K4 建 Provider **总是**带上 `protocol`（用户明确选过，不
   assertEqual(body.protocol, 'OPENAI_COMPAT', '哪怕就是默认值也要显式带上（否则"界面显示兼容、实际存了别的"看不出来）')
   assertEqual(body.name, 'OpenAI 生产', '名称两端空白要去掉')
   assert(!('apiKey' in body), 'Key 留空 ⇒ 不带这个键')
+  assert(!('type' in body), '⚠️ 2026-10-22：Provider 已无 type 列 ⇒ 请求体绝不带 type')
 
   const anth = buildCreateProviderBody({
     name: 'Claude',
     baseUrl: 'https://api.anthropic.com/v1',
-    type: 'CHAT',
     protocol: 'ANTHROPIC_MESSAGES',
     enabled: true,
     apiKey: '  sk-new  ',
@@ -821,7 +858,6 @@ await it('K5 改 Provider：协议**逐字比较**，只在真变了才带；什
   const baseline = {
     name: provider.name,
     baseUrl: provider.baseUrl,
-    type: provider.type,
     protocol: 'ANTHROPIC_MESSAGES',
     enabled: provider.enabled,
     apiKey: '',
@@ -832,18 +868,12 @@ await it('K5 改 Provider：协议**逐字比较**，只在真变了才带；什
   const onlyProtocol = buildProviderUpdateBody(provider, { ...baseline, protocol: 'OPENAI_RESPONSES' }, false)
   assertEqual(Object.keys(onlyProtocol).join(','), 'protocol', '只改协议 ⇒ 请求体里**只有** protocol 这个键')
 
-  // ⚠️ 协议**没有**"有模型就不许改"的守卫（与 type 刻意相反，`02` §4.3）
+  // ⚠️ 协议**没有**"有向量模型就不许改"以外的守卫（填错了本来就该能改回来）
   const manyModels = makeProvider({ protocol: 'ANTHROPIC_MESSAGES', modelCount: 9 })
   assertEqual(
     buildProviderUpdateBody(manyModels, { ...baseline, protocol: 'OPENAI_COMPAT' }, false).protocol,
     'OPENAI_COMPAT',
-    'modelCount > 0 也要能改协议（协议填错了本来就该能改回来）',
-  )
-  // 而 type 在同一条路上是被拦的 —— 两条"刻意相反"的处置放在一起对照
-  assertEqual(
-    buildProviderUpdateBody(manyModels, { ...baseline, type: 'EMBEDDING' }, false),
-    null,
-    '改 type 被拦（不发必然 409 的请求）',
+    'modelCount > 0 也能改协议（没有向量模型时协议随便改）',
   )
 })
 
@@ -868,7 +898,6 @@ await it('K7 ⚠️ `values` 不带 `protocol` ⇒ 当作**没改**，绝不把 
   const partial = {
     name: provider.name,
     baseUrl: provider.baseUrl,
-    type: provider.type,
     enabled: provider.enabled,
     apiKey: '',
   }
@@ -1042,27 +1071,68 @@ await it('J13 ⚠️ 列表 hook 一律**对象参数**：`offset` 与 `limit` �
   assertIncludes(page.source, 'limit: MODEL_POOL_PAGE_LIMIT_MAX', '两个 hook 都要显式带上 limit')
 })
 
-await it('J14 ⚠️ 协议下拉标灰 + 改类型走收口函数；列表里有一列「上游协议」', () => {
+await it('J14 ⚠️ 协议下拉按"有没有向量模型"标灰；Provider 表单**不再有类型选择器**；列表里有「上游协议」列', () => {
   const files = sourceFiles()
 
   const modal = files.find((item) => item.name === 'pages/admin/ProviderFormModal.tsx')
   assert(modal !== undefined, '找不到 ProviderFormModal.tsx')
-  // ① 灰色下拉：`EMBEDDING` 下只剩一个选项就必须灰掉（配一个必然 400 的选项等于给用户挖坑）
+  // ① 灰色下拉：该 Provider 下有向量模型时只剩一个选项就必须灰掉（配一个必然 400 的选项等于给用户挖坑）
   assertIncludes(modal.source, 'disabled={protocolLocked}', '协议选择器要按 protocolLocked 标灰')
-  assertIncludes(modal.source, 'PROTOCOL_LOCKED_BY_TYPE_REASON', '标灰时要说清为什么（灰按钮不加解释等于页面坏了）')
-  // ② 改类型必须经过收口函数 —— 直接 `setProtocol` 会留下"灰着的字段报 400"
-  assert(
-    /setProtocol\(\(current\) => protocolAfterTypeChange\(next, current\)\)/.test(modal.source),
-    '类型选择器的 onChange 里必须调用 `protocolAfterTypeChange`：不收回默认值，' +
-      '"CHAT+Anthropic 改成 EMBEDDING"就是一次必然 400 的提交，且报错字段是那个灰着的下拉',
+  assertIncludes(
+    modal.source,
+    'PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON',
+    '标灰时要说清为什么（灰按钮不加解释等于页面坏了）',
   )
-  // ③ baseUrl 的提示随协议变（三条路后缀不同，填错的表现是 404）
+  // ② 判据入参是"有没有向量模型"，不是 Provider 的 type
+  assertIncludes(
+    modal.source,
+    'protocolOptionsFor(provider?.hasEmbeddingModel === true)',
+    '协议可选集的输入必须是"该 Provider 有没有向量模型"',
+  )
+  // ③ ⚠️ Provider 表单里**不该再有**类型选择器（`model_providers.type` 已整列删除）
+  assert(
+    !modal.source.includes('PROVIDER_TYPE_LOCKED_REASON') && !modal.source.includes('protocolAfterTypeChange'),
+    'Provider 表单不该再出现"改类型/协议收回"那套判据（类型列已删除）',
+  )
+  // ④ baseUrl 的提示随协议变（三条路后缀不同，填错的表现是 404）
   assertIncludes(modal.source, 'protocolBaseUrlHint(protocol)', 'baseUrl 的提示要跟着协议走')
 
   const page = files.find((item) => item.name === 'pages/admin/ModelsPage.tsx')
   assert(page !== undefined, '找不到 ModelsPage.tsx')
-  assertIncludes(page.source, "title: '上游协议'", 'Provider 表要单独一列显示协议（类型与协议是两个维度）')
+  assertIncludes(page.source, "title: '上游协议'", 'Provider 表要单独一列显示协议')
   assertIncludes(page.source, 'UPSTREAM_PROTOCOL_LABELS[provider.protocol]', '列里读的是契约字段，不是自己拼的字符串')
+  assert(
+    !page.source.includes('MODEL_TYPE_LABELS[provider.type]'),
+    '⚠️ Provider 表不该再读 provider.type（列已删除）',
+  )
+})
+
+await it('J15 ⚠️ 拉取抽屉：类型在**每行**选（默认按型号名推测；不做总单选 / 待创建清单）', () => {
+  const files = sourceFiles()
+  const drawer = files.find((item) => item.name === 'pages/admin/RemoteModelsDrawer.tsx')
+  assert(drawer !== undefined, '找不到 RemoteModelsDrawer.tsx')
+  // ① 行内逐条选类型（类型是每个模型自己的属性）
+  assertIncludes(drawer.source, "title: '建成类型'", '型号表要有「建成类型」列，逐行选')
+  assert(
+    /typeOfRow\(row\)/.test(drawer.source) && /setTypeOverrides/.test(drawer.source),
+    '每行的下拉用 typeOfRow(row) 取值、onChange 写 typeOverrides',
+  )
+  // ② 默认值来自**按型号名的保守推测**（只是默认、可逐行改；不是判据）
+  assert(
+    /typeOverrides\[row\.id\] \?\? row\.guessedType/.test(drawer.source),
+    '每行类型默认取 `row.guessedType`（推测值），用户可在该行改',
+  )
+  assert(
+    /guessModelType/.test(drawer.source) === false && /guessedType/.test(drawer.source),
+    '抽屉消费 `guessedType`（推测由 `adminModel` 的 `guessModelType` 产出，抽屉不自己再写一份）',
+  )
+  // ② 不做"待创建清单"块
+  assert(!drawer.source.includes('待创建清单'), '不做待创建清单（类型直接在行内选）')
+  // ④ 抽屉顶部**不再有**「建成的类型」总单选（初版被读成"筛选"，定位错）
+  assert(
+    !drawer.source.includes('Radio.Group'),
+    '抽屉里不该再有「建成的类型」总单选（与筛选输入框并排，会被读成筛列表）',
+  )
 })
 
 // ───────────────────────────── P1-5：编辑被引用的向量模型要提示"哪些库需重建" ─────────────────────────────

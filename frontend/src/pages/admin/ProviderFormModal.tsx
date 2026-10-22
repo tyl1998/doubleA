@@ -19,30 +19,28 @@
  * 会让"改个名字顺手把输入框里的掩码删掉"变成一次**静默的密钥删除**（`02` §4.3 原文：
  * "改个名字会顺手把 Key 抹掉 —— 而且是静默的，要等到真正调用模型时才发现"）。
  *
- * ⚠️ 另一处不能发明的功能：`type` 在"该 Provider 下已有模型"时**改不了**（后端 409，
- * 理由：`models.type` 与 `model_providers.type` 冗余，级联改会悄悄改变已绑定智能体用的是
- * 哪类模型）。所以选择器标灰 + 写明原因 + 指向"新建一个 Provider"。
+ * ⚠️ 2026-10-22：**Provider 不再有「类型」字段**（`model_providers.type` 整列删除）——
+ * 同一个 Provider（同一个 baseUrl + 同一把 Key）下可以同时挂对话与向量模型，类型属于**模型**。
+ * 所以本表单里既没有类型选择器、也没有"改类型"这件事（原先那条"有模型就不许改 type → 409"
+ * 随方案A一起废除）。见 `docs/子方案/Provider与模型类型解耦.md`。
  *
  * ─────────────────────────────────────────────────────────────────────
  * P0-1-37 加的第三个字段：上游协议
  * ─────────────────────────────────────────────────────────────────────
  * `protocol` 决定"报文怎么发"（`/chat/completions` vs `/responses` vs `/messages`，
  * 以及鉴权头是 `Bearer` 还是 `x-api-key`）。界面上两处与它相关：
- *   · 可选值由 `protocolOptionsFor(type)` 过滤 —— `EMBEDDING` 只剩默认协议，理由写在提示里；
- *   · **改类型时把协议收回默认值**（{@link protocolAfterTypeChange}）：否则
- *     "CHAT+Anthropic 改成 EMBEDDING"必然 400，而报错的字段是一个灰着的下拉。
+ *   · 可选值由 `protocolOptionsFor(hasEmbeddingModel)` 过滤 —— **该 Provider 下有向量模型**时
+ *     只剩默认协议（`EMBEDDING` 只有 `/embeddings` 一条路），理由写在提示里；
+ *     ⚠️ 2026-10-22 起判据的输入是"**有没有向量模型**"（同一 Provider 可同时挂两类模型）。
  * 另外 `baseUrl` 的提示随协议变 —— 三条路后缀不同（`/chat/completions` / `/responses` /
  * `/messages`），把整条 URL 粘进 baseUrl 的表现是 404，且 404 的文案只会说"检查版本段"。
  */
 
 import { Alert, Input, Modal, Select, Switch } from 'antd'
 import {
-  MODEL_TYPES,
-  MODEL_TYPE_LABELS,
   PROVIDER_CREDENTIAL_MODES,
   PROVIDER_CREDENTIAL_MODE_LABELS,
   type ModelProviderItem,
-  type ModelType,
   type ProviderCredentialMode,
   type UpstreamProtocol,
 } from '@doubulea/shared'
@@ -58,16 +56,13 @@ import {
 import { useFeedback } from '../../app/feedback.js'
 import {
   EMPTY_PROVIDER_FORM_VALUES,
-  PROTOCOL_LOCKED_BY_TYPE_REASON,
-  PROVIDER_TYPE_LOCKED_REASON,
+  PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON,
   buildCreateProviderBody,
   buildProviderUpdateBody,
   describeProviderKey,
-  protocolAfterTypeChange,
   protocolBaseUrlHint,
   protocolOptionsFor,
   providerEditValuesOf,
-  providerTypeChangeBlocked,
 } from './adminModel.js'
 
 export interface ProviderFormModalProps {
@@ -76,8 +71,6 @@ export interface ProviderFormModalProps {
   open: boolean
   onClose: () => void
 }
-
-const TYPE_OPTIONS = MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] }))
 
 export function ProviderFormModal({ provider, open, onClose }: ProviderFormModalProps) {
   const feedback = useFeedback()
@@ -91,7 +84,6 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [customUrl, setCustomUrl] = useState(EMPTY_PROVIDER_FORM_VALUES.customUrl)
-  const [type, setType] = useState<ModelType>(EMPTY_PROVIDER_FORM_VALUES.type)
   const [protocol, setProtocol] = useState<UpstreamProtocol>(EMPTY_PROVIDER_FORM_VALUES.protocol)
   const [enabled, setEnabled] = useState(true)
   const [credentialMode, setCredentialMode] = useState<ProviderCredentialMode>(
@@ -102,9 +94,12 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
   const [errorText, setErrorText] = useState<string | null>(null)
 
   const editing = provider !== null
-  const typeLocked = provider !== null && providerTypeChangeBlocked(provider)
-  /** `EMBEDDING` 下协议没得选（`shared#protocolAllowedForType` 是唯一判据） */
-  const protocolOptions = protocolOptionsFor(type)
+  /**
+   * 协议下拉的可用值由"该 Provider 下**有没有向量模型**"决定（{@link protocolOptionsFor}）：
+   * 有向量模型 ⇒ 只剩默认协议（embedding 只有 `/embeddings` 一条路）。
+   * ⚠️ 创建态 `provider === null` ⇒ `hasEmbeddingModel` 恒 false，三种协议都可选。
+   */
+  const protocolOptions = protocolOptionsFor(provider?.hasEmbeddingModel === true)
   const protocolLocked = protocolOptions.length === 1
 
   // 每次打开都按目标对象重置 —— 尤其是 `apiKey` 必须回到空串（绝不回填掩码，见文件头）
@@ -114,7 +109,6 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     setName(values.name)
     setBaseUrl(values.baseUrl)
     setCustomUrl(values.customUrl)
-    setType(values.type)
     setProtocol(values.protocol)
     setEnabled(values.enabled)
     setCredentialMode(values.credentialMode)
@@ -137,7 +131,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     if (provider === null) {
       try {
         const created = await create.mutateAsync(
-          buildCreateProviderBody({ name, baseUrl, customUrl, type, protocol, enabled, apiKey, credentialMode }),
+          buildCreateProviderBody({ name, baseUrl, customUrl, protocol, enabled, apiKey, credentialMode }),
         )
         if (personalKey !== '') {
           // Provider 已经建出来了 —— 这一步失败**不能**假装整体失败（那会让用户重建成两条）。
@@ -169,7 +163,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
 
     const body = buildProviderUpdateBody(
       provider,
-      { name, baseUrl, customUrl, type, protocol, enabled, apiKey, credentialMode },
+      { name, baseUrl, customUrl, protocol, enabled, apiKey, credentialMode },
       clearRequested,
     )
     const personalTouched = credentialMode === 'PER_USER' && (personalKey !== '' || clearRequested)
@@ -266,26 +260,6 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
         </div>
 
         <div>
-          <p className="block-label">类型</p>
-          <Select<ModelType>
-            value={type}
-            options={TYPE_OPTIONS}
-            disabled={typeLocked}
-            style={{ width: '100%' }}
-            aria-label="Provider 类型"
-            onChange={(next) => {
-              setType(next)
-              // ⚠️ 类型换了要把协议收回到合法值（`EMBEDDING` 只允许默认协议）——
-              //    不收就是一次必然 400 的提交，且报错字段是一个灰着的下拉
-              setProtocol((current) => protocolAfterTypeChange(next, current))
-            }}
-          />
-          <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {typeLocked ? PROVIDER_TYPE_LOCKED_REASON : '对话与向量模型分别属于两类 Provider；建下拉时按类型过滤。'}
-          </p>
-        </div>
-
-        <div>
           <p className="block-label">上游协议</p>
           <Select<UpstreamProtocol>
             value={protocol}
@@ -297,7 +271,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
             {protocolLocked
-              ? PROTOCOL_LOCKED_BY_TYPE_REASON
+              ? PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON
               : '这个 Provider 的上游"怎么说话"：决定请求打到哪个路径、用哪种鉴权头。' +
                 'OpenAI 兼容 = /chat/completions，Responses = /responses，Anthropic = /messages（x-api-key）。'}
           </p>

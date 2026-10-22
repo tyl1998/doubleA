@@ -46,6 +46,11 @@ export const MODEL_TYPE_LABELS: Readonly<Record<ModelType, string>> = {
  * 同一个用途可以有多种协议（对话可以是 OpenAI 兼容、OpenAI Responses、Anthropic 原生），
  * 而向量只有一条路（见 {@link DEFAULT_UPSTREAM_PROTOCOL}）。
  *
+ * ⚠️ 2026-10-22 起：`type` 是**模型自己的用途**，**不再要求等于所属 Provider 的 type**
+ * （`Provider.type` 降级为"新建模型的默认类型"）。所以"向量只有一条路"这条约束也**从 Provider
+ * 的 type 移到"该 Provider 下有没有 EMBEDDING 模型"**上 —— 判据见
+ * {@link vectorModelRequiresCompatProtocol} 与 {@link VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE}。
+ *
  * 与 `schema.prisma` 的 `enum UpstreamProtocol` **逐字一致**。
  */
 export const UPSTREAM_PROTOCOLS = ['OPENAI_COMPAT', 'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES'] as const
@@ -82,18 +87,41 @@ export const UPSTREAM_PROTOCOL_BASE_URL_HINTS: Readonly<Record<UpstreamProtocol,
 export const DEFAULT_UPSTREAM_PROTOCOL: UpstreamProtocol = 'OPENAI_COMPAT'
 
 /**
- * 「向量 Provider 只能配默认协议」这一条判据的**唯一实现**（schema 与 service 共用）。
+ * 「**挂着向量模型的 Provider** 只能配默认协议」这一条判据的**唯一实现**（服务层四处共用）。
  *
- * ⚠️ 写成纯函数而不是两处各写一遍 `type === 'EMBEDDING' && protocol !== …`：
- * 建与改两条路径都要判它，而**改**那条只能拿"库里的 type + 请求里的 protocol"合并后再判
- * （请求里可能一个字段都没带）⇒ 判据必须能被两处用**不同入参**调用。
+ * ⚠️ 2026-10-22 前这条判据挂在 **Provider 的 `type`** 上（`protocolAllowedForType`）——
+ * 那版假设"一个 Provider 只能承载一类模型"。实际同一个 baseUrl（one-api / new-api / vLLM
+ * 那类网关）**往往同时**提供对话与向量模型，只是模型名不同；于是"类型跟随 Provider"这条
+ * 硬约束逼迫管理员把同一个上游配两遍（两份 Key、两次轮换）。改造后 `type` 是**模型自己的
+ * 用途**、`Provider.type` 降级为"新建模型的默认类型"，约束因此改挂到"这个 Provider 下**有没有**
+ * EMBEDDING 模型"上。
+ *
+ * ⚠️ 判据只看**有没有向量模型**这一个事实（`hasEmbeddingModel`），**不看** Provider 的 `type`：
+ * 若按 `type` 判，管理员改一下"默认类型"就会静默放开一个必然调不通的组合。
  */
-export function protocolAllowedForType(type: ModelType, protocol: UpstreamProtocol): boolean {
-  return type !== 'EMBEDDING' || protocol === DEFAULT_UPSTREAM_PROTOCOL
+export function vectorModelRequiresCompatProtocol(
+  hasEmbeddingModel: boolean,
+  protocol: UpstreamProtocol,
+): boolean {
+  return !hasEmbeddingModel || protocol === DEFAULT_UPSTREAM_PROTOCOL
 }
 
 /** 上一条的中文说明（400 的字段级文案与前端提示共用） */
-export const EMBEDDING_PROTOCOL_CONFLICT_MESSAGE = `向量类型的 Provider 只能用 ${DEFAULT_UPSTREAM_PROTOCOL} 协议（embedding 只有 OpenAI 兼容一条路）`
+export const VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE = `该 Provider 下已有向量模型，协议只能是 ${DEFAULT_UPSTREAM_PROTOCOL}（embedding 只有 OpenAI 兼容一条路）`
+
+/**
+ * 「向量模型只能建在兼容协议的 Provider 上」这一条判据的**唯一实现**（建 / 改模型共用）。
+ *
+ * 与 {@link vectorModelRequiresCompatProtocol} 是同一件事的**两个视角**：那条问"这个 Provider
+ * 能不能换成别的协议"，这条问"这个模型能不能建在这个 Provider 上"。两者的判据逐字相同
+ * （`isEmbedding ⇒ protocol === 默认`），故只留这一个纯函数、由调用方传各自的入参。
+ */
+export function embeddingModelAllowedOnProtocol(protocol: UpstreamProtocol): boolean {
+  return protocol === DEFAULT_UPSTREAM_PROTOCOL
+}
+
+/** 上一条的中文说明（400 的字段级文案与前端提示共用） */
+export const EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE = `所属 Provider 用的是 ${DEFAULT_UPSTREAM_PROTOCOL} 以外的协议，不能在其下建向量模型（embedding 只有 OpenAI 兼容一条路）`
 
 /**
  * 掩码低于这个长度就**只露尾巴**。
@@ -158,12 +186,30 @@ export const modelProviderItemSchema = z.object({
    * ⚠️ 开启后「远程拉模型」（`GET /models` 探测）无法从固定后缀派生，型号名需手动录入。
    */
   customUrl: z.boolean(),
-  type: z.enum(MODEL_TYPES),
   /**
-   * 上游协议（P0-1-37）。⚠️ 与 `type` 是两件事：这个是"**怎么说话**"，`type` 是"**干什么用**"。
-   * 管理页把它当一列显示（改错协议的症状是"一发消息就 404/401"）。
+   * 上游协议（P0-1-37）。决定"报文怎么发"（`/chat/completions` vs `/responses` vs `/messages`，
+   * 以及鉴权头是 `Bearer` 还是 `x-api-key`）。
+   *
+   * ⚠️ 2026-10-22 起约束是：**该 Provider 下存在 EMBEDDING 模型时，协议只能是
+   * {@link DEFAULT_UPSTREAM_PROTOCOL}**（embedding 只有 `/embeddings` 一条路）——
+   * 判据 {@link vectorModelRequiresCompatProtocol}，输入是下面那个 `hasEmbeddingModel`。
+   *
+   * ⚠️ 原 `type` 列（"Provider 只能放这类模型"）已整列删除：`models.type` 是**模型自己的用途**，
+   * Provider 只是"上游终点"（baseUrl + Key + 协议）。见
+   * `docs/子方案/Provider与模型类型解耦.md`。
    */
   protocol: z.enum(UPSTREAM_PROTOCOLS),
+  /**
+   * 该 Provider 下**是否存在 EMBEDDING 模型**（2026-10-22 新增）。
+   *
+   * 为什么要有它：embedding 只有 `/embeddings` 一条路 ⇒ 一旦这个 Provider 下挂了向量模型，
+   * 它的协议**只能**是 OpenAI 兼容（判据 {@link vectorModelRequiresCompatProtocol}）。
+   * 前端据此把协议下拉锁成默认值；服务层据此拒绝"改成非兼容协议"。
+   *
+   * ⚠️ 与 {@link modelCount} 是**两个不同的读数**（前者答"协议能不能换"，后者答"能不能删"），
+   * 不合并：一个布尔表达不了三个状态。
+   */
+  hasEmbeddingModel: z.boolean(),
   enabled: z.boolean(),
   /** 是否已配置**共享** Key（`credentialMode=SHARED` 时才有意义）。**只有布尔**，不泄露长度等元信息 */
   hasKey: z.boolean(),
@@ -271,7 +317,6 @@ export const createModelProviderBodySchema = z.object({
     .min(1, '请输入名称')
     .max(128, '名称最多 128 个字符'),
   baseUrl: providerBaseUrlSchema,
-  type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
   /**
    * 自定义 URL（非规范第三方端点）。缺省即 `false`（= 既有拼接行为）。
    * 与 `protocol` 同款：`.optional()` 而非 `.default()`，默认值只在服务层补一处。
@@ -284,6 +329,11 @@ export const createModelProviderBodySchema = z.object({
    * 默认值只在**服务层**补一处（`?? DEFAULT_UPSTREAM_PROTOCOL`）。用 `.default()` 会让
    * `z.infer` 变成 required、`z.input` 变成 optional —— 同一个字段两套类型，
    * 服务层读到的类型与运行时不一致（`06` P0-1-24 那类"看着对、其实对不上"的坑）。
+   *
+   * ⚠️ 新建时该 Provider 下**必然还没有任何模型**，也就没有向量模型可言，协议随便选；
+   * 建完之后想挂向量模型再按 `embeddingModelAllowedOnProtocol` 判（服务层，看得到库里的模型）。
+   *
+   * ⚠️ 2026-10-22：**删除了 `type` 字段** —— Provider 不再有类型，建它的请求体也就不该带。
    */
   protocol: z
     .enum(UPSTREAM_PROTOCOLS, {
@@ -303,20 +353,6 @@ export const createModelProviderBodySchema = z.object({
   /** 可缺省（先建 Provider 后配 Key 是正常流程）。`null` 与缺省同义：不配置 Key */
   apiKey: providerApiKeySchema.nullish(),
 })
-  /**
-   * ⚠️ 用 `superRefine` 而不是 `.refine()`：后者失败时 `path` 是**空串**，
-   * 前端没法把错误挂到 `protocol` 那个下拉上（`06` P0-1-24 的教训）。
-   */
-  .superRefine((body, ctx) => {
-    // 缺省按默认协议判（与 service 层补的默认值同一口径）
-    if (!protocolAllowedForType(body.type, body.protocol ?? DEFAULT_UPSTREAM_PROTOCOL)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['protocol'],
-        message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
-      })
-    }
-  })
 export type CreateModelProviderBody = z.infer<typeof createModelProviderBodySchema>
 
 // ───────────────────────────── 改（三态） ─────────────────────────────
@@ -342,13 +378,15 @@ export const updateModelProviderBodySchema = z
     baseUrl: providerBaseUrlSchema.optional(),
     /** 自定义 URL 开关（两态：不带 = 不动；给值 = 改成它）。不加 `.default()`，理由同 `protocol` */
     customUrl: z.boolean().optional(),
-    type: z
-      .enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) })
-      .optional(),
     /**
      * 上游协议（P0-1-37）。**三态与 `apiKey` 不同**：这里没有"清空"这个概念
      * （协议总得有一个值），所以只有"不带 = 不动"与"给值 = 改成它"两态。
      * ⚠️ 正因为如此，**绝不能加 `.default()`** —— 那会把"改个名字"顺手改成默认协议。
+     *
+     * ⚠️ 「该 Provider 下有向量模型 ⇒ 协议只能兼容」这条**判不了**：schema 里看不到库里的模型，
+     * 所以判据只在**服务层**（`vectorModelRequiresCompatProtocol`，看得到模型表）。
+     *
+     * ⚠️ 2026-10-22：**删除了 `type` 字段** —— Provider 不再有类型，改它的请求体也就不该带。
      */
     protocol: z
       .enum(UPSTREAM_PROTOCOLS, {
@@ -376,7 +414,6 @@ export const updateModelProviderBodySchema = z
       body.name !== undefined ||
       body.baseUrl !== undefined ||
       body.customUrl !== undefined ||
-      body.type !== undefined ||
       body.protocol !== undefined ||
       body.enabled !== undefined ||
       body.credentialMode !== undefined ||
@@ -385,24 +422,6 @@ export const updateModelProviderBodySchema = z
       body.apiKey !== undefined,
     { message: '至少要提供一个要修改的字段' },
   )
-  /**
-   * ⚠️ 这里**只能**判"请求里同时给了 `type=EMBEDDING` 与一个非默认协议"这一种情况。
-   * 「库里的 type 是 EMBEDDING、而这次只改 protocol」拿不到库值 ⇒ 必须在**服务层**判
-   * （那里才查得到这一行）。两处共用 {@link protocolAllowedForType}，判据只有一份。
-   */
-  .superRefine((body, ctx) => {
-    if (
-      body.type !== undefined &&
-      body.protocol !== undefined &&
-      !protocolAllowedForType(body.type, body.protocol)
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['protocol'],
-        message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
-      })
-    }
-  })
 export type UpdateModelProviderBody = z.infer<typeof updateModelProviderBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
@@ -475,7 +494,8 @@ export type MyProviderCredentialsResult = z.infer<typeof myProviderCredentialsRe
 // ─────────────── 删除前的"被绑定模型"清单 + 删除结果（删模型商自动解绑） ───────────────
 
 /**
- * `GET /api/model-providers/:id/bound-models` 的一项：该 Provider 下**正被智能体绑定**的一个模型。
+ * `GET /api/model-providers/:id/bound-models` 的一项：该 Provider 下**正被在线智能体绑定
+ * 或被知识库用作向量模型**的一个模型。
  *
  * 用于删除弹窗如实列出"删了会解绑哪些"。`agentCount` **只算未软删的在线智能体**
  * （软删的智能体本就该被视作已解绑，不该再吓唬管理员）。
@@ -486,22 +506,41 @@ export const providerBoundModelSchema = z.object({
   label: z.string(),
   /** 上游型号名 */
   modelName: z.string(),
-  /** 绑定这个模型的**在线**智能体数（>0 才会出现在列表里） */
-  agentCount: z.number().int().min(1),
+  /** 绑定这个模型的**在线**智能体数（可为 0 —— 该模型可能只被知识库绑定） */
+  agentCount: z.number().int().min(0),
+  /**
+   * 把该模型当**向量模型**用的知识库数（`knowledge_bases.embedding_model_id`）。
+   *
+   * ⚠️ 2026-10-22 补：删 Provider 会级联删其下模型，若其中有向量模型被知识库绑定，
+   * 那些库的 `embedding_model_id` 会被 `ON DELETE SET NULL` **静默清空**（库还在、但无法入库/检索）。
+   * 所以这里如实报数，弹窗据此提醒"哪些库需要改用别的向量模型"。
+   */
+  knowledgeBaseCount: z.number().int().min(0),
+  /**
+   * 把该模型当**图片描述（VLM）**模型用的知识库数（`knowledge_bases.caption_model_id`，2026-10-22 同族补）。
+   * 同款 `SetNull` ⇒ 级联删除同样静默清空，故一并报数。
+   */
+  captionKnowledgeBaseCount: z.number().int().min(0),
+  /** 该模型是否被平台选为**会话标题生成模型**（`title_model_config.model_id`，单例；2026-10-22 同族补） */
+  usedAsTitleModel: z.boolean(),
 })
 export type ProviderBoundModel = z.infer<typeof providerBoundModelSchema>
 
 /**
  * `GET /api/model-providers/:id/bound-models` 的响应。
  *
- * `models` 是该 Provider 下**被在线智能体绑定**的模型清单（没有绑定的模型不列）；
- * `agentTotal` 是受影响的（去重）智能体数 —— 删除后它们会被自动解绑、变为"未绑定模型"。
+ * `models` 是该 Provider 下**被在线智能体绑定、或被知识库（向量 / 图片描述）、或平台标题配置引用**的
+ * 模型清单（都没引用的模型不列）；三个 total 是受影响（去重）的智能体数 / 知识库数 / 是否牵动平台标题模型。
  */
 export const providerBoundModelsResultSchema = z.object({
   providerId: z.string(),
   models: z.array(providerBoundModelSchema),
   /** 受影响的在线智能体总数（去重） */
   agentTotal: z.number().int().min(0),
+  /** 受影响的（向量模型或图片描述模型被清空的）知识库总数（去重） */
+  knowledgeBaseTotal: z.number().int().min(0),
+  /** 是否牵动平台**会话标题生成模型**（其下模型被 `title_model_config` 选中） */
+  clearsTitleModel: z.boolean(),
 })
 export type ProviderBoundModelsResult = z.infer<typeof providerBoundModelsResultSchema>
 
@@ -509,7 +548,8 @@ export type ProviderBoundModelsResult = z.infer<typeof providerBoundModelsResult
  * `DELETE /api/model-providers/:id` 的响应。
  *
  * 删 Provider 会级联删其下模型；引用这些模型的在线智能体被**自动解绑**（`model_id` 置空）。
- * `unboundAgents` 报出被解绑的智能体数，供界面给出有信息量的确认提示。
+ * `unboundAgents` 报出被解绑的智能体数；`clearedKnowledgeBases` / `clearedTitleModel` 报出**被清空**
+ * 的下游引用（2026-10-22 补：级联删掉的模型会让知识库的向量/图片描述引用、平台标题模型被 SetNull 静默清空）。
  */
 export const removeModelProviderResultSchema = z.object({
   id: z.string(),
@@ -518,6 +558,10 @@ export const removeModelProviderResultSchema = z.object({
   deletedModels: z.number().int().min(0),
   /** 被自动解绑（`model_id` 置空）的在线智能体数 */
   unboundAgents: z.number().int().min(0),
+  /** 向量 / 图片描述模型被清空（`embedding_model_id` 或 `caption_model_id` 置空）的知识库数 */
+  clearedKnowledgeBases: z.number().int().min(0),
+  /** 平台的**会话标题生成模型**是否被清空（其下模型被 `title_model_config` 选中 ⇒ 置空后退回确定性截断） */
+  clearedTitleModel: z.boolean(),
 })
 export type RemoveModelProviderResult = z.infer<typeof removeModelProviderResultSchema>
 

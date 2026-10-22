@@ -15,7 +15,7 @@
  */
 
 import { Alert, List, Modal, Spin, Tag } from 'antd'
-import type { ModelProviderItem } from '@doubulea/shared'
+import { UPSTREAM_PROTOCOL_LABELS, type ModelProviderItem } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
@@ -53,7 +53,11 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
         feedback.ok(
           `已删除 Provider「${result.name}」` +
             (result.deletedModels > 0 ? `，连带删除 ${result.deletedModels} 个模型` : '（它下面是空的）') +
-            (result.unboundAgents > 0 ? `，自动解绑 ${result.unboundAgents} 个智能体` : ''),
+            (result.unboundAgents > 0 ? `，自动解绑 ${result.unboundAgents} 个智能体` : '') +
+            (result.clearedKnowledgeBases > 0
+              ? `，${result.clearedKnowledgeBases} 个知识库的模型绑定被清空（需重新指定）`
+              : '') +
+            (result.clearedTitleModel ? '，平台的会话标题模型被清空' : ''),
         )
         onClose()
       },
@@ -66,6 +70,8 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
 
   const boundModels = bound.data?.models ?? []
   const agentTotal = bound.data?.agentTotal ?? 0
+  const knowledgeBaseTotal = bound.data?.knowledgeBaseTotal ?? 0
+  const clearsTitleModel = bound.data?.clearsTitleModel ?? false
 
   return (
     <Modal
@@ -90,7 +96,7 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
           </p>
           <ul>
             <li>
-              它的配置：<span className="num">{provider.baseUrl}</span>（{provider.type}）
+              它的配置：<span className="num">{provider.baseUrl}</span>（{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}）
             </li>
             <li>加密存储的 API Key（当前：{describeProviderKey(provider)}）</li>
             <li>
@@ -105,29 +111,57 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
 
         <Alert type={provider.modelCount > 0 ? 'warning' : 'info'} showIcon message="删除影响" description={PROVIDER_DELETE_IMPACT_HINT} />
 
-        {/* 需求 3：如实列出"会被自动解绑的模型 / 受影响的智能体" */}
+        {/* 需求 3：如实列出"会被自动解绑的模型 / 受影响的智能体"；2026-10-22 补：向量模型被知识库引用的影响 */}
         {bound.isLoading ? (
           <div className="row" style={{ gap: 'var(--sp-2)' }}>
-            <Spin size="small" /> <span className="ratio">正在核对哪些模型被智能体绑定…</span>
+            <Spin size="small" /> <span className="ratio">正在核对哪些模型被智能体 / 知识库绑定…</span>
           </div>
         ) : boundModels.length > 0 ? (
           <Alert
             type="warning"
             showIcon
-            message={`将自动解绑 ${agentTotal} 个智能体（它们绑定了下面这些模型）`}
+            message={
+              [
+                agentTotal > 0 ? `将自动解绑 ${agentTotal} 个智能体` : null,
+                knowledgeBaseTotal > 0 ? `将清空 ${knowledgeBaseTotal} 个知识库的模型绑定` : null,
+                clearsTitleModel ? '将清空平台的会话标题模型' : null,
+              ]
+                .filter((part): part is string => part !== null)
+                .join('；') + '（它们绑定了下面这些模型）'
+            }
             description={
-              <List
-                size="small"
-                dataSource={boundModels}
-                renderItem={(m) => (
-                  <List.Item>
-                    <span>
-                      <strong>{m.label}</strong>
-                      <span className="num">（{m.modelName}）</span> · 被 {m.agentCount} 个智能体绑定
-                    </span>
-                  </List.Item>
+              <>
+                <List
+                  size="small"
+                  dataSource={boundModels}
+                  renderItem={(m) => (
+                    <List.Item>
+                      <span>
+                        <strong>{m.label}</strong>
+                        <span className="num">（{m.modelName}）</span>
+                        {m.agentCount > 0 && <> · 被 {m.agentCount} 个智能体绑定</>}
+                        {m.knowledgeBaseCount > 0 && <> · 被 {m.knowledgeBaseCount} 个知识库用作向量模型</>}
+                        {m.captionKnowledgeBaseCount > 0 && (
+                          <> · 被 {m.captionKnowledgeBaseCount} 个知识库用作图片描述模型</>
+                        )}
+                        {m.usedAsTitleModel && <> · 被平台用作会话标题模型</>}
+                      </span>
+                    </List.Item>
+                  )}
+                />
+                {knowledgeBaseTotal > 0 && (
+                  <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                    ⚠️ 绑定被清空的知识库删除后<strong>无法入库 / 检索</strong>（图片描述也会失效），需到知识库设置里
+                    改用别的模型（换向量模型后旧向量需重建）。
+                  </p>
                 )}
-              />
+                {clearsTitleModel && (
+                  <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
+                    ⚠️ 平台的<strong>会话标题生成模型</strong>会被清空，之后会话标题退回确定性截断，需到模型池页
+                    「系统模型」重新指定。
+                  </p>
+                )}
+              </>
             }
           />
         ) : bound.isError ? (

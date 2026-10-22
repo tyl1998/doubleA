@@ -14,6 +14,8 @@
  *    所以编辑态的请求体里**不带 `providerId`**（见 `buildModelUpdateBody`）。
  * ② **`type` 被智能体引用时只读**：CHAT / EMBEDDING 不可互换，改了等于让已上线的智能体
  *    悄悄换一类模型（下一次发消息才暴露）⇒ 后端 409，界面标灰。
+ *    ⚠️ 2026-10-22 起**未**被引用时 `type` **可改**（原"恒跟随 Provider"的组织已废除）：
+ *    同一个 Provider 下可以同时挂对话与向量模型，类型只是"模型自己的用途"。
  * ③ **`maxContext` 是三态，不是两态**（`02` §4.3：不带 = 不动 / `null` = 清空 / 数字 = 设置）：
  *    用户清空这个输入框 = **明确要清空**（发 `null`），而"原来就是空的、这次也没填" =
  *    不动（不带这个键）。判据是"**与已存值比较**"，在 `buildModelUpdateBody` 里收口 ——
@@ -21,7 +23,14 @@
  */
 
 import { Alert, App as AntdApp, AutoComplete, Button, Input, InputNumber, Modal, Select, Switch } from 'antd'
-import { MODEL_TYPES, MODEL_TYPE_LABELS, type ModelItem, type ModelProviderItem, type ModelType } from '@doubulea/shared'
+import {
+  DEFAULT_UPSTREAM_PROTOCOL,
+  MODEL_TYPES,
+  MODEL_TYPE_LABELS,
+  type ModelItem,
+  type ModelProviderItem,
+  type ModelType,
+} from '@doubulea/shared'
 import { useEffect, useMemo, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
@@ -38,13 +47,14 @@ import {
   EMPTY_MODEL_FORM_VALUES,
   MAX_CONTEXT_MAX,
   MAX_CONTEXT_MIN,
-  MODEL_TYPE_FOLLOWS_PROVIDER_REASON,
+  MODEL_TYPE_HINT,
+  MODEL_TYPE_LOCKED_REASON,
   buildCreateModelBody,
   buildModelUpdateBody,
   knowledgeBasesUsingModel,
   modelEditAffectsVectors,
   modelEditValuesOf,
-  modelTypeForProvider,
+  modelTypeChangeBlocked,
   remoteModelRows,
   validateMaxContext,
 } from './adminModel.js'
@@ -86,13 +96,18 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
   const editing = model !== null
   /**
-   * 方案A：模型的 `type` **跟随所属 Provider**，因此选择器**始终只读** ——
-   * 创建时由所选 Provider 决定（见下方 Provider 的 `onChange`），编辑时 Provider 不可迁移、
-   * 类型也就不变。这样用户没有机会造出"Provider 是向量、模型却是对话"的不一致配置。
+   * 模型的 `type` 是**模型自己的用途**（对话 / 向量），**可编辑**。
+   *
+   * ⚠️ 2026-10-22 起解开了原先"恒只读（跟随 Provider）"的处置：Provider 上的类型列已整列删除，
+   * 同一个 Provider（同一个 baseUrl + 同一把 Key）下可以同时挂对话与向量模型，所以类型必须能选。
+   * 初值取 `EMPTY_MODEL_FORM_VALUES.type`（`CHAT`），用户在下方下拉里按需改。
+   *
+   * ⚠️ 编辑态仍有一条**真**的锁：被智能体引用时不可改类型（{@link modelTypeChangeBlocked}，
+   * 后端 409）—— 那与"跟随 Provider"是两件不同的事。
    */
-  const typeLocked = true
-  const typeLockedReason = editing ? '类型跟随所属 Provider，不可修改。' : MODEL_TYPE_FOLLOWS_PROVIDER_REASON
-  /** 向量模型：界面只显示"维度"，隐藏上下文/图片/思考等对话侧字段（类型跟随 Provider，故此刻已知） */
+  const typeLocked = editing && modelTypeChangeBlocked(model)
+  const typeLockedReason = editing ? MODEL_TYPE_LOCKED_REASON : MODEL_TYPE_HINT
+  /** 向量模型：界面只显示"维度"，隐藏上下文/图片/思考等对话侧字段 */
   const isEmbedding = type === 'EMBEDDING'
 
   // 拉取上游模型：型号名下拉的来源（获取失败/为空时 AutoComplete 仍可手动输入，见下方渲染）。
@@ -131,8 +146,8 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       setProviderId(initialProviderId)
       setModelName('')
       setLabel('')
-      // 方案A：类型跟随 Provider（还没选到 Provider 时占位为 CHAT，选了会跟着变）
-      setType(modelTypeForProvider(providers, initialProviderId))
+      // 2026-10-22：类型初值固定 CHAT（Provider 已无类型列），用户可在下拉里改成向量
+      setType(EMPTY_MODEL_FORM_VALUES.type)
       setMaxContext(null)
       setEmbeddingDim(null)
       setEmbeddingMultimodal(false)
@@ -160,8 +175,20 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
   const submitting = create.isPending || update.isPending
   const contextError = validateMaxContext(maxContext)
+  /**
+   * 想建/改成向量模型，但所属 Provider 用的不是 OpenAI 兼容协议 ⇒ 这次必然被后端 400
+   * （embedding 只有 `/embeddings` 一条路，判据 = `shared#embeddingModelAllowedOnProtocol`）。
+   * 界面上据此拦在提交前并说明原因 —— 与 `RemoteModelsDrawer` 的同名判据是同一条。
+   */
+  const protocol = providers.find((item) => item.id === providerId)?.protocol ?? DEFAULT_UPSTREAM_PROTOCOL
+  const embeddingProtocolBlocked = type === 'EMBEDDING' && protocol !== DEFAULT_UPSTREAM_PROTOCOL
   const canSubmit =
-    modelName.trim() !== '' && label.trim() !== '' && (editing || providerId !== '') && contextError === null && !submitting
+    modelName.trim() !== '' &&
+    label.trim() !== '' &&
+    (editing || providerId !== '') &&
+    contextError === null &&
+    !embeddingProtocolBlocked &&
+    !submitting
 
   const probing = probeEmbedding.isPending || probeChat.isPending
   const canProbe = providerId !== '' && modelName.trim() !== '' && !probing && !submitting
@@ -314,8 +341,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
               aria-label="所属 Provider"
               onChange={(next) => {
                 setProviderId(next)
-                // 方案A：换了 Provider，模型类型跟着它走（后端也会校验一致）
-                setType(modelTypeForProvider(providers, next))
+                // 2026-10-22：类型初值固定 CHAT（Provider 已无类型列），不随 Provider 变化
               }}
             />
           )}
@@ -392,6 +418,14 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
             {typeLockedReason}
           </p>
+          {embeddingProtocolBlocked && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 'var(--sp-2)' }}
+              message={`所属 Provider 用的不是 ${DEFAULT_UPSTREAM_PROTOCOL} 协议，不能建向量模型（embedding 只有 /embeddings 一条路）。请先到模型池把该 Provider 的协议改成 OpenAI 兼容，或改选「对话」类型。`}
+            />
+          )}
         </div>
 
         {isEmbedding ? (

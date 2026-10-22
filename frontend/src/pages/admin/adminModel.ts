@@ -17,10 +17,10 @@
  *   · **Key 的回显**：编辑弹窗如果把 `apiKeyPreview` 回填进输入框，用户一保存就把掩码
  *     当成真 Key 存了进去（`02` §4.3 的"Key 有进无出"在界面这一侧最容易被破坏）。
  * P0-1-37 又添了一族同性质的判据（上游协议）：
- *   · `protocol` 与 `type` 是**两个字段**，而 `EMBEDDING` 只允许默认协议 ⇒ 改类型时必须把
- *     协议收回默认值（见 {@link protocolAfterTypeChange}），否则这次提交必然 400，
- *     且报错的字段是用户**没碰过**的那个下拉；
- *   · 可选协议列表由 `shared#protocolAllowedForType` 过滤，前端不另写一遍判据。
+ *   · `protocol` 与 `type` 是**两个字段**；2026-10-22 起约束改为
+ *     **该 Provider 下有向量模型 ⇒ 协议只能是默认值**（见 {@link protocolOptionsFor}），
+ *     否则这次提交必然 400，且报错的字段是用户**没碰过**的那个下拉；
+ *   · 可选协议列表由 `shared#vectorModelRequiresCompatProtocol` 过滤，前端不另写一遍判据。
  * 这些全是纯函数，所以判据拆到这里，由 `frontend/scripts/verify-admin-ui.mjs` 逐条断言
  * ——本仓"纯逻辑拆进无依赖文件 ⇒ 断言进无依赖档"的同一手法（对照 `verify-chat-sse` /
  * `verify-knowledge-ui`）。
@@ -54,11 +54,11 @@ import type {
 } from '@doubulea/shared'
 import {
   DEFAULT_UPSTREAM_PROTOCOL,
-  EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
+  VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE,
   UPSTREAM_PROTOCOLS,
   UPSTREAM_PROTOCOL_BASE_URL_HINTS,
   UPSTREAM_PROTOCOL_LABELS,
-  protocolAllowedForType,
+  vectorModelRequiresCompatProtocol,
 } from '@doubulea/shared'
 
 // ═══════════════════════════════ 词表 ═══════════════════════════════
@@ -235,8 +235,12 @@ export interface ProviderFormValues {
    * （见 `shared` 的 `customUrl` / `backend#resolveUpstreamUrl`）。
    */
   customUrl: boolean
-  type: ModelType
-  /** 上游协议（P0-1-37）。`EMBEDDING` 下被类型锁成默认协议，见 {@link protocolAfterTypeChange} */
+  /**
+   * 上游协议（P0-1-37）。2026-10-22 起约束改为：**该 Provider 下有向量模型 ⇒ 只能是默认协议**
+   * （见 {@link protocolOptionsFor}）。
+   *
+   * ⚠️ 2026-10-22：**删除了 `type`** —— Provider 不再有类型（`models.type` 是模型自己的用途）。
+   */
   protocol: UpstreamProtocol
   enabled: boolean
   /** ⚠️ 编辑态**恒为空串**（`apiKeyPreview` 绝不回填）；空串 + 未动 = "不动原 Key" */
@@ -249,7 +253,6 @@ export const EMPTY_PROVIDER_FORM_VALUES: ProviderFormValues = {
   name: '',
   baseUrl: '',
   customUrl: false,
-  type: 'CHAT',
   protocol: DEFAULT_UPSTREAM_PROTOCOL,
   enabled: true,
   apiKey: '',
@@ -271,7 +274,6 @@ export function providerEditValuesOf(provider: ModelProviderItem): ProviderFormV
     name: provider.name,
     baseUrl: provider.baseUrl,
     customUrl: provider.customUrl,
-    type: provider.type,
     protocol: provider.protocol,
     enabled: provider.enabled,
     apiKey: '',
@@ -286,32 +288,36 @@ export const PROTOCOL_OPTIONS: readonly { value: UpstreamProtocol; label: string
   UPSTREAM_PROTOCOLS.map((protocol) => ({ value: protocol, label: UPSTREAM_PROTOCOL_LABELS[protocol] }))
 
 /**
- * 某个 Provider 类型下**可选**的协议。
+ * Provider 的协议下拉里**可选**的取值。
  *
- * 判据委托 `shared` 的 `protocolAllowedForType` —— 与后端 schema / service **同一份实现**。
- * 前端另写一遍 `type === 'EMBEDDING' && …` 就会出现"界面能选、后端 400"这种最招人烦的错配。
+ * 判据委托 `shared` 的 `vectorModelRequiresCompatProtocol` —— 与后端 service **同一份实现**。
+ * 前端另写一遍 `hasEmbeddingModel && protocol !== …` 就会出现"界面能选、后端 400"这种最招人烦的错配。
+ *
+ * ⚠️ 2026-10-22 起判据的**输入从"Provider 的 type"换成了"该 Provider 下有没有向量模型"**：
+ * 同一个 baseUrl 下可以同时挂对话与向量模型，所以"这个 Provider 能不能配非兼容协议"取决于
+ * 它**实际挂了什么模型**，而不是它自称的默认类型。
+ * ⚠️ **创建态**（`provider === null`）时下边还没有任何模型 ⇒ `hasEmbeddingModel` 恒 `false`，
+ * 三种协议都可选（建完之后想挂向量模型，那一侧会再判一次）。
  *
  * ⚠️ 返回**可变**数组（不是 `readonly`）：AntD 的 `Select.options` 收的是可变数组，
  * 传 `readonly` 会编译期报 TS4104。`.filter` 本来就产出一份新数组，没有共享可变状态的风险。
  */
-export function protocolOptionsFor(type: ModelType): { value: UpstreamProtocol; label: string }[] {
-  return PROTOCOL_OPTIONS.filter((option) => protocolAllowedForType(type, option.value))
+export function protocolOptionsFor(hasEmbeddingModel: boolean): { value: UpstreamProtocol; label: string }[] {
+  return PROTOCOL_OPTIONS.filter((option) =>
+    vectorModelRequiresCompatProtocol(hasEmbeddingModel, option.value),
+  )
 }
 
-/** 协议被类型锁住时选择器的说明（就是后端那条 400 字段级文案，不加一个字的翻译） */
-export const PROTOCOL_LOCKED_BY_TYPE_REASON = EMBEDDING_PROTOCOL_CONFLICT_MESSAGE
+/** 协议被"该 Provider 下有向量模型"锁住时选择器的说明（就是后端那条 400 字段级文案，不加一个字的翻译） */
+export const PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON = VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE
 
 /**
- * 切换类型后协议应当落到哪个值。
+ * ⚠️ 2026-10-22 **删掉了** `protocolAfterTypeChange`（原用于"改 Provider 类型时把协议收回默认值"）。
  *
- * ⚠️ 必须显式收回默认值：`CHAT + ANTHROPIC_MESSAGES` 的 Provider 被改成 `EMBEDDING` 时，
- * 若协议还停在 Anthropic，这次提交必然 `400`（字段级错误指向 `protocol`）——
- * 而那个下拉在 `EMBEDDING` 下是**灰的**，用户看到的是"一个我没碰过的字段报错了"。
- * 收回默认值的代价为零（默认协议正是唯一合法值），不收回则是一次必错的提交。
+ * 它当年成立的前提是"Provider 的 `type` 决定协议可用集"——而现行判据是"该 Provider 下**有没有
+ * 向量模型**"（{@link protocolOptionsFor}），**与 `type` 无关** ⇒ 改 `type` 不该动协议，
+ * 那个"收回"动作也就没有了对象。留着它会让人以为改默认类型会影响协议。
  */
-export function protocolAfterTypeChange(nextType: ModelType, current: UpstreamProtocol): UpstreamProtocol {
-  return protocolAllowedForType(nextType, current) ? current : DEFAULT_UPSTREAM_PROTOCOL
-}
 
 /** `baseUrl` 输入框下方的提示 —— 每种协议的路径后缀不同，填错的表现是 404（`02` §6.1） */
 export function protocolBaseUrlHint(protocol: UpstreamProtocol): string {
@@ -357,7 +363,6 @@ export function buildCreateProviderBody(values: ProviderFormValues): CreateModel
     baseUrl: values.baseUrl.trim(),
     // 总是带上 customUrl（同 protocol 的理由：用户在开关上明确设过，不靠服务端默认值）
     customUrl: values.customUrl,
-    type: values.type,
     // ⚠️ 总是带上 protocol（哪怕它就是默认值）：用户在下拉里**明确选过**，
     //    而依赖服务端默认值会让"界面显示 OpenAI 兼容、实际存了别的"无法从请求体看出来
     //    （与 `role` 总是带上同一个理由，见 `buildCreateUserBody`）
@@ -384,17 +389,16 @@ export function providerKeyRole(values: Pick<ProviderFormValues, 'credentialMode
 /**
  * 改 Provider 请求体。返回值 `null` = 没有任何改动 ⇒ 不发请求。
  *
- * 四处三态/守卫都在这里收口（页面只负责收集表单值）：
+ * 三处三态/守卫都在这里收口（页面只负责收集表单值）：
  *   · `apiKey` 按 {@link providerKeyIntent} 决定带不带、带什么（见上）；
- *   · `type` **有模型时不让改** —— 后端 `409`（`02` §4.3）。界面上把选择器标灰，
- *     所以这里再兜一道：`.type` 与已存值不同且 `modelCount > 0` 时**不带上这个键**
- *     （宁可当作"没改"，也不发一个必然 409 的请求）；
  *   · `protocol` **逐字比较后只在真变了才带**（同 `name`/`baseUrl` 的处置）——
  *     每次刷新 `updated_at` 会把"最近更新"这一列搅乱，而后端那条排序正是按它来的。
- *     ⚠️ 协议**没有**"有模型就不许改"的守卫（与 `type` 刻意相反，`02` §4.3）：
- *     填错了本来就该能改回来，所以这里不做 {@link providerTypeChangeBlocked} 那种拦截；
+ *     ⚠️ 界面侧对它唯一要做的是"下拉里不摆必然被 400 的选项"（{@link protocolOptionsFor}），
+ *     不在请求体构造里拦（那一层拦不住手改的请求）；
  *   · `baseUrl` 归一化（去尾斜杠）**交给契约层**（`providerBaseUrlSchema` 的 `transform`），
  *     前端不自己 `replace` —— 否则"存下来的到底是什么"会有两个答案。
+ *
+ * ⚠️ 2026-10-22：**不再构造 `type`** —— Provider 不再有类型（列已删）。
  */
 export function buildProviderUpdateBody(
   provider: ModelProviderItem,
@@ -414,8 +418,6 @@ export function buildProviderUpdateBody(
   // 否则会往请求体里塞一个 `customUrl: undefined`（被 JSON.stringify 丢掉、却已破坏
   // "零改动 ⇒ return null" 的判据，见下方 `protocol` 那段注释）。
   if (values.customUrl !== undefined && values.customUrl !== provider.customUrl) body.customUrl = values.customUrl
-
-  if (values.type !== provider.type && !providerTypeChangeBlocked(provider)) body.type = values.type
 
   /**
    * ⚠️ `protocol` 要显式判 `undefined`（**三态**，与后端 `apiKey`/`maxContext` 同款）：
@@ -449,21 +451,12 @@ export function buildProviderUpdateBody(
 }
 
 /**
- * 该 Provider 的 `type` 能不能改。
+ * ⚠️ 2026-10-22 **删掉了** `providerTypeChangeBlocked` / `PROVIDER_TYPE_LOCKED_REASON`
+ * （原用于"该 Provider 下有模型 ⇒ 类型选择器标灰"）。
  *
- * `02` §4.3：「`model_providers.type` 与 `models.type` 冗余，故 Provider 下**已有模型时不允许
- * 改 type** → `409`（同值放行）」。替代方案（级联改所有模型的 type）会静默改变"已绑定 Agent
- * 用的是哪类模型"，不采用。
- *
- * 界面上据此把选择器标灰 —— 与知识库的"`READY` 不给重试"同一处置：**点了必然失败的操作
- * 不该让人点**，但必须说明为什么。
+ * 方案A 废除后 `Provider.type` 只是"新建模型的默认类型"，改它不动任何模型数据 ⇒ 后端不再 409、
+ * 界面也就不该再摆一个"点了必然失败"的灰选择器。
  */
-export function providerTypeChangeBlocked(provider: Pick<ModelProviderItem, 'modelCount'>): boolean {
-  return provider.modelCount > 0
-}
-
-export const PROVIDER_TYPE_LOCKED_REASON =
-  '该 Provider 下已有模型，后端不允许改类型（409）：模型与 Provider 的类型冗余，级联改会悄悄改变已绑定智能体用的是哪类模型。要换类型请新建一个 Provider。'
 
 // ═══════════════════════════════ 模型 ═══════════════════════════════
 
@@ -639,32 +632,44 @@ export const MODEL_TYPE_LOCKED_REASON =
   '该模型已被智能体绑定，后端不允许改类型（409）：对话模型与向量模型不可互换，改了等于让已上线的智能体悄悄换一类模型。请先到智能体列表改绑。'
 
 /**
- * 方案A：模型的 `type` **跟随所属 Provider 的 type**（Provider 决定其下模型的用途）。
+ * ⚠️ 2026-10-22 **删掉了** `defaultTypeForProvider`（原"新建模型时取所属 Provider 的 type 作初值"）。
  *
- * 找不到该 Provider（还没选）时回落到 `CHAT` 只作展示占位 —— 提交时后端仍会强校验一致。
- * 判据的"权威"在后端（`model.service.ts#createModel`），这里只是把界面下拉 derive 出来，
- * 让用户没有"选错"的机会。
+ * Provider 上的 `type` 列已整列删除 ⇒ 没有"默认类型"可取了。新建模型时 `type` 的初值就是
+ * `EMPTY_MODEL_FORM_VALUES.type`（`CHAT`，最常见的那个），用户在下拉里按需改。
+ * 真正的合法性判据在后端：`type=EMBEDDING` 要求该 Provider 的协议是 OpenAI 兼容
+ * （`shared#embeddingModelAllowedOnProtocol`），前端按同一判据把提示写在表单里。
  */
-export function modelTypeForProvider(
-  providers: readonly Pick<ModelProviderItem, 'id' | 'type'>[],
-  providerId: string,
-): ModelType {
-  return providers.find((provider) => provider.id === providerId)?.type ?? 'CHAT'
-}
-
-export const MODEL_TYPE_FOLLOWS_PROVIDER_REASON =
-  '类型跟随所属 Provider：Provider 是「对话」就建对话模型、是「向量」就建向量模型，不再单独选择（后端也会校验一致）。'
+export const MODEL_TYPE_HINT =
+  '类型是**模型自己的用途**（对话 / 向量）。同一个 Provider（同一个 baseUrl / 同一把 Key）下可以同时挂两类模型；向量模型要求该 Provider 的协议是 OpenAI 兼容。'
 
 /**
  * 删模型前的"点下去会怎样"。`null` = 可以直接删（走 Popconfirm）。
  *
- * ⚠️ `agentCount` **只算在线（未软删）的智能体**（`02` §4.3 起口径调整：删智能体会把
- * `model_id` 置空自动解绑，软删的智能体不再占用模型）—— 与后端删除守卫**同口径**，
- * 不会出现"显示 N 个、其实那些都是已删除的智能体"。
+ * ⚠️ 引用口径有**五处**（与后端 `removeModel` 逐条同口径）：
+ *  ① 在线智能体（默认模型 / 模型池成员，`agentCount`）；
+ *  ② 知识库把它当**向量**模型用（`knowledgeBaseCount`）；
+ *  ③ 知识库把它当**图片描述**模型用（`captionKnowledgeBaseCount`）；
+ *  ④ 平台把它选为**会话标题**模型（`usedAsTitleModel`，单例）；
+ *  ⑤ 均已按 `ON DELETE SET NULL` / `CASCADE` 会**静默**产生副作用 ⇒ 任一命中都不能删。
  */
-export function modelDeleteBlockedNotice(model: Pick<ModelItem, 'agentCount'>): string | null {
-  if (model.agentCount === 0) return null
-  return `该模型正被 ${model.agentCount} 个在线智能体绑定，后端会拒绝这次删除（409）。请先到智能体列表把它们改绑到别的模型。`
+export function modelDeleteBlockedNotice(
+  model: Pick<ModelItem, 'agentCount' | 'knowledgeBaseCount' | 'captionKnowledgeBaseCount' | 'usedAsTitleModel'>,
+): string | null {
+  const reasons: string[] = []
+  if (model.agentCount > 0) reasons.push(`被 ${model.agentCount} 个在线智能体绑定`)
+  if (model.knowledgeBaseCount > 0) reasons.push(`被 ${model.knowledgeBaseCount} 个知识库用作向量模型`)
+  if (model.captionKnowledgeBaseCount > 0)
+    reasons.push(`被 ${model.captionKnowledgeBaseCount} 个知识库用作图片描述模型`)
+  if (model.usedAsTitleModel) reasons.push('被平台用作会话标题生成模型')
+  if (reasons.length === 0) return null
+
+  const targets: string[] = []
+  if (model.agentCount > 0) targets.push('智能体列表把它们改绑到别的模型')
+  if (model.knowledgeBaseCount > 0) targets.push('这些知识库改用别的向量模型')
+  if (model.captionKnowledgeBaseCount > 0) targets.push('这些知识库改用别的图片描述模型')
+  if (model.usedAsTitleModel) targets.push('「系统设置 · 会话标题模型」改用别的模型')
+
+  return `该模型正${reasons.join('、')}，后端会拒绝这次删除（409）。请先到${targets.join('、')}。`
 }
 
 // ═══════════════════════════════ 按 Provider 分组（顺序不许重排） ═══════════════════════════════
@@ -743,6 +748,35 @@ export interface RemoteModelRow {
   ownedBy: string | null
   /** 上游给的上下文长度（token），缺失为 `null`（新建模型时用它默认填充上下文长度） */
   contextLength: number | null
+  /**
+   * **类型推测**（`guessModelType` 的结果）：给该行的类型下拉一个**默认值**。
+   *
+   * ⚠️ 上游 `/models` **不返回类型**（没有任何标准字段区分对话与向量），所以只能按型号名猜。
+   * 它**只是默认值**、不锁死：用户可在该行改。方向上刻意偏"猜对话"（最常见、且不会被协议守卫拦；
+   * 猜错成对话只是"建错了再改"，反向会直接调不通）。
+   */
+  guessedType: ModelType
+}
+
+/** 向量型号名的**保守**启发式：命中才猜 `EMBEDDING`，否则一律 `CHAT`（见 {@link RemoteModelRow.guessedType}） */
+const EMBEDDING_MODEL_NAME_PATTERNS: readonly RegExp[] = [
+  /embed/i,
+  /(^|[-_/])bge([-_/]|$)/i,
+  /(^|[-_/])gte([-_/]|$)/i,
+  /\bm3e/i,
+  /voyage/i,
+  /(^|[-_/])e5([-_/]|$)/i,
+]
+
+/**
+ * 按型号名**保守**推测类型：命中向量特征才 `EMBEDDING`，其余一律 `CHAT`。
+ *
+ * ⚠️ 这是**启发式**、不是判据 —— 上游不返回类型，只能猜，所以会误伤（如某些 `*-e5*` 的对话变体）。
+ * 因此它只作**每行下拉的默认值**，用户可逐行改；方向上偏"猜对话"（把向量误建成对话只是再改一次，
+ * 而把对话误建成向量会被协议守卫拦 / 调不通）。
+ */
+export function guessModelType(modelName: string): ModelType {
+  return EMBEDDING_MODEL_NAME_PATTERNS.some((pattern) => pattern.test(modelName)) ? 'EMBEDDING' : 'CHAT'
 }
 
 export function remoteModelRows(result: RemoteModelListResult): RemoteModelRow[] {
@@ -750,6 +784,7 @@ export function remoteModelRows(result: RemoteModelListResult): RemoteModelRow[]
     id: item.id,
     ownedBy: item.ownedBy,
     contextLength: item.contextLength,
+    guessedType: guessModelType(item.id),
   }))
 }
 

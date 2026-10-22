@@ -38,10 +38,9 @@
 import { z } from 'zod'
 
 import { offsetPageOf } from './envelope.js'
-// 取值域复用 Provider 那一份：`models.type` 与 `model_providers.type` 是同一个数据库枚举
-// （`schema.prisma` 的 `enum ModelType`），拆两份迟早会出现"这里加了、那里忘了"。
-// 刻意**不再 re-export**（`MODEL_TYPES` 已由 `modelProvider.ts` 出口）：`index.ts` 用
-// `export *`，同一个名字从两个模块出来会让"是否算歧义"取决于运行时实现，没必要冒这个险。
+// 取值域定义在 `modelProvider.ts`（`MODEL_TYPES` / `PROVIDER_CREDENTIAL_MODES`）——
+// `models.type` 用的就是那个 `enum ModelType`（`schema.prisma`）。刻意**不再 re-export**
+// （`index.ts` 用 `export *`，同一个名字从两个模块出来会让"是否算歧义"取决于运行时实现）。
 import { MODEL_TYPES, PROVIDER_CREDENTIAL_MODES } from './modelProvider.js'
 
 // ───────────────────────────── 输出形态（两套投影） ─────────────────────────────
@@ -71,6 +70,13 @@ export const modelItemSchema = z.object({
   modelName: z.string(),
   /** 别名：界面上给业务同学看的名字 */
   label: z.string(),
+  /**
+   * **模型自己的用途**（对话 / 向量化）。
+   *
+   * ⚠️ 2026-10-22 起它**不再要求**等于所属 Provider 的 `type` —— 同一个 Provider（同一个
+   * baseUrl + 同一把 Key）下可以同时挂对话与向量模型。`Provider.type` 只是"新建模型的默认类型"。
+   * 见 `docs/子方案/Provider与模型类型解耦.md`。
+   */
   type: z.enum(MODEL_TYPES),
   /** 上下文长度（token）；未填为 `null`。**对话模型专属**（向量模型为 `null`） */
   maxContext: z.number().int().nullable(),
@@ -83,10 +89,10 @@ export const modelItemSchema = z.object({
   supportsReasoning: z.boolean(),
   enabled: z.boolean(),
   /**
-   * 有多少个 Agent 绑了这个模型。
-   * ⚠️ **含软删的 Agent**（`agents.deleted_at` 非空的也算）—— 删模型时外键是 `RESTRICT`，
-   * 软删的 Agent 照样占着引用；这个数字要和删除守卫的口径一致，否则会出现
-   * "显示 0 个却能删不掉"（`02` §三 删除语义、P0-1-10 同款结论）。
+   * 有多少个 Agent 绑了这个模型（默认模型或模型池成员）。
+   * ⚠️ **只算在线（未软删）的 Agent**（`agents.deleted_at` 为空的）—— 删 Agent 会把 `model_id` 置空
+   * 自动解绑，与删除守卫的口径一致（`02` §4.3）。`agents.model_id` 是 `onDelete: SetNull`，但
+   * "在线的被悄悄解绑"体验很差 ⇒ `removeModel` 仍会 409 拦下。
    */
   agentCount: z.number().int().min(0),
   /**
@@ -94,9 +100,23 @@ export const modelItemSchema = z.object({
    *
    * 编辑一个**被引用**的向量模型（改型号 / 改维度 / 改多模态 / 停用）会让那些库里已有的向量作废
    * ⇒ 它们需要重建索引。模型编辑弹窗据此弹确认并列出库名（P1-5 补）。
-   * 与 `agentCount` 不同，它**不**是删除守卫：删模型会把 `embedding_model_id` 置空（`onDelete: SetNull`）。
+   * ⚠️ 2026-10-22 起**也是删除守卫的一部分**：删模型会把 `embedding_model_id` 置空（`onDelete: SetNull`），
+   * 静默让那些库无法入库/检索 ⇒ `removeModel` 会 409 拦下。
    */
   knowledgeBaseCount: z.number().int().min(0),
+  /**
+   * 有多少个**知识库**把该模型用作**图片描述（VLM）**（`knowledge_bases.caption_model_id`，2026-10-22 补）。
+   *
+   * 与 {@link knowledgeBaseCount} 同款：`onDelete: SetNull` ⇒ 删模型会静默清空这些库的图片描述模型
+   * （此后"图片描述"入库会 409）⇒ 也在删除守卫里拦。
+   */
+  captionKnowledgeBaseCount: z.number().int().min(0),
+  /**
+   * 该模型是否被平台选为**会话标题生成模型**（`title_model_config.model_id`，单例配置，2026-10-22 补）。
+   *
+   * 同款 `onDelete: SetNull`：删它会静默把平台标题模型清空（会话标题退回确定性截断）⇒ 也在删除守卫里拦。
+   */
+  usedAsTitleModel: z.boolean(),
   /**
    * P1-13：模型**随 Provider 归属** —— 以下字段取自其 Provider（Model 本身没有可见性/归属列）。
    * ⚠️ P1-13 修订（2026-10-16）：Provider **不再有可见性** ⇒ 这里没有 `providerVisibility`。
@@ -128,6 +148,7 @@ export const modelOptionSchema = z.object({
   providerName: z.string(),
   modelName: z.string(),
   label: z.string(),
+  /** **模型自己的用途**（对话 / 向量化）；与所属 Provider 的 `type`（默认值）无关，见 {@link modelItemSchema} */
   type: z.enum(MODEL_TYPES),
   /** `03` §4.2：下拉要显示上下文长度 */
   maxContext: z.number().int().nullable(),
@@ -251,6 +272,12 @@ export const createModelBodySchema = z.object({
   providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
   modelName: modelNameSchema,
   label: labelSchema,
+  /**
+   * **模型自己的用途**（对话 / 向量化）；**不再要求**等于该 Provider 的 `type`。
+   *
+   * 服务层另有一条与 Provider 相关的约束：`type=EMBEDDING` 时该 Provider 的协议必须是
+   * OpenAI 兼容（`embeddingModelAllowedOnProtocol`）—— embedding 只有 `/embeddings` 一条路。
+   */
   type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
   /** 可缺省：`null` 与缺省同义（未填写） */
   maxContext: maxContextSchema.nullish(),
@@ -302,6 +329,8 @@ export type CreateModelBody = z.infer<typeof createModelBodySchema>
  *
  * · `type` 可改，但**被 Agent 引用时不允许**（服务层 409）—— 那等于让已绑定的智能体
  *   悄悄换到另一类模型上（对话模型 ↔ 向量模型不可互换）。
+ *   ⚠️ 2026-10-22 起它**不再**要求等于 Provider 的 `type`；改成 `EMBEDDING` 时服务层另判
+ *   "该 Provider 的协议是否兼容"（`embeddingModelAllowedOnProtocol`）。
  */
 export const updateModelBodySchema = z
   .object({

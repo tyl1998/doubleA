@@ -514,6 +514,22 @@
 .kb-cell__flag { color: var(--muted-2); font-size: var(--fs-sm); cursor: help; flex: 0 0 auto; }
 .kb-cell__flag--warn { color: var(--danger); }
 
+/* 知识库列表：**大屏**（≥ 1200px）整表自适应容器宽度，**不出现横向滚动条**（2026-10-22 用户反馈）。
+   各列宽度之和（1520px，含「检索口径」列）超过页面正文的可读宽度上限（`.page__body` 的 1440px）⇒
+   AntD `scroll={{ x: 'max-content' }}` 会把表格钉在 1520px，即使 2400px 的显示器上也**一直缺 80px**、
+   冒出横向滚动条且「操作」列被裁掉一截（"明明屏幕很宽，表格却挤着滚"）。
+   这里在 ≥ 1200px 把表格改成 `width:100%`、去掉滚动条 ⇒ 列等比收缩、长文本换行/截断（`.kb-cell__*`
+   本就两行截断）。
+   ⚠️ `!important` 是必需的：rc-table 把 `width: max-content` / `overflow: auto` 写在**元素内联样式**上，
+   文件里的规则压不过内联（与 `03` §七「覆盖 AntD 外观一律加 `:root` 前缀」同源：都是为了抬特异度）。
+   ⚠️ 小屏（< 1200px）**不碰** ⇒ 保留 `scroll.x` 的横向滚动，不把「名称」压缩变形。 */
+@media (min-width: 1200px) {
+  .kb-table .ant-table-content { overflow-x: hidden !important; }
+  .kb-table .ant-table-content table { width: 100% !important; min-width: 0 !important; }
+  .kb-table .kb-cell__name,
+  .kb-table .kb-cell__sub { overflow-wrap: anywhere; }
+}
+
 /* 检索测试抽屉里的命中片段（`hit.snippet` 是**原文窗口**，可能带整段换行 ⇒ 必须截断，
    否则一行结果能把抽屉撑成几屏高，用户再也看不出"哪一条排在前面"）。
    三行是刻意的：够看出命中上下文，又不至于让一屏放不下三条结果。 */

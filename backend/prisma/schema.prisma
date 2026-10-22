@@ -63,8 +63,10 @@ enum UserStatus {
   @@map("user_status")
 }
 
-/// provider 与 model 共用的类型域（`02` §三 两处都写 `type(CHAT|EMBEDDING)`）。
-/// 共用一个枚举而不是各建一个：两者本就同一取值域，将来加第三类（如 RERANK）只改一处。
+/// **模型的用途**（`models.type`）：对话 / 向量化。
+/// ⚠️ 2026-10-22 起它**只属于模型**（`model_providers.type` 已整列删除）—— 同一个 Provider
+/// （同一个 baseUrl / 同一把 Key）下可以同时挂两类模型。见 `docs/子方案/Provider与模型类型解耦.md`。
+/// 保留单一枚举是为将来加第三类（如 RERANK）时只改一处。
 enum ModelType {
   CHAT
   EMBEDDING
@@ -80,8 +82,9 @@ enum ModelType {
 /// · `ANTHROPIC_MESSAGES` —— `POST {baseUrl}/messages` + `x-api-key` + `anthropic-version`
 ///
 /// 默认值 `OPENAI_COMPAT` 让既有行**逐字保持原行为**（`02` §6.1 的三协议映射表）。
-/// `type = EMBEDDING` 只允许 `OPENAI_COMPAT`（embedding 只有 `/embeddings` 一条路，
-/// 判据收在 `shared/src/modelProvider.ts#protocolAllowedForType`）。
+/// 向量模型只允许 `OPENAI_COMPAT`（embedding 只有 `/embeddings` 一条路）—— 2026-10-22 起该约束
+/// 挂在**模型侧**（"该 Provider 下有没有 EMBEDDING 模型"），判据收在
+/// `shared/src/modelProvider.ts#vectorModelRequiresCompatProtocol`。
 enum UpstreamProtocol {
   OPENAI_COMPAT
   OPENAI_RESPONSES
@@ -362,7 +365,12 @@ model User {
 ///
 /// `api_key_enc` 是 **AES-256-GCM 密文**（P0-1-6 的 infra/crypto 加解密，P0-1-10 写入）。
 /// 可空：本系统允许无鉴权的自建 provider（如内网 vLLM / Ollama 兼容端点）。
-/// `@@index([type, enabled])` 服务管理页按类型过滤的列表查询。
+///
+/// ⚠️ 2026-10-22：**删除了 `type` 列**（原"这条 Provider 只能放这类模型"的硬约束）。
+/// 同一个 baseUrl（one-api / new-api / vLLM 那类网关）往往同时提供对话与向量模型，
+/// 类型约束逼着把同一个上游配两遍（两份密文、两次轮换）。现在 `models.type` 是**模型自己的用途**，
+/// Provider 只是"上游终点"（`base_url` + Key + `protocol`）—— 类型列因此失去全部语义，整列删除。
+/// 见 `docs/子方案/Provider与模型类型解耦.md`。
 model ModelProvider {
   id        String    @id @default(uuid(7)) @db.Uuid
   name      String    @db.VarChar(128)
@@ -372,8 +380,9 @@ model ModelProvider {
   /// （见 `backend/src/llm/upstream.ts#resolveUpstreamUrl`）。默认 false = 既有拼接行为。
   customUrl Boolean   @default(false) @map("custom_url")
   apiKeyEnc String?   @map("api_key_enc") @db.Text
-  type      ModelType
-  /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`
+  /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`。
+  /// ⚠️ 2026-10-22 起约束改为：**本 Provider 下存在 EMBEDDING 模型时，协议只能是 `OPENAI_COMPAT`**
+  /// （embedding 只有 `/embeddings` 一条路）—— 判据 = `shared#vectorModelRequiresCompatProtocol`。
   protocol  UpstreamProtocol @default(OPENAI_COMPAT)
   enabled   Boolean   @default(true)
   /// P1-13：**所属人**（新增 `created_by`）。语义 = 权限判据的唯一主体：
@@ -393,7 +402,6 @@ model ModelProvider {
   userCredentials ProviderUserCredential[]
   creator User @relation(fields: [createdBy], references: [id], onDelete: Restrict)
 
-  @@index([type, enabled])
   @@index([createdBy])
   @@map("model_providers")
 }
@@ -427,9 +435,9 @@ model ProviderUserCredential {
 ///
 /// · `label` = 别名（界面上给业务同学看的名字），`model_name` = 上游真实型号名。
 /// · `@@unique([providerId, modelName, type])`：同一 provider 下同型号同类型只应有一条。
-///   ⚠️ 方案A 起**模型 `type` 跟随 Provider 的 `type`**（`createModel` 强校验一致），
-///   所以这条唯一约束实际等价于 `(providerId, modelName)`；保留 `type` 列是为了不动约束、
-///   且对历史数据仍能正确判重。
+///   ⚠️ 2026-10-22 起 `type` 是**模型自己的用途**（Provider 上**已无** type 列，它只是上游终点）——
+///   同一个 Provider 下可以同时挂 CHAT 与 EMBEDDING 模型（同一个 baseUrl / 同一把 Key）。
+///   （2026-09-30~2026-10-22 期间曾有"方案A：类型跟随 Provider"的强校验，已废除。）
 /// · `@@index([type, enabled])`：服务 `GET /api/models?type=CHAT`（全员可选模型列表，
 ///   `enabled=false` 的必须筛掉 —— `01` §3.2「无效模型创建 Agent 时不可选」）。
 /// · 删除语义 `onDelete: Cascade`：模型之于 provider 没有独立意义，provider 没了模型也留不住。
@@ -462,6 +470,8 @@ model Model {
   knowledgeBases KnowledgeBase[] @relation("KnowledgeBaseEmbeddingModel")
   /// 把本模型用作"图片描述（VLM 描述）"的知识库（`KnowledgeBase.captionModelId`，P1-11）
   captionKnowledgeBases KnowledgeBase[] @relation("KnowledgeBaseCaptionModel")
+  /// 把本模型用作"会话标题生成"的平台配置（`TitleModelConfig.modelId`）
+  titleModelConfigs TitleModelConfig[] @relation("TitleModelConfigModel")
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -1525,4 +1535,28 @@ model EgressPolicy {
   updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("egress_policy")
+}
+
+/// title_model_config —— 会话标题生成模型（平台级；**单例行**）。
+///
+/// 依据：产品优化（2026-09-29 会话标题自动命名）的延伸 —— 把"标题从首条消息原文截断"
+/// 升级为"用一个廉价模型压成短标题"，模型选择对齐 `KnowledgeBase.captionModelId` 那套
+/// （从模型池选 + 保存时校验）。
+///   · **单行**（`id` 固定 `'default'`）—— 会话标题是平台级单一事实，没有"每个用户/会话一份"的维度；
+///   · `enabled` = 平台总开关（关掉即全体回落确定性截断）；
+///   · `modelId` = 选定的标题模型（模型池里 `type=CHAT` 的模型）；`null` = 未配置 ⇒ 回落确定性截断。
+///     ⚠️ 可空 + `onDelete: SetNull`：删模型时自动置空，会话标题生成退回确定性逻辑，**不报错**。
+/// 消费方 = `orchestrator/titleGenerate.ts`（落库后**异步**升级标题；调不通 / 没配置一律回落）。
+model TitleModelConfig {
+  id        String   @id @default("default") @db.VarChar(32)
+  /// 平台总开关（默认**关**）：开且配了模型才会尝试模型生成标题
+  enabled   Boolean  @default(false)
+  /// 选定的标题模型（`models` 里 `type=CHAT`）；`null` = 未配置
+  modelId   String?  @map("model_id") @db.Uuid
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// 选定的标题模型（删模型置空 ⇒ 之后会话标题退回确定性截断）
+  model Model? @relation("TitleModelConfigModel", fields: [modelId], references: [id], onDelete: SetNull)
+
+  @@map("title_model_config")
 }

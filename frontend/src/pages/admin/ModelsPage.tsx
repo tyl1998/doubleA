@@ -8,7 +8,7 @@
  * ─────────────────────────────────────────────────────────────────────
  * ① 一张表还是两张表：本页是**两张**，因为它们是两个资源
  * ─────────────────────────────────────────────────────────────────────
- * Provider（配置：baseUrl + Key + 类型）与模型（它下面的具体型号）是两级资源，各有各的 CRUD。
+ * Provider（配置：baseUrl + Key + 上游协议）与模型（它下面的具体型号）是两级资源，各有各的 CRUD。
  * 合成一张表会让"编辑"这一个动作有两种含义。所以上面一张 Provider 表、下面一张模型表，
  * 模型表用「Provider」列 + `rowSpan` 合并相邻同 Provider 的行来表达归属（见 `providerGroupSpans`）。
  *
@@ -50,15 +50,17 @@ import {
   useModelProviders,
   useRemoveModel,
 } from '../../api/modelPool.js'
+import { useCurrentUser } from '../../api/auth.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
-import { AGENTS_PATH, credentialsSectionPath } from '../../app/paths.js'
+import { AGENTS_PATH, KNOWLEDGE_PATH, credentialsSectionPath } from '../../app/paths.js'
 import { DeleteProviderModal } from './DeleteProviderModal.js'
 import { ModelFormModal } from './ModelFormModal.js'
 import { ProviderFormModal } from './ProviderFormModal.js'
 import { RemoteModelsDrawer } from './RemoteModelsDrawer.js'
+import { SystemModelSection } from './SystemModelSection.js'
 import {
   describeProviderKey,
   maxContextText,
@@ -86,6 +88,10 @@ interface TransferTarget {
 
 export function ModelsPage() {
   const feedback = useFeedback()
+  // 「系统模型」区块是**平台级配置**（仅 ADMIN）：判据是 `role === 'ADMIN'`，不是"页面在哪个路由下"
+  // —— 模型池页自 P1-13 起对全员开放，同一个页面两种身份都会进来（与 `AssetUserPicker` 同款判据）。
+  const { data: me } = useCurrentUser()
+  const isAdmin = me?.role === 'ADMIN'
   // ⚠️ 只传 `limit`、**不传 `offset`**（默认 0，一次取满、筛选全在客户端）。
   //    这里曾经写成 `useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)` —— 在位置参数签名下
   //    那个 100 落进了 `offset`，页面因此把 3 个 Provider / 2 个模型全当成"没有"。
@@ -159,14 +165,9 @@ export function ModelsPage() {
       ),
     },
     {
-      title: '类型',
-      dataIndex: 'type',
-      width: 90,
-      render: (_, provider) => <Tag>{MODEL_TYPE_LABELS[provider.type]}</Tag>,
-    },
-    {
       // P0-1-37：协议与类型是**两个维度**（同为对话，可以是兼容/Responses/Anthropic），
-      // 所以单独一列，而不是塞进「类型」那个 Tag 里 —— 合在一处就没法按协议扫一眼排查
+      // 所以单独一列，而不是塞进「类型」那个 Tag 里 —— 合在一处就没法按协议扫一眼排查。
+      // ⚠️ 2026-10-22：Provider 上的 `type` 列已删除 ⇒ 这张表**不再有「类型」列**（见下条）。
       title: '上游协议',
       dataIndex: 'protocol',
       width: 160,
@@ -177,6 +178,9 @@ export function ModelsPage() {
             <span className="kb-cell__sub">
               {provider.protocol === 'ANTHROPIC_MESSAGES' ? 'x-api-key' : '/responses'}
             </span>
+          )}
+          {provider.hasEmbeddingModel && (
+            <span className="kb-cell__sub">含向量模型</span>
           )}
         </div>
       ),
@@ -454,7 +458,17 @@ export function ModelsPage() {
                   <>
                     {blocked}
                     <br />
-                    <Link to={AGENTS_PATH}>去智能体列表改绑 →</Link>
+                    {model.agentCount > 0 && <Link to={AGENTS_PATH}>去智能体列表改绑 →</Link>}
+                    {(model.agentCount > 0 && (model.knowledgeBaseCount > 0 || model.captionKnowledgeBaseCount > 0)) &&
+                      ' · '}
+                    {(model.knowledgeBaseCount > 0 || model.captionKnowledgeBaseCount > 0) && (
+                      <Link to={KNOWLEDGE_PATH}>去知识库改模型 →</Link>
+                    )}
+                    {model.usedAsTitleModel && (
+                      <span className="ratio">
+                        （会话标题模型在本页上方「系统模型」区改）
+                      </span>
+                    )}
                   </>
                 }
                 okText="删除"
@@ -505,7 +519,8 @@ export function ModelsPage() {
         <div>
           <h1>模型池</h1>
           <p className="page__lead">
-            先建 <strong>Provider</strong>（baseUrl + API Key + 类型），再在它下面录入模型。只有在
+            先建 <strong>Provider</strong>（baseUrl + API Key + 上游协议），再在它下面录入模型。同一个
+            Provider 下可以同时挂对话与向量模型（共用一个 baseUrl 与一把 Key）。只有在
             这里被<strong>启用</strong>的模型才会出现在「新建智能体」的模型下拉里 —— 停用是"先别再选它"，
             不是删除。
           </p>
@@ -526,6 +541,10 @@ export function ModelsPage() {
           </Button>
         </div>
       </div>
+
+      {/* ───────────────────── 系统模型（仅 ADMIN）─────────────────────
+          平台级"会话标题生成用哪个模型"；与模型池同主题、共用 CHAT 模型下拉，故并入本页而非单开一页。 */}
+      {isAdmin && <SystemModelSection />}
 
       {/* ───────────────────── Provider ───────────────────── */}
       <section className="admin-section">
@@ -552,7 +571,7 @@ export function ModelsPage() {
           <div className="card">
             <EmptyState
               title="还没有 Provider"
-              lead="Provider 是模型的来源：一个 baseUrl、一把 API Key、一个类型（对话或向量）。建完它才能在下面录入模型。"
+              lead="Provider 是模型的来源：一个 baseUrl、一把 API Key（+ 上游协议）。建完它才能在下面录入模型；同一个 Provider 下可以同时挂对话与向量模型。"
               action={
                 <Button type="primary" onClick={() => setCreatingProvider(true)}>
                   新建 Provider

@@ -21,6 +21,7 @@
     "workspace:regression": "node --import tsx scripts/workspace-regression.ts",
     "git:regression": "node --import tsx scripts/git-credential-regression.ts",
     "egress:regression": "node --import tsx scripts/egress-policy-regression.ts",
+    "title:regression": "node --import tsx scripts/title-model-regression.ts",
     "runtime-build:regression": "node --import tsx scripts/runtime-build-regression.ts",
     "router:regression": "node --import tsx scripts/router-regression.ts",
     "gateway:regression": "node --import tsx scripts/mcp-gateway-regression.ts",

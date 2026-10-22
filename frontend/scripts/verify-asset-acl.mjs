@@ -146,8 +146,8 @@ it('A5 Provider：body 带 credentialMode、不带 visibility；凭据模式变�
   eq(created.credentialMode, 'SHARED', '创建体带默认凭据模式 SHARED')
   assert(!('visibility' in admin.EMPTY_PROVIDER_FORM_VALUES), 'Provider 表单初值里没有 visibility')
 
-  const provider = { name: 'p', baseUrl: 'https://x/v1', customUrl: false, type: 'CHAT', protocol: 'OPENAI_COMPAT', enabled: true, credentialMode: 'SHARED', modelCount: 0 }
-  const values = { name: 'p', baseUrl: 'https://x/v1', customUrl: false, type: 'CHAT', protocol: 'OPENAI_COMPAT', enabled: true, credentialMode: 'SHARED', apiKey: '' }
+  const provider = { name: 'p', baseUrl: 'https://x/v1', customUrl: false, protocol: 'OPENAI_COMPAT', enabled: true, credentialMode: 'SHARED', modelCount: 0 }
+  const values = { name: 'p', baseUrl: 'https://x/v1', customUrl: false, protocol: 'OPENAI_COMPAT', enabled: true, credentialMode: 'SHARED', apiKey: '' }
   eq(admin.buildProviderUpdateBody(provider, values, false), null, '零改动 ⇒ null')
   eq(admin.buildProviderUpdateBody(provider, { ...values, credentialMode: 'PER_USER' }, false), { credentialMode: 'PER_USER' }, '改凭据模式 ⇒ 只带它')
 })

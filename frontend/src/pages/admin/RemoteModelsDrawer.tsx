@@ -23,8 +23,15 @@
  *    界面上照实说"只列了前 N 个"，不静默截断（静默截断会让"某几个模型不见了"变成幽灵 bug）。
  */
 
-import { Alert, Button, Drawer, Input, Table, Tooltip, type TableColumnsType } from 'antd'
-import type { ModelProviderItem } from '@doubulea/shared'
+import { Alert, Button, Drawer, Input, Select, Table, Tooltip, type TableColumnsType } from 'antd'
+import {
+  DEFAULT_UPSTREAM_PROTOCOL,
+  MODEL_TYPES,
+  MODEL_TYPE_LABELS,
+  UPSTREAM_PROTOCOL_LABELS,
+  type ModelProviderItem,
+  type ModelType,
+} from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
@@ -55,6 +62,20 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
   // 多选：勾选的上游型号名，用于批量创建到本 Provider 下
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [creating, setCreating] = useState(false)
+  /**
+   * 表格里**每行**选定的建成类型（2026-10-22 定案的交互）。
+   *
+   * 上游 `/models` **不返回类型**（没有任何标准字段区分对话与向量），所以建成什么类型只能由人确认。
+   * 交互定案：类型是**每个模型自己的属性** ⇒ 直接在**该行**给一个下拉；默认值取按型号名的**保守推测**
+   * （{@link RemoteModelRow.guessedType}，会误伤，但只是默认、可逐行改）。不做抽屉级总单选（那会与
+   * "过滤型号名"并排、被读成筛列表），也不另生成"待创建清单"。
+   */
+  const [typeOverrides, setTypeOverrides] = useState<Record<string, ModelType>>({})
+  /**
+   * 某一行最终要建成的类型：用户在该行的下拉里选过就用它，否则用按型号名的**保守推测**
+   * （{@link RemoteModelRow.guessedType}）作默认值。
+   */
+  const typeOfRow = (row: RemoteModelRow): ModelType => typeOverrides[row.id] ?? row.guessedType
 
   const providerId = provider?.id ?? null
 
@@ -68,17 +89,32 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       probe.reset()
       setKeyword('')
       setSelectedIds([])
+      setTypeOverrides({})
       return
     }
     probe.mutate(providerId)
     setKeyword('')
     setSelectedIds([])
+    setTypeOverrides({})
   }, [providerId])
 
   const result = probe.data
   const rows = result === undefined ? [] : remoteModelRows(result)
   const normalized = keyword.trim().toLowerCase()
   const filtered = normalized === '' ? rows : rows.filter((row) => row.id.toLowerCase().includes(normalized))
+  /** 勾选的行（按上游顺序）；用来判"选中里有向量行却协议不兼容" */
+  const selectedRows = rows.filter((row) => selectedIds.includes(row.id))
+
+  /**
+   * 勾选的型号若建成向量、但该 Provider 协议不是 OpenAI 兼容 ⇒ 那些行必然被后端 400
+   * （embedding 只有 `/embeddings` 一条路，判据 = `shared#embeddingModelAllowedOnProtocol`）。
+   * 逐行判：只有真的选中且被改成"向量"的行才算被挡，避免"没勾向量行却禁用按钮"。
+   */
+  const embeddingBlockedRows =
+    provider !== null && provider.protocol !== DEFAULT_UPSTREAM_PROTOCOL
+      ? selectedRows.filter((row) => typeOfRow(row) === 'EMBEDDING')
+      : []
+  const embeddingBlocked = embeddingBlockedRows.length > 0
 
   const copy = (id: string): void => {
     void navigator.clipboard
@@ -90,8 +126,9 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
   /**
    * 批量创建：把勾选的上游型号名逐个建成本 Provider 下的模型。
    *
-   * · 别名默认取型号名、类型取 Provider 类型、上下文长度取上游给的值（`null` 则不带）；
-   *   支持图片/深度思考默认关（这些要管理员按模型确认，随后到「编辑」里改）。
+   * · 别名默认取型号名、类型取**该行选定的类型**（每行一个下拉，默认按型号名保守推断）、
+   *   上下文长度取上游给的值（`null` 则不带，且仅"该行类型 = 对话"时才带入 —— 向量模型
+   *   没有上下文概念）；支持图片/深度思考默认关（这些要管理员按模型确认，随后到「编辑」里改）。
    * · 逐个建、逐个兜错：已存在（409）等失败不阻断其余项，最后汇总成功/失败条数。
    */
   const createSelected = async (): Promise<void> => {
@@ -101,13 +138,14 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
     let ok = 0
     const failures: string[] = []
     for (const row of targets) {
+      const rowType = typeOfRow(row)
       const values: ModelFormValues = {
         providerId: provider.id,
         modelName: row.id,
         label: row.id,
-        type: provider.type,
+        type: rowType,
         // 向量模型无"上下文长度"概念（维度由保存时尽力探测 / 管理员手动填）
-        maxContext: provider.type === 'EMBEDDING' ? null : row.contextLength,
+        maxContext: rowType === 'EMBEDDING' ? null : row.contextLength,
         embeddingDim: null,
         embeddingMultimodal: false,
         supportsVision: false,
@@ -123,6 +161,7 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
     }
     setCreating(false)
     setSelectedIds([])
+    setTypeOverrides({})
     if (ok > 0) {
       feedback.ok(`已创建 ${ok} 个模型${failures.length > 0 ? `，${failures.length} 个失败` : ''}`)
     }
@@ -144,15 +183,32 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       ),
     },
     {
+      // 类型是**每个模型自己的属性** —— 上游 /models 不返回类型，默认按型号名保守推测、可逐行改。
+      // 建成什么类型由这一列决定（勾选后一起提交）。
+      title: '建成类型',
+      dataIndex: 'guessedType',
+      width: 120,
+      render: (_, row) => (
+        <Select<ModelType>
+          size="small"
+          value={typeOfRow(row)}
+          options={MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] }))}
+          style={{ width: '100%' }}
+          aria-label={`${row.id} 建成类型`}
+          onChange={(next) => setTypeOverrides((current) => ({ ...current, [row.id]: next }))}
+        />
+      ),
+    },
+    {
       title: '归属',
       dataIndex: 'ownedBy',
-      width: 160,
+      width: 140,
       render: (_, row) => <span className="num">{row.ownedBy ?? '—'}</span>,
     },
     {
       title: '上下文',
       dataIndex: 'contextLength',
-      width: 120,
+      width: 110,
       align: 'right',
       render: (_, row) => <span className="num">{maxContextText(row.contextLength)}</span>,
     },
@@ -170,7 +226,7 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
           <div>
             <p className="num">{provider.baseUrl}</p>
             <p className="ratio">
-              API Key：{describeProviderKey(provider)} · 类型：{provider.type}
+              API Key：{describeProviderKey(provider)} · 协议：{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}
             </p>
           </div>
 
@@ -178,7 +234,7 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
             type="info"
             showIcon
             message="只读探测，勾选后可批量创建"
-            description="这里探的是上游 /models 的真实返回。勾选想要的型号，点「创建选中的模型」即可批量建到本 Provider 下（别名默认取型号名、类型取 Provider 类型、上下文长度取上游值，可稍后编辑）。探到了也不代表调用一定成功（上游可能仍需鉴权或该型号不可用）。"
+            description="这里探的是上游 /models 的真实返回。勾选想要的型号，逐行确认「建成类型」（默认按型号名推测，可改），点「创建选中的模型」即可批量建到本 Provider 下（别名默认取型号名、上下文长度取上游值，可稍后编辑）。探到了也不代表调用一定成功（上游可能仍需鉴权或该型号不可用）。"
           />
 
           {probe.isPending && <p className="ratio">正在向上游发起一次请求…（可能较慢，内网地址会一直等到超时）</p>}
@@ -213,7 +269,7 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                 />
                 <Button
                   type="primary"
-                  disabled={selectedIds.length === 0 || creating}
+                  disabled={selectedIds.length === 0 || creating || embeddingBlocked}
                   loading={creating}
                   onClick={() => void createSelected()}
                 >
@@ -224,6 +280,14 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                   {result.truncated && <>（本次列出前 {result.items.length} 个）</>}
                 </span>
               </div>
+
+              {embeddingBlocked && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={`选中的型号里有「向量」，但这个 Provider 用的不是 ${DEFAULT_UPSTREAM_PROTOCOL} 协议 —— 不能在其下建向量模型（embedding 只有 /embeddings 一条路）。请先把该 Provider 的协议改成 OpenAI 兼容，或把这些行改选「对话」。`}
+                />
+              )}
 
               {rows.length === 0 ? (
                 <p className="ratio">上游返回的清单是空的。</p>
@@ -246,7 +310,8 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
 
               <p className="ratio">
                 提示：勾选型号后可批量创建；也可点型号名复制到「新建模型」里手动录入。上游清单里常有
-                embedding / 图像 / 老版本模型，不一定都能拿来做对话 —— 加进来之前先确认它的类型。
+                embedding / 图像 / 老版本模型，不一定都能拿来做对话 —— 每行的「建成类型」**默认只是按
+                型号名的推测、可能不准**，请在建之前逐行确认。
               </p>
             </>
           )}

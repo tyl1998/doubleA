@@ -47,6 +47,7 @@
     "workspace:regression": "pnpm --filter @doubulea/backend workspace:regression",
     "git:regression": "pnpm --filter @doubulea/backend git:regression",
     "egress:regression": "pnpm --filter @doubulea/backend egress:regression",
+    "title:regression": "pnpm --filter @doubulea/backend title:regression",
     "runtime-build:regression": "pnpm --filter @doubulea/backend runtime-build:regression",
     "router:regression": "pnpm --filter @doubulea/backend router:regression",
     "gateway:regression": "pnpm --filter @doubulea/backend gateway:regression",

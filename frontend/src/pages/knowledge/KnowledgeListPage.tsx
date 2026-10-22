@@ -310,11 +310,24 @@ export function KnowledgeListPage() {
           <Table<KnowledgeBaseItem>
             rowKey="id"
             size="middle"
+            // `kb-table` 只做一件事：给 `.ant-table-content` 一个可选的挂点，供 `app.css` 在**大屏**
+            // （≥ 1200px）把它从「横向滚动」改回「整表自适应容器宽度」（见下方 `scroll` 与 `app.css`）。
+            className="kb-table"
             columns={columns}
             dataSource={filtered}
             loading={false}
-            // 各列宽度之和即自适应最小宽度：窄屏改为**横向滚动**，而不是把「名称」压缩变形
-            //（`max-content` 会随 `responsive` 隐藏的「检索口径」列自动收放）。
+            // ⚠️ `scroll.x` 只在**小屏**（< xl = 1200px）真正生效 —— 各列宽度之和（1220，隐藏了
+            // 「检索口径」列）大于容器时**横向滚动**，而不是把「名称」压缩变形。
+            //
+            // 为什么大屏必须关掉它（2026-10-22 用户反馈「大屏展示很奇怪」）：`max-content` 会把
+            // 表格钉在「各列宽度之和」= 1520px（含「检索口径」列），而页面正文**可读宽度上限是
+            // 1440px**（`.page__body`，见 `app.css`）⇒ 即使在 2400px 的显示器上，表格右缘也**一直缺
+            // 80px**、冒出横向滚动条、「操作」列被裁掉一截 —— 观感正是"明明屏幕很宽，表格却挤着滚"。
+            // 大屏下改由 `app.css` 的 `@media (min-width: 1200px) .kb-table` 把表格改成 `width:100%`、
+            // 去掉滚动条，列**等比收缩**、放不下的长文本换行/截断（`.kb-cell__name` 本就两行截断）。
+            //
+            // ⚠️ `max-content` 不能换成固定数字（如 `1520`）：它要随 `responsive: ['xl']` 隐藏的
+            // 「检索口径」列**自动收放**，写死数字会让窄屏多出一列宽的空白。
             scroll={{ x: 'max-content' }}
             pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
           />

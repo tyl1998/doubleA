@@ -46,6 +46,7 @@ import { registerSandboxRoutes } from './routes/sandbox.js'
 import { registerSandboxInstanceRoutes } from './routes/sandboxInstances.js'
 import { registerNodeRoutes } from './routes/node.js'
 import { registerNodeInternalRoutes } from './routes/nodeInternal.js'
+import { registerTitleModelRoutes } from './routes/titleModel.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -234,6 +235,11 @@ export function buildApp(): FastifyInstance {
   //    权限 **仅 ADMIN**（平台级配置，与 `/api/model-providers` 同族 —— 不是"每个人自己的东西"）。
   //    本表只是"平台声明"；真实拦截在 egress 代理容器，由 `egress-up.sh --watch` 轮询落成策略文件。
   registerEgressPolicyRoutes(app)
+
+  // ㉓ 会话标题生成模型（平台级单例）：`/api/admin/title-model` 两条（读 / 整替换）。
+  //    权限 **仅 ADMIN**（平台级配置，与 egress 策略同族）。未配置 / 调用不通时，会话标题
+  //    一律回落 `persist.ts` 里那条确定性截断（`deriveConversationTopic`）。
+  registerTitleModelRoutes(app)
 
   return app
 }

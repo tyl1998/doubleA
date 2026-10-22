@@ -697,6 +697,14 @@ await it('H6 列表页窄屏适配：「检索口径」列窄屏隐藏，表格�
   assertIncludes(page.source, 'describeRetrieval(', '口径仍由同一纯函数给出（只有一处来源）')
   // 窄屏改为横向滚动，而不是把名称列压缩变形
   assertIncludes(page.source, "scroll={{ x: 'max-content' }}", '表格要横向滚动兜底')
+  // 2026-10-22 用户反馈：大屏下各列宽度之和 > 正文可读上限 ⇒ `max-content` 会一直冒横向滚动条
+  //（2400px 屏上「操作」列仍被裁）；故大屏把表格改成自适应容器宽度。挂点只在页面里给一次。
+  assertIncludes(page.source, 'className="kb-table"', '大屏自适应需要 `.kb-table` 挂点')
+  // `sourceFiles()` 只收 `.ts/.tsx`（见其实现），样式表要单独读
+  const css = stripComments(readFileSync(new URL('../src/styles/app.css', import.meta.url), 'utf8'))
+  assertIncludes(css, '@media (min-width: 1200px)', '大屏断点必须 ≥ xl，与小屏滚动分界一致')
+  assertIncludes(css, '.kb-table .ant-table-content { overflow-x: hidden', '大屏要关掉横向滚动')
+  assertIncludes(css, '.kb-table .ant-table-content table { width: 100%', '大屏表格要自适应容器宽度')
 })
 
 // ───────────────────────────── I 下载文件名的解析 ─────────────────────────────

@@ -34,6 +34,7 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { touchConversation } from '../services/conversation.service.js'
 import { buildAssistantContent } from './chatContext.js'
+import { generateConversationTitle } from './titleGenerate.js'
 
 /**
  * 落库需要的那两项用量。
@@ -206,7 +207,7 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
     (steers?.length ?? 0) > 0
   try {
     const db = getPrisma()
-    return await db.$transaction(async (tx) => {
+    const { assistantMessageId, upgradeFrom } = await db.$transaction(async (tx) => {
       await tx.message.create({
         data: {
           conversationId,
@@ -253,11 +254,16 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
       //   · 流式中用户手动改名 ⇒ `topic` 已非 null ⇒ 这里不会覆盖（后写覆盖先写是错的）；
       //   · 之后每一轮都一样 —— 标题只由"第一条消息"或"手动重命名"产生，二选一。
       const derivedTopic = stripNulChars(deriveConversationTopic(content))
+      let topicDerived = false
       if (derivedTopic !== '') {
-        await tx.conversation.updateMany({
+        const written = await tx.conversation.updateMany({
           where: { id: conversationId, topic: null },
           data: { topic: derivedTopic },
         })
+        // `count === 1` ⟺ **本**轮写下了这条确定性标题（= 这是首条消息、且无人抢先改名）。
+        // 它是下面"要不要尝试模型升级"的**唯一**判据：只有本函数刚写的这一条才允许被升级
+        // （见事务外那段注释的 provenance 口径）。
+        topicDerived = written.count === 1
       }
       // ── 计量行（P0-3-12）：与上面两条消息、会话活跃时间同一个事务 ──
       // `user_id` / `agent_id` 从**会话行**读（它们是这两个身份的唯一权威，见 `UsageRecordInput`）。
@@ -284,13 +290,60 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
           },
         })
       }
-      return assistantMessageId
+      return { assistantMessageId, upgradeFrom: topicDerived ? derivedTopic : null }
     })
+    // ── 模型升级标题（2026-10-22）：确定性标题刚由**本**轮写下时，尽力把它升级成模型生成的短标题 ──
+    //
+    // provenance 口径（与 `hermes-agent` 的 `derived < llm < user` 同源）：
+    //   · 只在 `upgradeFrom !== null`（= 本函数**刚写的**那条确定性标题）时尝试 —— **绝不覆盖**：
+    //       · 用户手打的标题（`topic` 早已非 null ⇒ 事务里 CAS 没写成功 ⇒ `upgradeFrom === null`）；
+    //       · 更早那轮已经升级成的 `llm` 标题（同样 CAS 不成功 ⇒ `upgradeFrom !== null` 不成立）。
+    //     于是"升级"只会把**这一级的**`derived` 换成更好的一条，优先级链条天然成立。
+    //   · 更新语句带 `topic: upgradeFrom` 作为 CAS 守卫：生成期间用户手动改名 ⇒ 条件不成立、
+    //     这次升级被安全丢弃（不会把用户刚起的名字冲掉）。
+    //
+    // ⚠️ **刻意不 `await`、也不阻塞落库**：标题是"美化"，不该拖慢这一轮回给用户的时间；
+    //     生成慢 / 卡住都不影响消息已经落库这件事。失败一律静默回落（保留 `derived` 那条）。
+    //     `void` + 内部 try/catch：这是唯一不给 unhandled rejection 的写法（`generateConversationTitle`
+    //     自身也永不抛，这里是第二道保险）。
+    if (upgradeFrom !== null) {
+      void upgradeGeneratedTitle(conversationId, content, upgradeFrom, logger)
+    }
+    return assistantMessageId
   } catch (error) {
     logger.error(
       { err: error, conversationId, hasAssistantContent, generatedChars: assistantText.length },
       '本轮消息落库失败（回答已流给用户，但历史里不会有这一轮）',
     )
     return null
+  }
+}
+
+/**
+ * 落库事务**之外**的标题升级（见 {@link persistRoundQuietly} 的注释）。
+ *
+ * **永不抛**：这是 `void` 调用的后台动作，任何异常都不能变成未处理的 rejection。三件事：
+ *   ① 让配置的标题模型把首条消息压成短标题（未配 / 不可用 ⇒ `null`，回落）；
+ *   ② 升级条件 `topic = derivedTopic`（CAS：生成期间用户没改名、且这条还是当初那条）；
+ *   ③ 生成不出 / 更新不成立 ⇒ 什么都不做（保留已有的确定性标题）。
+ */
+async function upgradeGeneratedTitle(
+  conversationId: string,
+  firstUserText: string,
+  derivedTopic: string,
+  logger: ReturnType<typeof getLogger>,
+): Promise<void> {
+  try {
+    const generated = await generateConversationTitle(firstUserText)
+    if (generated === null || generated === derivedTopic) return
+    await getPrisma().conversation.updateMany({
+      // ⚠️ `topic: derivedTopic` 是 CAS 守卫（不是 `topic: null`）：只升级**本函数刚写的**那一条，
+      //    且生成期间用户没改过名 —— 后写覆盖先写在这里是错的（会把用户的名字冲掉）。
+      where: { id: conversationId, topic: derivedTopic },
+      data: { topic: generated },
+    })
+    logger.debug({ conversationId }, '会话标题已由模型生成升级')
+  } catch (error) {
+    logger.warn({ err: error, conversationId }, '会话标题模型升级失败（已保留确定性标题）')
   }
 }

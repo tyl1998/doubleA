@@ -26,20 +26,29 @@
  *
  * **④ 两个"删不掉/改不动"要先查再说人话。** `agents.model_id` 是 `ON DELETE RESTRICT`，
  *    直接删 Provider 会级联删 `models`、撞上 Agent 的外键约束后抛 Prisma `P2003`（500）。
- *    更糟的是"改 type"：`model_providers.type` 与 `models.type` 冗余，改了 Provider 类型而
- *    不管模型，会留下"CHAT 的 Provider 挂着 EMBEDDING 的模型"这种自相矛盾的数据。
- *    两条都在服务层**前置检查**并给出可执行的 409 文案（`06` P0-1-10 落地要点）。
+ *    删除在服务层**前置检查**并给出可执行的 409 文案（`06` P0-1-10 落地要点）。
  *    P0-1-11 又在**模型**这一侧补了同族的三条守卫（同款思路：先查、说人话、别让 500 说话）：
  *    删除时有 Agent 引用 / 改 type 时有 Agent 引用 / 试图把模型迁到别的 Provider。
+ *    ⚠️ 2026-10-22 起**删掉了**"有模型时不许改 Provider 的 `type`"这条 —— `type` 已降级为
+ *    "默认类型"，改它不动任何模型数据（见 ⑥）。
  *
- * **⑤ `protocol`（P0-1-37）在服务层的两条落点。**
+ * **⑤ `protocol`（P0-1-37）在服务层的落点。**
  *    · **创建**：`protocol` 缺省 = `DEFAULT_UPSTREAM_PROTOCOL`（默认值只在这一处补，
  *      `shared` 的 schema 刻意不用 `.default()` —— 见那边的注释）；
- *    · **修改**：`type` 与 `protocol` 的关系要在**服务层**判一次 —— 因为"只改 protocol、
- *      不动 type"这条路在 schema 里看不到库里的 `type`（`protocolAllowedForType` 是唯一判据）。
- *    ⚠️ 改 `protocol` **刻意不加"有模型就 409"的守卫**（与改 `type` 刻意相反，`02` §4.3）：
- *      改 `type` 会留下自相矛盾的冗余数据，改 `protocol` 只换调用方式、不动任何数据形状 ——
- *      而协议填错了本来就应该能改回来。
+ *    · **改 Provider 的协议**：见 ⑥ 的那条约束（"该 Provider 下有向量模型 ⇒ 只能兼容协议"）。
+ *
+ * **⑥ 2026-10-22：Provider 不再有 `type`（整列删除），`models.type` 是模型自己的用途。**
+ *    起因：同一个 baseUrl（one-api / new-api / vLLM 那类网关）**往往同时**提供对话与向量模型，
+ *    只是模型名不同；而"类型跟随 Provider"的硬约束逼着管理员把**同一个上游配两遍**
+ *    （`api_key_enc` 存两份密文、AAD 按 providerId 绑定 ⇒ 密文不可互换 ⇒ 轮换要改两处、漏一处就
+ *    一半模型静默 401）。改造后 Provider 只是"上游终点"（baseUrl + Key + protocol），
+ *    那列 `type` 失去全部语义（连"新建模型的默认类型"都不值得占一列），故整列删除。
+ *    遗留约束全部转移到**模型侧**：
+ *    · **建/改模型**：`type=EMBEDDING` 时该 Provider 的协议必须是 OpenAI 兼容
+ *      （{@link embeddingModelAllowedOnProtocol}）：embedding 只有 `/embeddings` 一条路；
+ *    · **改 Provider 协议**：该 Provider 下有 EMBEDDING 模型时，协议只能是默认值
+ *      （{@link vectorModelRequiresCompatProtocol}）。
+ *    判据是纯函数、收在 `shared/src/modelProvider.ts` 一处，服务层只看"有没有向量模型"这个事实。
  */
 
 
@@ -48,9 +57,11 @@ import {
   assetVisibilityWhere,
   canEditAsset,
   DEFAULT_UPSTREAM_PROTOCOL,
-  EMBEDDING_PROTOCOL_CONFLICT_MESSAGE,
+  EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE,
+  embeddingModelAllowedOnProtocol,
   maskApiKey,
-  protocolAllowedForType,
+  VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE,
+  vectorModelRequiresCompatProtocol,
   type AssetViewer,
   type CreateModelBody,
   type CreateModelProviderBody,
@@ -95,7 +106,6 @@ const PROVIDER_SELECT = {
   baseUrl: true,
   customUrl: true,
   apiKeyEnc: true,
-  type: true,
   protocol: true,
   enabled: true,
   // P1-18：凭据模式（共享 Key / 各自 Key）
@@ -114,7 +124,6 @@ interface ProviderRow {
   baseUrl: string
   customUrl: boolean
   apiKeyEnc: string | null
-  type: ModelProviderItem['type']
   protocol: UpstreamProtocol
   enabled: boolean
   credentialMode: ModelProviderItem['credentialMode']
@@ -164,15 +173,24 @@ export function providerUserKeyAad(userId: string, providerId: string): string {
  *
  * 掩码来自"解密后取首尾"而不是"存一段明文的尾巴"：既不多存一份敏感数据（那等于把 key
  * 的尾巴明文落库），又顺带证明了密文确实解得开。
+ *
+ * ⚠️ `hasEmbeddingModel` 是**派生读数**（`models` 子表里有没有 `type=EMBEDDING`），
+ * 不在 {@link ProviderRow} 上 —— 它由调用方查出来传进来（与 `userHasKey` 同款），
+ * 因为列表那儿要用一条 `distinct` 查询批量取、单条那儿用 `count`，两种取法不该塞进一个断言里。
  */
-function toItem(row: ProviderRow, viewer: AssetViewer, userHasKey: boolean): ModelProviderItem {
+function toItem(
+  row: ProviderRow,
+  viewer: AssetViewer,
+  userHasKey: boolean,
+  hasEmbeddingModel: boolean,
+): ModelProviderItem {
   return {
     id: row.id,
     name: row.name,
     baseUrl: row.baseUrl,
     customUrl: row.customUrl,
-    type: row.type,
     protocol: row.protocol,
+    hasEmbeddingModel,
     enabled: row.enabled,
     hasKey: row.apiKeyEnc !== null,
     apiKeyPreview: row.apiKeyEnc === null ? null : buildPreview(row.apiKeyEnc, row.id),
@@ -185,6 +203,31 @@ function toItem(row: ProviderRow, viewer: AssetViewer, userHasKey: boolean): Mod
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }
+}
+
+/**
+ * 某个 Provider 下**是否存在 EMBEDDING 模型**（单条查询；`toItem` 的第四个入参）。
+ *
+ * 用途见 `ModelProviderItem.hasEmbeddingModel`：向量模型把该 Provider 的协议钉死在 OpenAI 兼容。
+ * 单条路径（建 / 改 / 转移）用它；列表路径用 {@link embeddingModelProviderIds}（一条 `distinct`）。
+ */
+async function hasEmbeddingModelOf(providerId: string): Promise<boolean> {
+  const row = await getPrisma().model.findFirst({
+    where: { providerId, type: 'EMBEDDING' },
+    select: { id: true },
+  })
+  return row !== null
+}
+
+/** 一批 Provider 里**挂着向量模型的那些 id**（列表用的一条查询，避免逐条 N+1） */
+async function embeddingModelProviderIds(providerIds: readonly string[]): Promise<Set<string>> {
+  if (providerIds.length === 0) return new Set()
+  const rows = await getPrisma().model.findMany({
+    where: { providerId: { in: [...providerIds] }, type: 'EMBEDDING' },
+    select: { providerId: true },
+    distinct: ['providerId'],
+  })
+  return new Set(rows.map((row) => row.providerId))
 }
 
 /** P1-18：调用者是否已为某个 Provider 配置了**自己的** Key（列表/详情渲染"我的 Key"用） */
@@ -248,8 +291,10 @@ export async function listModelProviders(
           select: { providerId: true },
         })
   const hasKeySet = new Set(mine.map((row) => row.providerId))
+  // 2026-10-22：一次查出"这批 Provider 里哪些挂着向量模型"（`hasEmbeddingModel` 投影），同样避免 N+1
+  const embeddingSet = await embeddingModelProviderIds(ids)
   return {
-    items: rows.map((row) => toItem(row, viewer, hasKeySet.has(row.id))),
+    items: rows.map((row) => toItem(row, viewer, hasKeySet.has(row.id), embeddingSet.has(row.id))),
     total,
     offset: query.offset,
     limit: query.limit,
@@ -285,7 +330,6 @@ export async function createModelProvider(
         baseUrl: input.baseUrl,
         // 默认 false ⇒ 既有拼接行为（默认值只在服务层补一处，理由同 protocol）
         customUrl: input.customUrl ?? false,
-        type: input.type,
         // 显式写出 protocol/enabled：DB 默认也是这两值，但"新 Provider 默认走兼容协议、默认启用"
         // 属于契约，不该藏在迁移里
         protocol,
@@ -308,31 +352,31 @@ export async function createModelProvider(
     {
       providerId: created.id,
       name: created.name,
-      type: created.type,
       protocol: created.protocol,
       credentialMode: created.credentialMode,
       hasKey: apiKey !== undefined,
     },
     '已创建模型 Provider（Key 已加密落库，明文不再出现）',
   )
-  return toItem(created, viewer, false)
+  // 新建的 Provider 下**必然还没有任何模型** ⇒ `hasEmbeddingModel` 恒 false
+  return toItem(created, viewer, false, false)
 }
 
 /**
  * 改 Provider（`02` §4.3）：`apiKey` 的**三态**语义见 `shared/src/modelProvider.ts` 的表。
  *
- * 另一条守卫：**有模型时不允许改 `type`**。`model_providers.type` 与 `models.type` 是冗余的
- * （`02` §三），改了 Provider 类型而模型类型不动，会留下自相矛盾的数据；而级联改所有模型的
- * `type` 又会静默改变"已绑定的 Agent 用的是哪类模型"。两条都不好，故**拒绝并要求先处理模型** ——
- * 显式报错比静默改数据强。
+ * ⚠️ 2026-10-22：**没有"改类型"这条路了**（`type` 列整列删除）。原先那条"有模型就不许改 type
+ * → 409"随方案A一起废除 —— Provider 现在只是"上游终点"（baseUrl + Key + protocol）。
+ * 见 `docs/子方案/Provider与模型类型解耦.md`。
  *
- * **`protocol` 的守卫只有一条**（P0-1-37）：合并后的 `(type, protocol)` 必须是合法组合
- * （判据 = `shared` 的 `protocolAllowedForType`，只有一份）。⚠️ 「只改 protocol」这条路
- * **在 schema 里判不了** —— 那里看不到库里的 `type` —— 所以必须在这里判。
- * 其余刻意**不加**守卫：改 protocol 不动任何数据形状，填错了就该能改回来（与改 `type` 刻意相反）。
+ * **`protocol` 的守卫只有一条**（P0-1-37 立、2026-10-22 改口径）：**该 Provider 下存在
+ * EMBEDDING 模型**时，协议只能是默认值（判据 = `shared` 的 `vectorModelRequiresCompatProtocol`，
+ * 只有一份）—— embedding 只有 `/embeddings` 一条路，配个 Anthropic 协议只会造出"一建就失败
+ * 的向量模型"。⚠️ 「只改 protocol」这条路在 schema 里判不了（那里看不到库里的模型），
+ * 所以必须在这里判。其余刻意**不加**守卫：改 protocol 不动任何数据形状，填错了就该能改回来。
  *
- * @throws {AppError} `NOT_FOUND`(404) 目标不存在 / `CONFLICT`(409) 有模型时改 type
- *                    / `VALIDATION`(400) 合并后 type 与 protocol 冲突（字段级指向 `body.protocol`）
+ * @throws {AppError} `NOT_FOUND`(404) 目标不存在
+ *                    / `VALIDATION`(400) 该 Provider 有向量模型而协议非兼容（字段级指向 `body.protocol`）
  */
 export async function updateModelProvider(
   id: string,
@@ -342,7 +386,11 @@ export async function updateModelProvider(
   const db = getPrisma()
   const target = await db.modelProvider.findUnique({
     where: { id },
-    select: { id: true, type: true, protocol: true, createdBy: true, _count: { select: { models: true } } },
+    select: {
+      id: true,
+      protocol: true,
+      createdBy: true,
+    },
   })
   if (target === null) throw AppError.notFound('Provider 不存在')
 
@@ -351,21 +399,15 @@ export async function updateModelProvider(
     throw AppError.forbidden('只有该 Provider 的所属人或管理员可以修改它')
   }
 
-  if (input.type !== undefined && input.type !== target.type && target._count.models > 0) {
-    throw AppError.conflict(
-      `该 Provider 下已有 ${target._count.models} 个模型，不能改类型（模型类型与 Provider 类型必须一致）。` +
-        '请先删除或迁走这些模型',
-    )
-  }
+  const hasEmbeddingModel = await hasEmbeddingModelOf(id)
 
   /**
-   * 合并后判一次（用**库里**的 type × **请求里的** protocol，两边都可能缺省）。
-   * 与 `shared` 的 `updateModelProviderBodySchema#superRefine` 共用同一个纯函数判据，
-   * 那条 schema 只能覆盖"type 与 protocol 一起传且互相矛盾"的情形。
+   * 合并后判一次（协议可能只在库里、也可能只在请求里）。判据 = **该 Provider 下有没有向量模型**
+   * —— 这是唯一与"这条 Provider 能配什么协议"有关的事实（Provider 已无 `type` 列）。
    */
-  if (!protocolAllowedForType(input.type ?? target.type, input.protocol ?? target.protocol)) {
-    throw AppError.validation(EMBEDDING_PROTOCOL_CONFLICT_MESSAGE, {
-      fields: [{ path: 'body.protocol', message: EMBEDDING_PROTOCOL_CONFLICT_MESSAGE }],
+  if (!vectorModelRequiresCompatProtocol(hasEmbeddingModel, input.protocol ?? target.protocol)) {
+    throw AppError.validation(VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE, {
+      fields: [{ path: 'body.protocol', message: VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE }],
     })
   }
 
@@ -383,7 +425,6 @@ export async function updateModelProvider(
         ...(input.name === undefined ? {} : { name: input.name }),
         ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
         ...(input.customUrl === undefined ? {} : { customUrl: input.customUrl }),
-        ...(input.type === undefined ? {} : { type: input.type }),
         ...(input.protocol === undefined ? {} : { protocol: input.protocol }),
         ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
         ...(input.credentialMode === undefined ? {} : { credentialMode: input.credentialMode }),
@@ -403,20 +444,22 @@ export async function updateModelProvider(
       // 只记"改了什么类别"，**不记 Key 本身**（`02` §十 密钥零留痕）
       keyAction: input.apiKey === undefined ? 'untouched' : input.apiKey === null ? 'cleared' : 'replaced',
       enabled: input.enabled,
-      type: input.type,
       protocol: input.protocol,
       credentialMode: input.credentialMode,
     },
     '已更新模型 Provider',
   )
-  return toItem(updated, viewer, await viewerHasProviderKey(id, viewer.id))
+  return toItem(updated, viewer, await viewerHasProviderKey(id, viewer.id), hasEmbeddingModel)
 }
 
 /**
- * 删 Provider 前列出"其下**被在线智能体绑定**的模型"（`GET /api/model-providers/:id/bound-models`）。
+ * 删 Provider 前列出"其下**被在线智能体绑定或被知识库用作向量模型**的模型"
+ * （`GET /api/model-providers/:id/bound-models`）。
  *
- * 供删除弹窗如实展示"删了会解绑哪些模型、影响多少智能体"（需求 3）。
+ * 供删除弹窗如实展示"删了会解绑哪些模型、影响多少智能体 / 多少知识库"（需求 3）。
  * 只算 `deletedAt: null` 的在线智能体（软删的本就已解绑，不该再计入吓唬管理员）。
+ * ⚠️ 知识库侧（`knowledge_bases.embedding_model_id`）2026-10-22 补：级联删掉的向量模型会
+ * 让那些库的引用被 `ON DELETE SET NULL` 静默清空，故一并计数（否则管理员完全看不到）。
  *
  * @throws {AppError} `NOT_FOUND`(404) Provider 不存在
  */
@@ -438,24 +481,64 @@ export async function getProviderBoundModels(
       id: true,
       label: true,
       modelName: true,
-      _count: { select: { agents: { where: { deletedAt: null } } } },
+      _count: {
+        select: {
+          agents: { where: { deletedAt: null } },
+          // 有多少知识库把它当向量 / 图片描述模型用（级联删除时会静默清空这些引用）
+          knowledgeBases: true,
+          captionKnowledgeBases: true,
+          // 平台会话标题模型是否选中了它（单例配置，至多 1 条）
+          titleModelConfigs: true,
+        },
+      },
     },
     orderBy: [{ label: 'asc' }],
   })
 
   const bound = models
-    .filter((m) => m._count.agents > 0)
-    .map((m) => ({ modelId: m.id, label: m.label, modelName: m.modelName, agentCount: m._count.agents }))
+    .filter(
+      (m) =>
+        m._count.agents > 0 ||
+        m._count.knowledgeBases > 0 ||
+        m._count.captionKnowledgeBases > 0 ||
+        m._count.titleModelConfigs > 0,
+    )
+    .map((m) => ({
+      modelId: m.id,
+      label: m.label,
+      modelName: m.modelName,
+      agentCount: m._count.agents,
+      knowledgeBaseCount: m._count.knowledgeBases,
+      captionKnowledgeBaseCount: m._count.captionKnowledgeBases,
+      usedAsTitleModel: m._count.titleModelConfigs > 0,
+    }))
   // 每个在线智能体只绑一个模型 ⇒ 各模型的计数之和即受影响智能体总数（无重复计数）
   const agentTotal = bound.reduce((sum, m) => sum + m.agentCount, 0)
+  // 每个知识库至多各绑一个向量模型 + 一个图片描述模型：用"去重后的知识库并集"数更准（一个库可能同时
+  // 用了同一 Provider 下的向量模型与图片描述模型），故这里直接查一次库数而非把两个计数相加。
+  const knowledgeBaseTotal = await db.knowledgeBase.count({
+    where: {
+      OR: [
+        { embeddingModelRef: { providerId: id } },
+        { captionModelRef: { providerId: id } },
+      ],
+    },
+  })
+  const clearsTitleModel = bound.some((m) => m.usedAsTitleModel)
 
-  return { providerId: id, models: bound, agentTotal }
+  return { providerId: id, models: bound, agentTotal, knowledgeBaseTotal, clearsTitleModel }
 }
 
 /**
  * 删 Provider（`02` §4.3；需求 3：自动解绑）。`models.provider_id` 是 `ON DELETE CASCADE`，
  * `agents.model_id` 是 `ON DELETE SET NULL` —— 于是删 Provider 会连带删掉其下**全部模型**，
  * 引用这些模型的**在线**智能体被 DB 自动解绑（`model_id` 置空）、变为"未绑定模型"。
+ *
+ * ⚠️ 2026-10-22 补：若其下有**向量模型**被知识库引用，级联删模型会让那些库的
+ * `knowledge_bases.embedding_model_id` 被 `ON DELETE SET NULL` **静默清空**（库还在、但无法
+ * 入库/检索）。删除前数出来、在返回值里回报（{@link RemoveModelProviderResult.clearedKnowledgeBases}），
+ * 与 `unboundAgents` 同款 —— 不拦，但必须让人看见。**注意：这里刻意不 409**（级联删除是该接口
+ * 的既定语义），拦的是**单删模型**那条路（见 {@link removeModel}）。
  *
  * 不再像旧版那样因"有模型被引用"而 409 拦截：现在删除照常进行，只是把受影响的模型数与
  * 被解绑的在线智能体数如实回报给界面（弹窗已提前用 {@link getProviderBoundModels} 列出清单）。
@@ -481,6 +564,25 @@ export async function removeModelProvider(
   const unboundAgents = await db.agent.count({
     where: { deletedAt: null, model: { providerId: id } },
   })
+  /**
+   * 删除前数一遍"向量 / 图片描述模型会被清空的知识库"（2026-10-22 补）。
+   *
+   * ⚠️ 这条**必须显式数**：级联删掉其下模型后，那些用其中某个模型当向量 / 图片描述的知识库的
+   * 对应列会被 `ON DELETE SET NULL` 静默清空（库还在、但无法入库/检索、图片描述入库 409），
+   * 删除后**再查就查不到了** —— 与 `unboundAgents` 同一个理由。一个库可能同时用了向量与图片描述
+   * 两个模型 ⇒ 用 `OR` 去重计数（而不是把两路相加）。
+   */
+  const clearedKnowledgeBases = await db.knowledgeBase.count({
+    where: {
+      OR: [
+        { embeddingModelRef: { providerId: id } },
+        { captionModelRef: { providerId: id } },
+      ],
+    },
+  })
+  /** 平台会话标题模型是否会被这次删除清空（单例配置的 `modelId` 落在这个 Provider 的模型下） */
+  const clearedTitleModel =
+    (await db.titleModelConfig.count({ where: { model: { providerId: id } } })) > 0
   const deletedModels = target._count.models
 
   try {
@@ -492,10 +594,17 @@ export async function removeModelProvider(
   }
 
   getLogger().info(
-    { providerId: id, name: target.name, deletedModels, unboundAgents },
+    { providerId: id, name: target.name, deletedModels, unboundAgents, clearedKnowledgeBases, clearedTitleModel },
     '已删除模型 Provider（其下模型级联删除，引用它们的在线智能体已自动解绑）',
   )
-  return { id: target.id, name: target.name, deletedModels, unboundAgents }
+  return {
+    id: target.id,
+    name: target.name,
+    deletedModels,
+    unboundAgents,
+    clearedKnowledgeBases,
+    clearedTitleModel,
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -712,7 +821,7 @@ export async function transferModelProvider(
     select: PROVIDER_SELECT,
   })
   getLogger().info({ providerId: id, from: target.createdBy, to: toUserId }, '已转移 Provider 所属人')
-  return toItem(updated, viewer, await viewerHasProviderKey(id, viewer.id))
+  return toItem(updated, viewer, await viewerHasProviderKey(id, viewer.id), await hasEmbeddingModelOf(id))
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -757,6 +866,10 @@ const MODEL_MANAGE_SELECT = {
       agents: { where: { deletedAt: null } },
       // 有多少知识库把它当 embedding 用（编辑被引用的向量模型时要提示这些库需重建）
       knowledgeBases: true,
+      // 2026-10-22 同族补漏：有多少知识库把它当**图片描述（VLM）**用（`caption_model_id`）
+      captionKnowledgeBases: true,
+      // 2026-10-22 同族补漏：平台**会话标题**模型是否选中了它（`title_model_config.model_id`，单行）
+      titleModelConfigs: true,
     },
   },
 } as const
@@ -777,7 +890,7 @@ interface ModelRow {
   createdAt: Date
   updatedAt: Date
   provider: { name: string; baseUrl: string; enabled: boolean; createdBy: string; creator: { username: string; nickname: string | null } }
-  _count: { agents: number; knowledgeBases: number }
+  _count: { agents: number; knowledgeBases: number; captionKnowledgeBases: number; titleModelConfigs: number }
 }
 
 /** 可选列表的查询字段（`GET /api/models/available`）：只要下拉需要的，管理字段一律不带 */
@@ -826,6 +939,8 @@ function toModelItem(row: ModelRow, viewer: AssetViewer): ModelItem {
     enabled: row.enabled,
     agentCount: row._count.agents,
     knowledgeBaseCount: row._count.knowledgeBases,
+    captionKnowledgeBaseCount: row._count.captionKnowledgeBases,
+    usedAsTitleModel: row._count.titleModelConfigs > 0,
     providerOwnerId: row.provider.createdBy,
     providerOwnerName: row.provider.creator.nickname ?? row.provider.creator.username,
     // P1-13：模型随 Provider 编删 ⇒ 编删权随 Provider（所属人或 ADMIN）
@@ -985,12 +1100,14 @@ async function tryProbeDimForProvider(
 }
 
 /**
- * 建模型（`POST /api/models`，仅 ADMIN）。
+ * 建模型（`POST /api/models`，登录 + 行级：该 Provider 所属人 / ADMIN）。
  *
  * 四条守卫按"先查再说人话"排：
  *   ① Provider 必须存在 —— 不存在时若直接 create，会撞 `models_provider_id_fkey` 抛 `P2003`（500）；
- *   ② **`type` 必须等于 Provider 的 `type`**（方案A：类型跟随 Provider）—— 模型是对话还是向量，
- *      由它所属的 Provider 决定，不允许"Provider 是向量、模型却是对话"这种不一致配置；
+ *   ② **向量模型只能建在兼容协议的 Provider 上**（2026-10-22 起，取代原先的"类型跟随 Provider"）：
+ *      `type=EMBEDDING` 时该 Provider 的 `protocol` 必须是 OpenAI 兼容（embedding 只有
+ *      `/embeddings` 一条路）。Provider 上**已无** `type` 列 ⇒ 类型是模型自己的用途，
+ *      同一个 Provider（同一个 baseUrl + 同一把 Key）下可以同时挂对话与向量模型；
  *   ③ **向量模型探测维度**：`type=EMBEDDING` 时向上游探测输出维度并落库（对话模型恒 null）；
  *   ④ `(providerId, modelName, type)` 唯一（`schema.prisma` 的 `@@unique`）——
  *      先查一遍给出可读文案，再 `catch P2002` 兜住并发窗口（`user.service.ts` 同款双保险）。
@@ -1000,7 +1117,7 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
 
   const provider = await db.modelProvider.findUnique({
     where: { id: input.providerId },
-    select: { id: true, type: true, createdBy: true },
+    select: { id: true, protocol: true, createdBy: true },
   })
   if (provider === null) throw AppError.notFound('Provider 不存在')
   // P1-13：模型随 Provider 编删 —— 只有 Provider 的所属人 / ADMIN 能在其下建模型
@@ -1008,12 +1125,11 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
     throw AppError.forbidden('只有该 Provider 的所属人或管理员可以在其下创建模型')
   }
 
-  // ② 类型跟随 Provider（方案A）：拦在建之前，给出可读的字段级 400，而不是让不一致的数据落库
-  if (input.type !== provider.type) {
-    throw AppError.validation(
-      `模型类型必须与所属 Provider 一致：该 Provider 是「${provider.type}」，不能创建「${input.type}」类型的模型`,
-      { fields: [{ path: 'body.type', message: `必须与 Provider 的类型（${provider.type}）一致` }] },
-    )
+  // ② 向量模型 × 上游协议：拦在建之前，给出可读的字段级 400（判据与"改 Provider 协议"共用一份）
+  if (input.type === 'EMBEDDING' && !embeddingModelAllowedOnProtocol(provider.protocol)) {
+    throw AppError.validation(EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE, {
+      fields: [{ path: 'body.type', message: EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE }],
+    })
   }
 
   const duplicated = await db.model.findFirst({
@@ -1086,10 +1202,14 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
  *
  * ③ **唯一冲突** → 409（先查 + `catch P2002`，与建模型同一套双保险）。
  *
+ * ④ **改成向量模型时所属 Provider 的协议必须兼容**（2026-10-22 起）→ 400（字段级指向 `body.type`）。
+ *    与建模型共用 `embeddingModelAllowedOnProtocol`；`type` **不再**要求等于 Provider 的 `type`。
+ *
  * `maxContext` 走三态（缺省不动 / `null` 清空 / 数字设置），与 Provider 的 `apiKey` 同款口径 ——
  * 合并成一个 `.default(null)` 的话，"改个别名"会把上下文长度顺手抹掉。
  *
  * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `CONFLICT`(409) 三条守卫
+ *                    / `VALIDATION`(400) 改成向量而 Provider 协议非兼容
  */
 export async function updateModel(id: string, input: UpdateModelBody, viewer: AssetViewer): Promise<ModelItem> {
   const db = getPrisma()
@@ -1102,7 +1222,7 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
       type: true,
       embeddingDim: true,
       embeddingMultimodal: true,
-      provider: { select: { createdBy: true } },
+      provider: { select: { createdBy: true, protocol: true } },
       _count: { select: { agents: true } },
     },
   })
@@ -1124,6 +1244,19 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
       `该模型已被 ${target._count.agents} 个 Agent 使用，不能改类型（对话模型与向量模型不可互换）。` +
         '请先删除或改绑这些 Agent',
     )
+  }
+
+  /**
+   * 2026-10-22：改成（或本来就是）向量模型时，所属 Provider 的协议必须兼容 —— 与建模型同一判据。
+   * ⚠️ 只判 `nextType === 'EMBEDDING'`：这是"这条模型能不能是向量"的判据，与 `input.type` 是否
+   * 带了无关（PATCH 只改别名、库里本来就是向量 ⇒ 也该拦在一个不兼容的 Provider 上吗？
+   * 会的场景只有"Provider 协议先被改成非兼容"——而那条路已被 `updateModelProvider` 拦住，
+   * 所以这里只可能命中"这次要把这条改成向量"）。
+   */
+  if (nextType === 'EMBEDDING' && !embeddingModelAllowedOnProtocol(target.provider.protocol)) {
+    throw AppError.validation(EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE, {
+      fields: [{ path: 'body.type', message: EMBEDDING_MODEL_PROTOCOL_CONFLICT_MESSAGE }],
+    })
   }
 
   const nextModelName = input.modelName ?? target.modelName
@@ -1202,11 +1335,17 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
  * （不会撞外键）。但对**在线**智能体来说，"悄悄把模型删了、它下次发消息才发现没模型"体验很差，
  * 所以仍在删之前数一遍**在线**引用并给 409 + 数字（软删的智能体不算 —— 它们本就已解绑/将被 SetNull）。
  *
- * ⚠️ 引用口径含**两处**：作为智能体的**默认模型**（`agents.model_id`），或作为其**模型池成员**
- * （`agent_models`）。后者删除时是 `ON DELETE CASCADE`（会静默把它移出池），所以更要在删之前
- * 拦一道 —— 否则"删个模型，好几个智能体的可选列表悄悄少了一项"而没人知道。
+ * ⚠️ 引用口径有**五处**，缺一即漏检（前三条 2026-10-22 补，后两条 2026-10-22 同族补漏）：
+ * ① 作为智能体的**默认模型**（`agents.model_id`）；② 作为其**模型池成员**（`agent_models`，
+ * `ON DELETE CASCADE` ⇒ 删了会静默移出池）；③ 作为**知识库的向量模型**
+ * （`knowledge_bases.embedding_model_id`，`ON DELETE SET NULL` ⇒ 删了会静默清空该库的绑定，
+ * **该库此后无法入库/检索**，而库本身看起来还在）；④ 作为**知识库的图片描述模型**
+ * （`knowledge_bases.caption_model_id`，同款 `SetNull` ⇒ 静默清空后"图片描述"入库 409）；
+ * ⑤ 作为**平台会话标题模型**（`title_model_config.model_id`，单例，同款 `SetNull` ⇒ 静默清空后
+ * 标题退回确定性截断）。五条都在删之前拦一道并给可读的 409 —— 否则"删个模型，好几个智能体 /
+ * 知识库 / 平台配置悄悄出问题"没人知道。
  *
- * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `CONFLICT`(409) 正被在线 Agent 使用
+ * @throws {AppError} `NOT_FOUND`(404) 模型不存在 / `CONFLICT`(409) 正被在线 Agent、知识库或平台配置使用
  */
 export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id: string; modelName: string }> {
   const db = getPrisma()
@@ -1227,6 +1366,40 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
   if (referencedAgents > 0) {
     throw AppError.conflict(
       `该模型正被 ${referencedAgents} 个智能体使用（默认模型或模型池），无法删除。请先删除或改绑这些智能体`,
+    )
+  }
+
+  /**
+   * ③ 知识库把它当向量模型用（`knowledge_bases.embedding_model_id`）。
+   * ⚠️ 这条**最隐蔽**：FK 是 `ON DELETE SET NULL` ⇒ 不拦的话删除照样成功，只是**静默**把那些库的
+   * `embedding_model_id` 清成 `NULL` —— 库还在、但再也入库/检索不了。所以必须显式拦。
+   */
+  const referencedKnowledgeBases = await db.knowledgeBase.count({ where: { embeddingModelId: id } })
+  if (referencedKnowledgeBases > 0) {
+    throw AppError.conflict(
+      `该模型正被 ${referencedKnowledgeBases} 个知识库用作向量模型，无法删除。请先到这些知识库改用别的向量模型（换模型后旧向量需重建）`,
+    )
+  }
+
+  /**
+   * ④ 知识库把它当**图片描述（VLM）**模型用（`knowledge_bases.caption_model_id`，2026-10-22 补）。
+   * 同款 `ON DELETE SET NULL` ⇒ 不拦会静默清空这些库的图片描述模型（此后"图片描述"入库 409）。
+   */
+  const captionKnowledgeBases = await db.knowledgeBase.count({ where: { captionModelId: id } })
+  if (captionKnowledgeBases > 0) {
+    throw AppError.conflict(
+      `该模型正被 ${captionKnowledgeBases} 个知识库用作图片描述模型，无法删除。请先到这些知识库改用别的图片描述模型`,
+    )
+  }
+
+  /**
+   * ⑤ 平台把它选为**会话标题生成模型**（`title_model_config.model_id`，单例；2026-10-22 补）。
+   * 同款 `ON DELETE SET NULL` ⇒ 不拦会静默清空平台标题模型（会话标题退回确定性截断）。
+   */
+  const titleModelConfigs = await db.titleModelConfig.count({ where: { modelId: id } })
+  if (titleModelConfigs > 0) {
+    throw AppError.conflict(
+      '该模型正被平台用作会话标题生成模型，无法删除。请先到「系统设置 · 会话标题模型」改用别的模型',
     )
   }
 
