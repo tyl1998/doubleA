@@ -246,6 +246,8 @@ const { remarkInlineBlocks, remarkToolCards } = await import(
   '../src/features/chat/AssistantMarkdown.tsx'
 )
 const { disconnectOf, roundOf, streamingIdsOf, useChatStreamStore } = await import('../src/stores/chatStream.ts')
+const { watchPlaceholderText } = await import('../src/features/chat/useConversationWatch.ts')
+const { parseActiveSnapshot } = await import('@doubulea/shared')
 const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
 const { flattenMessagePages, streamChat } = await import('../src/api/conversations.ts')
@@ -308,6 +310,8 @@ const SAMPLE_PAYLOAD_BY_EVENT = {
     inputSummary: 'rm -rf build',
     expiresAt: '2026-09-23T00:02:00.000Z',
   },
+  // 2026-10-22：`confirm_resolved` 的终局帧（第三方代点 / 超时 / 中断都要撤卡）
+  confirm_resolved: { confirmId: 'confirm-1', decision: 'CONFIRMED' },
   citations: { items: [{ docName: '手册.pdf', snippet: '片段原文', score: 0.87 }] },
   artifact: { artifactId: 'art-1', fileName: '报告.md', size: 2048, mime: 'text/markdown' },
   queued: { position: 2 },
@@ -797,6 +801,20 @@ await it('D7 `confirm` / `queued` 落到各自字段（P0 阶段无产生路径�
   assertDeepEqual(round.confirm, SAMPLE_PAYLOAD_BY_EVENT.confirm, '确认卡载荷')
   round = reduceRound(round, eventOf('queued', { position: 3 }))
   assertEqual(round.queuedPosition, 3, '排队位次')
+})
+
+await it('D7b `confirm_resolved` ⇒ 撤卡（第三方代点 / 超时 / 中断都能收卡）', () => {
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('confirm'))
+  assertEqual(round.confirm !== null, true, '先有卡')
+  // 1) 匹配 confirmId ⇒ 撤卡
+  const cleared = reduceRound(round, eventOf('confirm_resolved', { confirmId: 'confirm-1', decision: 'CONFIRMED' }))
+  assertEqual(cleared.confirm, null, '已撤卡')
+  // 2) confirmId 不匹配（迟到 / 错配的终局帧）⇒ 不能撤掉当前这张卡
+  assertSameRef(reduceRound(round, eventOf('confirm_resolved', { confirmId: 'other', decision: 'REJECTED' })), round, '错配不动')
+  // 3) 本来没有卡 ⇒ 原样返回（不制造空更新）
+  const bare = beginRound('问', STARTED_AT)
+  assertSameRef(reduceRound(bare, eventOf('confirm_resolved', { confirmId: 'confirm-1', decision: 'TIMEOUT' })), bare, '无卡不动')
 })
 
 await it('D8 `done{COMPLETE}` ⇒ 收口、持久化判据、usage 落上', () => {
@@ -1399,6 +1417,64 @@ await it('G5 `fail` 把客户端侧的失败落到同一个出口（消息流内
   assertEqual(roundOf(store.getState(), 'conv-1').assistant.text, '半', '已经收到的内容保留（不假装没发生过）')
 })
 
+await it('G6 `noteServerRun` 带上发起方；`begin` 恒为 `UI`，收口时两处一起清', () => {
+  const store = useChatStreamStore
+  store.getState().resetAll()
+
+  // 外部 Open API 调用（`/active.startedBy = OPEN_API`）—— 本页没有轮次，只有"服务端在跑"
+  store.getState().noteServerRun('conv-api', true, STARTED_AT, 'OPEN_API')
+  assertEqual(store.getState().serverRun['conv-api'], STARTED_AT, '记下开始时刻')
+  assertEqual(store.getState().runOrigins['conv-api'], 'OPEN_API', '记下发起方')
+
+  // 同一轮再读一次（来源可能后到）：`startedAt` 相同但来源变了 ⇒ 必须更新
+  store.getState().noteServerRun('conv-api', true, STARTED_AT, 'SCHEDULED')
+  assertEqual(store.getState().runOrigins['conv-api'], 'SCHEDULED', '同轮来源可变（旧快照 → 新快照）')
+
+  // 本页自己发起的：`begin` 记成 `UI`（与 `/active` 同口径）
+  store.getState().begin('conv-ui', '你好', STARTED_AT)
+  assertEqual(store.getState().runOrigins['conv-ui'], 'UI', '本页发起 = UI')
+
+  // 收口（`/active.streaming=false`）：两处一起清，不留"来源"孤儿键
+  store.getState().noteServerRun('conv-api', false, null)
+  assert(!('conv-api' in store.getState().serverRun), 'serverRun 已清')
+  assert(!('conv-api' in store.getState().runOrigins), 'runOrigins 已清')
+  assertEqual(store.getState().runOrigins['conv-ui'], 'UI', '别的会话不受影响')
+  store.getState().resetAll()
+  assertDeepEqual(store.getState().runOrigins, {}, '`resetAll` 也清来源')
+})
+
+await it('G7 ★ 观察轮次的占位文案按**发起方**说人话（不得一律说成定时任务）', () => {
+  // 2026-10-22 的 bug：外部 Open API 调用的会话在聊天页里显示成"（定时任务正在运行…）"
+  assertEqual(watchPlaceholderText('SCHEDULED'), '（定时任务正在运行…）', '定时任务')
+  assertEqual(watchPlaceholderText('OPEN_API'), '（外部调用正在运行…）', '外部 Open API 调用')
+  assertEqual(watchPlaceholderText('UI'), '（另一处界面正在生成…）', '另一个窗口/设备')
+  const unknown = watchPlaceholderText(null)
+  assert(!unknown.includes('定时任务'), `来源不明时不许猜成定时任务：${unknown}`)
+  assertEqual(watchPlaceholderText(undefined), unknown, '缺省与 null 同款（旧后端）')
+})
+
+await it('G8 `/active` 的 `startedBy`：只认取值域，旧快照/值坏降级为 `null`（不回落成 UI）', () => {
+  const base = {
+    queuedPosition: null,
+    currentTool: null,
+    startedAt: STARTED_AT,
+    pendingConfirmId: null,
+  }
+  assertEqual(parseActiveSnapshot(JSON.stringify({ ...base, startedBy: 'OPEN_API' })).startedBy, 'OPEN_API', '外部调用')
+  assertEqual(parseActiveSnapshot(JSON.stringify({ ...base, startedBy: 'SCHEDULED' })).startedBy, 'SCHEDULED', '定时任务')
+  assertEqual(
+    parseActiveSnapshot(JSON.stringify(base)).startedBy,
+    null,
+    '旧进程写的快照没有这个键 ⇒ 来源不明（**不能**当成 UI）',
+  )
+  assertEqual(
+    parseActiveSnapshot(JSON.stringify({ ...base, startedBy: 'LEGACY' })).startedBy,
+    null,
+    '取值域外 ⇒ null',
+  )
+  assertEqual(parseActiveSnapshot(JSON.stringify(base)).startedAt, STARTED_AT, '其它字段不受影响')
+})
+
 // ═════════════════════════════ H 组：输入区状态机（P0-1-33） ═════════════════════════
 
 groupStart(
@@ -1591,6 +1667,23 @@ await it('H11 「插话」入口（P1-9 · P4 · R1）：只在沙箱 streaming 
   assertEqual(idle.steer.visible, false, '空闲态不露出')
 })
 
+
+await it('H12 ★ 服务端侧在跑但**不归本页**（外部调用 / 定时任务）：输入区如实显示「正在生成」，且不出停止键', () => {
+  // 2026-10-22：早先这种情况直接落到 `idle`（看起来像可以发），
+  // 用户只能从消息流末尾那行才看得出"它还在跑"；点发送则必得 CONFLICT。
+  const view = composeState({ round: null, sending: false, stopping: false, draft: '下一句', serverRunning: true })
+  assertEqual(view.state, 'streaming', '状态按"在生成"算')
+  assertEqual(view.canType, true, '还能先构思（与 streaming 同款）')
+  assertEqual(view.canSend, false, '发送禁用（服务端那把锁会被拒）')
+  assertEqual(view.primary.action, null, '**没有**停止动作 —— 那一轮不归本页收口')
+  assertEqual(view.primary.disabled, true, '主按钮是只读的忙碌态')
+  assert(!view.placeholder.includes('定时任务'), `不许替这一轮编来源：${view.placeholder}`)
+
+  // 缺省 `serverRunning:false` ⇒ 与引入前逐字一致（历史行为不被改）
+  const idle = composeState({ round: null, sending: false, stopping: false, draft: '你好' })
+  assertEqual(idle.state, 'idle', '缺省仍是 idle')
+  assertEqual(idle.canSend, true, '缺省仍可发')
+})
 
 // ═════════════════════════════ I 组：停止时序（P0-1-33） ═════════════════════════
 

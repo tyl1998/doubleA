@@ -127,6 +127,8 @@ import {
   buildToolResultMessages,
   buildUserChatMessage,
   createToolCallTextFilter,
+  failedToolNamesOf,
+  failedToolNotice,
   knowledgeListTool,
   knowledgeSearchTool,
   readDocumentTool,
@@ -145,6 +147,7 @@ import {
   MCP_GATEWAY_TOOL_SERVER_NAME,
   callMcpToolTool,
   executeListMcpTools,
+  indexCatalogSchemas,
   listMcpToolsTool,
   resolveMcpGatewayCall,
 } from './mcpGatewayTools.js'
@@ -390,6 +393,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 再 `mcp_call_tool` 调用；工具少时（全量下发）不加，行为与旧版逐字一致。
      */
     if (catalog.gatewayActive) builtinTools.push(listMcpToolsTool(), callMcpToolTool())
+
     // 「记住」+「按需检索记忆」内置工具（P1-8/P1-8a）：与知识库无关、**始终下发** —— 记忆是平台级能力
     builtinTools.push(rememberTool(), recallMemoryTool())
     // 通知工具（P1-6，场景 1）：只在该会话属于一个**配了通知渠道**的定时任务运行（含"立即执行"）时下发
@@ -519,6 +523,36 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 作用域是"这一轮用户消息"（放在 `for(;;)` 之外），下一条消息重新开始。
      */
     const blockedToolNames = new Set<string>()
+
+    /**
+     * 本轮（这一条用户消息）里**已经成功执行过**的危险工具名 → 执行过的入参指纹集合。
+     *
+     * 🔧 修复"同一动作重复执行 / 重复弹卡"：模型在同一条回复里连报同一个危险工具
+     * （2026-10-22 实测：`upsert_environment` 一次回复里连着 3 次），或拿到结果后又要一遍。
+     * 不管的话，用户每见一次就得多点一次确认，而 `delete_*` 这类工具**第二次确认就是第二次
+     * 真的执行**。判据是 **工具名 + 规范化入参**：同一工具换了参数是另一件事（照常弹卡），
+     * 只有"同名同参且已经成功过"才走二次确认（措辞写明"重复执行"，由用户裁决）。
+     * 作用域同样是"这一轮用户消息"。
+     */
+    const executedDangerousCalls = new Map<string, Set<string>>()
+    /** 目录 schema 查表（懒建一次，判据见 `mcpGatewayTools.ts#indexCatalogSchemas`） */
+    let gatewaySchemas: Readonly<Record<string, unknown>> | undefined
+    /** 入参的规范化序列化（键排序，使 `{a,b}` 与 `{b,a}` 视为同一份），失败时退回原文 */
+    const fingerprintArguments = (arguments_: string): string => {
+      const parsed = parseToolArguments(arguments_)
+      if (!parsed.ok) return arguments_
+      const stable = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(stable)
+        if (typeof value !== 'object' || value === null) return value
+        const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+        return Object.fromEntries(entries.map(([key, item]) => [key, stable(item)]))
+      }
+      try {
+        return JSON.stringify(stable(parsed.value))
+      } catch {
+        return arguments_
+      }
+    }
 
     /**
      * 会话级自动审批（读一次缓存）——只用于决定"危险工具要不要**提前**落 RUNNING 卡"。
@@ -698,6 +732,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
         messages.push(buildAssistantToolCallsMessage(stripToolCallMarkup(round.text), round.toolCalls))
 
         const outcomes: ToolOutcome[] = []
+        /**
+         * 本轮助手回复内**已经裁决过**的危险调用（工具名 + 入参指纹 → 裁决结论）。
+         *
+         * 🔧 修复"一条回复连弹 N 张卡"（2026-10-22 实测：模型在同一条回复里连报 3 次
+         * `upsert_environment`，用户被要求点了 3 次，其中 1 次点了取消）。
+         * 模型把"想调一个工具"写成多条 `tool_calls` 时，它们**是同一个意图**：
+         *   · 用户已经确认/取消过这个（名 + 参）⇒ 后续相同的调用**不再问**，直接沿用结论；
+         *   · 参数不同（例如补了不同变量）⇒ 是另一件事，仍会单独问。
+         * ⚠️ 它与 `executedDangerousCalls`（跨工具**轮次**、只管"已成功过"）分工不同：
+         *    这张表管"同一条回复内的重复意图"，且包含**取消**的结论（取消就是取消，不该再问）。
+         */
+        const decidedInThisRound = new Map<string, { decision: ConfirmDecision; callId: string }>()
         for (const rawCall of round.toolCalls) {
           /**
            * ── P1-19 工具网关分流（排在最前，先于知识库/通知/记忆/MCP 的既有分流）──
@@ -732,7 +778,16 @@ export const chatBotProducer: ChatProducer = async (input) => {
 
           let call = rawCall
           if (rawCall.name === MCP_CALL_TOOL_TOOL_NAME) {
-            const resolved = resolveMcpGatewayCall(catalog.routes, rawCall.arguments)
+            /**
+             * ⚠️ 第 3 参给的是**目录里的 schema 查表**（懒建一次）：网关模式下模型看不到工具定义，
+             * 这里先做一次"必填 / 顶层类型"体检，把 `variables` 传成字符串这类**明显必错**的调用
+             * 在弹确认卡之前挡掉 —— 代价是一张 ERROR 卡，而不是"上游往返 + 一张危险确认卡"。
+             */
+            const resolved = resolveMcpGatewayCall(
+              catalog.routes,
+              rawCall.arguments,
+              gatewaySchemas ?? (gatewaySchemas = indexCatalogSchemas(catalog.entries)),
+            )
             if (!resolved.ok) {
               const parsed = parseToolArguments(rawCall.arguments)
               const inputSummary = parsed.ok
@@ -931,17 +986,60 @@ export const chatBotProducer: ChatProducer = async (input) => {
            *     使模型的后续同名请求走上面那条"不弹卡"分支。
            */
           let blocked: ConfirmDecision | null = null
+          /**
+           * 本次调用是否**已经成功执行过同一件事**（工具名 + 规范化入参都相同，见
+           * `executedDangerousCalls`）。命中时**仍然弹卡**，但换成"这是重复执行"的措辞 ——
+           * 由用户决定要不要再执行一次（拒绝即不执行，且之后同名同参不再反复打扰）。
+           *
+           * ⚠️ 不设独立变量：重复与否只影响**那张卡怎么问**（`duplicate: true`），
+           * 执行与否仍完全由 `blocked` 决定 —— 少一个状态就少一处"卡上说重复、实际又跑了一遍"。
+           */
           if (route !== undefined && parsed.ok && route.dangerous) {
-            if (blockedToolNames.has(call.name)) {
+            const fingerprint = fingerprintArguments(call.arguments)
+            const alreadyExecuted = executedDangerousCalls.get(call.name)?.has(fingerprint) === true
+            const batchKey = `${call.name}\u0000${fingerprint}`
+            const decided = decidedInThisRound.get(batchKey)
+            if (decided !== undefined) {
+              /**
+               * 同一条回复里已经有**完全相同**的调用被裁决过 ⇒ 不再打扰用户，直接沿用结论。
+               * `callId` 不同（每次调用是独立的），所以执行/回填各走各的，只是不重复问。
+               */
+              blocked = decided.decision
+              logger.info(
+                { conversationId, agentId, toolName: call.name, reusedFrom: decided.callId, decision: decided.decision },
+                '同一条回复里已有相同参数的同名危险调用被裁决过 ⇒ 不再弹确认卡，沿用同一结论',
+              )
+            } else if (blockedToolNames.has(call.name)) {
               blocked = 'REJECTED'
+              decidedInThisRound.set(batchKey, { decision: 'REJECTED', callId: call.id })
               logger.info(
                 { conversationId, agentId, toolName: call.name },
                 '该工具本轮已被用户取消/超时，模型再次请求 ⇒ 不再弹确认卡，直接按取消处理',
               )
+            } else if (alreadyExecuted) {
+              const decision = await input.awaitConfirm({
+                source: 'PLATFORM',
+                toolName: call.name,
+                inputSummary,
+                duplicate: true,
+              })
+              logger.info(
+                { conversationId, agentId, toolName: call.name, decision },
+                '模型要求重复执行本轮已成功的危险工具 ⇒ 已向用户二次确认（措辞为"重复执行"）',
+              )
+              if (decision === 'CONFIRMED') {
+                blocked = 'CONFIRMED'
+              } else {
+                blocked = 'REJECTED'
+                blockedToolNames.add(call.name)
+              }
+              decidedInThisRound.set(batchKey, { decision: blocked, callId: call.id })
             } else {
               blocked = await input.awaitConfirm({ source: 'PLATFORM', toolName: call.name, inputSummary })
               // 取消与超时都意味着"这一轮不该再为它弹卡"（见 `blockedToolNames` 的注释）
               if (blocked === 'REJECTED' || blocked === 'TIMEOUT') blockedToolNames.add(call.name)
+              // 记住这次裁决：同一条回复里**同参同名**的后续调用不再重复问
+              decidedInThisRound.set(batchKey, { decision: blocked, callId: call.id })
             }
           }
           const blockedOutput =
@@ -1065,6 +1163,16 @@ export const chatBotProducer: ChatProducer = async (input) => {
               isError = execution.isError
               status = execution.isError ? 'ERROR' : 'SUCCESS'
               output = truncateToolResult(execution.text)
+              /**
+               * 只有**真成功**才记账（失败要允许模型改完再试，那是正常自愈）：
+               * 记住"这个名字 + 这份参数已执行过"，供上面那次"重复执行"二次确认使用。
+               */
+              if (!execution.isError && route.dangerous) {
+                const fingerprint = fingerprintArguments(call.arguments)
+                const seen = executedDangerousCalls.get(call.name) ?? new Set<string>()
+                seen.add(fingerprint)
+                executedDangerousCalls.set(call.name, seen)
+              }
             } catch (error) {
               // 用户的「停止」**不是**工具失败 —— 它要真的中断这一轮（见文件头 ④②）
               if (error instanceof McpAbortError) throw error
@@ -1137,6 +1245,19 @@ export const chatBotProducer: ChatProducer = async (input) => {
       const notice = toolLoopLimitUserNotice(limitRounds)
       assistantText += notice
       enqueue({ name: 'delta', data: { text: notice } })
+    }
+    /**
+     * 3) **收尾一致性核对**（2026-10-22）：本轮有工具失败/被取消时，正文若仍写着"创建成功"
+     *    就是事实错误（实测三个调用全失败，正文却给了"成功 ✅ + 一个早已被删的环境 ID"）。
+     *    提示词挡不住这类复述（模型见过一次成功就会沿用），所以按**结构化事实**补一句更正。
+     *    ⚠️ 只在正常收尾时加（故障/中断下用户看到的是错误/停止卡，再叠一句会混淆结局）。
+     */
+    if (failure === null && abortReasonOf(signal) === undefined) {
+      const notice = failedToolNotice(failedToolNamesOf(toolRecords))
+      if (notice !== '') {
+        assistantText += notice
+        enqueue({ name: 'delta', data: { text: notice } })
+      }
     }
 
     // ── ⑤′ 引用卡：只在回答**真的引用了某篇文档**时才发（产品反馈 2026-09-30）──
@@ -1220,6 +1341,10 @@ export const chatBotProducer: ChatProducer = async (input) => {
         durationMs: Date.now() - requestedAtMs,
         rounds: upstreamRounds,
         createdAt: new Date(),
+        // P1-22 · X1：开放平台发起的那一轮标 `OPEN_API` + Key id；内部本轮不传 ⇒ 库默认 INTERNAL/NULL
+        ...(input.openKeyId === undefined
+          ? {}
+          : { channel: 'OPEN_API' as const, openKeyId: input.openKeyId }),
       },
       logger,
     })

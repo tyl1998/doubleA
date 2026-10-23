@@ -411,6 +411,8 @@ export async function resolveMcpToolCatalog(
         serverName: row.name,
         toolName: route.toolName,
         description: tool.function.description,
+        // ⚠️ 目录里要给出必填参数：网关模式下真实定义不下发，这是模型唯一的参数说明书
+        inputSchema: tool.function.parameters,
         dangerous: route.dangerous,
       })
       taken.add(name)

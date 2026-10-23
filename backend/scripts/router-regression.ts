@@ -96,6 +96,24 @@ it('★ A4 非粘性清单（落任意实例都正确）：stop/confirm/steer/au
     eq(classifyRoute('POST', `/api/conversations/${CID}/${endpoint}`), { kind: 'round-robin' }, endpoint)
   }
 })
+it('★ A4b 开放平台（P1-22）同一套粘性清单：/open/v1/conversations/:id/{chat,regenerate,stream}', () => {
+  eq(sticky(`/open/v1/conversations/${CID}/chat`), { kind: 'sticky', conversationId: CID }, 'open /chat')
+  eq(
+    classifyRoute('POST', `/open/v1/conversations/${CID}/regenerate`),
+    { kind: 'sticky', conversationId: CID },
+    'open /regenerate',
+  )
+  eq(
+    classifyRoute('GET', `/open/v1/conversations/${CID}/stream`),
+    { kind: 'sticky', conversationId: CID },
+    'open /stream',
+  )
+  // 写 Redis 信号 / 只读库的端点照旧轮询（与内部同一判据）
+  for (const endpoint of ['stop', 'confirm', 'steer', 'auto-approve', 'active', 'messages']) {
+    eq(classifyRoute('POST', `/open/v1/conversations/${CID}/${endpoint}`), { kind: 'round-robin' }, `open ${endpoint}`)
+  }
+  eq(classifyRoute('POST', '/open/v1/conversations'), { kind: 'round-robin' }, 'open 建会话')
+})
 it('A5 非会话路由轮询（登录/列表/健康）', () => {
   eq(classifyRoute('POST', '/api/auth/login'), { kind: 'round-robin' }, '登录')
   eq(classifyRoute('GET', '/api/agents/x/conversations'), { kind: 'round-robin' }, '会话列表')
@@ -112,6 +130,7 @@ it('★ A8 可重放 body（shared#isReplayableBodyRoute）：只有 POST /chat'
   eq(isReplayableBodyRoute('POST', `/api/conversations/${CID}/regenerate`), false, '/regenerate 不带 body，重放＝重跑一轮')
   eq(isReplayableBodyRoute('PUT', `/api/conversations/${CID}/workspace/file`), false, '工作区写不缓冲（可能几 MB + 丢改风险）')
   eq(isReplayableBodyRoute('POST', '/api/files'), false, '上传绝不缓冲')
+  eq(isReplayableBodyRoute('POST', `/open/v1/conversations/${CID}/chat`), true, '开放层 /chat 同样可重放（同一链路）')
 })
 it('★ A7 长任务路由（shared#isLongRunningRoute）：只有清单内的 POST 才放宽超时', () => {
   eq(isLongRunningRoute('POST', '/api/admin/node/bootstrap'), true, '一键初始化')

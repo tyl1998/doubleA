@@ -48,8 +48,9 @@ export const MCP_PATH = '/mcp'
  *
  * ⚠️ 它是**个人凭据页**，与 MCP 解耦 —— 「代表你调用工具」是个人设置，
  * 归入 `/settings` 一族（与 `/settings/password` 同族），后续可扩展别的凭据类型。
- * 页面**内容**分三个分区（MCP 工具凭据 / 模型 Provider 凭据 / Git 凭据），
- * 后端端点也仍是 `/api/mcp/credentials`、`/api/model-providers/my-*`、`/api/git-credentials`。
+ * 页面**内容**分四个分区（MCP 工具凭据 / 模型 Provider 凭据 / Git 凭据 / **开放调用 Key**），
+ * 后端端点也仍是 `/api/mcp/credentials`、`/api/model-providers/my-*`、`/api/git-credentials`、
+ * `/api/open-keys`。
  */
 export const CREDENTIALS_PATH = '/settings/credentials'
 
@@ -59,8 +60,9 @@ export const CREDENTIALS_PATH = '/settings/credentials'
  *   · `mcp`      —— MCP 工具凭据（按 server 分组的长表单；默认分区）
  *   · `provider` —— 模型 Provider 凭据（各自 Key 可配 / 共享 Key 只读）
  *   · `git`      —— Git 凭据与 Git 身份（Code 模式容器内 `git clone` 用）
+ *   · `openapi`  —— 开放调用 API Key（P1-22；**按人**管理，"我 × 哪个智能体"的调用凭据）
  */
-export const CREDENTIALS_SECTIONS = ['mcp', 'provider', 'git'] as const
+export const CREDENTIALS_SECTIONS = ['mcp', 'provider', 'git', 'openapi'] as const
 export type CredentialsSection = (typeof CREDENTIALS_SECTIONS)[number]
 
 /** 分区锚点 id（分区 `<section>` 与跳转共用；**唯一构造点**） */

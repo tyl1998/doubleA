@@ -60,7 +60,9 @@ async function refresh(
       if (signal.aborted || !isMounted()) return
       const streaming = active.streaming
       if (streaming) busy = true
-      useChatStreamStore.getState().noteServerRun(id, streaming, active.startedAt ?? null)
+      // `startedBy`（2026-10-22）随同一份 `/active` 结论回来：界面据此说清"这一轮是谁发起的"
+      // （外部 Open API 调用 / 定时任务 / 界面），别再让观察到的轮次一律写成"定时任务正在运行"
+      useChatStreamStore.getState().noteServerRun(id, streaming, active.startedAt ?? null, active.startedBy)
     }
   }
   await Promise.all(Array.from({ length: Math.min(ACTIVE_POLL_CONCURRENCY, conversationIds.length) }, worker))

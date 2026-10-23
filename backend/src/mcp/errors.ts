@@ -269,6 +269,26 @@ export interface McpFailureContext {
 }
 
 /**
+ * 从上游 JSON-RPC 错误的 `error.data` 里取出给人/模型看的提示（`hint`）。
+ *
+ * ⚠️ 只认 `hint` 一个键（MCP 协议本身没有约定 `data` 的形状，别的键是各家自己的实现细节；
+ * 原样拼进错误消息等于让上游的任意字符串直接进模型上下文）。取不到 ⇒ 空串。
+ * 长度设上限：这一段会进工具卡的 `output`，也会回填进模型上下文，不设限等于让上游决定我们的
+ * 上下文预算。
+ */
+const MCP_UPSTREAM_HINT_MAX = 512
+
+function readUpstreamHint(data: unknown): string {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return ''
+  const hint = (data as { hint?: unknown }).hint
+  if (typeof hint !== 'string') return ''
+  const trimmed = hint.trim()
+  if (trimmed === '') return ''
+  const points = [...trimmed]
+  return points.length <= MCP_UPSTREAM_HINT_MAX ? trimmed : `${points.slice(0, MCP_UPSTREAM_HINT_MAX).join('')}…`
+}
+
+/**
  * 统一的 MCP 失败出口。
  *
  * @throws {AppError} `UPSTREAM_TIMEOUT`(504) 超时；`UPSTREAM_ERROR`(502) 其余全部
@@ -319,15 +339,21 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
   // ⑤ v2 JSON-RPC 协议层错误（`ProtocolError`：`code` 是数字，服务端**答了**但答的是错误帧）
   if (isProtocolError(error)) {
     const hint = MCP_ERROR_HINTS[String(error.code)] ?? ''
+    // 上游自己给的 `error.data.hint` —— **必须带给模型**
+    // ⚠️ 有的服务端刻意把多种拒绝理由压成同一个错误码（例如把"缺参数 / scope 不够"都回成
+    //    `-32601 Method not found`，只靠 `data.hint` 说明下一步）。丢掉它 ⇒ 模型看到裸的
+    //    "Method not found" 读不出该怎么改，只会反复重试同一个坏调用（2026-10-22 实测 4 连败）。
+    const upstreamHint = readUpstreamHint(error.data)
     getLogger().warn(
-      { ...describeMcpEndpoint(endpoint), stage, rpcCode: error.code },
+      { ...describeMcpEndpoint(endpoint), stage, rpcCode: error.code, hasUpstreamHint: upstreamHint !== '' },
       'MCP 服务端返回 JSON-RPC 错误',
     )
     // -32022 = 协议版本不被支持（现代协议 negotiation 阶段的错误帧）
     throw AppError.upstreamError(
       `MCP 服务端返回错误 ${error.code}（${stage}）：${endpoint.serverName}` +
-        `${hint === '' ? '' : `。${hint}`}。原始消息：${detail}`,
-      { mcpRpcCode: error.code },
+        `${hint === '' ? '' : `。${hint}`}` +
+        `${upstreamHint === '' ? '' : `。服务端提示：${upstreamHint}`}。原始消息：${detail}`,
+      { mcpRpcCode: error.code, ...(upstreamHint === '' ? {} : { mcpUpstreamHint: upstreamHint }) },
     )
   }
 

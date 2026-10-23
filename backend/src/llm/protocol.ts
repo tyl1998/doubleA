@@ -611,10 +611,36 @@ function toOpenAiToolCalls(toolCalls: readonly ChatToolCall[]): Record<string, u
  *     （带 `tool_calls` 时空串会让一部分网关 400；`null` 是规范允许的形态）。
  * ⚠️ 原样透出还有第二个坏处：`toolCallId` / `isError` 这些**我们自己的字段名**会漏到线上。
  */
+/**
+ * 工具结果**失败**的机器可读标记（`OPENAI_COMPAT` / `Responses` 专用；Anthropic 有 `is_error`）。
+ *
+ * ⚠️ 为什么需要它（2026-10-22 实测）：三协议里只有 Anthropic 的 `tool_result` 有 `is_error`
+ * 字段，另两家**没有任何结构化失败位** —— 失败信息只剩我们写进正文的那句自然语言。
+ * 于是模型会把"用户取消 / 参数不符"当成"工具跑了但没说话"，再顺着上文写出
+ * **「创建成功 ✅」**（同一轮里工具一次都没执行）。加一个稳定的前后缀记号，让"这是失败结果"
+ * 在报文里**不依赖措辞**，同时不改变正文本身的语义（仍可读给人）。
+ *
+ * 形态选前缀而不是给 `role:'tool'` 加 `is_error` 字段：后者在 OpenAI 兼容网关上**未经证实**
+ * 会被接受（未知字段有的网关直接 400），而正文是我们完全可控的。
+ */
+export const TOOL_RESULT_ERROR_PREFIX = '[工具执行失败] '
+
 /** 内容为空判定（字符串空串 / 空块数组都算空）—— 三协议共用 */
 function isEmptyContent(content: ChatMessageContent): boolean {
   if (typeof content === 'string') return content === ''
   return content.length === 0
+}
+
+/**
+ * 工具结果正文 → 线上文本：失败时加 {@link TOOL_RESULT_ERROR_PREFIX}。
+ *
+ * 幂等（已经带前缀就不再加），且**只作用于工具结果**（正文消息不受影响）。
+ */
+function toolResultText(message: Extract<ChatMessage, { role: 'tool' }>): string {
+  // 工具结果的 `content` 恒为字符串（见 `ChatMessage` 的 `role:'tool'` 分支）⇒ 不需要块数组分支
+  const text = message.content
+  if (message.isError !== true) return text
+  return text.startsWith(TOOL_RESULT_ERROR_PREFIX) ? text : `${TOOL_RESULT_ERROR_PREFIX}${text}`
 }
 
 /** 图片 data URL（OpenAI / Responses 的 `image_url` 都收这种形态） */
@@ -656,7 +682,8 @@ function toOpenAiMessages(messages: readonly ChatMessage[]): Record<string, unkn
   const out: Record<string, unknown>[] = []
   for (const message of messages) {
     if (message.role === 'tool') {
-      out.push({ role: 'tool', tool_call_id: message.toolCallId, content: message.content })
+      // ⚠️ OpenAI 兼容协议**没有** `is_error`（见 `toolResultText`）⇒ 失败标记进正文
+      out.push({ role: 'tool', tool_call_id: message.toolCallId, content: toolResultText(message) })
       continue
     }
     const row: Record<string, unknown> = { role: message.role, content: toOpenAiContent(message.content) }
@@ -825,7 +852,8 @@ function toResponsesInput(messages: readonly ChatMessage[]): Record<string, unkn
   for (const message of messages) {
     if (message.role === 'system') continue // 顶层 `instructions`（见 buildBody）
     if (message.role === 'tool') {
-      out.push({ type: 'function_call_output', call_id: message.toolCallId, output: message.content })
+      // Responses 同样没有 `is_error` ⇒ 失败标记进 `output` 正文
+      out.push({ type: 'function_call_output', call_id: message.toolCallId, output: toolResultText(message) })
       continue
     }
     // 带 `tool_calls` 而正文为空是常态（模型直接给调用、不回一句话）⇒ 空正文不占一个 item

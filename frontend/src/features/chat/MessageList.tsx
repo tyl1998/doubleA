@@ -18,6 +18,7 @@
  */
 
 import { memo, useState } from 'react'
+import type { ConversationRunOrigin } from '@doubulea/shared'
 
 import { useFeedback } from '../../app/feedback.js'
 import { fileContentUrl } from '../../api/files.js'
@@ -108,6 +109,8 @@ export interface MessageListProps {
    * 才为真）。理由与"流式进度行贴在本轮末尾"同源 —— 放在页面上方会被长历史顶出视口。
    */
   serverRunning?: boolean
+  /** 这一轮的发起方（2026-10-22；`/active.startedBy`）—— 尾部那句状态据此说清来源 */
+  serverRunOrigin?: ConversationRunOrigin | null
   /** 服务端那条流的开始时刻（ISO；`null` ⇒ 只显示"仍在生成"，不算已用时） */
   serverStartedAt?: string | null
 }
@@ -237,6 +240,7 @@ export function MessageList({
   onRecallSteer,
   serverRunning = false,
   serverStartedAt = null,
+  serverRunOrigin = null,
 }: MessageListProps) {
   // ⚠️ **不在这里包 `.stream` / `.stream__inner`**：滚动容器与居中列由页面的 `StreamFrame`
   // （`ChatPage.tsx`）持有，三态（骨架 / 错误 / 空态）与消息流共用同一个外框。
@@ -268,7 +272,7 @@ export function MessageList({
             agentName={agentName}
             {...(regenerable?.key === view.key && onRegenerate !== undefined ? { onRegenerate } : {})}
             {...(serverRunning && index === messages.length - 1
-              ? { serverRunning: true, serverStartedAt }
+              ? { serverRunning: true, serverStartedAt, serverRunOrigin }
               : {})}
           />
         )

@@ -32,11 +32,30 @@ import {
 import { parseToolArguments } from '../llm/client.js'
 import {
   filterMcpToolEntries,
+  findMcpArgumentIssues,
+  formatArgumentIssues,
   formatMcpToolCatalog,
   type McpCatalogToolEntry,
 } from '../mcp/gatewayModel.js'
 import type { McpToolRoute, OpenAiFunctionTool } from '../mcp/toolSchema.js'
 import { truncateToolResult } from './chatContext.js'
+
+/**
+ * 「工具名 → 参数 schema」的查表（`chatBot.ts` / 沙箱代理用来做本地参数体检）。
+ *
+ * ⚠️ 单独一张表、而不是把 schema 塞进 `McpToolRoute`：`routes` 是**名字 → 调哪里**的映射，
+ * 它的消费方（执行链）不需要也不该看到 schema；而目录条目（`entries`）本来就是"给模型看
+ * 的信息"的载体。这里只是把同一份 `entries` 索引成按名字的查表，避免调用点再线性扫一遍。
+ */
+export function indexCatalogSchemas(
+  entries: readonly McpCatalogToolEntry[],
+): Readonly<Record<string, unknown>> {
+  const schemas: Record<string, unknown> = {}
+  for (const entry of entries) {
+    if (!Object.prototype.hasOwnProperty.call(schemas, entry.name)) schemas[entry.name] = entry.inputSchema
+  }
+  return schemas
+}
 
 /** 网关工具卡片上的"来自哪个系统"（`toolCallRecordSchema.serverName`；与 `KNOWLEDGE_TOOL_SERVER_NAME` 同族） */
 export const MCP_GATEWAY_TOOL_SERVER_NAME = 'MCP 工具'
@@ -71,6 +90,16 @@ export function listMcpToolsTool(): OpenAiFunctionTool {
  * ⚠️ 它只是一个**转发壳**：`name` 必须是 `mcp_list_tools` 给出过的工具名；`arguments` 是那台
  * 工具自己的参数对象。真正的危险确认 / 凭据注入 / 调用都发生在后端拿到真实工具名之后
  * （见 `chatBot.ts` 的分流）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 为什么 `arguments` 是**宽松**的，而类型信息由 `mcp_list_tools` 给
+ * ─────────────────────────────────────────────────────────────────────
+ * 网关的初衷就是"**按需发现**"：模型先搜、我们再把那个工具的**完整信息**返给它。
+ * 所以参数 schema 的落点是 `mcp_list_tools` 的**返回内容**（见 `gatewayModel.ts#formatMcpToolCatalog`
+ * 里内嵌的 inputSchema），不是这里的工具定义。
+ * ⚠️ 曾经试过把"已列出工具"的 schema 收进本工具的 `oneOf`（2026-10-22）：那样每轮都要重建
+ * `tools`（提示缓存失效），而且模型拿到的信息被拆成"搜索结果"和"工具定义"两个来源，反而更难对上。
+ * ⇒ 这里保持宽松；真正的兜底是执行前的本地体检（`findMcpArgumentIssues`）。
  */
 export function callMcpToolTool(): OpenAiFunctionTool {
   return {
@@ -79,14 +108,16 @@ export function callMcpToolTool(): OpenAiFunctionTool {
       name: MCP_CALL_TOOL_TOOL_NAME,
       description:
         '调用一个 MCP 工具。name 用 mcp_list_tools 给出的工具名（形如 mcp_xxx_yyy）；' +
-        'arguments 是该工具的参数对象（没有参数就省略）。',
+        'arguments 是该工具的参数对象（没有参数就省略）。' +
+        '⚠️ 参数必须符合 mcp_list_tools 结果里该工具的 inputSchema：object / array 参数直接给 ' +
+        'JSON 字面量，不要序列化成字符串（否则会被拒绝，且不会真的发出调用）。',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: '要调用的工具名（来自 mcp_list_tools）。' },
           arguments: {
             type: 'object',
-            description: '该工具的参数对象（键值对）；没有参数可省略。',
+            description: '该工具的参数对象（键值对）；没有参数可省略。字段与类型见 mcp_list_tools 的 inputSchema。',
             additionalProperties: true,
           },
         },
@@ -143,12 +174,18 @@ export type McpGatewayCallResolution =
  * 与原生的直接调用**逐字同一条**（危险确认、凭据注入、卡片、错误回填都复用），
  * 于是网关不会引入第二条执行语义。
  *
- * 失败（参数非法 / 名字不在目录里）**不抛**：翻成一句可读的原因回填给模型，让它自己改
- * （同 `01` §3.6 的"失败可自愈"）。
+ * 失败（参数非法 / 名字不在目录里 / **参数类型明显不符**）**不抛**：翻成一句可读的原因回填给模型，
+ * 让它自己改（同 `01` §3.6 的"失败可自愈"）。
+ *
+ * ⚠️ **先做本地类型体检，再放行到上游**（2026-10-22 教训）：网关模式下模型看不到工具 schema，
+ * 很容易把 object 参数序列化成字符串；若直接发给上游，会拿到一句 `data/variables must be object`
+ * —— 既耗一次上游往返，又要在执行链上多弹一张危险确认卡，而模型往往只是"把字符串加个缩进"再试。
+ * 本地体检把这类明显必错的调用**在弹卡之前**拦下（`confirmed` 里的工具名不再要求确认）。
  */
 export function resolveMcpGatewayCall(
   routes: Readonly<Record<string, McpToolRoute>>,
   rawArguments: string,
+  schemas?: Readonly<Record<string, unknown>>,
 ): McpGatewayCallResolution {
   const parsed = parseToolArguments(rawArguments)
   if (!parsed.ok) {
@@ -165,5 +202,10 @@ export function resolveMcpGatewayCall(
       output: `工具调用失败：本轮没有名为「${name}」的工具（可能是模型编的名字，或该工具所属的 MCP server 已被解绑）。请先用 ${MCP_LIST_TOOLS_TOOL_NAME} 确认真实的工具名。`,
     }
   }
-  return { ok: true, name, arguments: JSON.stringify(args.data.arguments ?? {}) }
+  const toolArguments: Record<string, unknown> = args.data.arguments ?? {}
+  if (schemas !== undefined && Object.prototype.hasOwnProperty.call(schemas, name)) {
+    const issues = findMcpArgumentIssues(schemas[name], toolArguments)
+    if (issues.length > 0) return { ok: false, output: formatArgumentIssues(issues) }
+  }
+  return { ok: true, name, arguments: JSON.stringify(toolArguments) }
 }

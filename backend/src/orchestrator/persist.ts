@@ -27,11 +27,17 @@ import type {
   SteerRecord,
   ThinkingSegment,
   ToolCallRecord,
+  UsageChannel,
 } from '@doubulea/shared'
 import { deriveConversationTopic } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import {
+  ensureRedisConnected,
+  OPEN_API_DAILY_TOKEN_TTL_SEC,
+  openApiDailyTokenKey,
+} from '../infra/redis.js'
 import { touchConversation } from '../services/conversation.service.js'
 import { buildAssistantContent } from './chatContext.js'
 import { generateConversationTitle } from './titleGenerate.js'
@@ -74,6 +80,14 @@ export interface UsageRecordInput {
   rounds: number
   /** ⚠️ 由调用方显式传入（本机 PG 会话时区非 UTC 时 `@default(now())` 会偏一个时区，见 `02` 的已知问题） */
   createdAt: Date
+  /**
+   * 调用来源（**P1-22** · X1）：`INTERNAL`（平台界面）/ `OPEN_API`（开放平台）。
+   * 不传 = `INTERNAL`（库列默认值同值）⇒ 内部路径**零改动**，回归断言"内部聊一轮后
+   * `channel='INTERNAL' ∧ open_key_id IS NULL`"因此天然成立。
+   */
+  channel?: UsageChannel
+  /** 仅 `OPEN_API` 行有值（哪把 Key 花掉的）；内部行为 `undefined` ⇒ 库里 NULL */
+  openKeyId?: string | null
 }
 
 /** {@link persistRoundQuietly} 的入参 */
@@ -287,6 +301,9 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
             durationMs: usageRecord.durationMs,
             rounds: usageRecord.rounds,
             createdAt: usageRecord.createdAt,
+            // P1-22 · X1：分内外（报表）与按 Key 归集；内部路径不传 ⇒ 库默认 INTERNAL / NULL
+            ...(usageRecord.channel === undefined ? {} : { channel: usageRecord.channel }),
+            openKeyId: usageRecord.openKeyId ?? null,
           },
         })
       }
@@ -308,6 +325,18 @@ export async function persistRoundQuietly(input: PersistRoundInput): Promise<str
     //     自身也永不抛，这里是第二道保险）。
     if (upgradeFrom !== null) {
       void upgradeGeneratedTitle(conversationId, content, upgradeFrom, logger)
+    }
+    // ── 开放平台当日 token 累计（P1-22 · X6）：与落库同一判据（这一轮真的落库了才记账）──
+    //
+    // 为什么在**落库之后**累加而不是在请求前:这是"已经花掉"的账 —— 请求前累加会在失败/停止的
+    // 轮次里多算，而 `usage_records` 那一行恰恰是"这一轮真的跑过"的唯一证据。
+    // ⚠️ **尽力而为**（`void` + 内部永不抛）：Redis 抖动只该让"日额度"少算一点，
+    //    绝不能把已经落库的回答变成一次失败（用户会看到"答案没了"）。
+    //
+    // `tokensIn/Out` 允许为 NULL（上游没上报）：那种轮次**不计**入当天总量，也不编 0 ——
+    // 与 `usage_records` 的 NULL 口径一致（"不知道"不是"用了 0"）。
+    if (usageRecord?.openKeyId != null) {
+      void accumulateOpenApiDailyTokens(usageRecord.openKeyId, usageRecord.tokensIn, usageRecord.tokensOut, logger)
     }
     return assistantMessageId
   } catch (error) {
@@ -346,4 +375,36 @@ async function upgradeGeneratedTitle(
   } catch (error) {
     logger.warn({ err: error, conversationId }, '会话标题模型升级失败（已保留确定性标题）')
   }
+}
+
+/**
+ * 把本轮 token 累加进「本 Key 当日用量」（P1-22 · X6；键 `open:day:tok:{keyId}:{YYYY-MM-DD}`）。
+ *
+ * **永不抛**（`void` 调用）：调用方是已经落库成功的收尾路径，任何异常都只该是一条 warn。
+ * 日界按 **UTC** 算：与 `usage_records.created_at`（`TIMESTAMPTZ`，跨环境按时刻对齐）的统计口径
+ * 一致；`/open/v1/usage` 回带的 `day` 就是这个 UTC 日期，客户端据此理解"什么时候重置"。
+ */
+async function accumulateOpenApiDailyTokens(
+  keyId: string,
+  tokensIn: number | null,
+  tokensOut: number | null,
+  logger: ReturnType<typeof getLogger>,
+): Promise<void> {
+  const total = (tokensIn ?? 0) + (tokensOut ?? 0)
+  // 两列都没上报 ⇒ 这一轮没有可计的数（不写 0，避免把"不知道"记成"用了 0"）
+  if (tokensIn === null && tokensOut === null) return
+  if (total <= 0) return
+  try {
+    const redis = await ensureRedisConnected()
+    const key = openApiDailyTokenKey(keyId, openApiUtcDay())
+    const next = await redis.incrby(key, total)
+    if (next === total) await redis.expire(key, OPEN_API_DAILY_TOKEN_TTL_SEC)
+  } catch (error) {
+    logger.warn({ err: error, keyId, tokens: total }, '累加开放平台当日 token 失败（仅影响日额度读数）')
+  }
+}
+
+/** 当前 UTC 日期（`YYYY-MM-DD`）—— 开放平台"当日"的唯一口径（见 {@link accumulateOpenApiDailyTokens}） */
+export function openApiUtcDay(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10)
 }

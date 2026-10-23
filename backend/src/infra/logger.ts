@@ -131,6 +131,8 @@ export interface RequestContext {
   requestId: string
   userId?: string
   conversationId?: string
+  /** 开放平台 Key id（P1-22）：`/open/**` 的请求自动带上，便于按 Key 对账（`02` §十三 同一手法） */
+  openKeyId?: string
 }
 
 const requestStorage = new AsyncLocalStorage<RequestContext>()
@@ -180,6 +182,7 @@ export function enrichRequestContext(patch: Partial<Omit<RequestContext, 'reques
   if (context === undefined) return
   if (patch.userId !== undefined) context.userId = patch.userId
   if (patch.conversationId !== undefined) context.conversationId = patch.conversationId
+  if (patch.openKeyId !== undefined) context.openKeyId = patch.openKeyId
 }
 
 /** Fastify `onRequest` 钩子的入参最小形状（不引 Fastify 类型，保持本模块零框架耦合） */

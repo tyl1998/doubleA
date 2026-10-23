@@ -68,6 +68,7 @@ import {
 } from './mcpModel.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { GitCredentialsSection } from '../settings/GitCredentialsSection.js'
+import { OpenApiKeysSection } from '../agents/OpenApiKeysSection.js'
 import { ProviderKeySection } from '../settings/ProviderKeySection.js'
 import { GitIdentitySection } from '../settings/GitIdentitySection.js'
 import {
@@ -156,10 +157,11 @@ export function McpCredentialsPage() {
       <div>
         <h1>我的凭据</h1>
         <p className="page__lead">
-          这里集中管理<strong>你个人</strong>的凭据，按来源分为三个分区：
+          这里集中管理<strong>你个人</strong>的凭据，按来源分为四个分区：
           <strong>MCP 工具凭据</strong>（代表你调用工具）、<strong>模型 Provider 凭据</strong>
           （你是所属人的 Provider + 需要你自配的「各自 Key」Provider）、<strong>Git 凭据 / 身份</strong>
-          （Code 模式下 agent 在容器里 <code>git clone</code> 私有仓库）。凭据不会展示给他人，
+          （Code 模式下 agent 在容器里 <code>git clone</code> 私有仓库）、
+          <strong>开放调用</strong>（给外部系统用的 API Key，代表<strong>你</strong>调用某个智能体）。凭据不会展示给他人，
           也不会出现在会话记录里；列表接口永不返回明文或掩码 —— 保存之后界面上只剩一个「已配置」标记。
         </p>
       </div>
@@ -373,6 +375,15 @@ export function McpCredentialsPage() {
             children: (
               <section id={credentialsSectionAnchorId('provider')}>
                 <ProviderKeySection />
+              </section>
+            ),
+          },
+          {
+            key: 'openapi',
+            label: '开放调用',
+            children: (
+              <section id={credentialsSectionAnchorId('openapi')} className="stack">
+                <OpenApiKeysSection />
               </section>
             ),
           },

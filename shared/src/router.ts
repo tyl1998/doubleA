@@ -89,6 +89,19 @@ const STICKY_CONVERSATION_ENDPOINTS: Record<string, ReadonlySet<string>> = {
 }
 
 const CONVERSATION_ENDPOINT = /^\/api\/conversations\/([^/?#]+)\/([^/?#]+)\/?$/
+
+/**
+ * **开放平台**的会话路由（P1-22）：`/open/v1/conversations/:id/(chat|regenerate|stream)`。
+ *
+ * 为什么必须在这里（而不是"反正本期只有 ChatBot"就省掉）：粘性与否取决于**状态在不在本机**，
+ * 与调用方是谁无关 —— 帧总线（`/stream` 的迟到补帧）与编排进程都是**进程内**的，
+ * 开放层落错实例的症状与内部路径**一模一样**（流能发出去、重连续不上，或者一条流跑到一半
+ * 被另一台当成"没有流"）。
+ *
+ * ⚠️ 前缀是 `/open/v1`（带版本号），与内部的 `/api/conversations` 是两条不同的路径 ——
+ * 用同一个正则去匹配会漏掉这一族，所以单列一个常量（判据仍然只有 `classifyRoute` 一处）。
+ */
+const OPEN_CONVERSATION_ENDPOINT = /^\/open\/v1\/conversations\/([^/?#]+)\/([^/?#]+)\/?$/
 /** `/workspace` 及其全部子路由（树/读/写/建/移/删/changes/revert/file/raw/events），任意方法 */
 const WORKSPACE_ROUTE = /^\/api\/conversations\/([^/?#]+)\/workspace(?:\/(?:[^?#]*))?$/
 
@@ -116,8 +129,9 @@ export function classifyRoute(method: string, pathname: string): RouteDispatch {
     const conversationId = workspace[1]
     return conversationId === undefined ? { kind: 'round-robin' } : { kind: 'sticky', conversationId }
   }
-  const matched = CONVERSATION_ENDPOINT.exec(path)
-  if (matched !== null) {
+  for (const pattern of [CONVERSATION_ENDPOINT, OPEN_CONVERSATION_ENDPOINT]) {
+    const matched = pattern.exec(path)
+    if (matched === null) continue
     const conversationId = matched[1]
     const endpoint = matched[2]
     const stickyMethods = endpoint === undefined ? undefined : STICKY_CONVERSATION_ENDPOINTS[method.toUpperCase()]
@@ -145,8 +159,13 @@ export function classifyRoute(method: string, pathname: string): RouteDispatch {
  */
 export function isReplayableBodyRoute(method: string, pathname: string): boolean {
   if (method.toUpperCase() !== 'POST') return false
-  const matched = CONVERSATION_ENDPOINT.exec(pathnameOnly(pathname))
-  return matched !== null && matched[2] === 'chat' && matched[1] !== undefined
+  const path = pathnameOnly(pathname)
+  // 开放层（P1-22）的 `/chat` 与内部同一条链路、同一个 body 形态 ⇒ 同一套"首跳重试"待遇
+  for (const pattern of [CONVERSATION_ENDPOINT, OPEN_CONVERSATION_ENDPOINT]) {
+    const matched = pattern.exec(path)
+    if (matched !== null) return matched[2] === 'chat' && matched[1] !== undefined
+  }
+  return false
 }
 
 // ═════════════════════════════ 长任务路由 ═════════════════════════════

@@ -61,7 +61,13 @@
 
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentType, ConversationActive, ConversationItem, MessagePageResult } from '@doubulea/shared'
+import type {
+  AgentType,
+  ConversationActive,
+  ConversationItem,
+  ConversationRunOrigin,
+  MessagePageResult,
+} from '@doubulea/shared'
 
 import {
   agentConversationsQueryKey,
@@ -188,6 +194,25 @@ export interface UseChatStreamResult {
    * `null` = 还没有会话 id，无从对齐。
    */
   align: () => Promise<AlignOutcome | null>
+}
+
+/**
+ * "别处正在跑，本页发不出去"的那句话（2026-10-22）。
+ *
+ * 与页面头部标签（`ChatPage#serverRunLabel`）**同一套来源**：用户看到的提示与状态必须对得上，
+ * 否则"头部说定时任务、toast 说外部调用"又是一处新的自相矛盾。
+ */
+function runOriginBusyMessage(origin: ConversationRunOrigin | null): string {
+  switch (origin) {
+    case 'SCHEDULED':
+      return '定时任务正在运行这个会话，等它跑完再发（可在任务中心查看）'
+    case 'OPEN_API':
+      return '外部系统正在通过开放接口运行这个会话，等它跑完再发'
+    case 'UI':
+      return '另一个窗口正在生成这个会话的回答，等它跑完再发'
+    default:
+      return '这个会话正在生成中（不是本页发起），等它跑完再发'
+  }
 }
 
 export function useChatStream(
@@ -401,6 +426,23 @@ export function useChatStream(
       let gateKey = conversationIdRef.current ?? NEW_CONVERSATION_KEY
       if (!gateFor(gateKey).enter()) {
         return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
+      }
+      // ★ 服务端侧**还有一轮在跑，但不是本页发起的**（2026-10-22：外部 Open API 调用 /
+      //   定时任务后台运行 / 另一个窗口）：本页没有它的控制器，服务端那把锁会直接回 `CONFLICT`，
+      //   而那条错误落在**新一轮**的气泡里，看起来像"刚发的这条失败了"。这里先说清事实：
+      //   那一轮归别处，等它跑完再发（或去别处停）。
+      //   ⚠️ 判据与页面头部那枚标签同源（`round === null && serverRun[id]`）：本页有轮次时那条流
+      //   归本页，闸门与 `CONFLICT` 文案都是既有行为，这里不插手。
+      const current = conversationIdRef.current
+      if (current !== undefined) {
+        const streamState = useChatStreamStore.getState()
+        if (roundOf(streamState, current) === null && streamState.serverRun[current] !== undefined) {
+          gateFor(gateKey).leave()
+          return {
+            ok: false,
+            error: new ApiError('BUSY', runOriginBusyMessage(streamState.runOrigins[current] ?? null), 429),
+          }
+        }
       }
       markSending(gateKey)
       try {

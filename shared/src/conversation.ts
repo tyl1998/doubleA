@@ -401,6 +401,19 @@ export type GetConversationInstanceResult = z.infer<typeof getConversationInstan
 // ───────────────────────────── 活跃流状态（`/:id/active`） ─────────────────────────────
 
 /**
+ * 一轮的发起方（见 {@link conversationActiveSnapshotSchema.startedBy}）。
+ *
+ *   · `UI`        —— 平台界面（`POST /api/conversations/:id/{chat,regenerate}`）；
+ *   · `OPEN_API`  —— 开放层（`POST /open/v1/conversations/:id/{chat,regenerate}`，第三方调用者）；
+ *   · `SCHEDULED` —— 定时任务的后台运行（`orchestrator/scheduledRun.ts`，无 HTTP 客户端）。
+ *
+ * `null` = 旧快照 / 值坏（读侧降级，前端按"来源不明"处理）—— **不要**回落到 `UI`：
+ * 那会把"不知道"说成"你在这个窗口里发起的"，正是本条修的那个 bug 的另一种形态。
+ */
+export const CONVERSATION_RUN_ORIGINS = ['UI', 'OPEN_API', 'SCHEDULED'] as const
+export type ConversationRunOrigin = (typeof CONVERSATION_RUN_ORIGINS)[number]
+
+/**
  * 活跃流**快照**（Redis `chat.active:{conversationId}` 的值形态，**不含 `streaming`**，见文件头 ⑤）。
  *
  * 四个字段都是「断线重连要恢复的进度视图」（`02` §5.2、`03` §4.1 的输入区状态机）：
@@ -420,7 +433,20 @@ export const conversationActiveSnapshotSchema = z.object({
   currentTool: z.string().nullable(),
   startedAt: z.string().nullable(),
   pendingConfirmId: z.string().nullable(),
+  /**
+   * 这一轮**是谁发起的**（`chat.active:{id}` 锁值里的一格，2026-10-22 契约增量）。
+   *
+   * 为什么需要它：帧总线（`orchestrator/frameBus.ts`）把**所有**来路的帧广播给所有订阅者 ——
+   * 交互式 `/chat`、开放层 `/open/v1/**`、以及定时任务的后台运行都是同一种帧、不带来源。
+   * 于是一个"不是本页发起"的页面只能猜：`useConversationWatch` 曾把占位文案写死成
+   * "（定时任务正在运行…）"，结果**外部 Open API 调用的会话在聊天页里也显示成定时任务执行中**。
+   * 来源必须由**发起方**记在锁里，读侧（`/active` 与观察流）才能如实说"是谁在跑"。
+   *
+   * ⚠️ 取值只为"说清是谁"服务，不参与任何权限/计费判据（那些各有自己的来源字段）。
+   */
+  startedBy: z.enum(CONVERSATION_RUN_ORIGINS).nullable(),
 })
+
 export type ConversationActiveSnapshot = z.infer<typeof conversationActiveSnapshotSchema>
 
 /**
@@ -455,12 +481,13 @@ export const conversationActiveSchema = conversationActiveSnapshotSchema.extend(
 })
 export type ConversationActive = z.infer<typeof conversationActiveSchema>
 
-/** 无流时的快照（四处字段全是 `null`） */
+/** 无流时的快照（五个字段全是 `null`） */
 export const EMPTY_ACTIVE_SNAPSHOT: ConversationActiveSnapshot = Object.freeze({
   queuedPosition: null,
   currentTool: null,
   startedAt: null,
   pendingConfirmId: null,
+  startedBy: null,
 })
 
 /**
@@ -487,7 +514,7 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
   if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) return empty()
 
   const record = decoded as Record<string, unknown>
-  const { queuedPosition, currentTool, startedAt, pendingConfirmId } = record
+  const { queuedPosition, currentTool, startedAt, pendingConfirmId, startedBy } = record
   return {
     queuedPosition:
       typeof queuedPosition === 'number' && Number.isInteger(queuedPosition) && queuedPosition >= 1
@@ -504,6 +531,13 @@ export function parseActiveSnapshot(raw: string | null | undefined): Conversatio
     pendingConfirmId:
       typeof pendingConfirmId === 'string' && pendingConfirmId.trim() !== ''
         ? pendingConfirmId.trim()
+        : null,
+    // 发起方（2026-10-22）：只认取值域内的字符串；旧快照 / 值坏一律 `null`（= 来源不明）。
+    // ⚠️ **不许**回落成 `'UI'` —— 读侧要靠"不知道"与"本页发起"区分开（见字段注释）。
+    startedBy:
+      typeof startedBy === 'string' &&
+      (CONVERSATION_RUN_ORIGINS as readonly string[]).includes(startedBy)
+        ? (startedBy as ConversationRunOrigin)
         : null,
   }
 }

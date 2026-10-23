@@ -425,6 +425,11 @@ export interface ConfirmQuestion {
   toolName: string
   /** 给用户看的一句话（`PLATFORM` 是参数摘要，`SERVER` 是服务端给的消息原文） */
   inputSummary: string
+  /**
+   * 这次问的是**重复执行**（本轮同名同参的危险工具已经成功执行过一次）。
+   * 只影响前端措辞与 `confirm` 帧里的标记；挂起与应答机制完全相同（见 {@link ConfirmQuestion}）。
+   */
+  duplicate?: boolean
 }
 
 /**
@@ -755,6 +760,13 @@ export interface ChatProducerInput {
   conversationId: string
   agentId: string
   /**
+   * 本轮由**哪把开放平台 Key** 发起（**P1-22**）：`undefined` = 内部界面。
+   *
+   * 只用于计量归属（`usage_records.channel/open_key_id`，X1）—— **不是**权限判据。
+   * 由出口层从 `StreamChatReplyInput#openKeyId` 原样转交，编排层一个分支都不用加。
+   */
+  openKeyId?: string
+  /**
    * 本轮用户消息的正文（**已 trim**）—— 来自请求体（`shared` 的 `chatRequestBodySchema`）。
    *
    * 为什么由出口层转交、而不是让编排层回头查库：这条消息**此刻还没落库**
@@ -858,10 +870,14 @@ class SseChannel {
   /** 撤回插话的监听器（2026-10-21）；与 {@link #steerListeners} 同一条"没人消费就不取"的纪律 */
   readonly #steerCancelListeners = new Set<() => void>()
 
-  constructor(raw: ServerResponse, conversationId: string, startedAt: string) {
+  /** 本轮确认卡的超时（秒，P1-22）：来自 `StreamChatReplyInput#confirmTimeoutSec`，缺省走全局配置 */
+  readonly #confirmTimeoutSec: number
+
+  constructor(raw: ServerResponse, conversationId: string, startedAt: string, confirmTimeoutSec?: number) {
     this.#raw = raw
     this.#conversationId = conversationId
     this.#startedAt = startedAt
+    this.#confirmTimeoutSec = confirmTimeoutSec ?? config.mcp.confirmTimeoutSec
     this.#controller = new AbortController()
   }
 
@@ -1194,11 +1210,17 @@ class SseChannel {
     await clearConfirmSignal(this.#conversationId)
 
     const confirmId = randomUUID()
-    const timeoutMs = config.mcp.confirmTimeoutSec * 1000
+    // P1-22：本轮的超时（Key 可覆盖）；`#waitForConfirm` 与日志共用这一个值
+    const timeoutMs = this.#confirmTimeoutSec * 1000
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString()
 
     // 见 ②：登记在发帧**之前**
     await this.updateSnapshot({ pendingConfirmId: confirmId })
+    /**
+     * 本次提问的**终局**（见 `finally` 里的 `confirm_resolved`）：三处退出点都只写这一个变量，
+     * 于是"发终局帧"只有一处实现 —— 少一处就少一种"卡不消失"的路径。
+     */
+    let decision: ConfirmDecision | 'ABORTED' = 'ABORTED'
     try {
       await this.emit({
         name: 'confirm',
@@ -1208,6 +1230,7 @@ class SseChannel {
           toolName: question.toolName,
           inputSummary: question.inputSummary,
           expiresAt,
+          ...(question.duplicate === true ? { duplicate: true } : {}),
         },
       })
       getLogger().info(
@@ -1216,12 +1239,26 @@ class SseChannel {
           confirmId,
           source: question.source,
           toolName: question.toolName,
-          timeoutSec: config.mcp.confirmTimeoutSec,
+          timeoutSec: this.#confirmTimeoutSec,
         },
         '已发出确认请求（本轮挂起等待应答）',
       )
-      return await this.#waitForConfirm(confirmId, timeoutMs)
+      decision = await this.#waitForConfirm(confirmId, timeoutMs)
+      return decision
     } finally {
+      /**
+       * ⑥ **通知前端这次提问结束了**（2026-10-22）：`confirm` 帧只是"开始提问"，而结束可能
+       * 由**别人**触发（第三方代理替用户点了 `/confirm`）、或超时/中断 —— 早先前端只在
+       * "自己点过"之后才撤卡，于是对方确认后我们这边工具都跑完了、确认卡还挂在输入区
+       * （它还锁着输入）直到整轮流结束。
+       * ⚠️ 放在 `finally` 且**先于**清快照：即使这一轮因为中断在抛错，前端也该先收到"卡作废"。
+       * ⚠️ 发帧失败**不掩盖**原结论（`emit` 的失败由出口层统一处理，这里不让它改变 decision）。
+       */
+      try {
+        await this.emit({ name: 'confirm_resolved', data: { confirmId, decision } })
+      } catch {
+        // 流已断（用户关页 / 客户端断开）：没有接收方，忽略
+      }
       // 见 ⑤：结局无论如何都要把"待答"清干净（`updateSnapshot` 在流已收尾时会自己短路）
       await clearConfirmSignal(this.#conversationId)
       await this.updateSnapshot({ pendingConfirmId: null })
@@ -1293,7 +1330,7 @@ class SseChannel {
         }
         if (Date.now() >= deadline) {
           getLogger().info(
-            { conversationId: this.#conversationId, confirmId, timeoutSec: config.mcp.confirmTimeoutSec },
+            { conversationId: this.#conversationId, confirmId, timeoutSec: this.#confirmTimeoutSec },
             '等待确认超时 ⇒ 按取消处理（`02` §5.2）',
           )
           done('TIMEOUT')
@@ -1515,6 +1552,19 @@ export interface StreamChatReplyInput {
    * **JSON 信封**（Fastify errorHandler）而不是一个 SSE `error` 帧 —— 与其余前置失败同口径。
    */
   onLockAcquired?: () => Promise<void>
+  /**
+   * 开放平台调用来源（**P1-22**）：本轮由哪把 Key 发起。`undefined` = 内部界面。
+   * 透传进 `ChatProducerInput#openKeyId` ⇒ 落库时写 `usage_records.channel='OPEN_API' / open_key_id`。
+   */
+  openKeyId?: string
+  /**
+   * 本轮的**确认卡超时**（秒；**P1-22**）：开放层按 Key 配置覆盖全局 `MCP_CONFIRM_TIMEOUT_SEC`。
+   *
+   * 为什么按"每次流"而不是"进程配置"：同一个进程里内部用户与外部客户并存 —— 外部人工审批更慢
+   * （`docs/08` §4.1 允许配到 300s），改全局配置会把内部 UI 的等待也一起拉长。
+   * 不传 ⇒ 走 `config.mcp.confirmTimeoutSec`（内部路径零改动）。
+   */
+  confirmTimeoutSec?: number
 }
 
 /**
@@ -1573,9 +1623,14 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
   // ⚠️ 用 `EMPTY_ACTIVE_SNAPSHOT` 铺底而**不是**逐字段手写（P0-2-10 改这里时正好踩过）：
   //    手写的版本在加第四个字段 `pendingConfirmId` 时**不会报错也不会漂** —— 它只是少一个键，
   //    而少这一个键的后果是"所有 `/confirm` 应答都变成 `applied:false`"（静默到只有类型检查能抓）。
+  // ★ `startedBy`（2026-10-22）：**发起方必须由发起方自己说**。帧总线（`frameBus`）对所有
+  //   `/chat` 来路一视同仁地广播 —— 开放层的第三方调用与界面里的发送是同一种帧，观察者
+  //   无法从帧上分辨 ⇒ 只能记在锁里，让 `/active` 与观察流如实回答"这一轮是谁发起的"。
+  //   判据是"有没有 Key 上下文"（`openKeyId` 由开放层透传，见 `StreamChatReplyInput#openKeyId`）。
   const locked = await acquireConversationLock(conversationId, {
     ...EMPTY_ACTIVE_SNAPSHOT,
     startedAt,
+    startedBy: input.openKeyId === undefined ? 'UI' : 'OPEN_API',
   })
   if (!locked) {
     // 被拒的这次**不进**下面的 finally（没拿锁就没什么可释放的），但必须走 SSE 事件收尾：
@@ -1606,7 +1661,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
     reply.raw.writeHead(200, SSE_RESPONSE_HEADERS)
     reply.raw.flushHeaders()
 
-    channel = new SseChannel(reply.raw, conversationId, startedAt)
+    channel = new SseChannel(reply.raw, conversationId, startedAt, input.confirmTimeoutSec)
     /**
      * 非空别名：`channel` 是 `let`（外层 `finally` 要读它），而 TS 在**闭包**里会把它重置为
      * `SseChannel | undefined` ⇒ `channel.awaitConfirm(...)` 编不过。用 `const` 取一次，
@@ -1651,6 +1706,7 @@ export async function streamChatReply(input: StreamChatReplyInput): Promise<void
       const result = await producer({
         conversationId,
         agentId,
+        ...(input.openKeyId === undefined ? {} : { openKeyId: input.openKeyId }),
         content,
         attachments: attachments ?? [],
         target,

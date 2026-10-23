@@ -108,6 +108,7 @@ import {
   submittableComponents,
   valuesFromAgent,
   type AgentFormValues,
+  type AgentPageSectionKey,
   type AgentSectionKey,
 } from './agentModel.js'
 
@@ -344,6 +345,12 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               <Button>返回列表</Button>
             </Link>
           </div>
+
+          {/* 开放调用（P1-22）：**入口在「我的凭据」**（Key 的主语是「我 × 智能体」），
+              这里只留一个指路条 —— 受众用户也能给自己签（R3），只是不该在本页操作。 */}
+          <FormSection section="openKeys" dirty={false} failed={false}>
+            <OpenApiKeysHelp agentId={initialItem.id} />
+          </FormSection>
         </div>
       </>
     )
@@ -996,6 +1003,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               </div>
             </FormSection>
 
+            {/* ⑤ 开放调用（P1-22）：**只指路，不放 Key 管理**（见 `OpenApiKeysHelp`）。
+                该区块不参与本页保存链路（`agentModel#AGENT_PAGE_SECTIONS` 的 `openKeys` 不在
+                `AGENT_SECTIONS` 里）—— 它没有任何可提交的表单值。 */}
+            <FormSection section="openKeys" dirty={false} failed={false}>
+              <OpenApiKeysHelp agentId={item?.id} />
+            </FormSection>
+
             <div className="savebar">
               <span className="ratio">
                 {item === undefined
@@ -1028,6 +1042,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               />
               <SummaryRow label="知识库" value={`${selectedKbIds.length} 个`} />
               <SummaryRow label="MCP 工具" value={`${selectedMcpIds.length} 个 server`} />
+
               <SummaryRow
                 label="我的会话"
                 value={conversationCount.data === undefined ? '—' : String(conversationCount.data)}
@@ -1065,6 +1080,36 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   )
 }
 
+/**
+ * 「开放调用」指路条（P1-22；2026-10-22 定案）。
+ *
+ * Key 的主语是「**我** × 智能体」，所以它不是智能体的属性 —— 放在编辑页会让人以为
+ * "给这个智能体开了 Key 就所有人都能用"。管理入口因此在「我的凭据」的新分区
+ * （`/settings/credentials?section=openapi`），本页只解释"它是什么、去哪配"。
+ *
+ * ⚠️ 不给"在这里新建"的按钮：那等于把语义问题又搬回来一次（而且新建必须先在凭据页选智能体，
+ * 本页的上下文只是"预选"，跳过去带 cookie 更省事）。
+ */
+function OpenApiKeysHelp({ agentId }: { agentId: string | undefined }) {
+  return (
+    <div className="stack stack--tight">
+      <p className="ratio">
+        OpenAPI Key 是<strong>「你 × 这个智能体」</strong>的调用凭据（给外部系统用），
+        不是智能体的共享开关 —— 谁要调用，谁在自己的「我的凭据」里签一把。所以它的管理入口在
+        <strong>「我的凭据」</strong>，不在本页。
+      </p>
+      <div className="row">
+        <Link to={credentialsSectionPath('openapi')}>
+          <Button>去「我的凭据 · 开放调用」管理 Key</Button>
+        </Link>
+        {agentId !== undefined && (
+          <span className="ratio">进去后可按智能体筛选；你这个智能体签过的 Key 会带它的名字。</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ═════════════════════════════ 局部组件 ═════════════════════════════
 
 /**
@@ -1084,7 +1129,7 @@ function FormSection({
   failed,
   children,
 }: {
-  section: AgentSectionKey
+  section: AgentPageSectionKey
   dirty: boolean
   failed: boolean
   children: ReactNode

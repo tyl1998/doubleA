@@ -105,6 +105,12 @@ export interface ChatInputProps {
    * 这里只把它交给状态机（`composeState`），**不自己判**。
    */
   steerable: boolean
+  /**
+   * **服务端侧还有一轮在跑，但本页没有它的事件流**（2026-10-22：外部 Open API 调用 /
+   * 定时任务后台运行 / 切走再切回 / 刷新后进入）。交给状态机（`composeState`），
+   * 于是输入区如实显示"正在生成"且**不给停止按钮**（那一轮不归本页收口）。
+   */
+  serverRunning?: boolean
   /** 点「插话」：把当前草稿插给运行中的 agent（页面负责发请求与清草稿） */
   onSteer: () => void
   /** 插话请求在飞（按钮置 loading，防连点） */
@@ -131,11 +137,12 @@ export function ChatInput({
   onPickFiles,
   onRemoveAttachment,
   steerable,
+  serverRunning = false,
   onSteer,
   steerPending,
   controls,
 }: ChatInputProps) {
-  const view = composeState({ round, sending, stopping, draft, steerable })
+  const view = composeState({ round, sending, stopping, draft, steerable, serverRunning })
 
   /**
    * 输入框高度**跟着正文走**（`app.css` 里 `.composer textarea` 的 `min-height`/`max-height`）。
@@ -245,6 +252,7 @@ export function ChatInput({
             toolName={round.confirm.toolName}
             inputSummary={round.confirm.inputSummary}
             expiresAt={round.confirm.expiresAt}
+            duplicate={round.confirm.duplicate === true}
             pending={confirmPending}
             onAnswer={onConfirmAnswer}
           />

@@ -64,7 +64,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import { CHAT_ATTACHMENT_MAX_COUNT, HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
-import type { AgentItem, RecallConversationResult } from '@doubulea/shared'
+import type { AgentItem, ConversationRunOrigin, RecallConversationResult } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
 import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
@@ -152,6 +152,39 @@ export interface ChatPageProps {
    * 此时即便 `useAgent` 404 也照常渲染（不再报"打不开这个对话"，见 §3 用户反馈）。
    */
   readOnly?: boolean
+}
+
+/**
+ * 头部那枚标签的文案：**这一轮是谁发起的**（`/active.startedBy`）。
+ *
+ * ⚠️ 别退回"服务端仍在生成"这种模糊说法，也别默认说成定时任务：外部 Open API 调用、定时任务、
+ * 另一个窗口/设备发起的轮次在界面上必须能区分开（2026-10-22 的 bug 就是这三者被说成了同一个）。
+ */
+function serverRunLabel(origin: ConversationRunOrigin | null): string {
+  switch (origin) {
+    case 'SCHEDULED':
+      return '定时任务运行中'
+    case 'OPEN_API':
+      return '外部调用运行中'
+    case 'UI':
+      return '另一窗口正在生成'
+    default:
+      return '服务端仍在生成'
+  }
+}
+
+/** 头部标签的悬停说明（与 {@link serverRunLabel} 同源，补一句"为什么本页不能操作它"） */
+function serverRunTitle(origin: ConversationRunOrigin | null): string {
+  switch (origin) {
+    case 'SCHEDULED':
+      return '定时任务正在后台运行这一轮（可在任务中心查看，或在下方消息流里实时观察）'
+    case 'OPEN_API':
+      return '这一轮由外部系统通过开放接口发起，本页只读观察，不能在这里停止'
+    case 'UI':
+      return '这一轮由另一个窗口或设备发起，本页只读观察'
+    default:
+      return '服务端仍在生成这一轮（来源未知：可能是别的窗口发起，或刚切回来）'
+  }
 }
 
 /** 消息流的外框（三态共用，避免切换时布局跳动） */
@@ -299,14 +332,21 @@ export function ChatPage({
     },
   )
 
-  // P1-6 方案 A：观察这条会话"不是本页发起的那一轮"（定时任务后台运行的实时视图）
+  // P1-6 方案 A：观察这条会话"不是本页发起的那一轮"（定时任务后台运行 / **外部 Open API 调用**）
   useConversationWatch(conversationId)
 
   /**
    * 服务端侧"正在跑"的轮次（2026-10-21）：本页可能**画不出**它（切到别的会话后就没了 `rounds`），
    * 但侧栏的灯必须继续亮，且主区要如实显示"另一条流还在跑"。
+   *
+   * `serverRunOrigin`（2026-10-22）：这一轮是谁发起的（`/active.startedBy`）—— 头部与提示文案
+   * 据此说人话。⚠️ 早先观察到的轮次被一律写成"定时任务"，于是**外部 Open API 调用的会话**
+   * 在聊天页里也显示成定时任务执行中（这正是本批修的那个 bug）。
    */
   const serverRun = useChatStreamStore((state) => state.serverRun)
+  const serverRunOrigin = useChatStreamStore((state) =>
+    conversationId === undefined ? null : (state.runOrigins[conversationId] ?? null),
+  )
   const serverRunning = round === null && conversationId !== undefined && serverRun[conversationId] !== undefined
   const serverRunStartedAt = conversationId === undefined ? null : (serverRun[conversationId] ?? null)
 
@@ -472,7 +512,11 @@ export function ChatPage({
         setRuntime(active.runtime)
         // 这一步同时也回答"服务端此刻在跑吗"（`/active.streaming`）⇒ 记进流 store：
         // 刚切进来时就能把侧栏的灯点亮（`useConversationActiveWatch` 会继续按节拍刷新）
-        useChatStreamStore.getState().noteServerRun(conversationId, active.streaming, active.startedAt ?? null)
+        // `startedBy`（2026-10-22）一并记下：这一轮可能是**外部 Open API 调用**或定时任务发起的，
+        // 界面要据此说清来源，而不是一律当成定时任务
+        useChatStreamStore
+          .getState()
+          .noteServerRun(conversationId, active.streaming, active.startedAt ?? null, active.startedBy)
       })
       .catch(() => {
         // `/active` 只是只读探活：读不到就保持"关"（安全默认），也不弹错 ——
@@ -1370,8 +1414,8 @@ export function ChatPage({
                 ⚠️ 没有"停止"按钮：停止走的是本页那条流的 abort 收口（`stopController`），
                 这里没有可收口的流；点了只会发一个信号而界面无从确认。 */}
             {serverRunning ? (
-              <Tag className="tag--warn" title="服务端仍在生成这一轮（可能是别的窗口发起，或刚切回来）">
-                <span className="led led--run" aria-hidden="true" /> 服务端仍在生成
+              <Tag className="tag--warn" title={serverRunTitle(serverRunOrigin)}>
+                <span className="led led--run" aria-hidden="true" /> {serverRunLabel(serverRunOrigin)}
               </Tag>
             ) : null}
 
@@ -1487,6 +1531,7 @@ export function ChatPage({
                 onRecallSteer={handleRecallSteer}
                 serverRunning={serverRunning}
                 serverStartedAt={serverRunStartedAt}
+                serverRunOrigin={serverRunOrigin}
               />
             </StreamFrame>
           )}
@@ -1539,6 +1584,7 @@ export function ChatPage({
               // ChatBot 在**下一次上游调用前**注入（producer 已注册 steer 监听器）。是否出现由状态机的
               // `view.steer` 决定（仅在"正在生成 + 草稿非空"时放出），本组件不另判。
               steerable
+              serverRunning={serverRunning}
               onSteer={handleSteer}
               steerPending={steerPending}
               // R4：会话控件（模型 / 自动审批 / 记忆 / Code 模式 / 专注）摆到输入框下方

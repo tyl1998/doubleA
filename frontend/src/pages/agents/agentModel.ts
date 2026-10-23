@@ -44,20 +44,38 @@ export const AGENT_TYPE_HINT: Readonly<Record<AgentType, string>> = {
 // 抄一份 `AGENT_TYPE_OPTIONS` 的代价不是"多几行"，而是新增类型时改一处、漏一处，
 // 症状是"后端认这个类型、前端选不出来"（本仓 P0-1-22 已为同类重复枚举立过规矩）。
 
-/** 表单分区（`03` §4.2 的四区）。顺序即页面上的区块顺序 */
+/**
+ * 表单分区（`03` §4.2 的四区）。顺序即页面上的区块顺序。
+ *
+ * ⚠️ 这四个是**参与保存**的区块：`changedSections` / `sectionsOfUpdateBody` 都会遍历它，
+ * 每个都必须由 `PATCH` 或 `PUT …/components` 覆盖到。新增"不参与保存"的区块（例如 P1-22 的
+ * `openKeys`）**不要**加进本数组，否则每次保存都会给它打一个"未保存"标记，而它永远不会变干净。
+ */
 export const AGENT_SECTIONS = ['basic', 'model', 'prompt', 'components'] as const
 export type AgentSectionKey = (typeof AGENT_SECTIONS)[number]
 
-export const AGENT_SECTION_LABEL: Readonly<Record<AgentSectionKey, string>> = {
+/**
+ * 页面上的**全部**区块（含不参与保存的只读/独立操作区）。顺序即渲染顺序。
+ *
+ * · `openKeys`（P1-22 开放调用）：Key 的签发/吊销走 `<agentId>/open-keys` 自己的端点，
+ *   **不进保存链路**（它不读表单、也不随"保存"按钮提交）；
+ * · 它仍需要区块标题与序号（左侧刻度线 `03 / 开放调用`）。
+ */
+export const AGENT_PAGE_SECTIONS = [...AGENT_SECTIONS, 'openKeys'] as const
+export type AgentPageSectionKey = (typeof AGENT_PAGE_SECTIONS)[number]
+
+/** 区块标题（参与保存的四区 + `openKeys`，唯一文案来源） */
+export const AGENT_SECTION_LABEL: Readonly<Record<AgentPageSectionKey, string>> = {
   basic: '基本信息',
   model: '模型',
   prompt: '提示词',
   components: '组件绑定',
+  openKeys: '开放调用',
 }
 
 /** 区块序号（原型左侧的 `01 / …`） */
-export function sectionOrdinal(section: AgentSectionKey): string {
-  return String(AGENT_SECTIONS.indexOf(section) + 1).padStart(2, '0')
+export function sectionOrdinal(section: AgentPageSectionKey): string {
+  return String(AGENT_PAGE_SECTIONS.indexOf(section) + 1).padStart(2, '0')
 }
 
 /**

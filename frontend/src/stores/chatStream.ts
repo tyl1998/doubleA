@@ -31,7 +31,7 @@
  * TanStack Query 的职责，两处都存必然不一致（`03` §六）。
  */
 
-import type { SseEvent } from '@doubulea/shared'
+import type { ConversationRunOrigin, SseEvent } from '@doubulea/shared'
 import { create } from 'zustand'
 
 import type { ClientErrorCode } from '../api/client.js'
@@ -71,6 +71,7 @@ interface ChatStreamState {
   rounds: Record<string, StreamRound>
   /**
    * 服务端侧**正在跑**的会话（`conversationId → startedAt | null`）—— 2026-10-21 增。
+   * 发起方见 {@link runOrigins}（2026-10-22 增：同一批 `/active` 结论里带回来的 `startedBy`）。
    *
    * ⚠️ 与 `rounds` 是**两个来源**，不能合并：
    *   · `rounds` = 本页**画得出这一轮**（有完整事件流，能渲染正文 / 工具卡）；只覆盖"本页发起的流"
@@ -81,6 +82,14 @@ interface ChatStreamState {
    * 值里的 `startedAt` 是服务端那条流的开始时刻（`/active` 回带），拿不到的 `null`。
    */
   serverRun: Record<string, string | null>
+  /**
+   * 服务端侧正在跑的那一轮**是谁发起的**（`conversationId → startedBy`；2026-10-22 增）。
+   *
+   * 写入点只有 `noteServerRun`（`/active` 的结论），`begin`（本页自己发起 = `UI`）也写一次。
+   * ⚠️ 它只用于**文案**（"定时任务正在运行" / "外部调用正在跑" / "服务端仍在生成"），
+   * 不参与任何判据 —— 判据始终是 `rounds` / `serverRun` 本身。
+   */
+  runOrigins: Record<string, ConversationRunOrigin | null>
   /**
    * 每个会话的顶部黄条（`conversationId → DisconnectState`）。
    * **按会话存**：A 断线亮条不该在 B 的画面上出现（多流之后这是必须的）。
@@ -106,7 +115,12 @@ interface ChatStreamState {
    * `false` ⇒ 收掉这个键。只影响**会话栏的灯**与"没有本页轮次时的生成中气泡"，
    * 不碰 `rounds`（那是本页自己的事件流，见 `serverRun` 的注释）。
    */
-  noteServerRun: (conversationId: string, streaming: boolean, startedAt: string | null) => void
+  noteServerRun: (
+    conversationId: string,
+    streaming: boolean,
+    startedAt: string | null,
+    startedBy?: ConversationRunOrigin | null,
+  ) => void
   /**
    * 往指定会话这一轮**乐观地**追加一条用户插话（P1-20）—— `POST /:id/steer` 成功后调它。
    *
@@ -228,6 +242,7 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
   rounds: {},
   disconnects: {},
   serverRun: {},
+  runOrigins: {},
 
   begin: (conversationId, userText, startedAt, kind, userAttachments) => {
     // 开新一轮 ⇒ 该会话上一轮的黄条自动消失（`03` §4.1 的状态机里，`idle → streaming` 是一个
@@ -238,6 +253,8 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
       // 本页自己发起的这一轮同样是"服务端在跑"：记进 `serverRun`，切走时侧栏的灯才不会灭
       // （它的收口与清除统一走 `noteServerRun(false)`，见 `useChatStream` 的 `finally`）
       serverRun: { ...state.serverRun, [conversationId]: startedAt },
+      // 本页发起的必然来自界面（`/active` 的 `startedBy` 也是这个值）—— 一并记下，别留空
+      runOrigins: { ...state.runOrigins, [conversationId]: 'UI' },
     }))
   },
 
@@ -253,14 +270,22 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
     })
   },
 
-  noteServerRun: (conversationId, streaming, startedAt) => {
+  noteServerRun: (conversationId, streaming, startedAt, startedBy = null) => {
     set((state) => {
       if (!streaming) {
-        if (!(conversationId in state.serverRun)) return state
-        return { serverRun: without(state.serverRun, conversationId) }
+        if (!(conversationId in state.serverRun) && !(conversationId in state.runOrigins)) return state
+        return {
+          serverRun: without(state.serverRun, conversationId),
+          runOrigins: without(state.runOrigins, conversationId),
+        }
       }
-      if (conversationId in state.serverRun && state.serverRun[conversationId] === startedAt) return state
-      return { serverRun: { ...state.serverRun, [conversationId]: startedAt } }
+      const sameRun = conversationId in state.serverRun && state.serverRun[conversationId] === startedAt
+      // 同一个 `startedAt` 只表示"还是那一轮"；**来源**可能在后一次读到（旧快照 → 新快照），故也参与比较
+      if (sameRun && (state.runOrigins[conversationId] ?? null) === startedBy) return state
+      return {
+        serverRun: { ...state.serverRun, [conversationId]: startedAt },
+        runOrigins: { ...state.runOrigins, [conversationId]: startedBy },
+      }
     })
   },
 
@@ -364,6 +389,6 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
   resetAll: () => {
     // `serverRun` 也清：对话页卸载后没有人在看这些灯，留着"某个会话在跑"只会在下次进页面时
     // 与 `/active` 的结论打架（下次进页面会重新问一次）
-    set({ rounds: {}, disconnects: {}, serverRun: {} })
+    set({ rounds: {}, disconnects: {}, serverRun: {}, runOrigins: {} })
   },
 }))

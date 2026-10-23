@@ -339,22 +339,26 @@ model User {
   createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  agents         Agent[]
-  conversations  Conversation[]
-  mcpServers     McpServer[]
-  mcpCredentials McpCredential[]
-  usageRecords   UsageRecord[]
-  artifacts      Artifact[]
-  files          File[]
-  scheduledTasks ScheduledTask[]
-  memories       Memory[]
-  gitCredentials GitCredential[]
+  agents                  Agent[]
+  conversations           Conversation[]
+  mcpServers              McpServer[]
+  mcpCredentials          McpCredential[]
+  usageRecords            UsageRecord[]
+  artifacts               Artifact[]
+  files                   File[]
+  scheduledTasks          ScheduledTask[]
+  memories                Memory[]
+  gitCredentials          GitCredential[]
+  /// P1-22：我名下的开放平台 Key（Key 可被硬删）
+  apiKeys                 ApiKey[]                 @relation("ApiKeyOwner")
+  /// P1-22：我签发的 Key（ADMIN 代建时与 `apiKeys` 不同；留痕）
+  issuedApiKeys           ApiKey[]                 @relation("ApiKeyIssuer")
   /// P1-13：知识库的**所属人**（新增 `created_by` 列）
-  knowledgeBases KnowledgeBase[]
+  knowledgeBases          KnowledgeBase[]
   /// P1-13：模型池 Provider 的**所属人**（新增 `created_by` 列）
-  modelProviders ModelProvider[]
+  modelProviders          ModelProvider[]
   /// P1-18：本用户所在的用户组（受众圈选；见 `UserGroupMember`）
-  userGroupMembers UserGroupMember[]
+  userGroupMembers        UserGroupMember[]
   /// P1-18：本用户的 **per-user Provider 凭据**（各自 Key；见 `ProviderUserCredential`）
   providerUserCredentials ProviderUserCredential[]
 
@@ -372,35 +376,35 @@ model User {
 /// Provider 只是"上游终点"（`base_url` + Key + `protocol`）—— 类型列因此失去全部语义，整列删除。
 /// 见 `docs/子方案/Provider与模型类型解耦.md`。
 model ModelProvider {
-  id        String    @id @default(uuid(7)) @db.Uuid
-  name      String    @db.VarChar(128)
-  baseUrl   String    @map("base_url") @db.Text
+  id             String                 @id @default(uuid(7)) @db.Uuid
+  name           String                 @db.VarChar(128)
+  baseUrl        String                 @map("base_url") @db.Text
   /// 自定义 URL（第三方端点不按 `{host}/v1` + 固定后缀规范时）：为 true 时 `base_url`
   /// **就是完整端点**，后端直接拿它发请求、**不再拼** `/chat/completions` 等后缀
   /// （见 `backend/src/llm/upstream.ts#resolveUpstreamUrl`）。默认 false = 既有拼接行为。
-  customUrl Boolean   @default(false) @map("custom_url")
-  apiKeyEnc String?   @map("api_key_enc") @db.Text
+  customUrl      Boolean                @default(false) @map("custom_url")
+  apiKeyEnc      String?                @map("api_key_enc") @db.Text
   /// 上游协议（P0-1-37）。默认 `OPENAI_COMPAT` ⇒ 既有行行为不变；见 `enum UpstreamProtocol`。
   /// ⚠️ 2026-10-22 起约束改为：**本 Provider 下存在 EMBEDDING 模型时，协议只能是 `OPENAI_COMPAT`**
   /// （embedding 只有 `/embeddings` 一条路）—— 判据 = `shared#vectorModelRequiresCompatProtocol`。
-  protocol  UpstreamProtocol @default(OPENAI_COMPAT)
-  enabled   Boolean   @default(true)
+  protocol       UpstreamProtocol       @default(OPENAI_COMPAT)
+  enabled        Boolean                @default(true)
   /// P1-13：**所属人**（新增 `created_by`）。语义 = 权限判据的唯一主体：
   /// 编/删/转移 = 所属人 + ADMIN；**系统级 Provider（`created_by` 是 ADMIN）只有 ADMIN 能改/删**。
-  createdBy String    @map("created_by") @db.Uuid
+  createdBy      String                 @map("created_by") @db.Uuid
   /// ⚠️ P1-18（用户定案）：Provider **没有可见范围、也没有定向分享** —— 模型只能通过 Agent
   /// 被使用，全局"曝光"不承担访问控制（归 Agent 可见范围）。
   /// **读 = 全体登录用户**（默认 2026-10-16 修订：Provider/Model 即"平台模型池"，人人可见、只读）；
   /// **写（编/删/转移）= 所属人 + ADMIN**（见 `shared/src/assetAcl.ts` 文件头 ①）。
   /// **凭据模式**（P1-18）：`SHARED` 用本行 `api_key_enc`；`PER_USER` 用调用者自己的 Key。
   credentialMode ProviderCredentialMode @default(SHARED) @map("credential_mode")
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  models Model[]
+  models          Model[]
   /// P1-18：**各自 Key**（`credentialMode=PER_USER` 时生效）——每用户一把，加密存储
   userCredentials ProviderUserCredential[]
-  creator User @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  creator         User                     @relation(fields: [createdBy], references: [id], onDelete: Restrict)
 
   @@index([createdBy])
   @@map("model_providers")
@@ -442,36 +446,36 @@ model ProviderUserCredential {
 ///   `enabled=false` 的必须筛掉 —— `01` §3.2「无效模型创建 Agent 时不可选」）。
 /// · 删除语义 `onDelete: Cascade`：模型之于 provider 没有独立意义，provider 没了模型也留不住。
 model Model {
-  id             String    @id @default(uuid(7)) @db.Uuid
-  providerId     String    @map("provider_id") @db.Uuid
-  modelName      String    @map("model_name") @db.VarChar(128)
-  label          String    @db.VarChar(128)
-  type           ModelType
-  maxContext     Int?      @map("max_context")
+  id                  String    @id @default(uuid(7)) @db.Uuid
+  providerId          String    @map("provider_id") @db.Uuid
+  modelName           String    @map("model_name") @db.VarChar(128)
+  label               String    @db.VarChar(128)
+  type                ModelType
+  maxContext          Int?      @map("max_context")
   /// **向量模型专属**：embedding 输出维度（建/改模型时向上游**探测**写入）。对话模型为 NULL。
   /// 知识库建库时**复制**该值作为维度快照（`KnowledgeBase.embeddingDim`），故正常不再二次探测。
-  embeddingDim   Int?      @map("embedding_dim")
+  embeddingDim        Int?      @map("embedding_dim")
   /// **向量模型专属**：是否走**多模态** embedding 端点（如火山 `doubao-embedding-vision`）。
   /// 为 true 时请求打 `POST {baseUrl}/embeddings/multimodal` 且 `input` 为 `[{type:"text",text}]`；
   /// 为 false（默认）走标准 OpenAI `POST {baseUrl}/embeddings` + `input: [string]`。
-  embeddingMultimodal Boolean @default(false) @map("embedding_multimodal")
-  supportsVision Boolean   @default(false) @map("supports_vision")
+  embeddingMultimodal Boolean   @default(false) @map("embedding_multimodal")
+  supportsVision      Boolean   @default(false) @map("supports_vision")
   // 是否支持"深度思考"（reasoning / thinking）。默认 false —— 与 supportsVision 同款：
   // 既是选模型侧的读数，也在对话链路上决定"是否向上游请求思考"（见 llm/protocol.ts 各协议 buildBody）。
-  supportsReasoning Boolean @default(false) @map("supports_reasoning")
-  enabled        Boolean   @default(true)
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  supportsReasoning   Boolean   @default(false) @map("supports_reasoning")
+  enabled             Boolean   @default(true)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
-  agents   Agent[]
-  agentPool AgentModel[]
+  provider              ModelProvider      @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  agents                Agent[]
+  agentPool             AgentModel[]
   /// 把本模型用作 embedding 的知识库（`KnowledgeBase.embeddingModelId`）
-  knowledgeBases KnowledgeBase[] @relation("KnowledgeBaseEmbeddingModel")
+  knowledgeBases        KnowledgeBase[]    @relation("KnowledgeBaseEmbeddingModel")
   /// 把本模型用作"图片描述（VLM 描述）"的知识库（`KnowledgeBase.captionModelId`，P1-11）
-  captionKnowledgeBases KnowledgeBase[] @relation("KnowledgeBaseCaptionModel")
+  captionKnowledgeBases KnowledgeBase[]    @relation("KnowledgeBaseCaptionModel")
   /// 把本模型用作"会话标题生成"的平台配置（`TitleModelConfig.modelId`）
-  titleModelConfigs TitleModelConfig[] @relation("TitleModelConfigModel")
+  titleModelConfigs     TitleModelConfig[] @relation("TitleModelConfigModel")
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -491,34 +495,36 @@ model Model {
 ///   ⚠️ `modelId` 的语义自"模型池"上线后收窄为**默认模型**（对话时不指定模型走它）；
 ///   可选的模型集合是 `pool`（{@link AgentModel}），默认模型**必须**是池成员（服务层保证）。
 model Agent {
-  id             String    @id @default(uuid(7)) @db.Uuid
-  name           String    @db.VarChar(128)
-  description    String?   @db.Text
-  icon           String?   @db.VarChar(255)
+  id             String          @id @default(uuid(7)) @db.Uuid
+  name           String          @db.VarChar(128)
+  description    String?         @db.Text
+  icon           String?         @db.VarChar(255)
   type           AgentType
-  systemPrompt   String?   @map("system_prompt") @db.Text
-  openingRemarks String?   @map("opening_remarks") @db.Text
-  guideQuestions Json      @default("[]") @map("guide_questions") @db.JsonB
-  modelId        String?   @map("model_id") @db.Uuid
+  systemPrompt   String?         @map("system_prompt") @db.Text
+  openingRemarks String?         @map("opening_remarks") @db.Text
+  guideQuestions Json            @default("[]") @map("guide_questions") @db.JsonB
+  modelId        String?         @map("model_id") @db.Uuid
   /// P1-13：**所属人**（复用 `created_by`，语义由"创建者"扩为"所属人"）。转移时更新此列。
-  createdBy      String    @map("created_by") @db.Uuid
+  createdBy      String          @map("created_by") @db.Uuid
   /// P1-18：可见范围（新行默认 `PRIVATE`，存量回填 `PUBLIC`）。判据见 `shared/src/assetAcl.ts`。
   /// `SHARED` 时受众来自 `audiences`（用户 ∪ 组）；`PUBLIC` 全员；`PRIVATE` 仅所属人 + ADMIN。
   visibility     AssetVisibility @default(PRIVATE)
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
-  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt      DateTime?       @map("deleted_at") @db.Timestamptz(3)
 
-  model         Model?            @relation(fields: [modelId], references: [id], onDelete: SetNull)
-  creator       User              @relation(fields: [createdBy], references: [id], onDelete: Restrict)
-  components    AgentComponent[]
+  model          Model?           @relation(fields: [modelId], references: [id], onDelete: SetNull)
+  creator        User             @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  components     AgentComponent[]
   /// P1-18：**受众**（仅 `visibility=SHARED` 时有行）——`visibility≠SHARED` 时不写、并把旧行清空
-  audiences     AgentAudience[]
-  pool          AgentModel[]
-  conversations Conversation[]
-  usageRecords  UsageRecord[]
+  audiences      AgentAudience[]
+  pool           AgentModel[]
+  conversations  Conversation[]
+  usageRecords   UsageRecord[]
   scheduledTasks ScheduledTask[]
-  memories      Memory[]
+  memories       Memory[]
+  /// P1-22：本智能体上的开放平台 Key（Agent 硬删时级联；软删时由校验链第 ④b 步 403）
+  apiKeys        ApiKey[]         @relation("ApiKeyAgent")
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy])
@@ -660,44 +666,44 @@ model UserGroupMember {
 /// · `status` 的 FINISHED 用于 Agent 软删后把历史会话转只读（§4.4）。
 /// · 删除语义全部 `Restrict`：会话是业务留痕，不允许因为删 Agent/用户而被动消失。
 model Conversation {
-  id            String             @id @default(uuid(7)) @db.Uuid
-  agentId       String             @map("agent_id") @db.Uuid
-  userId        String             @map("user_id") @db.Uuid
-  topic         String?            @db.VarChar(255)
-  status        ConversationStatus @default(ACTIVE)
+  id             String             @id @default(uuid(7)) @db.Uuid
+  agentId        String             @map("agent_id") @db.Uuid
+  userId         String             @map("user_id") @db.Uuid
+  topic          String?            @db.VarChar(255)
+  status         ConversationStatus @default(ACTIVE)
   /// 会话级「不记入记忆」（P1-8，HCI §5.2.1）。true = 本次对话不写入长期记忆（注入仍照常）
-  memoryExcluded Boolean           @default(false) @map("memory_excluded")
+  memoryExcluded Boolean            @default(false) @map("memory_excluded")
   /// 会话级 **Code 模式**（P1-9 §六 4）：true = 本会话的工作区走**人机共享可编辑**形态
   /// （派活时给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`，pi 的 read/write/edit 走版本中介）。
   /// ⚠️ **持久列**（不是 Redis）：沙箱创建时要读到它；且它决定 `/work` 的语义，必须跨实例一致。
-  codeMode      Boolean            @default(false) @map("code_mode")
+  codeMode       Boolean            @default(false) @map("code_mode")
   /// 会话级 **Code 模式运行时**（P1-17a）：派活时按它选运行时镜像（后端扫本机镜像确定）。
   /// 与 `codeMode` 同族（**持久列**：`ensureSandbox` 建容器时要读到它，且必须跨实例一致）。
   /// ⚠️ **自由字符串**（后端探测出的运行时 id，如 `node` / `python310` / `node22-python38`），
   ///    默认**空串**（产品反馈 2026-10-14：新会话默认**空环境** = 只带基础工具链、不额外装语言运行时）；
   ///    找不到对应镜像（含空串）时 `ensureSandbox` 回退 `SANDBOX_IMAGE` 并 warn。
-  runtime       String             @default("") @map("runtime")
-  lastMessageAt DateTime?          @map("last_message_at") @db.Timestamptz(3)
-  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  runtime        String             @default("") @map("runtime")
+  lastMessageAt  DateTime?          @map("last_message_at") @db.Timestamptz(3)
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  agent    Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
-  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
-  messages Message[]
+  agent             Agent                @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  messages          Message[]
   /// 本会话的滚动小结（P1-8 L1，1:1；删会话级联删行）
-  summary  ConversationSummary?
+  summary           ConversationSummary?
   /// 沙箱账本（P0-3-2）。⚠️ 删会话会**级联删掉这些行**，但容器不归数据库管 ——
   /// 孤儿回收器按 label 找容器、按"会话还在不在"判死（见 `backend/src/sandbox/reaper.ts`）。
-  sandboxes Sandbox[]
+  sandboxes         Sandbox[]
   /// 本会话的产出文件（P0-3-7）。⚠️ 删会话会级联删行，但**对象与行的过期收口只由保留期
   /// 清理器做**（`02` §三"消息与产物都不删"指的是不跟会话/Agent 的删除走）
-  artifacts Artifact[]
+  artifacts         Artifact[]
   /// 把本会话当作"最近一次运行"的定时任务（P1-6；删会话置空，不级联删任务）
-  scheduledTaskRuns ScheduledTask[] @relation("ScheduledTaskLastRun")
+  scheduledTaskRuns ScheduledTask[]      @relation("ScheduledTaskLastRun")
   /// Code 模式工作区（P1-9，1:1）。⚠️ 删会话级联删**索引行**，但宿主目录上的字节由
   /// workspace reaper 另行清理（与产物"行保留、对象由保留期收口"是两条不同的纪律：
   /// 工作区是会话的**派生计算目录**，会话没了它就没有归属，故行随会话走）
-  workspace Workspace?
+  workspace         Workspace?
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -789,39 +795,39 @@ model Message {
 /// · `retrievalConfig` 的 DB 默认值是**完整形状**（不是 `{}`）：即便将来有代码路径绕过
 ///   服务层直接插行，读出来也是可用配置。读取端仍一律 `??` 补默认值（§二），两层兜底。
 model KnowledgeBase {
-  id             String   @id @default(uuid(7)) @db.Uuid
-  name           String   @db.VarChar(128)
-  description    String?  @db.Text
-  embeddingModel String   @map("embedding_model") @db.VarChar(255)
+  id               String          @id @default(uuid(7)) @db.Uuid
+  name             String          @db.VarChar(128)
+  description      String?         @db.Text
+  embeddingModel   String          @map("embedding_model") @db.VarChar(255)
   /// 建库时**选定**的 embedding 模型（来自模型池的 `EMBEDDING` 类型模型）。
   /// 可空只为兼容本列引入前的老库；新建库必填。模型被删时置空（该库向量路不可用，需重建）。
-  embeddingModelId String? @map("embedding_model_id") @db.Uuid
+  embeddingModelId String?         @map("embedding_model_id") @db.Uuid
   /// 该库 embedding 向量的维度快照（建库时**探测**该模型输出后写入）。
   /// `chunks.embedding` 自本批起是**无固定维度**的 `vector`，检索按此维度收窄。
-  embeddingDim   Int?     @map("embedding_dim")
+  embeddingDim     Int?            @map("embedding_dim")
   /// 图片"含义"理解（VLM 描述，P1-11）用的 vision 对话模型（模型池里 `type=CHAT` 且 `supportsVision`）。
   /// 可空 = 该库不产出图片描述（no-op）；模型被删/停用时置空（之后的文档不再描述，已入库内容不变）。
   /// 与 `embeddingModelId` 是**两件事**：这个只影响"图片含义"这一步，不影响向量化/检索。
-  captionModelId String?  @map("caption_model_id") @db.Uuid
-  chunkSize      Int      @default(512) @map("chunk_size")
-  chunkOverlap   Int      @default(64) @map("chunk_overlap")
+  captionModelId   String?         @map("caption_model_id") @db.Uuid
+  chunkSize        Int             @default(512) @map("chunk_size")
+  chunkOverlap     Int             @default(64) @map("chunk_overlap")
   /// 形状见 `子方案①` §二：`{topK, score, mode, splitStrategy, rrfK, weights:{vector,fulltext}}`
-  retrievalConfig Json    @default("{\"topK\":5,\"score\":0.3,\"mode\":\"HYBRID\",\"splitStrategy\":\"hybrid\",\"rrfK\":60,\"weights\":{\"vector\":1.0,\"fulltext\":1.0}}") @map("retrieval_config") @db.JsonB
+  retrievalConfig  Json            @default("{\"topK\":5,\"score\":0.3,\"mode\":\"HYBRID\",\"splitStrategy\":\"hybrid\",\"rrfK\":60,\"weights\":{\"vector\":1.0,\"fulltext\":1.0}}") @map("retrieval_config") @db.JsonB
   /// P1-13：**所属人**（新增列）。权限判据的唯一主体：编/删/改可见性/转移 = 所属人 + ADMIN。
-  createdBy      String   @map("created_by") @db.Uuid
+  createdBy        String          @map("created_by") @db.Uuid
   /// P1-13：可见性（新行默认 `PRIVATE`，存量回填 `PUBLIC`）。判据见 `shared/src/assetAcl.ts`
-  visibility     AssetVisibility @default(PRIVATE)
-  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  visibility       AssetVisibility @default(PRIVATE)
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  documents Document[]
-  creator   User     @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  documents         Document[]
+  creator           User                    @relation(fields: [createdBy], references: [id], onDelete: Restrict)
   /// P1-18.x（2026-10-16）：知识库的**受众**（仅 `visibility=SHARED` 时有行）—— 用户 ∪ 组
-  audiences KnowledgeBaseAudience[]
+  audiences         KnowledgeBaseAudience[]
   /// 选定的 embedding 模型（删模型时不删库，只把引用置空 ⇒ 该库退化为纯全文检索，需重建）
-  embeddingModelRef Model? @relation("KnowledgeBaseEmbeddingModel", fields: [embeddingModelId], references: [id], onDelete: SetNull)
+  embeddingModelRef Model?                  @relation("KnowledgeBaseEmbeddingModel", fields: [embeddingModelId], references: [id], onDelete: SetNull)
   /// 选定的图片描述模型（P1-11）：删模型时置空 ⇒ 之后的文档不再产出图片描述（不影响入库）
-  captionModelRef Model? @relation("KnowledgeBaseCaptionModel", fields: [captionModelId], references: [id], onDelete: SetNull)
+  captionModelRef   Model?                  @relation("KnowledgeBaseCaptionModel", fields: [captionModelId], references: [id], onDelete: SetNull)
 
   @@index([visibility])
   @@index([createdBy])
@@ -841,21 +847,21 @@ model KnowledgeBase {
 /// · 删除 `onDelete: Cascade`：删库必删其文档（`02` §4.6「删除时级联清 chunks 与 S3 原文件」，
 ///   S3 部分由服务层在删行前后处理）。
 model Document {
-  id          String         @id @default(uuid(7)) @db.Uuid
-  kbId        String         @map("kb_id") @db.Uuid
-  fileKey     String         @map("file_key") @db.Text
-  fileName    String         @map("file_name") @db.VarChar(255)
-  status      DocumentStatus @default(PARSING)
-  chunkCount  Int            @default(0) @map("chunk_count")
-  errorMsg    String?        @map("error_msg") @db.Text
-  contentHash String         @map("content_hash") @db.VarChar(64)
+  id             String           @id @default(uuid(7)) @db.Uuid
+  kbId           String           @map("kb_id") @db.Uuid
+  fileKey        String           @map("file_key") @db.Text
+  fileName       String           @map("file_name") @db.VarChar(255)
+  status         DocumentStatus   @default(PARSING)
+  chunkCount     Int              @default(0) @map("chunk_count")
+  errorMsg       String?          @map("error_msg") @db.Text
+  contentHash    String           @map("content_hash") @db.VarChar(64)
   /// 图片的**处理选项**（上传/覆盖重建时选定，见 `shared/src/document.ts#DocumentImageOptions`）。
   /// · imageRecognize —— 识别方式**三选一**（NONE / OCR / LLM；见 {@link ImageRecognition}）
   /// · imageVectorize —— 图片走多模态向量（要求该库向量模型支持多模态端点），与识别方式**正交**
   imageRecognize ImageRecognition @default(NONE) @map("image_recognize")
   imageVectorize Boolean          @default(false) @map("image_vectorize")
-  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   kb     KnowledgeBase @relation(fields: [kbId], references: [id], onDelete: Cascade)
   chunks Chunk[]
@@ -883,19 +889,19 @@ model Document {
 ///   见 `02` §3.1 与 P0-1-5 的实测：函数型默认值不进 DDL）。因此 P0-1-19 的
 ///   `INSERT ... SELECT unnest(...)` **必须自带 id 数组**，不能指望 DB 兜底。
 model Chunk {
-  id        String                      @id @default(uuid(7)) @db.Uuid
-  docId     String                      @map("doc_id") @db.Uuid
-  kbId      String                      @map("kb_id") @db.Uuid
-  seq       Int
-  content   String                      @db.Text
+  id           String                 @id @default(uuid(7)) @db.Uuid
+  docId        String                 @map("doc_id") @db.Uuid
+  kbId         String                 @map("kb_id") @db.Uuid
+  seq          Int
+  content      String                 @db.Text
   /// pgvector 列，DDL 里是**无固定维度**的 `vector`（本批起支持任意维度的 embedding 模型）；
   /// Prisma 侧只作声明，读写走手写 SQL。维度记在 `embedding_dim`，检索按它收窄。
-  embedding Unsupported("vector")?
+  embedding    Unsupported("vector")?
   /// 该向量的维度（= 所属知识库的 `embedding_dim`）。逐行存一份，检索时 `WHERE embedding_dim = $n`
   /// 双保险（避免不同维度的向量被放进同一次距离比较）；也便于将来按维度建 ANN 索引。
-  embeddingDim Int?                  @map("embedding_dim")
-  meta      Json                        @default("{}") @db.JsonB
-  createdAt DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
+  embeddingDim Int?                   @map("embedding_dim")
+  meta         Json                   @default("{}") @db.JsonB
+  createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
 
   doc Document @relation(fields: [docId], references: [id], onDelete: Cascade)
 
@@ -1072,42 +1078,42 @@ model Sandbox {
 /// `@default(now())` 与 JS 侧边界相差一个时区偏移，而调度的比较正是 JS 侧边界
 /// （`nextRunAt <= now`）—— 写偏了就会整批早跑/晚跑一个时区（见 `06` §七 待决 8）。
 model ScheduledTask {
-  id        String @id @default(uuid(7)) @db.Uuid
+  id                 String             @id @default(uuid(7)) @db.Uuid
   /// owner（= 到点派活时那个会话的 `user_id`）。**唯一判据**：只有本人能看/改/删/执行
-  userId    String @map("user_id") @db.Uuid
+  userId             String             @map("user_id") @db.Uuid
   /// 目标 TaskAgent（建时校验 `type = TASK_AGENT` 且未软删；软删后停用、不再触发）
-  agentId   String @map("agent_id") @db.Uuid
-  name      String @db.VarChar(120)
+  agentId            String             @map("agent_id") @db.Uuid
+  name               String             @db.VarChar(120)
   /// 到点发给 TaskAgent 的指令正文（拼进那一轮的用户消息）
-  prompt    String @db.Text
+  prompt             String             @db.Text
   /// 5 段 cron（分 时 日 月 周）；合法性由 `shared/src/cron.ts` 唯一校验
-  cronExpr  String @map("cron_expr") @db.VarChar(120)
-  enabled   Boolean @default(true)
+  cronExpr           String             @map("cron_expr") @db.VarChar(120)
+  enabled            Boolean            @default(true)
   /// 无人值守时对**危险工具（MCP 破坏性操作）**的处置：`true` = 自动放行（按"已确认"），
   /// `false` = 一律拒绝。默认 `true`（定时任务本就要能干活；不想要的用户在任务里关掉）。
   /// ⚠️ 它与会话级 `chat.autoapprove` 是两码事：前者是**任务**的策略、随任务持久化，后者是运行时。
-  autoApprove Boolean @default(true) @map("auto_approve")
+  autoApprove        Boolean            @default(true) @map("auto_approve")
   /// 通知渠道（`01` 场景 1：定时获取信息后经企微/飞书等渠道通知我）。默认 `NONE` = 不通知。
-  notifyType NotifyType @default(NONE) @map("notify_type")
+  notifyType         NotifyType         @default(NONE) @map("notify_type")
   /// webhook 地址（**密文**，`infra/crypto.ts#encryptSecret`；含 key，绝不回显）。`NONE` 时为 `NULL`
-  notifyUrl String? @map("notify_url") @db.Text
+  notifyUrl          String?            @map("notify_url") @db.Text
   /// 飞书自定义机器人签名密钥（**密文**，可选）
-  notifySecret String? @map("notify_secret") @db.Text
+  notifySecret       String?            @map("notify_secret") @db.Text
   /// 通知模板（**明文**；占位符 `{{task}}/{{time}}/{{status}}/{{result}}`）。空 = 用内置默认
-  notifyTemplate String? @map("notify_template") @db.Text
+  notifyTemplate     String?            @map("notify_template") @db.Text
   /// 下一次该跑的时刻（**本地时区**，JS 侧计算并显式写入）；停用时置 `NULL`
-  nextRunAt DateTime? @map("next_run_at") @db.Timestamptz(3)
+  nextRunAt          DateTime?          @map("next_run_at") @db.Timestamptz(3)
   /// 最近一次开始运行的时刻
-  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(3)
-  lastRunStatus ScheduledRunStatus @default(NEVER) @map("last_run_status")
+  lastRunAt          DateTime?          @map("last_run_at") @db.Timestamptz(3)
+  lastRunStatus      ScheduledRunStatus @default(NEVER) @map("last_run_status")
   /// 最近一次运行产生的会话（去对话页看过程/产物）；从未跑过为 `NULL`。
   /// ⚠️ `ON DELETE SET NULL`：删会话不影响任务本身（只丢"最近一次"的定位）
-  lastConversationId String? @map("last_conversation_id") @db.Uuid
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  lastConversationId String?            @map("last_conversation_id") @db.Uuid
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent            Agent         @relation(fields: [agentId], references: [id], onDelete: Cascade)
   /// 最近一次运行的会话（可空；删会话时置 `NULL`，任务本身不受影响）
   lastConversation Conversation? @relation("ScheduledTaskLastRun", fields: [lastConversationId], references: [id], onDelete: SetNull)
 
@@ -1130,35 +1136,35 @@ model ScheduledTask {
 /// **只由保留期清理器做**（`sandbox/artifacts.ts#reapExpiredArtifacts`，
 /// `ARTIFACT_RETENTION_DAYS` 默认 7 天），不存在"会话一删文件就没了"的路径。
 model Artifact {
-  id String @id @default(uuid(7)) @db.Uuid
+  id             String   @id @default(uuid(7)) @db.Uuid
   /// 所属会话；**可空** = 会话已删（产物转为历史产物，`GET /api/artifacts/history` 查得到）
-  conversationId String? @map("conversation_id") @db.Uuid
+  conversationId String?  @map("conversation_id") @db.Uuid
   /// 产物归属用户（= 当时会话的 `conversations.user_id`，建行时从会话查一次写入）。
   /// ⚠️ 它是"我的历史产物"的**唯一判据**：删除会话后 `conversationId` 被置空，
   /// 只有这一列还能把产物归回给用户（`02` §三 的"产物 → 会话 → 本人"对历史产物不再成立）
-  userId String @map("user_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
   /// S3 对象键：`artifacts/{conversationId}/{uuid}/{安全化的文件名}`（uuid 是存储层随机段，
   /// 与 `document.service.ts` 的 `kb/...` 键同一条纪律：对象名不需要有序）
-  fileKey String @map("file_key") @db.VarChar(512)
+  fileKey        String   @map("file_key") @db.VarChar(512)
   /// 容器内相对 `/work` 的路径（子目录产物就是 `out/report.csv` 这种形态）
-  fileName String @map("file_name") @db.VarChar(512)
+  fileName       String   @map("file_name") @db.VarChar(512)
   /// 字节数（扫描时从 `find` 读到；上传用的 buffer 长度与之不一致时以实际读到的为准并 warn）
-  size Int
+  size           Int
   /// ⚠️ 产物 `Content-Type` 的**唯一来源**（`子方案④` §四）：P0-3-7 扫描时按扩展名定一次，
   /// 下载/预览端点不再看对象元数据、前端不看文件名后缀
-  mime String @db.VarChar(255)
+  mime           String   @db.VarChar(255)
   /// 预览就绪标记（P0-3-10 才有消费者；P0-3-7 恒写 `false`，列先按 `02` §三 落上）
-  previewReady Boolean @default(false) @map("preview_ready")
+  previewReady   Boolean  @default(false) @map("preview_ready")
   /// ⚠️ 由**调用方显式传入**（`artifacts.ts` 写行时传 JS 侧 `new Date()`）：本机 PG 会话
   /// 时区非 UTC 时 `@default(now())` 与 JS 侧边界相差一个时区偏移，而保留期清理
   /// （`createdAt < now - N 天`）正是 JS 侧边界比较 —— 写偏了保留期就整体偏一个时区。
   /// 默认值只是兜底（同 `Sandbox.createdAt` 的口径）。
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   /// ⚠️ `SetNull` 而不是 `Cascade`：删除会话**保留产物行**（历史产物，见上方的方案链接）。
   /// 行保留后由 `userId` 归回给用户 —— 这是 `delete 会话 → 产物还能查到` 的落点
   conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
-  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   /// P0-3-9 的产物列表（`GET /:id/artifacts`）扫描键
   @@index([conversationId, createdAt(sort: Desc)])
@@ -1233,6 +1239,13 @@ model UsageRecord {
   durationMs Int      @map("duration_ms")
   /// 引擎这一轮跑了几轮（`turn_start` 条数 = 模型请求次数）；`0` = 引擎一次都没开轮
   rounds     Int
+  /// 调用来源（P1-22 · X1）：`INTERNAL`（平台界面）/ `OPEN_API`（开放平台）。
+  /// ⚠️ 用 VarChar 而不是 enum：本表是**按月分区**表，加 enum 在多环境迁移里更容易卡住；
+  /// 取值域在 `shared#USAGE_CHANNELS`（服务层常量），库层只做默认值。
+  channel    String   @default("INTERNAL") @db.VarChar(16)
+  /// 仅 `OPEN_API` 行有值；内部行为 NULL（便于"按 Key 看用量"）。⚠️ 刻意**不是外键**：
+  /// Key 被硬删（级联）时计量行要保留（账不该被谁连带删掉，与 user/agent 两列的 RESTRICT 同源）。
+  openKeyId  String?  @map("open_key_id") @db.Uuid
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   agent Agent @relation(fields: [agentId], references: [id], onDelete: Restrict)
@@ -1246,7 +1259,62 @@ model UsageRecord {
   /// ⚠️ **刻意没有 `@@index([createdAt])`**：分区表上的索引是**分区本地**的，
   /// "某段时间的全局用量"由分区裁剪（partition pruning）完成，再挂一个时间索引只增写放大。
   /// ⚠️ 也**刻意没有 `@@index([model])`**：按型号聚合是 P1 报表的事，届时按实际查询形状再加。
+  /// 「一把 Key 的用量」（P1-22 X6 的日 token 计数与 `/open/v1/usage`）—— 时间窗口 + Key 的形状
+  @@index([openKeyId, createdAt(sort: Desc)])
   @@map("usage_records")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// open_api_keys（P1-22 开放平台；`docs/08-开放平台-智能体OpenAPI(APIKey).md` §4.1）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// open_api_keys —— 对外开放调用凭据（P1-22）
+///
+/// ★ 三元组 `(userId, agentId)`：用户给自己拥有的（或被授权管理的）智能体签发，
+///   一把 Key 只对应一个智能体，且**只能以该用户身份**操作。
+///   ⇒ 会话的 `user_id` 就是 `userId` 本人（Q1）：**不存在虚拟账号、不给 conversations 加列**（R5）。
+/// ★ 同一用户在同一 Agent 下的**多把 Key 共享会话池**（X5）⇒ 开放层列表 = `where {userId, agentId}`，
+///   与内部 `listConversationsForAgent` 完全同形状；轮换 Key 不丢会话。
+/// ★ 明文**只在创建那一刻**返回一次；本表只存 `sha256(明文)`（不可逆，与 `api_key_enc` 那类"能解密的密文"不同）。
+model ApiKey {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  agentId           String    @map("agent_id") @db.Uuid
+  name              String    @db.VarChar(64)
+  /// 展示用前缀（`oak_` + 8 字符），界面与日志里识别是哪把 Key
+  keyPrefix         String    @map("key_prefix") @db.VarChar(16)
+  /// 只存 **sha256(明文)**，不可逆
+  keyHash           String    @unique @map("key_hash") @db.Char(64)
+  /// 前端展示用的尾 4 位（如 `a9f3`），便于人眼对齐日志
+  keySuffix         String    @map("key_suffix") @db.VarChar(8)
+  /// 作用域（`shared#OPEN_API_SCOPES`）；空数组 = 无权限（等于停用，但语义不同）
+  scopes            String[]
+  /// Q12：过期时间；**null = 不过期**（允许，但界面默认建议填）
+  expiresAt         DateTime? @map("expires_at") @db.Timestamptz(3)
+  lastUsedAt        DateTime? @map("last_used_at") @db.Timestamptz(3)
+  /// 吊销（幂等、不可恢复）；吊销后外部立即进不来，历史仍在**平台界面**可见（Q5 + X2）
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(3)
+  /// Q7 + X7：是否允许这把 Key 打开会话级自动审批。**默认 true**（界面用危险色提示）
+  allowAutoApprove  Boolean   @default(true) @map("allow_auto_approve")
+  /// Q12：本 Key 的确认卡超时秒数（null = 用全局默认 `MCP_CONFIRM_TIMEOUT_SEC`）
+  confirmTimeoutSec Int?      @map("confirm_timeout_sec")
+  /// 单 Key 并发上限（默认 2；null = 用全局默认）
+  maxConcurrency    Int?      @map("max_concurrency")
+  /// 单 Key 每分钟请求上限（默认 120；null = 用全局默认）
+  rateLimitPerMin   Int?      @map("rate_limit_per_min")
+  /// X6：单 Key 日 token 上限；**0 / null = 不限**（防刷爆 provider 额度）
+  dailyTokenLimit   Int?      @map("daily_token_limit")
+  createdBy         String    @map("created_by") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user   User  @relation("ApiKeyOwner", fields: [userId], references: [id], onDelete: Cascade)
+  agent  Agent @relation("ApiKeyAgent", fields: [agentId], references: [id], onDelete: Cascade)
+  /// 签发人（ADMIN 代建时与 `userId` 不同；留痕用，不参与判权）
+  issuer User  @relation("ApiKeyIssuer", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@index([userId, agentId])
+  @@index([agentId, revokedAt])
+  @@map("open_api_keys")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1302,12 +1370,12 @@ model File {
 /// · `up_to_message_id` 是"小结覆盖到哪条消息"的游标（供将来增量更新；本批每轮整体重算并覆盖）；
 /// · `onDelete: Cascade` —— 会话没了，小结也随之消失（它是会话的**派生**物，不是独立资产）。
 model ConversationSummary {
-  id              String   @id @default(uuid(7)) @db.Uuid
-  conversationId  String   @unique @map("conversation_id") @db.Uuid
-  text            String   @db.Text
-  upToMessageId   String?  @map("up_to_message_id") @db.Uuid
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id             String   @id @default(uuid(7)) @db.Uuid
+  conversationId String   @unique @map("conversation_id") @db.Uuid
+  text           String   @db.Text
+  upToMessageId  String?  @map("up_to_message_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
@@ -1369,7 +1437,7 @@ model Workspace {
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   files        WorkspaceFile[]
   claims       WorkspaceClaim[]
   events       WorkspaceEvent[]
@@ -1525,14 +1593,14 @@ model GitCredential {
 /// 真实执行点在 **egress 代理容器**（容器在 internal bridge 上没有公网路由）；本表只是"平台声明"，
 /// 由 `egress-up.sh --watch` 轮询落成代理挂载的策略文件（≤ 同步间隔 + 5s 生效）。
 model EgressPolicy {
-  id         String   @id @default("default") @db.VarChar(32)
+  id         String      @id @default("default") @db.VarChar(32)
   /// 平台出网范围（P1-16a；默认 `ALL` = 全放行）。决定**基线放行集**，与下面两张表并列补充。
   scope      EgressScope @default(ALL) @map("scope")
   /// 白名单（`*` 或含 `*` 段 = 全放行）；空数组 = 未配白名单
-  allowHosts String[] @default([]) @map("allow_hosts")
+  allowHosts String[]    @default([]) @map("allow_hosts")
   /// 黑名单（命中即拒，优先级高于白名单）
-  denyHosts  String[] @default([]) @map("deny_hosts")
-  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  denyHosts  String[]    @default([]) @map("deny_hosts")
+  updatedAt  DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("egress_policy")
 }

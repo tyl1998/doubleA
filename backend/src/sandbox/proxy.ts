@@ -69,7 +69,12 @@ import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { McpAbortError } from '../mcp/errors.js'
-import { selectMcpInlineTools, type McpCatalogToolEntry } from '../mcp/gatewayModel.js'
+import {
+  findMcpArgumentIssues,
+  formatArgumentIssues,
+  selectMcpInlineTools,
+  type McpCatalogToolEntry,
+} from '../mcp/gatewayModel.js'
 import { isDangerousTool } from '../mcp/risk.js'
 import { parseToolCache } from '../mcp/toolCache.js'
 import { toDescription } from '../mcp/toolSchema.js'
@@ -243,6 +248,8 @@ async function computeSandboxMcpCatalog(
     serverName: ref.serverName,
     toolName: ref.toolName,
     description: ref.description,
+    // 目录要给出必填参数（网关模式下未注册的工具没有其它参数说明渠道）
+    inputSchema: ref.inputSchema,
     dangerous: isDangerousTool({ annotations: ref.annotations }),
   }))
   const pinned = new Set<string>()
@@ -311,6 +318,8 @@ function sandboxCatalogEntries(catalog: SandboxMcpCatalog): McpCatalogToolEntry[
     serverName: ref.serverName,
     toolName: ref.toolName,
     description: ref.description,
+    // 同上（`mcpCall.service.ts`）：容器侧也给不出未注册工具的定义 ⇒ 目录必须带 schema
+    inputSchema: ref.inputSchema,
     dangerous: isDangerousTool({ annotations: ref.annotations }),
   }))
 }
@@ -658,6 +667,24 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
           isError: true,
           text: `工具调用失败：本轮没有名为「${inner.data.name}」的工具。请先用 ${MCP_LIST_TOOLS_TOOL_NAME} 确认真实的工具名。`,
         })
+      }
+      /**
+       * ⚠️ 与 ChatBot 路径同一条本地体检（判据只在 `gatewayModel.ts#findMcpArgumentIssues`）：
+       * 容器侧同样看不到未注册工具的定义，`variables` 传成字符串这类调用要在**弹确认卡之前**
+       * 挡掉 —— 否则又是一次上游往返 + 一张危险确认卡，而模型只会换个缩进再试。
+       */
+      const argumentIssues = findMcpArgumentIssues(ref.inputSchema, inner.data.arguments ?? {})
+      if (argumentIssues.length > 0) {
+        getLogger().info(
+          {
+            conversationId: auth.record.conversationId,
+            agentId: auth.record.agentId,
+            toolName: ref.toolName,
+            issueCount: argumentIssues.length,
+          },
+          '沙箱经网关的调用参数与工具 schema 明显不符 ⇒ 本地拒绝（未发上游、未弹确认卡）',
+        )
+        return reply.send({ isError: true, text: formatArgumentIssues(argumentIssues) })
       }
       // 越权检查与 `/mcp/call` 同一条（清单是快照，绑定可能已改）
       const bound = await getPrisma().agentComponent.findFirst({

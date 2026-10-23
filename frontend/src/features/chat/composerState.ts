@@ -115,6 +115,11 @@ export interface ComposerInput {
   /** 草稿（只用于算 `canSend`；空草稿时按钮禁用，避免"点一下发现没反应"） */
   draft: string
   /**
+   * 服务端侧**还有一轮在跑，但本页没有它的事件流**（2026-10-22；`stores/chatStream.ts#serverRun`）。
+   * 缺省 `false` ⇒ 与引入前逐字一致（与 `steerable` 同款：缺省值即历史行为）。
+   */
+  serverRunning?: boolean
+  /**
    * 本会话是否支持**中途插话**（P1-9 · P4 · R1；**P1-20 起两种会话都支持**）。
    * 判据在页面（现在恒为 `true`）；缺省 `false` ⇒ 与引入前逐字一致（`view.steer` 恒隐藏）。
    * ⚠️ 真正的"能不能插"仍由本状态机决定：只在 `streaming`（正在生成）且草稿非空时放出。
@@ -158,7 +163,7 @@ const TEXT = {
  *   ④ `sending` —— 上面那段"建会话/建流"的空窗（`round` 还不存在，但它已经不是 `idle` 了）。
  */
 export function composeState(input: ComposerInput): ComposerView {
-  const { round, sending, stopping, draft, steerable = false } = input
+  const { round, sending, stopping, draft, steerable = false, serverRunning = false } = input
 
   // ① confirm：锁输入（优先级最高）
   if (round !== null && round.confirm !== null) {
@@ -218,6 +223,25 @@ export function composeState(input: ComposerInput): ComposerView {
       ...TEXT.sending,
       led: 'run',
       label: 'sending',
+    }
+  }
+
+  // ④′ **服务端在跑但本页没有这一轮**（2026-10-22）：切走再切回 / 刷新后进入 / **外部
+  //    Open API 调用**与定时任务后台运行。✅ 这一轮**不归本页** ⇒ 主按钮不能给「停止」
+  //    （没有可收口的流，点了只会发一个无法确认的信号），发送也禁用（服务端有锁，发必冲突）。
+  //    早先这里直接落到 `idle`，界面上看不出"它还在跑"—— 用户只能从消息流末尾那行状态里读出来。
+  if (serverRunning) {
+    return {
+      state: 'streaming',
+      canType: true,
+      canSend: false,
+      locked: false,
+      primary: { kind: 'busy', label: '正在生成…', disabled: true, action: null },
+      steer: HIDE_STEER,
+      placeholder: '正在生成（不是本页发起），可以先构思下一条…',
+      hint: '这一轮由别处发起（外部调用 / 定时任务 / 另一个窗口），结束后即可继续',
+      led: 'run',
+      label: 'streaming',
     }
   }
 

@@ -1,10 +1,23 @@
 /**
  * 观察一条会话的**活跃运行**（P1-6 方案 A）—— 把"不是本页发起的那一轮"实时画出来。
  *
- * 依据：`docs/03` §4.1、`docs/02` §5.2。场景：定时任务到点或"立即执行"时，后端在**后台**跑一轮
+ * 依据：`docs/03` §4.1、`docs/02` §5.2。典型场景：定时任务到点或"立即执行"时，后端在**后台**跑一轮
  * （`scheduledRun.ts`），帧发进**帧总线**（`frameBus`）。本 hook 打开
  * `GET /api/conversations/:id/stream` 订阅那条会话的帧，并喂进 `chatStream` store
  * —— 于是用户打开那个会话窗口就能看到实时内容，而不是等落库。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * ★ 帧**不带来源** ⇒ 文案必须问 `/active`（2026-10-22 修）
+ * ─────────────────────────────────────────────────────────────────────
+ * 帧总线对所有发起方一视同仁：界面里的 `/chat`、开放层 `/open/v1/**` 的第三方调用、定时任务的
+ * 后台运行写进去的是**同一种帧**，`SseEvent` 里没有任何来源字段。早先这里把占位正文写死成
+ * "（定时任务正在运行…）"，于是**通过 Open API 调用的会话**在聊天页里也被显示成定时任务执行中
+ * —— 帧没有说谎，是文案在替它编来源。
+ *
+ * 现在的口径：占位正文按 `/active` 回来的 `startedBy` 说人话（`SCHEDULED` / `OPEN_API` / `UI`），
+ * 读不到（旧后端、值坏）就退成中性的"这一轮正在生成…"，**绝不**默认说成定时任务。
+ * ⚠️ `/active` 是**观察开始时**读一次（这一轮的发起方不会中途变），失败不拦观察：
+ *    帧照喂、正文用中性占位 —— 宁可少说一句，也不误报来源。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ★ 与"本页自己发起的那一轮"互斥（防重复画两遍）
@@ -27,16 +40,51 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 
+import type { ConversationRunOrigin } from '@doubulea/shared'
+
 import {
   conversationMessagesQueryKey,
+  fetchConversationActive,
   streamConversationWatch,
 } from '../../api/conversations.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
 import { roundOf, useChatStreamStore } from '../../stores/chatStream.js'
 import { reportSseIssue } from './chatStream.js'
 
-/** 观察产生的轮次用的占位用户文案（很快会被落库的历史替换） */
-const WATCH_PLACEHOLDER = '（定时任务正在运行…）'
+/**
+ * 观察产生的轮次用的占位用户文案（很快会被落库的历史替换）。
+ *
+ * ⚠️ **按来源分文案**：这段文字是用户在聊天页里唯一能看到的"这一轮从哪来"的线索，
+ * 写死一句就等于把外部调用、别的窗口发起的轮次全都说成定时任务（2026-10-22 的 bug）。
+ * 来源不明时用中性措辞 —— 少说，但不能说错。
+ */
+export function watchPlaceholderText(origin: ConversationRunOrigin | null | undefined): string {
+  switch (origin) {
+    case 'SCHEDULED':
+      return '（定时任务正在运行…）'
+    case 'OPEN_API':
+      return '（外部调用正在运行…）'
+    case 'UI':
+      return '（另一处界面正在生成…）'
+    default:
+      return '（这一轮正在生成…）'
+  }
+}
+
+/**
+ * 观察开始时读一次"这一轮是谁发起的"。**永不抛错**：读不到就返回 `null`（= 中性文案）。
+ *
+ * 为什么要读 `/active` 而不是从流里拿：帧里没有来源字段（见文件头），而 `/active` 的
+ * `startedBy` 由**发起方**写进锁里（`orchestrator/sse.ts` / `scheduledRun.ts`）。
+ */
+async function readWatchOrigin(conversationId: string): Promise<ConversationRunOrigin | null> {
+  try {
+    const active = await fetchConversationActive(conversationId)
+    return active.startedBy
+  } catch {
+    return null
+  }
+}
 
 export function useConversationWatch(conversationId: string | undefined): void {
   const queryClient = useQueryClient()
@@ -61,6 +109,9 @@ export function useConversationWatch(conversationId: string | undefined): void {
 
     void (async () => {
       try {
+        // 先问来源（一次只读 GET），再开流：这样第一帧到达时占位文案已经是对的
+        const origin = await readWatchOrigin(conversationId)
+        if (controller.signal.aborted) return
         await streamConversationWatch(
           conversationId,
           {
@@ -78,7 +129,7 @@ export function useConversationWatch(conversationId: string | undefined): void {
                 // 第一帧：开一轮（占位正文），此后由上面的 `opened` 分支继续喂
                 useChatStreamStore
                   .getState()
-                  .begin(conversationId, WATCH_PLACEHOLDER, new Date().toISOString(), 'send')
+                  .begin(conversationId, watchPlaceholderText(origin), new Date().toISOString(), 'send')
                 opened = true
                 useChatStreamStore.getState().apply(conversationId, event)
               }

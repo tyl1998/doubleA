@@ -102,6 +102,9 @@ export async function runScheduledTaskTurn(input: {
   const locked = await acquireConversationLock(conversationId, {
     ...EMPTY_ACTIVE_SNAPSHOT,
     startedAt,
+    // 发起方（2026-10-22）：定时任务是**唯一**没有 HTTP 客户端的发起方 ⇒ 观察者要能据此
+    // 如实显示"定时任务正在运行"，而不是把别的来源（外部 Open API 调用）也说成定时任务。
+    startedBy: 'SCHEDULED',
   })
   if (!locked) {
     clearTimeout(timeoutTimer)

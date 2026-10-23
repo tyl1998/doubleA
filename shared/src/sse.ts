@@ -93,6 +93,16 @@ export const SSE_EVENT_NAMES = [
   'tool_output',
   /** elicitation：弹确认卡，流挂起等 `/confirm` */
   'confirm',
+  /**
+   * 确认**已结束**（`confirm_resolved`，2026-10-22）：这次提问不再等人。
+   *
+   * 为什么需要它：`confirm` 帧只是一个"现在有提问"的开始信号，而**结束**可能由三个来源发生 ——
+   * 本端点了确认/取消、**对面（第三方代理）替用户点了**、或超时/被中断。早先前端只在自己
+   * 点过之后才撤卡（`ChatPage#handleConfirmAnswer` 的 `finally`），于是"对方已确认、我们这边
+   * 都收到工具结果了，确认卡还挂在输入区锁着"——直到整轮流结束才消失（用户实测反馈）。
+   * ⇒ 服务端在 `awaitConfirm` 结束时**必发**这一帧，前端按 `confirmId` 收卡。
+   */
+  'confirm_resolved',
   /** 本轮知识库引用 */
   'citations',
   /** TaskAgent 产出文件 */
@@ -127,6 +137,7 @@ export const SSE_EVENT_NAMES = [
   'error',
 ] as const
 export type SseEventName = (typeof SSE_EVENT_NAMES)[number]
+
 
 /** 流结束原因（`02` §5.1 的 `done.finishReason`）；`ERROR` 当前无产生路径，见文件头 ③ */
 export const CHAT_FINISH_REASONS = ['COMPLETE', 'STOPPED', 'ERROR'] as const
@@ -250,8 +261,30 @@ export const sseConfirmPayloadSchema = z.object({
   inputSummary: z.string(),
   /** 服务端等待的截止时刻（ISO 8601）—— 前端倒计时**只**读它，不自己另起一个 120s */
   expiresAt: z.string(),
+  /**
+   * 这次问的是**重复执行**（同一轮里同名同参的危险工具已经成功执行过一次）。
+   * 前端据此把措辞换成"这会再执行一次"，并建议默认取消；缺省 = 普通确认。
+   */
+  duplicate: z.boolean().optional(),
 })
 export type SseConfirmPayload = z.infer<typeof sseConfirmPayloadSchema>
+
+/**
+ * `confirm_resolved`：一次确认提问的**终局**（与 `confirm` 成对，见 {@link SSE_EVENT_NAMES}）。
+ *
+ * `decision` 是服务端那一侧的结论（不是"谁点的"）：
+ *   · `CONFIRMED` / `REJECTED` —— 有人答了（可能是本端，也可能是第三方代理）；
+ *   · `TIMEOUT` —— 到点没人答，服务端按取消处理；
+ *   · `ABORTED` —— 这一轮被中断（停止 / 断连），提问作废。
+ *
+ * ⚠️ 前端**只**用它来撤卡（以及把倒计时置为结束态）；它不携带任何执行结果 ——
+ *    执行结果是随后的 `tool_call` 帧。
+ */
+export const sseConfirmResolvedPayloadSchema = z.object({
+  confirmId: z.string().min(1),
+  decision: z.enum(['CONFIRMED', 'REJECTED', 'TIMEOUT', 'ABORTED']),
+})
+export type SseConfirmResolvedPayload = z.infer<typeof sseConfirmResolvedPayloadSchema>
 
 /**
  * `citations`：本轮知识库引用（文档名 + 片段原文 + 分数；`01` 决策 12）。
@@ -377,6 +410,7 @@ export const SSE_PAYLOAD_SCHEMAS = {
   tool_call: sseToolCallPayloadSchema,
   tool_output: sseToolOutputPayloadSchema,
   confirm: sseConfirmPayloadSchema,
+  confirm_resolved: sseConfirmResolvedPayloadSchema,
   citations: sseCitationsPayloadSchema,
   artifact: sseArtifactPayloadSchema,
   queued: sseQueuedPayloadSchema,

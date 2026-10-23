@@ -770,6 +770,21 @@ const envSchema = z
      * ⚠️ 它只影响"下发面"，不影响"能不能调"：走网关时**全部工具仍然可调**，只是要知道名字。
      */
     MCP_INLINE_TOOL_LIMIT: intVar('MCP_INLINE_TOOL_LIMIT', 24, { min: 0, max: 512 }),
+    /**
+     * 开放平台（P1-22）的**全局默认限额** —— Key 上的同名列可覆盖，缺省走这里。
+     *
+     * 为什么是"全局默认 + Key 覆盖"而不是只放 Key 上：新签的 Key 不该逼着填写四个数字
+     * （绝大多数人用默认值），而运维要能一刀调整全平台的天花板（改 env 重启，不用逐把 Key 改库）。
+     * ⚠️ `OPEN_API_DAILY_TOKEN_LIMIT` 的 `0` = **不限**（不是"不能用"）—— 与界面语义一致。
+     */
+    OPEN_API_MAX_CONCURRENCY: intVar('OPEN_API_MAX_CONCURRENCY', 2, { min: 1, max: 20 }),
+    OPEN_API_RATE_LIMIT_PER_MIN: intVar('OPEN_API_RATE_LIMIT_PER_MIN', 120, { min: 1, max: 6000 }),
+    OPEN_API_DAILY_TOKEN_LIMIT: intVar('OPEN_API_DAILY_TOKEN_LIMIT', 0, { min: 0, max: 1_000_000_000 }),
+    /**
+     * 开放层的**审计采样**：每次 `/open/**` 已由 `onResponse` 记一行；这里只在"出事"时补一条
+     * 结构化审计（4xx 拒绝 / 429 / 鉴权失败）。默认开（量小、可查），设为 false 只留访问日志。
+     */
+    OPEN_API_KEY_CACHE_TTL_SEC: intVar('OPEN_API_KEY_CACHE_TTL_SEC', 60, { min: 0, max: 600 }),
 
     // ── 知识库流水线（子方案① §二 参数总表）──
     CHUNK_SIZE_DEFAULT: intVar('CHUNK_SIZE_DEFAULT', 512),
@@ -1063,6 +1078,22 @@ export interface AppConfig {
     toolLimit: number
     /** 直接下发给模型的 MCP 工具**总数**上限；超过则走工具网关（P1-19） */
     inlineToolLimit: number
+  }
+  /**
+   * 开放平台（P1-22）：Key 未填时的**全局默认限额**（`open_api_keys` 的同名列可覆盖）。
+   *
+   * 四个值的消费方只有一个（`plugins/openAuth.ts#effectiveOpenLimits`）—— 于是"Key 没填时到底
+   * 用多少"不会在路由、服务、报表三处各算一遍。
+   */
+  openApi: {
+    /** 单 Key 并发 `/chat` 上限（默认 2） */
+    maxConcurrency: number
+    /** 单 Key 每分钟请求上限（默认 120） */
+    rateLimitPerMin: number
+    /** 单 Key 日 token 上限（**0 = 不限**） */
+    dailyTokenLimit: number
+    /** 校验链 Key 快照的缓存 TTL（秒）；0 = 不缓存（每请求查库） */
+    keyCacheTtlSec: number
   }
   limits: {
     uploadBodyLimitRaw: string
@@ -1395,6 +1426,12 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       toolLimit: vars.MCP_TOOL_LIMIT,
       inlineToolLimit: vars.MCP_INLINE_TOOL_LIMIT,
     },
+    openApi: {
+      maxConcurrency: vars.OPEN_API_MAX_CONCURRENCY,
+      rateLimitPerMin: vars.OPEN_API_RATE_LIMIT_PER_MIN,
+      dailyTokenLimit: vars.OPEN_API_DAILY_TOKEN_LIMIT,
+      keyCacheTtlSec: vars.OPEN_API_KEY_CACHE_TTL_SEC,
+    },
     limits: {
       uploadBodyLimitRaw: vars.UPLOAD_BODY_LIMIT.raw,
       uploadBodyLimitBytes: vars.UPLOAD_BODY_LIMIT.bytes,
@@ -1535,6 +1572,7 @@ export function describeConfig(value: AppConfig): Record<string, unknown> {
     },
     llm: value.llm,
     mcp: value.mcp,
+    openApi: value.openApi,
     scheduledTask: value.scheduledTask,
     memory: value.memory,
     workspace: value.workspace,

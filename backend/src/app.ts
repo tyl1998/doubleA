@@ -19,7 +19,11 @@ import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } 
 import { config } from './config.js'
 import { enterRequestContext, genReqId, logger } from './infra/logger.js'
 import { installErrorHandler } from './plugins/errorHandler.js'
+import { installOpenApiAuth } from './plugins/openAuth.js'
 import { installPasswordChangeGate, installSession } from './plugins/session.js'
+import { registerOpenApiDocRoutes } from './routes/openDoc.js'
+import { registerOpenApiRoutes } from './routes/open/index.js'
+import { registerOpenApiKeyRoutes } from './routes/openKeys.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerActivityRoutes } from './routes/activity.js'
 import { registerAgentRoutes } from './routes/agents.js'
@@ -114,6 +118,11 @@ export function buildApp(): FastifyInstance {
   // ④ 首登强制改密闸门（P0-1-7；`02` §4.1 注记）：根级 preHandler，拦「除 /auth/{login,logout,me,password}
   //    之外的所有 /api/**」。挂在根上是刻意的 —— 逐个业务路由去挂迟早会漏一个，而漏掉的就是缺口。
   installPasswordChangeGate(app)
+
+  // ④′ 开放平台鉴权（P1-22）：`request.open` 装饰器 + `requireOpenApi` 工厂。
+  //    它是 `/open/v1/**` 的**唯一**鉴权入口（不读 Cookie），与 ③ 的会话链互不可替代；
+  //    首登改密闸门只拦 `/api/**` ⇒ `/open/**` 天然不经过（`docs/08` §2）。
+  installOpenApiAuth(app)
 
   // ⑤ 访问日志：默认那两条（incoming/request completed）已关掉，这里只留一条带耗时的，
   //    用 request.log 是为了尊重路由级 logLevel（如 /health 设为 warn，不打点也不刷屏）
@@ -240,6 +249,22 @@ export function buildApp(): FastifyInstance {
   //    权限 **仅 ADMIN**（平台级配置，与 egress 策略同族）。未配置 / 调用不通时，会话标题
   //    一律回落 `persist.ts` 里那条确定性截断（`deriveConversationTopic`）。
   registerTitleModelRoutes(app)
+
+  // ㉔ 开放平台（P1-22）：内部管理三条（Cookie + 行级权限）+ 对外 17 条（`/open/v1/**`，Key 鉴权）。
+  //    内部三条与 `registerAgentRoutes` 同族（行级判定在服务层），**不是** `(A)`：受众也要能给自己签 Key。
+  registerOpenApiKeyRoutes(app)
+  //    ⚠️ 对外族**不挂** `requireAuth`：它只认 `Authorization: Bearer oak_…`；路径前缀不同 ⇒ 与内部
+  //    会话链互不可替代。`/open/v1/conversations/:id/{chat,regenerate,stream}` 在网关侧是**粘性**的
+  //    （`shared/src/router.ts#classifyRoute`），不改粘性表多机下 SSE 会落错实例。
+  registerOpenApiRoutes(app)
+
+  /**
+   * ⑦′ 开放平台文档（P1-22 · B4；`docs/08` §9）：
+   *   · `GET /open/v1/openapi.json` —— **入库的那份 spec**（`openapi/open-v1.json` 就是它，CI 比对）；
+   *   · `GET /open/v1/docs` —— 极简文档站（读同一份 JSON，无 CDN、无额外依赖）。
+   * 两者都**不要 Key**（公开的契约），且路径在 `/open/v1` 下 ⇒ 网关侧是轮询路由（无状态）。
+   */
+  registerOpenApiDocRoutes(app)
 
   return app
 }

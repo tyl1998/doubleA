@@ -1,0 +1,87 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 开放平台 `/open/v1` 的反向代理样例（**P1-22 · B4**；`docs/08` §11 的「长连接被中间件掐断」缓解）
+#
+# 用法：把 `server` 段里的地址改成你的部署（单机后端，或多机时的**路由网关**），
+#      然后 `include` 到你的 `http {}` 里。**改地址不改本文件的结构**。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 三个必须注意的点（不看会踩）
+# ─────────────────────────────────────────────────────────────────────────────
+# ① **SSE 不能缓冲**：`/open/v1/conversations/{id}/{chat,stream,regenerate}` 是 `text/event-stream`。
+#    `proxy_buffering off` + `proxy_cache off` + 清掉 `Connection` 头是硬要求 —— 否则客户端会看到
+#    "一条回答在结束时一次性吐出"，或者干脆等到超时才收到。
+# ② **读超时要长**：一轮对话可能要几分钟（尤其是 `confirm` 等人工审批，上限按 Key 配，
+#    默认 120s、可到 3600s）。`proxy_read_timeout` 必须大于「最长确认超时 + 模型时长」，
+#    这里给 30 分钟；小于它就会在审批还没点头时把连接掐掉。
+# ③ **粘性在网关层已做**：多机部署时 `/open/v1/conversations/:id/{chat,regenerate,stream}`
+#    必须落到**同一台**后端（帧总线是进程内的）。本文件只负责"透传到上游"，
+#    上游地址应指向 `infra/docker-compose.router.yml` 起的**路由网关**（它按会话粘性转发），
+#    **不要**在 nginx 里再写一套 `upstream` 轮询到各业务后端 —— 那会绕开粘性。
+#
+# ⚠️ 本文件是**样例**：仓库没有自动化去加载它（nginx 是部署方的事）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.example.com;
+
+    # 证书按你的环境给（这里不写死路径）
+    # ssl_certificate     /etc/nginx/certs/api.crt;
+    # ssl_certificate_key /etc/nginx/certs/api.key;
+
+    # 附件上传：`POST /open/v1/files` 走 multipart，默认 1m 太小
+    client_max_body_size 60m;
+
+    # ── 公共头（所有 /open/v1 请求）─────────────────────────────────────────
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # `Authorization: Bearer oak_…` 与 `X-API-Key` 原样透传（nginx 默认就透传，这里写出来是为了显式）
+    proxy_pass_request_headers on;
+
+    # ── 普通 JSON 端点 ──────────────────────────────────────────────────────
+    # `/open/v1/agent`、`/open/v1/conversations`（GET/POST）、`…/messages`、`…/active`、
+    # `…/stop`、`…/steer`、`…/confirm`、`…/auto-approve`、`/open/v1/files`、`/open/v1/usage`
+    location /open/v1/ {
+        proxy_pass http://127.0.0.1:13001;   # ← 路由网关（多机）或业务后端（单机）
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    120s;
+        proxy_buffering off;                 # 统一关：这几条里混着 SSE，见 ①
+        proxy_cache off;
+        proxy_set_header Connection "";      # 让上游保持长连接（SSE 不被中间件复用干扰）
+    }
+
+    # ── SSE：chat / stream / regenerate ────────────────────────────────────
+    # 用正则 location 覆盖，避免"上面那条被优先匹配"
+    location ~ ^/open/v1/conversations/[^/]+/(chat|stream|regenerate)$ {
+        proxy_pass http://127.0.0.1:13001;
+        proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    30m;           # 见 ②
+        proxy_read_timeout    30m;
+        proxy_buffering off;
+        proxy_cache off;
+        # SSE 的两种常见"被中间件吃掉"的来源：gzip 与 chunked 重写
+        gzip off;
+        chunked_transfer_encoding on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";  # 别让 nginx 给 SSE 做压缩缓冲
+        add_header X-Accel-Buffering no always;
+    }
+
+    # ── 文档（公开，无需 Key）───────────────────────────────────────────────
+    location = /open/v1/docs {
+        proxy_pass http://127.0.0.1:13001;
+        proxy_read_timeout 30s;
+    }
+    location = /open/v1/openapi.json {
+        proxy_pass http://127.0.0.1:13001;
+        proxy_read_timeout 30s;
+        # spec 是静态契约，可缓存 5 分钟（改契约会发版，不必逐请求回源）
+        proxy_cache_valid 200 5m;
+    }
+}

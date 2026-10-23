@@ -891,6 +891,17 @@ export interface ChatSendContext {
    * 的结果 ⇒ 编排层拿到的就是可以直接拼进报文的内容，不必再碰 S3 / 解析器。
    */
   attachments: ChatAttachmentContext[]
+  /**
+   * 本轮由**哪把开放平台 Key** 发起（**P1-22**）：`undefined` = 内部界面发起。
+   *
+   * ⚠️ 它**不是权限判据**（判据全是 `viewer.id`，见文件头 ①）：它只往下游透传两件事 ——
+   * `usage_records.channel='OPEN_API' / open_key_id`（X1 的分内外与按 Key 归集），
+   * 以及确认卡超时按 Key 覆盖（`docs/08` §4.1）。两条都由开放层在闸门之后补进来，
+   * 内部路径不传 ⇒ 行为与从前逐字一致。
+   */
+  openKeyId?: string
+  /** 本轮确认卡超时（秒）；仅开放层会传（Key 配了 `confirmTimeoutSec` 时），否则用全局默认 */
+  confirmTimeoutSec?: number
 }
 
 /** 只做归属校验（观察端点 `GET /:id/stream` 用：仅本人能看这条会话的帧流）；不是我的 / 不存在都 404 */

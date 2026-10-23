@@ -30,6 +30,7 @@ import type { FastifySchemaValidationError } from 'fastify'
 import { ZodError, type ZodSchema } from 'zod'
 
 import { getLogger } from '../infra/logger.js'
+import { auditOpenApiRejection } from './openAuth.js'
 
 /** 字段级错误明细：进信封 `data.fields`，前端据此定位到具体输入框（`03` §六 错误码映射层） */
 export interface FieldIssue {
@@ -200,6 +201,10 @@ export function installErrorHandler(app: FastifyInstance): void {
     } else {
       logger.warn({ err: error, status, code: appError.code }, `${request.method} ${request.url} 被拒绝`)
     }
+
+    // 开放平台（P1-22）：审计必须在**这一处**（而不是各开放路由里各写一遍）——
+    // 于是"哪个端点忘了记审计"在结构上不可能发生（`docs/08` §8 的审计要求）。
+    if (request.url.startsWith('/open/')) auditOpenApiRejection(request, appError.code, { status })
 
     void reply.status(status).send(envelope)
   })

@@ -353,6 +353,55 @@ export function chatSteerKey(conversationId: string): string {
  */
 export const CHAT_STEER_TTL_SEC = 60
 
+// ═════════════════════════════ 开放平台（P1-22）═════════════════════════════
+
+/**
+ * `open:key:{sha256}` —— 开放平台 Key 的**校验快照缓存**（`docs/08` §5.2 第 ③ 步）。
+ *
+ * 值是鉴权链需要的全部字段的 JSON（见 `plugins/openAuth.ts#OpenKeySnapshot`）。三条口径：
+ *   · **键是明文哈希**（不是 Key id）：请求里只有明文，用它一次 sha256 就能直接命中，
+ *     不必先查库/查 id —— 也不存在"猜 id"这回事；
+ *   · **吊销/改 scope 时必须删键**（`services/openApiKey.service.ts`），否则最长
+ *     `OPEN_API_KEY_CACHE_TTL_SEC` 内旧 Key 仍然可用 —— 这是"吊销立即生效"的唯一保证；
+ *   · TTL 到点自然失效 ⇒ 过期 / 用户被停用 / Agent 被软删 / 被转移 这些**外部状态**的收窄
+ *     最多晚 TTL 秒（`docs/08` §4.4 已定案接受，TTL 默认 60s 与用户快照缓存同一口径）。
+ */
+export function openApiKeyCacheKey(keyHash: string): string {
+  return `open:key:${keyHash}`
+}
+
+/** `open:conc:{keyId}` —— 单 Key **并发 /chat** 计数（超限 429 BUSY） */
+export function openApiConcurrencyKey(keyId: string): string {
+  return `open:conc:${keyId}`
+}
+
+/** 并发计数的兜底 TTL（秒）：进程被杀时计数要能自己归零，否则这把 Key 会永久 429 */
+export const OPEN_API_CONCURRENCY_TTL_SEC = 3600
+
+/** `open:rpm:{keyId}:{minute}` —— 单 Key 每分钟请求数（固定窗口） */
+export function openApiRateLimitKey(keyId: string, minuteStartSec: number): string {
+  return `open:rpm:${keyId}:${minuteStartSec}`
+}
+
+/** 请求计数的 TTL（秒）：一个窗口 + 余量即可（窗口键本身就带分钟号，多留一分钟只为时钟边界） */
+export const OPEN_API_RATE_LIMIT_TTL_SEC = 120
+
+/** `open:day:tok:{keyId}:{YYYY-MM-DD}` —— 单 Key 当日 token 累计（X6） */
+export function openApiDailyTokenKey(keyId: string, day: string): string {
+  return `open:day:tok:${keyId}:${day}`
+}
+
+/** 日 token 计数的 TTL（秒）：两天（跨零点不丢当天，过期自然滚掉） */
+export const OPEN_API_DAILY_TOKEN_TTL_SEC = 2 * 24 * 3600
+
+/** `open:idem:{keyId}:{idempotencyKey}` —— 建会话的幂等结果（24h，`docs/08` §6.1） */
+export function openApiIdempotencyKey(keyId: string, idempotencyKey: string): string {
+  return `open:idem:${keyId}:${idempotencyKey}`
+}
+
+/** 幂等结果的保留时长（秒）= 24 小时（`docs/08` §6.1 的约定值） */
+export const OPEN_API_IDEMPOTENCY_TTL_SEC = 24 * 3600
+
 /**
  * `workspace.round.start:{conversationId}` —— 工作区**本轮起点**标记（P1-9 · P4 · R2）。
  *

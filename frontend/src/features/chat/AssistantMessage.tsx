@@ -20,6 +20,7 @@
  */
 
 import { memo, useEffect, useState } from 'react'
+import type { ConversationRunOrigin } from '@doubulea/shared'
 
 import { useFeedback } from '../../app/feedback.js'
 import { ArtifactCard } from './ArtifactCard.js'
@@ -47,6 +48,11 @@ export interface AssistantMessageProps {
   serverRunning?: boolean
   /** 服务端那条流的开始时刻（ISO；`null`/缺省 ⇒ 只显示"正在生成"，不算已用时） */
   serverStartedAt?: string | null
+  /**
+   * 这一轮**是谁发起的**（2026-10-22；`/active.startedBy`）：定时任务 / 外部 Open API 调用 /
+   * 另一个窗口。这一行是用户唯一能看到"它从哪来"的地方，**不许**再写死成定时任务。
+   */
+  serverRunOrigin?: ConversationRunOrigin | null
 }
 
 /** token 用量 → 一行文案；两个数各自可空（`usage.tokensIn` 是 `number | null`） */
@@ -95,6 +101,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   onRegenerate,
   serverRunning = false,
   serverStartedAt = null,
+  serverRunOrigin = null,
 }: AssistantMessageProps) {
   const feedback = useFeedback()
   const [copying, setCopying] = useState(false)
@@ -181,7 +188,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           只说"还在跑"，不编造正文 / 工具进度（那些帧没有经过本页）。 */}
       {serverRunning && view.status !== 'streaming' ? (
         <p className="msg__streaming ratio" data-testid="server-streaming-status">
-          服务端仍在生成这一轮
+          {serverRunStatusText(serverRunOrigin)}
           <ServerElapsed startedAt={serverStartedAt} />
         </p>
       ) : null}
@@ -223,6 +230,26 @@ export const AssistantMessage = memo(function AssistantMessage({
     </article>
   )
 })
+
+/**
+ * 尾部那句"服务端还在跑"的**来源**（2026-10-22）：文案必须与真正发起方一致。
+ *
+ * 为什么不能只写"服务端仍在生成这一轮"：用户看到一条不断变长的回答却不知道是谁在跑 ——
+ * 而最常见的两种情形（定时任务、外部 Open API 调用）**本页都停不掉**，说清楚比含糊更好。
+ * `null`（旧后端 / 值坏）= 来源不明，用中性措辞，**不猜**。
+ */
+function serverRunStatusText(origin: ConversationRunOrigin | null): string {
+  switch (origin) {
+    case 'SCHEDULED':
+      return '定时任务正在后台运行这一轮'
+    case 'OPEN_API':
+      return '外部调用正在生成这一轮'
+    case 'UI':
+      return '另一个窗口正在生成这一轮'
+    default:
+      return '服务端仍在生成这一轮'
+  }
+}
 
 /**
  * 流式进度行：`statusText`（后端 `status` 事件：模型在思考 / 根据工具结果继续…）+ 秒级计时器。

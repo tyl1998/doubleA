@@ -1,6 +1,15 @@
 # 开放平台：智能体 OpenAPI（API Key + SSE）
 
-> **状态**：方案稿（2026-10-20 初稿 / **2026-10-21 决策已定稿**，未开工）。
+> **状态**：**已落地**（2026-10-20 初稿 / 2026-10-21 决策定稿 / **2026-10-22 B1–B3 实现**）。
+> 落地物：迁移 `20261022150000_open_api_keys`、`shared/src/openApi.ts`、`plugins/openAuth.ts`、
+> `services/openApiKey.service.ts`、`routes/openKeys.ts`（内部 3 条）、`routes/open/{index,shared}.ts`（对外 17 条）；
+> 前端「开放调用」区块：`frontend/src/api/openKeys.ts` + `pages/agents/OpenApiKeysSection.tsx` + `AgentFormPage` 的 `05 / 开放调用`。
+> 自证：`pnpm openapi:regression`（19 项）+ `pnpm openapi:check`（6 项）+ `router:regression`（60 项）+ `pnpm verify:open-api-ui`（13 项）。
+> **B4 已落地**：契约源 = `backend/src/openapi/openV1Spec.ts` 的 `OPEN_ROUTE_DOCS`（17 条）；
+> 导出 `pnpm openapi:export` → 入库的 `openapi/open-v1.json`；文档站 `GET /open/v1/docs`；
+> 防漂移三条 `openapi:check`（入库文件一致 / security+scope / operationId）+ `openapi-regression` A5–A7；
+> nginx 样例 `infra/nginx/open-v1.conf.example`；curl 冒烟 `pnpm openapi:smoke`。
+> ⚠️ **`@fastify/swagger` 最终没有采用**（原因见 §9 的实测记录）—— 它在本仓 zod 校验器下扫不动路由 schema。
 > **一句话**：用户在某智能体的「开放调用」页给自己签发一把 Key，外部系统拿 Key 就能
 > **定位到"这个用户 × 这个智能体"** → 建会话 → 走 SSE 拿回答；不需要平台登录态，
 > 也不碰平台内部的 `/api/*` 会话链路。
@@ -451,7 +460,7 @@ curl -s -X POST https://<host>/open/v1/files -H "Authorization: Bearer $KEY" -F 
 
 | 位置 | 能力 |
 |------|------|
-| 智能体编辑页 → 「开放调用」Tab | 列出**我**在该 Agent 下的 Key（名称/前缀尾 4 位/作用域/过期/最后使用/状态）；**新建** 弹窗（名称、作用域预设、过期时间 Q12、并发 / RPM / 日 token 上限 X6、允许自动审批 X7）；**吊销**确认框（提示"吊销后外部立即无法访问，历史仍在平台可见"）；创建后**一次性**弹明文 + 复制按钮 |
+| **我的凭据 → 「开放调用」Tab**（`/settings/credentials?section=openapi`；2026-10-22 定案，原定在智能体编辑页） | 列出**我名下的全部 Key**（可按智能体筛选；名称/前缀尾 4 位/关联智能体/作用域/过期/最后使用/状态）；**新建** 弹窗（**必选关联智能体**、名称、作用域预设、过期时间 Q12、并发 / RPM / 日 token 上限 X6、允许自动审批 X7）；**编辑** 弹窗（2026-10-22 追加：名称 / 作用域 / 过期时间 / 限额 / 自动审批可改；**放宽作用域需勾选确认**；**关联智能体与 Key 值不可改**；已吊销的 Key 不可编辑；已过期续期 = 重新启用）；**吊销**确认框（"吊销后外部立即无法访问，历史会话仍在你名下"）；创建后**一次性**弹明文 + 复制按钮。⚠️ Key 的主语是「我 × 智能体」—— 挂在智能体编辑页会让人以为"开了 Key 大家都能用" |
 | 会话列表 | ⚠️ **无法精确标注"哪些会话是 API 建的"** —— 会话行没有记录来源（X5 共享池的代价）。折中：在会话详情里显示"最近一次外部调用时间"（读 `usage_records.channel='OPEN_API'` 的 `conversationId`，若该列没有则用消息 `created_at` 近似），或**干脆不标**。见 §12 遗留 P1 |
 | `/admin/open-usage` | 按 **用户 / 智能体 / Key** 聚合（`usage_records.channel + open_key_id`）：请求数、token、错误码分布、Top 客户端（`x-client-name` 头） |
 | 审计 | 每次 `/open/**` 一行结构化日志 `{ openKeyId, userId, agentId, route, status, latencyMs }`（requestId 已有） |
@@ -460,27 +469,48 @@ curl -s -X POST https://<host>/open/v1/files -H "Authorization: Bearer $KEY" -F 
 
 | 方法 | 路径 | 权限 |
 |------|------|------|
-| GET | `/api/agents/:id/open-keys` | 所属人 / ADMIN（ADMIN 可见全部，但只读他人 Key 的元数据，永不见明文） |
-| POST | `/api/agents/:id/open-keys` | 所属人（`userId` = 自己）/ ADMIN（可指定 `userId`，R2） |
-| DELETE | `/api/agents/:id/open-keys/:keyId` | 所属人 / ADMIN（吊销） |
+| GET | `/api/open-keys?agentId=&includeInactive=` | **只列自己名下的**（ADMIN 也不越权列举；`agentId` 可选过滤） |
+| POST | `/api/open-keys` | 体里 `agentId` 必须"我能看见"（所属人 / ADMIN / SHARED 受众 ⇒ 受众给自己签，R3）；`userId` 仅 ADMIN 可指定（R2 代建） |
+| PUT | `/api/open-keys/:keyId` | 编辑元数据（2026-10-22 追加）。Key 是我的，或我是 ADMIN（别人的一律 404）；**合并语义**（缺省字段保持原值）；可改 = name / scopes / expiresAt / 限额四项 / allowAutoApprove，**不可改 = 明文、agentId、userId**（换目标走吊销重签）；`expiresAt` 非 null 必须是未来时刻（续期即重新启用）；已吊销 ⇒ **409**；**保存即删缓存键**（scopes/限额在快照里，不删则外部最长 60s 仍按旧策略） |
+| DELETE | `/api/open-keys/:keyId` | Key 是我的，或我是 ADMIN（别人的一律 404）；幂等 |
+
+> ⚠️ **2026-10-22 形态变更**：管理面由 `/api/agents/:id/open-keys`（按智能体）改为 `/api/open-keys`（按人），
+> 关联哪个智能体从**路径**挪到**签发请求体的 `agentId`**。理由：Key 的归属是「我 × 智能体」，
+> 按智能体组织会让受众误读"这是这个智能体的共享凭据"。
 
 ---
 
 ## 9. OpenAPI 契约的生产方式
 
-**契约从代码生成，不从文档手抄。**
+**契约从一张表出发，生成入库文件；两侧都有断言。**
 
 ```
-@fastify/swagger（跟现有 zod schema 走）
-→ 只有 /open/v1 路由 + 公共 schema 进 spec
-→ CI 导出 openapi/open-v1.json（入库，review 时能看 diff）
-→ 文档站（scalar/redoc）渲染该文件
+backend/src/openapi/openV1Spec.ts 的 OPEN_ROUTE_DOCS（17 条，手写 JSON Schema）
+→ pnpm openapi:export  → openapi/open-v1.json（入库，review 时看 diff）
+→ GET /open/v1/openapi.json（线上返回同源数据）+ GET /open/v1/docs（极简文档站读它）
 ```
 
-CI 两条断言（`backend/scripts/openapi-regression.ts`，与其它 `*:regression` 同款）：
+三条断言（`pnpm openapi:check` + `pnpm openapi:regression`）：
 
-1. `/open/v1` 下**注册的每条路由**都在 spec 里、都有 `security` 与 scope 声明；
-2. spec 里的每条路径都能在 Fastify 路由表里找到（防"写了没实现"）。
+1. `openapi:regression` **A5**：spec 里的操作集合 == Fastify `printRoutes()` 的 17 条业务端点（不多不少），
+   且每条都有 `security` 与 `x-open-scope`；
+2. `openapi:regression` **A6**：入库的 `openapi/open-v1.json` 与 `buildOpenV1Spec()` 逐字节一致；
+   `openapi:check` **S1** 再兜一次"改了契约没提交"（`git status` 看得见）；
+3. `openapi:check` **S2–S6**：路径集合 / scope 闭集 / `operationId` 唯一 / 每条都有 200 与错误响应 /
+   spec 里没有 `/api/**` 与文档端点自身。
+
+### 9.1 为什么不用 `@fastify/swagger` 自动生成（2026-10-22 实测定案）
+
+装了 `@fastify/swagger@9.9.2` 试过，**撤掉**了：
+
+| 试验 | 结果 |
+|------|------|
+| 注册插件 + 路由 schema 是 zod 实例 | `/api/auth/*` 之后的注册会撞 `FST_ERR_ROUTE_BODY_VALIDATION_SCHEMA_NOT_SUPPORTED`；而插件自身的 `onRoute` 钩子要求先注册 |
+| 靠 `transform` 把 zod 换成 JSON Schema | 能出 spec，但 `/api/**` 的 zod schema 让 swagger 抛 `Cannot read properties of null (reading 'examples')`（它把 zod 实例当 JSON Schema 遍历） |
+| `zod → JSON Schema` 派生 | 需要再引一条链路（依赖 zod 内部 `_def`），升级即坏，且字段映射要长期维护 |
+
+⇒ 契约束在一张表上。代价是"字段级漂移靠 review"；收益是**生成不依赖任何运行时**（导出脚本
+不连库、不需要 env，CI 里永假绿/假红），且两侧一致性由 A5/A6 真正钉住。
 
 ---
 
@@ -488,10 +518,10 @@ CI 两条断言（`backend/scripts/openapi-regression.ts`，与其它 `*:regress
 
 | 批 | 内容 | 验收（可自动化） | 规模 |
 |----|------|-----------------|------|
-| **B1 身份与 Key** | 两条迁移（`open_api_keys` 建表 + `usage_records` 加 `channel`/`open_key_id`）；`/api/agents/:id/open-keys` 三条；`plugins/openAuth.ts`（④a/④b 判据、缓存、吊销删键、`NOT_OPENABLE`）；`GET /open/v1/agent` | Key 明文只回一次；吊销立即 401（缓存键被删）；过期 401；作用域不足 403；`TASK_AGENT` 403 `NOT_OPENABLE`；转移后原 Key 401；他人 Agent 签不出 Key；内部聊一轮后 `usage_records.channel='INTERNAL'` 且 `open_key_id IS NULL` | ~1.5 人日 |
+| **B1 身份与 Key** | 两条迁移（`open_api_keys` 建表 + `usage_records` 加 `channel`/`open_key_id`）；`/api/open-keys` 三条（2026-10-22 由按智能体改为按人）；`plugins/openAuth.ts`（④a/④b 判据、缓存、吊销删键、`NOT_OPENABLE`）；`GET /open/v1/agent` | Key 明文只回一次；吊销立即 401（缓存键被删）；过期 401；作用域不足 403；`TASK_AGENT` 403 `NOT_OPENABLE`；转移后原 Key 401；他人 Agent 签不出 Key；内部聊一轮后 `usage_records.channel='INTERNAL'` 且 `open_key_id IS NULL` | ~1.5 人日 |
 | **B2 会话与 SSE** | `/open/v1/conversations*`（建/列表/详情/删/消息/active/chat/stream/regenerate/stop/steer/confirm/auto-approve）；网关粘性表 + 回归补断言 | ChatBot 会话：delta 拼接 == 历史正文；并发第二次得流内 `CONFLICT`；`/stop` ⇒ `done.finishReason=STOPPED`；`confirm` 超时后 `applied:false`；**Key A 与 Key B（同用户同 Agent）看到同一批会话、Key C（另一用户）看不到**（X5）；界面建的会话在开放层**可见** | ~2 人日 |
 | **B3 附件/限速/审计** | `/open/v1/files` + 附件校验；限速/并发/日 token（X6）；`/open/v1/usage`；`channel='OPEN_API'` 落库 | 上传后 chat 能引用；RPM 打满 429 且 `Retry-After` 正确；超并发 429；日 token 超限 429；审计字段齐全 | ~1 人日 |
-| **B4 契约与文档** | `@fastify/swagger` + `openapi:check`；文档站；nginx 样例；curl 冒烟脚本 | CI 两条断言绿；§6.5 六个示例真跑通 | ~1 人日 |
+| **B4 契约与文档** ✅ | 契约表 `openV1Spec.ts` + `openapi:export` + 入库 `openapi/open-v1.json` + 文档站 `/open/v1/docs` + `openapi:check` + nginx 样例（`infra/nginx/open-v1.conf.example`）+ curl 冒烟（`pnpm openapi:smoke`） | `openapi:check`（6）+ `openapi:regression`（19，含 A5–A7）全绿；冒烟的无 Key 部分默认跑、带 Key 部分给 `OPEN_API_KEY` 后跑通 | ~1 人日 |
 
 > ⚠️ **跨批硬依赖**：粘性表不改，多机下 SSE 会落错（本期 ChatBot 也会：帧总线是进程内的，
 > `/stream` 必须落同一台）⇒ **B2 内必须完成**，不能延后。
@@ -551,4 +581,7 @@ CI 两条断言（`backend/scripts/openapi-regression.ts`，与其它 `*:regress
 |------|------|
 | 2026-10-20 | 初稿：19 条端点、虚拟服务账号方案、15 个待确认 |
 | 2026-10-21 | **按 15 条决策重写**：Key 改为「用户 + 智能体」（去掉 `service_accounts` 与虚拟用户，改为真身模型）；Q2 收窄为"调用 + 建会话/历史/流/确认"；Q9 只开放 CHATBOT（新增 `NOT_OPENABLE` 判据）；Q6 附件、Q7 允许自动审批、Q12 可配过期/超时/限速；Q13 管理面全走 `/api` |
+| 2026-10-22（B4） | **落地 B4**：契约表 + `openapi:export` → `openapi/open-v1.json` + 文档站 + `openapi:check` + nginx 样例 + `openapi:smoke`；`@fastify/swagger` 实测不可用（§9.1）⇒ 改为"手写表 + 双向断言"。同时**管理面按人**（`/api/open-keys`，见 §8）与前端入口移到「我的凭据」 |
+| 2026-10-22 | **落地 B1–B3**：见文件头的落地物清单。两处实现口径写进代码注释：① `GET /open/v1/conversations` 用"游标 → offset"换算（跨页期间新会话插到最前可能重复/漏一条，客户端按 id 去重）；② Key 快照缓存 TTL 内，"用户停用 / Agent 软删 / Agent 转移"最多晚 `OPEN_API_KEY_CACHE_TTL_SEC` 生效，**吊销走主动删缓存键、立即生效**。B4 的 spec 生成未做 |
 | 2026-10-21（第二次） | **X1–X7 全部定案并落文**：① X5=共享 ⇒ **删除 `conversations.open_key_id` 方案**，开放层列表复用 `listConversationsForAgent`（结构性增量收敛为"一张新表 + `usage_records` 两列"）；② X1 ⇒ `usage_records` 加 `channel`/`open_key_id`；③ X2 ⇒ 明确"外部进不来"并删除只读凭据分支；④ X4 ⇒ 新增错误码 `NOT_OPENABLE`；⑤ X6 ⇒ `daily_token_limit`；⑥ X7 ⇒ `allow_auto_approve` 默认 true；⑦ 产物两条端点**删除**（ChatBot 不产文件），端点总数 17；⑧ 新增 §12.1 遗留三项（P1 会话来源标注 / P2 放开 TaskAgent 的补充 / P3 SDK） |
+| 2026-10-22（编辑） | **元数据可编辑**（用户定案，推翻早期"改 scope = 吊销 + 新建"）：新增 `PUT /api/open-keys/:keyId`（合并语义；name / scopes / expiresAt / 限额 / 自动审批可改；**明文、`agentId`、`userId` 不可改**；已吊销 409；保存即删缓存键）。理由：Key 值只有 sha256 谈不上改，但**策略字段全是明文**——"续个期就得换掉外部系统里嵌的全部 Key"不成比例。原则 = **值不可变、策略可编辑**（与 Cloudflare/Stripe 的 token 同型）。前端新增编辑弹窗（放宽作用域需勾选确认；过期 Key 续期即重新启用）；`shared` 抽出签发/编辑共用字段校验（`updateOpenApiKeyBodySchema`）；`verify:open-api-ui` 增至 **15** 项 |

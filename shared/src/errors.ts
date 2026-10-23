@@ -15,6 +15,14 @@ export const ERROR_CODES = [
   'UNAUTHORIZED',
   /** 403 — 已登录但无权限 */
   'FORBIDDEN',
+  /**
+   * 403 — **该智能体没有开放调用**（P1-22，X4）。
+   *
+   * 与 `FORBIDDEN` 分开的唯一理由：外部的"去开通/找所属人"与"这条 Key 没这个 scope"是
+   * **两种完全不同的处置**。开放层只在第 ④b 步（`agent.deleted_at IS NULL ∧ type=CHATBOT ∧ 可查看`）
+   * 失败时用它；scope 不足仍是 `FORBIDDEN`（见 `docs/08` §5.2）。
+   */
+  'NOT_OPENABLE',
   /** 404 — 资源不存在 */
   'NOT_FOUND',
   /** 409 — 状态冲突（并发发送、重复创建、首登未改密等） */
@@ -40,6 +48,7 @@ export const HTTP_STATUS_BY_ERROR_CODE: Readonly<Record<ErrorCode, number>> = {
   VALIDATION: 400,
   UNAUTHORIZED: 401,
   FORBIDDEN: 403,
+  NOT_OPENABLE: 403,
   NOT_FOUND: 404,
   CONFLICT: 409,
   UNPROCESSABLE: 422,
@@ -55,6 +64,7 @@ export const DEFAULT_MESSAGE_BY_ERROR_CODE: Readonly<Record<ErrorCode, string>> 
   VALIDATION: '请求参数有误',
   UNAUTHORIZED: '登录已失效，请重新登录',
   FORBIDDEN: '没有权限执行该操作',
+  NOT_OPENABLE: '该智能体未开放调用（仅对话型智能体可对外开放）',
   NOT_FOUND: '资源不存在',
   CONFLICT: '操作与当前状态冲突',
   UNPROCESSABLE: '该操作会使公开资产引用到私有资产，请先处理引用',

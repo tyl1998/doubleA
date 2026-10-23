@@ -112,6 +112,17 @@ export default defineConfig({
         target: process.env.VITE_DEV_PROXY_TARGET ?? 'http://localhost:3000',
         changeOrigin: true,
       },
+      // ⚠️ `/open/v1/**`（P1-22 开放平台）同样**不以 `/api` 开头** ⇒ 与 `/health` 是同一类坑：
+      //    漏了它的症状是"请求 200、但返回 index.html"（SPA 兜底），`fetch().json()` 解析失败，
+      //    看起来像"开放平台没实现"。开发期若要从前端同源调 /open（如用 `/open/v1/docs` 自检），
+      //    必须让 vite 转给网关（网关再把 `/open/v1/conversations/:id/{chat,stream,regenerate}`
+      //    按会话粘性转到同一实例 —— 不要直连后端实例，否则 SSE 会落错机器）。
+      '/open': {
+        target: process.env.VITE_DEV_PROXY_TARGET ?? 'http://localhost:3000',
+        changeOrigin: true,
+        // SSE：不能让 vite 缓冲整条流（否则 chunked 变成"结束时一次性吐出"）
+        ws: false,
+      },
     },
   },
   build: {

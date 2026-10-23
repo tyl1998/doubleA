@@ -149,6 +149,11 @@ export interface StreamRound {
     inputSummary: string
     /** 服务端这次等待的截止时刻（ISO 8601） */
     expiresAt: string
+    /**
+     * 这次问的是**重复执行**（本轮同名同参的危险工具已经成功执行过一次）——
+     * 卡片据此换措辞，见 `ConfirmCard`。缺省 = 普通确认。
+     */
+    duplicate?: boolean
   } | null
   /**
    * 沙箱排队位次（`queued` 事件，**1 = 下一个**）。
@@ -414,6 +419,18 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
 
     case 'confirm':
       return { ...round, confirm: event.data }
+
+    /**
+     * 提问**结束**（`confirm_resolved`）：只撤卡，不改正文/工具。
+     *
+     * ⚠️ 必须处理这一帧：结束可能由**第三方代理**替用户点了 `/confirm`，或超时/中断发生 ——
+     * 本端 `ChatPage#handleConfirmAnswer` 的 `finally` 只覆盖"我点的"那一路。没有它，
+     * 对方确认后我们这边工具都跑完了，确认卡还挂在输入区（并且继续锁着输入）。
+     * ⚠️ 按 `confirmId` 比对：迟到/错配的终局帧不能撤掉**新**那张卡。
+     */
+    case 'confirm_resolved':
+      if (round.confirm === null || round.confirm.confirmId !== event.data.confirmId) return round
+      return { ...round, confirm: null }
 
     case 'queued':
       return { ...round, queuedPosition: event.data.position }

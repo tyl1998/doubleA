@@ -1,0 +1,2754 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Doubulea 开放平台 · 智能体 OpenAPI",
+    "version": "v1",
+    "description": "用「我的凭据」里签发的 API Key（`Authorization: Bearer oak_…`）调用**你本人**名下的智能体。\n\n- 凭据 = 「我 × 某个智能体」：会话出现在**你**的会话列表中，其他用户看不到也影响不到。\n- 本期只对 **ChatBot** 开放；`TASK_AGENT` ⇒ 403 `NOT_OPENABLE`。\n- SSE 协议（事件全集、`confirm` 卡、`ping`、`done`/`error`、断线恢复）见 `docs/07`。\n- 失败语义只有三类：401（Key 问题）/ 403（授权问题）/ 429（额度问题）；依赖故障是 500。\n- 统一信封 `{code, msg, data}`：成功 `code = 0`、`msg = \"ok\"`；失败 `code` 是错误码字符串。\n- 请求 id 在响应头 `x-request-id`（与平台内部日志可对齐）。"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "当前部署（相对地址；按实际域名拼）"
+    }
+  ],
+  "tags": [
+    {
+      "name": "agent",
+      "description": "我是谁 / 能力 / 用量"
+    },
+    {
+      "name": "conversation",
+      "description": "会话、消息与对话动作（含 SSE）"
+    },
+    {
+      "name": "chat",
+      "description": "发消息 / 停止 / 插话 / 确认 / 自动审批 / 附件"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API Key 明文（`oak_` 前缀）。也可用 `X-API-Key` 头。作用域：`chat`（对话（发消息/停止/插话/确认/附件））；`conversation:read`（读会话（列表/详情/历史/观察流））；`conversation:write`（写会话（新建/删除））。"
+      }
+    },
+    "schemas": {
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "UNAUTHORIZED（Key 缺失/形态非法/吊销/过期/账号停用，**同一句文案**）/ FORBIDDEN（缺 scope）/ NOT_OPENABLE（该智能体不开放：软删、非 CHATBOT、或无权限）/ NOT_FOUND / VALIDATION / CONFLICT / NEED_CREDENTIAL / BUSY（429）/ INTERNAL"
+          },
+          "msg": {
+            "type": "string",
+            "description": "可直接展示的中文文案（前端不再二次拼装）"
+          },
+          "data": {
+            "description": "失败时可为 null，或附加信息（fields / retryAfterSec 等）"
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/open/v1/agent": {
+      "get": {
+        "operationId": "agentGet",
+        "summary": "我是谁：Key 绑定的智能体公开画像 + 能力 + 本 Key 限额",
+        "description": "客户端拿到 Key 的第一件事。**不含** `systemPrompt`（所属人的私有知识）与 `visibility`（内部概念）。无 scope 要求（只要求 Key 有效）。",
+        "tags": [
+          "agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "name",
+                        "description",
+                        "type",
+                        "icon",
+                        "openingRemarks",
+                        "guideQuestions",
+                        "defaultModelId",
+                        "models",
+                        "capabilities",
+                        "limits"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "CHATBOT",
+                            "TASK_AGENT"
+                          ],
+                          "description": "本期只有 CHATBOT 可调"
+                        },
+                        "icon": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "openingRemarks": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "guideQuestions": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "defaultModelId": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "models": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "modelName",
+                              "label",
+                              "available",
+                              "supportsVision"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "modelName": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "available": {
+                                "type": "boolean",
+                                "description": "池内且模型与 Provider 都启用；false 时选它会被 400/424"
+                              },
+                              "supportsVision": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "capabilities": {
+                          "type": "object",
+                          "required": [
+                            "streaming",
+                            "confirm",
+                            "autoApprove",
+                            "attachments",
+                            "steer",
+                            "regenerate"
+                          ],
+                          "properties": {
+                            "streaming": {
+                              "type": "boolean"
+                            },
+                            "confirm": {
+                              "type": "boolean"
+                            },
+                            "autoApprove": {
+                              "type": "boolean",
+                              "description": "false = 本 Key 未获准开启自动审批（X7）"
+                            },
+                            "attachments": {
+                              "type": "boolean"
+                            },
+                            "steer": {
+                              "type": "boolean"
+                            },
+                            "regenerate": {
+                              "type": "boolean"
+                            }
+                          }
+                        },
+                        "limits": {
+                          "type": "object",
+                          "required": [
+                            "maxConcurrency",
+                            "rateLimitPerMin",
+                            "confirmTimeoutSec",
+                            "dailyTokenLimit"
+                          ],
+                          "properties": {
+                            "maxConcurrency": {
+                              "type": "integer",
+                              "minimum": 1
+                            },
+                            "rateLimitPerMin": {
+                              "type": "integer",
+                              "minimum": 1
+                            },
+                            "confirmTimeoutSec": {
+                              "type": "integer",
+                              "minimum": 1
+                            },
+                            "dailyTokenLimit": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "description": "0 = 不限"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/agent/models": {
+      "get": {
+        "operationId": "agentModelsGet",
+        "summary": "可选模型（池内）",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "defaultModelId",
+                        "items"
+                      ],
+                      "properties": {
+                        "defaultModelId": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "modelName",
+                              "label",
+                              "available",
+                              "supportsVision"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "modelName": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "available": {
+                                "type": "boolean",
+                                "description": "池内且模型与 Provider 都启用；false 时选它会被 400/424"
+                              },
+                              "supportsVision": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations": {
+      "post": {
+        "operationId": "conversationsCreate",
+        "summary": "建会话",
+        "description": "只能落到 Key 绑定的那个智能体（**请求体没有 agentId**）。可选 `Idempotency-Key` 头（24h）：同一把 Key 重放同一个值返回**第一次**建出来的会话。",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:write",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "agentId",
+                        "title",
+                        "status",
+                        "readOnly",
+                        "createdAt",
+                        "lastMessageAt"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "agentId": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "ACTIVE",
+                            "FINISHED"
+                          ]
+                        },
+                        "readOnly": {
+                          "type": "boolean",
+                          "description": "= status !== ACTIVE；只读会话不能再发消息（409）"
+                        },
+                        "createdAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "lastMessageAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "conversationsGet",
+        "summary": "我的会话列表（游标分页）",
+        "description": "列出（我 × 本 Key 的智能体）名下的会话 —— 同用户的多把 Key **共享同一批**（X5）。排序 `lastMessageAt desc`；`cursor` = 上一页最后一条的 id。⚠️ 实现用\"游标 → offset\"换算，跨页期间新会话可能造成重复/漏一条，客户端按 id 去重即可。",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:read",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "items",
+                        "nextCursor",
+                        "hasMore"
+                      ],
+                      "properties": {
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "agentId",
+                              "title",
+                              "status",
+                              "readOnly",
+                              "createdAt",
+                              "lastMessageAt"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "agentId": {
+                                "type": "string"
+                              },
+                              "title": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "status": {
+                                "type": "string",
+                                "enum": [
+                                  "ACTIVE",
+                                  "FINISHED"
+                                ]
+                              },
+                              "readOnly": {
+                                "type": "boolean",
+                                "description": "= status !== ACTIVE；只读会话不能再发消息（409）"
+                              },
+                              "createdAt": {
+                                "type": "string",
+                                "format": "date-time"
+                              },
+                              "lastMessageAt": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ],
+                                "format": "date-time"
+                              }
+                            }
+                          }
+                        },
+                        "nextCursor": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "hasMore": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}": {
+      "get": {
+        "operationId": "conversationsItemGet",
+        "summary": "会话详情",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:read",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "会话 id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "agentId",
+                        "title",
+                        "status",
+                        "readOnly",
+                        "createdAt",
+                        "lastMessageAt"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "agentId": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "ACTIVE",
+                            "FINISHED"
+                          ]
+                        },
+                        "readOnly": {
+                          "type": "boolean",
+                          "description": "= status !== ACTIVE；只读会话不能再发消息（409）"
+                        },
+                        "createdAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "lastMessageAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "conversationsItemDelete",
+        "summary": "删除会话（级联消息）",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:write",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "会话 id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "deletedMessages"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "deletedMessages": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/messages": {
+      "get": {
+        "operationId": "conversationsMessagesGet",
+        "summary": "历史消息（行 id 游标，时间正序）",
+        "description": "`items` 是**时间正序**；`nextCursor` / `beforeId` 都指向**更早**那一页（唯一的翻页方向）。`limit` 上限 500（不带 `beforeId` 时服务端内部按 100 分段聚合，返回最近的 N 条）。",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:read",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            }
+          },
+          {
+            "name": "beforeId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "parts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "text",
+                "full",
+                "timeline"
+              ],
+              "default": "text",
+              "description": "段落裁剪：text（默认，只给正文，**丢工具卡/引用/思考**）/ full（富对象原样 + extras）/ timeline（正文 + 拍平的时间线 parts[]）"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "items",
+                        "nextCursor",
+                        "hasMore"
+                      ],
+                      "properties": {
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "role",
+                              "content",
+                              "createdAt",
+                              "tokensIn",
+                              "tokensOut"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "role": {
+                                "type": "string",
+                                "enum": [
+                                  "USER",
+                                  "ASSISTANT"
+                                ]
+                              },
+                              "content": {
+                                "description": "形状由 `?parts=` 决定：`text`（默认）= 字符串（正文）；`full` = 富对象（含 tool_calls/citations/thinking_segments）；`timeline` = 字符串 + 同级 `parts[]`（拍平的时间线）"
+                              },
+                              "createdAt": {
+                                "type": "string",
+                                "format": "date-time"
+                              },
+                              "tokensIn": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "tokensOut": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "parts": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "required": [
+                                    "type",
+                                    "text",
+                                    "seq",
+                                    "textOffset"
+                                  ],
+                                  "properties": {
+                                    "type": {
+                                      "type": "string",
+                                      "enum": [
+                                        "TEXT",
+                                        "THINKING",
+                                        "TOOL"
+                                      ]
+                                    },
+                                    "text": {
+                                      "type": "string",
+                                      "description": "正文片段 / 思考文字（`TOOL` 时为空串）"
+                                    },
+                                    "seq": {
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ],
+                                      "description": "时间线序号（与 content 里 thinking_segments/tool_calls 的 seq 同序列）"
+                                    },
+                                    "textOffset": {
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ],
+                                      "description": "正文里的字符偏移"
+                                    },
+                                    "tool": {
+                                      "type": [
+                                        "object",
+                                        "null"
+                                      ],
+                                      "description": "`type=TOOL` 时的工具卡（callId / toolName / serverName / kind / status / inputSummary / output / errorCode）"
+                                    }
+                                  }
+                                },
+                                "description": "`parts=timeline` 时才有"
+                              },
+                              "extras": {
+                                "type": "object",
+                                "description": "`parts=full` 时才有：已翻译成对外名字的 thinkingSegments / citations / toolCalls / attachments"
+                              }
+                            }
+                          }
+                        },
+                        "nextCursor": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "hasMore": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/active": {
+      "get": {
+        "operationId": "conversationsActiveGet",
+        "summary": "断线恢复：在跑吗 / 排队第几 / 等谁确认",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:read",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "会话 id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "streaming",
+                        "currentTool",
+                        "startedAt",
+                        "queuedPosition",
+                        "pendingConfirmId",
+                        "autoApprove",
+                        "readOnly"
+                      ],
+                      "properties": {
+                        "streaming": {
+                          "type": "boolean"
+                        },
+                        "currentTool": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "startedAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ],
+                          "format": "date-time"
+                        },
+                        "queuedPosition": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "pendingConfirmId": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "autoApprove": {
+                          "type": "boolean"
+                        },
+                        "readOnly": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/chat": {
+      "post": {
+        "operationId": "conversationsChatCreate",
+        "summary": "发消息（SSE，粘性）",
+        "description": "返回 `text/event-stream`。事件全集、`confirm` 卡、`ping`、`done`/`error` 收尾、断线恢复流程**逐字复用** `docs/07-第三方接入-会话确认(confirm)协议.md`（`shared/src/sse.ts`）。前置失败（400/401/403/404/409/424/429）走 JSON 信封；并发冲突是**流内** `error{code:\"CONFLICT\"}`。网关侧必须粘性（同一会话的 chat/regenerate/stream 落同一实例）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE 流。帧格式与事件全集见 `docs/07`（`shared/src/sse.ts`）。**鉴权/授权失败走 JSON 信封（在首帧之前）**。",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "会话不存在（含\"不是你的会话\"/\"不属于这个智能体\"）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "会话只读 / 同一会话正在跑",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "模型所需凭据未配置（NEED_CREDENTIAL）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "依赖故障（Redis / DB / 上游）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/stream": {
+      "get": {
+        "operationId": "conversationsStreamGet",
+        "summary": "只读观察流（SSE，粘性）",
+        "description": "订阅这一轮的帧；迟到者**先回放**本轮已发的帧，整轮已结束则立刻收尾。心跳是注释行 `: ping`。与 `POST …/chat` 是同一套事件（`docs/07`）。",
+        "tags": [
+          "conversation"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "conversation:read",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "会话 id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE 流。帧格式与事件全集见 `docs/07`（`shared/src/sse.ts`）。**鉴权/授权失败走 JSON 信封（在首帧之前）**。",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "会话不存在（含\"不是你的会话\"/\"不属于这个智能体\"）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "会话只读 / 同一会话正在跑",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "模型所需凭据未配置（NEED_CREDENTIAL）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "依赖故障（Redis / DB / 上游）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/regenerate": {
+      "post": {
+        "operationId": "conversationsRegenerateCreate",
+        "summary": "重新生成（SSE，粘性）",
+        "description": "撤掉上一轮 + 重跑同一段正文（正文取自库里，**不收**请求体）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE 流。帧格式与事件全集见 `docs/07`（`shared/src/sse.ts`）。**鉴权/授权失败走 JSON 信封（在首帧之前）**。",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "会话不存在（含\"不是你的会话\"/\"不属于这个智能体\"）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "会话只读 / 同一会话正在跑",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "424": {
+            "description": "模型所需凭据未配置（NEED_CREDENTIAL）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "依赖故障（Redis / DB / 上游）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/stop": {
+      "post": {
+        "operationId": "conversationsStopCreate",
+        "summary": "停止本轮（幂等）",
+        "description": "`signaled:false` = 当时没有在跑（**不是错误**）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "会话 id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "signaled"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "signaled": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/steer": {
+      "post": {
+        "operationId": "conversationsSteerCreate",
+        "summary": "中途插话（幂等）",
+        "description": "`accepted:false` = 当时没有在跑（**不是错误**）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "accepted",
+                        "steerId"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "accepted": {
+                          "type": "boolean"
+                        },
+                        "steerId": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "message"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/confirm": {
+      "post": {
+        "operationId": "conversationsConfirmCreate",
+        "summary": "快速确认（确认卡）",
+        "description": "`applied:false` = 没人在等这个 id（已超时/已处理/迟到点击）—— **正常终局，不要重试**（`docs/07` §3.2）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "confirmId",
+                        "accepted",
+                        "applied"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "confirmId": {
+                          "type": "string"
+                        },
+                        "accepted": {
+                          "type": "boolean"
+                        },
+                        "applied": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "confirmId",
+                  "accepted"
+                ],
+                "properties": {
+                  "confirmId": {
+                    "type": "string"
+                  },
+                  "accepted": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/conversations/{id}/auto-approve": {
+      "post": {
+        "operationId": "conversationsAutoApproveCreate",
+        "summary": "会话级自动审批开关",
+        "description": "`enabled:true` 需要本 Key 的 `allowAutoApprove`（`GET /open/v1/agent` 的 `capabilities.autoApprove`），否则 403 FORBIDDEN；`enabled:false` 永远允许（关掉危险模式不该被拒绝）。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "autoApprove"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "autoApprove": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/files": {
+      "post": {
+        "operationId": "filesCreate",
+        "summary": "上传附件（multipart，字段名 file）",
+        "description": "与内部上传同一套格式白名单 / MIME / 魔数 / 大小校验；上传主语 = Key 的归属用户 ⇒ 之后 `POST …/chat` 的 `attachmentFileIds` 归属校验天然通过。",
+        "tags": [
+          "chat"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "chat",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "id",
+                        "name",
+                        "mime",
+                        "size",
+                        "kind"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "mime": {
+                          "type": "string"
+                        },
+                        "size": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "IMAGE",
+                            "DOCUMENT"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（VALIDATION，含 fields）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/open/v1/usage": {
+      "get": {
+        "operationId": "usageGet",
+        "summary": "本 Key 的用量与余量",
+        "description": "`dayTokens` 读 `usage_records`（`channel=OPEN_API` ∧ 本 Key，UTC 当日真账）；`rateLimitRemaining` 读 Redis 当前分钟窗口；`dailyTokenLimit=0` ⇒ `dailyTokenRemaining=null`（不限）。无 scope 要求（只读自己的账）。",
+        "tags": [
+          "agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-open-scope": "",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "成功（`ok(data)` 信封）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "msg",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "const": 0,
+                      "description": "成功恒为 0"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "const": "ok"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "keyId",
+                        "scopes",
+                        "limits",
+                        "usage"
+                      ],
+                      "properties": {
+                        "keyId": {
+                          "type": "string"
+                        },
+                        "scopes": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "chat",
+                              "conversation:read",
+                              "conversation:write"
+                            ]
+                          },
+                          "description": "本 Key 的作用域"
+                        },
+                        "limits": {
+                          "type": "object",
+                          "required": [
+                            "maxConcurrency",
+                            "rateLimitPerMin",
+                            "confirmTimeoutSec",
+                            "dailyTokenLimit"
+                          ],
+                          "properties": {
+                            "maxConcurrency": {
+                              "type": "integer"
+                            },
+                            "rateLimitPerMin": {
+                              "type": "integer"
+                            },
+                            "confirmTimeoutSec": {
+                              "type": "integer"
+                            },
+                            "dailyTokenLimit": {
+                              "type": "integer"
+                            }
+                          }
+                        },
+                        "usage": {
+                          "type": "object",
+                          "required": [
+                            "day",
+                            "dayTokens",
+                            "dayTokensUnknown",
+                            "dailyTokenLimit",
+                            "dailyTokenRemaining",
+                            "rateLimitRemaining"
+                          ],
+                          "properties": {
+                            "day": {
+                              "type": "string",
+                              "description": "UTC 日期 YYYY-MM-DD"
+                            },
+                            "dayTokens": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "dayTokensUnknown": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "description": "上游没上报 token 的轮次数（不计入）"
+                            },
+                            "dailyTokenLimit": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "dailyTokenRemaining": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "rateLimitRemaining": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API Key 无效或已失效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "缺 scope（FORBIDDEN）或该智能体不开放（NOT_OPENABLE）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "资源不存在（含不属于你 / 不属于这个智能体）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "超出并发 / 每分钟 / 日 token（BUSY，含 retryAfterSec）",
+            "headers": {
+              "Retry-After": {
+                "description": "多久之后可以再试（秒）",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

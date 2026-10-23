@@ -48,6 +48,11 @@ export interface ConfirmCardProps {
   inputSummary: string
   /** 服务端这次等待的截止时刻（ISO 8601）—— 倒计时的**唯一**输入 */
   expiresAt: string
+  /**
+   * 这次问的是**重复执行**：本轮同名同参的危险工具已经成功执行过一次。
+   * 只为把标题与说明换成"会再执行一次"，机制与普通确认完全相同。
+   */
+  duplicate?: boolean
   /** 正在提交（两个按钮都禁用，见文件头 ③） */
   pending: boolean
   /**
@@ -79,7 +84,15 @@ function useCountdownTick(expiresAt: string): number {
   return remaining
 }
 
-export function ConfirmCard({ source, toolName, inputSummary, expiresAt, pending, onAnswer }: ConfirmCardProps) {
+export function ConfirmCard({
+  source,
+  toolName,
+  inputSummary,
+  expiresAt,
+  duplicate = false,
+  pending,
+  onAnswer,
+}: ConfirmCardProps) {
   const remaining = useCountdownTick(expiresAt)
   const expired = remaining <= 0
 
@@ -87,14 +100,21 @@ export function ConfirmCard({ source, toolName, inputSummary, expiresAt, pending
     <div className="confirm-card" data-testid="confirm-card">
       <div className="confirm-card__head">
         <span className="led led--warn" />
-        <p className="confirm-card__title">工具请求确认：{toolName}</p>
+        <p className="confirm-card__title">
+          {duplicate ? '工具请求重复执行：' : '工具请求确认：'}
+          {toolName}
+        </p>
         {/* 读数只读服务端给的时刻（见文件头 ①）；到点显示「已超时」而不是 `0s` */}
         <span className="countdown num" data-testid="confirm-countdown">
           {confirmCountdownText(remaining)}
         </span>
       </div>
       <div className="confirm-card__body">
-        <p className="ratio">{confirmSourceHint(source)}</p>
+        <p className="ratio">
+          {duplicate
+            ? '本轮已经用完全相同的参数执行过这个工具。确认会再执行一次（例如再删一次、再写一次）；不确认则跳过。'
+            : confirmSourceHint(source)}
+        </p>
         {/* 入参摘要：`inputSummary` 里的凭据值已经被平台抹除（`chatContext#summarizeToolInput`）
             ⇒ 它可以直接显示，不需要再做一层遮罩 */}
         <div className="code-block">{inputSummary}</div>
