@@ -1,0 +1,35 @@
+# ═══════════════════════════════════════════════════════════════════════
+# 覆盖：**chatbot 档位**（纯对话后端，不跑沙箱）
+#
+# 用法（与 `docker-compose.host.yml` **叠加**，不能单独用）：
+#   docker compose -f infra/router/docker-compose.host.yml \
+#                  -f infra/router/docker-compose.host.chatbot.yml \
+#                  --env-file infra/router/.env.node up -d backend
+#
+# 它在 host.yml 之上做四件事（对 chatbot 都是"不需要"）：
+#   1) 不挂 `/var/run/docker.sock`（chatbot 不建容器）⇒ `volumes: !reset []`
+#   2) 不补 docker.sock 的组 ⇒ `group_add: !reset []`
+#   3) 不起 `docker-cli` 侧车与 `egress` 代理 ⇒ `!reset null` 删掉这两个服务
+#   4) 不依赖 `docker-cli` ⇒ `depends_on: !reset []`
+#
+# ⚠️ `DOCKER_SOCKET_GID` 在这条路线下**不需要设**：上面 `group_add: !reset []` 已把它从
+#    backend 上摘掉，而 host.yml 里的取值已放宽成 `${DOCKER_SOCKET_GID:-}`（可空）⇒
+#    不设也不会在解析期报"required variable missing"。设了也无害（会被 reset 掉）。
+#
+# ⚠️ 档位判据见 `backend/src/sandbox/roleOverride.ts`：`DOUBULEA_NODE_ROLE=chatbot` ⇒
+#    关掉沙箱（不建容器、不登记实例、不进实例列表）。下面显式写死，免得依赖 shared env。
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+  backend:
+    depends_on: !reset []
+    volumes: !reset []
+    group_add: !reset []
+    environment:
+      DOUBULEA_NODE_ROLE: chatbot
+
+  # chatbot 不建沙箱 ⇒ 不需要按需构建用的 CLI 侧车
+  docker-cli: !reset null
+
+  # chatbot 不建沙箱 ⇒ 不需要沙箱出网代理
+  egress: !reset null

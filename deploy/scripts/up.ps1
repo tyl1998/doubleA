@@ -285,6 +285,8 @@ if (-not ((Running 'doubulea-backend') -and -not $Force)) {
         -e "S3_ENDPOINT=$s3Endp" -e "S3_KEY=$S3Key" -e "S3_SECRET=$S3Secret" -e "S3_BUCKET=$PgDb" `
         -e "CREDENTIAL_MASTER_KEY=$MasterKey" `
         -e "SESSION_TTL_HOURS=$(Cfg 'SESSION_TTL_HOURS' '12')" `
+        -e "SESSION_COOKIE_SECURE=$(Cfg 'SESSION_COOKIE_SECURE' '')" `
+        -e "CORS_ORIGINS=$(Cfg 'CORS_ORIGINS' '')" `
         -e "CHATBOT_CONCURRENCY=$(Cfg 'CHATBOT_CONCURRENCY' '50')" `
         -e "SANDBOX_CONCURRENCY=$(Cfg 'SANDBOX_CONCURRENCY' '10')" `
         -e "SANDBOX_CALLBACK_PORT=$CallbackPort" `

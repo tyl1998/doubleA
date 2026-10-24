@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * router-compose-check.mjs —— 两套 compose 的**配置自检**（P1-14 · R1 的"自证：compose 配置校验"）
+ * router-compose-check.mjs —— 各套 compose 组合的**配置自检**（P1-14 · R1 的"自证：compose 配置校验"）
  *
  * 依据：`docs/06` §五·补 P1-14 · R1 的验收判据（"自证：镜像构建 + compose 配置校验"）。
  *
  * ── 它做什么 ─────────────────────────────────────────────────────────
- * 对 `infra/router/docker-compose.host.yml`、`docker-compose.router.yml` 与 `infra/frontend/docker-compose.yml` 各跑一次
+ * 对 `infra/router/docker-compose.host.yml`（叠加 `docker-compose.host.chatbot.yml` 再跑一次）、
+ * `docker-compose.router.yml` 与 `infra/frontend/docker-compose.yml` 各跑一次
  * `docker compose ... config -q`，并喂一份**最小可用的 env**
  * （真实 `.env.*` 不进仓库、也不该在 CI 上存在 ⇒ 全部进程环境注入）。
  *
@@ -85,18 +86,29 @@ const childEnv = { ...process.env, ...sharedEnv }
 
 const files = [
   { file: 'docker-compose.host.yml', title: '每台：backend + egress', dir: ROUTER_DIR },
+  {
+    file: 'docker-compose.host.yml',
+    extra: ['-f', join(ROUTER_DIR, 'docker-compose.host.chatbot.yml')],
+    title: '每台（chatbot 档位）：仅 backend（覆盖掉 socket / egress / 侧车）',
+    dir: ROUTER_DIR,
+    // ★ 刻意**删掉** DOCKER_SOCKET_GID：chatbot 覆盖必须能在"没设这个组"时解析通过
+    //   （它是这个覆盖文件存在的理由之一；设了就等于没验证到）
+    unset: ['DOCKER_SOCKET_GID'],
+  },
   { file: 'docker-compose.router.yml', title: '网关：router', dir: ROUTER_DIR },
   { file: 'docker-compose.yml', title: '前端：nginx 静态站点', dir: join(INFRA_DIR, 'frontend') },
 ]
 
-for (const { file, title, dir } of files) {
+for (const { file, extra = [], title, dir, unset = [] } of files) {
   step(`${title}（${file}）`)
   const path = join(dir, file)
   if (!existsSync(path)) fail(`缺文件：${path}`)
+  const caseEnv = { ...childEnv }
+  for (const key of unset) delete caseEnv[key]
   // `-q` 只校验；`--no-interpolate` 保留 `$$(...)` 等运行时语法
-  const result = spawnSync(docker, ['compose', '-f', path, 'config', '-q', '--no-interpolate'], {
+  const result = spawnSync(docker, ['compose', '-f', path, ...extra, 'config', '-q', '--no-interpolate'], {
     encoding: 'utf8',
-    env: childEnv,
+    env: caseEnv,
     cwd: REPO_ROOT,
   })
   if (result.status !== 0) {
@@ -108,4 +120,4 @@ for (const { file, title, dir } of files) {
 }
 
 step('Done')
-ok('三套 compose 配置均通过校验（镜像实际的运行期校验留给真跑：子方案 §八 6 的 R1~R6）')
+ok('四套 compose 组合均通过校验（镜像实际的运行期校验留给真跑：子方案 §八 6 的 R1~R6）')

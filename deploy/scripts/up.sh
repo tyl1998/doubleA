@@ -157,18 +157,20 @@ step '后端'
 BACKEND_ARGS=(
   run -d --name "$C_BACKEND" --restart unless-stopped
   --network host
-  -v /var/run/docker.sock:/var/run/docker.sock
+  # 工作区：Code 模式 / 产物都要它，两种档位都挂
   -v "${WORKSPACE_ROOT}:${WORKSPACE_ROOT}"
-  -v doubulea-node-infra:/opt/node-infra
-  -v doubulea-egress-policy:/opt/egress-policy
-  -v doubulea-docker-bin:/opt/doubulea-docker-bin:ro
-  -v doubulea-docker-buildx:/usr/local/libexec/docker/cli-plugins:ro
   # 业务配置
   -e NODE_ENV=production -e LOG_PRETTY=false -e TZ="$TZ"
   -e DATABASE_URL="$DATABASE_URL" -e REDIS_URL="$REDIS_URL"
   -e S3_ENDPOINT="$S3_ENDPOINT" -e S3_KEY="$S3_KEY" -e S3_SECRET="$S3_SECRET" -e S3_BUCKET="$POSTGRES_DB"
   -e CREDENTIAL_MASTER_KEY="$CREDENTIAL_MASTER_KEY"
   -e SESSION_TTL_HOURS="${SESSION_TTL_HOURS:-12}"
+  # ★ 会话 Cookie 的 Secure 位：**必须能透传**（未配 TLS 的 HTTP 直连内置默认 true ⇒ 浏览器
+  #   丢弃 Cookie，症状是"登录成功却立刻未登录"）。留空 = 跟随 NODE_ENV（生产 true），
+  #   与"不传"等价（后端 optionalBoolVar 把空串当未设置，见 backend/src/config.ts）。
+  -e SESSION_COOKIE_SECURE="${SESSION_COOKIE_SECURE:-}"
+  # ★ CORS 白名单：同源反代（前端 nginx /api → 网关）时可不设；设了可消掉生产的 WARN。
+  -e CORS_ORIGINS="${CORS_ORIGINS:-}"
   -e CHATBOT_CONCURRENCY="${CHATBOT_CONCURRENCY:-50}" -e SANDBOX_CONCURRENCY="${SANDBOX_CONCURRENCY:-10}"
   -e SANDBOX_CALLBACK_PORT="${SANDBOX_CALLBACK_PORT:-13001}"
   # 实例身份（网关靠它发现本机）
@@ -203,8 +205,21 @@ BACKEND_ARGS=(
   --health-cmd "node -e \"fetch('http://127.0.0.1:${BACKEND_PORT}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
   --health-interval 15s --health-timeout 5s --health-retries 10 --health-start-period 40s
 )
-# socket 组（Linux/macOS 都要；chatbot 档位不碰 socket）
-if [ "$NODE_ROLE" = 'taskAgent' ]; then BACKEND_ARGS+=( --group-add "$DOCKER_SOCKET_GID" ); fi
+# 沙箱专属挂载与补组：**只有 taskAgent 档位需要**（chatbot 不建容器 ⇒ 不挂 socket / 侧车卷，
+# 也就不需要 socket 的组）。见 `backend/src/sandbox/roleOverride.ts` 的档位判据。
+if [ "$NODE_ROLE" = 'taskAgent' ]; then
+  BACKEND_ARGS+=(
+    # ★ 驱动宿主 daemon 起沙箱（DooD）
+    -v /var/run/docker.sock:/var/run/docker.sock
+    # ★ 内置脚本的中转卷 / egress 策略卷 / 按需构建用的 docker CLI
+    -v doubulea-node-infra:/opt/node-infra
+    -v doubulea-egress-policy:/opt/egress-policy
+    -v doubulea-docker-bin:/opt/doubulea-docker-bin:ro
+    -v doubulea-docker-buildx:/usr/local/libexec/docker/cli-plugins:ro
+    # ★ socket 组：镜像内以 uid 10001 运行，宿主 socket 通常是 root:docker 660
+    --group-add "$DOCKER_SOCKET_GID"
+  )
+fi
 BACKEND_ARGS+=( "$IMG_BACKEND" )
 up_if_needed "$C_BACKEND" "${BACKEND_ARGS[@]}"
 wait_up "$C_BACKEND" 180

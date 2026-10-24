@@ -12,6 +12,12 @@
 #   2) 每台 `.env.node` 设两项：`SANDBOX_INSTANCE_ID`（a / b / c）与 `SANDBOX_INSTANCE_ADVERTISE_ADDR`（如 b:3000）
 #   3) `docker compose -f infra/router/docker-compose.host.yml --env-file infra/router/.env.node up -d`
 #
+# 变体：**chatbot 档位**（只做对话、不跑沙箱）叠加覆盖文件即可（摘掉 socket / egress / 侧车）：
+#   docker compose -f infra/router/docker-compose.host.yml \
+#                  -f infra/router/docker-compose.host.chatbot.yml \
+#                  --env-file infra/router/.env.node up -d backend
+#   （详见该覆盖文件与 `deploy/docs/分角色部署.md` §4.3）
+#
 # ⚠️ 三处**硬约束**（代码层只能告警、不能强制）：
 #   · `network_mode: host`：出口② 的 listener 绑的是**沙箱网桥的网关地址**（宿主接口），非 host 网络绑不上；
 #   · 挂 `/var/run/docker.sock`：后端经**宿主** daemon 起沙箱（兄弟容器，不是容器内嵌套 Docker）；
@@ -72,8 +78,13 @@ services:
     #   或 `root:root 660`（macOS OrbStack）⇒ 不补组就是 `EACCES /var/run/docker.sock`（起不了沙箱）。
     #   取值：宿主 `stat -c %g /var/run/docker.sock`（macOS：`stat -f %g /var/run/docker.sock`）⇒ 写进 `.env.node`
     # ⚠️ Linux 上服务账号必须在 docker 组里，`stat` 才读得到 660；否则请把 socket 的组显式列进这里。
+    # ⚠️ 这里用 `:-DOUBULEA_GID_UNSET`（可空 + 可读哨兵）而不是 `:?`（必填）：
+#    · **chatbot 档位**由 `docker-compose.host.chatbot.yml` 用 `!reset []` 摘掉本字段 ⇒ 用 `:?`
+#      会在**解析期**直接报 required variable missing，覆盖文件也救不了（实测）；
+#    · taskAgent 忘设时 docker 仍会**响亮失败**：`unable to find group DOUBULEA_GID_UNSET`
+#      （比空串的 `unable to find group :` 更可读）—— 只是从解析期挪到 `up` 运行期。
     group_add:
-      - '${DOCKER_SOCKET_GID:?每台必须设（宿主 docker.sock 的 gid，如 0 或 999）}'
+      - '${DOCKER_SOCKET_GID:-DOUBULEA_GID_UNSET}'
     env_file:
       # 三台共用那份（含 DATABASE_URL / REDIS_URL / S3_* / SANDBOX_IMAGE / SANDBOX_EGRESS_PROXY_URL …）
       - ${SHARED_ENV_FILE:-./.env.node.shared}
@@ -197,8 +208,9 @@ services:
         fi
         exec node /app/egress-proxy.mjs
     # 与 backend 同一份 socket ⇒ 同一个 gid 问题（egress 只是调 CLI，不需要沙箱网之外的权限）
+    # ⚠️ 同 backend：可空 + 可读哨兵（chatbot 覆盖文件会把本服务整体 `!reset null` 去掉）。
     group_add:
-      - '${DOCKER_SOCKET_GID:?每台必须设（宿主 docker.sock 的 gid，如 0 或 999）}'
+      - '${DOCKER_SOCKET_GID:-DOUBULEA_GID_UNSET}'
     volumes:
       # 接网需要 docker CLI：用宿主二进制（只读）+ socket（与后端同一份）
       - /var/run/docker.sock:/var/run/docker.sock
