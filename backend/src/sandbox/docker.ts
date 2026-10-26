@@ -22,11 +22,15 @@
  *     报错文案直接说这一句，比 `connect ENOENT` 省一轮排查。
  */
 
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import Docker from 'dockerode'
 
 import { getLogger } from '../infra/logger.js'
+import { config } from '../config.js'
 import { SANDBOX_LLM_ENV, sandboxFilter, sandboxFilterFor } from './spec.js'
 
 let client: Docker | undefined
@@ -90,6 +94,56 @@ export async function pingDocker(): Promise<string> {
     return info.Version
   } catch (error) {
     throw new Error(describeDockerFailure(error), { cause: error })
+  }
+}
+
+/**
+ * docker **可执行文件**路径（shell out 时用；`getDocker()` 那条 dockerode 通道不受它影响）。
+ *
+ * 判据：配置值（`SANDBOX_DOCKER_BIN`，默认裸名 `docker`）> 宿主上几个常见绝对路径。
+ *
+ * 为什么需要：容器里 `SANDBOX_DOCKER_BIN` 指向命名卷里的二进制（绝对路径，必然可执行）；
+ * 而宿主 dev（`pnpm dev`）下后端的进程 PATH 里**没有** `/usr/local/bin`（OrbStack / Docker
+ * Desktop 的 CLI 装在那里）⇒ `execFile('docker', …)` / `spawn('docker', …)` 会以 `ENOENT`
+ * 失败，症状是"镜像明明在、却说找不到 docker"。`infra/scripts/sandbox-build.mjs` 早有同款
+ * 回落，这里对齐同一口径，并让自举与按需构建共用一处（免得两边各写一遍、改一处漏一处）。
+ */
+const DOCKER_BIN_CANDIDATES = [
+  '/usr/local/bin/docker',
+  '/opt/homebrew/bin/docker',
+  path.join(homedir(), '.orbstack/bin/docker'),
+  '/Applications/OrbStack.app/Contents/MacOS/xbin/docker',
+]
+
+let resolvedDockerBin: string | undefined
+
+export function resolveDockerBin(): string {
+  if (resolvedDockerBin !== undefined) return resolvedDockerBin
+  const configured = config.sandbox.dockerBin
+  // 绝对路径（容器里的卷内二进制）直接采用；否则当名字看，先在常见位置找一遍，找不到才交回 PATH
+  resolvedDockerBin = configured.includes('/')
+    ? configured
+    : (DOCKER_BIN_CANDIDATES.find((candidate) => existsSync(candidate)) ?? configured)
+  return resolvedDockerBin
+}
+
+/**
+ * 给要 shell out docker 的子进程准备环境：把 docker 所在目录补进 `PATH`，并把绝对路径回填到
+ * `DOCKER_BIN` / `SANDBOX_DOCKER_BIN`（两个运维脚本与 `sandbox-build.mjs` 都认这两个变量）。
+ *
+ * ⚠️ 只在解析出**绝对路径**时才回填：裸名进 `SANDBOX_DOCKER_BIN` 会被脚本的 `[ -x … ]` 判假，
+ *    而 `dirname('docker')` 是 `.` —— 塞进 `PATH` 等于把当前目录当可执行目录，是安全问题。
+ */
+export function withDockerEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const bin = resolveDockerBin()
+  if (!bin.includes('/')) return base
+  const dir = path.dirname(bin)
+  const entries = (base.PATH ?? '').split(':')
+  return {
+    ...base,
+    DOCKER_BIN: bin,
+    SANDBOX_DOCKER_BIN: bin,
+    PATH: entries.includes(dir) ? (base.PATH ?? '') : `${dir}:${base.PATH ?? ''}`,
   }
 }
 

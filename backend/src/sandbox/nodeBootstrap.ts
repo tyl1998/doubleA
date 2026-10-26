@@ -33,8 +33,8 @@ import { promisify } from 'node:util'
 import type { NodeBootstrapResult, NodeBootstrapStep, NodeCheckItem, NodeReport, NodeRoleName } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
-import { config } from '../config.js'
-import { getDocker, listRuntimeImages } from './docker.js'
+import { config, findWorkspaceRoot } from '../config.js'
+import { getDocker, listRuntimeImages, resolveDockerBin, withDockerEnv } from './docker.js'
 import { ensureSandboxNetwork } from './network.js'
 import { canBuildSandboxRuntime } from './runtimeBuild.js'
 
@@ -42,6 +42,58 @@ const execFileAsync = promisify(execFile)
 
 // 报告结构与会话契约同源（`shared/src/node.ts`）：前端 `/admin/sandbox-instances` 直接消费
 export type { NodeBootstrapResult, NodeBootstrapStep, NodeCheckItem, NodeReport, NodeRoleName } from '@doubulea/shared'
+
+// ───────────────────── 两种运行布局（容器 / 宿主直跑）─────────────────────
+//
+// 一键初始化编排的三样东西（运维脚本、docker CLI、内置脚本中转卷）都是按**容器**形态设计的：
+// 脚本打进镜像的 `/app/infra/scripts`、CLI 由 `docker-cli` 侧车挂进命名卷、脚本再写进中转卷给
+// 兄弟容器用。而 `pnpm dev` 形态下后端是**宿主上的 `tsx watch`**：`/app` 不存在、脚本在仓库
+// `/infra/scripts`、CLI 就在宿主 PATH 上 —— 若不做兼容，同一套判据在这两个形态下结论相反
+// （页面点「一键初始化」必然失败，报「找不到 /app/infra/scripts/egress-up.sh」）。
+// 下面三个小函数把"当前是哪一种布局"收在一处，供每一步共用。
+
+/**
+ * 后端跑在**容器**里，还是直接跑在**宿主**上。
+ *
+ * 判据取"容器身份标记"，不看某个目录存不存在：`DOUBULEA_CONTAINER_NAME` 由 compose /
+ * `deploy/scripts/up.sh` 显式注入（自举要靠它 `docker exec` 定位"自己这个容器"），
+ * `/.dockerenv` 是 Docker 给每个容器铺的标记文件。宿主上两者都没有 ⇒ 走"本机直跑"分支
+ * （CLI 自带、脚本在真实路径上、不需要侧车与中转卷）。
+ */
+function isContainerMode(): boolean {
+  return (process.env.DOUBULEA_CONTAINER_NAME ?? '').trim() !== '' || existsSync('/.dockerenv')
+}
+
+/**
+ * 自举脚本路径：`envKey` 显式指定 > `/app/infra/scripts/<name>`（容器）> `<仓库根>/infra/scripts/<name>`（宿主 dev）。
+ *
+ * 先看 `/app`（它存在就说明是在镜像布局里），再按**上面找到的工作区根**拼仓库路径；两个都没有时
+ * 回落容器路径 —— 错误文案里带上它比"某个临时路径"更好定位（调用方的报错都会回显这个值）。
+ */
+function bootstrapScript(name: string, envKey: string): string {
+  const override = (process.env[envKey] ?? '').trim()
+  if (override !== '') return override
+  const inImage = `/app/infra/scripts/${name}`
+  if (existsSync(inImage)) return inImage
+  const root = findWorkspaceRoot()
+  if (root !== undefined) {
+    const inRepo = pathJoin(root, 'infra', 'scripts', name)
+    if (existsSync(inRepo)) return inRepo
+  }
+  return inImage
+}
+
+/**
+ * 跑脚本时的子进程工作目录。
+ *
+ * ⚠️ `cwd` 不存在时 `execFile` 直接以 `ENOENT spawn bash` 失败（**不是**脚本自己报错），所以本机
+ * dev 形态下不能传写死的 `/app`。三个脚本内部都 `cd "$REPO_ROOT"`（按自身位置推导）⇒ 这里给
+ * 仓库根只是为了"能 spawn 出来"，不影响脚本的路径解析。
+ */
+function bootstrapCwd(): string {
+  if (existsSync('/app')) return '/app'
+  return findWorkspaceRoot() ?? process.cwd()
+}
 
 /**
  * 补齐 toolkit（空环境）镜像：**先拉取、后构建**。
@@ -65,10 +117,10 @@ async function ensureToolkitImage(note?: (event: string) => void): Promise<{ ok:
   if (pullFrom !== '') {
     try {
       note?.(`本地没有 ${image}，开始 docker pull ${pullFrom}（可能较久）`)
-      await execFileAsync(config.sandbox.dockerBin, ['pull', pullFrom], { timeout: 20 * 60_000 })
+      await execFileAsync(resolveDockerBin(), ['pull', pullFrom], { timeout: 20 * 60_000 })
       if (pullFrom !== image) {
         note?.(`拉取完成，标记为 ${image}`)
-        await execFileAsync(config.sandbox.dockerBin, ['tag', pullFrom, image], { timeout: 60_000 })
+        await execFileAsync(resolveDockerBin(), ['tag', pullFrom, image], { timeout: 60_000 })
       }
       return { ok: true, detail: `已从 ${pullFrom} 拉取并标记为 ${image}` }
     } catch (error) {
@@ -82,14 +134,20 @@ async function ensureToolkitImage(note?: (event: string) => void): Promise<{ ok:
 
 /** 用仓库里的构建脚本建 toolkit（`scripts/sandbox-build.mjs`；脚本内部自己决定层版本） */
 async function buildToolkit(image: string, prefix: string, note?: (event: string) => void): Promise<{ ok: boolean; detail: string }> {
-  const script = process.env.DOUBULEA_SANDBOX_BUILD_SCRIPT ?? '/app/infra/scripts/sandbox-build.mjs'
+  const script = bootstrapScript('sandbox-build.mjs', 'DOUBULEA_SANDBOX_BUILD_SCRIPT')
   if (!existsSync(script)) {
     return { ok: false, detail: `${prefix}且找不到 ${script}（无法构建 toolkit；请在宿主导入镜像或挂 infra/scripts）` }
   }
   try {
     // 只建 toolkit（base 是它的 FROM，脚本自己会先确保 base 存在）
     note?.(`通过 ${script} 构建 ${image}（镜像构建可能要几分钟）`)
-    await execFileAsync(process.execPath, [script, '--toolkit-only'], { timeout: 60 * 60_000, cwd: '/app' })
+    // 脚本内部自己定位 docker（`DOCKER_BIN` / `SANDBOX_DOCKER_BIN` / PATH）；宿主 dev 下后端 PATH
+    // 里没有 `/usr/local/bin` ⇒ 把已解析出来的那个二进制传给它，别让它再猜一遍。
+    await execFileAsync(process.execPath, [script, '--toolkit-only'], {
+      timeout: 60 * 60_000,
+      cwd: bootstrapCwd(),
+      env: withDockerEnv(),
+    })
     return { ok: true, detail: `${prefix}已通过 ${script} 构建 ${image}` }
   } catch (error) {
     return { ok: false, detail: `${prefix}构建失败：${error instanceof Error ? error.message : String(error)}` }
@@ -129,6 +187,10 @@ export async function materializeInfraDir(scriptPath: string): Promise<{ hostDir
   const explicitHostDir = (process.env.DOUBULEA_HOST_INFRA_DIR ?? '').trim()
   if (explicitHostDir !== '') return undefined // 覆盖文件已把脚本挂到宿主路径上
   if (infraMaterialized !== undefined) return { hostDir: infraMaterialized }
+  // ★ 本机直跑（`pnpm dev`）：脚本本来就在**宿主文件系统**上（`<仓库根>/infra/scripts`），`-v` 的源
+  //   直接就是它 ⇒ 不需要中转卷。若不在这里早退，会走下面的 `DOUBULEA_CONTAINER_NAME` 缺失分支，
+  //   在每次初始化时打一条"写入中转卷失败"的 warn（看着像配置错误，其实是正常路径）。
+  if (!isContainerMode()) return undefined
   const container = (process.env.DOUBULEA_CONTAINER_NAME ?? '').trim()
 
   const sourceDir = pathDirname(scriptPath)
@@ -137,16 +199,16 @@ export async function materializeInfraDir(scriptPath: string): Promise<{ hostDir
   try {
     if (container === '') throw new Error('未设置 DOUBULEA_CONTAINER_NAME')
     // ① 确保卷存在（compose 已建过则 no-op）
-    await exec(config.sandbox.dockerBin, ['volume', 'create', INFRA_VOLUME], { timeout: 30_000 })
+    await exec(resolveDockerBin(), ['volume', 'create', INFRA_VOLUME], { timeout: 30_000 })
     // ② 把本容器的脚本写进卷（`docker cp` 从本进程文件系统读，写到本容器的卷挂载点）
-    await exec(config.sandbox.dockerBin, ['exec', container, 'mkdir', '-p', INFRA_VOLUME_MOUNT], { timeout: 30_000 })
+    await exec(resolveDockerBin(), ['exec', container, 'mkdir', '-p', INFRA_VOLUME_MOUNT], { timeout: 30_000 })
     for (const file of files) {
-      await exec(config.sandbox.dockerBin, ['cp', pathJoin(sourceDir, file), `${container}:${INFRA_VOLUME_MOUNT}/${file}`], {
+      await exec(resolveDockerBin(), ['cp', pathJoin(sourceDir, file), `${container}:${INFRA_VOLUME_MOUNT}/${file}`], {
         timeout: 60_000,
       })
     }
     // ③ 校验：卷里确实有脚本（避免"看起来成功、兄弟容器挂了空目录"）
-    const listing = await exec(config.sandbox.dockerBin, ['exec', container, 'ls', INFRA_VOLUME_MOUNT], { timeout: 30_000 })
+    const listing = await exec(resolveDockerBin(), ['exec', container, 'ls', INFRA_VOLUME_MOUNT], { timeout: 30_000 })
     if (!String(listing.stdout).includes('sandbox-relay.mjs')) throw new Error('卷里没有脚本')
     infraMaterialized = INFRA_VOLUME_MOUNT
     getLogger().info({ volume: INFRA_VOLUME, files: files.length }, '内置运维脚本已写入中转卷')
@@ -180,7 +242,7 @@ async function ensureInfraImages(needed: readonly string[]): Promise<Array<{ ima
       // 继续拉
     }
     try {
-      await execFileAsync(config.sandbox.dockerBin, ['pull', image], { timeout: 15 * 60_000 })
+      await execFileAsync(resolveDockerBin(), ['pull', image], { timeout: 15 * 60_000 })
       results.push({ image, ok: true, detail: `已拉取：${image}` })
     } catch (error) {
       results.push({
@@ -251,7 +313,7 @@ export async function ensureSharedVolumesWritable(volumes: readonly string[]): P
     if (container === '') break
     try {
       await execFileAsync(
-        config.sandbox.dockerBin,
+        resolveDockerBin(),
         ['exec', '-u', '0', container, 'sh', '-lc', `chmod 0777 /opt/${volume.replace(/^doubulea-/u, '')}`],
         { timeout: 30_000 },
       )
@@ -619,12 +681,20 @@ export async function bootstrapNode(options: {
   }
 
   // ② docker-cli 侧车（镜像缺了就拉；容器本身仍由 compose 负责 —— 它带命名卷，就地起易与 compose 定义分叉）
+  //
+  // ⚠️ **本机直跑（`pnpm dev`）不需要侧车**：那是"容器里没有 docker CLI，靠一个 CLI 容器把二进制
+  //   挂进命名卷"的替身方案。宿主上 CLI 本来就在 PATH（或 `SANDBOX_DOCKER_BIN`）⇒ 这一项直接判 ok，
+  //   否则页面会在一个健康的 dev 环境里一直显示"侧车未运行"的红项。
   const dockerUsable = !failing.has('docker') || steps.some((step) => step.step === 'docker' && step.ok)
   if (!dockerUsable) {
     // Docker 都连不上 ⇒ 这一项**什么都没查**：标"失败"会让人以为侧车本身有问题（实际是连不上 Docker）
     const detail = 'Docker 不可达 ⇒ 无法检查（先修 Docker）'
     progress?.end('dockerCli', { ok: false, detail })
     push('dockerCli', false, detail)
+  } else if (!isContainerMode()) {
+    const detail = '不需要（后端直接跑在宿主上，docker CLI 就在 PATH）'
+    progress?.end('dockerCli', { ok: true, detail, skipped: true })
+    push('dockerCli', true, detail, true)
   } else {
     progress?.begin('dockerCli', '正在检查 docker-cli 侧车')
     const cliOk = await containerRunning(DOCKER_HOST_NAME)
@@ -681,26 +751,30 @@ export async function bootstrapNode(options: {
     progress?.note('egress', `检查镜像 ${egressImage}`)
     const pulled = await ensureInfraImages([egressImage])
     for (const item of pulled) progress?.note('egress', item.detail)
-    const script = process.env.DOUBULEA_EGRESS_SCRIPT ?? '/app/infra/scripts/egress-up.sh'
+    const script = bootstrapScript('egress-up.sh', 'DOUBULEA_EGRESS_SCRIPT')
     if (pulled.some((item) => !item.ok)) {
       const detail = pulled.map((item) => item.detail).join('；')
       progress?.end('egress', { ok: false, detail })
       push('egress', false, detail)
     } else if (!existsSync(script)) {
-      const detail = `找不到 ${script}（容器里没有 infra/scripts）—— 请在宿主执行 bash infra/scripts/egress-up.sh --allow-all`
+      const detail = `找不到 ${script}（容器里没有 infra/scripts，本机也没有仓库源码）—— 请在宿主执行 bash infra/scripts/egress-up.sh --allow-all`
       progress?.end('egress', { ok: false, detail })
       push('egress', false, detail)
     } else {
       const infra = await materializeInfraDir(script)
       progress?.note('egress', `执行 ${script} --allow-all`)
+      // ⚠️ `bootstrapCwd()` / `withDockerEnv()` 是**本机 dev 兼容**的两处：前者避免 `cwd=/app`
+      //   不存在导致的 `ENOENT spawn bash`，后者把 docker 二进制目录补进子进程 PATH（脚本里
+      //   `command -v docker` 才找得到）。容器形态下两者都退化成原来的行为。
+      const scriptEnv =
+        infra === undefined
+          ? {}
+          : { DOUBULEA_HOST_INFRA_DIR: infra.hostDir, DOUBULEA_MOUNT_VOLUME: INFRA_VOLUME }
       const runEgress = (): Promise<unknown> =>
         execFileAsync('bash', [script, '--allow-all'], {
           timeout: 300_000,
-          cwd: '/app',
-          env:
-            infra === undefined
-              ? process.env
-              : { ...process.env, DOUBULEA_HOST_INFRA_DIR: infra.hostDir, DOUBULEA_MOUNT_VOLUME: INFRA_VOLUME },
+          cwd: bootstrapCwd(),
+          env: withDockerEnv({ ...process.env, ...scriptEnv }),
         })
       try {
         await runEgress()
@@ -752,7 +826,7 @@ export async function bootstrapNode(options: {
     progress?.note('relay', `检查镜像 ${relayImage}`)
     const pulled = await ensureInfraImages([relayImage])
     for (const item of pulled) progress?.note('relay', item.detail)
-    const relayScript = process.env.DOUBULEA_RELAY_SCRIPT ?? '/app/infra/scripts/relay-up.sh'
+    const relayScript = bootstrapScript('relay-up.sh', 'DOUBULEA_RELAY_SCRIPT')
     if (pulled.some((item) => !item.ok)) {
       const detail = pulled.map((item) => item.detail).join('；')
       progress?.end('relay', { ok: false, detail })
@@ -763,11 +837,12 @@ export async function bootstrapNode(options: {
         progress?.note('relay', `执行 ${relayScript}`)
         await execFileAsync('bash', [relayScript], {
           timeout: 120_000,
-          cwd: '/app',
-          env:
+          cwd: bootstrapCwd(),
+          env: withDockerEnv(
             infra === undefined
               ? process.env
               : { ...process.env, DOUBULEA_HOST_INFRA_DIR: infra.hostDir, DOUBULEA_MOUNT_VOLUME: INFRA_VOLUME },
+          ),
         })
         const detail = `已按 ${relayScript} 拉起`
         progress?.end('relay', { ok: true, detail })

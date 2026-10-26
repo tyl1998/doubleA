@@ -574,6 +574,11 @@ export function ChatPage({
    * （症状：回答在视口外一帧帧长出来，而滚动条纹丝不动）。
    */
   const pinnedRef = useRef(true)
+  /**
+   * 贴底跟随的"晚一拍"观察器（2026-10-24）：见下面"贴底跟随"effect 的说明。
+   * 记住**当前观察的节点**与观察器实例 —— 只在节点真的换掉时才重建，避免流式每帧 churn。
+   */
+  const pinObserverRef = useRef<{ node: Element; observer: ResizeObserver } | null>(null)
   /** `scroll` 事件 → 记录"用户是否贴底"（只在用户真的滚动时变化；内容长高不触发它） */
   const handleNearBottom = useCallback((nearBottom: boolean): void => {
     pinnedRef.current = nearBottom
@@ -856,9 +861,44 @@ export function ChatPage({
    */
   useEffect(() => {
     const frame = frameRef.current
-    if (frame === null) return
+    if (frame === null) {
+      // 三态切走了（骨架 / 错误 / 空态没有滚动容器）：断掉观察，别盯着一个已脱离文档的节点
+      pinObserverRef.current?.observer.disconnect()
+      pinObserverRef.current = null
+      return
+    }
     if (pinnedRef.current) frame.scrollTop = frame.scrollHeight
+    // **上面那一次 pin 不够，还要盯"晚一拍才定高"**（2026-10-24 修"输出完之后没有定位到文末"）。
+    //
+    // ⚠️ 为什么：`.msg` 带 `content-visibility: auto` + `contain-intrinsic-size: auto 220px`
+    //    （内存优化 P3 第 3 条，`app.css`）。那个尺寸**按元素**记住上一次实测值 —— 而一轮收尾时
+    //    流式气泡被**落库版本换掉**（React key 由 `stream:assistant` 换成真实消息 id ⇒ 卸载重挂），
+    //    新元素**没有**记忆尺寸，先按兜底的 220px 参与布局。上面这次 pin 读到的 `scrollHeight`
+    //    可能正是这个**偏小的估算值** ⇒ 视口落在文末**之上**；等浏览器真的把新元素排出来
+    //    （`content-visibility` 的渲染比这次提交晚一拍）内容变高，却**没有任何 `messages` 变化
+    //    再触发 pin** ⇒ 停在半途。
+    //
+    // 判据仍与上面一致：**只在用户贴底时**跟随（`pinnedRef`）。用 `ResizeObserver` 盯内容列：
+    // 它每次真实变高都会回调（含"估算 → 实测"那一次），且回调跑在**布局之后、绘制之前**
+    // ⇒ 在这里改 `scrollTop` 不会闪。观察对象只在节点真的换掉时才重建（避免流式每帧 churn）。
+    const inner = frame.firstElementChild
+    if (inner === null || pinObserverRef.current?.node === inner) return
+    pinObserverRef.current?.observer.disconnect()
+    const observer = new ResizeObserver(() => {
+      if (pinnedRef.current) frame.scrollTop = frame.scrollHeight
+    })
+    observer.observe(inner)
+    pinObserverRef.current = { node: inner, observer }
   }, [messages])
+
+  // 卸载时断开观察（`messages` 那条只负责"换节点时重建"，收尾在这里单独做）
+  useEffect(
+    () => () => {
+      pinObserverRef.current?.observer.disconnect()
+      pinObserverRef.current = null
+    },
+    [],
+  )
 
   /**
    * 「服务端说的故障」要弹 toast（`03` §五 的 `error` 行："错误 toast + 消息流内错误卡"）。

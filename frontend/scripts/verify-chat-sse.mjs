@@ -1475,6 +1475,42 @@ await it('G8 `/active` 的 `startedBy`：只认取值域，旧快照/值坏降�
   assertEqual(parseActiveSnapshot(JSON.stringify(base)).startedAt, STARTED_AT, '其它字段不受影响')
 })
 
+await it('G9 ★ 本页自己跑完的那一轮收口时收掉 `serverRun`（不许显示成"别人在跑"，2026-10-25）', () => {
+  const store = useChatStreamStore
+  store.getState().resetAll()
+
+  // 本页自己发起的一轮：`begin` 把它写进 `serverRun` / `runOrigins`（切走时侧栏的灯才不会灭）
+  store.getState().begin('conv-ui', '你好', STARTED_AT)
+  assertEqual(store.getState().serverRun['conv-ui'], STARTED_AT, '本页发起 = 服务端在跑')
+
+  // ★ 收口：`done` 让位（`ChatPage#reset`）把 `round` 清掉之后，若 `serverRun` 还留着，
+  //   界面就会把自己**刚跑完**的一轮显示成「另一个窗口正在生成」——
+  //   `releaseOwnRun` 正是那个缺失的收口动作（原先只有 `/active` 轮询会清，2s/10s 一拍）。
+  store.getState().reset('conv-ui')
+  store.getState().releaseOwnRun('conv-ui')
+  assert(!('conv-ui' in store.getState().serverRun), '本页自己那一轮收口后 serverRun 已清')
+  assert(!('conv-ui' in store.getState().runOrigins), '来源一并清（不留孤儿键）')
+
+  // ⚠️ **不是我的，不删**：外部调用 / 定时任务那一格的灯必须留住 ——
+  //    否则"我刚跑完"会把"它还在跑"一起灭掉（与后端 `releaseConversationLock` 同一条纪律）。
+  store.getState().noteServerRun('conv-api', true, STARTED_AT, 'OPEN_API')
+  store.getState().releaseOwnRun('conv-api')
+  assertEqual(store.getState().serverRun['conv-api'], STARTED_AT, '外部调用还在跑 ⇒ 不动')
+  assertEqual(store.getState().runOrigins['conv-api'], 'OPEN_API', '来源也不动')
+
+  store.getState().noteServerRun('conv-job', true, STARTED_AT, 'SCHEDULED')
+  store.getState().releaseOwnRun('conv-job')
+  assertEqual(store.getState().serverRun['conv-job'], STARTED_AT, '定时任务还在跑 ⇒ 不动')
+
+  // 没跑过 / 已收掉的会话：空转、不凭空造键
+  const before = store.getState()
+  store.getState().releaseOwnRun('conv-never')
+  assertSameRef(store.getState(), before, '无键时返回同一 state 引用（零重渲染）')
+
+  store.getState().resetAll()
+  assertDeepEqual(store.getState().serverRun, {}, '`resetAll` 清空')
+})
+
 // ═════════════════════════════ H 组：输入区状态机（P0-1-33） ═════════════════════════
 
 groupStart(

@@ -67,7 +67,7 @@ import {
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
-import { listRuntimeImages } from './docker.js'
+import { listRuntimeImages, resolveDockerBin, withDockerEnv } from './docker.js'
 
 /** 单次构建的上限（毫秒）：python 版本要联网下载 + 编译期较长，给足；超时按失败处理。 */
 const BUILD_TIMEOUT_MS = 20 * 60 * 1000
@@ -468,9 +468,11 @@ function runBuildProcess(
     try {
       // ⚠️ 强制 BuildKit：Dockerfile 里有 `RUN --mount=type=cache`（apt 缓存），经典构建器会直接报
       //   `the --mount option requires BuildKit`。与 `pnpm sandbox:build` 的口径一致（那边也带这个变量）。
-      child = spawn(config.sandbox.dockerBin, args, {
+      // ⚠️ `resolveDockerBin()` / `withDockerEnv()`：宿主 dev 下后端 PATH 里没有 `/usr/local/bin`
+      //   （OrbStack 的 CLI 在那里）⇒ 裸名 `docker` 会 `ENOENT`。容器里配置值是绝对路径，两者恒等。
+      child = spawn(resolveDockerBin(), args, {
         cwd: context,
-        env: { ...process.env, DOCKER_BUILDKIT: '1' },
+        env: withDockerEnv({ ...process.env, DOCKER_BUILDKIT: '1' }),
       })
     } catch (error) {
       finishJob(job, 'failed', `docker build 启动失败：${error instanceof Error ? error.message : String(error)}`)

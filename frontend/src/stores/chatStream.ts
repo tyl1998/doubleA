@@ -80,6 +80,10 @@ interface ChatStreamState {
    *     store 里没有 `rounds[那个会话]`，但 Redis 的活跃锁是真的 —— 会话栏的"生成中"灯必须认这个
    *     （否则症状正是用户 2026-10-21 报的："A 正在生成 → 切到 B → A 变成可继续"）。
    * 值里的 `startedAt` 是服务端那条流的开始时刻（`/active` 回带），拿不到的 `null`。
+   *
+   * ⚠️ **`begin` 也写它**（本页自己发起的那一轮）—— 于是"本页刚跑完"的那一格必须由本页自己收
+   * （`releaseOwnRun`，2026-10-25）：只靠 `/active` 轮询收，`done` 让位之后会有一段
+   * "自己刚跑完却显示成别人在跑"的空窗。见 {@link ChatStreamState.releaseOwnRun}。
    */
   serverRun: Record<string, string | null>
   /**
@@ -112,8 +116,9 @@ interface ChatStreamState {
   apply: (conversationId: string, event: SseEvent) => void
   /**
    * 记下"服务端这一刻是否在跑这个会话"（`GET /:id/active` 的结论）—— `streaming:true` ⇒ 记下，
-   * `false` ⇒ 收掉这个键。只影响**会话栏的灯**与"没有本页轮次时的生成中气泡"，
-   * 不碰 `rounds`（那是本页自己的事件流，见 `serverRun` 的注释）。
+   * `false` ⇒ 收掉这个键（**无条件**：`/active` 说没在跑，就是没在跑，这是权威结论）。
+   * 只影响**会话栏的灯**与"没有本页轮次时的生成中气泡"，不碰 `rounds`（那是本页自己的事件流，
+   * 见 `serverRun` 的注释）。
    */
   noteServerRun: (
     conversationId: string,
@@ -121,6 +126,22 @@ interface ChatStreamState {
     startedAt: string | null,
     startedBy?: ConversationRunOrigin | null,
   ) => void
+  /**
+   * 本页自己发起的那一轮**收口后**，收掉 `serverRun` 里属于本页的这一格（2026-10-25）。
+   *
+   * 为什么需要它：`begin` 把本页这一轮也写进 `serverRun`（切走时侧栏的灯才不灭），而那一格
+   * 原先只由 `/active` 轮询清除（2s/10s 一拍）。于是 `done` 一到手、`ChatPage` 的让位 effect
+   * 把 `round` 置空之后，必然出现 `round === null && serverRun[id] !== undefined` 的空窗 ——
+   * 界面上把本页**刚跑完**的一轮显示成「另一窗口正在生成」（头部标签 / 消息流尾部状态 / 输入区被禁用）。
+   *
+   * ⚠️ 判据用 `runOrigins`（**排除** `SCHEDULED` / `OPEN_API`），**不用 `startedAt` 比等**：
+   * `begin` 写的是**客户端**时刻，而 `/active` 轮询会把同一格覆写成**服务端**时刻
+   * （`streamChatReply` 自己的 `startedAt`）⇒ 两者永不相等，比等会永远不生效。
+   * 来源标记对得上：本页那一轮必是 `UI`（`/active` 回来也是 `UI`）；外部那两个值说明这一格
+   * 不是本页跑的 ⇒ **一概不动**（否则"我刚跑完"会把外部调用 / 定时任务的灯一起灭掉）。
+   * 这条纪律与后端 `releaseConversationLock` 的"按归属释放"同族：**不是我的，不删**。
+   */
+  releaseOwnRun: (conversationId: string) => void
   /**
    * 往指定会话这一轮**乐观地**追加一条用户插话（P1-20）—— `POST /:id/steer` 成功后调它。
    *
@@ -250,8 +271,10 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
     set((state) => ({
       rounds: { ...state.rounds, [conversationId]: beginRound(userText, startedAt, kind, userAttachments) },
       disconnects: without(state.disconnects, conversationId),
-      // 本页自己发起的这一轮同样是"服务端在跑"：记进 `serverRun`，切走时侧栏的灯才不会灭
-      // （它的收口与清除统一走 `noteServerRun(false)`，见 `useChatStream` 的 `finally`）
+      // 本页自己发起的这一轮同样是"服务端在跑"：记进 `serverRun`，切走时侧栏的灯才不会灭。
+      // ⚠️ 它的**收口**在本页这一轮流结束时按归属收掉（`releaseOwnRun`，2026-10-25 —— 原先这里
+      //    写的是"统一走 `useChatStream` 的 `finally`"，但那个调用**从来不存在**，于是本页刚跑完
+      //    的一轮会短暂显示成"另一个窗口正在生成"）。
       serverRun: { ...state.serverRun, [conversationId]: startedAt },
       // 本页发起的必然来自界面（`/active` 的 `startedBy` 也是这个值）—— 一并记下，别留空
       runOrigins: { ...state.runOrigins, [conversationId]: 'UI' },
@@ -285,6 +308,18 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
       return {
         serverRun: { ...state.serverRun, [conversationId]: startedAt },
         runOrigins: { ...state.runOrigins, [conversationId]: startedBy },
+      }
+    })
+  },
+
+  releaseOwnRun: (conversationId) => {
+    set((state) => {
+      // 不是本页跑的（外部调用 / 定时任务）：一概不动 —— 见 `releaseOwnRun` 的接口注释
+      const origin = state.runOrigins[conversationId]
+      if (origin === undefined || origin !== 'UI') return state
+      return {
+        serverRun: without(state.serverRun, conversationId),
+        runOrigins: without(state.runOrigins, conversationId),
       }
     })
   },
@@ -335,13 +370,17 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
   stoppedLocally: (conversationId) => {
     set((state) => {
       // 点了停止、服务端也收到了信号 ⇒ 这个会话不再算"在跑"（灯随之熄灭；真收口由 `done` 决定内容）
+      // 两格一起清（`serverRun` 与 `runOrigins` 是同一条结论的两个字段，留孤儿键会让下一轮的
+      // 文案读到上一轮的来源 —— 与 `noteServerRun(false)` / `releaseOwnRun` 同口径）
       const serverRun = without(state.serverRun, conversationId)
+      const runOrigins = without(state.runOrigins, conversationId)
       const round = state.rounds[conversationId]
       if (round === undefined) {
-        return serverRun === state.serverRun ? state : { serverRun }
+        return serverRun === state.serverRun && runOrigins === state.runOrigins ? state : { serverRun, runOrigins }
       }
       return {
         serverRun,
+        runOrigins,
         rounds: {
           ...state.rounds,
           [conversationId]: {

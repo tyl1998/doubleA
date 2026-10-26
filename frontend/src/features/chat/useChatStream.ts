@@ -352,10 +352,17 @@ export function useChatStream(
       const controller = new AbortController()
       abortRef.current.get(targetId)?.abort()
       abortRef.current.set(targetId, controller)
-      useChatStreamStore.getState().begin(targetId, content, new Date().toISOString(), kind, userAttachments)
+      // 本轮的身份：`begin` 与收尾共用同一时刻（`serverRun` 那一格的收口判据是**来源**，
+      // 见 `releaseOwnRun`，但这个时刻仍是会话栏"已用时"的起点）
+      const startedAt = new Date().toISOString()
+      useChatStreamStore.getState().begin(targetId, content, startedAt, kind, userAttachments)
+
+      /** 这一轮**有没有收到终帧**（`done`/`error`）—— 决定收尾时能不能把 `serverRun` 一起收掉，见 `finally` */
+      let terminated = false
 
       try {
         const result = await open(controller.signal)
+        terminated = result.terminated
 
         if (!result.terminated && !controller.signal.aborted) {
           // 流没给终帧就结束了（服务端被 kill / 代理断开）。**必须让用户看到**：
@@ -381,7 +388,36 @@ export function useChatStream(
         }
         return { ok: true }
       } finally {
-        if (abortRef.current.get(targetId) === controller) abortRef.current.delete(targetId)
+        // ⚠️ 这个 `finally` 可能**晚于**同一会话的下一条流（用户答完立刻追问）：新流在 `begin` 时就
+        //    abort 了本控制器并接管了 `abortRef` ⇒ `isCurrent === false` 时这一轮已经不是"这个会话
+        //    的妈妈"了，下面的收尾（尤其是 `releaseOwnRun`）**一概不许动**，否则会把新流刚写进去的
+        //    `serverRun` 清掉（两轮同为 `'UI'`，光看来源分不出来）。
+        const isCurrent = abortRef.current.get(targetId) === controller
+        if (isCurrent) abortRef.current.delete(targetId)
+        /**
+         * ★ 按归属收掉"服务端在跑"那一格（2026-10-25）。
+         *
+         * `begin` 把本页这一轮也写进了 `serverRun[id]`（切走时侧栏的灯才不灭）。但那条流的
+         * **收尾只有 `/active` 轮询会清**（2s/10s 一拍），而 `done` 一到手，`ChatPage` 的让位 effect
+         * 就会 `reset` 掉 `round` ⇒ 必然出现 `round === null && serverRun[id] !== undefined` 的空窗，
+         * 界面上把自己**刚跑完**的一轮显示成「另一个窗口正在生成」（头部标签 / 消息流尾部状态 /
+         * 输入区禁用），直到下一次轮询才消失。
+         *
+         * 只清**已收到终帧**（`terminated`，含 `done` 与流内 `error`）的那一轮 —— 那时这一轮在
+         * 服务端已经收尾（`orchestrator/sse.ts` 的 `finally` 就在 `done` 之后释放锁），本地清不必
+         * 再等下一次轮询；而没收到终帧（断线 / 用户 abort）时**不清**：服务端那把锁到底还在不在，
+         * 只有 `/active` 知道，本页不许猜（与"没落库就不说落库"同一纪律）。这种时候会话栏那盏灯
+         * 继续由 `/active` 轮询校准。
+         *
+         * ⚠️ 已知边界：终帧写出去与锁释放是同一个 handler 里紧邻的两步，客户端可能在锁真正删掉前
+         *    几毫秒就清了本地这一格 —— 这期间的发送由后端的 `CONFLICT` 兜底（与引入前的窗口同量级）。
+         *
+         * ⚠️ `releaseOwnRun` 内部按 `runOrigins === 'UI'` **按归属**收：期间若有别的来源
+         * （外部调用 / 定时任务）顶上了这一格，那盏灯必须留住，不能因为"我刚跑完"就把它灭掉。
+         */
+        if (terminated) {
+          if (isCurrent) useChatStreamStore.getState().releaseOwnRun(targetId)
+        }
         // 这一轮真的发生过 ⇒ 库里可能多了消息（`02` §5.2："中断/故障照样落库"）
         // ⇒ 让历史失效，下次读到的就是落库后的版本。
         // ⚠️ **不做这件事的后果很隐蔽**：`staleTime` 是 30s（`api/queryClient.ts`），

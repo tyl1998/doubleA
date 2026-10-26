@@ -41,7 +41,6 @@ import type { Plugin } from 'unified'
 
 import { ThinkingBlock } from './ThinkingBlock.js'
 import { ToolCard } from './ToolCard.js'
-import { shouldParseTail, streamingMarkdownChunks } from './markdownChunks.js'
 import type { ThinkingSegmentView, ToolCallView } from './messageModel.js'
 
 /** 工具卡的占位节点：渲染器按 `dataToolId` 把它换成 `ToolCard`（见 {@link AssistantMarkdown}）。 */
@@ -249,15 +248,6 @@ export interface AssistantMarkdownProps {
   /** 思考段里**仍在生成**的那一段（其余段落已完成、默认折叠）；不传 = 都当已完成 */
   streamingThinkingIndex?: number
   /**
-   * 这一条消息**正在流式生成**（内存优化 P3，`docs/子方案/前端长会话内存优化.md`）。
-   *
-   * `true` 时正文走"稳定前缀 + 尾巴"两段渲染（见 `markdownChunks.ts`）：
-   * 已完成的块只解析一次，末尾还在长的部分按纯文本渲染 —— 于是**一帧不再全量重解析**。
-   * 收尾（`false` / 不传）时整篇解析一次，与历史消息逐字同款。
-   * 默认 `false`：历史消息、产物预览等"一次性渲染"的调用点不需要它。
-   */
-  streaming?: boolean
-  /**
    * 渲染器覆盖（**P0-3-10 新增，默认不给**）。
    *
    * 唯一的消费者是**产物预览里的 MD**（`components/ArtifactPreview/MarkdownPreview`）：
@@ -290,7 +280,6 @@ export function AssistantMarkdown({
   tools,
   thinkingSegments,
   streamingThinkingIndex,
-  streaming = false,
   components,
 }: AssistantMarkdownProps) {
   const hasTools = tools !== undefined && tools.length > 0
@@ -341,66 +330,29 @@ export function AssistantMarkdown({
   )
 
   /**
-   * 流式分块（内存优化 P3）：见 `markdownChunks.ts`。`stable` 在未跨过新的块边界时**是同一个字符串**
-   * ⇒ `Markdown` 的 children 引用不变 ⇒ 已完成的部分不再重新解析。
+   * ⚠️ **流式与历史逐字同款：整篇解析一次**（2026-10-24 回退 P3 分块）。
    *
-   * ⚠️ 内联条目（工具卡 / 思考段）在分块期间**由尾巴那一次解析承载**：`markdownChunks.ts` 的
-   * 边界取"最后一个空行之后"，而条目到达的那一刻，它锚定的正文块**已经写完**（后端按
-   * `textOffset` 定位，正文先到、卡片随后）⇒ 条目的偏移必然 ≥ 尾巴的起点。
-   * 于是：
-   *   · 稳定段（纯正文前缀）用**没有条目**的插件解析 —— 它的结果因此与条目无关、可稳定复用；
-   *   · 尾巴用**全量条目**的插件解析 —— 条目落在尾巴内部（`insertInlineEntries` 只看相对位置），
-   *     落在尾巴之前的条目会被它插在尾巴开头（视觉上就在"正文之间"，与一次性解析一致）。
-   * 收尾时（`streaming === false`）走整篇解析，所以最终形态与历史消息逐字同款。
+   * 早先（内存优化 P3）流式期间把正文切成"稳定前缀 + 尾巴"两段：前缀用**不带内联条目**的插件
+   * 解析、短尾巴按**纯文本**渲染。那套做法的代价是**内联条目（思考块 / 工具卡）只在解析时才插**：
+   * 一旦正文开始到达（`tail !== ''`），前缀与纯文本尾巴**都不插条目** ⇒ 思考与工具卡在正文出现的
+   * 那一刻**整批消失**，直到收尾（`streaming` 变 `false`）整篇解析才回来；同时纯文本尾巴没有
+   * `.md` 的块级排版，内容高度骤降 ⇒ 视口定位被带到开头（用户报的两条症状）。
+   *
+   * 而且它**并没有真正省下解析**：`react-markdown` 的 `Markdown` 是**无 memo 的同步组件**，
+   * 父组件每帧重渲染时它照样 `parse + runSync` 整篇（见 `node_modules/react-markdown/lib/index.js`）。
+   * 故这里回到"与历史消息共用同一个 `<Markdown>` 单棵元素树"—— 行为可预期，且内联条目
+   * 与滚动跟随都不再依赖"哪一段被解析"。
    */
-  const chunks = useMemo(
-    () => (streaming ? streamingMarkdownChunks(text) : { stable: text, tail: '' }),
-    [streaming, text],
-  )
-  /** 尾巴是否交给解析器（极长且没有空行的正文，见 `shouldParseTail`） */
-  const parseTail = chunks.tail !== '' && shouldParseTail(chunks.tail)
-  /** 稳定段：纯正文前缀 ⇒ 插件里**不带**条目（见上面 ⚠️ 第三条） */
-  const stablePlugins = useMemo(() => [remarkGfm], [])
-
-  if (!streaming || chunks.tail === '') {
-    return (
-      // `.md` 的样式在 `styles/base.css`（P0-1-30 从 `design/styles/base.css` 搬入），
-      // 含 `pre` / `code` / `table` / `blockquote` 的完整口径 —— 这里不重复写任何样式
-      <div className="md">
-        <Markdown
-          remarkPlugins={remarkPlugins}
-          {...(renderers === undefined ? {} : { components: renderers })}
-        >
-          {text}
-        </Markdown>
-      </div>
-    )
-  }
-
   return (
+    // `.md` 的样式在 `styles/base.css`（P0-1-30 从 `design/styles/base.css` 搬入），
+    // 含 `pre` / `code` / `table` / `blockquote` 的完整口径 —— 这里不重复写任何样式
     <div className="md">
-      {chunks.stable === '' ? null : (
-        <Markdown
-          remarkPlugins={stablePlugins}
-          {...(renderers === undefined ? {} : { components: renderers })}
-        >
-          {chunks.stable}
-        </Markdown>
-      )}
-      {chunks.tail === '' ? null : parseTail ? (
-        <Markdown
-          remarkPlugins={remarkPlugins}
-          {...(renderers === undefined ? {} : { components: renderers })}
-        >
-          {chunks.tail}
-        </Markdown>
-      ) : (
-        // 尾巴按纯文本（`pre-wrap` 保留换行）：它可能是一个还没写完的代码围栏 / 表格，
-        // 解析出来只会是"半截语法"。收尾时整篇解析一次，立刻恢复正常渲染。
-        <div className="md md--tail" style={{ whiteSpace: 'pre-wrap' }}>
-          {chunks.tail}
-        </div>
-      )}
+      <Markdown
+        remarkPlugins={remarkPlugins}
+        {...(renderers === undefined ? {} : { components: renderers })}
+      >
+        {text}
+      </Markdown>
     </div>
   )
 }

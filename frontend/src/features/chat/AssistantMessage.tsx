@@ -153,9 +153,6 @@ export const AssistantMessage = memo(function AssistantMessage({
               text={view.text}
               tools={view.tools}
               thinkingSegments={view.thinkingSegments}
-              // 内存优化 P3：流式期间走"稳定前缀 + 尾巴"两段渲染（见 `markdownChunks.ts`），
-              // 收尾后整篇解析一次 —— 与历史消息逐字同款
-              streaming={view.status === 'streaming'}
               {...(view.status === 'streaming'
                 ? { streamingThinkingIndex: view.thinkingSegments.length - 1 }
                 : {})}
