@@ -40,7 +40,7 @@
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
 
-import {
+import { appMsg,
   AppError,
   openAgentModelsResultSchema,
   openAgentProfileSchema,
@@ -524,7 +524,7 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
 
       const row = await assertOpenConversation(conversationId, context)
       if (isOpenConversationReadOnly(row.status)) {
-        throw AppError.conflict('该会话已结束，不能再发送消息')
+        throw AppError.conflict(appMsg('app.m021'))
       }
 
       const lease = await acquireOpenConcurrency(context, request.id)
@@ -572,7 +572,7 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
 
       const row = await assertOpenConversation(conversationId, context)
       if (isOpenConversationReadOnly(row.status)) {
-        throw AppError.conflict('该会话已结束，不能重新生成')
+        throw AppError.conflict(appMsg('app.m104'))
       }
 
       const lease = await acquireOpenConcurrency(context, request.id)
@@ -684,7 +684,7 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
       return openRoute(async () => {
         await assertOpenConversation(request.params.id, context)
         if (body.enabled && !context.allowAutoApprove) {
-          throw AppError.forbidden('该 API Key 未获准开启自动审批，请联系签发人')
+          throw AppError.forbidden(appMsg('app.m105'))
         }
         // 先过所有权（不是我的会话 ⇒ 404），再写开关 —— 顺序与内部 `/auto-approve` 一致
         await getConversationActive(request.params.id, openViewer(context, role))
@@ -714,20 +714,19 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
         if (part.type !== 'file') continue
         const bytes = await part.toBuffer()
         if (part.file.truncated) {
-          throw AppError.validation(
-            `文件超过上传上限（${config.limits.uploadBodyLimitRaw}）：${part.filename || '未命名文件'}`,
+          throw AppError.validation(appMsg('app.m106', { p0: config.limits.uploadBodyLimitRaw, p1: part.filename || '未命名文件' }),
           )
         }
         if (file !== undefined) {
-          throw AppError.validation(`一次只能上传一个文件，字段名为 ${UPLOAD_FILE_FIELD}`)
+          throw AppError.validation(appMsg('app.m107', { p0: UPLOAD_FILE_FIELD }))
         }
         file = { fileName: part.filename, declaredMime: part.mimetype, bytes }
       }
       if (file === undefined) {
-        throw AppError.validation(`没有收到文件：请用 multipart/form-data 上传，字段名为 ${UPLOAD_FILE_FIELD}`)
+        throw AppError.validation(appMsg('app.m108', { p0: UPLOAD_FILE_FIELD }))
       }
       if (file.bytes.length === 0) {
-        throw AppError.validation(`上传的文件是空的（0 字节）：${file.fileName || '未命名文件'}`)
+        throw AppError.validation(appMsg('app.m010', { p0: file.fileName || '未命名文件' }))
       }
 
       return openRoute(async () => {
@@ -923,6 +922,6 @@ async function resolveConversationCursor(context: OpenRequestContext, cursor: st
     orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'first' } }, { createdAt: 'desc' }, { id: 'desc' }],
   })
   const index = rows.findIndex((row) => row.id === cursor)
-  if (index < 0) throw AppError.validation('cursor 不是该智能体下的会话 id')
+  if (index < 0) throw AppError.validation(appMsg('app.m109'))
   return index + 1
 }

@@ -324,7 +324,7 @@ export function useUpdateModel() {
   })
 }
 
-/** 删模型（被 Agent 引用时 409；`agentCount` 含软删的智能体，与后端守卫同口径） */
+/** 删模型（被 Agent 引用时 409；`agentCount` = 在线智能体的默认模型 ∪ 模型池成员，与后端守卫同口径） */
 export function useRemoveModel() {
   const queryClient = useQueryClient()
   return useMutation({

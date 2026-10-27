@@ -49,7 +49,7 @@
  * 那是需鉴权的内网 Confluence 附件 URL，收益不抵复杂度）—— 本模块只做"把导出件里**自带**的图取出来"。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { parseTableGrid, toPlainText } from './docx.js'
 import { decodeDataUri, fetchRemoteImage } from './md.js'
@@ -445,8 +445,7 @@ export async function parseHtml(bytes: Buffer, options: ParseOptions = DEFAULT_P
   const html = mhtml?.html ?? text
   const { blocks, imageRefs } = htmlToBlocks(html)
   if (blocks.length === 0) {
-    throw AppError.validation(
-      '无法从该 .doc 文件解析出文本：它被识别为 HTML/网页导出件，但内容里没有可抽取的文字。请确认文件未损坏。',
+    throw AppError.validation(appMsg('app.m076'),
     )
   }
 

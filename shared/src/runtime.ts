@@ -25,6 +25,10 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
+import type { MessageKey } from './i18n/index.js'
+
 /** 支持的语言（顺序 = 变体 id 里组件的排序键；与 `infra/sandbox/versions.mjs` 一致） */
 export const SANDBOX_RUNTIME_LANGUAGES = ['node', 'python', 'go', 'java', 'rust'] as const
 export type SandboxRuntimeLanguage = (typeof SANDBOX_RUNTIME_LANGUAGES)[number]
@@ -246,12 +250,16 @@ export const buildSandboxRuntimeBodySchema = z.object({
     .array(
       z.object({
         language: z.enum(SANDBOX_RUNTIME_LANGUAGES),
-        version: z.string().trim().min(1, '版本不能为空').max(32, '版本过长'),
+        version: z
+          .string()
+          .trim()
+          .min(1, validationMessage('validation.runtime.versionRequired'))
+          .max(32, validationMessage('validation.runtime.versionTooLong', { max: 32 })),
       }),
-      { required_error: '缺少 components（语言+版本列表）' },
+      { required_error: validationMessage('validation.runtime.componentsMissing') },
     )
-    .min(1, '至少选一个语言')
-    .max(8, '语言过多'),
+    .min(1, validationMessage('validation.runtime.languageRequired'))
+    .max(8, validationMessage('validation.runtime.tooManyLanguages', { max: 8 })),
   /**
    * 期望在**哪台实例**上构建（P1-14）。省略 = 接住本次请求的那台（旧行为）。
    * ⚠️ 任务只存在于发起它的进程 ⇒ 请求被网关路由到别的实例时，后端会回一个 `failed` 快照
@@ -286,7 +294,10 @@ export const SANDBOX_BUILD_PHASES = [
 ] as const
 export type SandboxBuildPhase = (typeof SANDBOX_BUILD_PHASES)[number]
 
-/** 各阶段的中文显示名（后端算不出"人话"时前端也有兜底，但这里给出统一口径） */
+/**
+ * 各阶段的中文显示名（**保留**：中文真相在这一份 —— `runtime-build:regression` 与
+ * `verify:i18n` G1 都拿它和 {@link SANDBOX_BUILD_PHASE_KEY} 的译文逐字对账）。
+ */
 export const SANDBOX_BUILD_PHASE_LABELS: Readonly<Record<SandboxBuildPhase, string>> = {
   queued: '排队中…',
   preparing: '准备构建上下文…',
@@ -294,6 +305,20 @@ export const SANDBOX_BUILD_PHASE_LABELS: Readonly<Record<SandboxBuildPhase, stri
   language: '安装语言运行时…',
   verifying: '运行时自检…',
   done: '构建完成',
+}
+
+/**
+ * 各阶段的**界面文案 key**（P1-23 收尾 ①）—— 前端按 `phase` 取译文，再与 `detail` 组合。
+ *
+ * 为什么中文表不删：后端日志仍按中文写；`verify:i18n` G1 逐表守"两边不漂移"。
+ */
+export const SANDBOX_BUILD_PHASE_KEY: Readonly<Record<SandboxBuildPhase, MessageKey>> = {
+  queued: 'label.buildPhase.queued',
+  preparing: 'label.buildPhase.preparing',
+  apt: 'label.buildPhase.apt',
+  language: 'label.buildPhase.language',
+  verifying: 'label.buildPhase.verifying',
+  done: 'label.buildPhase.done',
 }
 
 /** `GET /api/sandbox/runtimes/build/:buildId` 的响应（也是启动端点的响应形状） */
@@ -311,8 +336,18 @@ export const sandboxBuildJobSchema = z.object({
   status: z.enum(SANDBOX_BUILD_STATUSES),
   /** 当前阶段 */
   phase: z.enum(SANDBOX_BUILD_PHASES),
-  /** 阶段显示文案（后端已按当前组件算出，前端直接用） */
-  phaseLabel: z.string(),
+  /**
+   * 当前阶段的**细节**（组件名 / RUN 概要；没有时为 `null`）—— 前端与 `phase` 组合成一句人话。
+   *
+   * 老版本后端不返回该字段 ⇒ `null`（前端退化成"只显示阶段名"）。
+   */
+  detail: z.string().nullable(),
+  /**
+   * @deprecated 后端不再更新；仅为兼容旧前端保留（将随下个版本删除）。
+   *
+   * 新后端**不返回**它；保留可选形态是为了"新后端 + 旧前端"（灰度期）不拿到 `undefined` 样式的空白。
+   */
+  phaseLabel: z.string().optional(),
   /** 进度 0..1（粗粒度；只增不减，仅用于进度条观感） */
   progress: z.number().min(0).max(1),
   /** 构建日志**尾部**（给"查看日志"用；截断，避免几何膨胀） */

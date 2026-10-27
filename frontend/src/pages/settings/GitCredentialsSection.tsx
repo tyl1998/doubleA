@@ -28,20 +28,23 @@ import {
 } from '../../api/gitCredentials.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
 import {
-  GIT_CREDENTIAL_KIND_LABEL,
+  GIT_CREDENTIAL_KIND_KEY,
   gitCredentialCreateBody,
   gitCredentialUpdateBody,
   type GitCredentialFormValues,
 } from './gitCredentialModel.js'
 import type { GitCredentialItem } from '@doubulea/shared'
 
-const KIND_LABEL = GIT_CREDENTIAL_KIND_LABEL
+const KIND_KEY = GIT_CREDENTIAL_KIND_KEY
 
 type FormValues = GitCredentialFormValues
 
 export function GitCredentialsSection() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const query = useGitCredentials()
   const createCredential = useCreateGitCredential()
   const updateCredential = useUpdateGitCredential()
@@ -71,10 +74,10 @@ export function GitCredentialsSection() {
       if (editing === null) {
         createCredential.mutate(gitCredentialCreateBody(values), {
           onSuccess: () => {
-            feedback.ok('已保存 git 凭据（仅你可见；下一次派活时注入容器）')
+            feedback.ok(t('settings.gitCredentials.saved'))
             setOpen(false)
           },
-          onError: (error) => feedback.fail(error, '保存 git 凭据失败'),
+          onError: (error) => feedback.fail(error, t('settings.gitCredentials.saveFailed')),
         })
         return
       }
@@ -83,10 +86,10 @@ export function GitCredentialsSection() {
         { id: editing.id, body: gitCredentialUpdateBody(editing, values) },
         {
           onSuccess: () => {
-            feedback.ok('已更新 git 凭据')
+            feedback.ok(t('settings.gitCredentials.updated'))
             setOpen(false)
           },
-          onError: (error) => feedback.fail(error, '更新 git 凭据失败'),
+          onError: (error) => feedback.fail(error, t('settings.gitCredentials.updateFailed')),
         },
       )
     })
@@ -97,18 +100,23 @@ export function GitCredentialsSection() {
   const head = (
     <div className="admin-section__head">
       <div>
-        <h2 className="card__title">Git 凭据</h2>
+        <h2 className="card__title">{t('settings.gitCredentials.title')}</h2>
         <p className="page__lead">
-          Code 模式下，agent 会在容器里跑 <code>git clone</code> / <code>commit</code>。这里配置的凭据
-          <strong>按用户加密存平台</strong>，agent 需要时按需取用（容器里不落明文），<strong>绝不写进工作区</strong>。
-          列表接口永不返回明文或掩码。
+          {t('settings.gitCredentials.leadA')} <code>git clone</code> / <code>commit</code>
+          {t('settings.gitCredentials.leadB')}
+          <strong>{t('settings.gitCredentials.leadStrongEncrypted')}</strong>
+          {t('settings.gitCredentials.leadC')}
+          <strong>{t('settings.gitCredentials.leadStrongNotInWorkspace')}</strong>
+          {t('settings.gitCredentials.leadD')}
           <br />
-          <strong>推荐用 SSH（SSH_KEY）</strong>：HTTPS 需要额外配一个 PAT（HTTPS_TOKEN），且按
-          <code>host</code> 精确匹配 —— 未匹配时 git 只会报一个笼统的认证失败。
+          <strong>{t('settings.gitCredentials.leadStrongRecommendSsh')}</strong>
+          {t('settings.gitCredentials.leadE')}
+          <code>host</code>
+          {t('settings.gitCredentials.leadF')}
         </p>
       </div>
       <Button type="primary" onClick={openCreate}>
-        新建凭据
+        {t('settings.gitCredentials.new')}
       </Button>
     </div>
   )
@@ -122,7 +130,7 @@ export function GitCredentialsSection() {
 
       {query.isError ? (
         <ErrorState
-          title="凭据清单加载失败"
+          title={t('settings.gitCredentials.loadFailed')}
           error={query.error}
           retrying={query.isFetching}
           onRetry={() => {
@@ -134,11 +142,11 @@ export function GitCredentialsSection() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有 git 凭据"
-            lead="需要克隆私有仓库时，在这里配一把只读 deploy key（SSH_KEY）或一个 PAT（HTTPS_TOKEN）。"
+            title={t('settings.gitCredentials.emptyTitle')}
+            lead={t('settings.gitCredentials.emptyLead')}
             action={
               <Button type="primary" onClick={openCreate}>
-                新建凭据
+                {t('settings.gitCredentials.new')}
               </Button>
             }
           />
@@ -149,31 +157,41 @@ export function GitCredentialsSection() {
             <div className="card" key={item.id}>
               <div className="card__head">
                 <p className="card__title">{item.label}</p>
-                <Tag>{KIND_LABEL[item.kind]}</Tag>
-                {item.hasValue ? <Tag className="tag--ok">已配置 ✓</Tag> : <Tag className="tag--warn">无值</Tag>}
+                <Tag>{t(KIND_KEY[item.kind])}</Tag>
+                {item.hasValue ? (
+                  <Tag className="tag--ok">{t('settings.gitCredentials.configured')}</Tag>
+                ) : (
+                  <Tag className="tag--warn">{t('settings.gitCredentials.noValue')}</Tag>
+                )}
                 <div className="card__head-right">
                   <span className="ratio">
-                    {item.host === null ? '不限主机' : `主机 ${item.host}`} · 更新于{' '}
-                    {new Date(item.updatedAt).toLocaleString('zh-CN', { hour12: false })}
+                    {item.host === null
+                      ? t('settings.gitCredentials.unlimitedHost')
+                      : t('settings.gitCredentials.hostValue', { host: item.host })}{' '}
+                    ·{' '}
+                    {t('settings.gitCredentials.updatedAt', {
+                      time: new Date(item.updatedAt).toLocaleString(localeTag(locale), { hour12: false }),
+                    })}
                   </span>
                 </div>
               </div>
               <div className="card__body row" style={{ gap: 'var(--sp-3)' }}>
-                <Button onClick={() => openEdit(item)}>编辑</Button>
+                <Button onClick={() => openEdit(item)}>{t('common.edit')}</Button>
                 <Popconfirm
-                  title={`删除凭据「${item.label}」？`}
-                  description="删除后，依赖它的 git 操作会退回系统默认身份（git clone 私有仓库会失败），直到你重新配置。"
-                  okText="删除"
+                  title={t('settings.gitCredentials.deleteTitle', { label: item.label })}
+                  description={t('settings.gitCredentials.deleteDescription')}
+                  okText={t('common.delete')}
                   okButtonProps={{ danger: true }}
-                  cancelText="取消"
+                  cancelText={t('common.cancel')}
                   onConfirm={() => {
                     removeCredential.mutate(item.id, {
-                      onSuccess: (result) => feedback.ok(`已删除凭据「${result.label}」`),
-                      onError: (error) => feedback.fail(error, '删除凭据失败'),
+                      onSuccess: (result) =>
+                        feedback.ok(t('settings.gitCredentials.deletedOk', { label: result.label })),
+                      onError: (error) => feedback.fail(error, t('settings.gitCredentials.deleteFailed')),
                     })
                   }}
                 >
-                  <Button danger>删除</Button>
+                  <Button danger>{t('common.delete')}</Button>
                 </Popconfirm>
               </div>
             </div>
@@ -182,62 +200,78 @@ export function GitCredentialsSection() {
       )}
 
       <Modal
-        title={editing === null ? '新建 git 凭据' : `编辑「${editing.label}」`}
+        title={
+          editing === null
+            ? t('settings.gitCredentials.modalCreateTitle')
+            : t('settings.gitCredentials.modalEditTitle', { label: editing.label })
+        }
         open={open}
         confirmLoading={createCredential.isPending || updateCredential.isPending}
         onOk={submit}
         onCancel={() => setOpen(false)}
-        okText="保存"
-        cancelText="取消"
+        okText={t('common.save')}
+        cancelText={t('common.cancel')}
         destroyOnClose
       >
         <Alert
           type="info"
           showIcon
           style={{ marginBottom: 'var(--sp-4)' }}
-          message="值只在保存时提交一次，之后界面上不再展示（不提供掩码）。编辑时秘密字段留空 = 不变。"
+          message={t('settings.gitCredentials.modalAlert')}
         />
         <Form form={form} layout="vertical" initialValues={{ kind: 'SSH_KEY' }}>
-          <Form.Item name="label" label="名称" rules={[{ required: true, message: '给这条凭据起个名字' }]}>
-            <Input placeholder="如 github-work" maxLength={128} />
+          <Form.Item
+            name="label"
+            label={t('settings.gitCredentials.labelName')}
+            rules={[{ required: true, message: t('settings.gitCredentials.labelNameRule') }]}
+          >
+            <Input placeholder={t('settings.gitCredentials.labelNamePlaceholder')} maxLength={128} />
           </Form.Item>
-          <Form.Item name="kind" label="类型" rules={[{ required: true }]}>
+          <Form.Item name="kind" label={t('settings.gitCredentials.labelKind')} rules={[{ required: true }]}>
             <Select
               disabled={editing !== null}
               options={[
-                { value: 'SSH_KEY', label: 'SSH 私钥（deploy key）' },
-                { value: 'HTTPS_TOKEN', label: 'HTTPS 令牌（PAT）' },
+                { value: 'SSH_KEY', label: t('settings.gitCredentials.kindSshOption') },
+                { value: 'HTTPS_TOKEN', label: t('settings.gitCredentials.kindHttpsOption') },
               ]}
             />
           </Form.Item>
-          <Form.Item name="host" label="限定主机（可选）">
-            <Input placeholder="如 github.com；留空 = 不限" maxLength={255} />
+          <Form.Item name="host" label={t('settings.gitCredentials.labelHost')}>
+            <Input placeholder={t('settings.gitCredentials.hostPlaceholder')} maxLength={255} />
           </Form.Item>
 
           {kind === 'SSH_KEY' ? (
             <>
               <Form.Item
                 name="privateKey"
-                label={editing === null ? '私钥（OpenSSH 文本）' : '替换私钥（留空 = 不变）'}
-                rules={editing === null ? [{ required: true, message: '粘贴私钥内容' }] : []}
+                label={
+                  editing === null
+                    ? t('settings.gitCredentials.privateKeyLabelNew')
+                    : t('settings.gitCredentials.privateKeyLabelEdit')
+                }
+                rules={editing === null ? [{ required: true, message: t('settings.gitCredentials.privateKeyRule') }] : []}
               >
                 <Input.TextArea rows={5} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
               </Form.Item>
-              <Form.Item name="knownHosts" label="known_hosts（可选）">
-                <Input.TextArea rows={2} placeholder="留空则首次连接自动接受主机指纹（accept-new）" />
+              <Form.Item name="knownHosts" label={t('settings.gitCredentials.knownHostsLabel')}>
+                <Input.TextArea rows={2} placeholder={t('settings.gitCredentials.knownHostsPlaceholder')} />
               </Form.Item>
             </>
           ) : (
             <>
               <Form.Item
                 name="token"
-                label={editing === null ? '访问令牌（PAT）' : '替换令牌（留空 = 不变）'}
-                rules={editing === null ? [{ required: true, message: '粘贴访问令牌' }] : []}
+                label={
+                  editing === null
+                    ? t('settings.gitCredentials.tokenLabelNew')
+                    : t('settings.gitCredentials.tokenLabelEdit')
+                }
+                rules={editing === null ? [{ required: true, message: t('settings.gitCredentials.tokenRule') }] : []}
               >
                 <Input.Password placeholder="ghp_…" />
               </Form.Item>
-              <Form.Item name="username" label="用户名（可选）">
-                <Input placeholder="默认 x-access-token（GitLab 可用 oauth2）" maxLength={128} />
+              <Form.Item name="username" label={t('settings.gitCredentials.usernameLabel')}>
+                <Input placeholder={t('settings.gitCredentials.usernamePlaceholder')} maxLength={128} />
               </Form.Item>
             </>
           )}

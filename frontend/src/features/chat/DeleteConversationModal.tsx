@@ -27,6 +27,7 @@ import type { ConversationItem, RemoveConversationResult } from '@doubulea/share
 import { useRemoveConversation } from '../../api/conversations.js'
 import { describeError } from '../../api/client.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 export interface DeleteConversationModalProps {
   agentId: string
@@ -46,6 +47,7 @@ export function DeleteConversationModal({
   onDeleted,
 }: DeleteConversationModalProps) {
   const feedback = useFeedback()
+  const { t } = useT()
   const remove = useRemoveConversation(agentId)
   const [errorText, setErrorText] = useState<string | null>(null)
 
@@ -56,7 +58,7 @@ export function DeleteConversationModal({
 
   if (conversation === null) return null
 
-  const title = conversation.topic ?? '未命名会话'
+  const title = conversation.topic ?? t('deleteConversation.untitled')
   const removing = remove.isPending
 
   const confirm = (): void => {
@@ -65,8 +67,8 @@ export function DeleteConversationModal({
       onSuccess: (result) => {
         feedback.ok(
           result.deletedMessages === 0
-            ? `已删除会话「${title}」`
-            : `已删除会话「${title}」与其中的 ${result.deletedMessages} 条消息`,
+            ? t('deleteConversation.deletedOk', { title })
+            : t('deleteConversation.deletedOkWithCount', { title, count: result.deletedMessages }),
         )
         onDeleted(result)
       },
@@ -82,25 +84,30 @@ export function DeleteConversationModal({
       open
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          删除会话「{title}」
+          {t('deleteConversation.title', { title })}
           {/* 用 `tag--danger` 而不是 AntD 的预设色：全站"危险"只应该有一种红 */}
-          <Tag className="tag--danger">级联删除</Tag>
+          <Tag className="tag--danger">{t('deleteConversation.cascadeTag')}</Tag>
         </span>
       }
-      okText="确认删除"
+      okText={t('deleteConversation.okText')}
       okButtonProps={{ danger: true, loading: removing }}
-      cancelText="取消"
+      cancelText={t('confirm.reject')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!removing}
     >
       <div className="stack stack--tight">
         <p>
-          将删除该会话的<strong>全部消息</strong>（含其中的引用卡与工具调用记录）。
+          {t('deleteConversation.bodyAllPrefix')}
+          <strong>{t('deleteConversation.bodyAllStrong')}</strong>
+          {t('deleteConversation.bodyAllSuffix')}
         </p>
         <p className="ratio">
-          删除会话<strong>不影响</strong>智能体与知识库；这一轮的回答与消息<strong>无法恢复</strong>
-          ，P0-1 没有回收站。
+          {t('deleteConversation.bodyScopePrefix')}
+          <strong>{t('deleteConversation.bodyScopeStrong')}</strong>
+          {t('deleteConversation.bodyScopeMid')}
+          <strong>{t('deleteConversation.bodyScopeStrong2')}</strong>
+          {t('deleteConversation.bodyScopeSuffix')}
         </p>
 
         {streaming && (
@@ -109,12 +116,14 @@ export function DeleteConversationModal({
             showIcon
             // ⚠️ 文案**刻意**不写「该会话正在生成中」：那是 `CONFLICT` 的专用短句，
             // 全仓的代码里只许有一处定义（`streamErrors.ts`）。
-            message="删除的是一个正在生成的会话"
-            description="删除会同时收掉界面上这一轮的回答；服务端那条流随后也会结束，它已经生成的正文不会落库。"
+            message={t('deleteConversation.warnTitle')}
+            description={t('deleteConversation.warnDescription')}
           />
         )}
 
-        {errorText !== null && <Alert type="error" showIcon message="删除失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('deleteConversation.failed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

@@ -23,6 +23,7 @@
 import { Button } from 'antd'
 
 import { describeError } from '../api/client.js'
+import { useT } from './i18n.js'
 
 export interface SessionErrorScreenProps {
   error: unknown
@@ -33,26 +34,32 @@ export interface SessionErrorScreenProps {
 }
 
 export function SessionErrorScreen({ error, onRetry, retrying }: SessionErrorScreenProps) {
+  const { t } = useT()
   const { code, message } = describeError(error)
 
   return (
     <div className="boot" role="alert">
       <div className="boot__box">
         <span className="led led--fail" aria-hidden="true" />
-        <p className="boot__title">读不到登录态</p>
+        <p className="boot__title">{t('boot.sessionErrorTitle')}</p>
         <p className="boot__lead">
-          接口 <code>/api/auth/me</code> 没返回可用结果，无法判断当前会话。
+          {t('boot.sessionErrorLeadPrefix')}
+          <code>/api/auth/me</code>
+          {t('boot.sessionErrorLeadSuffix')}
         </p>
         {/* 错误码照实显示：这是内部工具，码比"出错了"三个字有用得多（`03` §六） */}
         <p className="kicker">
           {code} · {message}
         </p>
         <Button type="primary" loading={retrying} onClick={onRetry}>
-          重试
+          {t('common.retry')}
         </Button>
         <p className="boot__lead">
-          若一直失败：确认后端已在 <span className="num">13000</span> 监听，且前端 dev
-          server 启动时带了 <span className="num">VITE_DEV_PROXY_TARGET</span>。
+          {t('boot.sessionErrorHintPrefix')}
+          <span className="num">13000</span>
+          {t('boot.sessionErrorHintSuffix')}
+          <span className="num">VITE_DEV_PROXY_TARGET</span>
+          {t('boot.sessionErrorHintTail')}
         </p>
       </div>
     </div>

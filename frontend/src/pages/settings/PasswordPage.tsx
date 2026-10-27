@@ -12,36 +12,39 @@ import { Button } from 'antd'
 import { useNavigate } from 'react-router-dom'
 
 import { useCurrentUser } from '../../api/auth.js'
+import { useT } from '../../app/i18n.js'
 import { HOME_PATH } from '../../app/paths.js'
 import { ChangePasswordForm } from '../login/ChangePasswordForm.js'
 
 export function PasswordPage() {
   const navigate = useNavigate()
   const { data: user } = useCurrentUser()
+  const { t } = useT()
 
   return (
     <>
       <div className="page__head">
         <div>
+          {/* 屏号是本仓的**仪器读数**（刻意不翻译，口径见 `03` §九） */}
           <p className="kicker">S-08 · 改密</p>
-          <h1>修改密码</h1>
+          <h1>{t('settings.password.title')}</h1>
           <p className="page__lead">
-            当前账号 <span className="num">{user?.username ?? '—'}</span>。改密后立即生效，
-            当前会话保持登录，不需要重新登录。
+            {t('settings.password.leadPrefix')} <span className="num">{user?.username ?? '—'}</span>
+            {t('settings.password.leadSuffix')}
           </p>
         </div>
       </div>
 
       <div className="card bracket card--pad" style={{ maxWidth: 420 }}>
         <ChangePasswordForm
-          submitLabel="保存新密码"
+          submitLabel={t('settings.password.submit')}
           onSuccess={() => {
             navigate(HOME_PATH, { replace: true })
           }}
         />
         <div className="row" style={{ marginTop: 'var(--sp-4)' }}>
           <Button type="link" size="small" onClick={() => navigate(-1)} style={{ padding: 0 }}>
-            ← 返回上一页
+            {t('common.back')}
           </Button>
         </div>
       </div>

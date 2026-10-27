@@ -65,7 +65,7 @@
  *    漏掉任何一处都表现为"这个协议下模型不会用工具"，而**日志里什么都不会说**。
  */
 
-import { AppError, DEFAULT_UPSTREAM_PROTOCOL, type UpstreamProtocol } from '@doubulea/shared'
+import { appMsg, AppError, DEFAULT_UPSTREAM_PROTOCOL, type UpstreamProtocol } from '@doubulea/shared'
 
 import { describeForMessage, redactSecret, snippet, upstreamHeaders, type UpstreamEndpoint } from './upstream.js'
 
@@ -332,9 +332,12 @@ function throwUpstreamErrorFrame(ctx: ProtocolDecodeContext, errorField: unknown
   const message = record === null ? null : str(record.message)
   const type = record === null ? null : str(record.type)
   throw AppError.upstreamError(
-    `上游${stage}返回错误：${describeForMessage(ctx)}。` +
-      `${redactSecret(String(message ?? '(无 message)'), ctx.apiKey)}` +
-      `${type === null ? '' : `（type=${type}）`}`,
+    appMsg('app.m277', {
+      p0: stage,
+      p1: describeForMessage(ctx),
+      p2: redactSecret(String(message ?? '(无 message)'), ctx.apiKey),
+      p3: type === null ? '' : `（type=${type}）`,
+    }),
   )
 }
 
@@ -765,7 +768,7 @@ const openAiCompat: ChatProtocol = {
   readNonStream(payload, ctx) {
     const record = asRecord(payload)
     if (record === null) {
-      throw AppError.upstreamError(`上游响应结构异常（不是对象）：${ctx.providerName}`)
+      throw AppError.upstreamError(appMsg('app.m016', { p0: ctx.providerName }))
     }
     // ⚠️ 有的网关**用 200 返回错误**：不显式判它的话会取到空文本，问题被推迟到很久以后
     if (asRecord(record.error) !== null) throwUpstreamErrorFrame(ctx, record.error, '以 200 ')
@@ -773,11 +776,10 @@ const openAiCompat: ChatProtocol = {
     const choices = Array.isArray(record.choices) ? record.choices : []
     const choice = asRecord(choices[0])
     if (choice === null) {
-      throw AppError.upstreamError(
-        `上游响应里没有 choices[0]：${ctx.providerName}。原始响应：${snippet(
+      throw AppError.upstreamError(appMsg('app.m054', { p0: ctx.providerName, p1: snippet(
           JSON.stringify(record),
           ctx.apiKey,
-        )}`,
+        ) }),
       )
     }
     const message = asRecord(choice.message) ?? {}
@@ -935,7 +937,7 @@ const openAiResponses: ChatProtocol = {
   readNonStream(payload, ctx) {
     const record = asRecord(payload)
     if (record === null) {
-      throw AppError.upstreamError(`上游响应结构异常（不是对象）：${ctx.providerName}`)
+      throw AppError.upstreamError(appMsg('app.m016', { p0: ctx.providerName }))
     }
     if (asRecord(record.error) !== null) throwUpstreamErrorFrame(ctx, record.error, '以 200 ')
     const status = str(record.status)
@@ -973,11 +975,10 @@ const openAiResponses: ChatProtocol = {
     if (text === '' && thinking === '' && output.length === 0) {
       const convenience = str(record.output_text)
       if (convenience === null) {
-        throw AppError.upstreamError(
-          `上游响应里没有 output[]（也没有 output_text）：${ctx.providerName}。原始响应：${snippet(
+        throw AppError.upstreamError(appMsg('app.m055', { p0: ctx.providerName, p1: snippet(
             JSON.stringify(record),
             ctx.apiKey,
-          )}`,
+          ) }),
         )
       }
       text = convenience
@@ -1264,7 +1265,7 @@ const anthropicMessages: ChatProtocol = {
   readNonStream(payload, ctx) {
     const record = asRecord(payload)
     if (record === null) {
-      throw AppError.upstreamError(`上游响应结构异常（不是对象）：${ctx.providerName}`)
+      throw AppError.upstreamError(appMsg('app.m016', { p0: ctx.providerName }))
     }
     // Anthropic 的错误体是 `{type:'error', error:{type,message}}`；有的网关只给顶层 `error`
     if (str(record.type) === 'error' || asRecord(record.error) !== null) {

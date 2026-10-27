@@ -33,7 +33,7 @@
  *    必须逐字一致，否则重建会变成绕过校验的后门（"上传拒了 `.doc`，重建却能塞进去"）。
  */
 
-import {
+import { appMsg,
   AppError,
   documentParamsSchema,
   knowledgeBaseIdParamsSchema,
@@ -81,7 +81,7 @@ function parseBoolField(raw: string | undefined, label: string): boolean {
   const value = (raw ?? '').trim().toLowerCase()
   if (value === '' || value === 'false' || value === '0') return false
   if (value === 'true' || value === '1') return true
-  throw AppError.validation(`${label} 只能是 true / false，收到「${raw}」`)
+  throw AppError.validation(appMsg('app.m097', { p0: label, p1: raw ?? '' }))
 }
 
 /** 解析 multipart 里的识别方式字段（缺省/空 = `NONE`；非法值 400） */
@@ -89,7 +89,7 @@ function parseRecognition(raw: string | undefined): ImageRecognition {
   const value = (raw ?? '').trim().toUpperCase()
   if (value === '') return 'NONE'
   if ((IMAGE_RECOGNITIONS as readonly string[]).includes(value)) return value as ImageRecognition
-  throw AppError.validation(`imageRecognize 只能是 ${IMAGE_RECOGNITIONS.join(' / ')}，收到「${raw}」`)
+  throw AppError.validation(appMsg('app.m098', { p0: IMAGE_RECOGNITIONS.join(' / '), p1: raw ?? '' }))
 }
 
 /**
@@ -115,7 +115,7 @@ async function readUploadedFile(request: FastifyRequest): Promise<{
       // ⚠️ `truncated` 在**流**上（`part.file`）而不是 `MultipartFile` 本身 —— 类型里只有流有这个字段
       if (part.file.truncated) throw fileTooLarge(part.filename)
       if (file !== undefined) {
-        throw AppError.validation('一次只能上传一个文件：请只保留一个待上传文件，字段名为 file')
+        throw AppError.validation(appMsg('app.m099'))
       }
       file = { fileName: part.filename, declaredMime: part.mimetype, bytes }
       continue
@@ -125,10 +125,10 @@ async function readUploadedFile(request: FastifyRequest): Promise<{
   }
 
   if (file === undefined) {
-    throw AppError.validation('没有收到文件：请用 multipart/form-data 上传，文件字段名为 file')
+    throw AppError.validation(appMsg('app.m100'))
   }
   if (file.bytes.length === 0) {
-    throw AppError.validation(`上传的文件是空的（0 字节）：${file.fileName || '未命名文件'}`)
+    throw AppError.validation(appMsg('app.m010', { p0: file.fileName || '未命名文件' }))
   }
   return {
     // `fileName` 可能含路径（老式浏览器会把客户端全路径塞进来），服务层只按扩展名判定，

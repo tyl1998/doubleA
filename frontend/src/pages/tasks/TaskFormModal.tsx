@@ -12,9 +12,19 @@
 import { AutoComplete, Button, Form, Input, Modal, Select, Switch } from 'antd'
 import { useEffect } from 'react'
 import type { AgentItem, NotifyType, ScheduledTaskItem } from '@doubulea/shared'
+import type { MessageKey } from '@doubulea/shared'
 import { isValidCron, NOTIFY_TEMPLATE_PLACEHOLDERS, NOTIFY_TYPES } from '@doubulea/shared'
 
-import { CRON_PRESETS, NOTIFY_TYPE_LABELS, cronHint } from './taskModel.js'
+/** 通知模板占位符的 key（`shared#NOTIFY_TEMPLATE_PLACEHOLDERS` 的前端覆盖，§3.5） */
+const NOTIFY_PLACEHOLDER_KEY: Record<(typeof NOTIFY_TEMPLATE_PLACEHOLDERS)[number]['key'], MessageKey> = {
+  task: 'label.notifyPlaceholder.task',
+  time: 'label.notifyPlaceholder.time',
+  status: 'label.notifyPlaceholder.status',
+  result: 'label.notifyPlaceholder.result',
+}
+
+import { useT } from '../../app/i18n.js'
+import { CRON_PRESETS, NOTIFY_TYPE_KEY, cronHint } from './taskModel.js'
 
 export interface TaskFormValues {
   name: string
@@ -42,17 +52,26 @@ export interface TaskFormModalProps {
 
 export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubmit }: TaskFormModalProps) {
   const [form] = Form.useForm<TaskFormValues>()
+  const { t, locale } = useT()
   const isEdit = task !== null
   // 联动：只有选了具体渠道才显示 webhook 地址/密钥（`NONE` 时整块隐藏）
   const notifyType = Form.useWatch('notifyType', form)
   const notifySelected = notifyType !== undefined && notifyType !== 'NONE'
   const cronExprValue = Form.useWatch('cronExpr', form)
-  const cronParsed = cronExprValue === undefined ? { description: null, next: [] } : cronHint(cronExprValue)
+  const cronParsed = cronExprValue === undefined ? { description: null, next: [] } : cronHint(cronExprValue, locale)
   // cron 的辅助说明：合法时带上"一句话描述 + 接下来 3 次"，交给 AntD 的 extra 排版（不用手写 div，避免重叠）
+  // ⚠️ `cronParsed.description` 来自 `shared#describeCron(expr, locale)`（P1-23 末批起走字典），
+  // 故 en 下"约 每天 09:00；"这句也是英文；`next` 的周几读数同样走 `label.weekday.*`。
   const cronExtra =
     cronParsed.next.length > 0
-      ? `可直接手填，也可从常用周期里选。${cronParsed.description !== null ? `约 ${cronParsed.description}；` : ''}接下来：${cronParsed.next.join('、')}`
-      : '可直接手填，也可从常用周期里选；例如 0 9 * * * = 每天 09:00、0 9 * * 1 = 每周一 09:00（时区 = 服务器本地时区）'
+      ? t('tasks.form.cronHintParsed', {
+          approx:
+            cronParsed.description === null
+              ? ''
+              : t('tasks.form.cronApprox', { desc: cronParsed.description }),
+          next: cronParsed.next.join(t('tasks.form.cronNextSeparator')),
+        })
+      : t('tasks.form.cronHintPlain')
 
   useEffect(() => {
     if (!open) return
@@ -88,12 +107,12 @@ export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubm
   return (
     <Modal
       open={open}
-      title={isEdit ? '编辑定时任务' : '新建定时任务'}
+      title={isEdit ? t('tasks.form.editTitle') : t('tasks.form.createTitle')}
       onCancel={onCancel}
       destroyOnClose
       footer={[
         <Button key="cancel" onClick={onCancel}>
-          取消
+          {t('common.cancel')}
         </Button>,
         <Button
           key="ok"
@@ -103,27 +122,30 @@ export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubm
             void form.validateFields().then(onSubmit)
           }}
         >
-          保存
+          {t('common.save')}
         </Button>,
       ]}
     >
       <Form form={form} layout="vertical" requiredMark={false}>
         <Form.Item
           name="name"
-          label="任务名"
-          rules={[{ required: true, message: '请填写任务名' }, { max: 120, message: '最长 120 个字符' }]}
+          label={t('tasks.form.name')}
+          rules={[
+            { required: true, message: t('tasks.form.nameRequired') },
+            { max: 120, message: t('tasks.form.nameMax') },
+          ]}
         >
-          <Input placeholder="例如：每日销售汇总" maxLength={120} />
+          <Input placeholder={t('tasks.form.namePlaceholder')} maxLength={120} />
         </Form.Item>
 
         <Form.Item
           name="agentId"
-          label="目标智能体"
-          rules={[{ required: true, message: '请选择智能体' }]}
-          extra={isEdit ? '目标智能体不可修改（换智能体请删除后重建）' : 'ChatBot 与任务型智能体（TaskAgent）都可以被定时派活'}
+          label={t('tasks.form.agent')}
+          rules={[{ required: true, message: t('tasks.form.agentRequired') }]}
+          extra={isEdit ? t('tasks.form.agentLockedExtra') : t('tasks.form.agentFreeExtra')}
         >
           <Select
-            placeholder="选择一个智能体"
+            placeholder={t('tasks.form.agentPlaceholder')}
             disabled={isEdit}
             options={agents.map((agent) => ({ value: agent.id, label: agent.name }))}
             showSearch
@@ -133,29 +155,34 @@ export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubm
 
         <Form.Item
           name="prompt"
-          label="指令（到点发给该智能体）"
-          rules={[{ required: true, message: '请填写指令' }]}
+          label={t('tasks.form.prompt')}
+          rules={[{ required: true, message: t('tasks.form.promptRequired') }]}
         >
-          <Input.TextArea rows={4} placeholder="例如：统计昨天的订单并生成汇总表" maxLength={20_000} showCount />
+          <Input.TextArea
+            rows={4}
+            placeholder={t('tasks.form.promptPlaceholder')}
+            maxLength={20_000}
+            showCount
+          />
         </Form.Item>
 
         <Form.Item
           name="cronExpr"
-          label="cron 周期（分 时 日 月 周）"
+          label={t('tasks.form.cron')}
           rules={[
-            { required: true, message: '请填写 cron 表达式' },
+            { required: true, message: t('tasks.form.cronRequired') },
             {
               validator: (_rule, value: string) =>
                 value === undefined || value.trim() === '' || isValidCron(value.trim())
                   ? Promise.resolve()
-                  : Promise.reject(new Error('cron 表达式不合法（5 段：分 时 日 月 周）')),
+                  : Promise.reject(new Error(t('tasks.form.cronInvalid'))),
             },
           ]}
           extra={cronExtra}
         >
           <AutoComplete
             placeholder="0 9 * * *"
-            options={CRON_PRESETS.map((preset) => ({ value: preset.expr, label: `${preset.label}  ·  ${preset.expr}` }))}
+            options={CRON_PRESETS.map((preset) => ({ value: preset.expr, label: `${t(preset.labelKey)}  ·  ${preset.expr}` }))}
             filterOption={(input, option) =>
               String(option?.label ?? option?.value ?? '')
                 .toLowerCase()
@@ -164,32 +191,32 @@ export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubm
           />
         </Form.Item>
 
-        <Form.Item name="enabled" label="启用" valuePropName="checked">
+        <Form.Item name="enabled" label={t('tasks.form.enabled')} valuePropName="checked">
           <Switch />
         </Form.Item>
 
         <Form.Item
           name="autoApprove"
-          label="允许执行危险工具（MCP 破坏性操作）"
+          label={t('tasks.form.autoApprove')}
           valuePropName="checked"
-          extra="定时任务无人值守运行、没有第二个人能确认。打开 = 遇到危险工具自动放行；关闭 = 一律拒绝。"
+          extra={t('tasks.form.autoApproveExtra')}
         >
           <Switch />
         </Form.Item>
 
         <Form.Item
           name="notifyType"
-          label="通知渠道"
-          extra="任务跑完会把结果自动推送到该渠道；智能体也能用 send_notification 工具主动发消息。"
+          label={t('tasks.form.notifyType')}
+          extra={t('tasks.form.notifyTypeExtra')}
         >
-          <Select options={NOTIFY_TYPES.map((type) => ({ value: type, label: NOTIFY_TYPE_LABELS[type] }))} />
+          <Select options={NOTIFY_TYPES.map((type) => ({ value: type, label: t(NOTIFY_TYPE_KEY[type]) }))} />
         </Form.Item>
 
         {notifySelected && (
           <>
             <Form.Item
               name="notifyUrl"
-              label="webhook 地址"
+              label={t('tasks.form.webhookUrl')}
               rules={[
                 {
                   validator: (_rule, value: string) =>
@@ -197,45 +224,51 @@ export function TaskFormModal({ open, task, agents, submitting, onCancel, onSubm
                       ? Promise.resolve() // 已配置且留空 = 保持不变
                       : value !== undefined && value.trim() !== ''
                         ? Promise.resolve()
-                        : Promise.reject(new Error('选择了通知渠道就必须填写 webhook 地址')),
+                        : Promise.reject(new Error(t('tasks.form.webhookRequired'))),
                 },
               ]}
               extra={
                 isEdit && task.notifyUrlSet
-                  ? '已配置；留空保持不变（把「通知渠道」改为「不通知」即可停用）'
+                  ? t('tasks.form.webhookConfigured')
                   : notifyType === 'WECOM'
-                    ? '企业微信群机器人的完整 webhook URL（含 key，加密存储、不回显）'
+                    ? t('tasks.form.webhookWecom')
                     : notifyType === 'FEISHU'
-                      ? '飞书自定义机器人的完整 webhook URL（加密存储、不回显）'
-                      : '通用 webhook URL：后端会 POST `{ text }`（加密存储、不回显）'
+                      ? t('tasks.form.webhookFeishu')
+                      : t('tasks.form.webhookGeneric')
               }
             >
-              <Input placeholder={isEdit && task.notifyUrlSet ? '（已配置，留空保持不变）' : 'https://…'} />
+              <Input placeholder={isEdit && task.notifyUrlSet ? t('tasks.form.webhookPlaceholderConfigured') : 'https://…'} />
             </Form.Item>
 
             {notifyType === 'FEISHU' && (
               <Form.Item
                 name="notifySecret"
-                label="签名密钥（飞书自定义机器人可选）"
-                extra={
-                  isEdit && task.notifySecretSet
-                    ? '已配置；留空保持不变'
-                    : '仅飞书机器人开启「签名校验」时才需要；未开启可留空'
-                }
+                label={t('tasks.form.secret')}
+                extra={isEdit && task.notifySecretSet ? t('tasks.form.secretConfigured') : t('tasks.form.secretHint')}
               >
-                <Input.Password placeholder={isEdit && task.notifySecretSet ? '（已配置，留空保持不变）' : '可留空'} />
+                <Input.Password
+                  placeholder={
+                    isEdit && task.notifySecretSet
+                      ? t('tasks.form.webhookPlaceholderConfigured')
+                      : t('tasks.form.secretPlaceholder')
+                  }
+                />
               </Form.Item>
             )}
 
             <Form.Item
               name="notifyTemplate"
-              label="通知模板（可选）"
-              extra={`占位符：${NOTIFY_TEMPLATE_PLACEHOLDERS.map((item) => `{{${item.key}}} = ${item.label}`).join('、')}；留空用内置默认（抬头 + 时间/状态 + 正文）`}
+              label={t('tasks.form.template')}
+              extra={t('tasks.form.templateExtra', {
+                placeholders: NOTIFY_TEMPLATE_PLACEHOLDERS
+                  .map((item) => `{{${item.key}}} = ${t(NOTIFY_PLACEHOLDER_KEY[item.key])}`)
+                  .join(t('tasks.form.cronNextSeparator')),
+              })}
             >
               <Input.TextArea
                 rows={3}
                 maxLength={2000}
-                placeholder={'【定时任务】{{task}}\n时间：{{time}}　状态：{{status}}\n\n{{result}}'}
+                placeholder={t('tasks.form.templatePlaceholder')}
               />
             </Form.Item>
           </>

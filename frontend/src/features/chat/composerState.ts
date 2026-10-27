@@ -49,6 +49,8 @@
  * 故这一段有名字（`sending`），并且由 {@link createSendGate} 在**同步层**再兜一次。
  */
 
+import { translate, type Locale, type MessageKey } from '@doubulea/shared'
+
 import type { StreamRound } from './roundReducer.js'
 
 /**
@@ -127,29 +129,32 @@ export interface ComposerInput {
   steerable?: boolean
 }
 
-/** 各状态的文案。**一处定义**：placeholder / hint / 按钮 label 全从这里取 */
-const TEXT = {
+/** 各状态的文案 key。**一处定义**：placeholder / hint / 按钮 label 全从这里取（P1-23 起存 key 不存文案） */
+const TEXT: Record<
+  ComposerState,
+  { placeholder: MessageKey; hint: MessageKey }
+> = {
   idle: {
-    placeholder: '输入消息，Enter 发送，Shift+Enter 换行…',
-    hint: 'Enter 发送 · Shift+Enter 换行',
+    placeholder: 'composer.placeholderIdle',
+    hint: 'composer.hintIdle',
   },
   sending: {
-    placeholder: '正在建立连接…',
-    hint: '正在发送，稍候即可继续输入',
+    placeholder: 'composer.placeholderSending',
+    hint: 'composer.hintSending',
   },
   streaming: {
-    placeholder: '正在生成，可以先构思下一条…',
-    hint: '流式中仍可输入，点「停止」可中断这一轮',
+    placeholder: 'composer.placeholderStreaming',
+    hint: 'composer.hintStreaming',
   },
   stopping: {
-    placeholder: '正在停止，已生成的内容会保留…',
-    hint: '已发出停止信号，等这一轮收口（约 5 秒内）',
+    placeholder: 'composer.placeholderStopping',
+    hint: 'composer.hintStopping',
   },
   confirm: {
-    placeholder: '请先处理上面的确认卡',
-    hint: '有待确认的工具调用，输入区暂不可用',
+    placeholder: 'composer.placeholderConfirm',
+    hint: 'composer.hintConfirm',
   },
-} as const satisfies Record<ComposerState, { placeholder: string; hint: string }>
+}
 
 /**
  * 由"这一轮 + 这次发送"推出输入区的样子。
@@ -162,8 +167,9 @@ const TEXT = {
  *   ③ `round.streaming` —— 服务端正在产出（`03` §4.1 唯一的"正经流式态"）；
  *   ④ `sending` —— 上面那段"建会话/建流"的空窗（`round` 还不存在，但它已经不是 `idle` 了）。
  */
-export function composeState(input: ComposerInput): ComposerView {
+export function composeState(input: ComposerInput, locale: Locale): ComposerView {
   const { round, sending, stopping, draft, steerable = false, serverRunning = false } = input
+  const text = (key: MessageKey): string => translate(locale, key)
 
   // ① confirm：锁输入（优先级最高）
   if (round !== null && round.confirm !== null) {
@@ -172,9 +178,10 @@ export function composeState(input: ComposerInput): ComposerView {
       canType: false,
       canSend: false,
       locked: true,
-      primary: { kind: 'busy', label: '等待确认', disabled: true, action: null },
+      primary: { kind: 'busy', label: text('composer.primaryConfirm'), disabled: true, action: null },
       steer: HIDE_STEER,
-      ...TEXT.confirm,
+      placeholder: text(TEXT.confirm.placeholder),
+      hint: text(TEXT.confirm.hint),
       led: 'warn',
       label: 'confirm',
     }
@@ -187,9 +194,10 @@ export function composeState(input: ComposerInput): ComposerView {
       canType: true,
       canSend: false,
       locked: false,
-      primary: { kind: 'busy', label: '停止中…', disabled: true, action: null },
+      primary: { kind: 'busy', label: text('composer.primaryStopping'), disabled: true, action: null },
       steer: HIDE_STEER,
-      ...TEXT.stopping,
+      placeholder: text(TEXT.stopping.placeholder),
+      hint: text(TEXT.stopping.hint),
       led: 'warn',
       label: 'stopping',
     }
@@ -203,9 +211,10 @@ export function composeState(input: ComposerInput): ComposerView {
       canType: true,
       canSend: false,
       locked: false,
-      primary: { kind: 'stop', label: '停止', disabled: false, action: 'stop' },
+      primary: { kind: 'stop', label: text('composer.primaryStop'), disabled: false, action: 'stop' },
       steer: { visible: steerable && draft.trim() !== '', disabled: false },
-      ...TEXT.streaming,
+      placeholder: text(TEXT.streaming.placeholder),
+      hint: text(TEXT.streaming.hint),
       led: 'run',
       label: 'streaming',
     }
@@ -218,9 +227,10 @@ export function composeState(input: ComposerInput): ComposerView {
       canType: true,
       canSend: false,
       locked: false,
-      primary: { kind: 'busy', label: '发送中…', disabled: true, action: null },
+      primary: { kind: 'busy', label: text('composer.primarySending'), disabled: true, action: null },
       steer: HIDE_STEER,
-      ...TEXT.sending,
+      placeholder: text(TEXT.sending.placeholder),
+      hint: text(TEXT.sending.hint),
       led: 'run',
       label: 'sending',
     }
@@ -236,10 +246,10 @@ export function composeState(input: ComposerInput): ComposerView {
       canType: true,
       canSend: false,
       locked: false,
-      primary: { kind: 'busy', label: '正在生成…', disabled: true, action: null },
+      primary: { kind: 'busy', label: text('composer.primaryServerRunning'), disabled: true, action: null },
       steer: HIDE_STEER,
-      placeholder: '正在生成（不是本页发起），可以先构思下一条…',
-      hint: '这一轮由别处发起（外部调用 / 定时任务 / 另一个窗口），结束后即可继续',
+      placeholder: text('composer.placeholderServerRunning'),
+      hint: text('composer.hintServerRunning'),
       led: 'run',
       label: 'streaming',
     }
@@ -253,9 +263,10 @@ export function composeState(input: ComposerInput): ComposerView {
     canType: true,
     canSend,
     locked: false,
-    primary: { kind: 'send', label: '发送', disabled: !canSend, action: 'send' },
+    primary: { kind: 'send', label: text('composer.primarySend'), disabled: !canSend, action: 'send' },
     steer: HIDE_STEER,
-    ...TEXT.idle,
+    placeholder: text(TEXT.idle.placeholder),
+    hint: text(TEXT.idle.hint),
     led: 'idle',
     label: 'idle',
   }

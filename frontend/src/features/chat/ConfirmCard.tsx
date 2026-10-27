@@ -39,6 +39,7 @@ import { useEffect, useState } from 'react'
 // ⚠️ 纯逻辑在**同目录**的 `confirmModel.ts`（不能取 `pages/mcp/mcpModel.ts` —— 那会造出
 //    `features/chat/` → `pages/` 的反向依赖，见 `confirmModel.ts` 文件头的说明）
 import { confirmCountdownText, confirmSourceHint, remainingSeconds } from './confirmModel.js'
+import { useT } from '../../app/i18n.js'
 import type { ConfirmSource } from '@doubulea/shared'
 
 export interface ConfirmCardProps {
@@ -93,6 +94,7 @@ export function ConfirmCard({
   pending,
   onAnswer,
 }: ConfirmCardProps) {
+  const { t, locale } = useT()
   const remaining = useCountdownTick(expiresAt)
   const expired = remaining <= 0
 
@@ -101,29 +103,25 @@ export function ConfirmCard({
       <div className="confirm-card__head">
         <span className="led led--warn" />
         <p className="confirm-card__title">
-          {duplicate ? '工具请求重复执行：' : '工具请求确认：'}
+          {duplicate ? t('confirm.titleDuplicate') : t('confirm.title')}
           {toolName}
         </p>
         {/* 读数只读服务端给的时刻（见文件头 ①）；到点显示「已超时」而不是 `0s` */}
         <span className="countdown num" data-testid="confirm-countdown">
-          {confirmCountdownText(remaining)}
+          {confirmCountdownText(remaining, locale)}
         </span>
       </div>
       <div className="confirm-card__body">
         <p className="ratio">
-          {duplicate
-            ? '本轮已经用完全相同的参数执行过这个工具。确认会再执行一次（例如再删一次、再写一次）；不确认则跳过。'
-            : confirmSourceHint(source)}
+          {duplicate ? t('confirm.duplicateHint') : confirmSourceHint(source, locale)}
         </p>
         {/* 入参摘要：`inputSummary` 里的凭据值已经被平台抹除（`chatContext#summarizeToolInput`）
             ⇒ 它可以直接显示，不需要再做一层遮罩 */}
         <div className="code-block">{inputSummary}</div>
         {expired ? (
-          <p className="ratio">
-            服务端的等待窗口已经结束，它会按「取消」处理并继续这一轮；这两个按钮现在点了也不会生效。
-          </p>
+          <p className="ratio">{t('confirm.expiredNote')}</p>
         ) : (
-          <p className="ratio">超时后会由服务端按「取消」处理，这一轮不会卡住。</p>
+          <p className="ratio">{t('confirm.timeoutNote')}</p>
         )}
       </div>
       <div className="confirm-card__foot">
@@ -134,10 +132,10 @@ export function ConfirmCard({
           data-testid="confirm-accept"
           onClick={() => onAnswer(true)}
         >
-          确认执行
+          {t('confirm.accept')}
         </Button>
         <Button disabled={pending || expired} data-testid="confirm-reject" onClick={() => onAnswer(false)}>
-          取消
+          {t('confirm.reject')}
         </Button>
       </div>
     </div>

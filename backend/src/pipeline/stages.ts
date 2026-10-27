@@ -37,7 +37,7 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, type ImageRecognition } from '@doubulea/shared'
+import { appMsg, AppError, type ImageRecognition } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -157,15 +157,14 @@ async function readSourceObject(document: PipelineDocument): Promise<Buffer> {
     }
     const bytes = Buffer.concat(chunks)
     if (bytes.length === 0) {
-      throw AppError.validation(`原文件《${document.fileName}》是空的（0 字节），无法解析。请重新上传。`)
+      throw AppError.validation(appMsg('app.m080', { p0: document.fileName }))
     }
     return bytes
   } catch (error) {
     // AppError 是我们自己刚抛的那条（空文件），原样上抛；其余（NoSuchKey / 网络 / 权限）统一翻译
     if (error instanceof AppError) throw error
     getLogger().error({ err: error, bucket, key, docId: document.id }, '读取原文件失败')
-    throw AppError.internal(
-      `原文件读取失败：对象存储里找不到《${document.fileName}》，可能已被清理。请重新上传该文档。`,
+    throw AppError.internal(appMsg('app.m081', { p0: document.fileName }),
     )
   }
 }

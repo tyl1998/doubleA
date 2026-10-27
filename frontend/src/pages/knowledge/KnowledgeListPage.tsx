@@ -31,6 +31,7 @@ import { Link, useNavigate } from 'react-router-dom'
 
 import { KNOWLEDGE_BASES_PICKER_LIMIT, useKnowledgeBases } from '../../api/knowledgeBases.js'
 import { useCurrentUser } from '../../api/auth.js'
+import { useT } from '../../app/i18n.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { VisibilityBadge } from '../../components/VisibilityBadge.js'
@@ -45,6 +46,7 @@ type OwnerFilter = 'ALL' | 'MINE'
 
 export function KnowledgeListPage() {
   const navigate = useNavigate()
+  const { t, locale } = useT()
   const { data: me } = useCurrentUser()
   const [keyword, setKeyword] = useState('')
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>('ALL')
@@ -69,7 +71,7 @@ export function KnowledgeListPage() {
 
   const columns: TableColumnsType<KnowledgeBaseItem> = [
     {
-      title: '名称',
+      title: t('kbList.colName'),
       dataIndex: 'name',
       // 显式宽度：窄屏下让这一列**不被挤扁**（其余列宽固定，本列有 width 才不会被压成一行碎片）。
       // 宽度之和交给 Table 的 `scroll.x` 兜底（见表格处）。
@@ -81,42 +83,42 @@ export function KnowledgeListPage() {
           <Link to={knowledgeDetailPath(kb.id)} className="kb-cell__name">
             {kb.name}
           </Link>
-          <span className="kb-cell__sub">{kb.description ?? '（没有描述）'}</span>
+          <span className="kb-cell__sub">{kb.description ?? t('kbList.noDescription')}</span>
         </div>
       ),
     },
     {
-      title: '文档',
+      title: t('kbList.colDocs'),
       dataIndex: 'documentCount',
       width: 90,
       align: 'right',
       render: (_, kb) => <span className="num">{kb.documentCount}</span>,
     },
     {
-      title: '引用它的智能体',
+      title: t('kbList.colAgents'),
       dataIndex: 'agentCount',
       width: 150,
       render: (_, kb) =>
         kb.agentCount === 0 ? (
-          <span className="ratio">未被引用</span>
+          <span className="ratio">{t('kbList.notReferenced')}</span>
         ) : (
           <span className="num">
-            {kb.agentCount} 个 <Tag className="tag--warn">删除前需解绑</Tag>
+            {t('kbList.agentCount', { count: kb.agentCount })} <Tag className="tag--warn">{t('kbList.unbindTag')}</Tag>
           </span>
         ),
     },
     {
-      title: '检索口径',
+      title: t('kbList.colRetrieval'),
       key: 'retrieval',
       width: 300,
       // 窄屏（< xl = 1200px）**整列隐藏**：它是本表最宽的一列，窄屏上留着会把「名称」挤到看不清。
       // 隐藏后口径不丢 —— 「名称」列的名称旁有一个 hover 图标（见上）承载同一份内容。
       responsive: ['xl'],
       render: (_, kb) => {
-        const notice = embeddingChangedNotice(kb.embeddingModelChanged)
+        const notice = embeddingChangedNotice(kb.embeddingModelChanged, locale)
         return (
           <div className="kb-cell">
-            <span className="kb-cell__sub num">{describeRetrieval(kb.retrievalConfig)}</span>
+            <span className="kb-cell__sub num">{describeRetrieval(kb.retrievalConfig, locale)}</span>
             {/* 三态提示（`true` = 该库需重建 / `null` = 判断不了）——两种原因分开报，
                 合成一句会让用户去重做一个治不好的动作（见 `embeddingChangedNotice`）。
                 一句话的完整文案放 `title`（原生 tooltip）：这一列放不下，删掉它又会让
@@ -124,7 +126,7 @@ export function KnowledgeListPage() {
             {notice !== null && (
               <span className="kb-cell__sub" title={notice.text}>
                 <Tag className={notice.tone === 'warn' ? 'tag--danger' : undefined}>
-                  {notice.tone === 'warn' ? 'embedding 需重建' : 'embedding 无法判定'}
+                  {notice.tone === 'warn' ? t('kbList.embeddingRebuild') : t('kbList.embeddingUnknown')}
                 </Tag>
                 <span className="num">{kb.embeddingModel}</span>
               </span>
@@ -136,12 +138,12 @@ export function KnowledgeListPage() {
     {
       // P1-13：所属人（= `createdBy`/`creatorName`）。只有所属人/管理员（`canEdit`）能点，点了弹转移弹窗；
       // 其余人只显示名字。可见性徽标与受众规模移到独立的「可见性」列。
-      title: '所属人',
+      title: t('kbList.colOwner'),
       dataIndex: 'creatorName',
       width: 140,
       render: (_, kb) =>
         kb.canEdit ? (
-          <Tooltip title="点击转移所属人">
+          <Tooltip title={t('kbList.ownerTransferTitle')}>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(kb)}>
               {kb.creatorName}
             </Button>
@@ -152,47 +154,47 @@ export function KnowledgeListPage() {
     },
     {
       // P1-18.x：可见性徽标 +（指定用户时）受众规模（判据来自服务端下发字段，前端不自己算）
-      title: '可见性',
+      title: t('kbList.colVisibility'),
       dataIndex: 'visibility',
       width: 170,
       render: (_, kb) => (
         <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
           <VisibilityBadge visibility={kb.visibility} />
           {kb.visibility === 'SHARED' && (
-            <span className="ratio" title="受众 = 直接指定的用户 ∪ 指定组里的成员">
-              {kb.audience.users.length} 人 / {kb.audience.groups.length} 组
+            <span className="ratio" title={t('kbList.audienceTitle')}>
+              {t('kbList.audienceCount', { users: kb.audience.users.length, groups: kb.audience.groups.length })}
             </span>
           )}
         </span>
       ),
     },
     {
-      title: '最近更新',
+      title: t('kbList.colUpdated'),
       dataIndex: 'updatedAt',
       width: 130,
       render: (_, kb) => <span className="num">{formatUpdatedAt(kb.updatedAt)}</span>,
     },
     {
-      title: '操作',
+      title: t('kbList.colActions'),
       key: 'actions',
       width: 260,
       align: 'right',
       render: (_, kb) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
-          <Link to={knowledgeDetailPath(kb.id)}>打开</Link>
+          <Link to={knowledgeDetailPath(kb.id)}>{t('kbList.open')}</Link>
           {/* P1-13：知识库现在有 owner —— 编 / 删按服务端给的 `canEdit` 渲染（所属人或 ADMIN） */}
           {kb.canEdit ? (
             <>
               <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditing(kb)}>
-                编辑
+                {t('common.edit')}
               </Button>
               <Button type="link" danger size="small" style={{ padding: 0 }} onClick={() => setPendingDelete(kb)}>
-                删除
+                {t('common.delete')}
               </Button>
             </>
           ) : (
-            <span className="ratio" title="只有该知识库的所属人或管理员可以编辑 / 删除">
-              无编辑权限
+            <span className="ratio" title={t('kbList.noEditPermTitle')}>
+              {t('kbList.noEditPerm')}
             </span>
           )}
         </div>
@@ -204,21 +206,22 @@ export function KnowledgeListPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>知识库</h1>
+          <h1>{t('kbList.title')}</h1>
           <p className="page__lead">
             {isPending ? (
-              '正在读取知识库列表…'
+              t('kbList.loading')
             ) : (
               <>
-                共 <span className="num">{total}</span> 个知识库（仅列出对你可见的：公开的、共享给你的、以及你自己的）。
-                编辑 / 删除只对<strong>所属人</strong>或管理员开放；被智能体引用时删除会被后端拒绝（409）。
+                {t('kbList.leadPrefix', { total })}
+                <strong>{t('kbList.leadStrong')}</strong>
+                {t('kbList.leadSuffix')}
               </>
             )}
           </p>
         </div>
         <div className="page__head-actions">
           <Button type="primary" onClick={() => setCreating(true)}>
-            创建知识库
+            {t('kbList.create')}
           </Button>
         </div>
       </div>
@@ -230,7 +233,7 @@ export function KnowledgeListPage() {
       <>
         {head}
         <ErrorState
-          title="知识库列表加载失败"
+          title={t('kbList.loadFailed')}
           error={error}
           retrying={isFetching}
           onRetry={() => {
@@ -250,25 +253,26 @@ export function KnowledgeListPage() {
           allowClear
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
-          placeholder="搜索名称或描述…"
+          placeholder={t('kbList.searchPlaceholder')}
           style={{ width: 260 }}
-          aria-label="搜索知识库"
+          aria-label={t('kbList.searchAria')}
         />
-        <div className="seg" role="group" aria-label="按所属人筛选">
+        <div className="seg" role="group" aria-label={t('kbList.filterAria')}>
           <button type="button" aria-pressed={ownerFilter === 'ALL'} onClick={() => setOwnerFilter('ALL')}>
-            全部可见
+            {t('kbList.filterAll')}
           </button>
           <button type="button" aria-pressed={ownerFilter === 'MINE'} onClick={() => setOwnerFilter('MINE')}>
-            只看我的
+            {t('kbList.filterMine')}
           </button>
         </div>
         <span className="ratio u-right">
-          数据来自 GET /api/knowledge-bases · 缓存 30s
+          {t('kbList.source')}
           {total > items.length && (
             <>
               {' '}
-              · 共 <span className="num">{total}</span> 个，本次取回前 <span className="num">{items.length}</span> 个
-              （<code>limit</code> 上限 100）
+              {t('kbList.sourceMorePrefix', { total, shown: items.length })}
+              <code>limit</code>
+              {t('kbList.sourceMoreSuffix')}
             </>
           )}
         </span>
@@ -279,11 +283,11 @@ export function KnowledgeListPage() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有知识库"
-            lead="知识库是「可检索的语料」：先建一个库，再把 md / pdf / docx / txt 传进去，之后在智能体的组件绑定里勾上它，对话时就会带上这里的引用。"
+            title={t('kbList.emptyTitle')}
+            lead={t('kbList.emptyLead')}
             action={
               <Button type="primary" onClick={() => setCreating(true)}>
-                创建知识库
+                {t('kbList.create')}
               </Button>
             }
           />
@@ -291,8 +295,8 @@ export function KnowledgeListPage() {
       ) : filtered.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="没有匹配的知识库"
-            lead={`当前筛选条件下没有结果（关键字「${keyword.trim()}」）。`}
+            title={t('kbList.noMatchTitle')}
+            lead={t('kbList.noMatchLead', { keyword: keyword.trim() })}
             action={
               <Button
                 onClick={() => {
@@ -300,7 +304,7 @@ export function KnowledgeListPage() {
                   setOwnerFilter('ALL')
                 }}
               >
-                清空筛选
+                {t('kbList.clearFilter')}
               </Button>
             }
           />
@@ -329,7 +333,7 @@ export function KnowledgeListPage() {
             // ⚠️ `max-content` 不能换成固定数字（如 `1520`）：它要随 `responsive: ['xl']` 隐藏的
             // 「检索口径」列**自动收放**，写死数字会让窄屏多出一列宽的空白。
             scroll={{ x: 'max-content' }}
-            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
+            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => t('kbList.pageTotal', { count }) }}
           />
         </div>
       )}

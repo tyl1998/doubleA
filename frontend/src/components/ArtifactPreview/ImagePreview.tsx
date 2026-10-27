@@ -17,6 +17,7 @@
 import { useState } from 'react'
 import { Alert } from 'antd'
 
+import { useT } from '../../app/i18n.js'
 import { artifactContentUrl } from './artifactPreview.js'
 
 export interface ImagePreviewProps {
@@ -25,6 +26,7 @@ export interface ImagePreviewProps {
 }
 
 export function ImagePreview({ artifactId, fileName }: ImagePreviewProps) {
+  const { t } = useT()
   const [failed, setFailed] = useState(false)
 
   if (failed) {
@@ -32,8 +34,8 @@ export function ImagePreview({ artifactId, fileName }: ImagePreviewProps) {
       <Alert
         type="warning"
         showIcon
-        message="图片没能加载"
-        description="可能是会话已过期、或你没有这个产物的访问权限。可重新登录后重试，或点右上角「下载」看原文件。"
+        message={t('artifact.preview.imageFailedTitle')}
+        description={t('artifact.preview.imageFailedBody')}
       />
     )
   }

@@ -32,6 +32,10 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
+import type { MessageKey } from './i18n/index.js'
+
 // ═════════════════════════════ 工作区参与者 ═════════════════════════════
 
 /**
@@ -49,6 +53,16 @@ export const WORKSPACE_ACTOR_LABELS: Record<WorkspaceActor, string> = {
   AGENT: 'Agent',
   USER: '我',
   SYSTEM: '系统',
+}
+
+/**
+ * 参与者 → i18n key（P1-23：前端面板据此取译文；**中文那份 {@link WORKSPACE_ACTOR_LABELS} 保留**
+ * 给后端与其它中文消费方用，见 `子方案/界面语言切换.md` §3.5 的"前端主译、标签表保留兜底"）。
+ */
+export const WORKSPACE_ACTOR_KEY: Record<WorkspaceActor, MessageKey> = {
+  AGENT: 'label.workspaceActor.agent',
+  USER: 'label.workspaceActor.user',
+  SYSTEM: 'label.workspaceActor.system',
 }
 
 // ═════════════════════════════ 事件 ═════════════════════════════
@@ -124,11 +138,17 @@ export const WORKSPACE_TEXT_INLINE_MAX_MB_DEFAULT = 2
 
 /** 归一化路径的 zod 字段（请求体 / 查询参数共用；不合法 = `VALIDATION` 400） */
 export const workspacePathSchema = z
-  .string({ required_error: '缺少路径', invalid_type_error: '路径必须是字符串' })
+  .string({
+    required_error: validationMessage('validation.workspace.pathMissing'),
+    invalid_type_error: validationMessage('validation.workspace.pathNotString'),
+  })
   .transform((value, ctx) => {
     const normalized = normalizeWorkspacePath(value)
     if (normalized === null) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: '不是合法的工作区相对路径（不许绝对路径 / `..` / 空）' })
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: validationMessage('validation.workspace.pathInvalid'),
+      })
       return z.NEVER
     }
     return normalized
@@ -211,12 +231,16 @@ export type WorkspaceFileRead = z.infer<typeof workspaceFileReadSchema>
 
 /** 写文件请求体（`PUT /api/conversations/:id/workspace/file?path=`）—— 核心是 `baseVersion` 的 CAS */
 export const workspaceWriteFileBodySchema = z.object({
-  content: z.string({ required_error: '缺少 content' }),
+  content: z.string({ required_error: validationMessage('validation.workspace.contentMissing') }),
   /**
    * 写前读到的版本号。`0` = "我认为这个文件还不存在"（新建）。
    * 与当前版本不一致 ⇒ 409（并发写冲突，§七 1 第 ③ 层）。
    */
-  baseVersion: z.coerce.number().int().min(0, 'baseVersion 不能为负').default(0),
+  baseVersion: z.coerce
+    .number()
+    .int()
+    .min(0, validationMessage('validation.workspace.baseVersionNotNegative'))
+    .default(0),
 })
 export type WorkspaceWriteFileBody = z.infer<typeof workspaceWriteFileBodySchema>
 
@@ -233,7 +257,10 @@ export const workspaceMoveBodySchema = z
     from: workspacePathSchema,
     to: workspacePathSchema,
   })
-  .refine((value) => value.from !== value.to, { message: '源路径与目标路径相同', path: ['to'] })
+  .refine((value) => value.from !== value.to, {
+    message: validationMessage('validation.workspace.samePath'),
+    path: ['to'],
+  })
 export type WorkspaceMoveBody = z.infer<typeof workspaceMoveBodySchema>
 
 /** 路径查询参数（读 / 写 / 删共用：`?path=out/report.csv`） */

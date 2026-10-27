@@ -21,30 +21,38 @@ import { Alert, Button, Modal, Table, Tag, type TableColumnsType } from 'antd'
 import { describeError } from '../../api/client.js'
 import { useMcpServerTools, useRefreshMcpServerTools } from '../../api/mcp.js'
 import { useFeedback } from '../../app/feedback.js'
-import type { McpServerItem, McpToolDescriptor } from '@doubulea/shared'
+import { useT } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
+import type { Locale, McpServerItem, McpToolDescriptor } from '@doubulea/shared'
 
 export interface McpServerToolsModalProps {
   server: McpServerItem | null
   onClose: () => void
 }
 
-/** `fetchedAt` 的读数（只在这一处格式化；`null` 就是"从没拉过"） */
-function fetchedAtText(fetchedAt: string | null): string {
-  if (fetchedAt === null) return '从未成功拉取过'
+/**
+ * `fetchedAt` 的读数（只在这一处格式化；`null` 就是"从没拉过"）。
+ *
+ * ⚠️ P1-23：日期 tag 走 `localeTag(locale)` —— 手写 `'zh-CN'` 会让英文界面下日期仍是中文格式
+ * （静默、不报错；`03` §九 第二批定的口径）。
+ */
+function fetchedAtText(fetchedAt: string | null, locale: Locale, neverText: string): string {
+  if (fetchedAt === null) return neverText
   const parsed = new Date(fetchedAt)
   if (Number.isNaN(parsed.getTime())) return fetchedAt
-  return parsed.toLocaleString('zh-CN', { hour12: false })
+  return parsed.toLocaleString(localeTag(locale), { hour12: false })
 }
 
 export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const query = useMcpServerTools(server?.id)
   const refresh = useRefreshMcpServerTools(server?.id ?? '')
 
   const data = query.data
   const columns: TableColumnsType<McpToolDescriptor> = [
     {
-      title: '工具名',
+      title: t('mcpTools.colName'),
       dataIndex: 'name',
       width: 240,
       render: (_, tool) => (
@@ -56,13 +64,13 @@ export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProp
       ),
     },
     {
-      title: '说明',
+      title: t('mcpTools.colDesc'),
       dataIndex: 'description',
       render: (_, tool) =>
         // ⚠️ `description` 的 `null` 是"上游没给"、`''` 是"上游给了一个空串"
         //    —— 两者在界面上的处理一样（都是"没有说明"），但判据仍是 `null` 优先
         tool.description === null || tool.description === '' ? (
-          <span className="ratio">（上游没有给说明）</span>
+          <span className="ratio">{t('mcpTools.noDesc')}</span>
         ) : (
           tool.description
         ),
@@ -72,7 +80,7 @@ export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProp
   return (
     <Modal
       open={server !== null}
-      title={server === null ? '' : `工具清单 · ${server.name}`}
+      title={server === null ? '' : t('mcpTools.title', { name: server.name })}
       width={720}
       onCancel={onClose}
       footer={
@@ -81,10 +89,13 @@ export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProp
             {data === undefined
               ? ''
               : data.fetchedAt === null
-                ? '从未成功拉取过'
-                : `${data.cached ? '来自缓存' : '刚刚拉取'} · ${fetchedAtText(data.fetchedAt)}`}
+                ? t('mcpTools.metaCached')
+                : t('mcpTools.meta', {
+                    source: t(data.cached ? 'mcpTools.fromCache' : 'mcpTools.justFetched'),
+                    time: fetchedAtText(data.fetchedAt, locale, t('mcpTools.neverFetched')),
+                  })}
           </span>
-          <Button onClick={onClose}>关闭</Button>
+          <Button onClick={onClose}>{t('mcpTools.close')}</Button>
           <Button
             type="primary"
             loading={refresh.isPending}
@@ -93,39 +104,42 @@ export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProp
                 onSuccess: (result) => {
                   feedback.ok(
                     result.cached && result.fetchedAt !== null
-                      ? `没能重新拉取，下面是缓存里的 ${result.tools.length} 个工具`
-                      : `已刷新：${result.tools.length} 个工具`,
+                      ? t('mcpTools.refetchPartial', { count: result.tools.length })
+                      : t('mcpTools.refetched', { count: result.tools.length }),
                   )
                 },
                 onError: (error) => {
-                  feedback.fail(error, '重新拉取工具列表失败')
+                  feedback.fail(error, t('mcpTools.refetchFailed'))
                 },
               })
             }}
           >
-            重新拉取
+            {t('mcpTools.refetch')}
           </Button>
         </div>
       }
     >
       {query.isPending ? (
-        <p className="ratio">正在读取缓存的工具列表…</p>
+        <p className="ratio">{t('mcpTools.loading')}</p>
       ) : query.isError ? (
         <Alert
           type="error"
           showIcon
-          message="拿不到工具列表"
-          description={`${describeError(query.error).code} · ${describeError(query.error).message}（这不等于「这台 server 没有工具」—— 我们只是答不了。可以点「重新拉取」再试一次。）`}
+          message={t('mcpTools.loadFailed')}
+          description={t('mcpTools.loadFailedDesc', {
+            code: describeError(query.error).code,
+            message: describeError(query.error).message,
+          })}
         />
       ) : data === undefined ? null : data.tools.length === 0 ? (
         <Alert
           type="info"
           showIcon
-          message="这台 server 现在报出来 0 个工具"
+          message={t('mcpTools.emptyTitle')}
           description={
             data.fetchedAt === null
-              ? '还没有成功握过手。点「重新拉取」会真连一次。'
-              : `这是一条真话（不是抓取失败）：上游确实没给出任何工具。缓存于 ${fetchedAtText(data.fetchedAt)}。`
+              ? t('mcpTools.emptyNever')
+              : t('mcpTools.emptyReal', { time: fetchedAtText(data.fetchedAt, locale, t('mcpTools.neverFetched')) })
           }
         />
       ) : (
@@ -138,8 +152,8 @@ export function McpServerToolsModal({ server, onClose }: McpServerToolsModalProp
             pagination={false}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-            <Tag>{data.tools.length} 个</Tag>
-            工具列表由「注册者视角」拉取（不带任何人的个人凭据），因此它对所有人是同一份。
+            <Tag>{t('mcpTools.count', { count: data.tools.length })}</Tag>
+            {t('mcpTools.sharedNote')}
           </p>
         </>
       )}

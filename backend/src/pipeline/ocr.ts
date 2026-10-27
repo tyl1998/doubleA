@@ -15,7 +15,7 @@
  * 首次识别才初始化 worker（不在启动期）—— 没传图片的部署不需要付出这份资源。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 import { createWorker, type PSM, type Worker } from 'tesseract.js'
 
 import { config } from '../config.js'
@@ -50,9 +50,7 @@ function getWorker(): Promise<Worker> {
       })
       .catch((error: unknown) => {
         workerPromise = null
-        throw AppError.internal(
-          `本地 OCR 初始化失败（tesseract）：${String(error)}。` +
-            '若为离线环境，请配置 OCR_LANG_PATH / OCR_CACHE_PATH 指向本地语言包与缓存目录',
+        throw AppError.internal(appMsg('app.m254', { p0: String(error) }),
         )
       })
   }
@@ -103,7 +101,7 @@ export async function recognizeImage(image: Buffer, options: RecognizeImageOptio
   } catch (error) {
     if (error instanceof AppError) throw error
     log({ err: error }, 'OCR 识别失败')
-    throw AppError.internal(`图片 OCR 识别失败：${String(error)}`)
+    throw AppError.internal(appMsg('app.m074', { p0: String(error) }))
   }
 }
 

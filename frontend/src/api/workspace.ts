@@ -11,22 +11,24 @@
 
 import { useQuery, type UseQueryResult } from '@tanstack/react-query'
 
-import type {
-  GetConversationInstanceResult,
-  SetConversationCodeModeResult,
-  SetConversationInstanceResult,
-  SetConversationRuntimeResult,
-  WorkspaceChangesResult,
-  WorkspaceDeleteDirResult,
-  WorkspaceFileDiff,
-  WorkspaceFileEntry,
-  WorkspaceFileRead,
-  WorkspaceGitResult,
-  WorkspaceRevertResult,
-  WorkspaceTreeResult,
+import {
+  translate,
+  type GetConversationInstanceResult,
+  type SetConversationCodeModeResult,
+  type SetConversationInstanceResult,
+  type SetConversationRuntimeResult,
+  type WorkspaceChangesResult,
+  type WorkspaceDeleteDirResult,
+  type WorkspaceFileDiff,
+  type WorkspaceFileEntry,
+  type WorkspaceFileRead,
+  type WorkspaceGitResult,
+  type WorkspaceRevertResult,
+  type WorkspaceTreeResult,
 } from '@doubulea/shared'
 
 import { openEventStream, request, requestBlob, requestFormData } from './client.js'
+import { currentLocale } from '../stores/locale.js'
 
 import type { WorkspaceEventItem } from '@doubulea/shared'
 
@@ -362,7 +364,7 @@ export async function streamWorkspaceEvents(
         if (!frame.startsWith(':')) {
           const parsed = parseWorkspaceFrame(frame)
           if (parsed !== null) handlers.onEvent(parsed)
-          else handlers.onIssue?.('工作区事件帧解析失败')
+          else handlers.onIssue?.(translate(currentLocale(), 'api.workspace.frameInvalid'))
         }
         boundary = buffer.indexOf('\n\n')
       }

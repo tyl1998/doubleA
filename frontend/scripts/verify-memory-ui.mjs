@@ -41,31 +41,36 @@ const { memorySourceText, memoryKindLabel, memoryKindColor, memoryScopeLabel } =
   '../src/pages/tasks/memoryModel.ts'
 )
 
+// P1-23：`memoryModel` 的读数改为"传 locale 的纯函数"（键与译文都在 `shared/src/i18n`）。
+// 断言随之传 `'zh'` —— 句子的中文形态与旧断言逐字一致，但**真相只有字典一份**
+// （这里再抄一遍中文就等于第二份真相；字典本身的齐平由 `verify-i18n` 守着）。
+const ZH = 'zh'
+
 console.log('── M1 memorySourceText（来源文案）──')
 it('原会话存在 ⇒ 显示标题', () => {
   eq(
-    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: true, sourceTopic: '报销流程' }),
+    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: true, sourceTopic: '报销流程' }, ZH),
     '报销流程',
     '有标题',
   )
 })
 it('原会话存在但未命名 ⇒ 未命名会话', () => {
   eq(
-    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: true, sourceTopic: null }),
+    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: true, sourceTopic: null }, ZH),
     '未命名会话',
     '未命名',
   )
 })
 it('原会话已删 ⇒ 原会话已删除（不可点）', () => {
   eq(
-    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: false, sourceTopic: null }),
+    memorySourceText({ sourceConversationId: 'c1', sourceAvailable: false, sourceTopic: null }, ZH),
     '原会话已删除',
     '已删除',
   )
 })
 it('没有来源（手动添加）⇒ 手动添加', () => {
   eq(
-    memorySourceText({ sourceConversationId: null, sourceAvailable: false, sourceTopic: null }),
+    memorySourceText({ sourceConversationId: null, sourceAvailable: false, sourceTopic: null }, ZH),
     '手动添加',
     '手动',
   )
@@ -73,13 +78,13 @@ it('没有来源（手动添加）⇒ 手动添加', () => {
 
 console.log('── M2 类型 / 作用域 标签 ──')
 it('v2 类型标签（画像/重点）与色', () => {
-  eq(memoryKindLabel('PROFILE'), '画像', 'PROFILE label')
-  eq(memoryKindLabel('HIGHLIGHT'), '重点', 'HIGHLIGHT label')
+  eq(memoryKindLabel('PROFILE', ZH), '画像', 'PROFILE label')
+  eq(memoryKindLabel('HIGHLIGHT', ZH), '重点', 'HIGHLIGHT label')
   eq(memoryKindColor('PREFERENCE'), 'purple', 'PREFERENCE color')
 })
 it('作用域标签（全局记忆 / Agent 记忆）', () => {
-  eq(memoryScopeLabel('USER'), '全局记忆', 'USER scope')
-  eq(memoryScopeLabel('AGENT'), 'Agent 记忆', 'AGENT scope')
+  eq(memoryScopeLabel('USER', ZH), '全局记忆', 'USER scope')
+  eq(memoryScopeLabel('AGENT', ZH), 'Agent 记忆', 'AGENT scope')
 })
 
 console.log('── M3 源码级守门（契约接线）──')

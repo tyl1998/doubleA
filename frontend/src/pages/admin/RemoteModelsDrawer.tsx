@@ -27,8 +27,8 @@ import { Alert, Button, Drawer, Input, Select, Table, Tooltip, type TableColumns
 import {
   DEFAULT_UPSTREAM_PROTOCOL,
   MODEL_TYPES,
-  MODEL_TYPE_LABELS,
-  UPSTREAM_PROTOCOL_LABELS,
+  MODEL_TYPE_KEY,
+  UPSTREAM_PROTOCOL_KEY,
   type ModelProviderItem,
   type ModelType,
 } from '@doubulea/shared'
@@ -37,6 +37,7 @@ import { useEffect, useState } from 'react'
 import { describeError } from '../../api/client.js'
 import { useCreateModel, useProbeRemoteModels } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { ErrorState } from '../../components/ListStates.js'
 import {
   buildCreateModelBody,
@@ -56,6 +57,7 @@ export interface RemoteModelsDrawerProps {
 
 export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const probe = useProbeRemoteModels()
   const create = useCreateModel()
   const [keyword, setKeyword] = useState('')
@@ -119,8 +121,8 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
   const copy = (id: string): void => {
     void navigator.clipboard
       .writeText(id)
-      .then(() => feedback.ok(`已复制型号名「${id}」`))
-      .catch(() => feedback.fail(new Error('浏览器拒绝了剪贴板访问，请手工选中后复制'), '复制失败'))
+      .then(() => feedback.ok(t('models.copied', { id })))
+      .catch(() => feedback.fail(new Error(t('models.copyBlocked')), t('models.copyFailed')))
   }
 
   /**
@@ -163,21 +165,27 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
     setSelectedIds([])
     setTypeOverrides({})
     if (ok > 0) {
-      feedback.ok(`已创建 ${ok} 个模型${failures.length > 0 ? `，${failures.length} 个失败` : ''}`)
+      feedback.ok(
+        t('models.createdBatch', { ok }) +
+          (failures.length > 0 ? t('models.createdBatchFailed', { count: failures.length }) : ''),
+      )
     }
     if (failures.length > 0) {
-      feedback.fail(new Error(failures.join('；')), ok > 0 ? '部分模型创建失败' : '模型创建失败')
+      feedback.fail(
+        new Error(failures.join('；')),
+        ok > 0 ? t('models.partialCreateFailed') : t('models.createFailedMany'),
+      )
     }
   }
 
   const columns: TableColumnsType<RemoteModelRow> = [
     {
-      title: '上游型号名',
+      title: t('models.remoteColId'),
       dataIndex: 'id',
       render: (_, row) => (
         // 用 AntD 的文字链按钮而不是自写 `.linkish`：`styles/app.css` 里没有那个类
         // （`06` P0-1-30 定案：AntD 已有的样式不重写），照原型类名写会得到一个没有样式的裸按钮
-        <Button type="link" size="small" style={{ padding: 0 }} title="点击复制" onClick={() => copy(row.id)}>
+        <Button type="link" size="small" style={{ padding: 0 }} title={t('models.copyTitle')} onClick={() => copy(row.id)}>
           {row.id}
         </Button>
       ),
@@ -185,32 +193,32 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
     {
       // 类型是**每个模型自己的属性** —— 上游 /models 不返回类型，默认按型号名保守推测、可逐行改。
       // 建成什么类型由这一列决定（勾选后一起提交）。
-      title: '建成类型',
+      title: t('models.remoteColType'),
       dataIndex: 'guessedType',
       width: 120,
       render: (_, row) => (
         <Select<ModelType>
           size="small"
           value={typeOfRow(row)}
-          options={MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] }))}
+          options={MODEL_TYPES.map((type) => ({ value: type, label: t(MODEL_TYPE_KEY[type]) }))}
           style={{ width: '100%' }}
-          aria-label={`${row.id} 建成类型`}
+          aria-label={t('models.remoteTypeAria', { id: row.id })}
           onChange={(next) => setTypeOverrides((current) => ({ ...current, [row.id]: next }))}
         />
       ),
     },
     {
-      title: '归属',
+      title: t('models.remoteColOwnedBy'),
       dataIndex: 'ownedBy',
       width: 140,
       render: (_, row) => <span className="num">{row.ownedBy ?? '—'}</span>,
     },
     {
-      title: '上下文',
+      title: t('models.remoteColContext'),
       dataIndex: 'contextLength',
       width: 110,
       align: 'right',
-      render: (_, row) => <span className="num">{maxContextText(row.contextLength)}</span>,
+      render: (_, row) => <span className="num">{maxContextText(row.contextLength, locale)}</span>,
     },
   ]
 
@@ -219,29 +227,32 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
       open={provider !== null}
       onClose={onClose}
       width={620}
-      title={provider === null ? '拉取上游模型' : `上游模型 · ${provider.name}`}
+      title={provider === null ? t('models.remoteTitle') : t('models.remoteTitleNamed', { name: provider.name })}
     >
       {provider === null ? null : (
         <div className="stack">
           <div>
             <p className="num">{provider.baseUrl}</p>
             <p className="ratio">
-              API Key：{describeProviderKey(provider)} · 协议：{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}
+              {t('models.remoteKeyNote', {
+                key: describeProviderKey(provider, locale),
+                protocol: t(UPSTREAM_PROTOCOL_KEY[provider.protocol]),
+              })}
             </p>
           </div>
 
           <Alert
             type="info"
             showIcon
-            message="只读探测，勾选后可批量创建"
-            description="这里探的是上游 /models 的真实返回。勾选想要的型号，逐行确认「建成类型」（默认按型号名推测，可改），点「创建选中的模型」即可批量建到本 Provider 下（别名默认取型号名、上下文长度取上游值，可稍后编辑）。探到了也不代表调用一定成功（上游可能仍需鉴权或该型号不可用）。"
+            message={t('models.remoteInfoTitle')}
+            description={t('models.remoteInfoDesc')}
           />
 
-          {probe.isPending && <p className="ratio">正在向上游发起一次请求…（可能较慢，内网地址会一直等到超时）</p>}
+          {probe.isPending && <p className="ratio">{t('models.remoteProbing')}</p>}
 
           {probe.isError && (
             <ErrorState
-              title="探测失败"
+              title={t('models.remoteProbeFailed')}
               error={probe.error}
               retrying={probe.isPending}
               onRetry={() => probe.mutate(provider.id)}
@@ -250,11 +261,11 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
 
           {probe.isError === false && result !== undefined && (
             <>
-              {remoteModelNotice(result, provider.hasKey) !== null && (
+              {remoteModelNotice(result, provider.hasKey, locale) !== null && (
                 <Alert
                   type={result.total === 0 ? 'warning' : 'info'}
                   showIcon
-                  message={remoteModelNotice(result, provider.hasKey) ?? ''}
+                  message={remoteModelNotice(result, provider.hasKey, locale) ?? ''}
                 />
               )}
 
@@ -263,9 +274,9 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                   allowClear
                   value={keyword}
                   onChange={(event) => setKeyword(event.target.value)}
-                  placeholder="过滤型号名…"
+                  placeholder={t('models.remoteFilterPlaceholder')}
                   style={{ width: 240 }}
-                  aria-label="过滤上游型号名"
+                  aria-label={t('models.remoteFilterAria')}
                 />
                 <Button
                   type="primary"
@@ -273,11 +284,11 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                   loading={creating}
                   onClick={() => void createSelected()}
                 >
-                  创建选中的模型（{selectedIds.length}）
+                  {t('models.remoteCreateSelected', { count: selectedIds.length })}
                 </Button>
                 <span className="ratio u-right">
-                  上游共 <span className="num">{result.total}</span> 个
-                  {result.truncated && <>（本次列出前 {result.items.length} 个）</>}
+                  {t('models.remoteTotalTail', { total: result.total })}
+                  {result.truncated && <> {t('models.remoteTruncated', { shown: result.items.length })}</>}
                 </span>
               </div>
 
@@ -285,14 +296,14 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
                 <Alert
                   type="warning"
                   showIcon
-                  message={`选中的型号里有「向量」，但这个 Provider 用的不是 ${DEFAULT_UPSTREAM_PROTOCOL} 协议 —— 不能在其下建向量模型（embedding 只有 /embeddings 一条路）。请先把该 Provider 的协议改成 OpenAI 兼容，或把这些行改选「对话」。`}
+                  message={t('models.remoteConflict', { protocol: DEFAULT_UPSTREAM_PROTOCOL })}
                 />
               )}
 
               {rows.length === 0 ? (
-                <p className="ratio">上游返回的清单是空的。</p>
+                <p className="ratio">{t('models.remoteEmptyResult')}</p>
               ) : filtered.length === 0 ? (
-                <p className="ratio">没有匹配「{keyword.trim()}」的型号名。</p>
+                <p className="ratio">{t('models.remoteNoMatch', { keyword: keyword.trim() })}</p>
               ) : (
                 <Table<RemoteModelRow>
                   rowKey="id"
@@ -309,16 +320,16 @@ export function RemoteModelsDrawer({ provider, onClose }: RemoteModelsDrawerProp
               )}
 
               <p className="ratio">
-                提示：勾选型号后可批量创建；也可点型号名复制到「新建模型」里手动录入。上游清单里常有
-                embedding / 图像 / 老版本模型，不一定都能拿来做对话 —— 每行的「建成类型」**默认只是按
-                型号名的推测、可能不准**，请在建之前逐行确认。
+                {t('models.remoteFootnotePrefix')}
+                <strong>{t('models.remoteFootnoteStrong')}</strong>
+                {t('models.remoteFootnoteTail')}
               </p>
             </>
           )}
 
-          <Tooltip title="重新探一次（换过 Key 或改了 baseUrl 之后常用）">
+          <Tooltip title={t('models.remoteRefetchTitle')}>
             <Button onClick={() => probe.mutate(provider.id)} loading={probe.isPending}>
-              重新探测
+              {t('models.remoteRefetch')}
             </Button>
           </Tooltip>
         </div>

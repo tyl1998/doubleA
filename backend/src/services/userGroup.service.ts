@@ -10,7 +10,7 @@
  * 组件的口径，见 `agent.service.ts` 文件头 ②）。
  */
 
-import {
+import { appMsg,
   AppError,
   type CreateUserGroupBody,
   type ListUserGroupsQuery,
@@ -87,7 +87,7 @@ export async function getUserGroup(id: string): Promise<UserGroupDetail> {
       },
     },
   })
-  if (row === null) throw AppError.notFound('用户组不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m015'))
   return {
     ...toItem(row),
     members: row.members.map((m) => ({
@@ -108,7 +108,7 @@ export async function createUserGroup(input: CreateUserGroupBody): Promise<UserG
     getLogger().info({ groupId: created.id, name: created.name }, '已创建用户组')
     return toItem(created)
   } catch (error) {
-    if (hasPrismaCode(error, 'P2002')) throw AppError.conflict(`已存在同名用户组：${input.name}`)
+    if (hasPrismaCode(error, 'P2002')) throw AppError.conflict(appMsg('app.m231', { p0: input.name }))
     throw error
   }
 }
@@ -129,8 +129,8 @@ export async function updateUserGroup(id: string, input: UpdateUserGroupBody): P
     getLogger().info({ groupId: id, changed: Object.keys(input) }, '已更新用户组')
     return toItem(updated)
   } catch (error) {
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('用户组不存在')
-    if (hasPrismaCode(error, 'P2002')) throw AppError.conflict('已存在同名用户组')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m015'))
+    if (hasPrismaCode(error, 'P2002')) throw AppError.conflict(appMsg('app.m232'))
     throw error
   }
 }
@@ -147,13 +147,13 @@ export async function replaceUserGroupMembers(
 ): Promise<UserGroupDetail> {
   const db = getPrisma()
   const group = await db.userGroup.findUnique({ where: { id }, select: { id: true } })
-  if (group === null) throw AppError.notFound('用户组不存在')
+  if (group === null) throw AppError.notFound(appMsg('app.m015'))
 
   const userIds = [...new Set(input.userIds)]
   if (userIds.length > 0) {
     const found = await db.user.findMany({ where: { id: { in: userIds } }, select: { id: true } })
     const missing = userIds.filter((uid) => !found.some((u) => u.id === uid))
-    if (missing.length > 0) throw AppError.validation(`成员里有不存在的用户：${missing.join('、')}`)
+    if (missing.length > 0) throw AppError.validation(appMsg('app.m233', { p0: missing.join('、') }))
   }
 
   await db.$transaction(async (tx) => {
@@ -180,7 +180,7 @@ export async function removeUserGroup(
 ): Promise<{ id: string; name: string; removedAudiences: number }> {
   const db = getPrisma()
   const group = await db.userGroup.findUnique({ where: { id }, select: { id: true, name: true } })
-  if (group === null) throw AppError.notFound('用户组不存在')
+  if (group === null) throw AppError.notFound(appMsg('app.m015'))
 
   const removedAudiences = await db.$transaction(async (tx) => {
     const removed = await tx.agentAudience.deleteMany({

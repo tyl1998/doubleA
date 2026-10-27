@@ -23,6 +23,7 @@ import { Modal } from 'antd'
 import { useNavigate } from 'react-router-dom'
 
 import { credentialsSectionPath } from '../../app/paths.js'
+import { useT } from '../../app/i18n.js'
 import type { MissingModelKeyProvider } from './modelKeyGuard.js'
 
 export interface MissingModelKeyModalProps {
@@ -33,32 +34,31 @@ export interface MissingModelKeyModalProps {
 }
 
 export function MissingModelKeyModal({ missing, onClose }: MissingModelKeyModalProps) {
+  const { t } = useT()
   const navigate = useNavigate()
   return (
     <Modal
       open={missing !== null}
-      title="还没配置模型 Key"
-      okText="去配置"
-      cancelText="取消"
+      title={t('missingKey.title')}
+      okText={t('missingKey.okText')}
+      cancelText={t('confirm.reject')}
       onOk={() => {
         onClose()
         navigate(credentialsSectionPath('provider'))
       }}
       onCancel={onClose}
     >
-      <p>
-        这些模型所属的 Provider 用的是「各自 Key」，你还没有配置自己的 Key —— 用它们对话会失败。
-        请先到「我的凭据」配置自己的 Key。
-      </p>
+      <p>{t('missingKey.body')}</p>
       <ul style={{ margin: 'var(--sp-3) 0 0', paddingLeft: '1.2em' }}>
         {(missing ?? []).map((item) => (
           <li key={item.providerId}>
-            <strong>{item.providerName}</strong>：{item.modelLabels.join('、')}
+            <strong>{item.providerName}</strong>
+            {t('missingKey.providerModels', { models: item.modelLabels.join(t('missingKey.listSeparator')) })}
           </li>
         ))}
       </ul>
       <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-        ⚠️ 点「取消」不做任何变更（不切模型 / 不开始这段对话）—— 配好 Key 后再重试即可。
+        {t('missingKey.footNote')}
       </p>
     </Modal>
   )

@@ -11,12 +11,15 @@
  * （遮罩色与页面色不对路）。这里只放一条等宽读数 —— 与左侧栏的语言一致。
  */
 
+import { useT } from './i18n.js'
+
 export function BootScreen() {
+  const { t } = useT()
   return (
     <div className="boot" role="status" aria-live="polite">
       <p className="boot__line">
         <span className="led led--run" aria-hidden="true" />
-        <span className="kicker">读取登录态 · /api/auth/me</span>
+        <span className="kicker">{`${t('boot.readingSession')} · /api/auth/me`}</span>
       </p>
     </div>
   )

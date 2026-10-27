@@ -9,7 +9,9 @@
  * 要防的"同一口径两处写"。
  */
 
-import { HEALTH_TARGET_LABEL, useHealth } from '../api/health.js'
+import { useHealth } from '../api/health.js'
+import { useT } from './i18n.js'
+import { HEALTH_TARGET_KEY } from '../api/health.js'
 
 /**
  * 三态（正常 / 降级 / 取不到），文案在 `title` 里给全 —— 避免只有一个颜色（色觉障碍用户读不出）。
@@ -17,24 +19,27 @@ import { HEALTH_TARGET_LABEL, useHealth } from '../api/health.js'
  */
 export function ServiceLed() {
   const health = useHealth()
+  const { t } = useT()
 
   let className = 'led led--idle'
-  let title = '正在读取服务状态…'
+  let title = t('shell.servicePending')
   if (!health.isPending) {
     const report = health.data
     if (report === undefined) {
       className = 'led led--fail'
-      title = '取不到服务状态（/health 未响应）'
+      title = t('shell.serviceUnreachable')
     } else if (report.status === 'ok') {
       className = 'led led--ok'
-      title = `服务正常 · v${report.version} · ${report.env}`
+      title = t('shell.serviceOk', { version: report.version, env: report.env })
     } else {
       const broken = report.checks
         .filter((check) => !check.ok)
-        .map((check) => `${HEALTH_TARGET_LABEL[check.target]}：${check.detail}`)
-        .join('；')
+        .map((check) =>
+          t('shell.serviceCheckBroken', { name: t(HEALTH_TARGET_KEY[check.target]), detail: check.detail }),
+        )
+        .join(t('shell.serviceCheckSeparator'))
       className = 'led led--warn'
-      title = `部分依赖不可用 —— ${broken}`
+      title = t('shell.serviceDegraded', { broken })
     }
   }
 

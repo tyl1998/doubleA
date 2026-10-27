@@ -18,6 +18,8 @@
 
 import { memo, useMemo, useState } from 'react'
 
+import { useT } from '../../app/i18n.js'
+
 export interface ThinkingBlockProps {
   /** 思考过程全文（累积的 `thinking` 增量） */
   text: string
@@ -43,6 +45,7 @@ function charCount(text: string): number {
  * 不是来自 DOM）。
  */
 export const ThinkingBlock = memo(function ThinkingBlock({ text, streaming }: ThinkingBlockProps) {
+  const { t } = useT()
   // `null` = 用户还没碰过（跟随流式状态）；`true/false` = 用户的明确选择，一直生效
   const [userChoice, setUserChoice] = useState<boolean | null>(null)
   const open = userChoice ?? streaming
@@ -60,7 +63,7 @@ export const ThinkingBlock = memo(function ThinkingBlock({ text, streaming }: Th
       >
         {/* ⚠️ 原型这里是「思考过程 · 4 步 · 2.1s」，而本仓的 `thinking` 事件只给文本增量
             —— 没有"步数"、也没有分段时刻。**不编造**：只报真实可算的那个数（字数）。 */}
-        <span>思考过程 · {chars} 字{streaming ? ' · 生成中' : ''}</span>
+        <span>{t('thinking.head', { chars })}{streaming ? t('thinking.streamingSuffix') : ''}</span>
         <span className="think__caret" aria-hidden="true">
           ›
         </span>

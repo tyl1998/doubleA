@@ -53,7 +53,7 @@ import type { MenuProps } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import {
-  WORKSPACE_ACTOR_LABELS,
+  WORKSPACE_ACTOR_KEY,
   type WorkspaceChangeEntry,
   type WorkspaceDiffLine,
   type WorkspaceEventItem,
@@ -82,6 +82,7 @@ import {
   workspaceTreeQueryKey,
 } from '../../api/workspace.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { useWorkspaceExpandedDirs, useWorkspaceStore, useWorkspaceTabs } from '../../stores/workspace.js'
 import { CodeMirrorEditor } from './CodeMirrorEditor.js'
 import {
@@ -110,7 +111,8 @@ import {
   workspaceMoveTargetPath,
   workspaceNewFolderPlaceholderPath,
   workspaceParentDir,
-  WORKSPACE_COPY_ITEMS,
+  workspaceCopyItems,
+  WORKSPACE_COPY_ITEM_KEYS,
   type WorkspaceCopyKind,
   type WorkspaceFileIconKind,
   type WorkspaceTreeNode,
@@ -123,18 +125,19 @@ export function CodeModeSwitch(props: {
   loading: boolean
   onToggle: (enabled: boolean) => void
 }) {
+  const { t } = useT()
   return (
     <Switch
       size="small"
       checked={props.enabled}
       loading={props.loading}
-      checkedChildren="Code 模式"
-      unCheckedChildren="普通"
+      checkedChildren={t('workspace.codeModeOn')}
+      unCheckedChildren={t('workspace.codeModeOff')}
       onChange={props.onToggle}
       title={
         props.conversationId === undefined
-          ? '打开后本会话的工作区走人机共享可编辑形态（发送第一条消息时生效）'
-          : '打开后本会话的工作区走人机共享可编辑形态（下次派活生效）'
+          ? t('workspace.codeModeTitleNew')
+          : t('workspace.codeModeTitleExisting')
       }
     />
   )
@@ -202,13 +205,14 @@ export interface WorkspaceRuntimeControls {
 }
 
 export function WorkspacePanelPlaceholder(props: WorkspaceRuntimeControls) {
+  const { t } = useT()
   return (
     <div className="ws" data-testid="workspace-panel-placeholder">
       <header className="ws__head">
-        <span className="ws__icon-btn ws__icon-btn--static" title="资源管理器" aria-hidden="true">
+        <span className="ws__icon-btn ws__icon-btn--static" title={t('workspace.explorer')} aria-hidden="true">
           <FolderOutlined />
         </span>
-        <span className="ws__title">工作区</span>
+        <span className="ws__title">{t('workspace.title')}</span>
         <div className="u-right">
           {/* 新会话态也能选运行时：会话建出来前先记意图、开流前落地（见 ChatPage#runtimePresetRef） */}
           <RuntimeSelect
@@ -222,7 +226,7 @@ export function WorkspacePanelPlaceholder(props: WorkspaceRuntimeControls) {
       </header>
       <div className="ws__body">
         <div className="ws__empty">
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="发送第一条消息后创建工作区" />
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('workspace.placeholderEmpty')} />
         </div>
       </div>
     </div>
@@ -235,6 +239,7 @@ export function WorkspacePanel({
   ...runtimeControls
 }: { conversationId: string; codeMode: boolean } & WorkspaceRuntimeControls) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const { modal } = App.useApp()
   const queryClient = useQueryClient()
   const { openPaths, activePath } = useWorkspaceTabs(conversationId)
@@ -368,7 +373,7 @@ export function WorkspacePanel({
         return { ...prev, [path]: { ...current, baseText: current.text, version: entry.version, conflict: null } }
       })
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok('已保存')
+      feedback.ok(t('workspace.savedOk'))
     } catch (error) {
       if (error instanceof ApiError && error.code === 'CONFLICT') {
         const data = error.data as { currentVersion?: number } | null
@@ -383,9 +388,9 @@ export function WorkspacePanel({
             },
           }
         })
-        feedback.fail(error, '保存冲突')
+        feedback.fail(error, t('workspace.saveConflict'))
       } else {
-        feedback.fail(error, '保存失败')
+        feedback.fail(error, t('workspace.saveFailed'))
       }
     } finally {
       setSavingPath(null)
@@ -403,19 +408,19 @@ export function WorkspacePanel({
         return next
       })
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok('已删除')
+      feedback.ok(t('workspace.deletedOk'))
     } catch (error) {
-      feedback.fail(error, '删除失败')
+      feedback.fail(error, t('workspace.deleteFailed'))
     }
   }
 
   /** 右键「删除」：软删仍可在历史里找回，故确认一次即可 */
   const confirmRemove = (path: string): void => {
     modal.confirm({
-      title: '删除这个文件？',
-      content: `${path}（软删 + 墓碑；可在历史里找回，若在保留期内）`,
-      okText: '删除',
-      cancelText: '取消',
+      title: t('workspace.deleteFileTitle'),
+      content: t('workspace.deleteFileContent', { path }),
+      okText: t('common.delete'),
+      cancelText: t('common.cancel'),
       okButtonProps: { danger: true },
       onOk: () => remove(path),
     })
@@ -438,19 +443,23 @@ export function WorkspacePanel({
         return next
       })
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok(result.deleted > 0 ? `已删除文件夹（${result.deleted} 个文件）` : '已删除文件夹')
+      feedback.ok(
+        result.deleted > 0
+          ? t('workspace.deleteDirOk', { count: result.deleted })
+          : t('workspace.deleteDirOkPlain'),
+      )
     } catch (error) {
-      feedback.fail(error, '删除文件夹失败')
+      feedback.fail(error, t('workspace.deleteDirFailed'))
     }
   }
 
   /** 右键「删除文件夹」：递归软删仍可在历史里找回，故确认一次即可（但明示"整目录递归"） */
   const confirmRemoveDir = (dir: string): void => {
     modal.confirm({
-      title: '删除这个文件夹？',
-      content: `${dir}/ —— 将递归删除其中的所有文件（软删 + 墓碑；可在历史里找回，若在保留期内）`,
-      okText: '删除',
-      cancelText: '取消',
+      title: t('workspace.deleteDirTitle'),
+      content: t('workspace.deleteDirContent', { dir }),
+      okText: t('common.delete'),
+      cancelText: t('common.cancel'),
       okButtonProps: { danger: true },
       onOk: () => removeDir(dir),
     })
@@ -463,10 +472,10 @@ export function WorkspacePanel({
       await createWorkspaceFile(conversationId, path)
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
       openFile(conversationId, path)
-      feedback.ok('已新建')
+      feedback.ok(t('workspace.createdOk'))
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, '同名文件已存在')
-      else feedback.fail(error, '新建失败')
+      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, t('workspace.sameNameFile'))
+      else feedback.fail(error, t('workspace.createFailed'))
     }
   }
 
@@ -480,10 +489,10 @@ export function WorkspacePanel({
     try {
       await createWorkspaceFile(conversationId, placeholder)
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok('已新建文件夹')
+      feedback.ok(t('workspace.folderCreatedOk'))
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, '同名文件夹已存在')
-      else feedback.fail(error, '新建文件夹失败')
+      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, t('workspace.sameNameFolder'))
+      else feedback.fail(error, t('workspace.folderCreateFailed'))
     }
   }
 
@@ -502,10 +511,10 @@ export function WorkspacePanel({
       })
       renameFile(conversationId, from, to)
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok('已重命名')
+      feedback.ok(t('workspace.renamedOk'))
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, '目标路径已存在')
-      else feedback.fail(error, '重命名失败')
+      if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, t('workspace.targetExists'))
+      else feedback.fail(error, t('workspace.renameFailed'))
     }
   }
 
@@ -536,12 +545,12 @@ export function WorkspacePanel({
         await uploadWorkspaceFile(conversationId, dir, file)
         okCount += 1
       } catch (error) {
-        feedback.fail(error, `上传失败：${file.name}`)
+        feedback.fail(error, t('workspace.uploadFailed', { name: file.name }))
       }
     }
     if (okCount > 0) {
       void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      feedback.ok(`已上传 ${okCount} 个文件`)
+      feedback.ok(t('workspace.uploadedOk', { count: okCount }))
     }
   }
 
@@ -566,18 +575,18 @@ export function WorkspacePanel({
     try {
       const result = await revertWorkspaceRound(conversationId)
       modal.info({
-        title: '已撤销本轮',
+        title: t('workspace.revertDoneTitle'),
         width: 560,
-        okText: '知道了',
+        okText: t('workspace.revertAck'),
         content: (
           <div data-testid="revert-report">
-            <p className="ws__revert-summary">{revertSummaryText(result)}</p>
+            <p className="ws__revert-summary">{revertSummaryText(result, locale)}</p>
             {result.items.length > 0 && (
               <ul className="ws__revert-list">
                 {result.items.map((item) => (
                   <li key={`${item.action}:${item.path}`} className="ws__revert-item">
                     <span className={`ws__revert-action ws__revert-action--${item.action}`}>
-                      {revertActionLabel(item.action)}
+                      {revertActionLabel(item.action, locale)}
                     </span>
                     <span className="ws__revert-path">{item.path}</span>
                     {item.message !== undefined && item.message !== '' && (
@@ -594,7 +603,7 @@ export function WorkspacePanel({
       // 打开的文件全量重读：干净的重铺，有草稿的进冲突（不静默覆盖）
       void queryClient.invalidateQueries({ queryKey: ['workspace-file', conversationId] })
     } catch (error) {
-      feedback.fail(error, '撤销本轮失败')
+      feedback.fail(error, t('workspace.revertFailed'))
     } finally {
       setReverting(false)
     }
@@ -720,8 +729,8 @@ export function WorkspacePanel({
     const value = workspaceCopyValue(kind, path)
     navigator.clipboard
       .writeText(value)
-      .then(() => feedback.ok(`已复制：${value}`))
-      .catch((error: unknown) => feedback.fail(error, '复制失败'))
+      .then(() => feedback.ok(t('workspace.copiedOk', { value })))
+      .catch((error: unknown) => feedback.fail(error, t('workspace.copyFailed')))
   }
 
   /** 文件树右键 / 拖拽要用的动作集合（下传给 `WorkspaceTree`） */
@@ -739,7 +748,7 @@ export function WorkspacePanel({
   }
 
   if (!codeMode) {
-    return <Empty description="当前会话未开启 Code 模式" />
+    return <Empty description={t('workspace.notCodeMode')} />
   }
 
   const language = activePath === null ? 'text' : workspaceEditorLanguage(activePath)
@@ -751,10 +760,10 @@ export function WorkspacePanel({
   return (
     <div className="ws" data-testid="workspace-panel">
       <header className="ws__head">
-        <span className="ws__icon-btn ws__icon-btn--static" title="资源管理器" aria-hidden="true">
+        <span className="ws__icon-btn ws__icon-btn--static" title={t('workspace.explorer')} aria-hidden="true">
           <FolderOutlined />
         </span>
-        <span className="ws__title">工作区</span>
+        <span className="ws__title">{t('workspace.title')}</span>
         <div className="u-right">
           {/* 运行时选择（P1-17a）：建容器（派活）时用哪份预烘焙镜像；下次派活生效 */}
           <RuntimeSelect
@@ -765,14 +774,14 @@ export function WorkspacePanel({
             onPreferredInstanceChange={runtimeControls.onPreferredInstanceChange}
           />
           <Popconfirm
-            title="撤销本轮？"
-            description="把上一轮 agent / 你的写入回退到轮初；此后又被改过的文件不会被覆盖。"
-            okText="撤销"
-            cancelText="取消"
+            title={t('workspace.revertConfirmTitle')}
+            description={t('workspace.revertConfirmDescription')}
+            okText={t('workspace.revertOk')}
+            cancelText={t('common.cancel')}
             onConfirm={() => void revert()}
           >
             <Button size="small" icon={<UndoOutlined />} loading={reverting} data-testid="workspace-revert">
-              撤销本轮
+              {t('workspace.revertButton')}
             </Button>
           </Popconfirm>
         </div>
@@ -783,13 +792,13 @@ export function WorkspacePanel({
             树行右键出菜单、可拖拽移动到目录；空白区右键 = 根目录级的新建 / 上传 */}
         <div className="ws__explorer">
           <div className="ws__explorer-head">
-            <span className="ws__explorer-title">资源管理器</span>
+            <span className="ws__explorer-title">{t('workspace.explorer')}</span>
               <span className="u-right ws__explorer-actions">
                 <button
                   type="button"
                   className="ws__icon-btn"
                   onClick={() => setPrompt({ mode: 'createFile', dir: '' })}
-                  title="新建文件"
+                  title={t('workspace.newFile')}
                 >
                   <FileAddOutlined />
                 </button>
@@ -797,7 +806,7 @@ export function WorkspacePanel({
                   type="button"
                   className={`ws__icon-btn${showHidden ? ' is-on' : ''}`}
                   onClick={() => setShowHidden((value) => !value)}
-                  title={showHidden ? '隐藏点文件（.git 等）' : '显示点文件（.git 等）'}
+                  title={showHidden ? t('workspace.hideDotFiles') : t('workspace.showDotFiles')}
                   aria-pressed={showHidden}
                 >
                   {showHidden ? <EyeOutlined /> : <EyeInvisibleOutlined />}
@@ -821,7 +830,8 @@ export function WorkspacePanel({
             {changes.length > 0 && (
               <div className={`ws__recent${recentOpen ? ' is-open' : ''}`}>
                 <button type="button" className="ws__recent-head" onClick={() => setRecentOpen((open) => !open)}>
-                  <RightOutlined className="ws__chevron" rotate={recentOpen ? 90 : 0} /> 最近变更 {changes.length}
+                  <RightOutlined className="ws__chevron" rotate={recentOpen ? 90 : 0} />{' '}
+                  {t('workspace.recentChanges', { count: changes.length })}
                 </button>
                 {recentOpen && (
                   <ul className="ws__recent-list">
@@ -849,10 +859,10 @@ export function WorkspacePanel({
             {gitRepos.length > 0 && (
               <div className="ws__git-bar" data-testid="workspace-git">
                 {gitRepos.map((repo) => (
-                  <div key={repo.path} className="ws__git-row" title={workspaceGitChipTitle(repo)}>
+                  <div key={repo.path} className="ws__git-row" title={workspaceGitChipTitle(repo, locale)}>
                     <BranchesOutlined className="ws__git-icon" />
                     {gitRepos.length > 1 && repo.path !== '' ? <span className="ws__git-repo">{repo.path}</span> : null}
-                    <span className="ws__git-branch">{workspaceGitChipLabel(repo)}</span>
+                    <span className="ws__git-branch">{workspaceGitChipLabel(repo, locale)}</span>
                   </div>
                 ))}
               </div>
@@ -876,12 +886,12 @@ export function WorkspacePanel({
                     <button type="button" className="ws__tab-name" title={path} onClick={() => activateFile(conversationId, path)}>
                       <FileGlyph path={path} />
                       <span className="ws__tab-label">{workspaceBaseName(path)}</span>
-                      {tabDirty && <span className="ws__tab-dot" aria-label="未保存" />}
+                      {tabDirty && <span className="ws__tab-dot" aria-label={t('workspace.unsaved')} />}
                     </button>
                     <button
                       type="button"
                       className="ws__tab-close"
-                      title="关闭"
+                      title={t('workspace.tabClose')}
                       onClick={(event) => {
                         event.stopPropagation()
                         closeFile(conversationId, path)
@@ -903,10 +913,10 @@ export function WorkspacePanel({
                   // ⚠️ 读失败（文件被删 / 没权限）时**不能**一直显示"正在读取文件…"（产品反馈）：
                   //    那种情况 `docs[path]` 永远不会被填上 ⇒ 这个占位会一直是"加载中"。
                   activePath === null
-                    ? '从左侧选一个文件开始'
+                    ? t('workspace.pickFile')
                     : fileQuery.isError
-                      ? '文件读不到（可能已被删除，或没有权限）'
-                      : '正在读取文件…'
+                      ? t('workspace.fileUnreadable')
+                      : t('workspace.fileLoading')
                 }
               />
             </div>
@@ -917,10 +927,10 @@ export function WorkspacePanel({
                   {activePath}
                 </span>
                 <Space size="small" className="u-right">
-                  <Tooltip title="重新加载（丢弃未保存改动）">
+                  <Tooltip title={t('workspace.reloadTooltip')}>
                     <Button size="small" type="text" icon={<ReloadOutlined />} onClick={reloadActive} />
                   </Tooltip>
-                  <Tooltip title="下载">
+                  <Tooltip title={t('workspace.downloadTooltip')}>
                     <a href={workspaceRawUrl(conversationId, activePath)} download>
                       <Button size="small" type="text" icon={<DownloadOutlined />} />
                     </a>
@@ -934,7 +944,7 @@ export function WorkspacePanel({
                       disabled={!dirty}
                       onClick={() => void save(activePath)}
                     >
-                      保存
+                      {t('workspace.save')}
                     </Button>
                   )}
                 </Space>
@@ -942,7 +952,7 @@ export function WorkspacePanel({
 
               {fileQuery.isError ? (
                 <div className="ws__placeholder">
-                  <Typography.Text type="danger">文件读不到（可能已被删除，或没有权限）。</Typography.Text>
+                  <Typography.Text type="danger">{t('workspace.fileUnreadablePeriod')}</Typography.Text>
                 </div>
               ) : (
                 <>
@@ -951,10 +961,10 @@ export function WorkspacePanel({
                       <Alert
                         type="warning"
                         showIcon
-                        message={conflictText(activeDoc.conflict.currentVersion)}
+                        message={conflictText(activeDoc.conflict.currentVersion, locale)}
                         action={
                           <Button size="small" onClick={reloadActive}>
-                            重新加载
+                            {t('workspace.reload')}
                           </Button>
                         }
                       />
@@ -983,13 +993,13 @@ export function WorkspacePanel({
                     ) : (
                       <div className="ws__placeholder">
                         <Typography.Text type="secondary">
-                          该文件不是文本（{fileQuery.data?.mime}），只能下载 / 预览。
+                          {t('workspace.notText', { mime: fileQuery.data?.mime ?? '' })}
                         </Typography.Text>
                       </div>
                     )}
                   </div>
                   <div className="ws__status" data-testid="workspace-status">
-                    <span>{workspaceLanguageLabel(language)}</span>
+                    <span>{workspaceLanguageLabel(language, locale)}</span>
                     <span>v{activeDoc.version}</span>
                     <span>{formatBytes(fileQuery.data?.size ?? 0)}</span>
                     <span
@@ -997,7 +1007,11 @@ export function WorkspacePanel({
                         activeDoc.conflict !== null ? ' ws__status--conflict' : ''
                       }`}
                     >
-                      {activeDoc.conflict !== null ? '冲突' : dirty ? '未保存' : '已保存'}
+                      {activeDoc.conflict !== null
+                        ? t('workspace.conflictTag')
+                        : dirty
+                          ? t('workspace.unsaved')
+                          : t('workspace.saved')}
                     </span>
                   </div>
                 </>
@@ -1052,6 +1066,7 @@ function RecentChangeRow(props: {
   onOpenDiff: () => void
 }) {
   const { conversationId, change, onOpenFile, onOpenDiff } = props
+  const { t, locale } = useT()
   // 逐行差异的**计数**（只回 `+N −M`，不带逐行内容）：每行一个轻量查询，点开才取全文
   const stats = useQuery({
     queryKey: workspaceFileDiffQueryKey(conversationId, change.path, change.version ?? undefined),
@@ -1077,7 +1092,7 @@ function RecentChangeRow(props: {
         </button>
       )}
       {badge !== undefined && badge.available ? (
-        <button type="button" className="ws__recent-diff" onClick={onOpenDiff} title="查看行级差异">
+        <button type="button" className="ws__recent-diff" onClick={onOpenDiff} title={t('workspace.diffViewTooltip')}>
           <span className="ws__diff-added">+{badge.added}</span>
           <span className="ws__diff-removed">−{badge.removed}</span>
         </button>
@@ -1086,12 +1101,12 @@ function RecentChangeRow(props: {
           type="button"
           className="ws__recent-diff ws__recent-diff--muted"
           onClick={onOpenDiff}
-          title={badge?.message ?? '查看差异'}
+          title={badge?.message ?? t('workspace.diffViewTooltipShort')}
         >
-          差异
+          {t('workspace.diff')}
         </button>
       )}
-      <span className="ws__recent-actor">{WORKSPACE_ACTOR_LABELS[change.actor]}</span>
+      <span className="ws__recent-actor">{t(WORKSPACE_ACTOR_KEY[change.actor], { locale })}</span>
     </li>
   )
 }
@@ -1102,6 +1117,7 @@ function RecentChangeRow(props: {
  */
 function WorkspaceDiffModal(props: { conversationId: string; path: string | null; onClose: () => void }) {
   const { conversationId, path, onClose } = props
+  const { t } = useT()
   const query = useQuery({
     queryKey: workspaceFileDiffQueryKey(conversationId, path ?? ''),
     queryFn: () => fetchWorkspaceFileDiff(conversationId, path ?? ''),
@@ -1117,7 +1133,7 @@ function WorkspaceDiffModal(props: { conversationId: string; path: string | null
       width={760}
       title={
         <span className="ws__diff-title">
-          差异
+          {t('workspace.diffTitle')}
           <span className="ws__diff-title-path">{path}</span>
           {diff !== undefined && diff.available ? (
             <span className="ws__diff-title-stat">
@@ -1130,7 +1146,7 @@ function WorkspaceDiffModal(props: { conversationId: string; path: string | null
     >
       {query.isError ? (
         <div className="ws__placeholder">
-          <Typography.Text type="danger">差异读取失败。</Typography.Text>
+          <Typography.Text type="danger">{t('workspace.diffReadFailed')}</Typography.Text>
         </div>
       ) : diff === undefined ? (
         <div className="ws__loading">
@@ -1138,11 +1154,11 @@ function WorkspaceDiffModal(props: { conversationId: string; path: string | null
         </div>
       ) : !diff.available ? (
         <div className="ws__placeholder">
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={diff.message ?? '该文件无法逐行比较'} />
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={diff.message ?? t('workspace.diffNotComparable')} />
         </div>
       ) : lines.length === 0 ? (
         <div className="ws__placeholder">
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="内容没有变化" />
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('workspace.diffNoChange')} />
         </div>
       ) : (
         <div className="ws__diff" data-testid="workspace-diff">
@@ -1157,8 +1173,13 @@ function WorkspaceDiffModal(props: { conversationId: string; path: string | null
 
 /** 差异里的一行（`gap` = 折叠的未变长段） */
 function WorkspaceDiffLineRow({ line }: { line: WorkspaceDiffLine }) {
+  const { t } = useT()
   if (line.type === 'gap') {
-    return <div className="ws__diff-line ws__diff-line--gap">⋯ {line.gap ?? 0} 行未变 ⋯</div>
+    return (
+      <div className="ws__diff-line ws__diff-line--gap">
+        {t('workspace.diffGapLines', { count: line.gap ?? 0 })}
+      </div>
+    )
   }
   return (
     <div className={`ws__diff-line ws__diff-line--${line.type}`}>
@@ -1178,6 +1199,7 @@ function WorkspacePathPrompt(props: {
   onCancel: () => void
   onSubmit: (path: string) => void
 }) {
+  const { t } = useT()
   const [value, setValue] = useState(props.initialValue)
   useEffect(() => {
     if (props.open) setValue(props.initialValue)
@@ -1192,9 +1214,15 @@ function WorkspacePathPrompt(props: {
   return (
     <Modal
       open={props.open}
-      title={isRename ? '重命名 / 移动' : isFolder ? '新建文件夹' : '新建文件'}
-      okText={isRename ? '重命名' : isFolder ? '新建' : '新建'}
-      cancelText="取消"
+      title={
+        isRename
+          ? t('workspace.promptRenameTitle')
+          : isFolder
+            ? t('workspace.promptFolderTitle')
+            : t('workspace.promptFileTitle')
+      }
+      okText={isRename ? t('workspace.promptOkRename') : t('workspace.promptOk')}
+      cancelText={t('common.cancel')}
       onOk={submit}
       onCancel={props.onCancel}
       destroyOnClose
@@ -1202,12 +1230,18 @@ function WorkspacePathPrompt(props: {
       <Input
         value={value}
         autoFocus
-        placeholder={isFolder ? '例如 src/utils' : '例如 src/index.ts'}
+        placeholder={
+          isFolder ? t('workspace.promptPlaceholderFolder') : t('workspace.promptPlaceholderFile')
+        }
         onChange={(event) => setValue(event.target.value)}
         onPressEnter={submit}
       />
       <p className="ratio" style={{ marginTop: 8 }}>
-        相对工作区根目录的路径；目录不存在会自动建。{isFolder ? '文件夹内会落一个 .gitkeep 占位。' : isRename ? '目标已存在会被拒绝。' : '同名已存在会被拒绝。'}
+        {isFolder
+          ? t('workspace.promptHintFolder')
+          : isRename
+            ? t('workspace.promptHintRename')
+            : t('workspace.promptHintFile')}
       </p>
     </Modal>
   )
@@ -1250,11 +1284,17 @@ const FILE_ICON_NODES: Record<WorkspaceFileIconKind, ReactNode> = {
 
 /** 只读图片预览（内联；失败给因由，同 `ArtifactPreview/ImagePreview` 的纪律） */
 function WorkspaceImagePreview({ url, alt }: { url: string; alt: string }) {
+  const { t } = useT()
   const [failed, setFailed] = useState(false)
   if (failed) {
     return (
       <div className="ws__placeholder">
-        <Alert type="warning" showIcon message="图片没能加载" description="可能是会话已过期或没有权限；可点右上角「下载」看原文件。" />
+        <Alert
+          type="warning"
+          showIcon
+          message={t('workspace.imageFailedTitle')}
+          description={t('workspace.imageFailedDescription')}
+        />
       </div>
     )
   }
@@ -1291,6 +1331,7 @@ function WorkspaceTree(props: {
   selectedPath: string | null
   actions: TreeActions
 }) {
+  const { t, locale } = useT()
   const scrollRef = useRef<HTMLDivElement | null>(null)
   /** 被**展开**的目录（持久化在 store；初始为空 = 全部折叠，只看到顶层） */
   const expandedDirs = useWorkspaceExpandedDirs(props.conversationId)
@@ -1333,13 +1374,13 @@ function WorkspaceTree(props: {
   const copySubmenu = (): NonNullable<MenuProps['items']>[number] => ({
     key: 'copy',
     icon: <CopyOutlined />,
-    label: '复制',
-    children: WORKSPACE_COPY_ITEMS.map((item) => ({ key: `copy-${item.key}`, label: item.label })),
+    label: t('workspace.menuCopy'),
+    children: workspaceCopyItems(locale).map((item) => ({ key: `copy-${item.key}`, label: item.label })),
   })
 
   /** 命中的是不是「复制」子项 ⇒ 是就执行并回 `true`（调用方据此提前返回） */
   const handleCopyKey = (key: string, path: string): boolean => {
-    const kind = WORKSPACE_COPY_ITEMS.find((item) => `copy-${item.key}` === key)?.key
+    const kind = WORKSPACE_COPY_ITEM_KEYS.find((item) => `copy-${item.key}` === key)?.key
     if (kind === undefined) return false
     props.actions.copy(kind, path)
     return true
@@ -1347,13 +1388,13 @@ function WorkspaceTree(props: {
 
   const fileMenu = (path: string): MenuProps => ({
     items: [
-      { key: 'open', label: '打开' },
-      { key: 'rename', icon: <EditOutlined />, label: '重命名 / 移动' },
-      { key: 'download', icon: <DownloadOutlined />, label: '下载' },
+      { key: 'open', label: t('workspace.menuOpen') },
+      { key: 'rename', icon: <EditOutlined />, label: t('workspace.menuRename') },
+      { key: 'download', icon: <DownloadOutlined />, label: t('workspace.menuDownload') },
       { type: 'divider' },
       copySubmenu(),
       { type: 'divider' },
-      { key: 'delete', icon: <DeleteOutlined />, label: '删除', danger: true },
+      { key: 'delete', icon: <DeleteOutlined />, label: t('workspace.menuDelete'), danger: true },
     ],
     onClick: ({ key }) => {
       if (handleCopyKey(key, path)) return
@@ -1366,13 +1407,13 @@ function WorkspaceTree(props: {
 
   const dirMenu = (dir: string): MenuProps => ({
     items: [
-      { key: 'newFile', icon: <FileAddOutlined />, label: '新建文件' },
-      { key: 'newFolder', icon: <FolderAddOutlined />, label: '新建文件夹' },
-      { key: 'upload', icon: <UploadOutlined />, label: '上传文件到此目录' },
+      { key: 'newFile', icon: <FileAddOutlined />, label: t('workspace.newFile') },
+      { key: 'newFolder', icon: <FolderAddOutlined />, label: t('workspace.newFolder') },
+      { key: 'upload', icon: <UploadOutlined />, label: t('workspace.menuUploadHere') },
       { type: 'divider' },
       copySubmenu(),
       { type: 'divider' },
-      { key: 'delete', icon: <DeleteOutlined />, label: '删除文件夹', danger: true },
+      { key: 'delete', icon: <DeleteOutlined />, label: t('workspace.menuDeleteDir'), danger: true },
     ],
     onClick: ({ key }) => {
       if (handleCopyKey(key, dir)) return
@@ -1385,9 +1426,9 @@ function WorkspaceTree(props: {
 
   const blankMenu: MenuProps = {
     items: [
-      { key: 'newFile', icon: <FileAddOutlined />, label: '新建文件' },
-      { key: 'newFolder', icon: <FolderAddOutlined />, label: '新建文件夹' },
-      { key: 'upload', icon: <UploadOutlined />, label: '上传文件' },
+      { key: 'newFile', icon: <FileAddOutlined />, label: t('workspace.newFile') },
+      { key: 'newFolder', icon: <FolderAddOutlined />, label: t('workspace.newFolder') },
+      { key: 'upload', icon: <UploadOutlined />, label: t('workspace.menuUpload') },
     ],
     onClick: ({ key }) => {
       if (key === 'newFile') props.actions.newFile('')
@@ -1441,7 +1482,7 @@ function WorkspaceTree(props: {
       >
         {rows.length === 0 ? (
           <p className="ws__hint" data-testid="workspace-empty">
-            （空工作区；右键可新建文件 / 文件夹，或上传文件）
+            {t('workspace.emptyTree')}
           </p>
         ) : (
           <ul className="ws__tree" style={{ height: rows.length * TREE_ROW_HEIGHT, position: 'relative' }}>

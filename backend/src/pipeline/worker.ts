@@ -46,7 +46,7 @@
 
 import type { Logger } from 'pino'
 
-import { AppError, canTransitionDocumentStatus, MULTIMODAL_MODEL_REQUIRED_HINT, normalizeRetrievalConfig, type DocumentStatus, type ImageRecognition } from '@doubulea/shared'
+import { appMsg, AppError, canTransitionDocumentStatus, MULTIMODAL_MODEL_REQUIRED_HINT, normalizeRetrievalConfig, type DocumentStatus, type ImageRecognition } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -486,8 +486,7 @@ function countSkip(reason: string): void {
  */
 function requireEmbeddingDim(dim: number | null): number {
   if (dim === null) {
-    throw AppError.validation(
-      '该知识库未记录 embedding 维度（可能是本功能上线前建的老库）。请重建知识库并重新选择 embedding 模型后再上传文档',
+    throw AppError.validation(appMsg('app.m082'),
     )
   }
   return dim

@@ -25,17 +25,21 @@ import {
   MCP_CREDENTIAL_KEY_MAX,
   MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES,
   MCP_SERVER_NAME_MAX,
+  translate,
   validateCredentialSchema,
+  validationText,
   type KbMcpVisibility,
   type CredentialInjectLocation,
   type CredentialSchema,
   type CredentialSchemaEntry,
   type CreateMcpServerBody,
   type CredentialSchemaImpact,
+  type Locale,
   type McpCredentialField,
   type McpCredentialItem,
   type McpServerItem,
   type McpServerStatus,
+  type MessageKey,
   type UpdateMcpServerBody,
 } from '@doubulea/shared'
 
@@ -44,10 +48,10 @@ import {
 export interface ServerStatusView {
   /** 状态灯色（样式类，与 `styles/app.css` 的 `.led--*` 对齐） */
   led: 'ok' | 'warn' | 'fail' | 'idle'
-  /** 中文标签（`03` §七 文案词表：界面不出现裸英文状态词） */
-  label: string
-  /** 一句话说明"这意味着什么"（悬浮提示） */
-  hint: string
+  /** 状态标签的 i18n key（`03` §七 文案词表：界面不出现裸英文状态词；P1-23 起存 key 不存文案） */
+  labelKey: MessageKey
+  /** 一句话说明"这意味着什么"（悬浮提示）的 i18n key */
+  hintKey: MessageKey
 }
 
 /**
@@ -59,9 +63,9 @@ export interface ServerStatusView {
  * 「说不出来的数字宁可留白」是同一条口径。
  */
 const SERVER_STATUS_VIEW: Readonly<Record<McpServerStatus, ServerStatusView>> = {
-  OK: { led: 'ok', label: '正常', hint: '最近一次握手成功' },
-  ERROR: { led: 'fail', label: '握手失败', hint: '最近一次握手失败：点「测试」看具体原因' },
-  UNKNOWN: { led: 'idle', label: '未测试', hint: '还没有握手过：点「测试」会连一次并刷新工具数' },
+  OK: { led: 'ok', labelKey: 'label.serverStatus.OK', hintKey: 'mcp.statusHint.OK' },
+  ERROR: { led: 'fail', labelKey: 'label.serverStatus.ERROR', hintKey: 'mcp.statusHint.ERROR' },
+  UNKNOWN: { led: 'idle', labelKey: 'label.serverStatus.UNKNOWN', hintKey: 'mcp.statusHint.UNKNOWN' },
 }
 
 export function serverStatusView(status: McpServerStatus): ServerStatusView {
@@ -83,9 +87,9 @@ export function formatToolCount(server: Pick<McpServerItem, 'status' | 'toolCoun
 
 /** 表格里那一格「我的凭据」的读数 */
 export type CredentialCell =
-  | { kind: 'none'; label: string; hint: string }
-  | { kind: 'configured'; label: string; hint: string }
-  | { kind: 'missing'; label: string; hint: string; missingKeys: readonly string[] }
+  | { kind: 'none'; labelKey: MessageKey; hintKey: MessageKey }
+  | { kind: 'configured'; labelKey: MessageKey; hintKey: MessageKey; hintKeys?: readonly string[] }
+  | { kind: 'missing'; labelKey: MessageKey; hintKey: MessageKey; missingKeys: readonly string[] }
 
 /**
  * 「我的凭据」这一格。
@@ -101,33 +105,51 @@ export type CredentialCell =
  *
  * `item === undefined`（清单里没有这台 server ⇒ 请求还没回来/读失败）时**返回 `none` 之外的
  * 一个中性读数**：说不出来就说"未知"，不拿"未配置"去冒充（那会是一批假警报）。
+ *
+ * ⚠️ P1-23 第八批：`label`/`hint` 改为 `labelKey`/`hintKey`（存 key 不存文案）—— 组件侧
+ * `translate(locale, ...)` 落译文；`hintKeys` 是 `{keys}` 占位符的取值（缺必填时的 key 列表）。
  */
 export function credentialCell(item: McpCredentialItem | undefined): CredentialCell {
   if (item === undefined) {
-    return { kind: 'none', label: '未知', hint: '凭据清单还没读到；刷新页面或稍后再看' }
+    return { kind: 'none', labelKey: 'label.credentialCell.unknown', hintKey: 'mcp.credential.hintUnknown' }
   }
   // 模板为空 ⇒ 这台 server 不向用户要任何东西（内网无鉴权服务是最常见的一种）
   if (item.fields.length === 0) {
-    return { kind: 'none', label: '无需凭据', hint: '这台 server 的模板里没有需要用户填写的参数' }
+    return { kind: 'none', labelKey: 'label.credentialCell.none', hintKey: 'mcp.credential.hintNone' }
   }
   if (item.configured) {
     return {
       kind: 'configured',
-      label: '已配置',
-      hint:
-        item.missingKeys.length === 0
-          ? '你已填写过参数（值不会回显给任何人）'
-          : `你已填写过参数，但还缺必填：${item.missingKeys.join('、')}`,
+      labelKey: 'label.credentialCell.configured',
+      hintKey: item.missingKeys.length === 0 ? 'mcp.credential.hintConfigured' : 'mcp.credential.hintConfiguredMissing',
+      hintKeys: item.missingKeys,
     }
   }
   return {
     kind: 'missing',
-    label: '未配置',
-    hint:
-      item.missingKeys.length === 0
-        ? '你还没有为这台 server 填写凭据；点「未配置」去「我的凭据」里配你自己的那一份'
-        : `你还没有填写凭据；还缺：${item.missingKeys.join('、')}`,
+    labelKey: 'label.credentialCell.missing',
+    hintKey: item.missingKeys.length === 0 ? 'mcp.credential.hintMissing' : 'mcp.credential.hintMissingKeys',
     missingKeys: item.missingKeys,
+  }
+}
+
+/** 便利：把 {@link CredentialCell} 落到某个语言的文案（组件只关心"这一格显示什么"） */
+export function credentialCellText(
+  cell: CredentialCell,
+  locale: Locale,
+): { label: string; hint: string } {
+  const keys =
+    cell.kind === 'missing'
+      ? cell.missingKeys
+      : cell.kind === 'configured'
+        ? (cell.hintKeys ?? [])
+        : []
+  return {
+    label: translate(locale, cell.labelKey),
+    hint:
+      keys.length === 0
+        ? translate(locale, cell.hintKey)
+        : translate(locale, cell.hintKey, { keys: keys.join(translate(locale, 'mcp.listSeparator')) }),
   }
 }
 
@@ -374,7 +396,7 @@ export function canAppendTemplateRow(rows: readonly TemplateRowDraft[]): boolean
  * 用户在 `key` 里敲了空格时就该当场看到提示，而不是等提交后由后端裁完再报）。
  * `rowId` 的还原按**下标**：`validateCredentialSchema` 给的 path 首段就是数组下标。
  */
-export function templateRowIssues(rows: readonly TemplateRowDraft[]): TemplateRowIssue[] {
+export function templateRowIssues(rows: readonly TemplateRowDraft[], locale: Locale): TemplateRowIssue[] {
   const result = validateCredentialSchema(templateRowsToSchema(rows))
   if (result.ok) return []
   return result.issues.map((issue) => {
@@ -384,7 +406,9 @@ export function templateRowIssues(rows: readonly TemplateRowDraft[]): TemplateRo
     return {
       rowId: row?.rowId ?? null,
       field: (field ?? null) as TemplateRowIssue['field'],
-      message: issue.message,
+      // `validateCredentialSchema` 从 P1-23 收尾 ②-6 起给的是 `@validation.*` key（`shared` 里零中文），
+      // 落译文只在这一处 —— 组件与守门脚本因此看到的是**当前语言**的正文。
+      message: validationText(locale, issue.message),
     }
   })
 }
@@ -526,35 +550,43 @@ export function buildServerUpdateBody(
  * `null`（本次没有需要提示的影响）⇒ 返回 `null`，**不编一句"没有影响"**：
  * 那会让"改了个名字"这种零影响的操作也弹一条提示。
  */
-export function credentialImpactHint(impact: CredentialSchemaImpact | null): string | null {
+export function credentialImpactHint(impact: CredentialSchemaImpact | null, locale: Locale): string | null {
   if (impact === null) return null
+  const join = (keys: readonly string[]): string => keys.join(translate(locale, 'mcp.listSeparator'))
   const parts: string[] = []
   if (impact.removedKeys.length > 0) {
     const affected =
       impact.affectedCredentials > 0
-        ? `，已填的 ${impact.affectedCredentials} 份凭据里这些值将不再被注入`
-        : '，已填的值将不再被注入'
-    parts.push(`已移除的参数：${impact.removedKeys.join('、')}${affected}`)
+        ? translate(locale, 'mcp.impact.affectedFilled', { count: impact.affectedCredentials })
+        : translate(locale, 'mcp.impact.affectedBare')
+    parts.push(translate(locale, 'mcp.impact.removed', { keys: join(impact.removedKeys), affected }))
   }
   if (impact.retargetedKeys.length > 0) {
-    parts.push(`注入位置变了的参数：${impact.retargetedKeys.join('、')}（值不用重填）`)
+    parts.push(translate(locale, 'mcp.impact.retargeted', { keys: join(impact.retargetedKeys) }))
   }
   if (impact.addedKeys.length > 0) {
-    parts.push(`新增的参数：${impact.addedKeys.join('、')}（需要在「我的凭据」里填）`)
+    parts.push(translate(locale, 'mcp.impact.added', { keys: join(impact.addedKeys) }))
   }
   if (parts.length === 0) return null
-  return `${parts.join('；')}。**已填的值不会被自动清理**，如不再需要请到「我的凭据」里自行清除。`
+  return `${parts.join(translate(locale, 'mcp.impact.join'))}${translate(locale, 'mcp.impact.tail')}`
 }
 
 /** 连通用途之外的一处小读数：`name` / `endpointUrl` 的长度上限（提示文案与 `maxLength` 用） */
 export const SERVER_NAME_MAX = MCP_SERVER_NAME_MAX
 export const CREDENTIAL_KEY_MAX = MCP_CREDENTIAL_KEY_MAX
 
-/** 注入位置的中文标签（三处受控下拉共用；**不出现裸英文**） */
-export const INJECT_LOCATION_LABEL: Readonly<Record<CredentialInjectLocation, string>> = {
-  HEADER: '请求头（HEADER）',
-  QUERY: '查询参数（QUERY）',
-  BODY: '报文体（BODY）',
+/** 注入位置的中文标签 key（三处受控下拉共用；**不出现裸英文**；`translate(locale, ...)` 落译文） */
+export const INJECT_LOCATION_KEY: Readonly<Record<CredentialInjectLocation, MessageKey>> = {
+  HEADER: 'label.injectLocation.HEADER',
+  QUERY: 'label.injectLocation.QUERY',
+  BODY: 'label.injectLocation.BODY',
+}
+
+/** 注入位置随语言变体的短形（凭据页那一行说明用） */
+export const INJECT_HINT_KEY: Readonly<Record<CredentialInjectLocation, MessageKey>> = {
+  HEADER: 'label.injectHint.HEADER',
+  QUERY: 'label.injectHint.QUERY',
+  BODY: 'label.injectHint.BODY',
 }
 
 /** 注入位置的取值域（与 `shared` 同源，供下拉渲染；顺序即下拉顺序） */

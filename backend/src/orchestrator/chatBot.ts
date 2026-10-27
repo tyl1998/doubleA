@@ -74,7 +74,7 @@
  *    而是"这一轮结束了"，由 `awaitConfirm` 抛出 `ChatStoppedError` 交给收尾（见文件头 ①）。
  */
 
-import {
+import { appMsg,
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
   MCP_CALL_TOOL_TOOL_NAME,
@@ -196,7 +196,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
       { conversationId, agentId, inFlight: chatBotSlots.inFlight, limit: chatBotSlots.limit },
       'ChatBot 并发闸已满，本轮被拒（BUSY）',
     )
-    throw AppError.busy(`当前正在生成的对话已达上限（${chatBotSlots.limit}），请稍后重试`)
+    throw AppError.busy(appMsg('app.m064', { p0: chatBotSlots.limit }))
   }
 
   /**
@@ -281,7 +281,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
       // `user.role` 供 P1-13 的运行时可见性过滤（ADMIN 见全部组件）
       select: { userId: true, memoryExcluded: true, user: { select: { role: true } } },
     })
-    if (conversationRow === null) throw AppError.notFound('会话不存在')
+    if (conversationRow === null) throw AppError.notFound(appMsg('app.m001'))
     // 长期记忆 v2（P1-8a）：② USER 画像**常驻** + ③ AGENT 记忆**极简目录 TOC**（不含正文）；
     //    AGENT 记忆细节由 agent 按需调 `recall_memory`（见 `memoryTools.ts`）。两段在总开关关掉时为空。
     const memorySettings = await getMemorySettings(conversationRow.userId)
@@ -300,7 +300,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
       },
     })
     // 走到这里还查不到 = 软删与发消息的竞态（`assertConversationSendable` 已用 409 挡过一次）
-    if (agent === null) throw AppError.notFound('智能体不存在')
+    if (agent === null) throw AppError.notFound(appMsg('app.m000'))
     const kbIdsRaw = agent.components
       .filter((component) => component.componentType === 'KNOWLEDGE')
       .map((component) => component.refId)
@@ -507,7 +507,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
           select: { userId: true },
         })
         // 会话在流中途消失基本不可能（进门前 `assertConversationSendable` 已查过）
-        if (row === null) throw AppError.notFound('会话不存在')
+        if (row === null) throw AppError.notFound(appMsg('app.m001'))
         viewerUserId = row.userId
       }
       return { userId: viewerUserId }

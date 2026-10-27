@@ -47,7 +47,8 @@ import { Link, Outlet, useLocation } from 'react-router-dom'
 import { useCurrentUser } from '../api/auth.js'
 import { ConvRail } from '../features/chat/ConvRail.js'
 import { PageCrumbContext } from './crumbContext.js'
-import { crumbBaseForPath, matchNavItem, type CrumbSegment } from './nav.js'
+import { useT } from './i18n.js'
+import { crumbBaseForPath, matchNavItem } from './nav.js'
 import { conversationIdFromPath, isChatHomePath } from './paths.js'
 
 /**
@@ -57,11 +58,17 @@ import { conversationIdFromPath, isChatHomePath } from './paths.js'
  * （二级页用 `usePageCrumb` 上报）。有 `detail` 时前缀各段渲染成链接，否则末段即当前页。
  */
 function PageCrumb({ pathname, detail }: { pathname: string; detail: string | null }) {
+  const { t } = useT()
   const base = crumbBaseForPath(pathname)
-  const trail: CrumbSegment[] = detail === null ? base : [...base, { label: detail }]
+  // 静态前缀是 key（要翻译），细节段是运行时数据（原样渲染）⇒ 在这里就地取值，
+  // 让下面渲染逻辑保持"已成型字符串"的简单形态。
+  const trail: readonly { label: string; to?: string }[] =
+    detail === null
+      ? base.map((segment) => ({ label: t(segment.labelKey), to: segment.to }))
+      : [...base.map((segment) => ({ label: t(segment.labelKey), to: segment.to })), { label: detail }]
 
   return (
-    <nav className="crumb" aria-label="面包屑">
+    <nav className="crumb" aria-label={t('shell.crumbAria')}>
       {trail.map((segment, index) => {
         const last = index === trail.length - 1
         return (
@@ -84,6 +91,7 @@ function PageCrumb({ pathname, detail }: { pathname: string; detail: string | nu
 }
 
 export function AppShell() {
+  const { t } = useT()
   const location = useLocation()
   // 本组件只挂在 RequireAuth 里面 ⇒ 这里 `data` 必然是已登录用户
   const { data: user } = useCurrentUser()
@@ -116,9 +124,9 @@ export function AppShell() {
             onClick={() => {
               setRailHidden((value) => !value)
             }}
-            aria-label={railHidden ? '展开会话栏' : '收起会话栏'}
+            aria-label={railHidden ? t('shell.railExpand') : t('shell.railCollapse')}
             aria-expanded={!railHidden}
-            title={railHidden ? '展开会话栏' : '收起会话栏'}
+            title={railHidden ? t('shell.railExpand') : t('shell.railCollapse')}
           >
             {railHidden ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
           </button>
@@ -132,7 +140,10 @@ export function AppShell() {
                 <PageCrumb pathname={pathname} detail={crumbDetail} />
               </header>
               {/* 页面组件不再自带 `.page` 包裹 —— 留白与地标只在这里定义一次 */}
-              <main className="page" aria-label={current?.label ?? '工作台'}>
+              <main
+                className="page"
+                aria-label={current === undefined ? t('nav.workspace') : t(current.labelKey)}
+              >
                 <div className="page__body">
                   <Outlet />
                 </div>

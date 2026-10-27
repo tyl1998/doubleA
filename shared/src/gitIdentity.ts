@@ -14,6 +14,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 /** git `user.name` 上限（与 `users.git_name` 列宽一致） */
 export const GIT_IDENTITY_NAME_MAX = 128
 /** git `user.email` 上限（与 `users.git_email` 列宽一致） */
@@ -35,14 +37,23 @@ export type GitIdentity = z.infer<typeof gitIdentitySchema>
 const gitEmailField = z
   .string()
   .trim()
-  .max(GIT_IDENTITY_EMAIL_MAX, `git 邮箱最多 ${GIT_IDENTITY_EMAIL_MAX} 个字符`)
-  .refine((value) => value === '' || /^[^\s@]+@[^\s@]+$/u.test(value), '邮箱格式不正确（应形如 name@example.com）')
+  .max(
+    GIT_IDENTITY_EMAIL_MAX,
+    validationMessage('validation.gitIdentity.emailTooLong', { max: GIT_IDENTITY_EMAIL_MAX }),
+  )
+  .refine(
+    (value) => value === '' || /^[^\s@]+@[^\s@]+$/u.test(value),
+    validationMessage('validation.gitIdentity.emailInvalid'),
+  )
   .nullable()
 
 const gitNameField = z
   .string()
   .trim()
-  .max(GIT_IDENTITY_NAME_MAX, `git 名字最多 ${GIT_IDENTITY_NAME_MAX} 个字符`)
+  .max(
+    GIT_IDENTITY_NAME_MAX,
+    validationMessage('validation.gitIdentity.nameTooLong', { max: GIT_IDENTITY_NAME_MAX }),
+  )
   .nullable()
 
 /**
@@ -55,7 +66,7 @@ export const updateGitIdentityBodySchema = z
     email: gitEmailField.optional(),
   })
   .refine((body) => body.name !== undefined || body.email !== undefined, {
-    message: '至少要提供 name 或 email 之一',
+    message: validationMessage('validation.gitIdentity.atLeastOne'),
   })
 export type UpdateGitIdentityBody = z.infer<typeof updateGitIdentityBodySchema>
 

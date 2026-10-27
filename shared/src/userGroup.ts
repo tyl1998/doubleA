@@ -23,20 +23,27 @@
 import { z } from 'zod'
 
 import { offsetPageOf } from './envelope.js'
+import { validationMessage } from './i18n/validation.js'
 
 export const USER_GROUP_NAME_MAX_CHARS = 64
 export const USER_GROUP_DESCRIPTION_MAX_CHARS = 500
 
 const groupNameSchema = z
-  .string({ required_error: '请输入组名' })
+  .string({ required_error: validationMessage('validation.userGroup.nameRequired') })
   .trim()
-  .min(1, '请输入组名')
-  .max(USER_GROUP_NAME_MAX_CHARS, `组名最多 ${USER_GROUP_NAME_MAX_CHARS} 个字符`)
+  .min(1, validationMessage('validation.userGroup.nameRequired'))
+  .max(
+    USER_GROUP_NAME_MAX_CHARS,
+    validationMessage('validation.userGroup.nameTooLong', { max: USER_GROUP_NAME_MAX_CHARS }),
+  )
 
 const groupDescriptionSchema = z
   .string()
   .trim()
-  .max(USER_GROUP_DESCRIPTION_MAX_CHARS, `描述最多 ${USER_GROUP_DESCRIPTION_MAX_CHARS} 个字符`)
+  .max(
+    USER_GROUP_DESCRIPTION_MAX_CHARS,
+    validationMessage('validation.userGroup.descriptionTooLong', { max: USER_GROUP_DESCRIPTION_MAX_CHARS }),
+  )
 
 /** 列表项：组 + 成员数（不含成员明细，列表页据此显示"N 人"） */
 export const userGroupItemSchema = z.object({
@@ -66,8 +73,13 @@ export type UserGroupDetail = z.infer<typeof userGroupDetailSchema>
 // ───────────────────────────── 列表 ─────────────────────────────
 
 export const listUserGroupsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListUserGroupsQuery = z.infer<typeof listUserGroupsQuerySchema>
 
@@ -93,7 +105,7 @@ export const updateUserGroupBodySchema = z
     description: groupDescriptionSchema.nullable().optional(),
   })
   .refine((body) => body.name !== undefined || body.description !== undefined, {
-    message: '至少要提供一个要修改的字段',
+    message: validationMessage('validation.common.atLeastOneField'),
   })
 export type UpdateUserGroupBody = z.infer<typeof updateUserGroupBodySchema>
 
@@ -103,15 +115,15 @@ export type UpdateUserGroupBody = z.infer<typeof updateUserGroupBodySchema>
  * 服务层用 `Set` 去重并校验每个用户存在。
  */
 export const replaceUserGroupMembersBodySchema = z.object({
-  userIds: z.array(z.string().uuid('成员用户 ID 不是合法 UUID'), {
-    required_error: '请提供 userIds（全量替换；要清空请传空数组）',
-    invalid_type_error: 'userIds 必须是数组',
+  userIds: z.array(z.string().uuid(validationMessage('validation.userGroup.memberIdNotUuid')), {
+    required_error: validationMessage('validation.userGroup.userIdsRequired'),
+    invalid_type_error: validationMessage('validation.userGroup.userIdsNotArray'),
   }),
 })
 export type ReplaceUserGroupMembersBody = z.infer<typeof replaceUserGroupMembersBodySchema>
 
 /** 路径参数 */
 export const userGroupIdParamsSchema = z.object({
-  id: z.string().uuid('用户组 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.userGroup.idNotUuid')),
 })
 export type UserGroupIdParams = z.infer<typeof userGroupIdParamsSchema>

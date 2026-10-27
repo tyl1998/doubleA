@@ -38,6 +38,8 @@
 
 import type { AgentType, ArtifactItem, ArtifactListItem } from '@doubulea/shared'
 
+import { translate, type Locale } from '@doubulea/shared'
+
 import { describeConversationTime } from './conversationList.js'
 
 /** 面板里的一条产物 = 卡片那一份形状 + "什么时候产出的" */
@@ -48,20 +50,24 @@ export interface ArtifactPanelItem extends ArtifactItem {
   live: boolean
 }
 
-/** 面板标题那一格（`design/chat.html` 的 `产物 · 3`） */
-export const ARTIFACT_PANEL_TITLE = '产物'
+/**
+ * 面板上的三处固定文案 —— P1-23 起改为 **i18n key**（原为中文常量）。
+ *
+ * 取值都在组件里 `useT()`；本文件不再持有任何用户可见文案字面量。
+ * 标注各 key 的语义（原来是常量名，现在是 key 名）：
+ *   · `ARTIFACT_PANEL_TITLE` → `artifact.panelTitle`（`design/chat.html` 的 `产物 · 3`）；
+ *   · `ARTIFACT_PANEL_EMPTY` → `artifact.panelEmpty`（不是错误态，是新会话的常态）；
+ *   · `ARTIFACT_PANEL_NOTE` → `artifact.panelNote`（`design/chat.html` 的 `.alert--info`）。
+ */
+export const ARTIFACT_PANEL_TITLE = 'artifact.panelTitle' as const
+export const ARTIFACT_PANEL_EMPTY = 'artifact.panelEmpty' as const
+export const ARTIFACT_PANEL_NOTE = 'artifact.panelNote' as const
 
-/** 还没有产物时面板里说的那句（不是错误态，是新会话的常态） */
-export const ARTIFACT_PANEL_EMPTY = '这个会话还没有产出文件。TaskAgent 在沙箱里生成的文件会列在这里。'
+/** `createdAt` 缺失时的读数 key（这一轮刚产出，还没有落库时刻） */
+export const ARTIFACT_TIME_JUST = 'artifact.timeJust' as const
 
-/** 面板底部那句常驻说明（`design/chat.html` 的 `.alert--info`） */
-export const ARTIFACT_PANEL_NOTE = '产物保存在沙箱工作目录，空闲回收后仍可从对象存储下载。'
-
-/** `createdAt` 缺失时的读数（这一轮刚产出，还没有落库时刻） */
-export const ARTIFACT_TIME_JUST = '刚生成'
-
-/** `createdAt` 存在但解析不出来时的读数 —— 与"还没有"区分开，不拿别的话冒充 */
-export const ARTIFACT_TIME_UNKNOWN = '时间未知'
+/** `createdAt` 存在但解析不出来时的读数 key —— 与"还没有"区分开，不拿别的话冒充 */
+export const ARTIFACT_TIME_UNKNOWN = 'artifact.timeUnknown' as const
 
 /**
  * 面板要不要出现：**只有 TaskAgent 有**（`03` §4.1 的"TaskAgent 差异"）。
@@ -132,11 +138,11 @@ export function mergeArtifactPanelItems(
  *   · `null`（流式、还没落库）⇒ 「刚生成」；
  *   · 解析不出时刻 ⇒ 「时间未知」（那一格是给用户看的，填"还没有消息"是句假话）。
  */
-export function artifactTimeText(createdAt: string | null, now: Date): string {
-  if (createdAt === null) return ARTIFACT_TIME_JUST
+export function artifactTimeText(createdAt: string | null, now: Date, locale: Locale): string {
+  if (createdAt === null) return translate(locale, ARTIFACT_TIME_JUST)
   const at = new Date(createdAt)
-  if (Number.isNaN(at.getTime())) return ARTIFACT_TIME_UNKNOWN
-  return describeConversationTime(createdAt, now)
+  if (Number.isNaN(at.getTime())) return translate(locale, ARTIFACT_TIME_UNKNOWN)
+  return describeConversationTime(createdAt, now, locale)
 }
 
 /**
@@ -146,7 +152,11 @@ export function artifactTimeText(createdAt: string | null, now: Date): string {
  * 拿它当"共 N 个"会在超过一页时说谎（"`共 100 个`"其实还有第 101 个）。
  * `total` 拿不到（`undefined`）⇒ 什么都不说，而不是编一个数。
  */
-export function artifactPanelOverflowNote(shown: number, total: number | undefined): string | null {
+export function artifactPanelOverflowNote(
+  shown: number,
+  total: number | undefined,
+  locale: Locale,
+): string | null {
   if (total === undefined || total <= shown) return null
-  return `仅显示最近 ${shown} 个（共 ${total} 个）`
+  return translate(locale, 'artifact.panelOverflow', { shown, total })
 }

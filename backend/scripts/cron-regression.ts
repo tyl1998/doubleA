@@ -41,6 +41,10 @@ function eq(actual: unknown, expected: unknown, label: string): void {
   const b = JSON.stringify(expected)
   assert(a === b, `${label}：期望 ${b}，实际 ${a}`)
 }
+/** 英文描述里不许出现汉字（漏传 locale 的症状；`describeCron` 末批前恒返回中文） */
+function assertNoCjk(value: string | null, label: string): void {
+  assert(value !== null && !/[\u4e00-\u9fff]/.test(value), `${label}：en 描述里还有中文 → ${String(value)}`)
+}
 
 /** 本地时刻（与 `nextCronRun` 同一口径：本地时区） */
 const at = (y: number, mo: number, d: number, h = 0, mi = 0) => new Date(y, mo - 1, d, h, mi, 0, 0)
@@ -116,18 +120,26 @@ it('★ D4 永不成立（2 月 30 日）⇒ null', () => {
 })
 
 console.log('── E 人类描述与多次预览 ──')
-it('E1 常见形状给一句话', () => {
-  eq(describeCron('* * * * *'), '每分钟', '每分钟')
-  eq(describeCron('*/15 * * * *'), '每 15 分钟', '每 15 分钟')
-  eq(describeCron('0 * * * *'), '每小时的 00 分', '每小时')
-  eq(describeCron('0 9 * * *'), '每天 09:00', '每天')
-  eq(describeCron('0 9 * * 1'), '每周一 09:00', '每周一')
-  eq(describeCron('0 18 * * 1-5'), '工作日 18:00', '工作日')
-  eq(describeCron('0 0 1 * *'), '每月 1 日 00:00', '每月')
+it('E1 常见形状给一句话（zh；P1-23 末批起 `describeCron` 多收 locale）', () => {
+  eq(describeCron('* * * * *', 'zh'), '每分钟', '每分钟')
+  eq(describeCron('*/15 * * * *', 'zh'), '每 15 分钟', '每 15 分钟')
+  eq(describeCron('0 * * * *', 'zh'), '每小时的 00 分', '每小时')
+  eq(describeCron('0 9 * * *', 'zh'), '每天 09:00', '每天')
+  eq(describeCron('0 9 * * 1', 'zh'), '每周一 09:00', '每周一')
+  eq(describeCron('0 18 * * 1-5', 'zh'), '工作日 18:00', '工作日')
+  eq(describeCron('0 0 1 * *', 'zh'), '每月 1 日 00:00', '每月')
+})
+it('E1b 同一个表达式在 en 下给英文（末批之前这里恒为中文）', () => {
+  eq(describeCron('* * * * *', 'en'), 'Every minute', 'everyMinute')
+  eq(describeCron('*/15 * * * *', 'en'), 'Every 15 minutes', 'everyNMinutes')
+  eq(describeCron('0 9 * * 1', 'en'), 'Every Mon at 09:00', 'weeklyAt')
+  eq(describeCron('0 0 1 * *', 'en'), 'Monthly on day 1 at 00:00', 'monthlyAt')
+  // 反证：en 下不许再落回中文（漏接 locale 的症状就是这一条）
+  assertNoCjk(describeCron('0 9 * * *', 'en'), 'dailyAt')
 })
 it('E2 复杂形状 ⇒ null（认不出就不硬描述）', () => {
-  eq(describeCron('0 9,18 * * *'), null, '多值')
-  eq(describeCron('0 9 1,15 * *'), null, '多日')
+  eq(describeCron('0 9,18 * * *', 'zh'), null, '多值')
+  eq(describeCron('0 9 1,15 * *', 'zh'), null, '多日')
 })
 it('E3 `nextCronRuns` 连算 N 次（本地时区）', () => {
   const runs = nextCronRuns('0 9 * * *', 3, at(2026, 10, 9, 0, 0))

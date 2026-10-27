@@ -7,6 +7,8 @@
  * 施工纪律第 5 条（`06` §六）：schema / 类型定义在 `shared/`，前后端共用。
  */
 
+import { isAppMessage, type AppMessage, type AppMessagePayload } from './i18n/appMessage.js'
+
 /** 错误码字面量全集（前后端唯一事实来源，不在别处重复定义字符串） */
 export const ERROR_CODES = [
   /** 400 — 请求参数校验失败 */
@@ -81,46 +83,68 @@ export class AppError extends Error {
   readonly status: number
   /** 附加信息（如锁定倒计时秒数、缺失字段清单）—— 序列化进信封 `data` */
   readonly data: unknown
+  /**
+   * 细节消息的**结构化形态**（P1-23 收尾 ⑤）—— 随信封与 SSE 一起下发。
+   *
+   * `null` = 这条消息没有 key（默认文案 / 老代码路径）⇒ 前端退回 `message`。
+   * 用 `appMsg(...)` 构造的消息会有它，见 `shared/src/i18n/appMessage.ts`。
+   */
+  readonly msgKey: AppMessagePayload | null
 
-  constructor(code: ErrorCode, message?: string, data?: unknown) {
-    super(message ?? DEFAULT_MESSAGE_BY_ERROR_CODE[code])
+  constructor(code: ErrorCode, message?: string | AppMessage, data?: unknown) {
+    // `appMsg(...)` 传进来时：`message` 用它构造期渲染好的中文正文（与改写前逐字一致），
+    // key 单独存 —— 于是日志 / `documents.error_msg` / zh 界面全都零变化。
+    const structured = isAppMessage(message) ? message : null
+    const text =
+      structured !== null
+        ? structured.text
+        : typeof message === 'string'
+          ? message
+          : DEFAULT_MESSAGE_BY_ERROR_CODE[code]
+    super(text)
     this.name = 'AppError'
     this.code = code
     this.status = HTTP_STATUS_BY_ERROR_CODE[code]
     this.data = data
+    this.msgKey =
+      structured === null
+        ? null
+        : structured.params === undefined
+          ? { key: structured.key }
+          : { key: structured.key, params: structured.params }
   }
 
-  static validation(message?: string, data?: unknown): AppError {
+  static validation(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('VALIDATION', message, data)
   }
-  static unauthorized(message?: string, data?: unknown): AppError {
+  static unauthorized(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('UNAUTHORIZED', message, data)
   }
-  static forbidden(message?: string, data?: unknown): AppError {
+  static forbidden(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('FORBIDDEN', message, data)
   }
-  static notFound(message?: string, data?: unknown): AppError {
+  static notFound(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('NOT_FOUND', message, data)
   }
-  static conflict(message?: string, data?: unknown): AppError {
+  static conflict(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('CONFLICT', message, data)
   }
-  static unprocessable(message?: string, data?: unknown): AppError {
+  static unprocessable(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('UNPROCESSABLE', message, data)
   }
-  static busy(message?: string, data?: unknown): AppError {
+  static busy(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('BUSY', message, data)
   }
-  static needCredential(message?: string, data?: unknown): AppError {
+  static needCredential(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('NEED_CREDENTIAL', message, data)
   }
-  static upstreamError(message?: string, data?: unknown): AppError {
+  static upstreamError(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('UPSTREAM_ERROR', message, data)
   }
-  static upstreamTimeout(message?: string, data?: unknown): AppError {
+  static upstreamTimeout(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('UPSTREAM_TIMEOUT', message, data)
   }
-  static internal(message?: string, data?: unknown): AppError {
+  static internal(message?: string | AppMessage, data?: unknown): AppError {
     return new AppError('INTERNAL', message, data)
   }
 }

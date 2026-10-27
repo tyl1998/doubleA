@@ -38,11 +38,13 @@
  */
 
 import {
-  CONVERSATION_UNTITLED_HINT,
   CONVERSATION_TOPIC_MAX_CHARS,
   isConversationReadOnly,
+  translate,
   type AgentType,
   type ConversationItem,
+  type Locale,
+  type MessageKey,
 } from '@doubulea/shared'
 
 /** 侧栏一行的视图（组件只把它画出来，不再做任何判断） */
@@ -52,7 +54,7 @@ export interface ConversationListItemView {
   title: string
   /** 状态灯：`run` 正在生成 / `warn` 只读保留 / `idle` 正常 */
   led: 'run' | 'warn' | 'idle'
-  /** 状态文案（与 `led` 是"色 + 字"两重表达，`composerState` 同款：只靠颜色不可访问） */
+  /** 状态文案（已按当前语言译好；与 `led` 是"色 + 字"两重表达，`composerState` 同款） */
   state: string
   /** 时间读数（"2 分钟前" / "昨天 18:20" / "还没有消息"） */
   time: string
@@ -70,13 +72,19 @@ export interface ConversationListItemView {
 
 /** 一个分组标题 + 它的条目（顺序即渲染顺序） */
 export interface ConversationGroup {
+  /** **已译**的分组标题（`label.conversationGroup.*` 的译文）—— 组件直接渲染，不再判语言 */
   label: string
   items: ConversationListItemView[]
 }
 
-/** 两个分组标题（`design/chat.html` 的 `.sidebar__group` 只有这两个） */
-export const CONVERSATION_GROUP_TODAY = '今天'
-export const CONVERSATION_GROUP_EARLIER = '更早'
+/**
+ * 两个分组标题的 i18n key（`design/chat.html` 的 `.sidebar__group` 只有这两个）。
+ *
+ * P1-23：由"中文常量"改为 key —— 分组标题是**每屏都看得见**的读数，必须跟界面语言走；
+ * 取值由组件 `useT()` 完成（`ConversationGroup.label` 仍是已译字符串，见该接口注释）。
+ */
+export const CONVERSATION_GROUP_TODAY: MessageKey = 'label.conversationGroup.today'
+export const CONVERSATION_GROUP_EARLIER: MessageKey = 'label.conversationGroup.earlier'
 
 /** 一天的毫秒数（用于算"日历日差"，不是 24h 差 —— 见 {@link calendarDayDiff}） */
 const MS_PER_DAY = 86_400_000
@@ -120,20 +128,21 @@ function calendarDayDiff(now: Date, at: Date): number {
  * `shared` 文件头 ③；**不要**拿 `createdAt` 去冒充它 —— 那会把"刚建好还没说话"的会话
  * 显示成"3 分钟前"，而用户看不出这是两个不同的东西）。
  */
-export function describeConversationTime(lastMessageAt: string | null, now: Date): string {
-  if (lastMessageAt === null) return '还没有消息'
+export function describeConversationTime(lastMessageAt: string | null, now: Date, locale: Locale): string {
+  if (lastMessageAt === null) return translate(locale, 'sidebar.timeNoMessage')
   const at = new Date(lastMessageAt)
-  if (Number.isNaN(at.getTime())) return '还没有消息'
+  if (Number.isNaN(at.getTime())) return translate(locale, 'sidebar.timeNoMessage')
 
   const dayDiff = calendarDayDiff(now, at)
   if (dayDiff <= 0) {
     // `dayDiff < 0` = 服务端时间比本机快（时钟漂移）⇒ 当"刚刚"处理，不显示负数
     const minutes = Math.floor((now.getTime() - at.getTime()) / 60_000)
-    if (minutes < 1) return '刚刚'
-    if (minutes < 60) return `${minutes} 分钟前`
-    return `${Math.floor(minutes / 60)} 小时前`
+    if (minutes < 1) return translate(locale, 'sidebar.timeJustNow')
+    if (minutes < 60) return translate(locale, 'sidebar.timeMinutesAgo', { minutes })
+    return translate(locale, 'sidebar.timeHoursAgo', { hours: Math.floor(minutes / 60) })
   }
-  if (dayDiff === 1) return `昨天 ${hhmm(at)}`
+  // ⚠️ `MM-DD HH:mm`（更早那一档）是**仪器读数**，两语言同形，不译、不插值
+  if (dayDiff === 1) return translate(locale, 'sidebar.timeYesterday', { time: hhmm(at) })
   return `${mmddhhmm(at)}`
 }
 
@@ -150,19 +159,24 @@ export function conversationItemView(
   item: ConversationItem,
   now: Date,
   streamingIds: ReadonlySet<string>,
+  locale: Locale,
 ): ConversationListItemView {
-  const title = item.topic === null || item.topic.trim() === '' ? CONVERSATION_UNTITLED_HINT : item.topic
+  // ⚠️ 「新会话」的回落文案现在在字典里（`label.conversationUntitled`）—— 这个 `??` 仍是
+  //    **唯一**的回落点（组件里不许再写一次，否则改口径要全仓搜）。
+  const title =
+    item.topic === null || item.topic.trim() === '' ? translate(locale, 'label.conversationUntitled') : item.topic
   const snapshot = { agentId: item.agentId, agentName: item.agentName, agentType: item.agentType }
+  const time = describeConversationTime(item.lastMessageAt, now, locale)
 
   if (streamingIds.has(item.id)) {
-    return { id: item.id, title, led: 'run', state: '生成中', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
+    return { id: item.id, title, led: 'run', state: translate(locale, 'sidebar.stateStreaming'), time, ...snapshot }
   }
   if (isConversationReadOnly(item.status)) {
     // `FINISHED` 只由"Agent 被软删"产生 ⇒ 文案直接说结果，比"已结束"更可操作
     //（`docs/02` §4.4："会话转只读**保留**"）
-    return { id: item.id, title, led: 'warn', state: '只读保留', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
+    return { id: item.id, title, led: 'warn', state: translate(locale, 'sidebar.stateReadOnly'), time, ...snapshot }
   }
-  return { id: item.id, title, led: 'idle', state: '可继续', time: describeConversationTime(item.lastMessageAt, now), ...snapshot }
+  return { id: item.id, title, led: 'idle', state: translate(locale, 'sidebar.stateResumable'), time, ...snapshot }
 }
 
 /**
@@ -191,6 +205,7 @@ export function groupConversationViews(
    *
    * ⚠️ 判据必须逐字段比较（不能用引用比较）：`items` 来自网络，翻页 / 失效重取后是全新对象。
    */
+  locale: Locale,
   previous?: readonly ConversationGroup[],
 ): ConversationGroup[] {
   const today: ConversationListItemView[] = []
@@ -201,13 +216,15 @@ export function groupConversationViews(
     const at = new Date(reference)
     const isToday = Number.isNaN(at.getTime()) || calendarDayDiff(now, at) <= 0
     ;(isToday ? today : earlier).push(
-      reuseListItemView(conversationItemView(item, now, streamingIds), previous),
+      reuseListItemView(conversationItemView(item, now, streamingIds, locale), previous),
     )
   }
 
+  // ⚠️ 组标签取**已译**字符串：`reuseGroup` 的"逐项引用相同即复用上一组"判据是拿
+  //    `group.label` 对位的（见该函数），给 key 会让同一组在两种语言下拿到同一个标签。
   const groups: ConversationGroup[] = []
-  if (today.length > 0) groups.push(reuseGroup(CONVERSATION_GROUP_TODAY, today, previous))
-  if (earlier.length > 0) groups.push(reuseGroup(CONVERSATION_GROUP_EARLIER, earlier, previous))
+  if (today.length > 0) groups.push(reuseGroup(translate(locale, CONVERSATION_GROUP_TODAY), today, previous))
+  if (earlier.length > 0) groups.push(reuseGroup(translate(locale, CONVERSATION_GROUP_EARLIER), earlier, previous))
   // 整体没变 ⇒ 返回上一份（让 `useMemo` 的消费者也停在同一个引用上）
   if (previous !== undefined && sameGroups(groups, previous)) return previous as ConversationGroup[]
   return groups

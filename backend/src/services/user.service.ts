@@ -16,7 +16,7 @@
  *    `01` §五 门槛 4「停用账号 → 已登录会话 60s 内失效」就会变成"看运气"。
  */
 
-import {
+import { appMsg,
   AppError,
   normalizeUsername,
   type CreateUserBody,
@@ -125,7 +125,7 @@ export async function createUser(input: CreateUserBody): Promise<InitialPassword
   // 先查一次是为了给出"用户名已存在"这种可读结论；并发下仍可能撞唯一约束，
   // 故 create 也要接 P2002（两道都留，见下方 catch）。
   const existing = await db.user.findUnique({ where: { username }, select: { id: true } })
-  if (existing !== null) throw AppError.conflict(`用户名已存在：${username}`)
+  if (existing !== null) throw AppError.conflict(appMsg('app.m032', { p0: username }))
 
   const initialPassword = generateInitialPassword()
   let created
@@ -143,7 +143,7 @@ export async function createUser(input: CreateUserBody): Promise<InitialPassword
       select: USER_LIST_SELECT,
     })
   } catch (error) {
-    if (isUniqueViolation(error)) throw AppError.conflict(`用户名已存在：${username}`)
+    if (isUniqueViolation(error)) throw AppError.conflict(appMsg('app.m032', { p0: username }))
     throw error
   }
 
@@ -167,12 +167,12 @@ export async function updateUser(
   input: UpdateUserBody,
 ): Promise<UserListItem> {
   if (targetId === requesterId) {
-    throw AppError.conflict('不能修改自己的状态或角色（否则可能把自己锁在外面）')
+    throw AppError.conflict(appMsg('app.m229'))
   }
 
   const db = getPrisma()
   const target = await db.user.findUnique({ where: { id: targetId }, select: { id: true, username: true } })
-  if (target === null) throw AppError.notFound('用户不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m008'))
 
   let updated
   try {
@@ -187,7 +187,7 @@ export async function updateUser(
     })
   } catch (error) {
     // 极小的竞态窗口：查到了但更新前被删了（本系统不提供删用户，留作兜底）
-    if (isRecordNotFound(error)) throw AppError.notFound('用户不存在')
+    if (isRecordNotFound(error)) throw AppError.notFound(appMsg('app.m008'))
     throw error
   }
 
@@ -220,12 +220,12 @@ export async function resetUserPassword(
   if (targetId === requesterId) {
     // 与"不能停用自己"同源：重置自己的密码虽然不会锁死账号，但会在响应里显示一次新的初始密码，
     // 而本人本来就有 `/api/auth/password` 可以自助改密 —— 少一条可能把密码弄丢的路径。
-    throw AppError.conflict('不能重置自己的密码，请用「修改密码」自助改密')
+    throw AppError.conflict(appMsg('app.m230'))
   }
 
   const db = getPrisma()
   const target = await db.user.findUnique({ where: { id: targetId }, select: { id: true, username: true } })
-  if (target === null) throw AppError.notFound('用户不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m008'))
 
   const initialPassword = generateInitialPassword()
   let updated
@@ -236,7 +236,7 @@ export async function resetUserPassword(
       select: USER_LIST_SELECT,
     })
   } catch (error) {
-    if (isRecordNotFound(error)) throw AppError.notFound('用户不存在')
+    if (isRecordNotFound(error)) throw AppError.notFound(appMsg('app.m008'))
     throw error
   }
 

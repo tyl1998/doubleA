@@ -145,7 +145,7 @@ function stripComments(source) {
 
 // ───────────────────────────── 被测对象 ─────────────────────────────
 
-const { MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES, CREDENTIAL_INJECT_LOCATIONS } = await import('@doubulea/shared')
+const { MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES, CREDENTIAL_INJECT_LOCATIONS, translate } = await import('@doubulea/shared')
 
 const {
   appendTemplateRow,
@@ -153,10 +153,11 @@ const {
   buildCredentialSubmitValues,
   buildServerUpdateBody,
   canAppendTemplateRow,
-  credentialCell,
+  credentialCell: credentialCellRaw,
+  credentialCellText,
   credentialDraftsFromFields,
   credentialGroupAnchorId,
-  credentialImpactHint,
+  credentialImpactHint: credentialImpactHintRaw,
   emptyServerFormDraft,
   formatToolCount,
   formLevelTemplateIssues,
@@ -176,14 +177,31 @@ const {
   unconfiguredCount,
   updateTemplateRow,
   INJECT_LOCATIONS,
-  INJECT_LOCATION_LABEL,
+  INJECT_LOCATION_KEY,
 } = await import('../src/pages/mcp/mcpModel.ts')
 
-const { confirmCountdownText, confirmAnsweredText, confirmIgnoredNote, confirmSourceHint, remainingSeconds } =
+const { confirmCountdownText: confirmCountdownTextRaw, confirmAnsweredText: confirmAnsweredTextRaw, confirmIgnoredNote: confirmIgnoredNoteRaw, confirmSourceHint: confirmSourceHintRaw, remainingSeconds } =
   await import('../src/features/chat/confirmModel.ts')
 
-const { canConfigureCredential, errorCodeLabel, messageToView, toolErrorHint, toolViewFromEvent } = await import(
+// P1-23：6c 起这些纯函数多收一个 `locale`（译文搬去 `shared/src/i18n`）。本档统一用 `'zh'`
+// 断言 —— 中文形态逐字未变，这里只多喂一个参数（同 6a/6b 的做法）。
+const ZH = 'zh'
+const confirmCountdownText = (remaining) => confirmCountdownTextRaw(remaining, ZH)
+const confirmAnsweredText = (accepted) => confirmAnsweredTextRaw(accepted, ZH)
+const confirmIgnoredNote = (applied) => confirmIgnoredNoteRaw(applied, ZH)
+const confirmSourceHint = (source) => confirmSourceHintRaw(source, ZH)
+
+const { canConfigureCredential, errorCodeLabel, messageToView, toolErrorHint: toolErrorHintRaw, toolViewFromEvent } = await import(
   '../src/features/chat/messageModel.ts'
+)
+const toolErrorHint = (code) => toolErrorHintRaw(code, ZH)
+
+// P1-23 第八批：`mcpModel` 的展示口径同样迁到 key（`labelKey`/`hintKey`），纯函数档断言按 zh 落译文。
+const credentialCell = (item) => credentialCellRaw(item)
+const credentialCellZh = (item) => credentialCellText(credentialCellRaw(item), ZH)
+const credentialImpactHint = (impact) => credentialImpactHintRaw(impact, ZH)
+const INJECT_LOCATION_LABEL = Object.fromEntries(
+  Object.entries(INJECT_LOCATION_KEY).map(([key, messageKey]) => [key, translate(ZH, messageKey)]),
 )
 
 // ───────────────────────────── 夹具 ─────────────────────────────
@@ -326,7 +344,8 @@ await it('B2 凭据页分组顺序：**未配置的置顶**，组内保持服务
 
 await it('B3 表格里那一格的三种读数（无需凭据 / 已配置 / 未配置）', () => {
   assertEqual(credentialCell(credItem('s', true, { fields: [] })).kind, 'none', '模板为空 ⇒ 无需凭据')
-  assertEqual(credentialCell(credItem('s', true, { fields: [] })).label, '无需凭据', '文案固定')
+  // P1-23 第八批：`label`/`hint` 改成 `labelKey`/`hintKey` ⇒ 断言按 zh 落译文（`credentialCellText`）
+  assertEqual(credentialCellZh(credItem('s', true, { fields: [] })).label, '无需凭据', '文案固定')
   assertEqual(credentialCell(credItem('s', true)).kind, 'configured', '必填都有值 ⇒ 已配置')
   const missing = credentialCell(credItem('s', false))
   assertEqual(missing.kind, 'missing', '缺值 ⇒ 未配置')
@@ -336,7 +355,7 @@ await it('B3 表格里那一格的三种读数（无需凭据 / 已配置 / 未�
 await it('B4 清单还没读到 ⇒ 「未知」而**不是**「未配置」（说不出来的事不冒充结论）', () => {
   const unknown = credentialCell(undefined)
   assertEqual(unknown.kind, 'none', '中性那一档')
-  assertEqual(unknown.label, '未知', '不能显示成「未配置」—— 那会是一批假警报')
+  assertEqual(credentialCellZh(undefined).label, '未知', '不能显示成「未配置」—— 那会是一批假警报')
 })
 
 // ═════════════════════════════ C 组：?serverId= 定位 ═════════════════════════════
@@ -396,40 +415,40 @@ await it('D3 注入位置的取值域与标签都来自 `shared`（**受控下�
 await it('D4 HEADER 名撞平台保留头 / 或不是合法头名 ⇒ 都报在**那一行的 key 上**（与后端同一条语义规则）', () => {
   // ① 撞保留头：`accept` 在 `MCP_RESERVED_HEADER_NAMES` 里（**小写比较** —— 头名不区分大小写）
   //    ⚠️ 别拿 `Authorization` 当反例：它**不在**保留名单里、也是合法头名 ⇒ 什么都不报
-  const reserved = templateRowIssues([row('r1', 'Accept', 'Token', 'HEADER')])
+  const reserved = templateRowIssues([row('r1', 'Accept', 'Token', 'HEADER')], 'zh')
   assertEqual(reserved.length, 1, '大写的 `Accept` 也要拦下（按小写比较）')
   assertEqual(reserved[0].rowId, 'r1', '定位到那一行')
   assertEqual(reserved[0].field, 'key', '定位到 `key` 那一列')
   assertIncludes(keyIssueFor(reserved, 'r1'), 'Accept', '文案里要点出是哪个名字')
   // ② 合法但**不是合法 HTTP 头名**（含空格）⇒ 走的是另一条分支，文案说的是原因
-  const malformed = templateRowIssues([row('r1', 'X-User Token', 'Token', 'HEADER')])
+  const malformed = templateRowIssues([row('r1', 'X-User Token', 'Token', 'HEADER')], 'zh')
   assertEqual(malformed.length, 1, '含空格的伪头名也要拦下')
   assertEqual(malformed[0].field, 'key', '同样报在 key 上')
   assertIncludes(keyIssueFor(malformed, 'r1'), '空格', '文案要点出是哪一类问题')
   // ③ 对照：真的合法的头名 ⇒ 一条都不报（否则上面两条断言只是在证明"什么都拦"）
-  assertDeepEqual(templateRowIssues([row('r1', 'Authorization', 'Token', 'HEADER')]), [], 'Authorization 是合法的')
+  assertDeepEqual(templateRowIssues([row('r1', 'Authorization', 'Token', 'HEADER')], 'zh'), [], 'Authorization 是合法的')
 })
 
 await it('D5 QUERY 名不能含 `&`/`=`、BODY 名不能撞 JSON-RPC 保留键', () => {
-  const query = templateRowIssues([row('r1', 'a=b', 'X', 'QUERY')])
+  const query = templateRowIssues([row('r1', 'a=b', 'X', 'QUERY')], 'zh')
   assertEqual(query.length, 1, '`=` 被拦下')
   assertEqual(query[0].field, 'key', '报在 key 上')
-  const body = templateRowIssues([row('r1', 'method', 'X', 'BODY')])
+  const body = templateRowIssues([row('r1', 'method', 'X', 'BODY')], 'zh')
   assertEqual(body.length, 1, '`method` 是 JSON-RPC 保留键')
   // 同款名字放在 HEADER 里是合法的（判据**按注入位置分**，不是一刀切）
-  assertDeepEqual(templateRowIssues([row('r1', 'method', 'X', 'HEADER')]), [], 'HEADER 里 `method` 合法')
+  assertDeepEqual(templateRowIssues([row('r1', 'method', 'X', 'HEADER')], 'zh'), [], 'HEADER 里 `method` 合法')
 })
 
 await it('D6 同一模板内重名 ⇒ 报在后出现的那一行，并点名**第几个**', () => {
   const rows = [row('r1', 'token', 'T', 'HEADER'), row('r2', 'token', 'Again', 'HEADER')]
-  const issues = templateRowIssues(rows)
+  const issues = templateRowIssues(rows, 'zh')
   assertEqual(issues.length, 1, '只报一条（别把两行都标红）')
   assertEqual(issues[0].rowId, 'r2', '报在后一行')
   assertIncludes(issues[0].message, '第 1 个', '要说出与第几个重复')
 })
 
 await it('D7 空 `key` / 空 `label` ⇒ 逐字段报（`path` 精确到列）', () => {
-  const issues = templateRowIssues([row('r1', '', '', 'HEADER')])
+  const issues = templateRowIssues([row('r1', '', '', 'HEADER')], 'zh')
   const fields = issues.map((issue) => issue.field)
   assert(fields.includes('key'), 'key 必填')
   assert(fields.includes('label'), 'label 必填')
@@ -440,7 +459,7 @@ await it('D8 数量超限 ⇒ **没有归属到某一行**的错误（渲染在�
   const tooMany = Array.from({ length: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES + 1 }, (_, index) =>
     row(`r${index}`, `k${index}`, `L${index}`, 'HEADER'),
   )
-  const issues = templateRowIssues(tooMany)
+  const issues = templateRowIssues(tooMany, 'zh')
   assertEqual(formLevelTemplateIssues(issues).length, 1, '恰好一条表单级错误')
   assert(formLevelTemplateIssues(issues)[0].message.includes(String(MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES)), '文案要点出上限')
 })
@@ -633,9 +652,9 @@ await it('F2 连通状态三档：`UNKNOWN` 是「未测试」而**不是**「�
   assertEqual(serverStatusView('OK').led, 'ok', 'OK ⇒ 绿灯')
   assertEqual(serverStatusView('ERROR').led, 'fail', 'ECONN 失败 ⇒ 红灯')
   assertEqual(serverStatusView('UNKNOWN').led, 'idle', '没握过手 ⇒ 中性灯（**不是红灯**）')
-  assertEqual(serverStatusView('UNKNOWN').label, '未测试', '文案要说"没测过"而不是"有问题"')
+  assertEqual(translate(ZH, serverStatusView('UNKNOWN').labelKey), '未测试', '文案要说"没测过"而不是"有问题"')
   for (const status of ['OK', 'ERROR', 'UNKNOWN']) {
-    assert(serverStatusView(status).hint.length > 0, `${status} 要有悬浮说明`)
+    assert(translate(ZH, serverStatusView(status).hintKey).length > 0, `${status} 要有悬浮说明`)
   }
 })
 
@@ -918,7 +937,9 @@ await it('I9 「测试」按钮也归入 canEdit 门禁（2026-10-16：测试用
   const testAt = page.source.indexOf('testServer.mutate(')
   assert(canEditAt >= 0, 'canEdit 门禁必须存在')
   assert(testAt > canEditAt, '测试按钮要落在 `server.canEdit ? (` 之后（同门禁），不能无条件渲染')
-  assertIncludes(page.source, '测试 / 编辑 / 删除都需要', '无权限的说明要涵盖测试')
+  // P1-23 第八批：无权限说明搬进字典（组件用 key）⇒ 守门转向"组件用 key + 字典那句涵盖测试"。
+  assertIncludes(page.source, 'mcpServers.noEditPermTitle', '无权限的说明用 key')
+  assertIncludes(translate(ZH, 'mcpServers.noEditPermTitle'), '测试 / 编辑 / 删除都需要', '字典那句要涵盖测试')
 })
 
 // ───────────────────────────── 汇总 ─────────────────────────────

@@ -32,7 +32,7 @@
  * 嵌套表在 Word 里很少见，且退化后果只是"内层多出一个文本块"，不影响外层数据。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 import mammoth from 'mammoth'
 
 import { getLogger } from '../../infra/logger.js'
@@ -254,8 +254,7 @@ export async function parseDocx(
     // 走到这里基本只有一种原因：文件不是合法 OOXML（改名、损坏、或被截断）。
     // 魔数校验已在上传时拦过"不是 ZIP"，但"是 ZIP 却不是 docx"（如 xlsx 改名）仍会到这里，
     // 故文案要覆盖这种可能，而不是笼统的"解析失败"。
-    throw AppError.validation(
-      `无法解析 docx：文件不是有效的 Word 文档（可能已损坏，或被改名的其它格式）。${String(error)}`,
+    throw AppError.validation(appMsg('app.m075', { p0: String(error) }),
     )
   }
 

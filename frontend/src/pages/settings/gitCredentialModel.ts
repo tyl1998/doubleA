@@ -11,6 +11,7 @@ import type {
   CreateGitCredentialBody,
   GitCredentialItem,
   GitCredentialKind,
+  MessageKey,
   UpdateGitCredentialBody,
 } from '@doubulea/shared'
 
@@ -25,10 +26,17 @@ export interface GitCredentialFormValues {
   username?: string
 }
 
-/** 类型 → 中文读数 */
-export const GIT_CREDENTIAL_KIND_LABEL: Record<GitCredentialKind, string> = {
-  SSH_KEY: 'SSH 私钥',
-  HTTPS_TOKEN: 'HTTPS 令牌',
+/**
+ * 类型 → 读数 key（P1-23：**存 key 不存中文**）。
+ *
+ * ⚠️ 为什么不在这里再写一份中文（原 `GIT_CREDENTIAL_KIND_LABEL`）：这个文件是**无依赖自证**
+ * 的纯函数档（`verify-git-credentials-ui.mjs` 直接 import 它），若它同时承担文案，就会把
+ * "界面语言"这个关注点拖进一个本没有它的地方；且中文散在两处必然出现"改了字典漏了这里"。
+ * 取值交给调用方（`useT()`），本文件只负责"哪个 kind 对应哪条 key"这条判据。
+ */
+export const GIT_CREDENTIAL_KIND_KEY: Record<GitCredentialKind, MessageKey> = {
+  SSH_KEY: 'label.gitCredentialKind.ssh',
+  HTTPS_TOKEN: 'label.gitCredentialKind.httpsToken',
 }
 
 /** `host` 输入 → 契约值：空白 = `null`（不限） */

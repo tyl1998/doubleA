@@ -14,12 +14,16 @@
  */
 
 import {
+  SANDBOX_BUILD_PHASE_KEY,
   SANDBOX_BUILD_PHASE_LABELS,
-  SANDBOX_RUNTIME_COMPONENTS,
+  SANDBOX_RUNTIME_LANGUAGE_SPECS,
+  parseSandboxComponentId,
+  sandboxComponentId,
   sandboxComponentsArg,
-  sandboxComponentsFromVariantId,
-  sandboxVariantIdFromComponents,
+  sandboxSelectionFromVariantId,
+  sandboxVariantIdFromSelection,
   sandboxVariantLabel,
+  translate,
 } from '@doubulea/shared'
 
 import { interpretBuildLine, SANDBOX_BUILD_PHASE_ORDER } from '../src/sandbox/runtimeBuild.js'
@@ -66,6 +70,14 @@ it('每个阶段都有中文文案', () => {
     assert(typeof SANDBOX_BUILD_PHASE_LABELS[phase] === 'string' && SANDBOX_BUILD_PHASE_LABELS[phase] !== '', `缺 ${phase} 文案`)
   }
 })
+it('每个阶段的界面 key 都有，且 zh 译文与中文表逐字一致（同 `verify-i18n` G1 模式）', () => {
+  for (const phase of SANDBOX_BUILD_PHASE_ORDER) {
+    const key = SANDBOX_BUILD_PHASE_KEY[phase]
+    assert(typeof key === 'string' && key !== '', `缺 ${phase} 的 key`)
+    assertEqual(translate('zh', key), SANDBOX_BUILD_PHASE_LABELS[phase], `${phase} 的字典译文`)
+    assert(!/[\u4e00-\u9fff]/u.test(translate('en', key)), `${phase} 的 en 译文不该有汉字`)
+  }
+})
 
 // ───────────────────────── ② 行 → 进度/阶段 ─────────────────────────
 console.log('\n── ② interpretBuildLine（docker build 输出解析）──')
@@ -105,30 +117,59 @@ it('组件标记行给出人话细节', () => {
 })
 
 // ───────────────────────── ③ 变体规范化 ─────────────────────────
-console.log('\n── ③ 变体 id 规范化（组件集合）──')
+console.log('\n── ③ 变体 id 规范化（选择项集合）──')
 it('按语言顺序排序、- 连接', () => {
-  assertEqual(sandboxVariantIdFromComponents(['python310', 'node22']), 'node22-python310', 'node 在前')
+  assertEqual(
+    sandboxVariantIdFromSelection([
+      { language: 'python', version: '3.10' },
+      { language: 'node', version: '22' },
+    ]),
+    'node22-python3.10',
+    'node 在前（版本保留 `.`）',
+  )
 })
-it('空集合 = none；未知 id 丢弃', () => {
-  assertEqual(sandboxVariantIdFromComponents([]), 'none', '空')
-  assertEqual(sandboxVariantIdFromComponents(['bogus']), 'none', '全未知')
-  assertEqual(sandboxVariantIdFromComponents(['node22', 'bogus']), 'node22', '部分未知')
+it('空集合 = none；未知语言 / 非法版本丢弃', () => {
+  assertEqual(sandboxVariantIdFromSelection([]), 'none', '空')
+  assertEqual(sandboxVariantIdFromSelection([{ language: 'bogus', version: '1' }]), 'none', '全未知')
+  assertEqual(
+    sandboxVariantIdFromSelection([
+      { language: 'node', version: '22' },
+      { language: 'python', version: '3-10' },
+    ]),
+    'node22',
+    '含 `-` 的版本非法 ⇒ 丢弃',
+  )
 })
-it('变体 → 组件：含未知 ⇒ undefined', () => {
-  assertEqual(sandboxComponentsFromVariantId('node22-python310'), ['node22', 'python310'], '已知')
-  assertEqual(sandboxComponentsFromVariantId('none'), [], 'none')
-  assertEqual(sandboxComponentsFromVariantId('bogus'), undefined, '未知')
+it('变体 → 选择项：含未知片段 ⇒ undefined', () => {
+  assertEqual(sandboxSelectionFromVariantId('node22-python3.10'), [
+    { language: 'node', version: '22' },
+    { language: 'python', version: '3.10' },
+  ], '已知')
+  assertEqual(sandboxSelectionFromVariantId('none'), [], 'none')
+  assertEqual(sandboxSelectionFromVariantId('bogus'), undefined, '未知')
 })
 it('Dockerfile COMPONENTS 串：按语言顺序 lang=ver', () => {
-  assertEqual(sandboxComponentsArg(['python310', 'node22']), 'node=22,python=3.10', '参数串')
+  assertEqual(
+    sandboxComponentsArg([
+      { language: 'python', version: '3.10' },
+      { language: 'node', version: '22' },
+    ]),
+    'node=22,python=3.10',
+    '参数串',
+  )
 })
-it('变体显示名 = 组件 label 相加', () => {
-  assertEqual(sandboxVariantLabel('node22-python310'), 'Node.js 22 + Python 3.10', '显示名')
+it('变体显示名 = 语言名 + 版本相加', () => {
+  assertEqual(sandboxVariantLabel('node22-python3.10'), 'Node.js 22 + Python 3.10', '显示名')
   assertEqual(sandboxVariantLabel('none'), '无（仅基础工具）', '空')
 })
-it('组件目录里的 id 都能往返', () => {
-  for (const component of SANDBOX_RUNTIME_COMPONENTS) {
-    assertEqual(sandboxComponentsFromVariantId(component.id), [component.id], component.id)
+it('组件 id 与选择项往返（默认版本与候选版本都覆盖）', () => {
+  // 2026-10-15 起"组件目录"已删除（版本不再枚举）⇒ 用语言规格表推出 id 集合
+  for (const spec of SANDBOX_RUNTIME_LANGUAGE_SPECS) {
+    for (const version of [spec.defaultVersion, ...spec.suggestions]) {
+      const id = sandboxComponentId(spec.language, version)
+      assertEqual(parseSandboxComponentId(id), { language: spec.language, version }, id)
+      assertEqual(sandboxSelectionFromVariantId(id), [{ language: spec.language, version }], id)
+    }
   }
 })
 

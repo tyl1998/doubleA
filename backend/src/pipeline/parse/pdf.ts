@@ -29,7 +29,7 @@
  * `renderPageAsImage` 需要，本层不用）。原始像素由 `png.ts` 编成 PNG 再往下走。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 import { extractImages, extractText, getDocumentProxy } from 'unpdf'
 
 import { encodePngRaw } from './png.js'
@@ -116,7 +116,7 @@ export async function parsePdf(
   try {
     pdf = await getDocumentProxy(new Uint8Array(bytes))
   } catch (error) {
-    throw AppError.validation(`无法打开 PDF：文件已损坏或被加密（${String(error)}）`)
+    throw AppError.validation(appMsg('app.m079', { p0: String(error) }))
   }
 
   try {

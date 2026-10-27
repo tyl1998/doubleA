@@ -85,6 +85,8 @@ const {
   formatDurationMs,
   coverageText,
 } = await import('../src/pages/admin/usageModel.ts')
+const { translate } = await import('@doubulea/shared')
+const ZH = 'zh'
 
 /** 固定"此刻"（本地时区）：2026-08-13 15:30 —— 让区间断言可复现 */
 const NOW = new Date(2026, 7, 13, 15, 30, 0, 0)
@@ -114,7 +116,7 @@ await it('A3 近 7 天含今天：08-07 → 此刻', () => {
 await it('A4 预设齐全且本月默认（顺序即界面顺序）', () => {
   const presets = usageRangePresets(NOW)
   assertEqual(presets.map((preset) => preset.key).join(','), 'thisMonth,lastMonth,last7,last30', '预设键与顺序')
-  assertEqual(presets[0].label, '本月', '第一项是本月')
+  assertEqual(translate(ZH, presets[0].labelKey), '本月', '第一项是本月')
 })
 
 await it('A5 `dayStartIso` 按本地构造（不是 UTC 午夜）', () => {
@@ -159,15 +161,15 @@ await it('B2 记录数 / 轮次：千分位', () => {
 })
 
 await it('B3 时长：ms / s / 分秒三档', () => {
-  assertEqual(formatDurationMs(0), '0 ms', '0')
-  assertEqual(formatDurationMs(500), '500 ms', '< 1s')
-  assertEqual(formatDurationMs(1500), '1.5 s', '< 1min')
-  assertEqual(formatDurationMs(90_000), '1 分 30 秒', '>= 1min')
+  assertEqual(formatDurationMs(0, ZH), '0 ms', '0')
+  assertEqual(formatDurationMs(500, ZH), '500 ms', '< 1s')
+  assertEqual(formatDurationMs(1500, ZH), '1.5 s', '< 1min')
+  assertEqual(formatDurationMs(90_000, ZH), '1 分 30 秒', '>= 1min')
 })
 
 await it('B4 覆盖度：records=0 ⇒ `—`，否则 `x / y 条上报`', () => {
-  assertEqual(coverageText(0, 0), '—', '没有记录')
-  assertEqual(coverageText(3, 10), '3 / 10 条上报', '覆盖度读数')
+  assertEqual(coverageText(0, 0, ZH), '—', '没有记录')
+  assertEqual(coverageText(3, 10, ZH), '3 / 10 条上报', '覆盖度读数')
 })
 
 // ═════════════════════════ C 组：源码级守门 ═════════════════════════

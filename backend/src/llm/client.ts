@@ -61,7 +61,7 @@
  *    要的是**同一套**（§六.1 的差异收敛口径对 §八 同样成立）。本文件只留"对话协议"这一层。
  */
 
-import { AppError, type UpstreamProtocol } from '@doubulea/shared'
+import { appMsg, AppError, type UpstreamProtocol } from '@doubulea/shared'
 
 import { randomUUID } from 'node:crypto'
 
@@ -471,8 +471,7 @@ export async function chatStream(
     try {
       payload = JSON.parse(raw)
     } catch {
-      throw AppError.upstreamError(
-        `上游既不是 SSE 也不是 JSON（content-type=${contentType || '(空)'}）：${target.providerName}。响应：${snippet(raw, target.apiKey)}`,
+      throw AppError.upstreamError(appMsg('app.m034', { p0: contentType || '(空)', p1: target.providerName, p2: snippet(raw, target.apiKey) }),
       )
     }
     getLogger().warn(
@@ -504,7 +503,7 @@ export async function chatStream(
 
   const stream = response.body
   if (stream === null) {
-    throw AppError.upstreamError(`上游声明的流式响应没有 body：${target.providerName}`)
+    throw AppError.upstreamError(appMsg('app.m035', { p0: target.providerName }))
   }
 
   const state: StreamState = {
@@ -760,11 +759,15 @@ export async function fetchRemoteModels(
       (error as { data?: { upstreamStatus?: unknown } }).data?.upstreamStatus === 404
     ) {
       throw AppError.upstreamError(
-        `上游没有 ${protocol.modelsPath} 端点（HTTP 404）：${target.providerName}。` +
-          (protocol.id === 'ANTHROPIC_MESSAGES'
-            ? 'Anthropic Messages 协议下该端点同样要带 x-api-key（本平台已按协议带上）；' +
-              '若这是自建的兼容网关，请手工录入模型名。'
-            : '该实现可能不提供模型列表（不是所有 OpenAI 兼容实现都实现它），请手工录入模型名。'),
+        appMsg('app.m274', {
+          p0: protocol.modelsPath,
+          p1: target.providerName,
+          p2:
+            protocol.id === 'ANTHROPIC_MESSAGES'
+              ? 'Anthropic Messages 协议下该端点同样要带 x-api-key（本平台已按协议带上）；' +
+                '若这是自建的兼容网关，请手工录入模型名。'
+              : '该实现可能不提供模型列表（不是所有 OpenAI 兼容实现都实现它），请手工录入模型名。',
+        }),
         { upstreamStatus: 404 },
       )
     }

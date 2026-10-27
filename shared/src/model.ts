@@ -38,6 +38,7 @@
 import { z } from 'zod'
 
 import { offsetPageOf } from './envelope.js'
+import { validationMessage } from './i18n/validation.js'
 // 取值域定义在 `modelProvider.ts`（`MODEL_TYPES` / `PROVIDER_CREDENTIAL_MODES`）——
 // `models.type` 用的就是那个 `enum ModelType`（`schema.prisma`）。刻意**不再 re-export**
 // （`index.ts` 用 `export *`，同一个名字从两个模块出来会让"是否算歧义"取决于运行时实现）。
@@ -89,10 +90,14 @@ export const modelItemSchema = z.object({
   supportsReasoning: z.boolean(),
   enabled: z.boolean(),
   /**
-   * 有多少个 Agent 绑了这个模型（默认模型或模型池成员）。
-   * ⚠️ **只算在线（未软删）的 Agent**（`agents.deleted_at` 为空的）—— 删 Agent 会把 `model_id` 置空
-   * 自动解绑，与删除守卫的口径一致（`02` §4.3）。`agents.model_id` 是 `onDelete: SetNull`，但
-   * "在线的被悄悄解绑"体验很差 ⇒ `removeModel` 仍会 409 拦下。
+   * 有多少个 Agent 绑了这个模型（**默认模型 ∪ 模型池成员**，同一 Agent 只算一次）。
+   * ⚠️ **只算在线（未软删）的 Agent**（`agents.deleted_at` 为空的）—— 删 Agent 会把 `model_id` 置空、
+   * 并清掉其池成员行，自动解绑，与删除守卫的口径一致（`02` §4.3）。
+   *
+   * 口径 = `removeModel` 守卫的引用数（默认模型 `agents.model_id` ∪ 池成员 `agent_models`）。因不变式
+   * 「默认模型恒为池成员」（`agent.service.ts` 建/改/复制三处保证），池成员集合已覆盖默认集合，故按
+   * `agent_models` 计数即为并集。前端 `modelDeleteBlockedNotice` / `modelTypeChangeBlocked` 据此判断
+   * "删除键是否标灰 / 类型是否锁死"，必须与后端守卫**同口径**（否则出现"显示 0 却删不掉"）。
    */
   agentCount: z.number().int().min(0),
   /**
@@ -182,17 +187,24 @@ export type ModelOptionListResult = z.infer<typeof modelOptionListResultSchema>
 
 /** `GET /api/models` 的查询参数（管理面，offset/limit 与其它列表一致） */
 export const listModelsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
   /** 可选过滤：只按类型筛 */
   type: z
-    .enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) })
+    .enum(MODEL_TYPES, {
+      errorMap: () => ({ message: validationMessage('validation.model.typeAllowed', { allowed: MODEL_TYPES.join('/') }) }),
+    })
     .optional(),
   /** 可选过滤：只看某个 Provider 下的模型（管理页按 Provider 分组的入口） */
-  providerId: z.string().uuid('providerId 不是合法 UUID').optional(),
+  providerId: z.string().uuid(validationMessage('validation.model.providerIdNotUuid')).optional(),
   /** 可选过滤：只启用的 / 只停用的。不传 = 全都要（管理页默认看全部） */
   enabled: z
-    .enum(['true', 'false'], { errorMap: () => ({ message: 'enabled 只能是 true 或 false' }) })
+    .enum(['true', 'false'], { errorMap: () => ({ message: validationMessage('validation.model.enabledFlag') }) })
     .transform((value) => value === 'true')
     .optional(),
 })
@@ -222,8 +234,12 @@ export const listAvailableModelsQuerySchema = z.object({
   type: z.enum(MODEL_TYPES, {
     errorMap: (issue) =>
       issue.code === 'invalid_type'
-        ? { message: `type 必填（${MODEL_TYPES.join('/')}）：这个端点只用来填"选模型"的下拉` }
-        : { message: `type 只能是 ${MODEL_TYPES.join('/')}` },
+        ? {
+            message: validationMessage('validation.model.typeRequiredForPicker', {
+              allowed: MODEL_TYPES.join('/'),
+            }),
+          }
+        : { message: validationMessage('validation.model.typeAllowed', { allowed: MODEL_TYPES.join('/') }) },
   }),
 })
 export type ListAvailableModelsQuery = z.infer<typeof listAvailableModelsQuerySchema>
@@ -240,18 +256,18 @@ export type ListAvailableModelsQuery = z.infer<typeof listAvailableModelsQuerySc
  * 排查成本远高于现在就告诉管理员"这个型号名不对"。
  */
 const modelNameSchema = z
-  .string({ required_error: '请输入型号名' })
+  .string({ required_error: validationMessage('validation.model.modelNameRequired') })
   .trim()
-  .min(1, '请输入型号名')
-  .max(128, '型号名最多 128 个字符')
-  .refine((value) => /^\S+$/.test(value), '型号名不能含空格（填写上游的 model id，如 gpt-4o-mini）')
+  .min(1, validationMessage('validation.model.modelNameRequired'))
+  .max(128, validationMessage('validation.model.modelNameTooLong', { max: 128 }))
+  .refine((value) => /^\S+$/.test(value), validationMessage('validation.model.modelNameNoWhitespace'))
 
 /** 别名（界面上给业务同学看的名字，可以是中文） */
 const labelSchema = z
-  .string({ required_error: '请输入别名' })
+  .string({ required_error: validationMessage('validation.model.labelRequired') })
   .trim()
-  .min(1, '请输入别名')
-  .max(128, '别名最多 128 个字符')
+  .min(1, validationMessage('validation.model.labelRequired'))
+  .max(128, validationMessage('validation.model.labelTooLong', { max: 128 }))
 
 /**
  * 上下文长度（token）。允许 `null`（= 未填写/展示为未知）。
@@ -260,16 +276,18 @@ const labelSchema = z
  * 给一个宽但明确的上限，能挡掉"把 token 数错填成字节数"这类量级错误。
  */
 const maxContextSchema = z
-  .number({ invalid_type_error: 'maxContext 必须是数字' })
-  .int('maxContext 必须是整数')
-  .min(1, 'maxContext 至少为 1')
-  .max(10_000_000, 'maxContext 最多 10000000')
+  .number({ invalid_type_error: validationMessage('validation.model.maxContextNotNumber') })
+  .int(validationMessage('validation.model.maxContextNotInteger'))
+  .min(1, validationMessage('validation.model.maxContextMin', { min: 1 }))
+  .max(10_000_000, validationMessage('validation.model.maxContextMax', { max: 10_000_000 }))
 
 // ───────────────────────────── 建 ─────────────────────────────
 
 /** `POST /api/models` 请求体 */
 export const createModelBodySchema = z.object({
-  providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
+  providerId: z
+    .string({ required_error: validationMessage('validation.model.providerRequired') })
+    .uuid(validationMessage('validation.model.providerIdNotUuid')),
   modelName: modelNameSchema,
   label: labelSchema,
   /**
@@ -278,7 +296,9 @@ export const createModelBodySchema = z.object({
    * 服务层另有一条与 Provider 相关的约束：`type=EMBEDDING` 时该 Provider 的协议必须是
    * OpenAI 兼容（`embeddingModelAllowedOnProtocol`）—— embedding 只有 `/embeddings` 一条路。
    */
-  type: z.enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) }),
+  type: z.enum(MODEL_TYPES, {
+    errorMap: () => ({ message: validationMessage('validation.model.typeAllowed', { allowed: MODEL_TYPES.join('/') }) }),
+  }),
   /** 可缺省：`null` 与缺省同义（未填写） */
   maxContext: maxContextSchema.nullish(),
   /**
@@ -289,10 +309,10 @@ export const createModelBodySchema = z.object({
    * 对话模型忽略该字段。
    */
   embeddingDim: z
-    .number({ invalid_type_error: 'embeddingDim 必须是数字' })
-    .int('embeddingDim 必须是整数')
-    .min(1, 'embeddingDim 至少为 1')
-    .max(1_000_000, 'embeddingDim 过大')
+    .number({ invalid_type_error: validationMessage('validation.model.embeddingDimNotNumber') })
+    .int(validationMessage('validation.model.embeddingDimNotInteger'))
+    .min(1, validationMessage('validation.model.embeddingDimMin', { min: 1 }))
+    .max(1_000_000, validationMessage('validation.model.embeddingDimTooLarge', { max: 1_000_000 }))
     .optional(),
   /**
    * **向量模型专属**：是否走**多模态 embedding 端点**（`POST {baseUrl}/embeddings/multimodal`，
@@ -334,20 +354,24 @@ export type CreateModelBody = z.infer<typeof createModelBodySchema>
  */
 export const updateModelBodySchema = z
   .object({
-    providerId: z.string().uuid('providerId 不是合法 UUID').optional(),
+    providerId: z.string().uuid(validationMessage('validation.model.providerIdNotUuid')).optional(),
     modelName: modelNameSchema.optional(),
     label: labelSchema.optional(),
     type: z
-      .enum(MODEL_TYPES, { errorMap: () => ({ message: `type 只能是 ${MODEL_TYPES.join('/')}` }) })
+      .enum(MODEL_TYPES, {
+        errorMap: () => ({
+          message: validationMessage('validation.model.typeAllowed', { allowed: MODEL_TYPES.join('/') }),
+        }),
+      })
       .optional(),
     /** ⚠️ 必须是 `.nullable().optional()`（**不要**加 `.default()`）：要区分"不动"与"清空" */
     maxContext: maxContextSchema.nullable().optional(),
     /** **向量模型专属**：手动指定/覆盖输出维度（缺省时后端尽力探测；对话模型忽略） */
     embeddingDim: z
-      .number({ invalid_type_error: 'embeddingDim 必须是数字' })
-      .int('embeddingDim 必须是整数')
-      .min(1, 'embeddingDim 至少为 1')
-      .max(1_000_000, 'embeddingDim 过大')
+      .number({ invalid_type_error: validationMessage('validation.model.embeddingDimNotNumber') })
+      .int(validationMessage('validation.model.embeddingDimNotInteger'))
+      .min(1, validationMessage('validation.model.embeddingDimMin', { min: 1 }))
+      .max(1_000_000, validationMessage('validation.model.embeddingDimTooLarge', { max: 1_000_000 }))
       .optional(),
     /** **向量模型专属**：是否走多模态 embedding 端点（见 `createModelBodySchema` 同名字段） */
     embeddingMultimodal: z.boolean().optional(),
@@ -368,13 +392,13 @@ export const updateModelBodySchema = z
       body.supportsVision !== undefined ||
       body.supportsReasoning !== undefined ||
       body.enabled !== undefined,
-    { message: '至少要提供一个要修改的字段' },
+    { message: validationMessage('validation.common.atLeastOneField') },
   )
 export type UpdateModelBody = z.infer<typeof updateModelBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const modelIdParamsSchema = z.object({
-  id: z.string().uuid('模型 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.model.idNotUuid')),
 })
 export type ModelIdParams = z.infer<typeof modelIdParamsSchema>
 
@@ -387,8 +411,14 @@ export type ModelIdParams = z.infer<typeof modelIdParamsSchema>
  * 维度或真实报错（不必翻后端日志、也不必先保存）。**不落库**、不改任何状态。
  */
 export const probeEmbeddingBodySchema = z.object({
-  providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
-  modelName: z.string({ required_error: '请先填写型号名' }).trim().min(1, '请先填写型号名').max(255),
+  providerId: z
+    .string({ required_error: validationMessage('validation.model.providerRequired') })
+    .uuid(validationMessage('validation.model.providerIdNotUuid')),
+  modelName: z
+    .string({ required_error: validationMessage('validation.model.modelNameFillFirst') })
+    .trim()
+    .min(1, validationMessage('validation.model.modelNameFillFirst'))
+    .max(255),
   /** 是否走多模态端点（见 `createModelBodySchema.embeddingMultimodal`） */
   embeddingMultimodal: z.boolean().optional(),
 })
@@ -415,8 +445,14 @@ export type ProbeEmbeddingResult = z.infer<typeof probeEmbeddingResultSchema>
  * **不落库**、不改任何状态。
  */
 export const probeChatBodySchema = z.object({
-  providerId: z.string({ required_error: '请选择 Provider' }).uuid('providerId 不是合法 UUID'),
-  modelName: z.string({ required_error: '请先填写型号名' }).trim().min(1, '请先填写型号名').max(255),
+  providerId: z
+    .string({ required_error: validationMessage('validation.model.providerRequired') })
+    .uuid(validationMessage('validation.model.providerIdNotUuid')),
+  modelName: z
+    .string({ required_error: validationMessage('validation.model.modelNameFillFirst') })
+    .trim()
+    .min(1, validationMessage('validation.model.modelNameFillFirst'))
+    .max(255),
 })
 export type ProbeChatBody = z.infer<typeof probeChatBodySchema>
 

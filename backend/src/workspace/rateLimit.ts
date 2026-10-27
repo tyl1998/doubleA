@@ -19,7 +19,7 @@
  * 计数失败只 warn 一次并放行（同 `writeUserSnapshot` 的"缓存写失败不影响本次请求"纪律）。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -63,7 +63,7 @@ export async function assertWorkspaceWriteRate(conversationId: string): Promise<
 
   if (isWorkspaceWriteRateExceeded(count, limit)) {
     getLogger().warn({ conversationId, count, limit }, '工作区写入超限流阈值，拒绝本次写')
-    throw AppError.busy(`工作区写入过于频繁（每分钟上限 ${limit} 次），请稍后重试`, {
+    throw AppError.busy(appMsg('app.m236', { p0: limit }), {
       limit,
       windowSeconds: WORKSPACE_WRITE_RATE_WINDOW_MS / 1000,
       count,

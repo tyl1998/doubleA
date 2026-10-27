@@ -13,6 +13,8 @@
  * 与 `shared/src/usage.ts` 的口径一致。
  */
 
+import { translate, type Locale, type MessageKey } from '@doubulea/shared'
+
 /** 一个时间区间（ISO 8601 绝对时刻字符串） */
 export interface UsageRange {
   from: string
@@ -51,17 +53,18 @@ export type UsageRangePresetKey = 'thisMonth' | 'lastMonth' | 'last7' | 'last30'
 
 export interface UsageRangePreset {
   key: UsageRangePresetKey
-  label: string
+  /** 预设名的 i18n key（P1-23：存 key 不存文案） */
+  labelKey: MessageKey
   range: UsageRange
 }
 
 /** 预设区间（顺序即界面顺序；"本月"是默认） */
 export function usageRangePresets(now: Date = new Date()): UsageRangePreset[] {
   return [
-    { key: 'thisMonth', label: '本月', range: thisMonthRange(now) },
-    { key: 'lastMonth', label: '上月', range: lastMonthRange(now) },
-    { key: 'last7', label: '近 7 天', range: lastDaysRange(7, now) },
-    { key: 'last30', label: '近 30 天', range: lastDaysRange(30, now) },
+    { key: 'thisMonth', labelKey: 'usage.range.thisMonth', range: thisMonthRange(now) },
+    { key: 'lastMonth', labelKey: 'usage.range.lastMonth', range: lastMonthRange(now) },
+    { key: 'last7', labelKey: 'usage.range.last7', range: lastDaysRange(7, now) },
+    { key: 'last30', labelKey: 'usage.range.last30', range: lastDaysRange(30, now) },
   ]
 }
 
@@ -133,13 +136,13 @@ export function formatCount(value: number): string {
 }
 
 /** 时长：`< 1s` 给毫秒、`< 1min` 给秒（一位小数）、否则给"分 + 秒" */
-export function formatDurationMs(ms: number): string {
+export function formatDurationMs(ms: number, locale: Locale): string {
   if (!Number.isFinite(ms) || ms <= 0) return '0 ms'
   if (ms < 1000) return `${Math.round(ms)} ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
   const minutes = Math.floor(ms / 60_000)
   const seconds = Math.round((ms % 60_000) / 1000)
-  return `${minutes} 分 ${seconds} 秒`
+  return translate(locale, 'usage.minutesSeconds', { minutes, seconds })
 }
 
 /**
@@ -148,7 +151,10 @@ export function formatDurationMs(ms: number): string {
  * 报表里 token 之和是"**已知的**和"（`NULL` 被跳过）⇒ 不给出这个分母，
  * 读者无法分辨"这组真的只用了这么多"与"一半记录没上报"（`NULL` ≠ `0`）。
  */
-export function coverageText(tokenRecords: number, records: number): string {
+export function coverageText(tokenRecords: number, records: number, locale: Locale): string {
   if (records <= 0) return '—'
-  return `${groupThousands(tokenRecords)} / ${groupThousands(records)} 条上报`
+  return translate(locale, 'usage.coverage', {
+    tokens: groupThousands(tokenRecords),
+    records: groupThousands(records),
+  })
 }

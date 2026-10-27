@@ -33,6 +33,8 @@
 
 import { z } from 'zod'
 
+import type { MessageKey } from './i18n/index.js'
+
 // ───────────────────────────── 分组维度 ─────────────────────────────
 
 /**
@@ -51,11 +53,25 @@ export const USAGE_GROUP_LABELS: Record<UsageGroupBy, string> = {
   model: '按模型',
 }
 
+/** 维度 → i18n key（P1-23；中文那份 {@link USAGE_GROUP_LABELS} 保留给其它中文消费方） */
+export const USAGE_GROUP_KEY: Record<UsageGroupBy, MessageKey> = {
+  user: 'label.usageGroup.user',
+  agent: 'label.usageGroup.agent',
+  model: 'label.usageGroup.model',
+}
+
 /** 分组名称列的表头（每个维度的"名字"叫法不同） */
 export const USAGE_GROUP_KEY_LABELS: Record<UsageGroupBy, string> = {
   user: '用户',
   agent: '智能体',
   model: '模型',
+}
+
+/** 分组名称列的表头 → i18n key（P1-23） */
+export const USAGE_GROUP_HEADER_KEY: Record<UsageGroupBy, MessageKey> = {
+  user: 'label.usageGroupKey.user',
+  agent: 'label.usageGroupKey.agent',
+  model: 'label.usageGroupKey.model',
 }
 
 // ───────────────────────────── 查询 ─────────────────────────────

@@ -17,7 +17,7 @@
 
 import { Button, Input, Popconfirm, Tag } from 'antd'
 import { useState } from 'react'
-import { PROVIDER_CREDENTIAL_MODE_LABELS, type MyProviderCredentialEntry } from '@doubulea/shared'
+import { PROVIDER_CREDENTIAL_MODE_KEY, type MyProviderCredentialEntry } from '@doubulea/shared'
 
 import {
   useDeleteMyProviderCredential,
@@ -25,34 +25,36 @@ import {
   useSetMyProviderCredential,
 } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 /** `PER_USER`（各自 Key）：就地配置**我的** Key —— 可读可写 */
 function PerUserProviderKeyRow({ entry }: { entry: MyProviderCredentialEntry }) {
   const feedback = useFeedback()
+  const { t } = useT()
   const setKey = useSetMyProviderCredential()
   const clearKey = useDeleteMyProviderCredential()
   const [apiKey, setApiKey] = useState('')
 
   const save = async () => {
     if (apiKey.trim() === '') {
-      feedback.fail(new Error('请输入 API Key'), '无法保存')
+      feedback.fail(new Error(t('settings.providerKey.needApiKey')), t('settings.providerKey.cannotSave'))
       return
     }
     try {
       await setKey.mutateAsync({ id: entry.providerId, apiKey: apiKey.trim() })
       setApiKey('')
-      feedback.ok(`已保存你在「${entry.providerName}」上的 Key`)
+      feedback.ok(t('settings.providerKey.savedOk', { provider: entry.providerName }))
     } catch (error) {
-      feedback.fail(error, '保存失败')
+      feedback.fail(error, t('settings.providerKey.saveFailed'))
     }
   }
 
   const clear = async () => {
     try {
       await clearKey.mutateAsync(entry.providerId)
-      feedback.ok(`已清除你在「${entry.providerName}」上的 Key`)
+      feedback.ok(t('settings.providerKey.clearedOk', { provider: entry.providerName }))
     } catch (error) {
-      feedback.fail(error, '清除失败')
+      feedback.fail(error, t('settings.providerKey.clearFailed'))
     }
   }
 
@@ -60,47 +62,55 @@ function PerUserProviderKeyRow({ entry }: { entry: MyProviderCredentialEntry }) 
     <div className="cred-group card">
       <div className="card__head">
         <p className="card__title">{entry.providerName}</p>
-        <Tag>{PROVIDER_CREDENTIAL_MODE_LABELS.PER_USER}</Tag>
-        {entry.hasKey ? <Tag className="tag--ok">已配置</Tag> : <Tag className="tag--warn">未配置</Tag>}
+        <Tag>{t(PROVIDER_CREDENTIAL_MODE_KEY.PER_USER)}</Tag>
+        {entry.hasKey ? (
+          <Tag className="tag--ok">{t('settings.providerKey.configured')}</Tag>
+        ) : (
+          <Tag className="tag--warn">{t('settings.providerKey.unconfigured')}</Tag>
+        )}
         <div className="card__head-right">
           <span className="ratio">
             {entry.hasKey
-              ? `当前：${entry.apiKeyPreview ?? '****'}（仅用于核对）`
-              : '还没配 —— 用它下面模型的对话会返回「尚未配置凭据」'}
+              ? t('settings.providerKey.currentKey', { key: entry.apiKeyPreview ?? '****' })
+              : t('settings.providerKey.notConfiguredPerUser')}
           </span>
         </div>
       </div>
 
       <div className="card__body stack stack--tight">
         <label className="block-label" htmlFor={`provider-key-${entry.providerId}`}>
-          API Key
+          {t('settings.providerKey.apiKeyLabel')}
         </label>
         <Input.Password
           id={`provider-key-${entry.providerId}`}
           value={apiKey}
           autoComplete="off"
-          placeholder={entry.hasKey ? '输入新的 Key 以替换' : '粘贴你的 API Key'}
+          placeholder={
+            entry.hasKey
+              ? t('settings.providerKey.replacePlaceholder')
+              : t('settings.providerKey.pastePlaceholder')
+          }
           onChange={(event) => setApiKey(event.target.value)}
         />
         <div className="row" style={{ gap: 'var(--sp-3)' }}>
           <Button type="primary" loading={setKey.isPending} onClick={save}>
-            保存我的 Key
+            {t('settings.providerKey.saveMine')}
           </Button>
           {entry.hasKey ? (
             <Popconfirm
-              title={`清除你在「${entry.providerName}」上的 Key？`}
-              description="清除后，经该 Provider 的对话会报「尚未配置所需凭据」，直到你重新填写。"
-              okText="清除"
+              title={t('settings.providerKey.clearTitle', { provider: entry.providerName })}
+              description={t('settings.providerKey.clearDescription')}
+              okText={t('settings.providerKey.clearOk')}
               okButtonProps={{ danger: true }}
-              cancelText="取消"
+              cancelText={t('common.cancel')}
               onConfirm={clear}
             >
               <Button danger loading={clearKey.isPending}>
-                清除
+                {t('settings.providerKey.clearOk')}
               </Button>
             </Popconfirm>
           ) : null}
-          <span className="ratio u-right">只有你能读、能改这一把</span>
+          <span className="ratio u-right">{t('settings.providerKey.onlyYours')}</span>
         </div>
       </div>
     </div>
@@ -109,25 +119,35 @@ function PerUserProviderKeyRow({ entry }: { entry: MyProviderCredentialEntry }) 
 
 /** `SHARED`（共享 Key）：只读展示正在生效的共享 Key（掩码） —— 改它去模型池 */
 function SharedProviderKeyRow({ entry }: { entry: MyProviderCredentialEntry }) {
+  const { t } = useT()
   return (
     <div className="cred-group card">
       <div className="card__head">
         <p className="card__title">{entry.providerName}</p>
-        <Tag>{PROVIDER_CREDENTIAL_MODE_LABELS.SHARED}</Tag>
-        {entry.hasKey ? <Tag className="tag--ok">已配置</Tag> : <Tag className="tag--warn">未配置</Tag>}
+        <Tag>{t(PROVIDER_CREDENTIAL_MODE_KEY.SHARED)}</Tag>
+        {entry.hasKey ? (
+          <Tag className="tag--ok">{t('settings.providerKey.configured')}</Tag>
+        ) : (
+          <Tag className="tag--warn">{t('settings.providerKey.unconfigured')}</Tag>
+        )}
         <div className="card__head-right">
           <span className="ratio">
             {entry.hasKey
-              ? `当前：${entry.apiKeyPreview ?? '****'}（仅用于核对）`
-              : '该 Provider 还没配共享 Key —— 用它下面模型的对话会失败'}
+              ? t('settings.providerKey.currentKey', { key: entry.apiKeyPreview ?? '****' })
+              : t('settings.providerKey.notConfiguredShared')}
           </span>
         </div>
       </div>
 
       <div className="card__body stack stack--tight">
         <p className="ratio">
-          这把 Key 由该 Provider 的<strong>所属人 / 管理员</strong>统一配置、全员共用（额度与计费算在配置方）。
-          你<strong>无需、也无权</strong>在这里修改；要换请到<strong>模型池</strong>编辑该 Provider。
+          {t('settings.providerKey.sharedBodyA')}
+          <strong>{t('settings.providerKey.sharedBodyStrongOwner')}</strong>
+          {t('settings.providerKey.sharedBodyB')}
+          <strong>{t('settings.providerKey.sharedBodyStrongNoRight')}</strong>
+          {t('settings.providerKey.sharedBodyC')}
+          <strong>{t('settings.providerKey.sharedBodyStrongModelPool')}</strong>
+          {t('settings.providerKey.sharedBodyD')}
         </p>
       </div>
     </div>
@@ -135,6 +155,7 @@ function SharedProviderKeyRow({ entry }: { entry: MyProviderCredentialEntry }) {
 }
 
 export function ProviderKeySection() {
+  const { t } = useT()
   const query = useMyProviderCredentials()
   const items = query.data ?? []
 
@@ -150,17 +171,23 @@ export function ProviderKeySection() {
     <section>
       <div className="admin-section__head">
         <div>
-          <h2 className="card__title">模型 Provider 凭据</h2>
+          <h2 className="card__title">{t('settings.providerKey.title')}</h2>
           <p className="page__lead">
-            这里是<strong>你自己的</strong> Provider 凭据：你是<strong>所属人</strong>的 Provider（含共享 Key，仅你可见），
-            以及全部启用的「各自 Key」Provider（可就地配你自己的 Key）。
-            别人的共享 Key 不会出现在这里。
+            {t('settings.providerKey.leadA')}
+            <strong>{t('settings.providerKey.leadStrongMine')}</strong>
+            {t('settings.providerKey.leadB')}
+            <strong>{t('settings.providerKey.leadStrongOwner')}</strong>
+            {t('settings.providerKey.leadC')}
           </p>
         </div>
         {unconfigured.length === 0 ? (
-          <Tag className="tag--ok">{perUser.length === 0 ? '无需配置' : '需要你配的都已完成'}</Tag>
+          <Tag className="tag--ok">
+            {perUser.length === 0
+              ? t('settings.providerKey.tagNoConfigNeeded')
+              : t('settings.providerKey.tagAllConfigured')}
+          </Tag>
         ) : (
-          <Tag className="tag--warn">{unconfigured.length} 个待配置</Tag>
+          <Tag className="tag--warn">{t('settings.providerKey.tagPending', { count: unconfigured.length })}</Tag>
         )}
       </div>
 

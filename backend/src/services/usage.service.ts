@@ -27,7 +27,7 @@
  * 数非空值）让读者能分辨"真的用了 0"与"没上报"。
  */
 
-import {
+import { appMsg,
   AppError,
   type UsageGroupBy,
   type UsageSummaryItem,
@@ -41,7 +41,7 @@ import { getPrisma } from '../infra/prisma.js'
 function boundaryOf(value: string | undefined, fallback: Date): Date {
   if (value === undefined || value.trim() === '') return fallback
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) throw AppError.validation('时间区间不是合法的时间')
+  if (Number.isNaN(date.getTime())) throw AppError.validation(appMsg('app.m227'))
   return date
 }
 
@@ -147,7 +147,7 @@ export async function summarizeUsage(query: UsageSummaryQuery): Promise<UsageSum
   const from = boundaryOf(query.from, monthStart)
   const to = boundaryOf(query.to, now)
   if (from.getTime() >= to.getTime()) {
-    throw AppError.validation('时间区间的起点必须早于终点')
+    throw AppError.validation(appMsg('app.m228'))
   }
 
   const where = { createdAt: { gte: from, lt: to } }

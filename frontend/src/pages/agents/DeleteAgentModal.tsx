@@ -29,6 +29,7 @@ import { useMyConversationCount } from '../../api/conversations.js'
 import { useRemoveAgent } from '../../api/agents.js'
 import { describeError } from '../../api/client.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { mcpRefsOf } from './agentModel.js'
 
 export interface DeleteAgentModalProps {
@@ -41,6 +42,7 @@ export interface DeleteAgentModalProps {
 
 export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModalProps) {
   const feedback = useFeedback()
+  const { t } = useT()
   const removeAgent = useRemoveAgent()
   // 弹窗关闭时不发请求：`agent === null` ⇒ `agentId` 为 undefined
   const conversationCount = useMyConversationCount(agent?.id)
@@ -63,8 +65,11 @@ export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModal
     removeAgent.mutate(agent.id, {
       onSuccess: (result) => {
         feedback.ok(
-          `已删除「${result.name}」：解除了 ${result.removedComponents} 处组件绑定，` +
-            `${result.finishedConversations} 个会话转为只读`,
+          t('agentDelete.deleted', {
+            name: result.name,
+            components: result.removedComponents,
+            conversations: result.finishedConversations,
+          }),
         )
         onDeleted?.(result)
         onClose()
@@ -81,14 +86,14 @@ export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModal
       open
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          删除智能体「{agent.name}」
+          {t('agentDelete.title', { name: agent.name })}
           {/* 用 `tag--danger` 而不是 AntD 的预设色 `color="red"`：全站"危险"只应该有一种红。 */}
-          <Tag className="tag--danger">级联删除</Tag>
+          <Tag className="tag--danger">{t('agentDelete.cascadeTag')}</Tag>
         </span>
       }
-      okText="确认删除"
+      okText={t('agentDelete.okText')}
       okButtonProps={{ danger: true, loading: removing }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!removing}
@@ -96,31 +101,41 @@ export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModal
       <div className="stack stack--tight">
         <div>
           <p>
-            <strong>此操作会连带做两件事：</strong>
+            <strong>{t('agentDelete.bodyTitle')}</strong>
           </p>
           <ul>
             <li>
-              解除该智能体的 <span className="num">{agent.components.length}</span> 处组件绑定
-              （其中知识库 <span className="num">{knowledgeCount}</span> 个）——
-              知识库与它的文档<strong>不受影响</strong>，MCP server 同样不受影响
+              {t('agentDelete.bodyComponentsPrefix')}
+              <span className="num">{agent.components.length}</span>
+              {t('agentDelete.bodyComponentsSuffix', { kb: knowledgeCount })}
+              <strong>{t('agentDelete.bodyComponentsStrong')}</strong>
+              {t('agentDelete.bodyComponentsTail')}
             </li>
             <li>
-              它的<strong>全部会话</strong>转为「只读保留」（
+              {t('agentDelete.bodyConversationsPrefix')}
+              <strong>{t('agentDelete.bodyConversationsStrong')}</strong>
+              {t('agentDelete.bodyConversationsMid')}
               {conversationCount.data === undefined ? (
-                <>你名下的会话数暂时取不到</>
+                t('agentDelete.countUnavailable')
               ) : (
                 <>
-                  其中你名下 <span className="num">{conversationCount.data}</span> 个
+                  {t('agentDelete.countMinePrefix')}
+                  <span className="num">{conversationCount.data}</span>
+                  {t('agentDelete.countMineSuffix')}
                 </>
               )}
-              ）：会话与消息<strong>都不会被删除</strong>，只是不能再发新消息
+              {t('agentDelete.bodyConversationsTail')}
+              <strong>{t('agentDelete.bodyConversationsStrong2')}</strong>
+              {t('agentDelete.bodyConversationsEnd')}
             </li>
           </ul>
           {/* ⚠️ JSX 的文本子节点**不认 Markdown**：要加粗用 `<strong>`、要等宽用 `<code>`。 */}
           <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-            删除后该智能体从列表与对话入口一起消失。这是<strong>软删除</strong>（
-            <code>deleted_at</code> 打标记），
-            P0-1 没有恢复入口 —— 删错了只能重建一个（会话历史仍在库里，属于它的只读保留）。
+            {t('agentDelete.softDeletePrefix')}
+            <strong>{t('agentDelete.softDeleteStrong')}</strong>
+            {t('agentDelete.softDeleteMid')}
+            <code>deleted_at</code>
+            {t('agentDelete.softDeleteTail')}
           </p>
         </div>
 
@@ -128,12 +143,14 @@ export function DeleteAgentModal({ agent, onClose, onDeleted }: DeleteAgentModal
           <Alert
             type="warning"
             showIcon
-            message={`该智能体还有 ${mcpRefs.length} 条 MCP 绑定`}
-            description="MCP 注册（P0-2）尚未开放，这些绑定只可能由手工写库产生；删除会一并解除它们。"
+            message={t('agentDelete.mcpTitle', { count: mcpRefs.length })}
+            description={t('agentDelete.mcpDesc')}
           />
         )}
 
-        {errorText !== null && <Alert type="error" showIcon message="删除失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('agentDelete.failed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

@@ -29,6 +29,8 @@ import { Select, Tag, Tooltip } from 'antd'
 import { useState, type ReactNode } from 'react'
 import type { AgentItem } from '@doubulea/shared'
 
+import { useT } from '../../app/i18n.js'
+
 export interface ConversationSettingsProps {
   agent: AgentItem | undefined
   conversationId: string | undefined
@@ -105,25 +107,26 @@ function ControlButton(props: {
 }
 
 export function ConversationSettings(props: ConversationSettingsProps) {
+  const { t } = useT()
   const { agent } = props
 
   // 池里有 2 个及以上模型才给选择器（否则只有默认模型、没有可选项；与改造前同判据）
   const modelPool = agent !== undefined && agent.modelId !== null && agent.models.length >= 2
   const currentModelId = props.selectedModelId ?? agent?.modelId ?? ''
   const currentModelLabel =
-    agent?.models.find((m) => m.modelId === currentModelId)?.modelLabel ?? agent?.modelId ?? '默认模型'
+    agent?.models.find((m) => m.modelId === currentModelId)?.modelLabel ?? agent?.modelId ?? t('conversationSettings.defaultModel')
 
   return (
     <div className="composer-controls" data-testid="conversation-settings">
       {/* 模型：**文字选择器**（R5：用户要一眼看到当前模型，不能只给图标）。
           池 ≥2 用下拉；只有 1 个（或未绑定 / 不可用）时退化成文字读数。 */}
       {agent === undefined ? null : agent.modelId === null ? (
-        <Tag className="tag--danger" title="该智能体未绑定模型，请到「设置 → 智能体」重新绑定后再对话">
-          未绑定模型
+        <Tag className="tag--danger" title={t('conversationSettings.unboundTip')}>
+          {t('conversationSettings.unbound')}
         </Tag>
       ) : agent.modelAvailable === false ? (
-        <Tag className="tag--danger" title="绑定的模型或其 Provider 已停用，发送会被拒绝">
-          绑定模型不可用
+        <Tag className="tag--danger" title={t('conversationSettings.unavailableTip')}>
+          {t('conversationSettings.unavailable')}
         </Tag>
       ) : modelPool ? (
         <Select
@@ -134,16 +137,16 @@ export function ConversationSettings(props: ConversationSettingsProps) {
           options={agent.models.map((m) => ({
             value: m.modelId,
             label: !m.available
-              ? `${m.modelLabel}（已停用）`
+              ? t('conversationSettings.modelDisabled', { label: m.modelLabel })
               : props.keyBlockedModelIds?.has(m.modelId) === true
-                ? `${m.modelLabel}（需配 Key）`
+                ? t('conversationSettings.modelNeedKey', { label: m.modelLabel })
                 : m.modelLabel,
             disabled: !m.available,
           }))}
-          title="选择本会话使用的模型（来自该智能体的模型池）"
+          title={t('conversationSettings.poolTip')}
         />
       ) : (
-        <span className="composer-model-chip" title={`当前模型：${currentModelLabel}`}>
+        <span className="composer-model-chip" title={t('conversationSettings.currentModel', { label: currentModelLabel })}>
           {currentModelLabel}
         </span>
       )}
@@ -157,8 +160,8 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         disabled={props.autoApprovePending}
         label={
           props.conversationId === undefined
-            ? '自动审批：开启后本会话内危险工具不再逐次弹确认卡（发送第一条消息时生效）'
-            : '自动审批：开启后本会话内危险工具不再逐次弹确认卡（会话级）'
+            ? t('conversationSettings.autoApproveTipNew')
+            : t('conversationSettings.autoApproveTipExisting')
         }
         onClick={() => props.onToggleAutoApprove(!props.autoApprove)}
       />
@@ -170,10 +173,10 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         disabled={props.memoryExcludedPending}
         label={
           props.memoryExcluded
-            ? '本次对话不记入记忆（点击恢复记入）'
+            ? t('conversationSettings.memoryOnTip')
             : props.conversationId === undefined
-              ? '记入记忆（点击关闭；发送第一条消息时生效）'
-              : '记入记忆（点击关闭，本次对话不再写入长期记忆）'
+              ? t('conversationSettings.memoryOffTipNew')
+              : t('conversationSettings.memoryOffTipExisting')
         }
         onClick={() => props.onToggleMemoryExcluded(!props.memoryExcluded)}
       />
@@ -184,7 +187,7 @@ export function ConversationSettings(props: ConversationSettingsProps) {
           active={props.codeMode}
           busy={props.codeModePending}
           disabled={props.codeModePending}
-          label={props.codeMode ? 'Code 模式：已开启（点击关闭）' : 'Code 模式：开启人机共享工作区（下次派活生效）'}
+          label={props.codeMode ? t('conversationSettings.codeModeOn') : t('conversationSettings.codeModeOff')}
           onClick={() => props.onToggleCodeMode(!props.codeMode)}
         />
       ) : null}
@@ -194,7 +197,7 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         <ControlButton
           icon={<FolderOpenOutlined />}
           active={props.panelOpen}
-          label={props.panelOpen ? '产物面板：已展开（点击收起）' : '产物面板：已收起（点击展开）'}
+          label={props.panelOpen ? t('conversationSettings.panelOpen') : t('conversationSettings.panelClosed')}
           onClick={() => props.onTogglePanel(!props.panelOpen)}
         />
       ) : null}
@@ -204,19 +207,19 @@ export function ConversationSettings(props: ConversationSettingsProps) {
           <ControlButton
             icon={<MinusOutlined />}
             active={props.codeFocus === 'none'}
-            label="专注：常规（对话 + 工作区并排）"
+            label={t('conversationSettings.focusNone')}
             onClick={() => props.onChangeCodeFocus('none')}
           />
           <ControlButton
             icon={<LayoutOutlined />}
             active={props.codeFocus === 'workspace'}
-            label="专注工作区（对话收窄）"
+            label={t('conversationSettings.focusWorkspace')}
             onClick={() => props.onChangeCodeFocus('workspace')}
           />
           <ControlButton
             icon={<MessageOutlined />}
             active={props.codeFocus === 'chat'}
-            label="专注对话（收起工作区）"
+            label={t('conversationSettings.focusChat')}
             onClick={() => props.onChangeCodeFocus('chat')}
           />
         </>

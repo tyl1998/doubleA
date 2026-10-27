@@ -226,12 +226,21 @@ async function eventNamesOf(response) {
 
 // ───────────────────────────── 被测模块（**直接 import 源码**） ─────────────────────────────
 
-const { SseFrameParser, parseSseFrame, parseSseText } = await import('../src/features/chat/sseParser.ts')
+// P1-23：6c 起这些纯函数（`reduceRound` / `composeState` / `watchPlaceholderText` / 断线文案 /
+// 对齐）都**多收一个 `locale`**（译文搬去 `shared/src/i18n`）。本档统一用 `'zh'` 断言
+// —— 中文形态逐字未变，这里只多喂一个参数（同 6a/6b 的做法）。
+const ZH = 'zh'
+
+const { SseFrameParser, parseSseFrame: parseSseFrameRaw, parseSseText } = await import(
+  '../src/features/chat/sseParser.ts'
+)
+/** 帧解析多收 `locale`（`api.sse.dataNotJson`）；本档除专门验 en 的那条外统一用 zh */
+const parseSseFrame = (frame, locale = ZH) => parseSseFrameRaw(frame, locale)
 const { readChatEventStream } = await import('../src/features/chat/chatStream.ts')
 const {
   beginRound,
   isSettled,
-  reduceRound,
+  reduceRound: reduceRoundRaw,
   roundToViews,
   withInterjection,
   withoutInterjection,
@@ -246,7 +255,7 @@ const { remarkInlineBlocks, remarkToolCards } = await import(
   '../src/features/chat/AssistantMarkdown.tsx'
 )
 const { disconnectOf, roundOf, streamingIdsOf, useChatStreamStore } = await import('../src/stores/chatStream.ts')
-const { watchPlaceholderText } = await import('../src/features/chat/useConversationWatch.ts')
+const { watchPlaceholderText: watchPlaceholderTextRaw } = await import('../src/features/chat/useConversationWatch.ts')
 const { parseActiveSnapshot } = await import('@doubulea/shared')
 const { SSE_EVENT_NAMES } = await import('@doubulea/shared')
 const { ApiError, openEventStream, setUnauthorizedHandler } = await import('../src/api/client.ts')
@@ -255,15 +264,21 @@ const { flattenMessagePages, streamChat } = await import('../src/api/conversatio
 const { composeState: composeStateRaw, isSubmitKey, createSendGate } = await import(
   '../src/features/chat/composerState.ts'
 )
-/** 用例夹具：直接转发 `composeState`（**P1-19 删掉 `elsewhere` 后不再需要默认值补丁**） */
-const composeState = (patch) => composeStateRaw(patch)
+/** 用例夹具：直接转发 `composeState`（**P1-23 起多喂一个 `locale`**；`ZH` 在文件头定义） */
+const composeState = (patch) => composeStateRaw(patch, ZH)
+/** 同上：归约层多收 `locale`（只为自造的那一句「生成过程中断」），这里绑成 zh 形态 */
+const reduceRound = (round, event) => reduceRoundRaw(round, event, ZH)
+/** 观察轮次占位文案 / 标题 / 对齐结论：同款，统一按 zh 断言 */
+const watchPlaceholderText = (origin) => watchPlaceholderTextRaw(origin, ZH)
+const chatErrorTitle = (code) => chatErrorTitleRaw(code, ZH)
+const decideAlign = (input) => decideAlignRaw({ ...input, locale: ZH })
 const { createStopController, waitForRoundSettled, STOP_SETTLE_TIMEOUT_MS } = await import(
   '../src/features/chat/stopController.ts'
 )
-const { chatErrorTitle, chatErrorDescription, shouldToastChatError } = await import(
+const { chatErrorTitle: chatErrorTitleRaw, chatErrorDescription, shouldToastChatError } = await import(
   '../src/features/chat/streamErrors.ts'
 )
-const { countAssistantMessages, decideAlign, shouldDropStreamVersion } = await import(
+const { countAssistantMessages, decideAlign: decideAlignRaw, shouldDropStreamVersion } = await import(
   '../src/features/chat/alignHistory.ts'
 )
 // P0-1-34：会话侧栏的**零依赖纯逻辑**（分组 / 相对时间 / 状态灯 / 改名与删除判据）
@@ -434,11 +449,15 @@ await it('B2 不认识的事件名 ⇒ unknown（向前兼容；不是 invalid�
   assertEqual(outcome.data, '{"whatever":1}', '原文带出（便于排查）')
 })
 
-await it('B3 合法事件名 + 非法 JSON ⇒ invalid（不静默吞掉）', () => {
+await it('B3 合法事件名 + 非法 JSON ⇒ invalid（不静默吞掉），且 detail 跟着 locale 走', () => {
   const outcome = parseSseFrame({ event: 'delta', data: '{oops' })
   assertEqual(outcome.kind, 'invalid', '归类')
   assertEqual(outcome.name, 'delta', '事件名')
-  assertIncludes(outcome.detail, '不是合法 JSON', 'detail 说明')
+  assertIncludes(outcome.detail, '不是合法 JSON', 'zh detail 说明')
+  // en 下必须换语言（`api.sse.dataNotJson`），否则"英文界面里蹦中文"
+  const english = parseSseFrame({ event: 'delta', data: '{oops' }, 'en')
+  assertIncludes(english.detail, 'not valid JSON', 'en detail 说明')
+  assert(!/[\u4e00-\u9fff]/u.test(english.detail), `en detail 里不该有汉字：${english.detail}`)
 })
 
 await it('B4 合法事件名 + 形状不符 ⇒ invalid 且 detail 指出字段路径', () => {
@@ -1295,6 +1314,7 @@ await it('F4 200 + JSON 信封（畸形）⇒ 明确报"期望事件流"，而�
   )
   const error = await assertRejects(() => openEventStream('/api/conversations/c/chat'), '200 + JSON')
   assertIncludes(error.message, '期望事件流', '文案要说清是哪一种畸形')
+  assertIncludes(error.message, '统一信封', '并且点出"收到的是信封"而不是别的畸形')
 })
 
 await it('F5 网关/SPA 兜底回 HTML ⇒ 明确报"不是 JSON 也不是事件流"（P0-1-30 踩过的坑）', async () => {
@@ -1989,8 +2009,19 @@ function stripComments(source) {
   return source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/\/\/[^\n]*/g, '')
 }
 
-await it('J4 同一句文案在 `frontend/src` 的**代码里**只有一处（P0-1-29 的 ⑰ 号教训）', () => {
+await it('J4 同一句文案的**唯一定义**在字典里，`frontend/src` 代码里不再出现（P0-1-29 的 ⑰ 号教训）', () => {
   const literal = chatErrorTitle('CONFLICT')
+  // ⚠️ P1-23：这句短文案的**唯一真相**已从 `streamErrors.ts` 搬进字典
+  // （`shared/src/i18n/messages.zh.ts` 的 `chat.errorConflictTitle`）—— 于是守门口径也随之转向：
+  //   · 正向：字典里**恰好一处**（改文案只改一处）；
+  //   · 反向：`frontend/src` 的代码里**一处都不许再出现字面量**（否则字典改了它不跟着改，
+  //     就是 P0-1-29 那句"两处各写一遍、其中一处先腐烂"）。
+  const dict = stripComments(readFileSync(new URL('../../shared/src/i18n/messages.zh.ts', import.meta.url), 'utf8'))
+  // ⚠️ 判据是「**整条译文**恰好一处」，不是「这个子串出现几次」：
+  // P1-23 收尾 ⑤ 起后端 `AppError` 的细节消息也进了字典（`app.m*`），其中
+  // 「该会话正在生成中，本次定时运行被跳过」**包含**这句短文案 —— 按子串数会误报。
+  const wholeLine = dict.split('\n').filter((line) => line.includes(`'${literal}'`))
+  assertEqual(wholeLine.length, 1, `字典里应恰好一处定义「${literal}」`)
   const files = readdirSync(new URL('../src/', import.meta.url), { recursive: true })
     .filter((name) => typeof name === 'string' && /\.(ts|tsx)$/.test(name))
     // 目录分隔符统一成 `/`，否则这条断言在 Windows 上会因为 `features\chat\...` 而假红
@@ -2001,10 +2032,9 @@ await it('J4 同一句文案在 `frontend/src` 的**代码里**只有一处（P0
     const count = content.split(literal).length - 1
     if (count > 0) hits.push(`${name}×${count}`)
   }
-  // 两个消费方（错误卡 / toast）都从 `streamErrors.ts` 取 ⇒ 代码里应当**恰好一处定义**。
+  // 两个消费方（错误卡 / toast）都从字典取 ⇒ `frontend/src` 的代码里应当**一处都没有**。
   // **注释里的引用不算**（例如 `ErrorCard.tsx` 会说明"文案已搬走"）—— 这正是 `stripComments` 的用途。
-  // 本仓在 P0-1-29 就吃过"同一口径两处各写一遍、其中一处先腐烂"的亏（症状是随机红）
-  assertDeepEqual(hits, ['features/chat/streamErrors.ts×1'], `代码里的定义处应只有一处，实际：${hits.join('、') || '一处都没有'}`)
+  assertDeepEqual(hits, [], `frontend/src 代码里不该再有字面量，实际：${hits.join('、') || '一处都没有'}`)
 })
 
 await it('J5 `shouldDropStreamVersion`：按**助手消息条数**判"服务端存了吗"（两个方向都验）', () => {
@@ -2214,18 +2244,18 @@ const convItem = (patch) => ({
 })
 
 await it('K1 时间读数五档（含 `null`）；**按日历日分档，不是按 24 小时差**', () => {
-  assertEqual(describeConversationTime(null, SIDEBAR_NOW), '还没有消息', '没消息的会话（不是 createdAt！）')
-  assertEqual(describeConversationTime('2026-09-23T14:59:30', SIDEBAR_NOW), '刚刚', '30 秒前')
-  assertEqual(describeConversationTime('2026-09-23T14:57:00', SIDEBAR_NOW), '3 分钟前', '3 分钟前')
-  assertEqual(describeConversationTime('2026-09-23T12:00:00', SIDEBAR_NOW), '3 小时前', '3 小时前')
-  assertEqual(describeConversationTime('2026-09-22T18:20:00', SIDEBAR_NOW), '昨天 18:20', '昨天')
-  assertEqual(describeConversationTime('2026-09-20T11:02:00', SIDEBAR_NOW), '09-20 11:02', '更早')
+  assertEqual(describeConversationTime(null, SIDEBAR_NOW, 'zh'), '还没有消息', '没消息的会话（不是 createdAt！）')
+  assertEqual(describeConversationTime('2026-09-23T14:59:30', SIDEBAR_NOW, 'zh'), '刚刚', '30 秒前')
+  assertEqual(describeConversationTime('2026-09-23T14:57:00', SIDEBAR_NOW, 'zh'), '3 分钟前', '3 分钟前')
+  assertEqual(describeConversationTime('2026-09-23T12:00:00', SIDEBAR_NOW, 'zh'), '3 小时前', '3 小时前')
+  assertEqual(describeConversationTime('2026-09-22T18:20:00', SIDEBAR_NOW, 'zh'), '昨天 18:20', '昨天')
+  assertEqual(describeConversationTime('2026-09-20T11:02:00', SIDEBAR_NOW, 'zh'), '09-20 11:02', '更早')
   // ⚠️ 这一条是"日历日 vs 24h"的判别用例：差 15 小时 10 分，但**隔了一个自然日**。
   //    写成 `(now - at) / 86400000` 取整的实现会得到"15 小时前"，而它其实是昨天的消息
   //    —— 读数看着完全正常，只有分组会错（这正是它值得一条断言的原因）
-  assertEqual(describeConversationTime('2026-09-22T23:50:00', SIDEBAR_NOW), '昨天 23:50', '跨零点但不足 24 小时')
+  assertEqual(describeConversationTime('2026-09-22T23:50:00', SIDEBAR_NOW, 'zh'), '昨天 23:50', '跨零点但不足 24 小时')
   // 服务端时钟比本机快（漂移）⇒ 显示"刚刚"，不显示负数
-  assertEqual(describeConversationTime('2026-09-23T15:01:00', SIDEBAR_NOW), '刚刚', '未来的时间当刚刚')
+  assertEqual(describeConversationTime('2026-09-23T15:01:00', SIDEBAR_NOW, 'zh'), '刚刚', '未来的时间当刚刚')
 })
 
 await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持服务端给的顺序', () => {
@@ -2237,7 +2267,7 @@ await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持�
     convItem({ id: 'yesterday', lastMessageAt: '2026-09-22T18:20:00' }),
     convItem({ id: 'lastWeek', lastMessageAt: '2026-09-20T11:02:00' }),
   ]
-  const groups = groupConversationViews(list, SIDEBAR_NOW, new Set())
+  const groups = groupConversationViews(list, SIDEBAR_NOW, new Set(), 'zh')
 
   assertDeepEqual(
     groups.map((group) => group.label),
@@ -2262,39 +2292,39 @@ await it('K2 分组只切「今天 / 更早」，空组不出现，组内保持�
   )
 
   assertDeepEqual(
-    groupConversationViews([convItem({ id: 'a' })], SIDEBAR_NOW, new Set()).map((group) => group.label),
+    groupConversationViews([convItem({ id: 'a' })], SIDEBAR_NOW, new Set(), 'zh').map((group) => group.label),
     ['今天'],
     '只有今天的内容 ⇒ 不该出现一个空的「更早」标题',
   )
   assertDeepEqual(
-    groupConversationViews([convItem({ id: 'b', lastMessageAt: '2026-09-10T10:00:00' })], SIDEBAR_NOW, new Set()).map(
+    groupConversationViews([convItem({ id: 'b', lastMessageAt: '2026-09-10T10:00:00' })], SIDEBAR_NOW, new Set(), 'zh').map(
       (group) => group.label,
     ),
     ['更早'],
     '反过来同理',
   )
-  assertDeepEqual(groupConversationViews([], SIDEBAR_NOW, new Set()), [], '一个会话都没有 ⇒ 没有分组')
+  assertDeepEqual(groupConversationViews([], SIDEBAR_NOW, new Set(), 'zh'), [], '一个会话都没有 ⇒ 没有分组')
 })
 
 await it('K3 状态灯三态：「生成中」只由**流 store** 点亮，`FINISHED` ⇒ 只读保留', () => {
   const active = convItem({ id: 'a', topic: '本周部署变更周报', lastMessageAt: '2026-09-23T14:57:00' })
 
-  const running = conversationItemView(active, SIDEBAR_NOW, new Set(['a']))
+  const running = conversationItemView(active, SIDEBAR_NOW, new Set(['a']), 'zh')
   assertEqual(running.led, 'run', '这一条在生成')
   assertEqual(running.state, '生成中', '状态文案（与灯"色 + 字"两重表达）')
   assertEqual(running.title, '本周部署变更周报', '标题取 topic')
   assertEqual(running.time, '3 分钟前', '时间读数')
 
   // ⚠️ 指向是**单侧**的：别的会话在生成，这一条不该亮 run（写成"只要有流就全都亮"的实现会红）
-  const other = conversationItemView(active, SIDEBAR_NOW, new Set(['some-other-conversation']))
+  const other = conversationItemView(active, SIDEBAR_NOW, new Set(['some-other-conversation']), 'zh')
   assertEqual(other.led, 'idle', '别的会话在生成 ⇒ 这一条仍是 idle')
   assertEqual(other.state, '可继续', '文案')
 
-  const finished = conversationItemView(convItem({ id: 'c', status: 'FINISHED' }), SIDEBAR_NOW, new Set())
+  const finished = conversationItemView(convItem({ id: 'c', status: 'FINISHED' }), SIDEBAR_NOW, new Set(), 'zh')
   assertEqual(finished.led, 'warn', 'FINISHED（Agent 被软删 ⇒ 只读保留）')
   assertEqual(finished.state, '只读保留', '文案说结果，不说"已结束"')
 
-  const untitled = conversationItemView(convItem({ id: 'd' }), SIDEBAR_NOW, new Set())
+  const untitled = conversationItemView(convItem({ id: 'd' }), SIDEBAR_NOW, new Set(), 'zh')
   assertEqual(untitled.title, '新会话', '没命名过 ⇒ 回落到 shared 的 CONVERSATION_UNTITLED_HINT')
   assertEqual(untitled.time, '还没有消息', '没有消息时的时间读数')
 })

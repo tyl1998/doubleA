@@ -26,8 +26,9 @@ import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-route
 import { useState } from 'react'
 
 import { useCurrentUser } from '../../api/auth.js'
-import { HEALTH_TARGET_LABEL, useHealth, type HealthSummary } from '../../api/health.js'
+import { HEALTH_TARGET_KEY, useHealth, type HealthSummary } from '../../api/health.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT, type Translate } from '../../app/i18n.js'
 import { loginPath, safeRedirectTarget, type LoginView } from '../../app/paths.js'
 import { ChangePasswordForm } from './ChangePasswordForm.js'
 import { LoginForm } from './LoginForm.js'
@@ -39,13 +40,13 @@ interface ReadRow {
 }
 
 /** 把 `/health` 的结论翻译成三行读数。**取不到就如实说取不到**，不留空也不编 */
-function readRows(health: ReturnType<typeof useHealth>): ReadRow[] {
+function readRows(health: ReturnType<typeof useHealth>, t: Translate): ReadRow[] {
   const report: HealthSummary | undefined = health.data
   if (report === undefined) {
     return [
       {
-        label: '服务',
-        value: health.isPending ? '正在读取服务信息…' : '服务信息未取到（/health 未响应）',
+        label: t('login.read.service'),
+        value: health.isPending ? t('login.read.pending') : t('login.read.unavailable'),
       },
     ]
   }
@@ -53,13 +54,20 @@ function readRows(health: ReturnType<typeof useHealth>): ReadRow[] {
   const broken = report.checks.filter((check) => !check.ok)
   const dependencies =
     broken.length === 0
-      ? `${report.checks.map((check) => HEALTH_TARGET_LABEL[check.target]).join(' · ')} 全部正常`
-      : broken.map((check) => `${HEALTH_TARGET_LABEL[check.target]}：${check.detail}`).join('；')
+      ? t('login.read.allHealthy', {
+          names: report.checks.map((check) => t(HEALTH_TARGET_KEY[check.target])).join(' · '),
+        })
+      : broken
+          .map((check) =>
+            t('login.read.checkBroken', { name: t(HEALTH_TARGET_KEY[check.target]), detail: check.detail }),
+          )
+          .join(t('login.read.separator'))
 
   return [
-    { label: '服务', value: `${report.service} · v${report.version}` },
-    { label: '环境', value: `${report.env} · 端口 ${report.port}` },
-    { label: '依赖', value: dependencies },
+    { label: t('login.read.service'), value: `${report.service} · v${report.version}` },
+    // ⚠️「端口」这个词在英文里是 `port`；这里用整句插值以免「· port {port}」的语序在两种语言下都要拼
+    { label: t('login.read.env'), value: `${report.env} · ${t('login.read.port', { port: report.port })}` },
+    { label: t('login.read.dependency'), value: dependencies },
   ]
 }
 
@@ -69,6 +77,7 @@ export function LoginPage() {
   const location = useLocation()
   const feedback = useFeedback()
   const health = useHealth()
+  const { t } = useT()
   const { data: user, isPending } = useCurrentUser()
 
   const view: LoginView = searchParams.get('view') === 'password' ? 'password' : 'login'
@@ -86,17 +95,17 @@ export function LoginPage() {
   const handleAuthenticated = (authenticated: AuthUser, password: string) => {
     if (authenticated.mustChangePassword) {
       setKnownOldPassword(password)
-      feedback.ok('初始密码可用，请先设置新密码')
+      feedback.ok(t('login.initialPasswordOk'))
       goToView('password')
       return
     }
-    feedback.ok(`欢迎回来，${authenticated.nickname ?? authenticated.username}`)
+    feedback.ok(t('login.welcomeBack', { name: authenticated.nickname ?? authenticated.username }))
     navigate(safeRedirectTarget(location), { replace: true })
   }
 
   const handlePasswordChanged = () => {
     setKnownOldPassword(null)
-    feedback.ok('密码已更新，正在进入工作台')
+    feedback.ok(t('login.passwordUpdated'))
     navigate(safeRedirectTarget(location), { replace: true })
   }
 
@@ -112,7 +121,7 @@ export function LoginPage() {
     return <Navigate to={loginPath()} replace />
   }
 
-  const rows = readRows(health)
+  const rows = readRows(health, t)
 
   return (
     <div className="auth">
@@ -126,16 +135,16 @@ export function LoginPage() {
             <p style={{ fontFamily: 'var(--font-display)', fontWeight: 800, letterSpacing: '-0.03em' }}>
               doubuleA
             </p>
-            <p className="kicker">内部 Agent 工作台</p>
+            <p className="kicker">{t('login.brandTagline')}</p>
           </div>
         </div>
 
         <h1>
-          把智能体的
+          {t('login.headlineLine1')}
           <br />
-          每一步
+          {t('login.headlineLine2')}
           <br />
-          都摊开看
+          {t('login.headlineLine3')}
         </h1>
 
         <div className="auth__reads">
@@ -157,16 +166,16 @@ export function LoginPage() {
       </section>
 
       {/* 右：操作板。登录与「首登强制改密」是同一条链路的两态 */}
-      <main className="auth__panel" aria-label="登录表单">
+      <main className="auth__panel" aria-label={t('login.formAria')}>
         <div className="auth__form stack">
           <div className="row">
-            <h2 style={{ fontSize: 'var(--fs-lg)' }}>登录工作台</h2>
-            <div className="seg u-right" role="group" aria-label="切换登录与改密视图">
+            <h2 style={{ fontSize: 'var(--fs-lg)' }}>{t('login.title')}</h2>
+            <div className="seg u-right" role="group" aria-label={t('login.viewSwitchAria')}>
               <button type="button" aria-pressed={view === 'login'} onClick={() => goToView('login')}>
-                登录
+                {t('login.tabLogin')}
               </button>
               <button type="button" aria-pressed={view === 'password'} onClick={() => goToView('password')}>
-                首登改密
+                {t('login.tabPassword')}
               </button>
             </div>
           </div>
@@ -179,19 +188,17 @@ export function LoginPage() {
                 type="info"
                 showIcon
                 message={
-                  knownOldPassword === null
-                    ? '修改密码需要输入当前密码（登录后即可免去这一步）。'
-                    : '你正在使用管理员下发的初始密码，必须修改后才能进入工作台。改密后立即生效。'
+                  knownOldPassword === null ? t('login.alertNeedOld') : t('login.alertInitial')
                 }
               />
               <ChangePasswordForm
                 knownOldPassword={knownOldPassword}
-                submitLabel="保存并进入"
+                submitLabel={t('login.submitAndEnter')}
                 onSuccess={handlePasswordChanged}
               />
               <div className="row">
                 <Button type="link" size="small" onClick={() => goToView('login')} style={{ padding: 0 }}>
-                  返回登录
+                  {t('login.backToLogin')}
                 </Button>
               </div>
             </div>
@@ -199,7 +206,7 @@ export function LoginPage() {
         </div>
 
         <div className="auth__foot">
-          <p className="kicker">仅限内部使用 · 操作留痕 · 忘记密码请联系管理员重置</p>
+          <p className="kicker">{t('login.foot')}</p>
         </div>
       </main>
     </div>

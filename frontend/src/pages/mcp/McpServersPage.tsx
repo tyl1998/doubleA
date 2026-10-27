@@ -52,7 +52,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import { useMcpServers, useMyCredentials, useRemoveMcpServer, useTestMcpServer } from '../../api/mcp.js'
-import { credentialCell, formatToolCount, serverStatusView, unconfiguredCount } from './mcpModel.js'
+import { credentialCell, credentialCellText, formatToolCount, serverStatusView, unconfiguredCount } from './mcpModel.js'
 import { McpServerFormModal } from './McpServerFormModal.js'
 import { McpServerToolsModal } from './McpServerToolsModal.js'
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
@@ -60,10 +60,12 @@ import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStat
 import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { CREDENTIALS_PATH, credentialsPath } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import type { McpServerItem } from '@doubulea/shared'
 
 export function McpServersPage() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const servers = useMcpServers()
   const credentials = useMyCredentials()
   const removeServer = useRemoveMcpServer()
@@ -90,7 +92,7 @@ export function McpServersPage() {
 
   const columns: TableColumnsType<McpServerItem> = [
     {
-      title: '名称',
+      title: t('mcpServers.colName'),
       dataIndex: 'name',
       render: (_, server) => (
         <div className="agent-cell">
@@ -98,18 +100,18 @@ export function McpServersPage() {
           {/* slug 是工具名前缀的来源，藏起来会让用户看不懂 `mcp_git_xxx` 里的 `git` 是什么。
               ⚠️ 副行**不再写"由 X 注册"**（P0-2-12 起）：那一格原本是个 uuid，用户读不出是谁；
               「所属人」现在有**专门的列**，而且它已经从留痕字段升成**权限主语**。 */}
-          <span className="agent-cell__sub">工具名前缀 mcp_{server.slug}_</span>
+          <span className="agent-cell__sub">{t('mcpServers.slugPrefix', { slug: server.slug })}</span>
         </div>
       ),
     },
     {
-      title: 'endpoint',
+      title: t('mcpServers.endpoint'),
       dataIndex: 'endpointUrl',
       width: 260,
       render: (_, server) => <span className="mcp-endpoint">{server.endpointUrl}</span>,
     },
     {
-      title: '工具数',
+      title: t('mcpServers.colToolCount'),
       key: 'tools',
       width: 110,
       // ⚠️ 这一格是**可点的**：它是"缓存的工具数"，点开才知道缓存里到底是什么、缓存于何时
@@ -122,21 +124,21 @@ export function McpServersPage() {
       ),
     },
     {
-      title: '状态',
+      title: t('mcpServers.colStatus'),
       dataIndex: 'status',
       width: 130,
       render: (_, server) => {
         const view = serverStatusView(server.status)
         return (
-          <span className="row" style={{ gap: 'var(--sp-2)' }} title={view.hint}>
+          <span className="row" style={{ gap: 'var(--sp-2)' }} title={t(view.hintKey)}>
             <span className={`led led--${view.led}`} aria-hidden="true" />
-            <span>{view.label}</span>
+            <span>{t(view.labelKey)}</span>
           </span>
         )
       },
     },
     {
-      title: '所属人',
+      title: t('mcpServers.colOwner'),
       dataIndex: 'creatorName',
       width: 130,
       render: (_, server) =>
@@ -146,44 +148,43 @@ export function McpServersPage() {
         // P1-18（2026-10-16 修订）：去掉操作列的「转移所属人」按钮，把这一列做成入口 ——
         //    只有所属人/管理员（`canEdit`）能点；其余人只显示名字（带同一句说明）。
         server.canEdit ? (
-          <Tooltip title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据。点击转移所属人">
+          <Tooltip title={t('mcpServers.ownerTitle')}>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(server)}>
               {server.creatorName}
             </Button>
           </Tooltip>
         ) : (
-          <span title="连通测试与工具列表都用这位的凭据；调用工具注入的是你自己的凭据">
-            {server.creatorName}
-          </span>
+          <span title={t('mcpServers.ownerTooltip')}>{server.creatorName}</span>
         ),
     },
     {
       // P1-13：可见性徽标（判据来自服务端下发的 `visibility`，前端不自己算）
-      title: '可见性',
+      title: t('mcpServers.colVisibility'),
       dataIndex: 'visibility',
       width: 100,
       render: (_, server) => <VisibilityBadge visibility={server.visibility} />,
     },
     {
-      title: '我的凭据',
+      title: t('mcpServers.colCredential'),
       key: 'credential',
       width: 140,
       render: (_, server) => {
         const cell = credentialCell(credentialsById.get(server.id))
-        if (cell.kind === 'configured') return <Tag className="tag--ok">已配置</Tag>
+        const text = credentialCellText(cell, locale)
+        if (cell.kind === 'configured') return <Tag className="tag--ok">{text.label}</Tag>
         if (cell.kind === 'missing') {
           return (
-            <Link to={credentialsPath(server.id)} title={cell.hint}>
+            <Link to={credentialsPath(server.id)} title={text.hint}>
               <span className="cred-dot" aria-hidden="true" />
-              未配置
+              {text.label}
             </Link>
           )
         }
-        return <span className="ratio" title={cell.hint}>{cell.label}</span>
+        return <span className="ratio" title={text.hint}>{text.label}</span>
       },
     },
     {
-      title: '操作',
+      title: t('mcpServers.colActions'),
       key: 'actions',
       width: 280,
       align: 'right',
@@ -206,40 +207,40 @@ export function McpServersPage() {
                   testServer.mutate(server.id, {
                     onSuccess: (result) => {
                       if (result.ok) {
-                        feedback.ok(`握手成功：拿到 ${result.tools.length} 个工具`)
+                        feedback.ok(t('mcpServers.handshakeOk', { count: result.tools.length }))
                         // 握手就是"重新拉一次工具列表" ⇒ 顺手把清单弹窗打开，让结论有可见的落点
                         setToolsFor(server)
                       } else {
                         // 恒 200 的**结论**（不是异常）⇒ 中性通道，见文件头 ③
-                        feedback.note(`握手失败：${result.error}`)
+                        feedback.note(t('mcpServers.handshakeFailed', { error: result.error }))
                       }
                     },
                     onError: (error) => {
-                      feedback.fail(error, '连通测试失败')
+                      feedback.fail(error, t('mcpServers.testFailed'))
                     },
                   })
                 }}
               >
-                测试
+                {t('mcpServers.test')}
               </Button>
               <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openEdit(server)}>
-                编辑
+                {t('mcpServers.edit')}
               </Button>
               <Popconfirm
-                title="删除这个 server？"
-                description="删除后绑定它的智能体将失去这些工具，绑定关系会一并清理。这个动作不可撤销。"
-                okText="删除"
+                title={t('mcpServers.removeTitle')}
+                description={t('mcpServers.removeDesc')}
+                okText={t('common.delete')}
                 okButtonProps={{ danger: true }}
-                cancelText="取消"
+                cancelText={t('common.cancel')}
                 onConfirm={() => {
                   removeServer.mutate(server.id, {
-                    onSuccess: (result) => feedback.ok(`已删除 server「${result.name}」`),
-                    onError: (error) => feedback.fail(error, '删除失败'),
+                    onSuccess: (result) => feedback.ok(t('mcpServers.deleted', { name: result.name })),
+                    onError: (error) => feedback.fail(error, t('mcpServers.removeFailed')),
                   })
                 }}
               >
                 <Button type="link" size="small" danger style={{ padding: 0 }}>
-                  删除
+                  {t('common.delete')}
                 </Button>
               </Popconfirm>
             </>
@@ -247,8 +248,8 @@ export function McpServersPage() {
             // ⚠️ 判据是**服务端给的 `canEdit`**（P0-2-12），不自己拿 `createdBy` 跟当前用户 id 比 ——
             //    那样 ADMIN 会在界面上连自己的编辑入口都没有，而服务端允许他改 ⇒ 两边对不上。
             //    ⚠️ 2026-10-16 修订：「测试」也已归入本门禁（用所属人凭据，见上）。
-            <span className="ratio" title="测试 / 编辑 / 删除都需要该 server 的所属人或管理员权限">
-              无编辑权限
+            <span className="ratio" title={t('mcpServers.noEditPermTitle')}>
+              {t('mcpServers.noEditPerm')}
             </span>
           )}
         </div>
@@ -260,16 +261,9 @@ export function McpServersPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>MCP server</h1>
+          <h1>{t('mcpServers.title')}</h1>
           <p className="page__lead">
-            {servers.isPending ? (
-              '正在读取 server 列表…'
-            ) : (
-              <>
-                已注册 <span className="num">{total}</span> 个 server。工具列表带缓存，点「测试」会重新握手并刷新工具数；
-                点工具数那一格可以看缓存里到底是什么。
-              </>
-            )}
+            {servers.isPending ? t('mcpServers.loading') : t('mcpServers.leadPrefix', { total })}
           </p>
         </div>
         <div className="page__head-actions">
@@ -277,17 +271,17 @@ export function McpServersPage() {
               ⚠️ 这里的数字与表格里那一列同源（见文件头 ②），不是另算一遍。 */}
           <Link to={CREDENTIALS_PATH}>
             <Button>
-              我的凭据
+              {t('mcpServers.myCredentials')}
               {missingCount > 0 && (
                 <>
                   {' '}
-                  <Tag className="tag--warn">{missingCount} 个未配置</Tag>
+                  <Tag className="tag--warn">{t('mcpServers.missingTag', { count: missingCount })}</Tag>
                 </>
               )}
             </Button>
           </Link>
           <Button type="primary" onClick={openCreate}>
-            注册 server
+            {t('mcpServers.register')}
           </Button>
         </div>
       </div>
@@ -299,8 +293,8 @@ export function McpServersPage() {
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="任何人登录后都能注册 server、调用工具；但「测试连通 / 编辑 / 删除」只有「所属人」或管理员能操作"
-        description="连通测试与工具列表用的是「所属人」的凭据（工具缓存是全员共享的一份）—— 所以测试若报「凭据无效 / 尚未配置」，该找的是所属人而不是你自己。而调用工具注入的是「你自己」的凭据。删除一台被智能体绑定的 server 会被后端拒绝（409），需要先去编辑页解绑。"
+        message={t('mcpServers.collabTitle')}
+        description={t('mcpServers.collabDesc')}
       />
 
       {credentials.isError ? (
@@ -308,14 +302,14 @@ export function McpServersPage() {
           type="warning"
           showIcon
           style={{ marginBottom: 'var(--sp-5)' }}
-          message="凭据状态没有读出来"
-          description="表格里「我的凭据」那一列此刻显示「未知」而不是「未配置」—— 说不出来的事不冒充结论。可以刷新页面重试。"
+          message={t('mcpServers.credLoadFailed')}
+          description={t('mcpServers.credLoadFailedDesc')}
         />
       ) : null}
 
       {servers.isError ? (
         <ErrorState
-          title="MCP server 列表加载失败"
+          title={t('mcpServers.loadFailed')}
           error={servers.error}
           retrying={servers.isFetching}
           onRetry={() => {
@@ -327,11 +321,11 @@ export function McpServersPage() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有注册任何 MCP server"
-            lead="注册一台 server 后，它的工具会出现在智能体编辑页的「MCP 工具」里。注册时还能定义一组凭据参数模板，决定「我的凭据」页要每个人填什么。"
+            title={t('mcpServers.emptyTitle')}
+            lead={t('mcpServers.emptyLead')}
             action={
               <Button type="primary" onClick={openCreate}>
-                注册 server
+                {t('mcpServers.register')}
               </Button>
             }
           />
@@ -350,8 +344,8 @@ export function McpServersPage() {
               showSizeChanger: false,
               showTotal: (count) =>
                 total > items.length
-                  ? `共 ${total} 条 · 本次取回前 ${items.length} 条（limit 上限 100）· 每页 20`
-                  : `共 ${count} 条 · 每页 20`,
+                  ? t('mcpServers.totalMore', { total, shown: items.length })
+                  : t('mcpServers.total', { count }),
             }}
           />
         </div>

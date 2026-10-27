@@ -14,15 +14,17 @@ import { Link } from 'react-router-dom'
 import type { ActivityItem, ActivitySearchHit } from '@doubulea/shared'
 
 import { ACTIVITY_PAGE_LIMIT, useActivity, useActivitySearch } from '../../api/activity.js'
+import { useT, type Translate } from '../../app/i18n.js'
 import { chatPath } from '../../app/paths.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 
-function conversationLabel(item: { topic: string | null }): string {
-  return item.topic ?? '新会话'
+function conversationLabel(item: { topic: string | null }, t: Translate): string {
+  return item.topic ?? t('activity.newConversation')
 }
 
 export function ActivityPanel() {
+  const { t } = useT()
   const [offset, setOffset] = useState(0)
   const [keyword, setKeyword] = useState('')
   const [committed, setCommitted] = useState('')
@@ -39,7 +41,7 @@ export function ActivityPanel() {
     <>
       <div className="row" style={{ justifyContent: 'space-between', marginBottom: 'var(--sp-4)', gap: 'var(--sp-3)' }}>
         <Input.Search
-          placeholder="搜索我做过的对话（标题或消息内容）"
+          placeholder={t('activity.searchPlaceholder')}
           style={{ maxWidth: 420 }}
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
@@ -49,13 +51,13 @@ export function ActivityPanel() {
           }}
           allowClear
         />
-        <span className="ratio">共 {total} 条</span>
+        <span className="ratio">{t('activity.totalCount', { total })}</span>
       </div>
 
       {searching ? (
-        <SearchResults query={search} hits={hits} />
+        <SearchResults query={search} hits={hits} t={t} />
       ) : (
-        <Timeline query={timeline} items={items} />
+        <Timeline query={timeline} items={items} t={t} />
       )}
 
       {total > ACTIVITY_PAGE_LIMIT ? (
@@ -76,14 +78,16 @@ export function ActivityPanel() {
 function Timeline({
   query,
   items,
+  t,
 }: {
   query: ReturnType<typeof useActivity>
   items: readonly ActivityItem[]
+  t: Translate
 }) {
   if (query.isError) {
     return (
       <ErrorState
-        title="活动没读出来"
+        title={t('activity.loadFailed')}
         error={query.error}
         onRetry={() => {
           void query.refetch()
@@ -96,7 +100,7 @@ function Timeline({
   if (items.length === 0) {
     return (
       <div className="card">
-        <EmptyState title="还没有活动记录" lead="与任意智能体对话后，这里会出现你的活动时间线。" />
+        <EmptyState title={t('activity.emptyTitle')} lead={t('activity.emptyLead')} />
       </div>
     )
   }
@@ -106,15 +110,18 @@ function Timeline({
         <div key={item.conversationId} className="row" style={{ alignItems: 'flex-start', gap: 'var(--sp-4)', padding: 'var(--sp-3) 0', borderBottom: '1px solid var(--rule)' }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="row" style={{ gap: 'var(--sp-2)' }}>
-              <Link to={chatPath(item.agentId, item.conversationId)}>{conversationLabel(item)}</Link>
+              <Link to={chatPath(item.agentId, item.conversationId)}>{conversationLabel(item, t)}</Link>
               <Tag>{item.agentName}</Tag>
-              {item.status === 'FINISHED' ? <Tag>只读</Tag> : null}
+              {item.status === 'FINISHED' ? <Tag>{t('activity.readOnly')}</Tag> : null}
             </div>
             {item.summary !== null ? <p className="ratio" style={{ marginTop: 4 }}>{item.summary}</p> : null}
           </div>
           <div className="agent-cell" style={{ textAlign: 'right', width: 200 }}>
             <span className="agent-cell__name num">
-              {item.messageCount} 消息 · {item.artifactCount} 产物
+              {t('activity.messageArtifact', {
+                messages: item.messageCount,
+                artifacts: item.artifactCount,
+              })}
             </span>
             <span className="agent-cell__sub">{formatUpdatedAt(item.lastMessageAt ?? item.createdAt)}</span>
           </div>
@@ -127,14 +134,16 @@ function Timeline({
 function SearchResults({
   query,
   hits,
+  t,
 }: {
   query: ReturnType<typeof useActivitySearch>
   hits: readonly ActivitySearchHit[]
+  t: Translate
 }) {
   if (query.isError) {
     return (
       <ErrorState
-        title="搜索失败"
+        title={t('activity.searchFailed')}
         error={query.error}
         onRetry={() => {
           void query.refetch()
@@ -147,7 +156,7 @@ function SearchResults({
   if (hits.length === 0) {
     return (
       <div className="card">
-        <EmptyState title="没有命中" lead="换一个关键词试试（会在你所有会话的用户/助手消息里找）。" />
+        <EmptyState title={t('activity.noHitTitle')} lead={t('activity.noHitLead')} />
       </div>
     )
   }
@@ -156,8 +165,8 @@ function SearchResults({
       {hits.map((hit, index) => (
         <div key={`${hit.conversationId}-${index}`} style={{ padding: 'var(--sp-3) 0', borderBottom: '1px solid var(--rule)' }}>
           <div className="row" style={{ gap: 'var(--sp-2)' }}>
-            <Link to={chatPath(hit.agentId, hit.conversationId)}>{conversationLabel(hit)}</Link>
-            <Tag>{hit.role === 'USER' ? '我' : '助手'}</Tag>
+            <Link to={chatPath(hit.agentId, hit.conversationId)}>{conversationLabel(hit, t)}</Link>
+            <Tag>{hit.role === 'USER' ? t('activity.roleMe') : t('activity.roleAssistant')}</Tag>
             <span className="ratio">{formatUpdatedAt(hit.createdAt)}</span>
           </div>
           <p style={{ marginTop: 4 }}>{hit.snippet}</p>

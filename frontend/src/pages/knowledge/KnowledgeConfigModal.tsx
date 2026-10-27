@@ -32,6 +32,7 @@ import {
   RETRIEVAL_MODES,
   SPLIT_STRATEGIES,
   retrievalConfigInputSchema,
+  translate,
   type KnowledgeBaseItem,
 } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
@@ -39,9 +40,10 @@ import { useEffect, useState } from 'react'
 import { describeError } from '../../api/client.js'
 import { useUpdateKnowledgeBase } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
-  RETRIEVAL_MODE_LABEL,
-  SPLIT_STRATEGY_LABEL,
+  RETRIEVAL_MODE_LABEL_KEY,
+  SPLIT_STRATEGY_LABEL_KEY,
   buildRetrievalPatch,
   retrievalValuesOf,
   type RetrievalFormValues,
@@ -56,6 +58,7 @@ export interface KnowledgeConfigModalProps {
 
 export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const update = useUpdateKnowledgeBase()
   const [values, setValues] = useState<RetrievalFormValues | null>(null)
   const [errorText, setErrorText] = useState<string | null>(null)
@@ -77,7 +80,7 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
   const submit = (): void => {
     const body = buildRetrievalPatch(kb, values)
     if (body === null) {
-      feedback.note('没有需要保存的改动')
+      feedback.note(t('kbConfig.noChanges'))
       onClose()
       return
     }
@@ -94,7 +97,7 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
       { id: kb.id, body },
       {
         onSuccess: (saved) => {
-          feedback.ok(`已保存「${saved.name}」的检索配置`)
+          feedback.ok(t('kbConfig.saved', { name: saved.name }))
           onClose()
         },
         onError: (error) => setErrorText(describeError(error).message),
@@ -107,12 +110,12 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
       open={open}
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          检索配置「{kb.name}」
+          {t('kbConfig.title', { name: kb.name })}
         </span>
       }
-      okText="保存"
+      okText={t('common.save')}
       okButtonProps={{ loading: submitting }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={submit}
       onCancel={onClose}
       maskClosable={!submitting}
@@ -122,31 +125,34 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
         <Alert
           type="info"
           showIcon
-          message="这些是这个知识库的口径（会落库）"
-          description="保存后对所有检索生效，包括智能体对话时的检索。「检索测试」里的 mode / topK 是那一次试查的临时覆盖，不会改动这里。"
+          message={t('kbConfig.infoTitle')}
+          description={t('kbConfig.infoDesc')}
         />
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>
-            <p className="block-label">检索模式</p>
+            <p className="block-label">{t('kbConfig.mode')}</p>
             <Select
               value={values.mode}
               style={{ width: '100%' }}
-              aria-label="检索模式"
+              aria-label={t('kbConfig.modeAria')}
               onChange={(mode) => patch({ mode })}
-              options={RETRIEVAL_MODES.map((mode) => ({ value: mode, label: RETRIEVAL_MODE_LABEL[mode] }))}
+              options={RETRIEVAL_MODES.map((mode) => ({
+                value: mode,
+                label: translate(locale, RETRIEVAL_MODE_LABEL_KEY[mode]),
+              }))}
             />
           </div>
           <div style={{ flex: 1 }}>
-            <p className="block-label">分块策略</p>
+            <p className="block-label">{t('kbConfig.splitStrategy')}</p>
             <Select
               value={values.splitStrategy}
               style={{ width: '100%' }}
-              aria-label="分块策略"
+              aria-label={t('kbConfig.splitStrategyAria')}
               onChange={(splitStrategy) => patch({ splitStrategy })}
               options={SPLIT_STRATEGIES.map((strategy) => ({
                 value: strategy,
-                label: SPLIT_STRATEGY_LABEL[strategy],
+                label: translate(locale, SPLIT_STRATEGY_LABEL_KEY[strategy]),
               }))}
             />
           </div>
@@ -154,36 +160,36 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>
-            <p className="block-label">返回条数 topK</p>
+            <p className="block-label">{t('kbConfig.topK')}</p>
             <InputNumber
               value={values.topK}
               min={1}
               max={100}
               style={{ width: '100%' }}
-              aria-label="返回条数 topK"
+              aria-label={t('kbConfig.topKAria')}
               onChange={(value) => patch({ topK: Number(value ?? 1) })}
             />
           </div>
           <div style={{ flex: 1 }}>
-            <p className="block-label">向量路相似度下限</p>
+            <p className="block-label">{t('kbConfig.score')}</p>
             <InputNumber
               value={values.score}
               min={0}
               max={1}
               step={0.05}
               style={{ width: '100%' }}
-              aria-label="向量路相似度下限"
+              aria-label={t('kbConfig.scoreAria')}
               onChange={(value) => patch({ score: Number(value ?? 0) })}
             />
           </div>
           <div style={{ flex: 1 }}>
-            <p className="block-label">RRF 平滑常数 k</p>
+            <p className="block-label">{t('kbConfig.rrfK')}</p>
             <InputNumber
               value={values.rrfK}
               min={1}
               max={1000}
               style={{ width: '100%' }}
-              aria-label="RRF 平滑常数"
+              aria-label={t('kbConfig.rrfKAria')}
               onChange={(value) => patch({ rrfK: Number(value ?? 1) })}
             />
           </div>
@@ -191,38 +197,44 @@ export function KnowledgeConfigModal({ kb, open, onClose }: KnowledgeConfigModal
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>
-            <p className="block-label">向量路权重</p>
+            <p className="block-label">{t('kbConfig.vectorWeight')}</p>
             <InputNumber
               value={values.vectorWeight}
               min={0}
               max={100}
               step={0.1}
               style={{ width: '100%' }}
-              aria-label="向量路权重"
+              aria-label={t('kbConfig.vectorWeightAria')}
               onChange={(value) => patch({ vectorWeight: Number(value ?? 0) })}
             />
           </div>
           <div style={{ flex: 1 }}>
-            <p className="block-label">全文路权重</p>
+            <p className="block-label">{t('kbConfig.fulltextWeight')}</p>
             <InputNumber
               value={values.fulltextWeight}
               min={0}
               max={100}
               step={0.1}
               style={{ width: '100%' }}
-              aria-label="全文路权重"
+              aria-label={t('kbConfig.fulltextWeightAria')}
               onChange={(value) => patch({ fulltextWeight: Number(value ?? 0) })}
             />
           </div>
         </div>
 
         <p className="ratio">
-          「相似度下限」<strong>只作用于向量路</strong>（cosine）：全文路的分是
-          <code>bigm_similarity</code>，两者量纲不可比，用同一个阈值卡会把全文路的结果一起误杀。
-          两个权重按 RRF 公式 <code>w/(k+rank)</code> 相加，缺失的一路记为无贡献。
+          {t('kbConfig.scoreNotePrefix')}
+          <strong>{t('kbConfig.scoreNoteStrong')}</strong>
+          {t('kbConfig.scoreNoteMid1')}
+          <code>bigm_similarity</code>
+          {t('kbConfig.scoreNoteMid2')}
+          <code>w/(k+rank)</code>
+          {t('kbConfig.scoreNoteSuffix')}
         </p>
 
-        {errorText !== null && <Alert type="error" showIcon message="保存失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('kbConfig.saveFailed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

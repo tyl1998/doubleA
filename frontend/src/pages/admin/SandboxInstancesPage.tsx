@@ -32,19 +32,21 @@ import { Alert, Button, Modal, Space, Spin, Table, Tag, Tooltip, Typography, typ
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ReloadOutlined } from '@ant-design/icons'
-import type { NodeCheckItem, SandboxInstanceItem } from '@doubulea/shared'
+import type { Locale, NodeCheckItem, SandboxInstanceItem } from '@doubulea/shared'
 
 import { fetchCurrentUser } from '../../api/auth.js'
 import { useNodeBootstrapJob, useNodeSelf, useStartBootstrapJob } from '../../api/node.js'
 import { SANDBOX_INSTANCES_QUERY_KEY, useSandboxInstances, useSetSandboxDrained } from '../../api/sandboxInstances.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { useT, type Translate } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
 import { NodeBootstrapProgressPanel } from './NodeBootstrapProgress.js'
 import {
   drainActionView,
   heartbeatText,
   loadAgeText,
-  SANDBOX_INSTANCE_STATE_LABELS,
   sandboxInstanceState,
+  sandboxInstanceStateLabel,
   slotRatioText,
   type SandboxInstanceState,
 } from './sandboxInstanceModel.js'
@@ -60,31 +62,34 @@ function columnsFor(args: {
   loadStaleMs: number
   selfInstanceId: string | null
   discovered: readonly string[]
+  t: Translate
+  locale: Locale
 }): TableColumnsType<SandboxInstanceItem> {
+  const { t, locale } = args
   return [
     {
-      title: '实例',
+      title: t('sandboxInst.colInstance'),
       dataIndex: 'instanceId',
       render: (_, item) => (
         <Space size={6}>
           <span className="kb-cell__name">{item.instanceId}</span>
-          {item.instanceId === args.selfInstanceId && <Tag color="blue">本机</Tag>}
-          {args.discovered.includes(item.advertiseAddr) && <Tag>自动发现</Tag>}
+          {item.instanceId === args.selfInstanceId && <Tag color="blue">{t('sandboxInst.selfTag')}</Tag>}
+          {args.discovered.includes(item.advertiseAddr) && <Tag>{t('sandboxInst.discoveredTag')}</Tag>}
         </Space>
       ),
     },
     {
-      title: '状态',
+      title: t('sandboxInst.colStatus'),
       key: 'state',
       width: 160,
       render: (_, item) => {
         const view = sandboxInstanceState(item, { now: args.now, loadStaleMs: args.loadStaleMs })
         return (
           <Space size={4} wrap>
-            <Tag color={STATE_COLOR[view.state]}>{SANDBOX_INSTANCE_STATE_LABELS[view.state]}</Tag>
+            <Tag color={STATE_COLOR[view.state]}>{sandboxInstanceStateLabel(view.state, locale)}</Tag>
             {item.drained && (
-              <Tooltip title="已摘流：不再接收**新**会话；已钉在它上面的会话仍继续服务">
-                <Tag color="default">已摘流</Tag>
+              <Tooltip title={t('sandboxInst.drainedTooltip')}>
+                <Tag color="default">{t('sandboxInst.drainedTag')}</Tag>
               </Tooltip>
             )}
           </Space>
@@ -92,78 +97,83 @@ function columnsFor(args: {
       },
     },
     {
-      title: '节点就绪',
+      title: t('sandboxInst.colNodeReady'),
       key: 'readiness',
       width: 150,
       render: (_, item) =>
         item.readiness === null ? (
-          <Typography.Text type="secondary">未知（未上报）</Typography.Text>
+          <Typography.Text type="secondary">{t('sandboxInst.unknownUnreported')}</Typography.Text>
         ) : item.readiness.ready ? (
-          <Tag color="green">就绪</Tag>
+          <Tag color="green">{t('sandboxInst.readyTag')}</Tag>
         ) : (
-          <Tooltip title={`未就绪：${item.readiness.missing.join('、')}（该实例不会出现在会话的实例选择里）`}>
-            <Tag color="orange">未就绪 · {item.readiness.missing.length} 项</Tag>
+          <Tooltip
+            title={t('sandboxInst.notReadyTooltip', {
+              items: item.readiness.missing.join(t('mcp.listSeparator')),
+            })}
+          >
+            <Tag color="orange">{t('sandboxInst.notReadyTag', { count: item.readiness.missing.length })}</Tag>
           </Tooltip>
         ),
     },
-    { title: '回连地址', dataIndex: 'advertiseAddr', width: 190 },
+    { title: t('sandboxInst.colAdvertiseAddr'), dataIndex: 'advertiseAddr', width: 190 },
     {
-      title: '管理',
+      title: t('sandboxInst.colManage'),
       key: 'manage',
       width: 190,
       render: (_, item) => (
         <Space size={4} wrap>
           {/* 「展开」只是提示（展开由 antd 的 expandable 负责，行展开后才有初始化/自检） */}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {item.readiness === null ? '展开查看' : item.readiness.ready ? '展开查看' : '展开后初始化'}
+            {item.readiness === null
+              ? t('sandboxInst.expandView')
+              : item.readiness.ready
+                ? t('sandboxInst.expandView')
+                : t('sandboxInst.expandInit')}
           </Typography.Text>
           <DrainButton item={item} />
         </Space>
       ),
     },
     {
-      title: '沙箱槽位',
+      title: t('sandboxInst.colSlots'),
       key: 'slots',
       width: 140,
       align: 'right',
-      render: (_, item) => <span className="ratio">{slotRatioText(item)}</span>,
+      render: (_, item) => <span className="ratio">{slotRatioText(item, locale)}</span>,
     },
     {
-      title: '排队',
+      title: t('sandboxInst.colQueue'),
       key: 'queueDepth',
       width: 80,
       align: 'right',
       render: (_, item) => <span className="num">{item.load?.queueDepth ?? '—'}</span>,
     },
     {
-      title: 'ChatBot 在飞',
+      title: t('sandboxInst.colInFlight'),
       key: 'chatbotInFlight',
       width: 120,
       align: 'right',
       render: (_, item) => <span className="num">{item.load?.chatbotInFlight ?? '—'}</span>,
     },
     {
-      title: '负载年龄',
+      title: t('sandboxInst.colLoadAge'),
       key: 'loadAge',
       width: 100,
       align: 'right',
       render: (_, item) => (
-        <span
-          className="ratio"
-          title="负载是秒级软状态：心跳采样时刻到现在的秒数；超过新鲜度阈值即判「负载过期」"
-        >
+        <span className="ratio" title={t('sandboxInst.loadAgeTooltip')}>
           {loadAgeText(sandboxInstanceState(item, { now: args.now, loadStaleMs: args.loadStaleMs }).loadAgeMs)}
         </span>
       ),
     },
     {
-      title: '心跳',
+      title: t('sandboxInst.colHeartbeat'),
       key: 'heartbeat',
       width: 120,
       render: (_, item) => <span className="ratio">{heartbeatText(item)}</span>,
     },
     {
-      title: '宿主 / pid',
+      title: t('sandboxInst.colHostPid'),
       key: 'host',
       width: 160,
       render: (_, item) => (
@@ -176,6 +186,7 @@ function columnsFor(args: {
 }
 
 export function SandboxInstancesPage() {
+  const { t, locale } = useT()
   const query = useSandboxInstances()
   const [now, setNow] = useState(() => Date.now())
   /**
@@ -227,15 +238,21 @@ export function SandboxInstancesPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>沙箱实例</h1>
+          <h1>{t('sandboxInst.title')}</h1>
           <p className="page__lead">
-            读实例在线注册表 <code>sandbox:instance:*</code>（各实例心跳写入，TTL = 3× 心跳）——
-            与路由网关的自动发现<strong>同源同判据</strong>。「摘流」写 <code>sandbox:drain:*</code>（只挡新会话），
-            <strong>不等于下线</strong>：注册键照常续期，已钉在这台的会话继续服务。
+            {t('sandboxInst.leadPrefix')}
+            <code>sandbox:instance:*</code>
+            {t('sandboxInst.leadMid')}
+            <strong>{t('sandboxInst.leadStrong')}</strong>
+            {t('sandboxInst.leadMid2')}
+            <code>sandbox:drain:*</code>
+            {t('sandboxInst.leadMid3')}
+            <strong>{t('sandboxInst.leadStrong2')}</strong>
+            {t('sandboxInst.leadTail')}
           </p>
         </div>
         <Button onClick={refresh} loading={query.isFetching}>
-          刷新
+          {t('sandboxInst.refresh')}
         </Button>
       </div>
 
@@ -244,7 +261,7 @@ export function SandboxInstancesPage() {
           type="error"
           showIcon
           style={{ marginBottom: 'var(--sp-5)' }}
-          message="读注册表失败（不是「零台实例」）"
+          message={t('sandboxInst.readFailed')}
           description={
             <Typography.Text code>{data.error}</Typography.Text>
           }
@@ -255,28 +272,41 @@ export function SandboxInstancesPage() {
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="关于读数"
+        message={t('sandboxInst.aboutTitle')}
         description={
           <ul style={{ margin: 0, paddingInlineStart: 20 }}>
             <li>
-              <strong>上游表</strong> = 静态 <code>ROUTER_UPSTREAMS</code> 种子 ∪ 自动发现的实例；标记「自动发现」的不在静态种子里。
+              <strong>{t('sandboxInst.aboutUpstreamStrong')}</strong>
+              {t('sandboxInst.aboutUpstreamMid')}
+              <code>ROUTER_UPSTREAMS</code>
+              {t('sandboxInst.aboutUpstreamMid2')}
             </li>
             <li>
-              <strong>负载</strong>来自心跳采样（槽位占用 / 排队深度 / ChatBot 在飞）。超过新鲜度阈值（
-              {data === undefined ? '2× 心跳' : `${Math.round(data.loadStaleMs / 1000)}s`}
-              ）记「负载过期」—— 网关此时退回轮询，不会拿旧数据做 P2C。
+              <strong>{t('sandboxInst.aboutLoadStrong')}</strong>
+              {t('sandboxInst.aboutLoadMid')}
+              {data === undefined
+                ? `2× ${t('sandboxInst.colHeartbeat')}`
+                : `${String(Math.round(data.loadStaleMs / 1000))}s`}
+              {t('sandboxInst.aboutLoadTail')}
             </li>
             <li>
-              <strong>心跳超时</strong>：注册项已超过 TTL，网关通常已经看不见它；本节点的出现说明该实例正在停止或被 Redis 侧残留。
+              <strong>{t('sandboxInst.aboutHeartbeatStrong')}</strong>
+              {t('sandboxInst.aboutHeartbeatMid')}
             </li>
             <li>
-              <strong>摘流</strong>（行内按钮）：只让网关<strong>不再为它分配新会话</strong>；已钉在它上面的会话
-              <strong>仍会继续服务</strong>
-              （容器与工作区都在它本地盘）。<strong>不是下线</strong> —— 想彻底停掉一台请停它的进程。生效：本机立即，其它机器 ≤ 3× 心跳。
+              <strong>{t('sandboxInst.aboutDrainStrong')}</strong>
+              {t('sandboxInst.aboutDrainMid')}
+              <strong>{t('sandboxInst.aboutDrainStrong2')}</strong>
+              {t('sandboxInst.aboutDrainMid2')}
+              <strong>{t('sandboxInst.aboutDrainStrong3')}</strong>
+              {t('sandboxInst.aboutDrainMid3')}
+              <strong>{t('sandboxInst.aboutDrainStrong4')}</strong>
+              {t('sandboxInst.aboutDrainTail')}
             </li>
             <li>
-              当前进程角色：<strong>{data?.role === 'router' ? '网关（不登记实例）' : '沙箱宿主'}</strong>
-              {backendInstanceId == null ? '' : `，本机（打开本页时的后端）= ${backendInstanceId}`}。
+              {t('sandboxInst.rolePrefix')}
+              <strong>{data?.role === 'router' ? t('sandboxInst.roleRouter') : t('sandboxInst.roleHost')}</strong>
+              {backendInstanceId == null ? '' : t('sandboxInst.roleSelfMid') + backendInstanceId}。
             </li>
           </ul>
         }
@@ -289,14 +319,11 @@ export function SandboxInstancesPage() {
           </div>
         ) : query.isError ? (
           <div style={{ padding: 'var(--sp-4)' }}>
-            <ErrorState title="实例列表加载失败" error={query.error} retrying={query.isFetching} onRetry={refresh} />
+            <ErrorState title={t('sandboxInst.listLoadFailed')} error={query.error} retrying={query.isFetching} onRetry={refresh} />
           </div>
         ) : data !== undefined && data.items.length === 0 ? (
           <div style={{ padding: 'var(--sp-4)' }}>
-            <EmptyState
-              title="注册表里没有实例"
-              lead="单机形态下后端也会登记自己；这里为空通常意味着心跳被关掉（SANDBOX_INSTANCE_HEARTBEAT_SEC=0）或 Redis 里没有 sandbox:instance:* 键。"
-            />
+            <EmptyState title={t('sandboxInst.emptyTitle')} lead={t('sandboxInst.emptyLead')} />
           </div>
         ) : (
           <Table<SandboxInstanceItem>
@@ -308,6 +335,8 @@ export function SandboxInstancesPage() {
               // ★ 钉住首屏那台后端（不是每次轮询的作答者）；读不到时退回列表接口的值（至少不是空的）
               selfInstanceId: backendInstanceId ?? data?.selfInstanceId ?? null,
               discovered: data?.discovered ?? [],
+              t,
+              locale,
             })}
             dataSource={data?.items ?? []}
             loading={false}
@@ -329,7 +358,8 @@ export function SandboxInstancesPage() {
 
       {data !== undefined && data.upstreams.length > 0 && (
         <Typography.Paragraph type="secondary" style={{ marginTop: 'var(--sp-4)' }}>
-          上游表：{data.upstreams.join('、')}
+          {t('sandboxInst.upstreamsPrefix')}
+          {data.upstreams.join(t('mcp.listSeparator'))}
         </Typography.Paragraph>
       )}
     </>
@@ -345,15 +375,16 @@ export function SandboxInstancesPage() {
  * "会 / 不会发生什么"写清楚（文案在 `sandboxInstanceModel.ts#drainActionView`，与按钮同源）。
  */
 function DrainButton({ item }: { item: SandboxInstanceItem }) {
+  const { t, locale } = useT()
   const mutation = useSetSandboxDrained()
-  const view = drainActionView(item)
+  const view = drainActionView(item, locale)
   const confirmDrain = (): void => {
     Modal.confirm({
       title: view.confirmTitle,
       content: view.confirmBody,
-      okText: view.drained ? '恢复接收' : '摘流',
+      okText: view.drained ? t('sandboxInst.action.resumeLabel') : t('sandboxInst.action.drainLabel'),
       okButtonProps: view.drained ? {} : { danger: true },
-      cancelText: '取消',
+      cancelText: t('common.cancel'),
       onOk: () => mutation.mutateAsync({ instanceId: item.instanceId, drained: !view.drained }),
     })
   }
@@ -373,7 +404,7 @@ function DrainButton({ item }: { item: SandboxInstanceItem }) {
       {mutation.isError && (
         <Tooltip title={mutation.error instanceof Error ? mutation.error.message : String(mutation.error)}>
           <Typography.Text type="danger" style={{ fontSize: 12 }}>
-            失败
+            {t('sandboxInst.failed')}
           </Typography.Text>
         </Tooltip>
       )}
@@ -390,6 +421,7 @@ function DrainButton({ item }: { item: SandboxInstanceItem }) {
  *     （`useNodeBootstrapJob` 用 `jobId=null` 问"这台当前的任务"，不需要记住任何本地状态）。
  */
 function NodeDetail({ instanceId }: { instanceId: string }) {
+  const { t, locale } = useT()
   const queryClient = useQueryClient()
   const report = useNodeSelf(instanceId)
   const start = useStartBootstrapJob()
@@ -424,13 +456,15 @@ function NodeDetail({ instanceId }: { instanceId: string }) {
         <Tooltip
           title={
             report.data === undefined
-              ? '先完成自检'
+              ? t('sandboxInst.initFirstCheck')
               : report.data.ready
-                ? '该实例全部必需项都正常，无需初始化（只在自检失败时可点，避免误触）'
-                : `只修复未就绪的项：${report.data.items
-                    .filter((item) => item.required && !item.ok)
-                    .map((item) => item.label)
-                    .join('、')}`
+                ? t('sandboxInst.initAllReady')
+                : t('sandboxInst.initOnlyMissing', {
+                    items: report.data.items
+                      .filter((item) => item.required && !item.ok)
+                      .map((item) => item.label)
+                      .join(t('mcp.listSeparator')),
+                  })
           }
         >
           <Button
@@ -446,7 +480,7 @@ function NodeDetail({ instanceId }: { instanceId: string }) {
               })
             }
           >
-            {running ? '初始化中…' : '一键初始化'}
+            {running ? t('sandboxInst.initRunning') : t('sandboxInst.initOneClick')}
           </Button>
         </Tooltip>
         <Button
@@ -457,19 +491,27 @@ function NodeDetail({ instanceId }: { instanceId: string }) {
             void report.refetch()
           }}
         >
-          {refreshing ? '自检中…' : '重新自检'}
+          {refreshing ? t('sandboxInst.rechecking') : t('sandboxInst.recheck')}
         </Button>
         {checkedAt !== null && (
           <Typography.Text type="secondary" style={{ fontSize: 12 }} data-testid="node-checked-at">
-            上次自检：{new Date(checkedAt).toLocaleTimeString()}
+            {t('sandboxInst.lastCheck', { time: new Date(checkedAt).toLocaleTimeString(localeTag(locale)) })}
           </Typography.Text>
         )}
         {report.data !== undefined && (
           <>
-            <Tag>档位：{report.data.role === 'taskAgent' ? '沙箱宿主' : '仅对话'}</Tag>
-            <Tag>宿主平台：{report.data.hostPlatform || '未知'}</Tag>
-            {report.data.needsRelay && <Tag color="orange">需要 relay</Tag>}
-            <Tag color={report.data.ready ? 'green' : 'orange'}>{report.data.ready ? '就绪' : '未就绪'}</Tag>
+            <Tag>
+              {t('sandboxInst.roleTag', {
+                role: report.data.role === 'taskAgent' ? t('sandboxInst.roleTaskAgent') : t('sandboxInst.roleChatOnly'),
+              })}
+            </Tag>
+            <Tag>
+              {t('sandboxInst.hostPlatform', { platform: report.data.hostPlatform || t('sandboxInst.unknown') })}
+            </Tag>
+            {report.data.needsRelay && <Tag color="orange">{t('sandboxInst.needsRelay')}</Tag>}
+            <Tag color={report.data.ready ? 'green' : 'orange'}>
+              {report.data.ready ? t('sandboxInst.readyOrNot') : t('sandboxInst.notReady')}
+            </Tag>
           </>
         )}
       </Space>
@@ -482,16 +524,27 @@ function NodeDetail({ instanceId }: { instanceId: string }) {
       ) : null}
 
       {start.isError ? (
-        <Alert style={{ marginTop: 8 }} type="error" showIcon message="启动初始化失败" description={String(start.error)} />
+        <Alert
+          style={{ marginTop: 8 }}
+          type="error"
+          showIcon
+          message={t('sandboxInst.startInitFailed')}
+          description={String(start.error)}
+        />
       ) : null}
 
       {report.isPending ? (
         <TableSkeleton rows={2} />
       ) : report.isError ? (
-        <ErrorState title="自检失败" error={report.error} retrying={report.isFetching} onRetry={() => void report.refetch()} />
+        <ErrorState
+          title={t('sandboxInst.recheckFailed')}
+          error={report.error}
+          retrying={report.isFetching}
+          onRetry={() => void report.refetch()}
+        />
       ) : refreshing ? (
         // 已有数据时刷新：**不闪白**，在旧结果上盖一层淡化的"正在重新自检"（用户能立刻看到动效）
-        <Spin spinning tip="正在重新自检…">
+        <Spin spinning tip={t('sandboxInst.recheckingSpin')}>
           <div style={{ opacity: 0.55 }}>
             <ItemList items={report.data.items} />
           </div>
@@ -504,6 +557,7 @@ function NodeDetail({ instanceId }: { instanceId: string }) {
 }
 
 function ItemList({ items }: { items: readonly NodeCheckItem[] }) {
+  const { t } = useT()
   return (
     <ul style={{ margin: 0, paddingLeft: 18 }}>
       {items.map((item) => (
@@ -514,7 +568,7 @@ function ItemList({ items }: { items: readonly NodeCheckItem[] }) {
           <Typography.Text type="secondary">
             {' '}
             — {item.detail}
-            {item.required ? '' : '（可选）'}
+            {item.required ? '' : t('sandboxInst.optional')}
           </Typography.Text>
         </li>
       ))}

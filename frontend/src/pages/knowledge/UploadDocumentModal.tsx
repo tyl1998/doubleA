@@ -34,12 +34,12 @@ import { Alert, Button, Checkbox, Modal, Radio, Upload } from 'antd'
 import {
   DEFAULT_DOCUMENT_IMAGE_OPTIONS,
   hasAnyImageOption,
-  IMAGE_RECOGNITION_LABELS,
+  IMAGE_RECOGNITION_KEY,
   IMAGE_RECOGNITIONS,
-  IMAGE_VECTORIZE_LABEL,
+  IMAGE_VECTORIZE_KEY,
   LEGACY_DOC_EXTENSION,
-  REUPLOAD_UNCHANGED_HINT,
   UPLOAD_EXTENSIONS,
+  translate,
   type DocumentImageOptions,
   type DocumentItem,
   type ImageRecognition,
@@ -49,6 +49,7 @@ import { useEffect, useRef, useState } from 'react'
 import { describeError } from '../../api/client.js'
 import { useReuploadDocument, useUploadDocument } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
   LEGACY_DOC_PROBE_BYTES,
   UPLOAD_ACCEPT_ATTRIBUTE,
@@ -85,6 +86,7 @@ export function UploadDocumentModal({
   describeSupported,
 }: UploadDocumentModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const upload = useUploadDocument(kbId)
   const reupload = useReuploadDocument(kbId)
 
@@ -129,8 +131,8 @@ export function UploadDocumentModal({
           onSuccess: (result) => {
             feedback.ok(
               result.deduplicated
-                ? `该库里已有内容完全相同的文档，未新建记录（沿用「${result.document.fileName}」）`
-                : `已上传「${result.document.fileName}」并加入解析队列`,
+                ? t('uploadDoc.deduplicated', { name: result.document.fileName })
+                : t('uploadDoc.uploaded', { name: result.document.fileName }),
             )
             onClose()
           },
@@ -146,8 +148,8 @@ export function UploadDocumentModal({
         onSuccess: (result) => {
           feedback.ok(
             result.unchanged
-              ? `「${result.document.fileName}」${REUPLOAD_UNCHANGED_HINT}`
-              : `已覆盖重传「${result.document.fileName}」并加入解析队列`,
+              ? t('uploadDoc.unchanged', { name: result.document.fileName, hint: t('hint.reuploadUnchanged') })
+              : t('uploadDoc.reuploaded', { name: result.document.fileName }),
           )
           onClose()
         },
@@ -156,7 +158,7 @@ export function UploadDocumentModal({
     )
   }
 
-  const title = reuploading ? `覆盖重传「${doc.fileName}」` : '上传文档'
+  const title = reuploading ? t('uploadDoc.titleReupload', { name: doc.fileName }) : t('uploadDoc.title')
 
   return (
     <Modal
@@ -165,7 +167,7 @@ export function UploadDocumentModal({
       width={560}
       footer={[
         <Button key="cancel" onClick={onClose} disabled={mutating}>
-          取消
+          {t('common.cancel')}
         </Button>,
         <Button
           key="ok"
@@ -174,7 +176,7 @@ export function UploadDocumentModal({
           disabled={picked === null || rejection !== null || imageOptionMissing}
           onClick={submit}
         >
-          {reuploading ? '开始重传' : '开始上传'}
+          {reuploading ? t('uploadDoc.startReupload') : t('uploadDoc.startUpload')}
         </Button>
       ]}
       onCancel={onClose}
@@ -194,7 +196,7 @@ export function UploadDocumentModal({
             pickSeq.current = seq
             const item = fileList[0]
 
-            const result = screenPickedFiles(fileList.map((f) => ({ name: f.name, size: f.size })))
+            const result = screenPickedFiles(fileList.map((f) => ({ name: f.name, size: f.size })), locale)
             if (result.kind === 'reject') {
               setRejection(result)
               setPicked(null)
@@ -213,7 +215,7 @@ export function UploadDocumentModal({
                 .arrayBuffer()
                 .then((buffer) => {
                   if (pickSeq.current !== seq) return // 已被更晚的一次选择取代
-                  const verdict = screenLegacyDocContent(item.name, new Uint8Array(buffer))
+                  const verdict = screenLegacyDocContent(item.name, new Uint8Array(buffer), locale)
                   if (verdict.kind === 'reject') {
                     setRejection(verdict)
                     setPicked(null)
@@ -233,21 +235,20 @@ export function UploadDocumentModal({
             return false
           }}
         >
-          <p className="empty__title">把文件拖到这里</p>
+          <p className="empty__title">{t('uploadDoc.dropTitle')}</p>
           <p className="ratio">
-            支持 {UPLOAD_EXTENSIONS.map((extension) => `.${extension}`).join(' / ')}；
-            一次一个文件。上传后文档进入「解析中」，由后台流水线异步解析与分块。
+            {t('uploadDoc.dropLead', { extensions: UPLOAD_EXTENSIONS.map((extension) => `.${extension}`).join(' / ') })}
           </p>
         </Upload.Dragger>
 
         {picked !== null && (
           <p className="ratio">
-            已选择：<span className="num">{picked.name}</span>
+            {t('uploadDoc.selected', { name: picked.name })}
           </p>
         )}
 
         <div className="stack stack--tight">
-          <p className="ratio">图片识别方式（三选一）：</p>
+          <p className="ratio">{t('uploadDoc.imageModeLabel')}</p>
           <Radio.Group
             value={options.imageRecognize}
             onChange={(event) =>
@@ -255,7 +256,7 @@ export function UploadDocumentModal({
             }
             options={IMAGE_RECOGNITIONS.map((recognition) => ({
               value: recognition,
-              label: IMAGE_RECOGNITION_LABELS[recognition],
+              label: translate(locale, IMAGE_RECOGNITION_KEY[recognition]),
               disabled: !isRecognitionAllowed(recognition, caps),
             }))}
           />
@@ -266,18 +267,15 @@ export function UploadDocumentModal({
               setOptions((previous) => ({ ...previous, imageVectorize: event.target.checked }))
             }
           >
-            {IMAGE_VECTORIZE_LABEL}
+            {translate(locale, IMAGE_VECTORIZE_KEY)}
           </Checkbox>
           <p className="ratio">
-            「文字识别」在本机离线 OCR 出图上文字；「含义识别」用知识库选定的图片描述模型读图
-            （摘要 / 流程图转 Mermaid / 关键标签）——区别是识别方式，二者互斥、同时只需选一个。
-            「向量化」把图片编码进向量空间（视觉语义），可与任一识别方式并存、也可单独开。
-            独立上传的图片文件至少选一项。
-            {!multimodalSupported && ' 当前知识库向量模型不支持多模态，不能选「图片向量化」。'}
-            {!describeSupported && ' 当前知识库未选「图片描述模型」，不能选「图片含义识别（大模型）」。'}
+            {t('uploadDoc.imageHelp')}
+            {!multimodalSupported && t('uploadDoc.noMultimodal')}
+            {!describeSupported && t('uploadDoc.noDescribe')}
           </p>
           {imageOptionMissing && (
-            <Alert type="warning" showIcon message="这是图片文件，请至少选择一种图片处理方式后上传。" />
+            <Alert type="warning" showIcon message={t('uploadDoc.imageRequired')} />
           )}
         </div>
 
@@ -291,7 +289,7 @@ export function UploadDocumentModal({
                 {rejection.hint !== null && <p>{rejection.hint}</p>}
                 {/* 验收原文要的是"立即提示**且不发请求**"——那就把这件事说出来，
                     否则用户无从判断这次点击到底有没有惊动服务端 */}
-                <p className="ratio">文件已被前端拦下，没有发起上传请求。</p>
+                <p className="ratio">{t('uploadDoc.blockedNote')}</p>
               </>
             }
           />
@@ -301,17 +299,22 @@ export function UploadDocumentModal({
           <Alert
             type="warning"
             showIcon
-            message="覆盖重传会换掉这一篇的内容"
-            description="旧片段先删后建：期间这篇文档不可检索（列表里显示「更新中，暂不参与检索」）。文档 id 与创建时间不变，引用它的智能体不需要改配置。"
+            message={t('uploadDoc.reuploadWarnTitle')}
+            description={t('uploadDoc.reuploadWarnDesc')}
           />
         )}
 
         {errorText !== null && (
-          <Alert type="error" showIcon message={reuploading ? '重传失败' : '上传失败'} description={errorText} />
+          <Alert
+            type="error"
+            showIcon
+            message={reuploading ? t('uploadDoc.failedReupload') : t('uploadDoc.failedUpload')}
+            description={errorText}
+          />
         )}
 
         <p className="ratio">
-          单文件大小上限由服务端配置决定（超出会返回 413）；扫描件会在解析阶段判为失败并给出原因。
+          {t('uploadDoc.sizeNote')}
         </p>
       </div>
     </Modal>

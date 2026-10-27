@@ -31,7 +31,7 @@
  * 并发送，两端都不会看到对方的"正在生成"（新会话通常是任务刚建的，正常不会发生）。
  */
 
-import { AppError, EMPTY_ACTIVE_SNAPSHOT } from '@doubulea/shared'
+import { appMsg, AppError, EMPTY_ACTIVE_SNAPSHOT } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
@@ -108,7 +108,7 @@ export async function runScheduledTaskTurn(input: {
   })
   if (!locked) {
     clearTimeout(timeoutTimer)
-    throw AppError.conflict('该会话正在生成中，本次定时运行被跳过')
+    throw AppError.conflict(appMsg('app.m065'))
   }
   openRun(conversationId)
 

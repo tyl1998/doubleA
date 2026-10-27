@@ -41,6 +41,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 
 import type { ConversationRunOrigin } from '@doubulea/shared'
+import { translate, type Locale } from '@doubulea/shared'
 
 import {
   conversationMessagesQueryKey,
@@ -48,6 +49,7 @@ import {
   streamConversationWatch,
 } from '../../api/conversations.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
+import { currentLocale } from '../../stores/locale.js'
 import { roundOf, useChatStreamStore } from '../../stores/chatStream.js'
 import { reportSseIssue } from './chatStream.js'
 
@@ -58,16 +60,16 @@ import { reportSseIssue } from './chatStream.js'
  * 写死一句就等于把外部调用、别的窗口发起的轮次全都说成定时任务（2026-10-22 的 bug）。
  * 来源不明时用中性措辞 —— 少说，但不能说错。
  */
-export function watchPlaceholderText(origin: ConversationRunOrigin | null | undefined): string {
+export function watchPlaceholderText(origin: ConversationRunOrigin | null | undefined, locale: Locale): string {
   switch (origin) {
     case 'SCHEDULED':
-      return '（定时任务正在运行…）'
+      return translate(locale, 'watch.scheduled')
     case 'OPEN_API':
-      return '（外部调用正在运行…）'
+      return translate(locale, 'watch.openApi')
     case 'UI':
-      return '（另一处界面正在生成…）'
+      return translate(locale, 'watch.ui')
     default:
-      return '（这一轮正在生成…）'
+      return translate(locale, 'watch.unknown')
   }
 }
 
@@ -129,7 +131,7 @@ export function useConversationWatch(conversationId: string | undefined): void {
                 // 第一帧：开一轮（占位正文），此后由上面的 `opened` 分支继续喂
                 useChatStreamStore
                   .getState()
-                  .begin(conversationId, watchPlaceholderText(origin), new Date().toISOString(), 'send')
+                  .begin(conversationId, watchPlaceholderText(origin, currentLocale()), new Date().toISOString(), 'send')
                 opened = true
                 useChatStreamStore.getState().apply(conversationId, event)
               }

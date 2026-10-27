@@ -12,7 +12,8 @@
  *   · **负载过期**（`load.sampledAt` 超过 `loadStaleMs` = `2× 心跳`）：实例在线，但这份负载不能拿来比较。
  */
 
-import type { SandboxInstanceItem } from '@doubulea/shared'
+import type { Locale, MessageKey, SandboxInstanceItem } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 /** 实例的展示状态（`online` = 注册新鲜且负载新鲜；`load-stale` = 在线但负载不可用；`stale` = 注册快过期） */
 export type SandboxInstanceState = 'online' | 'load-stale' | 'stale'
@@ -43,10 +44,15 @@ export function sandboxInstanceState(
   return { state: 'online', loadAgeMs, slotRatio }
 }
 
-export const SANDBOX_INSTANCE_STATE_LABELS: Readonly<Record<SandboxInstanceState, string>> = {
-  online: '在线',
-  'load-stale': '负载过期',
-  stale: '心跳超时',
+export const SANDBOX_INSTANCE_STATE_LABEL_KEY: Readonly<Record<SandboxInstanceState, MessageKey>> = {
+  online: 'label.sandboxInstState.online',
+  'load-stale': 'label.sandboxInstState.loadStale',
+  stale: 'label.sandboxInstState.stale',
+}
+
+/** 便捷：状态 → 译文（组件不必自己 translate） */
+export function sandboxInstanceStateLabel(state: SandboxInstanceState, locale: Locale): string {
+  return translate(locale, SANDBOX_INSTANCE_STATE_LABEL_KEY[state])
 }
 
 /**
@@ -55,7 +61,7 @@ export const SANDBOX_INSTANCE_STATE_LABELS: Readonly<Record<SandboxInstanceState
  * 抽成纯函数是为了让「按钮文案 / 确认框文案 / 后果说明」三处永远一致 —— 这三处在三个组件里，
  * 各写一遍就会出现"按钮说恢复、弹窗还说摘流"这类只靠肉眼才能发现的错。
  */
-export function drainActionView(item: SandboxInstanceItem): {
+export function drainActionView(item: SandboxInstanceItem, locale: Locale): {
   /** `true` = 当前已摘流（按钮应该是「恢复接收」） */
   drained: boolean
   /** 按钮文案 */
@@ -68,26 +74,22 @@ export function drainActionView(item: SandboxInstanceItem): {
   if (item.drained) {
     return {
       drained: true,
-      actionLabel: '恢复接收',
-      confirmTitle: `让实例 ${item.instanceId} 重新接收新会话？`,
-      confirmBody:
-        '恢复后网关会重新把它列入新会话的候选（按负载 P2C 挑选）。它名下的已有会话不受影响。生效时间：本机立即，其它机器 ≤ 3× 心跳。',
+      actionLabel: translate(locale, 'sandboxInst.action.resumeLabel'),
+      confirmTitle: translate(locale, 'sandboxInst.action.resumeTitle', { id: item.instanceId }),
+      confirmBody: translate(locale, 'sandboxInst.action.resumeDesc'),
     }
   }
   return {
     drained: false,
-    actionLabel: '摘流',
-    confirmTitle: `把实例 ${item.instanceId} 从新会话里摘掉？`,
-    confirmBody:
-      '摘流后网关不再把**新会话**派给它（例如你要手工换镜像、腾空这台机器）。' +
-      '已钉在这台上的会话（容器与工作区都在它本地盘）**仍会继续服务**，不会掉线；' +
-      '这台机器也不会下线（注册键继续续期）。生效时间：本机立即，其它机器 ≤ 3× 心跳。',
+    actionLabel: translate(locale, 'sandboxInst.action.drainLabel'),
+    confirmTitle: translate(locale, 'sandboxInst.action.drainTitle', { id: item.instanceId }),
+    confirmBody: translate(locale, 'sandboxInst.action.drainDesc'),
   }
 }
 
 /** 占用率的展示文案（`3/10 · 30%`）；没有负载时说"未知"而不是 `0%` */
-export function slotRatioText(item: SandboxInstanceItem): string {
-  if (item.load === null) return '未知'
+export function slotRatioText(item: SandboxInstanceItem, locale: Locale): string {
+  if (item.load === null) return translate(locale, 'sandboxInst.unknown')
   const total = item.load.slotsTotal
   if (total <= 0) return `${item.load.slotsUsed}/0`
   return `${item.load.slotsUsed}/${total} · ${Math.round((item.load.slotsUsed / total) * 100)}%`

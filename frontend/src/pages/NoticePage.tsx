@@ -16,6 +16,7 @@ import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
 import { usePageCrumb } from '../app/crumbContext.js'
+import { useT } from '../app/i18n.js'
 import { HOME_PATH, LOGIN_PATH } from '../app/paths.js'
 
 export type NoticeTone = 'accent' | 'warn' | 'danger'
@@ -36,6 +37,7 @@ function toneClass(tone: NoticeTone | undefined): string {
 }
 
 export function NoticePage({ serial, title, lead, tag, bullets, actions }: NoticePageProps) {
+  const { t } = useT()
   // 面包屑（快捷页面导航）已挪到**顶栏**：这里把页面标题作为「细节段」上报，
   // 顶栏渲染成 `工作台 / <title>`（占位页 / 未找到没有独立的模块段）。
   usePageCrumb(title)
@@ -60,7 +62,7 @@ export function NoticePage({ serial, title, lead, tag, bullets, actions }: Notic
       <div className="card bracket card--pad stack">
         {bullets !== undefined && bullets.length > 0 && (
           <div>
-            <p className="kicker">这一页会包含</p>
+            <p className="kicker">{t('notice.bulletsTitle')}</p>
             <ul style={{ marginTop: 'var(--sp-3)' }}>
               {bullets.map((item) => (
                 <li key={item} style={{ color: 'var(--ink-2)', fontSize: 'var(--fs-sm)' }}>
@@ -90,54 +92,47 @@ export interface BatchPlaceholderPageProps {
  * 比"点不动"和"什么都没有"都诚实。
  */
 export function BatchPlaceholderPage({ serial, title, bullets }: BatchPlaceholderPageProps) {
+  const { t } = useT()
   return (
     <NoticePage
       serial={serial}
       title={title}
       lead={
         <>
-          {'本页尚未开工，后续版本会开放。当前可用的功能是登录 / 首登强制改密 / 修改密码 —— '}
-          <Link to={HOME_PATH}>回到首页</Link>。
+          {t('notice.placeholderLeadPrefix')}
+          <Link to={HOME_PATH}>{t('notice.placeholderLeadLink')}</Link>
+          {t('notice.placeholderLeadSuffix')}
         </>
       }
       bullets={bullets}
-      actions={
-        <Link to={HOME_PATH}>
-          ← 回到首页
-        </Link>
-      }
+      actions={<Link to={HOME_PATH}>{t('notice.backHome')}</Link>}
     />
   )
 }
 
 export function ForbiddenPage() {
+  const { t } = useT()
   return (
     <NoticePage
-      serial="S-00 · 权限"
-      title="没有权限"
+      serial={t('notice.forbiddenSerial')}
+      title={t('notice.forbiddenTitle')}
+      // ⚠️ 错误码 `403 FORBIDDEN` 是**契约值**（对照 `shared#ERROR_CODES`），不翻译
       tag={{ text: '403 FORBIDDEN', tone: 'danger' }}
-      lead="这一页仅管理员可见。当前账号是普通成员；如果确实需要，请联系管理员调整角色。"
-      actions={
-        <Link to={HOME_PATH}>
-          ← 回到首页
-        </Link>
-      }
+      lead={t('notice.forbiddenLead')}
+      actions={<Link to={HOME_PATH}>{t('notice.backHome')}</Link>}
     />
   )
 }
 
 export function NotFoundPage() {
+  const { t } = useT()
   return (
     <NoticePage
-      serial="S-00 · 未找到"
-      title="页面不存在"
+      serial={t('notice.notFoundSerial')}
+      title={t('notice.notFoundTitle')}
       tag={{ text: '404 NOT_FOUND', tone: 'danger' }}
-      lead="地址可能写错了，或者这个页面已经改名。左侧栏里的导航项就是全部目的地。"
-      actions={
-        <Link to={LOGIN_PATH}>
-          ← 回到登录页
-        </Link>
-      }
+      lead={t('notice.notFoundLead')}
+      actions={<Link to={LOGIN_PATH}>{t('notice.backLogin')}</Link>}
     />
   )
 }

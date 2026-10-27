@@ -34,6 +34,7 @@ import { Link } from 'react-router-dom'
 
 import { ARTIFACTS_PAGE_LIMIT, deleteArtifact, deleteArtifacts, useMyArtifacts } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { AGENTS_PATH } from '../../app/paths.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
@@ -47,6 +48,7 @@ export function ArtifactCollectionPage() {
   const [offset, setOffset] = useState(0)
   const query = useMyArtifacts(offset, limit)
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const queryClient = useQueryClient()
 
   // 相对时间读数（"3 分钟前"）不会自己走 —— 与侧栏 / 产物面板共用同一个节拍器
@@ -66,7 +68,7 @@ export function ArtifactCollectionPage() {
   const remove = useMutation({
     mutationFn: (artifactId: string) => deleteArtifact(artifactId),
     onSuccess: (_data, artifactId) => {
-      feedback.ok('产物已删除')
+      feedback.ok(t('artifacts.deletedOk'))
       // 单条删掉后把它从勾选集里摘掉，否则"批量删除（1）"会指着一个已不存在的产物
       setSelectedIds((prev) => {
         if (!prev.has(artifactId)) return prev
@@ -76,7 +78,7 @@ export function ArtifactCollectionPage() {
       })
     },
     onError: (error) => {
-      feedback.fail(error, '删除失败')
+      feedback.fail(error, t('artifacts.deleteFailed'))
     },
     onSettled: () => {
       // 删掉当页最后一条时回退一页：否则会停在一个空页上，看着像"产物全没了"。
@@ -90,14 +92,14 @@ export function ArtifactCollectionPage() {
     onSuccess: (result, artifactIds) => {
       // ⚠️ 报的是服务端**实际删掉的行数**（`deleted`），不是勾选数 —— 混进"不是我的 /
       //    已不存在"的会被如实扣掉（见 `api/artifacts.ts#deleteArtifacts`）。
-      feedback.ok(`已删除 ${result.deleted} 个产物`)
+      feedback.ok(t('artifacts.batchDeletedOk', { count: result.deleted }))
       setSelectedIds(new Set())
       // 把当页整页删空时回退一页（与单条删除同款，避免停在一个空页上）。
       // ⚠️ 只在**成功**时回退：失败（如 S3 不可用）时删掉的可能不足一页，跳页会更迷惑。
       if (artifactIds.length >= items.length && offset > 0) setOffset(Math.max(0, offset - limit))
     },
     onError: (error) => {
-      feedback.fail(error, '批量删除失败')
+      feedback.fail(error, t('artifacts.batchDeleteFailed'))
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ['artifacts', 'collection'] })
@@ -121,17 +123,14 @@ export function ArtifactCollectionPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>会话产物</h1>
-          <p className="page__lead">
-            所有会话里 TaskAgent 在容器中生成的文件汇总在这里。可以预览、下载，也可以删除（删除后
-            不可恢复）。与其它产物一样受保留期收口（超过保留天数后由后端清理）。
-          </p>
+          <h1>{t('artifacts.title')}</h1>
+          <p className="page__lead">{t('artifacts.lead')}</p>
         </div>
       </div>
 
       {query.isError ? (
         <ErrorState
-          title="会话产物没读出来"
+          title={t('artifacts.loadFailed')}
           error={query.error}
           onRetry={() => {
             void query.refetch()
@@ -142,11 +141,11 @@ export function ArtifactCollectionPage() {
         <TableSkeleton />
       ) : items.length === 0 ? (
         <EmptyState
-          title="还没有会话产物"
-          lead="派一个任务型智能体干活，它在沙箱里生成的文件会汇总到这里。"
+          title={t('artifacts.emptyTitle')}
+          lead={t('artifacts.emptyLead')}
           action={
             <Link to={AGENTS_PATH}>
-              <Button type="primary">回到智能体列表</Button>
+              <Button type="primary">{t('artifacts.backToAgents')}</Button>
             </Link>
           }
         />
@@ -160,16 +159,16 @@ export function ArtifactCollectionPage() {
                 toggleAll(event.target.checked)
               }}
             >
-              全选本页
+              {t('artifacts.selectAllPage')}
             </Checkbox>
             <p className="ratio">
-              共 <span className="num">{total}</span> 个 · 最新产出在最上面
+              {t('artifacts.totalCount', { total })}
             </p>
             <Popconfirm
-              title={`删除选中的 ${selectedOnPage.length} 个产物？`}
-              description="删除后不可恢复：文件与记录都会一并移除。"
-              okText="删除"
-              cancelText="取消"
+              title={t('artifacts.deleteSelectedTitle', { count: selectedOnPage.length })}
+              description={t('artifacts.deleteConfirmDescription')}
+              okText={t('common.delete')}
+              cancelText={t('common.cancel')}
               okButtonProps={{ danger: true }}
               disabled={selectedOnPage.length === 0}
               onConfirm={async () => {
@@ -183,7 +182,9 @@ export function ArtifactCollectionPage() {
                 disabled={selectedOnPage.length === 0}
                 loading={removeBatch.isPending}
               >
-                批量删除{selectedOnPage.length > 0 ? `（${selectedOnPage.length}）` : ''}
+                {selectedOnPage.length > 0
+                  ? t('artifacts.batchDeleteWithCount', { count: selectedOnPage.length })
+                  : t('artifacts.batchDelete')}
               </Button>
             </Popconfirm>
           </div>
@@ -192,7 +193,7 @@ export function ArtifactCollectionPage() {
               <ArtifactCard
                 key={item.artifactId}
                 artifact={item}
-                timeText={artifactTimeText(item.createdAt, now)}
+                timeText={artifactTimeText(item.createdAt, now, locale)}
                 selected={selectedIds.has(item.artifactId)}
                 onSelectedChange={(checked) => {
                   toggleOne(item.artifactId, checked)

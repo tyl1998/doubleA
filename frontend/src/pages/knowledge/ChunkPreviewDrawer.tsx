@@ -32,6 +32,7 @@ import {
   CHUNKS_PAGE_LIMIT,
   useDocumentChunks,
 } from '../../api/knowledgeBases.js'
+import { useT } from '../../app/i18n.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { chunkLengthText, chunkLocationText } from './knowledgeModel.js'
 
@@ -44,6 +45,7 @@ export interface ChunkPreviewDrawerProps {
 }
 
 export function ChunkPreviewDrawer({ kbId, doc, open, onClose }: ChunkPreviewDrawerProps) {
+  const { t } = useT()
   return (
     <Drawer
       open={open}
@@ -51,10 +53,10 @@ export function ChunkPreviewDrawer({ kbId, doc, open, onClose }: ChunkPreviewDra
       width={820}
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          片段预览
+          {t('chunkPreview.title')}
           {doc !== null && (
             <Tag>
-              {doc.fileName} · {doc.chunkCount} 块
+              {t('chunkPreview.tag', { name: doc.fileName, count: doc.chunkCount })}
             </Tag>
           )}
         </span>
@@ -79,6 +81,7 @@ function ChunkPreviewBody({
   enabled: boolean
 }) {
   const [page, setPage] = useState(1)
+  const { t, locale } = useT()
   const offset = (page - 1) * CHUNKS_PAGE_LIMIT
 
   const query = useDocumentChunks(kbId, docId, { offset, limit: CHUNKS_PAGE_LIMIT }, enabled)
@@ -87,18 +90,18 @@ function ChunkPreviewBody({
 
   const columns: TableColumnsType<ChunkItem> = [
     {
-      title: '位置',
+      title: t('chunkPreview.colLocation'),
       key: 'location',
       width: 240,
       render: (_, chunk) => (
         <div className="kb-cell">
-          <span className="kb-cell__name">{chunkLocationText(chunk)}</span>
-          <span className="kb-cell__sub num">{chunkLengthText(chunk.content)}</span>
+          <span className="kb-cell__name">{chunkLocationText(chunk, locale)}</span>
+          <span className="kb-cell__sub num">{chunkLengthText(chunk.content, locale)}</span>
         </div>
       ),
     },
     {
-      title: '内容',
+      title: t('chunkPreview.colContent'),
       dataIndex: 'content',
       render: (_, chunk) => <div className="chunk-content">{chunk.content}</div>,
     },
@@ -109,7 +112,7 @@ function ChunkPreviewBody({
   if (query.isError) {
     return (
       <ErrorState
-        title="片段加载失败"
+        title={t('chunkPreview.loadFailed')}
         error={query.error}
         retrying={query.isFetching}
         onRetry={() => {
@@ -124,8 +127,8 @@ function ChunkPreviewBody({
     // 不假装成功（`03` §七：空态要带一句能照着做的话）。
     return (
       <EmptyState
-        title="没有可预览的片段"
-        lead="这篇文档当前没有已入库的片段。若它刚被覆盖重传，等状态回到「已完成」后再看。"
+        title={t('chunkPreview.emptyTitle')}
+        lead={t('chunkPreview.emptyLead')}
       />
     )
   }
@@ -133,8 +136,9 @@ function ChunkPreviewBody({
   return (
     <>
       <p className="ratio" style={{ marginBottom: 'var(--sp-3)' }}>
-        共 <span className="num">{data?.total ?? 0}</span> 块，按文档内顺序（<code>seq</code>）升序展示整块原文，
-        不做摘要或截断。
+        {t('chunkPreview.totalPrefix', { total: data?.total ?? 0 })}
+        <code>seq</code>
+        {t('chunkPreview.totalSuffix')}
       </p>
       <Table<ChunkItem>
         rowKey="id"

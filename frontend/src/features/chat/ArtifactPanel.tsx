@@ -28,6 +28,7 @@
 
 import { Alert, Button } from 'antd'
 
+import { useT } from '../../app/i18n.js'
 import {
   ARTIFACT_PANEL_EMPTY,
   ARTIFACT_PANEL_NOTE,
@@ -61,21 +62,22 @@ function headLedClass(streaming: boolean, count: number): string {
 export function ArtifactPanel({ items, total, listFailed, onRetry, streaming }: ArtifactPanelProps) {
   // 相对时间读数（"3 分钟前"）不会自己走 —— 与侧栏共用同一个节拍器（`useMinuteTick` 文件头）
   const now = useMinuteTick()
-  const overflow = artifactPanelOverflowNote(items.length, total)
+  const { t, locale } = useT()
+  const overflow = artifactPanelOverflowNote(items.length, total, locale)
 
   return (
-    <aside className="panel" aria-label="产物面板" data-testid="artifact-panel">
+    <aside className="panel" aria-label={t('artifact.panelAria')} data-testid="artifact-panel">
       <div className="panel__head">
         <div className="row">
           <p className="kicker">
-            {ARTIFACT_PANEL_TITLE} · {items.length}
+            {t(ARTIFACT_PANEL_TITLE)} · {items.length}
           </p>
           <span className={`${headLedClass(streaming, items.length)} u-right`} aria-hidden="true" />
         </div>
         {/* 副标题只说一件**能证实**的事：排序口径（服务端列表是 `created_at desc`，
             本轮的流式那一段被 `mergeArtifactPanelItems` 倒序对齐到同一口径） */}
         <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-          最新产出在最上面
+          {t('artifact.panelLatestFirst')}
         </p>
       </div>
 
@@ -85,11 +87,11 @@ export function ArtifactPanel({ items, total, listFailed, onRetry, streaming }: 
           <Alert
             type="warning"
             showIcon
-            message="产物列表没读出来"
-            description="本轮刚产出的那些仍然在下面。点重试读一次完整列表；刷新页面也会重读。"
+            message={t('artifact.listFailedTitle')}
+            description={t('artifact.listFailedDescription')}
             action={
               <Button size="small" onClick={onRetry}>
-                重试
+                {t('common.retry')}
               </Button>
             }
           />
@@ -97,13 +99,17 @@ export function ArtifactPanel({ items, total, listFailed, onRetry, streaming }: 
 
         {items.length === 0 ? (
           <p className="ratio" data-testid="artifact-panel-empty">
-            {ARTIFACT_PANEL_EMPTY}
+            {t(ARTIFACT_PANEL_EMPTY)}
           </p>
         ) : (
           items.map((item) => (
             // ⚠️ 时间读数**由这里算好再交给卡片**：卡片不认识 `ArtifactPanelItem`，
             //    它只接受一个字符串（见 `ArtifactCard` 文件头的 `timeText` 那段）
-            <ArtifactCard key={item.artifactId} artifact={item} timeText={artifactTimeText(item.createdAt, now)} />
+            <ArtifactCard
+              key={item.artifactId}
+              artifact={item}
+              timeText={artifactTimeText(item.createdAt, now, locale)}
+            />
           ))
         )}
 
@@ -115,7 +121,7 @@ export function ArtifactPanel({ items, total, listFailed, onRetry, streaming }: 
 
         {/* 底部常驻说明（`design/chat.html` 的 `.alert--info`）：它是"空闲回收之后还能下载"
             这条保证的**唯一落点** —— 用户看着沙箱被回收时，需要知道产物没跟着没 */}
-        <Alert type="info" showIcon message={ARTIFACT_PANEL_NOTE} />
+        <Alert type="info" showIcon message={t(ARTIFACT_PANEL_NOTE)} />
       </div>
     </aside>
   )

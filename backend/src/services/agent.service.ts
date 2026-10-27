@@ -65,7 +65,7 @@
  *    全程**不动 `agents.updated_at`**（它只是列表排序键，见 ⑤）。
  */
 
-import {
+import { appMsg,
   AGENT_NAME_MAX_CHARS,
   AppError,
   audienceIsEmpty,
@@ -421,7 +421,7 @@ export async function getAgent(id: string, viewer: AgentViewer): Promise<AgentIt
     where: { id, deletedAt: null },
     select: AGENT_SELECT,
   })
-  if (row === null) throw AppError.notFound('智能体不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m000'))
   // P1-18：私有/指定用户 Agent 对受众外的人**404**（不泄漏存在性）—— 与列表过滤同判据（`canViewAsset`）
   const groupIds = await resolveViewerGroupIds(viewer)
   if (
@@ -435,7 +435,7 @@ export async function getAgent(id: string, viewer: AgentViewer): Promise<AgentIt
       { ...viewer, groupIds },
     )
   ) {
-    throw AppError.notFound('智能体不存在')
+    throw AppError.notFound(appMsg('app.m000'))
   }
   const audiences = await loadAudiences([row])
   return toItem(row, await componentsOf(id), viewer, audiences.get(row.id) ?? emptyAudience())
@@ -485,11 +485,11 @@ async function assertAudienceSubjectsExist(audience: { userIds: string[]; groupI
   ])
   const missingUsers = audience.userIds.filter((id) => !users.some((u) => u.id === id))
   if (missingUsers.length > 0) {
-    throw AppError.validation(`受众里有不存在或已停用的用户：${missingUsers.join('、')}`)
+    throw AppError.validation(appMsg('app.m114', { p0: missingUsers.join('、') }))
   }
   const missingGroups = audience.groupIds.filter((id) => !groups.some((g) => g.id === id))
   if (missingGroups.length > 0) {
-    throw AppError.validation(`受众里有不存在的用户组：${missingGroups.join('、')}`)
+    throw AppError.validation(appMsg('app.m115', { p0: missingGroups.join('、') }))
   }
 }
 
@@ -534,28 +534,24 @@ async function assertChatModelsBindable(modelIds: string[], viewer: AgentViewer)
 
   for (const id of unique) {
     const row = byId.get(id)
-    if (row === undefined) throw AppError.notFound(`模型不存在：${id}`)
+    if (row === undefined) throw AppError.notFound(appMsg('app.m116', { p0: id }))
     if (row.type !== 'CHAT') {
-      throw AppError.conflict(
-        `该模型是向量模型（EMBEDDING），不能绑定到智能体：${row.modelName}。请选择对话模型`,
+      throw AppError.conflict(appMsg('app.m117', { p0: row.modelName }),
       )
     }
     if (!row.enabled) {
-      throw AppError.conflict(
-        `模型已停用，不能绑定：${row.modelName}。请在模型池管理页启用它，或改用其他模型`,
+      throw AppError.conflict(appMsg('app.m118', { p0: row.modelName }),
       )
     }
     if (!row.provider.enabled) {
-      throw AppError.conflict(
-        `该模型所属的 Provider「${row.provider.name}」已停用，不能绑定。` +
-          '请启用该 Provider，或改用其他模型',
+      throw AppError.conflict(appMsg('app.m262', { p0: row.provider.name }),
       )
     }
     // P1-18：Provider 无可见范围、无定向分享 ⇒ 绑定时要求**我对该 Provider 有权使用**
     // （所属人 / ADMIN）。别人私有的 Provider 我绑不了（要复用请让对方把**引用它的 Agent** 分享给我）。
     const usable = viewer.role === 'ADMIN' || row.provider.createdBy === viewer.id
     if (!usable) {
-      throw AppError.notFound(`模型不存在或对你不可用：${row.modelName}`)
+      throw AppError.notFound(appMsg('app.m119', { p0: row.modelName }))
     }
   }
 }
@@ -604,11 +600,11 @@ export async function createAgent(
   const audience = normalizeAudienceInput(input.audience)
   if (visibility === 'SHARED') {
     if (audienceIsEmpty(audience)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
     await assertAudienceSubjectsExist(audience)
   } else if (!audienceIsEmpty(audience)) {
-    throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+    throw AppError.validation(appMsg('app.m017'))
   }
 
   const created = await db.agent.create({
@@ -695,7 +691,7 @@ export async function copyAgent(id: string, viewer: AgentViewer): Promise<AgentI
     where: { id, deletedAt: null },
     select: AGENT_SELECT,
   })
-  if (source === null) throw AppError.notFound('智能体不存在')
+  if (source === null) throw AppError.notFound(appMsg('app.m000'))
 
   const pool = source.pool.map((entry) => entry.modelId)
   const components = await componentsOf(id)
@@ -774,15 +770,15 @@ export async function updateAgent(
     where: { id, deletedAt: null },
     select: AGENT_SELECT,
   })
-  if (target === null) throw AppError.notFound('智能体不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m000'))
 
   // 先 404 再 403：智能体 id 本来就出现在全员可见的列表里，藏不住也不必藏
   if (!canEditAgent(target, viewer)) {
-    throw AppError.forbidden('只有该智能体的创建者或管理员可以修改它')
+    throw AppError.forbidden(appMsg('app.m120'))
   }
 
   if (input.type !== undefined && input.type !== target.type) {
-    throw AppError.conflict('智能体类型创建后不可修改。请新建一个智能体')
+    throw AppError.conflict(appMsg('app.m121'))
   }
 
   // ── 模型池 / 默认模型的换绑（文件头 ④：只校验"新引入"的模型；未变的不重校）──
@@ -817,11 +813,11 @@ export async function updateAgent(
   let audienceChanged = false
   if (input.audience !== undefined) {
     if (nextVisibility !== 'SHARED') {
-      throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+      throw AppError.validation(appMsg('app.m017'))
     }
     const normalized = normalizeAudienceInput(input.audience)
     if (audienceIsEmpty(normalized)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
     await assertAudienceSubjectsExist(normalized)
     nextAudience = normalized
@@ -831,7 +827,7 @@ export async function updateAgent(
   } else if (nextVisibility === 'SHARED') {
     // 改为/已是 SHARED 但本次没给受众 ⇒ 沿用现有；若现有为空则拒绝（不变量：SHARED 必须非空）
     if (audienceIsEmpty(currentAudience)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
   } else if (!audienceIsEmpty(currentAudience)) {
     // 改成非 SHARED ⇒ 清空受众
@@ -923,10 +919,10 @@ export async function removeAgent(
     where: { id, deletedAt: null },
     select: { id: true, name: true, createdBy: true, deletedAt: true },
   })
-  if (target === null) throw AppError.notFound('智能体不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m000'))
 
   if (!canEditAgent(target, viewer)) {
-    throw AppError.forbidden('只有该智能体的创建者或管理员可以删除它')
+    throw AppError.forbidden(appMsg('app.m122'))
   }
 
   const { removedComponents, finishedConversations } = await db.$transaction(async (tx) => {
@@ -936,7 +932,7 @@ export async function removeAgent(
       data: { deletedAt: new Date(), modelId: null },
     })
     // 并发窗口：查到了但打标记前被另一个请求删掉了
-    if (softDeleted.count === 0) throw AppError.notFound('智能体不存在')
+    if (softDeleted.count === 0) throw AppError.notFound(appMsg('app.m000'))
 
     // ⚠️ 这两步不能省：组件绑定是**多态外键、没有 FK 兜底**（`02` §3.1），
     //    留着它会让被绑的知识库永远删不掉（见文件头 ②）
@@ -977,19 +973,19 @@ export async function transferAgent(
 ): Promise<AgentItem> {
   const db = getPrisma()
   const target = await db.agent.findFirst({ where: { id, deletedAt: null }, select: AGENT_SELECT })
-  if (target === null) throw AppError.notFound('智能体不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m000'))
   if (!canEditAgent(target, viewer)) {
-    throw AppError.forbidden('只有该智能体的所属人或管理员可以转移它')
+    throw AppError.forbidden(appMsg('app.m123'))
   }
   if (toUserId === target.createdBy) {
-    throw AppError.validation('接收人已经是该智能体的所属人，无需转移')
+    throw AppError.validation(appMsg('app.m124'))
   }
   const newOwner = await db.user.findUnique({
     where: { id: toUserId },
     select: { id: true, status: true },
   })
   if (newOwner === null || newOwner.status !== 'ACTIVE') {
-    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+    throw AppError.validation(appMsg('app.m011'))
   }
 
   const updated = await db.agent.update({
@@ -1122,11 +1118,11 @@ async function assertComponentRefsBindable(
 
   const missingKb = knowledgeIds.filter((refId) => !kbRows.some((row) => row.id === refId))
   if (missingKb.length > 0) {
-    throw AppError.notFound(`知识库不存在或已被删除：${missingKb.join('、')}`)
+    throw AppError.notFound(appMsg('app.m125', { p0: missingKb.join('、') }))
   }
   const missingMcp = mcpIds.filter((refId) => !mcpRows.some((row) => row.id === refId))
   if (missingMcp.length > 0) {
-    throw AppError.notFound(`MCP server 不存在或已被删除：${missingMcp.join('、')}`)
+    throw AppError.notFound(appMsg('app.m126', { p0: missingMcp.join('、') }))
   }
 
   // P1-18：**取消可见性闭包** —— 不再要求"公开 Agent 只能引用公开组件"。
@@ -1146,7 +1142,7 @@ async function assertComponentRefsBindable(
     }
   }
   if (notVisible.length > 0) {
-    throw AppError.notFound(`引用的组件对你不可见或不存在：${notVisible.join('、')}`)
+    throw AppError.notFound(appMsg('app.m127', { p0: notVisible.join('、') }))
   }
 }
 
@@ -1193,10 +1189,10 @@ export async function replaceAgentComponents(
     where: { id, deletedAt: null },
     select: AGENT_SELECT,
   })
-  if (target === null) throw AppError.notFound('智能体不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m000'))
 
   if (!canEditAgent(target, viewer)) {
-    throw AppError.forbidden('只有该智能体的创建者或管理员可以修改它的组件绑定')
+    throw AppError.forbidden(appMsg('app.m128'))
   }
 
   // 归一化顺序：写库顺序 = 读取端 `componentsOf` 的顺序（同序让"行 id 的先后"也稳定，
@@ -1240,7 +1236,7 @@ export async function replaceAgentComponents(
 
   // ⑥ 重读（极短窗口内被并发软删的话，按"不存在"回 —— 与详情口径一致）
   const fresh = await db.agent.findFirst({ where: { id, deletedAt: null }, select: AGENT_SELECT })
-  if (fresh === null) throw AppError.notFound('智能体不存在')
+  if (fresh === null) throw AppError.notFound(appMsg('app.m000'))
   const audiences = await loadAudiences([fresh])
   return toItem(fresh, await componentsOf(id), viewer, audiences.get(fresh.id) ?? emptyAudience())
 }

@@ -36,6 +36,9 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
+import { translate, type Locale, type MessageKey } from './i18n/index.js'
 import { offsetPageOf } from './envelope.js'
 
 /** 文档流水线状态（与 `schema.prisma` 的 `document_status` 枚举逐字一致） */
@@ -119,6 +122,16 @@ export const IMAGE_RECOGNITION_LABELS: Readonly<Record<ImageRecognition, string>
   LLM: '图片含义识别（大模型）',
 })
 
+/**
+ * 识别方式 → i18n key（P1-23：前端据此取译文；**中文那份 {@link IMAGE_RECOGNITION_LABELS} 保留**
+ * 给后端与其它中文消费方用，见 `子方案/界面语言切换.md` §3.5）。
+ */
+export const IMAGE_RECOGNITION_KEY: Readonly<Record<ImageRecognition, MessageKey>> = Object.freeze({
+  NONE: 'label.imageRecognition.NONE',
+  OCR: 'label.imageRecognition.OCR',
+  LLM: 'label.imageRecognition.LLM',
+})
+
 /** 文档内图片的处理选项：识别方式（三选一）+ 是否向量化 */
 export interface DocumentImageOptions {
   imageRecognize: ImageRecognition
@@ -138,18 +151,21 @@ export const UPLOAD_IMAGE_VECTORIZE_FIELD = 'imageVectorize'
 /** 图片向量化选项的展示标签（识别方式的标签见 {@link IMAGE_RECOGNITION_LABELS}） */
 export const IMAGE_VECTORIZE_LABEL = '图片向量化（多模态）'
 
+/** 图片向量化选项的 i18n key（P1-23：前端据此取译文；中文那份 {@link IMAGE_VECTORIZE_LABEL} 保留） */
+export const IMAGE_VECTORIZE_KEY: MessageKey = 'label.imageVectorize'
+
 /** 是否至少选了一种图片处理（独立图片文件必须为 true；全不选 = 不处理图片） */
 export function hasAnyImageOption(options: DocumentImageOptions): boolean {
   return options.imageRecognize !== 'NONE' || options.imageVectorize
 }
 
 /** 人读的一句话，列出这篇文档的图片处理（文档表格里显示；全不选返回空串） */
-export function describeImageOptions(options: DocumentImageOptions): string {
+export function describeImageOptions(options: DocumentImageOptions, locale: Locale): string {
   const parts: string[] = []
-  if (options.imageRecognize === 'OCR') parts.push('文字识别')
-  else if (options.imageRecognize === 'LLM') parts.push('含义识别')
-  if (options.imageVectorize) parts.push('向量化')
-  return parts.join(' + ')
+  if (options.imageRecognize === 'OCR') parts.push(translate(locale, 'label.imageOption.ocr'))
+  else if (options.imageRecognize === 'LLM') parts.push(translate(locale, 'label.imageOption.llm'))
+  if (options.imageVectorize) parts.push(translate(locale, 'label.imageOption.vectorize'))
+  return parts.join(translate(locale, 'label.imageOption.join'))
 }
 
 /**
@@ -274,8 +290,8 @@ export type UploadDocumentResult = z.infer<typeof uploadDocumentResultSchema>
 
 /** 路径参数：`:id` = 知识库，`:docId` = 文档（reupload/retry/delete/download 共用） */
 export const documentParamsSchema = z.object({
-  id: z.string().uuid('知识库 ID 不是合法 UUID'),
-  docId: z.string().uuid('文档 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.document.kbIdNotUuid')),
+  docId: z.string().uuid(validationMessage('validation.document.docIdNotUuid')),
 })
 export type DocumentParams = z.infer<typeof documentParamsSchema>
 
@@ -300,10 +316,13 @@ export const DOCUMENT_FILE_NAME_MAX_CHARS = 255
  */
 export const renameDocumentBodySchema = z.object({
   fileName: z
-    .string({ required_error: '请输入文件名' })
+    .string({ required_error: validationMessage('validation.document.fileNameRequired') })
     .trim()
-    .min(1, '文件名不能为空')
-    .max(DOCUMENT_FILE_NAME_MAX_CHARS, `文件名最多 ${DOCUMENT_FILE_NAME_MAX_CHARS} 个字符`),
+    .min(1, validationMessage('validation.document.fileNameEmpty'))
+    .max(
+      DOCUMENT_FILE_NAME_MAX_CHARS,
+      validationMessage('validation.document.fileNameTooLong', { max: DOCUMENT_FILE_NAME_MAX_CHARS }),
+    ),
 })
 export type RenameDocumentBody = z.infer<typeof renameDocumentBodySchema>
 
@@ -374,8 +393,13 @@ export type RemoveDocumentResult = z.infer<typeof removeDocumentResultSchema>
  * 知识库的文档数是千级（`01` §1.3 的规模假设），没有"一次拉全"的需求。
  */
 export const listDocumentsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListDocumentsQuery = z.infer<typeof listDocumentsQuerySchema>
 
@@ -427,8 +451,13 @@ export type ChunkItem = z.infer<typeof chunkItemSchema>
  * 一屏看不了几条；而 `total` 会如实给出，前端据此分页。上限仍是 100（与其余列表一致）。
  */
 export const listDocumentChunksQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListDocumentChunksQuery = z.infer<typeof listDocumentChunksQuerySchema>
 

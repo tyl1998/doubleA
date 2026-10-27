@@ -27,16 +27,17 @@
  *  · **停用项**：管理页是**唯一**能看见并改回停用项的地方（`GET /api/models/available` 里没有它们）
  *    ⇒ 停用项用状态灯 + 「已停用」两重表达，且提供"只看停用"筛选，避免"它怎么不见了"。
  *  · **Key 的掩码**：`describeProviderKey` 给的是后端解密后生成的掩码；未配置给「未配置」而不是空。
- *  · **引用数**：`agentCount` **含软删的智能体**（`02` §4.3：软删仍占着 `agents.model_id` 外键）
- *    ⇒ 列头写明这一点，否则会出现"显示 0 个却删不掉"的困惑。
+ *  · **引用数**：`agentCount` = 被多少个**在线**智能体绑定（**默认模型 ∪ 模型池成员**，同一智能体只算一次；
+ *    与后端 `removeModel` 守卫同口径）。软删的智能体已自动解绑、不计入 ⇒ 列头写明这一点，否则会出现
+ *    "显示 0 个却删不掉"（池成员口径曾漏算）的困惑。
  */
 
 import { Alert, Button, Checkbox, Input, Popconfirm, Select, Table, Tag, Tooltip, type TableColumnsType } from 'antd'
 import {
   MODEL_TYPES,
-  MODEL_TYPE_LABELS,
-  PROVIDER_CREDENTIAL_MODE_LABELS,
-  UPSTREAM_PROTOCOL_LABELS,
+  MODEL_TYPE_KEY,
+  PROVIDER_CREDENTIAL_MODE_KEY,
+  UPSTREAM_PROTOCOL_KEY,
   type ModelItem,
   type ModelProviderItem,
   type ModelType,
@@ -55,6 +56,7 @@ import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStat
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { AGENTS_PATH, KNOWLEDGE_PATH, credentialsSectionPath } from '../../app/paths.js'
 import { DeleteProviderModal } from './DeleteProviderModal.js'
 import { ModelFormModal } from './ModelFormModal.js'
@@ -68,11 +70,6 @@ import {
   providerGroupSpans,
   summarizeModels,
 } from './adminModel.js'
-
-const TYPE_FILTER_OPTIONS = [
-  { value: 'ALL', label: '全部类型' },
-  ...MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] })),
-]
 
 /**
  * 转移目标（P1-18）：Provider 行与模型行都用它。
@@ -88,10 +85,15 @@ interface TransferTarget {
 
 export function ModelsPage() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   // 「系统模型」区块是**平台级配置**（仅 ADMIN）：判据是 `role === 'ADMIN'`，不是"页面在哪个路由下"
   // —— 模型池页自 P1-13 起对全员开放，同一个页面两种身份都会进来（与 `AssetUserPicker` 同款判据）。
   const { data: me } = useCurrentUser()
   const isAdmin = me?.role === 'ADMIN'
+  const typeFilterOptions = [
+    { value: 'ALL', label: t('models.allTypes') },
+    ...MODEL_TYPES.map((type) => ({ value: type, label: t(MODEL_TYPE_KEY[type]) })),
+  ]
   // ⚠️ 只传 `limit`、**不传 `offset`**（默认 0，一次取满、筛选全在客户端）。
   //    这里曾经写成 `useModelProviders(MODEL_POOL_PAGE_LIMIT_MAX)` —— 在位置参数签名下
   //    那个 100 落进了 `offset`，页面因此把 3 个 Provider / 2 个模型全当成"没有"。
@@ -147,15 +149,15 @@ export function ModelsPage() {
   const doRemoveModel = (model: ModelItem): void => {
     removeModel.mutate(model.id, {
       onSuccess: (result) => {
-        feedback.ok(`已删除模型「${result.modelName}」`)
+        feedback.ok(t('models.deleted', { name: result.modelName }))
       },
-      onError: (error) => feedback.fail(error, '删除失败'),
+      onError: (error) => feedback.fail(error, t('models.removeFailed')),
     })
   }
 
   const providerColumns: TableColumnsType<ModelProviderItem> = [
     {
-      title: '名称',
+      title: t('models.colName'),
       dataIndex: 'name',
       render: (_, provider) => (
         <div className="kb-cell">
@@ -168,41 +170,41 @@ export function ModelsPage() {
       // P0-1-37：协议与类型是**两个维度**（同为对话，可以是兼容/Responses/Anthropic），
       // 所以单独一列，而不是塞进「类型」那个 Tag 里 —— 合在一处就没法按协议扫一眼排查。
       // ⚠️ 2026-10-22：Provider 上的 `type` 列已删除 ⇒ 这张表**不再有「类型」列**（见下条）。
-      title: '上游协议',
+      title: t('models.colProtocol'),
       dataIndex: 'protocol',
       width: 160,
       render: (_, provider) => (
         <div className="kb-cell">
-          <span>{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}</span>
+          <span>{t(UPSTREAM_PROTOCOL_KEY[provider.protocol])}</span>
           {provider.protocol !== 'OPENAI_COMPAT' && (
             <span className="kb-cell__sub">
               {provider.protocol === 'ANTHROPIC_MESSAGES' ? 'x-api-key' : '/responses'}
             </span>
           )}
           {provider.hasEmbeddingModel && (
-            <span className="kb-cell__sub">含向量模型</span>
+            <span className="kb-cell__sub">{t('models.hasVectorModel')}</span>
           )}
         </div>
       ),
     },
     {
-      title: '模型数',
+      title: t('models.colModelCount'),
       dataIndex: 'modelCount',
       width: 90,
       align: 'right',
       render: (_, provider) => <span className="num">{provider.modelCount}</span>,
     },
     {
-      title: '状态',
+      title: t('models.colStatus'),
       dataIndex: 'enabled',
       width: 150,
       render: (_, provider) => (
         <div className="kb-cell">
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
             <span className={`led led--${provider.enabled ? 'ok' : 'fail'}`} aria-hidden="true" />
-            <span>{provider.enabled ? '启用' : '已停用'}</span>
+            <span>{provider.enabled ? t('models.enabled') : t('models.disabled')}</span>
           </span>
-          {!provider.enabled && <span className="kb-cell__sub">其下模型不在可选列表里</span>}
+          {!provider.enabled && <span className="kb-cell__sub">{t('models.providerDisabledNote')}</span>}
         </div>
       ),
     },
@@ -213,29 +215,29 @@ export function ModelsPage() {
       // 现在**一列讲清"这个 Provider 用谁的 Key、配没配"**：
       //   · 共享 Key：显示掩码 + 已配置/未配置（改它走「编辑」表单）
       //   · 各自 Key：显示我配没配；**没配就把用户引到「我的凭据」**（不再有行内「我的 Key」入口）
-      title: '凭据',
+      title: t('models.colCredential'),
       dataIndex: 'credentialMode',
       width: 230,
       render: (_, provider) =>
         provider.credentialMode === 'PER_USER' ? (
           <div className="kb-cell">
-            <span>{PROVIDER_CREDENTIAL_MODE_LABELS.PER_USER}</span>
+            <span>{t(PROVIDER_CREDENTIAL_MODE_KEY.PER_USER)}</span>
             {provider.userHasKey ? (
-              <span className="kb-cell__sub">我已配置（用自己的 Key 调用）</span>
+              <span className="kb-cell__sub">{t('models.credConfigured')}</span>
             ) : (
               <span className="kb-cell__sub">
-                <Tag color="warning">我未配置</Tag>
+                <Tag color="warning">{t('models.credUnconfigured')}</Tag>
                 <Link to={credentialsSectionPath('provider')} style={{ marginLeft: 'var(--sp-2)' }}>
-                  去我的凭据配置 →
+                  {t('models.goCredentials')}
                 </Link>
               </span>
             )}
           </div>
         ) : (
           <div className="kb-cell">
-            <span className="num">{describeProviderKey(provider)}</span>
+            <span className="num">{describeProviderKey(provider, locale)}</span>
             <span className="kb-cell__sub">
-              共享 Key · {provider.hasKey ? '掩码，仅用于核对' : '未配置：其下模型调用会失败'}
+              {provider.hasKey ? t('models.sharedKeyMask') : t('models.sharedKeyMissing')}
             </span>
           </div>
         ),
@@ -244,12 +246,12 @@ export function ModelsPage() {
       // P1-13：所属人来自服务端下发的字段（Provider 的访问控制归服务端行级）。
       // P1-18（2026-10-16 修订）：**去掉操作列的「转移所属人」按钮**，把这一列本身做成入口 ——
       // 只有所属人或 ADMIN（服务端下发的 `canEdit`）能点，点了弹转移弹窗；其余人只显示名字。
-      title: '所属人',
+      title: t('models.colOwner'),
       dataIndex: 'creatorName',
       width: 150,
       render: (_, provider) =>
         provider.canEdit ? (
-          <Tooltip title="点击转移所属人">
+          <Tooltip title={t('models.ownerTransferTitle')}>
             <Button
               type="link"
               size="small"
@@ -266,13 +268,13 @@ export function ModelsPage() {
         ),
     },
     {
-      title: '最近更新',
+      title: t('models.colUpdated'),
       dataIndex: 'updatedAt',
       width: 130,
       render: (_, provider) => <span className="num">{formatUpdatedAt(provider.updatedAt)}</span>,
     },
     {
-      title: '操作',
+      title: t('models.colActions'),
       key: 'actions',
       width: 220,
       align: 'right',
@@ -286,10 +288,10 @@ export function ModelsPage() {
         provider.canEdit ? (
           <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditingProvider(provider)}>
-              编辑
+              {t('models.edit')}
             </Button>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setProbingProvider(provider)}>
-              拉取上游模型
+              {t('models.fetchRemote')}
             </Button>
             {/* 删除放最后（§七）；Provider 删除是**级联**那一档 ⇒ 走 Modal + 逐字确认 */}
             <Button
@@ -299,12 +301,12 @@ export function ModelsPage() {
               style={{ padding: 0 }}
               onClick={() => setDeletingProvider(provider)}
             >
-              删除
+              {t('models.remove')}
             </Button>
           </div>
         ) : (
-          <span className="ratio" title="只有该 Provider 的所属人或管理员可以编辑 / 删除">
-            无编辑权限
+          <span className="ratio" title={t('models.noEditPermTitle')}>
+            {t('models.noEditPerm')}
           </span>
         ),
     },
@@ -323,12 +325,12 @@ export function ModelsPage() {
           {/* P1-18（2026-10-16 追加）：把所属 Provider 的 baseUrl 显示出来 —— 同名 Provider
               靠 id 区分，仅凭名字认不出"这个模型到底打到哪个上游"。 */}
           <span className="kb-cell__sub num">{model.providerBaseUrl}</span>
-          {!model.providerEnabled && <span className="kb-cell__sub">Provider 已停用</span>}
+          {!model.providerEnabled && <span className="kb-cell__sub">{t('models.providerDisabledCell')}</span>}
         </div>
       ),
     },
     {
-      title: '模型',
+      title: t('models.colModel'),
       dataIndex: 'label',
       render: (_, model) => (
         <div className="kb-cell">
@@ -338,26 +340,28 @@ export function ModelsPage() {
       ),
     },
     {
-      title: '类型',
+      title: t('models.colType'),
       dataIndex: 'type',
       width: 90,
-      render: (_, model) => <Tag>{MODEL_TYPE_LABELS[model.type]}</Tag>,
+      render: (_, model) => <Tag>{t(MODEL_TYPE_KEY[model.type])}</Tag>,
     },
     {
       // 对话模型看"上下文长度"，向量模型看"维度"（`01` 起向量模型没有 token 上下文这个概念）
-      title: '上下文 / 维度',
+      title: t('models.colContextDim'),
       dataIndex: 'maxContext',
       width: 130,
       align: 'right',
       render: (_, model) =>
         model.type === 'EMBEDDING' ? (
-          <span className="num">{model.embeddingDim === null ? '维度 —' : `维度 ${model.embeddingDim}`}</span>
+          <span className="num">
+            {model.embeddingDim === null ? t('models.dimEmpty') : t('models.dimValue', { value: model.embeddingDim })}
+          </span>
         ) : (
-          <span className="num">{maxContextText(model.maxContext)}</span>
+          <span className="num">{maxContextText(model.maxContext, locale)}</span>
         ),
     },
     {
-      title: '图片',
+      title: t('models.colVision'),
       dataIndex: 'supportsVision',
       width: 70,
       align: 'center',
@@ -366,7 +370,7 @@ export function ModelsPage() {
       ),
     },
     {
-      title: '思考',
+      title: t('models.colReasoning'),
       dataIndex: 'supportsReasoning',
       width: 70,
       align: 'center',
@@ -375,16 +379,16 @@ export function ModelsPage() {
       ),
     },
     {
-      title: '状态',
+      title: t('models.colStatus'),
       dataIndex: 'enabled',
       width: 150,
       render: (_, model) => (
         <div className="kb-cell">
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
             <span className={`led led--${model.enabled ? 'ok' : 'fail'}`} aria-hidden="true" />
-            <span>{model.enabled ? '启用' : '已停用'}</span>
+            <span>{model.enabled ? t('models.enabled') : t('models.disabled')}</span>
           </span>
-          {!model.enabled && <span className="kb-cell__sub">不在可选列表里</span>}
+          {!model.enabled && <span className="kb-cell__sub">{t('models.disabledNotSelectable')}</span>}
         </div>
       ),
     },
@@ -392,12 +396,12 @@ export function ModelsPage() {
       // P1-13：模型随 Provider —— 所属人取自其 Provider（`providerOwnerName`，Model 本身没有这一列）。
       // P1-18（2026-10-16 修订）：这一列可点 —— 从模型行转移的**是它所属的 Provider**
       //（模型没有独立归属，所有权只在 Provider 上）。只有 `canEdit`（Provider 的所属人或 ADMIN）能点。
-      title: '所属人',
+      title: t('models.colOwner'),
       dataIndex: 'providerOwnerName',
       width: 150,
       render: (_, model) =>
         model.canEdit ? (
-          <Tooltip title="点击转移所属 Provider 的所属人">
+          <Tooltip title={t('models.ownerProviderTransferTitle')}>
             <Button
               type="link"
               size="small"
@@ -415,10 +419,11 @@ export function ModelsPage() {
     },
     {
       title: (
-        // 列头写明"含已删除的智能体"：软删的 Agent 照样占着外键（`02` §4.3），
-        // 不写会出现"显示 0 个却删不掉"的困惑
-        <Tooltip title="含已被删除（软删）的智能体：它们仍占着这条引用，所以删不掉">
-          <span>引用</span>
+        // 列头写明口径：默认模型 ∪ 模型池成员（同一智能体只算一次），**只算在线**智能体；
+        // 软删的智能体已自动解绑（model_id 置空 + 池成员行清空），不再计入。不写会出现
+        // "显示 0 个却删不掉"（池成员口径曾漏算）或"显示被删的智能体"的困惑。
+        <Tooltip title={t('models.agentRefTitle')}>
+          <span>{t('models.colRef')}</span>
         </Tooltip>
       ),
       dataIndex: 'agentCount',
@@ -428,7 +433,7 @@ export function ModelsPage() {
         model.agentCount === 0 ? <span className="ratio">0</span> : <span className="num">{model.agentCount}</span>,
     },
     {
-      title: '操作',
+      title: t('models.colActions'),
       key: 'actions',
       width: 140,
       align: 'right',
@@ -438,54 +443,54 @@ export function ModelsPage() {
         // ⇒ 只读行（分享给你但不可编）不给编辑 / 删除入口。
         if (!model.canEdit) {
           return (
-            <span className="ratio" title="只有该模型所属 Provider 的所属人或管理员可以编辑 / 删除">
-              无编辑权限
+            <span className="ratio" title={t('models.modelNoEditPermTitle')}>
+              {t('models.noEditPerm')}
             </span>
           )
         }
-        const blocked = modelDeleteBlockedNotice(model)
+        const blocked = modelDeleteBlockedNotice(model, locale)
         return (
           <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditingModel(model)}>
-              编辑
+              {t('models.edit')}
             </Button>
             {blocked !== null ? (
               // 被引用时**不禁用整个按钮**而是把 Popconfirm 的确认键标灰 + 说明 + 指路
               //（`agentCount` 与后端守卫同口径 ⇒ 这里说的"删不掉"就是真会拿到的 409）
               <Popconfirm
-                title={`删除模型「${model.label}」？`}
+                title={t('models.removeModelTitle', { label: model.label })}
                 description={
                   <>
                     {blocked}
                     <br />
-                    {model.agentCount > 0 && <Link to={AGENTS_PATH}>去智能体列表改绑 →</Link>}
+                    {model.agentCount > 0 && <Link to={AGENTS_PATH}>{t('models.goAgentsRebind')}</Link>}
                     {(model.agentCount > 0 && (model.knowledgeBaseCount > 0 || model.captionKnowledgeBaseCount > 0)) &&
                       ' · '}
                     {(model.knowledgeBaseCount > 0 || model.captionKnowledgeBaseCount > 0) && (
-                      <Link to={KNOWLEDGE_PATH}>去知识库改模型 →</Link>
+                      <Link to={KNOWLEDGE_PATH}>{t('models.goKbModel')}</Link>
                     )}
                     {model.usedAsTitleModel && (
                       <span className="ratio">
-                        （会话标题模型在本页上方「系统模型」区改）
+                        {t('models.titleModelNote')}
                       </span>
                     )}
                   </>
                 }
-                okText="删除"
+                okText={t('models.remove')}
                 okButtonProps={{ danger: true, disabled: true }}
-                cancelText="知道了"
+                cancelText={t('models.acknowledge')}
               >
                 <Button type="link" size="small" danger style={{ padding: 0 }}>
-                  删除
+                  {t('models.remove')}
                 </Button>
               </Popconfirm>
             ) : (
               <Popconfirm
-                title={`删除模型「${model.label}」？`}
-                description="只删除这条模型配置，不影响别的模型；它下面没有级联数据，所以不会连带删任何东西。"
-                okText="删除"
+                title={t('models.removeModelTitle', { label: model.label })}
+                description={t('models.removeModelDesc')}
+                okText={t('models.remove')}
                 okButtonProps={{ danger: true }}
-                cancelText="取消"
+                cancelText={t('common.cancel')}
                 onConfirm={() => doRemoveModel(model)}
               >
                 <Button
@@ -495,7 +500,7 @@ export function ModelsPage() {
                   style={{ padding: 0 }}
                   loading={removeModel.isPending && removeModel.variables === model.id}
                 >
-                  删除
+                  {t('models.remove')}
                 </Button>
               </Popconfirm>
             )}
@@ -506,10 +511,10 @@ export function ModelsPage() {
   ]
 
   const providerSelectOptions = [
-    { value: 'ALL', label: '全部 Provider' },
+    { value: 'ALL', label: t('models.allProviders') },
     ...providers.map((provider) => ({
       value: provider.id,
-      label: `${provider.name}${provider.enabled ? '' : '（已停用）'}`,
+      label: `${provider.name}${provider.enabled ? '' : t('models.providerDisabledSuffix')}`,
     })),
   ]
 
@@ -517,27 +522,28 @@ export function ModelsPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>模型池</h1>
+          <h1>{t('models.title')}</h1>
           <p className="page__lead">
-            先建 <strong>Provider</strong>（baseUrl + API Key + 上游协议），再在它下面录入模型。同一个
-            Provider 下可以同时挂对话与向量模型（共用一个 baseUrl 与一把 Key）。只有在
-            这里被<strong>启用</strong>的模型才会出现在「新建智能体」的模型下拉里 —— 停用是"先别再选它"，
-            不是删除。
+            {t('models.leadPrefix')}
+            <strong>{t('models.leadStrong1')}</strong>
+            {t('models.leadMid')}
+            <strong>{t('models.leadStrong2')}</strong>
+            {t('models.leadSuffix')}
           </p>
         </div>
         <div className="page__head-actions">
-          <Button onClick={() => setCreatingProvider(true)}>新建 Provider</Button>
+          <Button onClick={() => setCreatingProvider(true)}>{t('models.createProvider')}</Button>
           <Button
             type="primary"
             onClick={() => setCreatingModel(true)}
             disabled={editableProviders.length === 0}
             title={
               editableProviders.length === 0
-                ? '先建一个你可编辑的 Provider（模型必须挂在它下面）'
-                : '新建模型'
+                ? t('models.needEditProviderHint')
+                : t('models.createModel')
             }
           >
-            新建模型
+            {t('models.createModel')}
           </Button>
         </div>
       </div>
@@ -551,14 +557,16 @@ export function ModelsPage() {
         <div className="admin-section__head">
           <h2 className="card__title">Provider</h2>
           <span className="ratio">
-            共 <span className="num">{providerTotal}</span> 个
-            {providerTotal > providers.length && <>（本次取回前 {providers.length} 个，limit 上限 100）</>}
+            {t('models.providerTotal', { count: providerTotal })}
+            {providerTotal > providers.length && (
+              <> {t('models.providerTotalMore', { shown: providers.length })}</>
+            )}
           </span>
         </div>
 
         {providersQuery.isError ? (
           <ErrorState
-            title="Provider 列表加载失败"
+            title={t('models.providerLoadFailed')}
             error={providersQuery.error}
             retrying={providersQuery.isFetching}
             onRetry={() => {
@@ -570,11 +578,11 @@ export function ModelsPage() {
         ) : providers.length === 0 ? (
           <div className="card">
             <EmptyState
-              title="还没有 Provider"
-              lead="Provider 是模型的来源：一个 baseUrl、一把 API Key（+ 上游协议）。建完它才能在下面录入模型；同一个 Provider 下可以同时挂对话与向量模型。"
+              title={t('models.noProviderTitle')}
+              lead={t('models.noProviderLead')}
               action={
                 <Button type="primary" onClick={() => setCreatingProvider(true)}>
-                  新建 Provider
+                  {t('models.createProvider')}
                 </Button>
               }
             />
@@ -587,7 +595,7 @@ export function ModelsPage() {
               columns={providerColumns}
               dataSource={providers}
               loading={false}
-              pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
+              pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => t('models.total', { count }) }}
               scroll={{ x: 1280 }}
             />
           </div>
@@ -597,13 +605,15 @@ export function ModelsPage() {
       {/* ───────────────────── 模型 ───────────────────── */}
       <section>
         <div className="admin-section__head">
-          <h2 className="card__title">模型</h2>
+          <h2 className="card__title">{t('models.modelCard')}</h2>
           <span className="ratio">
-            屏幕上有 <span className="num">{summary.total}</span> 个 · 覆盖{' '}
-            <span className="num">{summary.providers}</span> 个 Provider · 停用{' '}
-            <span className="num">{summary.disabled}</span> · 支持图片{' '}
-            <span className="num">{summary.vision}</span>
-            {modelTotal > models.length && <> · 接口共 {modelTotal} 个（limit 上限 100）</>}
+            {t('models.summaryProviders', {
+              total: summary.total,
+              providers: summary.providers,
+              disabled: summary.disabled,
+              vision: summary.vision,
+            })}
+            {modelTotal > models.length && <>{t('models.summaryBackendTotal', { total: modelTotal })}</>}
           </span>
         </div>
 
@@ -612,26 +622,26 @@ export function ModelsPage() {
             value={providerFilter}
             options={providerSelectOptions}
             style={{ width: 220 }}
-            aria-label="按 Provider 筛选"
+            aria-label={t('models.filterProviderAria')}
             onChange={setProviderFilter}
           />
           <Select
             value={typeFilter}
-            options={TYPE_FILTER_OPTIONS}
+            options={typeFilterOptions}
             style={{ width: 140 }}
-            aria-label="按类型筛选"
+            aria-label={t('models.filterTypeAria')}
             onChange={(value: ModelType | 'ALL') => setTypeFilter(value)}
           />
           <Input.Search
             allowClear
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
-            placeholder="搜索别名 / 型号名…"
+            placeholder={t('models.searchPlaceholder')}
             style={{ width: 240 }}
-            aria-label="搜索模型"
+            aria-label={t('models.searchAria')}
           />
           <Checkbox checked={onlyDisabled} onChange={(event) => setOnlyDisabled(event.target.checked)}>
-            只看已停用
+            {t('models.onlyDisabled')}
           </Checkbox>
         </div>
 
@@ -639,18 +649,19 @@ export function ModelsPage() {
           type="info"
           showIcon
           style={{ marginBottom: 'var(--sp-5)' }}
-          message="停用的模型去哪了"
+          message={t('models.disabledNoteTitle')}
           description={
             <>
-              「可用模型」下拉（建/改智能体时用）只含<strong>已启用</strong>的模型，且要求它的 Provider
-              也处于启用状态。所以这里停用一个模型之后，那个下拉里立刻就没有它了。
+              {t('models.disabledNoteDesc')}
+              <strong>{t('models.disabledNoteStrong')}</strong>
+              {t('models.disabledNoteTail')}
             </>
           }
         />
 
         {modelsQuery.isError ? (
           <ErrorState
-            title="模型列表加载失败"
+            title={t('models.modelLoadFailed')}
             error={modelsQuery.error}
             retrying={modelsQuery.isFetching}
             onRetry={() => {
@@ -662,11 +673,11 @@ export function ModelsPage() {
         ) : models.length === 0 ? (
           <div className="card">
             <EmptyState
-              title="还没有模型"
+              title={t('models.noModelTitle')}
               lead={
                 editableProviders.length === 0
-                  ? '模型必须挂在某个 Provider 下。你能看到全部 Provider，但只能往**自己可编辑的** Provider 下录入模型 —— 先新建一个自己的 Provider 再回来录模型。'
-                  : '可以点某个 Provider 行上的「拉取上游模型」把上游真实的型号名列出来，复制过来手工录入。'
+                  ? t('models.noModelNeedProvider')
+                  : t('models.noModelHint')
               }
               action={
                 <Button
@@ -674,7 +685,7 @@ export function ModelsPage() {
                   onClick={() => setCreatingModel(true)}
                   disabled={editableProviders.length === 0}
                 >
-                  新建模型
+                  {t('models.createModel')}
                 </Button>
               }
             />
@@ -682,8 +693,8 @@ export function ModelsPage() {
         ) : filteredModels.length === 0 ? (
           <div className="card">
             <EmptyState
-              title="没有匹配的模型"
-              lead="当前筛选条件下没有结果。"
+              title={t('models.noMatchTitle')}
+              lead={t('models.noMatchLead')}
               action={
                 <Button
                   onClick={() => {
@@ -693,7 +704,7 @@ export function ModelsPage() {
                     setOnlyDisabled(false)
                   }}
                 >
-                  清空筛选
+                  {t('models.clearFilter')}
                 </Button>
               }
             />
@@ -706,7 +717,7 @@ export function ModelsPage() {
               columns={modelColumns}
               dataSource={filteredModels}
               loading={false}
-              pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
+              pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => t('models.total', { count }) }}
               scroll={{ x: 1220 }}
             />
           </div>

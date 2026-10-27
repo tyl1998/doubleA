@@ -35,7 +35,7 @@
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
 
-import {
+import { appMsg,
   chatRequestBodySchema,
   confirmRequestBodySchema,
   conversationIdParamsSchema,
@@ -763,8 +763,8 @@ export function registerConversationRoutes(app: FastifyInstance): void {
         if (candidates.length === 0) {
           throw AppError.conflict(
             wanted === ''
-              ? '当前没有在线实例'
-              : `没有在线实例具备「${wanted}」且能构建它 —— 请先在有构建上下文的实例上构建该环境`,
+              ? appMsg('app.m281')
+              : appMsg('app.m282', { p0: wanted }),
           )
         }
         // 原 owner 仍满足 ⇒ 不动（"自动"不代表"每次重挑"）
@@ -777,7 +777,7 @@ export function registerConversationRoutes(app: FastifyInstance): void {
           allowReselect: current !== undefined,
         })
         if (pinned.status === 'conflict') {
-          throw AppError.conflict(`该会话已被钉在实例 ${pinned.current} 上，且自动重选失败，请重试`)
+          throw AppError.conflict(appMsg('app.m092', { p0: pinned.current }))
         }
         return ok({
           id: request.params.id,
@@ -795,25 +795,23 @@ export function registerConversationRoutes(app: FastifyInstance): void {
       const online = await readOnlineInstances()
       const found = online.find((item) => item.instanceId === target)
       if (found === undefined) {
-        throw AppError.conflict(`实例 ${target} 不在线（网关此刻看不见它），请稍后重试或选择别的实例`)
+        throw AppError.conflict(appMsg('app.m093', { p0: target }))
       }
       // ★ 明确的未就绪（节点自检没过）⇒ 现在就拒绝：选它在选择器里本就不该出现，
       //   网关也不给它派活（`router/gateway.ts`），先写目录只会在首轮派活时失败。
       if (found.ready === false) {
-        throw AppError.conflict(`实例 ${target} 尚未就绪（节点自检未通过），请等它就绪后再选或选择别的实例`)
+        throw AppError.conflict(appMsg('app.m094', { p0: target }))
       }
       // ③ 能力校验：有该运行时镜像，或那台可以构建；能力未知（未上报）不拦截，交给前端提示
       const runtime = conversation.runtime
       if (runtime !== '' && found.runtimes !== undefined && !found.runtimes.includes(runtime) && found.canBuild !== true) {
-        throw AppError.conflict(
-          `实例 ${target} 没有「${runtime}」的运行时镜像，且该实例不能按需构建 —— 请在那台机器上构建后再选`,
+        throw AppError.conflict(appMsg('app.m095', { p0: target, p1: runtime }),
         )
       }
 
       const pinned = await pinSandboxOwner(request.params.id, target)
       if (pinned.status === 'conflict') {
-        throw AppError.conflict(
-          `该会话已被钉在实例 ${pinned.current} 上（容器/工作区在那台）；要换到 ${target} 需先让原实例回收该会话`,
+        throw AppError.conflict(appMsg('app.m096', { p0: pinned.current, p1: target }),
         )
       }
       return ok({

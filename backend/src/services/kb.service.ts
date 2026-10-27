@@ -36,7 +36,7 @@
  *    S3 那一步的失败记 warn + 如实回报删除个数。
  */
 
-import {
+import { appMsg,
   AppError,
   assetVisibilityWhere,
   audienceIsEmpty,
@@ -405,11 +405,11 @@ async function assertAudienceSubjectsExist(audience: { userIds: string[]; groupI
   ])
   const missingUsers = audience.userIds.filter((id) => !users.some((u) => u.id === id))
   if (missingUsers.length > 0) {
-    throw AppError.validation(`受众里这些用户不存在或不是有效（ACTIVE）用户：${missingUsers.join('、')}`)
+    throw AppError.validation(appMsg('app.m161', { p0: missingUsers.join('、') }))
   }
   const missingGroups = audience.groupIds.filter((id) => !groups.some((g) => g.id === id))
   if (missingGroups.length > 0) {
-    throw AppError.validation(`受众里这些用户组不存在：${missingGroups.join('、')}`)
+    throw AppError.validation(appMsg('app.m162', { p0: missingGroups.join('、') }))
   }
 }
 
@@ -496,7 +496,7 @@ export async function listKnowledgeBases(
 export async function getKnowledgeBase(id: string, viewer: AssetViewer): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const row = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
-  if (row === null) throw AppError.notFound('知识库不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m003'))
   // P1-13 / P1-18.x：私有库对他人 **404**；`SHARED` 要看受众是否命中（含我所在的组）
   const viewerGroupIds = await resolveViewerGroupIds(viewer)
   if (
@@ -505,7 +505,7 @@ export async function getKnowledgeBase(id: string, viewer: AssetViewer): Promise
       { ...viewer, groupIds: viewerGroupIds },
     )
   ) {
-    throw AppError.notFound('知识库不存在')
+    throw AppError.notFound(appMsg('app.m003'))
   }
   const audiences = await loadKbAudiences([row])
   return toItem(row, await countsOf(id), viewer, audiences.get(row.id) ?? emptyAudience())
@@ -558,9 +558,7 @@ async function resolveEmbeddingSnapshot(
       )
     } catch (error) {
       const reason = error instanceof AppError ? error.message : String(error)
-      throw AppError.validation(
-        `无法确定 embedding 模型「${target.label}」的维度：${reason}。` +
-          '请在「模型池」编辑该向量模型并手动填写它的输出维度后重试（不是所有 embedding 端点都能被自动探测）',
+      throw AppError.validation(appMsg('app.m265', { p0: target.label, p1: reason }),
       )
     }
   }
@@ -597,15 +595,15 @@ async function resolveCaptionModelId(modelId: string | null | undefined): Promis
       provider: { select: { enabled: true } },
     },
   })
-  if (row === null) throw AppError.notFound('所选图片描述模型不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m163'))
   if (row.type !== 'CHAT' || !row.supportsVision) {
     throw AppError.validation(CAPTION_MODEL_MUST_SUPPORT_VISION_HINT, {
       fields: [{ path: 'body.captionModelId', message: CAPTION_MODEL_MUST_SUPPORT_VISION_HINT }],
     })
   }
-  if (!row.enabled) throw AppError.conflict(`所选图片描述模型「${row.label}」已停用，请先启用后再选它`)
+  if (!row.enabled) throw AppError.conflict(appMsg('app.m164', { p0: row.label }))
   if (!row.provider.enabled) {
-    throw AppError.conflict(`所选图片描述模型「${row.label}」所属的 Provider 已停用，请先启用`)
+    throw AppError.conflict(appMsg('app.m165', { p0: row.label }))
   }
   return row.id
 }
@@ -638,7 +636,7 @@ export async function createKnowledgeBase(
   const audience = normalizeAudienceInput(input.audience)
   if (visibility === 'SHARED') {
     if (audienceIsEmpty(audience)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
     await assertAudienceSubjectsExist(audience)
   }
@@ -711,7 +709,7 @@ async function assertKbModelsAccessible(modelIds: string[], viewer: AssetViewer)
   })
   for (const row of rows) {
     const usable = viewer.role === 'ADMIN' || row.provider.createdBy === viewer.id
-    if (!usable) throw AppError.notFound(`所选模型对你不可用：${row.label}`)
+    if (!usable) throw AppError.notFound(appMsg('app.m166', { p0: row.label }))
   }
 }
 
@@ -722,8 +720,7 @@ async function assertKbModelsAccessible(modelIds: string[], viewer: AssetViewer)
  */
 function assertChunkWindow(chunkSize: number, chunkOverlap: number): void {
   if (chunkOverlap >= chunkSize) {
-    throw AppError.validation(
-      `chunkOverlap（${chunkOverlap}）必须小于 chunkSize（${chunkSize}），否则分块无法前进`,
+    throw AppError.validation(appMsg('app.m167', { p0: chunkOverlap, p1: chunkSize }),
     )
   }
 }
@@ -763,10 +760,10 @@ export async function updateKnowledgeBase(
 ): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const current = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
-  if (current === null) throw AppError.notFound('知识库不存在')
+  if (current === null) throw AppError.notFound(appMsg('app.m003'))
   // P1-13：先 404 再 403（库 id 本就出现在可见列表里，藏不住也不必藏）
   if (!canEditAsset({ ownerId: current.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该知识库的所属人或管理员可以修改它')
+    throw AppError.forbidden(appMsg('app.m168'))
   }
 
   const chunkSize = input.chunkSize ?? current.chunkSize
@@ -822,11 +819,11 @@ export async function updateKnowledgeBase(
   let audienceChanged = false
   if (input.audience !== undefined) {
     if (nextVisibility !== 'SHARED') {
-      throw AppError.validation('只有可见范围为「指定用户」时才能设置受众')
+      throw AppError.validation(appMsg('app.m017'))
     }
     const normalized = normalizeAudienceInput(input.audience)
     if (audienceIsEmpty(normalized)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
     await assertAudienceSubjectsExist(normalized)
     nextAudience = normalized
@@ -835,7 +832,7 @@ export async function updateKnowledgeBase(
       !sameStringSet(currentAudience.groupIds, normalized.groupIds)
   } else if (nextVisibility === 'SHARED') {
     if (audienceIsEmpty(currentAudience)) {
-      throw AppError.validation('可见范围为「指定用户」时，至少要选择一位用户或一个组')
+      throw AppError.validation(appMsg('app.m006'))
     }
   } else if (!audienceIsEmpty(currentAudience)) {
     audienceChanged = true
@@ -892,19 +889,19 @@ export async function transferKnowledgeBase(
 ): Promise<KnowledgeBaseItem> {
   const db = getPrisma()
   const target = await db.knowledgeBase.findUnique({ where: { id }, select: KB_SELECT })
-  if (target === null) throw AppError.notFound('知识库不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m003'))
   if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该知识库的所属人或管理员可以转移它')
+    throw AppError.forbidden(appMsg('app.m169'))
   }
   if (toUserId === target.createdBy) {
-    throw AppError.validation('接收人已经是该知识库的所属人，无需转移')
+    throw AppError.validation(appMsg('app.m170'))
   }
   const newOwner = await db.user.findUnique({
     where: { id: toUserId },
     select: { id: true, status: true },
   })
   if (newOwner === null || newOwner.status !== 'ACTIVE') {
-    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+    throw AppError.validation(appMsg('app.m011'))
   }
   const updated = await db.knowledgeBase.update({
     where: { id },
@@ -980,21 +977,20 @@ export async function rebuildKnowledgeBase(
       documents: { select: { id: true, contentHash: true } },
     },
   })
-  if (kb === null) throw AppError.notFound('知识库不存在')
+  if (kb === null) throw AppError.notFound(appMsg('app.m003'))
   // P1-13：重建属"编"（会重写整库索引），仅所属人 / ADMIN
   if (!canEditAsset({ ownerId: kb.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该知识库的所属人或管理员可以重建它的索引')
+    throw AppError.forbidden(appMsg('app.m171'))
   }
 
   // 入库/检索都离不开"这个库选定的模型 + 维度快照"（worker 用它们构造 provider）。
   // 老库可能缺其一 ⇒ 早失败并给可操作文案，而不是投一批注定 FAILED 的 job
   if (kb.embeddingModelId === null || kb.embeddingDim === null) {
-    throw AppError.conflict(
-      '该知识库未记录 embedding 模型或维度（多为本功能上线前建的老库），无法整库重建；请重建该知识库并重新选择 embedding 模型',
+    throw AppError.conflict(appMsg('app.m172'),
     )
   }
   if (kb.documents.length === 0) {
-    throw AppError.conflict('该知识库还没有文档，无需重建索引')
+    throw AppError.conflict(appMsg('app.m173'))
   }
 
   // ① 解析**当前**模型（模型池里这一行可能被改过 `model_name` / 维度）—— 同时完成两件事：
@@ -1039,7 +1035,7 @@ export async function rebuildKnowledgeBase(
   if (enqueued === 0) {
     // ⚠️ 此刻维度快照可能已刷新，但 `embeddingModel`（"需重建"判据）**故意没动** ⇒ 告警仍在，
     //    用户再点一次即可恢复；不把"已换模型"的状态伪造成完成。
-    throw AppError.internal('任务入队失败（队列不可用），整库重建未被受理，请稍后重试')
+    throw AppError.internal(appMsg('app.m174'))
   }
 
   // ⑤ 入队成功后才把 `embedding_model` 快照刷成**当前**模型名 —— 它是 `embeddingModelChanged`
@@ -1090,10 +1086,10 @@ export async function removeKnowledgeBase(
     where: { id },
     select: { id: true, name: true, createdBy: true, documents: { select: { fileKey: true } } },
   })
-  if (target === null) throw AppError.notFound('知识库不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m003'))
   // P1-13：删 = 仅所属人 / ADMIN
   if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该知识库的所属人或管理员可以删除它')
+    throw AppError.forbidden(appMsg('app.m175'))
   }
 
   const fileKeys = target.documents.map((doc) => doc.fileKey)
@@ -1110,7 +1106,7 @@ export async function removeKnowledgeBase(
       return count
     })
   } catch (error) {
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('知识库不存在')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m003'))
     throw error
   }
 

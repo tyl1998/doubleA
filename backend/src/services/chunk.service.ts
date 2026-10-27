@@ -24,7 +24,7 @@
  *    变成一个装饰，也等于"知道 id 就能看任何库的正文"——与 retry/delete/download 同口径。
  */
 
-import { AppError, type ChunkItem, type DocumentChunkListResult } from '@doubulea/shared'
+import { appMsg, AppError, type ChunkItem, type DocumentChunkListResult } from '@doubulea/shared'
 
 import { getPrisma } from '../infra/prisma.js'
 import { parseChunkMeta } from './retrieval.js'
@@ -58,7 +58,7 @@ export async function listDocumentChunks(params: {
     where: { id: params.docId, kbId: params.kbId },
     select: { id: true },
   })
-  if (doc === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (doc === null) throw AppError.notFound(appMsg('app.m007'))
 
   const [rows, total] = await db.$transaction([
     db.chunk.findMany({

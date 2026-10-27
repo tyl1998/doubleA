@@ -16,7 +16,8 @@
  * ⇒ `frontend/scripts/verify-mcp-ui.mjs` 能在 node 里直接跑它逐条断言。
  */
 
-import type { ConfirmSource } from '@doubulea/shared'
+import type { ConfirmSource, Locale } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 /**
  * 剩余秒数（**向上取整**，最小 `0`）。
@@ -45,8 +46,8 @@ export function remainingSeconds(expiresAt: string, nowMs: number = Date.now()):
  * 到点是「**已超时**」而不是 `0s`：那三个字是此时唯一的实话（服务端很可能已经把这条提问
  * 按取消处理掉了），而 `0s` 只是一个看着还在数的数字。
  */
-export function confirmCountdownText(remaining: number): string {
-  return remaining <= 0 ? '已超时' : `${remaining}s`
+export function confirmCountdownText(remaining: number, locale: Locale): string {
+  return remaining <= 0 ? translate(locale, 'confirm.timeoutText') : `${remaining}s`
 }
 
 /**
@@ -56,10 +57,8 @@ export function confirmCountdownText(remaining: number): string {
  * 应答端点**完全一致**（都走 `POST /:id/confirm` 的确认/取消二元语义），
  * 差异只在**前端这句说明**上 —— 所以 `source` 是一个判别字段，而不是两个事件、两张卡。
  */
-export function confirmSourceHint(source: ConfirmSource): string {
-  return source === 'PLATFORM'
-    ? '这个工具被判定为危险操作（或没有声明只读），平台要求你确认后再执行。'
-    : '这台 MCP server 在调用过程中反过来要求你确认这次操作。'
+export function confirmSourceHint(source: ConfirmSource, locale: Locale): string {
+  return translate(locale, source === 'PLATFORM' ? 'confirm.sourcePlatform' : 'confirm.sourceServer')
 }
 
 /**
@@ -73,13 +72,11 @@ export function confirmSourceHint(source: ConfirmSource): string {
  * 返回 `null` = 无需提示（`applied:true` 时由 {@link confirmAnsweredText} 说一句更具体的）。
  * 调用方据此走 `feedback.note`（中性），**不走 `fail`**（那是给服务端故障的通道）。
  */
-export function confirmIgnoredNote(applied: boolean): string | null {
-  return applied
-    ? null
-    : '这次确认没有生效：这个提问已经结束了（超时按取消处理），本轮流程继续。'
+export function confirmIgnoredNote(applied: boolean, locale: Locale): string | null {
+  return applied ? null : translate(locale, 'confirm.ignored')
 }
 
 /** `applied:true` 时的提示（成功通道） */
-export function confirmAnsweredText(accepted: boolean): string {
-  return accepted ? '已确认，工具继续执行' : '已取消，这个工具不会执行'
+export function confirmAnsweredText(accepted: boolean, locale: Locale): string {
+  return translate(locale, accepted ? 'confirm.answeredAccepted' : 'confirm.answeredRejected')
 }

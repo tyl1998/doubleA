@@ -15,13 +15,14 @@
  */
 
 import { Alert, List, Modal, Spin, Tag } from 'antd'
-import { UPSTREAM_PROTOCOL_LABELS, type ModelProviderItem } from '@doubulea/shared'
+import { UPSTREAM_PROTOCOL_KEY, type ModelProviderItem } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { describeError } from '../../api/client.js'
 import { useProviderBoundModels, useRemoveModelProvider } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
-import { PROVIDER_DELETE_IMPACT_HINT, describeProviderKey } from './adminModel.js'
+import { useT } from '../../app/i18n.js'
+import { PROVIDER_DELETE_IMPACT_HINT_KEY, describeProviderKey } from './adminModel.js'
 
 export interface DeleteProviderModalProps {
   /** 要删的 Provider；`null` = 弹窗关闭 */
@@ -32,6 +33,7 @@ export interface DeleteProviderModalProps {
 
 export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const remove = useRemoveModelProvider()
   const [errorText, setErrorText] = useState<string | null>(null)
   // 弹窗打开时拉取"会被解绑的模型清单"（需求 3）；关闭时不发请求
@@ -51,13 +53,15 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
     remove.mutate(provider.id, {
       onSuccess: (result) => {
         feedback.ok(
-          `已删除 Provider「${result.name}」` +
-            (result.deletedModels > 0 ? `，连带删除 ${result.deletedModels} 个模型` : '（它下面是空的）') +
-            (result.unboundAgents > 0 ? `，自动解绑 ${result.unboundAgents} 个智能体` : '') +
+          t('deleteProvider.deleted', { name: result.name }) +
+            (result.deletedModels > 0
+              ? t('deleteProvider.deletedWithModels', { count: result.deletedModels })
+              : t('deleteProvider.emptyProvider')) +
+            (result.unboundAgents > 0 ? t('deleteProvider.unbound', { count: result.unboundAgents }) : '') +
             (result.clearedKnowledgeBases > 0
-              ? `，${result.clearedKnowledgeBases} 个知识库的模型绑定被清空（需重新指定）`
+              ? t('deleteProvider.clearedKb', { count: result.clearedKnowledgeBases })
               : '') +
-            (result.clearedTitleModel ? '，平台的会话标题模型被清空' : ''),
+            (result.clearedTitleModel ? t('deleteProvider.clearedTitleModel') : ''),
         )
         onClose()
       },
@@ -78,13 +82,13 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
       open={open}
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          删除 Provider「{provider.name}」
-          <Tag className="tag--danger">级联删除</Tag>
+          {t('deleteProvider.title', { name: provider.name })}
+          <Tag className="tag--danger">{t('deleteProvider.cascadeTag')}</Tag>
         </span>
       }
-      okText="确认删除"
+      okText={t('deleteProvider.okText')}
       okButtonProps={{ danger: true, loading: removing }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!removing}
@@ -92,29 +96,40 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
       <div className="stack stack--tight">
         <div>
           <p>
-            <strong>这个 Provider 下现有 {provider.modelCount} 个模型，删除会一起消失：</strong>
+            <strong>{t('deleteProvider.modelsNoteStrong', { count: provider.modelCount })}</strong>
           </p>
           <ul>
             <li>
-              它的配置：<span className="num">{provider.baseUrl}</span>（{UPSTREAM_PROTOCOL_LABELS[provider.protocol]}）
+              {t('deleteProvider.config', {
+                baseUrl: provider.baseUrl,
+                protocol: t(UPSTREAM_PROTOCOL_KEY[provider.protocol]),
+              })}
             </li>
-            <li>加密存储的 API Key（当前：{describeProviderKey(provider)}）</li>
+            <li>{t('deleteProvider.encryptedKey', { state: describeProviderKey(provider, locale) })}</li>
             <li>
-              它下面的 <span className="num">{provider.modelCount}</span> 个模型记录
+              {t('deleteProvider.modelRecordsPrefix')}
+              {provider.modelCount}
+              {t('deleteProvider.modelRecordsMid')}
             </li>
           </ul>
           <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-            操作<strong>不可恢复</strong>：没有回收站。密文与模型记录都没了，只能重新建 Provider、
-            重新填 Key、重新录入型号名（模型 id 可以先用「拉取上游模型」探出来）。
+            {t('deleteProvider.irreversiblePrefix')}
+            <strong>{t('deleteProvider.irreversibleStrong')}</strong>
+            {t('deleteProvider.irreversibleTail')}
           </p>
         </div>
 
-        <Alert type={provider.modelCount > 0 ? 'warning' : 'info'} showIcon message="删除影响" description={PROVIDER_DELETE_IMPACT_HINT} />
+        <Alert
+          type={provider.modelCount > 0 ? 'warning' : 'info'}
+          showIcon
+          message={t('deleteProvider.impactTitle')}
+          description={t(PROVIDER_DELETE_IMPACT_HINT_KEY)}
+        />
 
         {/* 需求 3：如实列出"会被自动解绑的模型 / 受影响的智能体"；2026-10-22 补：向量模型被知识库引用的影响 */}
         {bound.isLoading ? (
           <div className="row" style={{ gap: 'var(--sp-2)' }}>
-            <Spin size="small" /> <span className="ratio">正在核对哪些模型被智能体 / 知识库绑定…</span>
+            <Spin size="small" /> <span className="ratio">{t('deleteProvider.checking')}</span>
           </div>
         ) : boundModels.length > 0 ? (
           <Alert
@@ -122,12 +137,14 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
             showIcon
             message={
               [
-                agentTotal > 0 ? `将自动解绑 ${agentTotal} 个智能体` : null,
-                knowledgeBaseTotal > 0 ? `将清空 ${knowledgeBaseTotal} 个知识库的模型绑定` : null,
-                clearsTitleModel ? '将清空平台的会话标题模型' : null,
+                agentTotal > 0 ? t('deleteProvider.unbindPrefix') + agentTotal + t('deleteProvider.unbindMid') : null,
+                knowledgeBaseTotal > 0
+                  ? t('deleteProvider.clearKbPrefix') + knowledgeBaseTotal + t('deleteProvider.clearKbMid')
+                  : null,
+                clearsTitleModel ? t('deleteProvider.clearTitleModel') : null,
               ]
                 .filter((part): part is string => part !== null)
-                .join('；') + '（它们绑定了下面这些模型）'
+                .join(t('mcp.impact.join')) + t('deleteProvider.bindingsNoteSuffix')
             }
             description={
               <>
@@ -139,36 +156,47 @@ export function DeleteProviderModal({ provider, open, onClose }: DeleteProviderM
                       <span>
                         <strong>{m.label}</strong>
                         <span className="num">（{m.modelName}）</span>
-                        {m.agentCount > 0 && <> · 被 {m.agentCount} 个智能体绑定</>}
-                        {m.knowledgeBaseCount > 0 && <> · 被 {m.knowledgeBaseCount} 个知识库用作向量模型</>}
-                        {m.captionKnowledgeBaseCount > 0 && (
-                          <> · 被 {m.captionKnowledgeBaseCount} 个知识库用作图片描述模型</>
+                        {m.agentCount > 0 && <>{t('deleteProvider.boundAgents', { count: m.agentCount })}</>}
+                        {m.knowledgeBaseCount > 0 && (
+                          <>{t('deleteProvider.boundVectorKb', { count: m.knowledgeBaseCount })}</>
                         )}
-                        {m.usedAsTitleModel && <> · 被平台用作会话标题模型</>}
+                        {m.captionKnowledgeBaseCount > 0 && (
+                          <>{t('deleteProvider.boundCaptionKb', { count: m.captionKnowledgeBaseCount })}</>
+                        )}
+                        {m.usedAsTitleModel && <>{t('deleteProvider.boundTitleModel')}</>}
                       </span>
                     </List.Item>
                   )}
                 />
                 {knowledgeBaseTotal > 0 && (
                   <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                    ⚠️ 绑定被清空的知识库删除后<strong>无法入库 / 检索</strong>（图片描述也会失效），需到知识库设置里
-                    改用别的模型（换向量模型后旧向量需重建）。
+                    {t('deleteProvider.warnKbPrefix')}
+                    <strong>{t('deleteProvider.warnKbStrong')}</strong>
+                    {t('deleteProvider.warnKbTail')}
                   </p>
                 )}
                 {clearsTitleModel && (
                   <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                    ⚠️ 平台的<strong>会话标题生成模型</strong>会被清空，之后会话标题退回确定性截断，需到模型池页
-                    「系统模型」重新指定。
+                    {t('deleteProvider.warnTitlePrefix')}
+                    <strong>{t('deleteProvider.warnTitleStrong')}</strong>
+                    {t('deleteProvider.warnTitleTail')}
                   </p>
                 )}
               </>
             }
           />
         ) : bound.isError ? (
-          <Alert type="info" showIcon message="未能核对被绑定的模型" description="删除仍可进行；被引用的智能体会被自动解绑。" />
+          <Alert
+            type="info"
+            showIcon
+            message={t('deleteProvider.checkFailedTitle')}
+            description={t('deleteProvider.checkFailedDesc')}
+          />
         ) : null}
 
-        {errorText !== null && <Alert type="error" showIcon message="删除失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('deleteProvider.failed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

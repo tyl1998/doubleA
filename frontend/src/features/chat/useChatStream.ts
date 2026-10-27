@@ -66,8 +66,10 @@ import type {
   ConversationActive,
   ConversationItem,
   ConversationRunOrigin,
+  Locale,
   MessagePageResult,
 } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 import {
   agentConversationsQueryKey,
@@ -85,6 +87,7 @@ import {
 import { ApiError, type ClientErrorCode } from '../../api/client.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
 import { conversationInstanceQueryKey } from '../../api/workspace.js'
+import { currentLocale } from '../../stores/locale.js'
 import {
   disconnectOf,
   roundOf,
@@ -202,16 +205,16 @@ export interface UseChatStreamResult {
  * 与页面头部标签（`ChatPage#serverRunLabel`）**同一套来源**：用户看到的提示与状态必须对得上，
  * 否则"头部说定时任务、toast 说外部调用"又是一处新的自相矛盾。
  */
-function runOriginBusyMessage(origin: ConversationRunOrigin | null): string {
+function runOriginBusyMessage(origin: ConversationRunOrigin | null, locale: Locale): string {
   switch (origin) {
     case 'SCHEDULED':
-      return '定时任务正在运行这个会话，等它跑完再发（可在任务中心查看）'
+      return translate(locale, 'chat.busyScheduled')
     case 'OPEN_API':
-      return '外部系统正在通过开放接口运行这个会话，等它跑完再发'
+      return translate(locale, 'chat.busyOpenApi')
     case 'UI':
-      return '另一个窗口正在生成这个会话的回答，等它跑完再发'
+      return translate(locale, 'chat.busyUi')
     default:
-      return '这个会话正在生成中（不是本页发起），等它跑完再发'
+      return translate(locale, 'chat.busyUnknown')
   }
 }
 
@@ -313,7 +316,7 @@ export function useChatStream(
     }
 
     const after = flattenMessagePages(queryClient.getQueryData<{ pages: MessagePageResult[] }>(key))
-    const outcome = decideAlign({ before, after, active })
+    const outcome = decideAlign({ before, after, active, locale: currentLocale() })
     if (outcome.dropStreamVersion) {
       // 服务端存下来了 ⇒ 丢掉流式版本（否则同一轮会渲染两遍）。注意 `reset()` **不动黄条**：
       // 那是"我已经对齐过"的可见凭据，由调用方（点黄条那一下）显式清
@@ -370,11 +373,11 @@ export function useChatStream(
           // 两个通道各司其职：消息流内的错误卡（说"这一轮没成"）+ 顶部黄条（说"点我对齐"）
           useChatStreamStore.getState().fail(targetId, {
             code: 'NETWORK',
-            message: '与服务器的连接中断，已生成的内容保留（可点顶部的提示对齐历史）',
+            message: translate(currentLocale(), 'chat.streamInterrupted'),
           })
           useChatStreamStore
             .getState()
-            .showDisconnect(targetId, { extra: 'NETWORK · 没收到服务端的收口事件' })
+            .showDisconnect(targetId, { extra: translate(currentLocale(), 'chat.disconnectExtraNetwork') })
         }
         return { ok: true }
       } catch (error) {
@@ -382,7 +385,7 @@ export function useChatStream(
         // 故在消息流内收口，而不是假装它没发生（前置失败在调用方那儿就已经返回了）
         if (!controller.signal.aborted) {
           const code: ClientErrorCode = error instanceof ApiError ? error.code : 'NETWORK'
-          const message = error instanceof ApiError ? error.message : '读取回答时连接中断'
+          const message = error instanceof ApiError ? error.message : translate(currentLocale(), 'chat.readInterrupted')
           useChatStreamStore.getState().fail(targetId, { code, message })
           useChatStreamStore.getState().showDisconnect(targetId, { extra: `${code} · ${message}` })
         }
@@ -461,7 +464,7 @@ export function useChatStream(
       //    会一直占着哨兵键，把后面的新会话挡住 —— 正是多流要修掉的那类卡住）。
       let gateKey = conversationIdRef.current ?? NEW_CONVERSATION_KEY
       if (!gateFor(gateKey).enter()) {
-        return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
+        return { ok: false, error: new ApiError('BUSY', translate(currentLocale(), 'chat.busySendAgain'), 429) }
       }
       // ★ 服务端侧**还有一轮在跑，但不是本页发起的**（2026-10-22：外部 Open API 调用 /
       //   定时任务后台运行 / 另一个窗口）：本页没有它的控制器，服务端那把锁会直接回 `CONFLICT`，
@@ -476,7 +479,7 @@ export function useChatStream(
           gateFor(gateKey).leave()
           return {
             ok: false,
-            error: new ApiError('BUSY', runOriginBusyMessage(streamState.runOrigins[current] ?? null), 429),
+            error: new ApiError('BUSY', runOriginBusyMessage(streamState.runOrigins[current] ?? null, currentLocale()), 429),
           }
         }
       }
@@ -552,13 +555,13 @@ export function useChatStream(
       const content = userText.trim()
       const targetId = conversationIdRef.current
       if (targetId === undefined) {
-        return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法重新生成', 0) }
+        return { ok: false, error: new ApiError('VALIDATION', translate(currentLocale(), 'chat.noConversationRegenerate'), 0) }
       }
       if (content === '') {
-        return { ok: false, error: new ApiError('VALIDATION', '这一轮没有可重新生成的正文', 0) }
+        return { ok: false, error: new ApiError('VALIDATION', translate(currentLocale(), 'chat.noRegenerateContent'), 0) }
       }
       if (!gateFor(targetId).enter()) {
-        return { ok: false, error: new ApiError('BUSY', '上一条消息还在发送中，请稍后再发', 429) }
+        return { ok: false, error: new ApiError('BUSY', translate(currentLocale(), 'chat.busySendAgain'), 429) }
       }
       markSending(targetId)
       try {
@@ -598,7 +601,7 @@ export function useChatStream(
         const targetId = conversationIdRef.current
         // `isRunning()` 为真时不可能没有 id（`begin` 只在建出/已有会话时调用），
         // 这里的兜底只为类型安全：宁可报一个明确的错，也不要往 `/undefined/stop` 打请求
-        if (targetId === undefined) throw new ApiError('INTERNAL', '没有会话 id，无法停止', 0)
+        if (targetId === undefined) throw new ApiError('INTERNAL', translate(currentLocale(), 'chat.noConversationIdStop'), 0)
         return stopConversation(targetId)
       },
       waitSettled: (timeoutMs) =>
@@ -637,11 +640,13 @@ export function useChatStream(
         // 窗口内没等到 `done{STOPPED}`：客户端侧把这一轮标成"已停止"（如实标注，不假装收到了确认）
         useChatStreamStore.getState().stoppedLocally(targetId)
         useChatStreamStore.getState().showDisconnect(targetId, {
-          extra: `已过 ${Math.round(outcome.timeoutMs / 1000)}s 没等到服务端的收口事件`,
+          extra: translate(currentLocale(), 'chat.stopTimeoutExtra', { seconds: Math.round(outcome.timeoutMs / 1000) }),
         })
       } else if (targetId !== undefined && outcome.kind === 'stop-request-failed') {
         const message =
-          outcome.error instanceof ApiError ? `${outcome.error.code} · ${outcome.error.message}` : '停止信号没能发出去'
+          outcome.error instanceof ApiError
+        ? `${outcome.error.code} · ${outcome.error.message}`
+        : translate(currentLocale(), 'chat.stopSignalFailed')
         useChatStreamStore.getState().showDisconnect(targetId, { extra: message })
       }
       return outcome
@@ -663,7 +668,7 @@ export function useChatStream(
     if (text === '') return { ok: true, accepted: false }
     const targetId = conversationIdRef.current
     if (targetId === undefined) {
-      return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法插话', 0) }
+      return { ok: false, error: new ApiError('VALIDATION', translate(currentLocale(), 'chat.noConversationSteer'), 0) }
     }
     const round = roundOf(useChatStreamStore.getState(), targetId)
     if (round === null || round.status !== 'streaming') {
@@ -703,7 +708,7 @@ export function useChatStream(
   const cancelSteer = useCallback(async (steerId: string): Promise<CancelSteerOutcome> => {
     const targetId = conversationIdRef.current
     if (targetId === undefined) {
-      return { ok: false, error: new ApiError('VALIDATION', '还没有会话，无法撤回插话', 0) }
+      return { ok: false, error: new ApiError('VALIDATION', translate(currentLocale(), 'chat.noConversationCancelSteer'), 0) }
     }
     try {
       const result = await cancelSteerConversation(targetId, steerId)

@@ -50,7 +50,7 @@
 
 import type { Logger } from 'pino'
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { getLogger } from '../../infra/logger.js'
 import { getPrisma } from '../../infra/prisma.js'
@@ -120,8 +120,7 @@ export async function embedChunks(
     if (batchVectors.length !== batch.length) {
       // provider 契约里已有一条同样的校验；这里再拦一道是因为**它才是"顺序对得上"的保证**：
       // 少了这一条，上面 `vectors.push(...)` 的错位会一路滑到库里（检索答非所问）
-      throw AppError.internal(
-        `文本向量化结果条数不符（本批 ${batch.length} 条，返回 ${batchVectors.length} 条），已中止本次入库`,
+      throw AppError.internal(appMsg('app.m069', { p0: batch.length, p1: batchVectors.length }),
       )
     }
     vectors.push(...batchVectors)
@@ -150,7 +149,7 @@ async function embedBatchWithRetry(
       await sleep(delay)
     }
   }
-  throw AppError.internal(`文本向量化失败（已重试 ${EMBED_RETRY_DELAYS_MS.length} 次）：${describe(lastError)}`)
+  throw AppError.internal(appMsg('app.m070', { p0: EMBED_RETRY_DELAYS_MS.length, p1: describe(lastError) }))
 }
 
 /** 睡眠（只为退避；`unref` 以免在退出流程里把进程多留 1 秒） */
@@ -191,14 +190,13 @@ export interface WriteChunksInput {
 export async function writeChunks(input: WriteChunksInput): Promise<number> {
   const { docId, kbId, chunks, vectors, embeddingName, embeddingDim } = input
   if (chunks.length !== vectors.length) {
-    throw AppError.internal(
-      `入库参数不一致：${chunks.length} 个块 / ${vectors.length} 条向量。这是编程错误，请上报。`,
+    throw AppError.internal(appMsg('app.m071', { p0: chunks.length, p1: vectors.length }),
     )
   }
   if (chunks.length === 0) {
     // 空文本检测（`§五`）已经拦掉了"解析出 0 字"的情况，走到这里说明分块真的产出为空
     // —— 那不是"没问题"，而是分块策略坏了。静默写 0 行会让文档显示 READY 却没有任何内容。
-    throw AppError.internal('分块结果为空，未写入任何 chunk（请上报：这不该发生在通过空文本检测的文档上）')
+    throw AppError.internal(appMsg('app.m072'))
   }
 
   const db = getPrisma()
@@ -234,7 +232,7 @@ export async function writeChunks(input: WriteChunksInput): Promise<number> {
     for (const chunk of chunks) {
       const id = idBySeq.get(chunk.seq)
       if (id === undefined) {
-        throw AppError.internal(`建行后拿不到第 ${chunk.seq} 块的 id（返回了 ${created.length} 行）`)
+        throw AppError.internal(appMsg('app.m073', { p0: chunk.seq, p1: created.length }))
       }
       ids.push(id)
     }

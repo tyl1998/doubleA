@@ -26,6 +26,8 @@
 import { memo } from 'react'
 import type { CitationItem } from '@doubulea/shared'
 
+import { useT } from '../../app/i18n.js'
+
 export interface CitationCardProps {
   items: readonly CitationItem[]
 }
@@ -41,16 +43,17 @@ function formatScore(score: number): string {
  * 流式那一轮的引用卡只在 `citations` 帧到达时换一次引用，所以也只重渲染一次。
  */
 export const CitationCard = memo(function CitationCard({ items }: CitationCardProps) {
+  const { t } = useT()
   if (items.length === 0) return null
 
   return (
     <div className="cites" data-testid="citation-card">
       <div className="cites__head">
-        <span className="kicker">引用 · {items.length} 篇</span>
+        <span className="kicker">{t('citation.head', { count: items.length })}</span>
         {/* 口径来自 `docs/子方案①` §六（两路召回 + RRF 融合）与 `shared` 的 `citationItemSchema`
             注释："`score` 是**融合分**而不是任何一路的原始分"——两路量纲不可比，
             把 `vectorScore` 与 `bigm_similarity` 混在一张卡上会让数字无法解释。 */}
-        <span className="ratio u-right">向量 + 全文双路，RRF 融合排序</span>
+        <span className="ratio u-right">{t('citation.note')}</span>
       </div>
       {items.map((item, index) => (
         <details

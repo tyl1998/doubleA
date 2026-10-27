@@ -14,6 +14,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 // ───────────────────────────── 取值域（与 Prisma 枚举、`02` §三 一一对应）─────────────────────────────
 
 /** 用户角色（`02` §4.2：仅 ADMIN / MEMBER，无自注册） */
@@ -73,13 +75,20 @@ export function utf8ByteLength(value: string): number {
   return bytes
 }
 
-/** 新密码（建号 / 改密共用）：长度 + 字节双上限；两条消息都直接给用户看 */
+/**
+ * 新密码（建号 / 改密共用）：长度 + 字节双上限；两条消息都直接给用户看。
+ *
+ * P1-23 末批：消息从"中文正文"改为 **key + 参数**（`@validation.*`，见 `i18n/validation.ts`）——
+ * 这是 zod 收口的**样本模块**（登录 / 改密是最先被看到的表单）。其余模块**未动**，
+ * 台账见 `docs/子方案/界面语言切换.md` §3.5b。
+ * ⚠️ 中文形态逐字未变（译文在字典里），故 zh 下用户看到的话与以前一模一样。
+ */
 const newPasswordSchema = z
-  .string({ required_error: '请输入新密码' })
-  .min(PASSWORD_MIN_LENGTH, `密码至少 ${PASSWORD_MIN_LENGTH} 个字符`)
-  .max(PASSWORD_MAX_LENGTH, `密码最多 ${PASSWORD_MAX_LENGTH} 个字符`)
+  .string({ required_error: validationMessage('validation.newPasswordRequired') })
+  .min(PASSWORD_MIN_LENGTH, validationMessage('validation.newPasswordTooShort', { min: PASSWORD_MIN_LENGTH }))
+  .max(PASSWORD_MAX_LENGTH, validationMessage('validation.newPasswordTooLong', { max: PASSWORD_MAX_LENGTH }))
   .refine((value) => utf8ByteLength(value) <= PASSWORD_MAX_BYTES, {
-    message: `密码过长（最多 ${PASSWORD_MAX_BYTES} 字节，中文按 3 字节计）`,
+    message: validationMessage('validation.newPasswordTooManyBytes', { max: PASSWORD_MAX_BYTES }),
   })
 
 // ───────────────────────────── 请求体 schema ─────────────────────────────
@@ -93,17 +102,23 @@ const newPasswordSchema = z
  */
 export const loginBodySchema = z.object({
   username: z
-    .string({ required_error: '请输入用户名' })
+    .string({ required_error: validationMessage('validation.usernameRequired') })
     .trim()
-    .min(1, '请输入用户名')
-    .max(USERNAME_MAX_LENGTH, `用户名最多 ${USERNAME_MAX_LENGTH} 个字符`),
-  password: z.string({ required_error: '请输入密码' }).min(1, '请输入密码').max(256, '密码过长'),
+    .min(1, validationMessage('validation.usernameRequired'))
+    .max(USERNAME_MAX_LENGTH, validationMessage('validation.usernameTooLong', { max: USERNAME_MAX_LENGTH })),
+  password: z
+    .string({ required_error: validationMessage('validation.passwordRequired') })
+    .min(1, validationMessage('validation.passwordRequired'))
+    .max(256, validationMessage('validation.passwordTooLongPlain')),
 })
 export type LoginBody = z.infer<typeof loginBodySchema>
 
 /** 改密请求体（`02` §4.1：旧密码校验；首登强制也走这个端点） */
 export const changePasswordBodySchema = z.object({
-  oldPassword: z.string({ required_error: '请输入当前密码' }).min(1, '请输入当前密码').max(256, '密码过长'),
+  oldPassword: z
+    .string({ required_error: validationMessage('validation.oldPasswordRequired') })
+    .min(1, validationMessage('validation.oldPasswordRequired'))
+    .max(256, validationMessage('validation.passwordTooLongPlain')),
   newPassword: newPasswordSchema,
 })
 export type ChangePasswordBody = z.infer<typeof changePasswordBodySchema>

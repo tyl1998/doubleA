@@ -59,7 +59,6 @@ import {
   sandboxComponentsArg,
   sandboxVariantIdFromSelection,
   sandboxVariantLabel,
-  SANDBOX_BUILD_PHASE_LABELS,
   type SandboxBuildJob,
   type SandboxBuildPhase,
   type SandboxRuntimeSelection,
@@ -120,8 +119,8 @@ interface BuildJobState {
   startedAtMs: number
   status: SandboxBuildJob['status']
   phase: SandboxBuildPhase
-  /** 阶段显示文案（含"正在装 X"这类细节，由 {@link phaseLabelFor} 生成） */
-  phaseLabel: string
+  /** 阶段细节（组件名 / RUN 概要；没有时为 `null`）—— 前端与 `phase` 组合成一句人话 */
+  detail: string | null
   /** 0..1；只增不减 */
   progress: number
   log: string
@@ -149,7 +148,7 @@ function snapshot(job: BuildJobState): SandboxBuildJob {
     label: job.label,
     status: job.status,
     phase: job.phase,
-    phaseLabel: job.phaseLabel,
+    detail: job.detail,
     progress: job.progress,
     log: job.log,
     image: job.image,
@@ -179,7 +178,7 @@ function settleImmediately(partial: {
     startedAtMs: Date.now(),
     status: partial.status,
     phase: partial.phase,
-    phaseLabel: SANDBOX_BUILD_PHASE_LABELS[partial.phase],
+    detail: null,
     progress: partial.progress,
     log: partial.log ?? '',
     image: partial.image,
@@ -271,10 +270,7 @@ export function interpretBuildLine(line: string): BuildLineInterpretation {
 function advancePhase(job: BuildJobState, phase: SandboxBuildPhase, detail?: string): void {
   if (SANDBOX_BUILD_PHASE_ORDER.indexOf(phase) < SANDBOX_BUILD_PHASE_ORDER.indexOf(job.phase)) return
   job.phase = phase
-  job.phaseLabel =
-    detail !== undefined && detail !== ''
-      ? `${SANDBOX_BUILD_PHASE_LABELS[phase]}（${detail}）`
-      : SANDBOX_BUILD_PHASE_LABELS[phase]
+  job.detail = detail !== undefined && detail !== '' ? detail : null
   job.progress = Math.max(job.progress, PHASE_PROGRESS_FLOOR[phase])
 }
 
@@ -310,7 +306,7 @@ function finishJob(job: BuildJobState, status: 'succeeded' | 'failed' | 'cancele
   job.error = error
   if (status === 'succeeded') {
     job.phase = 'done'
-    job.phaseLabel = SANDBOX_BUILD_PHASE_LABELS.done
+    job.detail = null
     job.progress = 1
   }
   tagToJob.delete(job.tag)
@@ -408,7 +404,7 @@ export async function startSandboxRuntimeBuild(
     startedAtMs: Date.now(),
     status: 'running',
     phase: 'queued',
-    phaseLabel: SANDBOX_BUILD_PHASE_LABELS.queued,
+    detail: null,
     progress: 0,
     log: '',
     image: null,

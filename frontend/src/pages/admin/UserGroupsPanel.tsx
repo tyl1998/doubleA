@@ -11,8 +11,8 @@
  */
 
 import { Button, Form, Input, Modal, Popconfirm, Select, Spin, Table, type TableColumnsType } from 'antd'
-import { useEffect, useState } from 'react'
-import type { UserGroupItem } from '@doubulea/shared'
+import { useEffect, useMemo, useState } from 'react'
+import type { UserGroupItem, UserGroupMember } from '@doubulea/shared'
 
 import { useUserSearch } from '../../api/users.js'
 import {
@@ -24,6 +24,7 @@ import {
   useUserGroups,
 } from '../../api/userGroups.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 const SEARCH_DEBOUNCE_MS = 250
 
@@ -32,12 +33,16 @@ const SEARCH_DEBOUNCE_MS = 250
 function UserMultiSelect({
   value,
   onChange,
+  knownMembers,
   disabled,
 }: {
   value: string[]
   onChange: (next: string[]) => void
+  /** 已选成员的已知显示名（来自组详情），用于打开弹窗时直接展示名字而非 id */
+  knownMembers?: UserGroupMember[]
   disabled?: boolean
 }) {
+  const { t } = useT()
   const [keyword, setKeyword] = useState('')
   const [debounced, setDebounced] = useState('')
   useEffect(() => {
@@ -47,6 +52,13 @@ function UserMultiSelect({
 
   const search = useUserSearch(debounced)
   const [known, setKnown] = useState<Record<string, string>>({})
+
+  // 已知名字的两个来源：组详情里的成员（打开时立即可用）+ 曾搜到的用户（增量补充）
+  const seeded = useMemo(() => {
+    const next: Record<string, string> = {}
+    for (const member of knownMembers ?? []) next[member.id] = member.name
+    return next
+  }, [knownMembers])
   useEffect(() => {
     const found = search.data ?? []
     if (found.length === 0) return
@@ -57,9 +69,12 @@ function UserMultiSelect({
     })
   }, [search.data])
 
+  // 已知名字的两个来源合并：搜索结果覆盖同 id 的种子名（两者同源，取更新的一份）
+  const knownLabels = useMemo(() => ({ ...seeded, ...known }), [seeded, known])
+
   const options = (search.data ?? []).map((user) => ({ value: user.id, label: user.name }))
   const missing = value.filter((id) => !options.some((o) => o.value === id))
-  const selectedOptions = missing.map((id) => ({ value: id, label: known[id] ?? id }))
+  const selectedOptions = missing.map((id) => ({ value: id, label: knownLabels[id] ?? id }))
 
   return (
     <Select
@@ -70,10 +85,10 @@ function UserMultiSelect({
       options={[...selectedOptions, ...options]}
       loading={search.isFetching}
       disabled={disabled}
-      placeholder="按用户名 / 显示名搜索并选择成员"
+      placeholder={t('userGroups.memberPlaceholder')}
       style={{ width: '100%' }}
       notFoundContent={
-        search.isFetching ? <Spin size="small" /> : debounced === '' ? '输入关键词搜索用户' : '没有匹配的用户'
+        search.isFetching ? <Spin size="small" /> : debounced === '' ? t('userGroups.searchHint') : t('userGroups.noMatch')
       }
       onSearch={setKeyword}
       onChange={onChange}
@@ -85,6 +100,7 @@ function UserMultiSelect({
 
 function GroupFormModal({ group, open, onClose }: { group: UserGroupItem | null; open: boolean; onClose: () => void }) {
   const feedback = useFeedback()
+  const { t } = useT()
   const create = useCreateUserGroup()
   const update = useUpdateUserGroup()
   const [name, setName] = useState('')
@@ -99,43 +115,43 @@ function GroupFormModal({ group, open, onClose }: { group: UserGroupItem | null;
   const submitting = create.isPending || update.isPending
   const submit = async () => {
     if (name.trim() === '') {
-      feedback.fail(new Error('请输入组名'), '无法保存')
+      feedback.fail(new Error(t('userGroups.nameRequired')), t('userGroups.cannotSave'))
       return
     }
     try {
       if (group === null) {
         await create.mutateAsync({ name: name.trim(), description: description.trim() })
-        feedback.ok('已创建用户组')
+        feedback.ok(t('userGroups.created'))
       } else {
         await update.mutateAsync({ id: group.id, body: { name: name.trim(), description: description.trim() } })
-        feedback.ok('已保存用户组')
+        feedback.ok(t('userGroups.saved'))
       }
       onClose()
     } catch (error) {
-      feedback.fail(error, '保存失败')
+      feedback.fail(error, t('userGroups.saveFailed'))
     }
   }
 
   return (
     <Modal
       open={open}
-      title={group === null ? '新建用户组' : `编辑用户组 · ${group.name}`}
-      okText="保存"
-      cancelText="取消"
+      title={group === null ? t('userGroups.titleCreate') : t('userGroups.titleEdit', { name: group.name })}
+      okText={t('common.save')}
+      cancelText={t('common.cancel')}
       confirmLoading={submitting}
       onOk={submit}
       onCancel={onClose}
       destroyOnClose
     >
       <Form layout="vertical">
-        <Form.Item label="组名" required>
-          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：测试团队" />
+        <Form.Item label={t('userGroups.nameLabel')} required>
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder={t('userGroups.namePlaceholder')} />
         </Form.Item>
-        <Form.Item label="描述">
+        <Form.Item label={t('userGroups.descriptionLabel')}>
           <Input
             value={description}
             onChange={(event) => setDescription(event.target.value)}
-            placeholder="这个组是干什么的（可选）"
+            placeholder={t('userGroups.descriptionPlaceholder')}
           />
         </Form.Item>
       </Form>
@@ -147,6 +163,7 @@ function GroupFormModal({ group, open, onClose }: { group: UserGroupItem | null;
 
 function MembersModal({ group, open, onClose }: { group: UserGroupItem | null; open: boolean; onClose: () => void }) {
   const feedback = useFeedback()
+  const { t } = useT()
   const detail = useUserGroup(open && group !== null ? group.id : undefined)
   const replace = useReplaceUserGroupMembers()
   const [userIds, setUserIds] = useState<string[]>([])
@@ -160,27 +177,27 @@ function MembersModal({ group, open, onClose }: { group: UserGroupItem | null; o
     if (group === null) return
     try {
       await replace.mutateAsync({ id: group.id, body: { userIds } })
-      feedback.ok('已保存成员')
+      feedback.ok(t('userGroups.membersSaved'))
       onClose()
     } catch (error) {
-      feedback.fail(error, '保存失败')
+      feedback.fail(error, t('userGroups.saveFailed'))
     }
   }
 
   return (
     <Modal
       open={open}
-      title={group === null ? '管理成员' : `管理成员 · ${group.name}`}
-      okText="保存"
-      cancelText="取消"
+      title={group === null ? t('userGroups.membersTitle') : t('userGroups.membersTitleNamed', { name: group.name })}
+      okText={t('common.save')}
+      cancelText={t('common.cancel')}
       confirmLoading={replace.isPending}
       onOk={submit}
       onCancel={onClose}
       destroyOnClose
     >
       <div className="stack stack--tight">
-        <p className="ratio">整体替换：提交的就是全部成员（清空即移除所有人）。</p>
-        {detail.isPending ? <Spin /> : <UserMultiSelect value={userIds} onChange={setUserIds} />}
+        <p className="ratio">{t('userGroups.membersReplaceNote')}</p>
+        {detail.isPending ? <Spin /> : <UserMultiSelect value={userIds} onChange={setUserIds} knownMembers={detail.data?.members} />}
       </div>
     </Modal>
   )
@@ -190,6 +207,7 @@ function MembersModal({ group, open, onClose }: { group: UserGroupItem | null; o
 
 export function UserGroupsPanel() {
   const feedback = useFeedback()
+  const { t } = useT()
   const groups = useUserGroups()
   const remove = useRemoveUserGroup()
   const [creating, setCreating] = useState(false)
@@ -197,47 +215,47 @@ export function UserGroupsPanel() {
   const [membersFor, setMembersFor] = useState<UserGroupItem | null>(null)
 
   const columns: TableColumnsType<UserGroupItem> = [
-    { title: '组名', dataIndex: 'name', width: 220 },
+    { title: t('userGroups.colName'), dataIndex: 'name', width: 220 },
     {
-      title: '描述',
+      title: t('userGroups.colDescription'),
       dataIndex: 'description',
       render: (_, group) => group.description ?? <span className="ratio">—</span>,
     },
-    { title: '成员数', dataIndex: 'memberCount', width: 100, align: 'right' },
+    { title: t('userGroups.colMemberCount'), dataIndex: 'memberCount', width: 100, align: 'right' },
     {
-      title: '操作',
+      title: t('models.colActions'),
       key: 'actions',
       width: 260,
       align: 'right',
       render: (_, group) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
           <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditing(group)}>
-            编辑
+            {t('common.edit')}
           </Button>
           <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setMembersFor(group)}>
-            管理成员
+            {t('userGroups.manageMembers')}
           </Button>
           <Popconfirm
-            title={`删除用户组「${group.name}」？`}
-            description="会从所有作为受众引用它的智能体上移除这个组。"
-            okText="删除"
+            title={t('userGroups.removeTitle', { name: group.name })}
+            description={t('userGroups.removeDesc')}
+            okText={t('common.delete')}
             okButtonProps={{ danger: true }}
-            cancelText="取消"
+            cancelText={t('common.cancel')}
             onConfirm={async () => {
               try {
                 const result = await remove.mutateAsync(group.id)
                 feedback.ok(
                   result.removedAudiences > 0
-                    ? `已删除用户组（并从 ${result.removedAudiences} 个智能体受众中移除）`
-                    : '已删除用户组',
+                    ? t('userGroups.deletedWithCount', { count: result.removedAudiences })
+                    : t('userGroups.deleted'),
                 )
               } catch (error) {
-                feedback.fail(error, '删除失败')
+                feedback.fail(error, t('userGroups.removeFailed'))
               }
             }}
           >
             <Button type="link" size="small" danger style={{ padding: 0 }}>
-              删除
+              {t('common.delete')}
             </Button>
           </Popconfirm>
         </div>
@@ -249,11 +267,11 @@ export function UserGroupsPanel() {
     <>
       <div className="row row--wrap" style={{ marginBottom: 'var(--sp-5)' }}>
         <p className="ratio">
-          用户组用于在智能体的「指定用户」可见范围里批量圈人；组由管理员维护。
+          {t('userGroups.lead')}
         </p>
         <div className="u-right">
           <Button type="primary" onClick={() => setCreating(true)}>
-            新建用户组
+            {t('userGroups.create')}
           </Button>
         </div>
       </div>
@@ -267,7 +285,7 @@ export function UserGroupsPanel() {
           loading={false}
           pagination={false}
           scroll={{ x: 800 }}
-          locale={{ emptyText: groups.isFetching ? '正在读取…' : '还没有用户组' }}
+          locale={{ emptyText: groups.isFetching ? t('common.loading') : t('userGroups.emptyTable') }}
         />
       </div>
 

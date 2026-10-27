@@ -62,10 +62,11 @@ import {
   AGENT_SYSTEM_PROMPT_MAX_CHARS,
   AGENT_TYPES,
   ASSET_VISIBILITIES,
-  ASSET_VISIBILITY_LABELS,
+  ASSET_VISIBILITY_KEY,
   GUIDE_QUESTION_MAX_CHARS,
   GUIDE_QUESTIONS_MAX,
   createAgentBodySchema,
+  translate,
   updateAgentBodySchema,
   type AgentComponentInput,
   type AgentItem,
@@ -81,14 +82,15 @@ import { useMcpServers, useMcpServerTools, useMyCredentials } from '../../api/mc
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
+import { useT } from '../../app/i18n.js'
 import { AGENTS_PATH, chatPath, credentialsPath, credentialsSectionPath } from '../../app/paths.js'
 import { AudiencePicker } from '../../components/AudiencePicker.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { DeleteAgentModal } from './DeleteAgentModal.js'
 import {
   AGENT_SECTIONS,
-  AGENT_SECTION_LABEL,
-  AGENT_TYPE_HINT,
+  AGENT_SECTION_LABEL_KEY,
+  AGENT_TYPE_HINT_KEY,
   AGENT_TYPE_LABEL,
   EMPTY_AGENT_FORM_VALUES,
   buildCreateBody,
@@ -120,16 +122,20 @@ import {
 function AudienceField({
   value,
   onChange,
+  knownUsers,
   disabled,
 }: {
   value?: { userIds: string[]; groupIds: string[] }
   onChange?: (next: { userIds: string[]; groupIds: string[] }) => void
+  /** 已保存受众的用户回显（`id + 显示名`），用于打开时展示名字而非 id */
+  knownUsers?: { id: string; name: string }[]
   disabled?: boolean
 }) {
   return (
     <AudiencePicker
       userIds={value?.userIds ?? []}
       groupIds={value?.groupIds ?? []}
+      knownUsers={knownUsers}
       onChange={(next) => onChange?.(next)}
       disabled={disabled}
     />
@@ -149,21 +155,22 @@ export function AgentEditPage() {
 
 function AgentFormPage({ agentId }: { agentId?: string }) {
   const agentQuery = useAgent(agentId)
+  const { t } = useT()
 
   // 面包屑已挪到顶栏：这里把"创建 / 编辑 · 名称"作为「细节段」上报
   //（顶栏渲染 `工作台 / 智能体 / <detail>`）
   const crumbDetail =
     agentId === undefined
-      ? '创建'
+      ? t('agentForm.crumbCreate')
       : agentQuery.data !== undefined
-        ? `编辑 · ${agentQuery.data.name}`
-        : '编辑智能体'
+        ? t('agentForm.crumbEditName', { name: agentQuery.data.name })
+        : t('agentForm.crumbEdit')
   usePageCrumb(crumbDetail)
 
   if (agentId !== undefined && agentQuery.isPending) {
     return (
       <>
-        <EditHead title="编辑智能体" lead="正在读取智能体…" />
+        <EditHead title={t('agentForm.editTitle')} lead={t('agentForm.loadingLead')} />
         <TableSkeleton rows={4} />
       </>
     )
@@ -172,9 +179,9 @@ function AgentFormPage({ agentId }: { agentId?: string }) {
   if (agentId !== undefined && agentQuery.isError) {
     return (
       <>
-        <EditHead title="编辑智能体" lead="读不到这个智能体。" />
+        <EditHead title={t('agentForm.editTitle')} lead={t('agentForm.notFoundLead')} />
         <ErrorState
-          title="智能体详情加载失败"
+          title={t('agentForm.loadFailedTitle')}
           error={agentQuery.error}
           retrying={agentQuery.isFetching}
           onRetry={() => {
@@ -227,6 +234,7 @@ function toFailures(sections: readonly AgentSectionKey[], error: unknown): SaveF
 function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const navigate = useNavigate()
   const feedback = useFeedback()
+  const { t, locale } = useT()
 
   const createAgent = useCreateAgent()
   const updateAgent = useUpdateAgent()
@@ -329,20 +337,23 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   if (initialItem !== undefined && !initialItem.canEdit) {
     return (
       <>
-        <EditHead title="编辑智能体" lead={`「${initialItem.name}」由 ${initialItem.creatorName} 创建，本页只读。`} />
+        <EditHead
+          title={t('agentForm.editTitle')}
+          lead={t('agentForm.readOnlyLead', { name: initialItem.name, creator: initialItem.creatorName })}
+        />
         <div className="stack">
           <Alert
             type="info"
             showIcon
-            message="只有创建者或管理员可以修改这个智能体"
-            description="它的对话入口对所有人开放 —— 你可以直接用它，或者请创建者调整配置。"
+            message={t('agentForm.readOnlyTitle')}
+            description={t('agentForm.readOnlyDesc')}
           />
           <div className="row">
             <Link to={chatPath(initialItem.id)}>
-              <Button type="primary">用这个智能体开一个会话</Button>
+              <Button type="primary">{t('agentForm.openSession')}</Button>
             </Link>
             <Link to={AGENTS_PATH}>
-              <Button>返回列表</Button>
+              <Button>{t('agentForm.backToList')}</Button>
             </Link>
           </div>
 
@@ -440,12 +451,12 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
       // **不静默部分成功**：留在本页并列出未保存的区块。若 `POST` 已经成功，先把
       // "对象已经建出来了"这件事说出来（否则用户会以为整次操作都没生效而重复建一个）。
       if (initialItem === undefined && currentId !== undefined) {
-        feedback.fail(new Error('智能体已创建，但还有区块没保存成功 —— 见页面顶部的提示'), '部分保存失败')
+        feedback.fail(new Error(t('agentForm.partialFailed')), t('agentForm.partialFailedTitle'))
       }
       return
     }
 
-    feedback.ok(initialItem === undefined ? '智能体已创建' : '已保存')
+    feedback.ok(initialItem === undefined ? t('agentForm.created') : t('agentForm.saved'))
     navigate(AGENTS_PATH)
   }
 
@@ -455,9 +466,10 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   // 可用（已启用）CHAT 模型的选项（模型池多选框的主数据源）
   const availableModelOptions = modelOptions.map((option) => ({
     value: option.id,
-    label: `${option.label} · 上下文 ${option.maxContext === null ? '未配置' : option.maxContext} · ${
-      option.supportsVision ? '支持图片' : '不支持图片'
-    }`,
+    label: `${option.label}${t('agentForm.modelOptionMeta', {
+      context: option.maxContext === null ? t('agentForm.modelContextUnset') : option.maxContext,
+      vision: option.supportsVision ? t('agentForm.modelVisionYes') : t('agentForm.modelVisionNo'),
+    })}`,
   }))
   // 编辑时：池里"已停用/已删"的成员（不在可用列表里）也要能显示与保留，否则 Select 只剩裸 uuid，
   // 用户看不出绑的是什么。停用成员的名字来自投影 `item.models`。
@@ -466,7 +478,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
       ? []
       : item.models
           .filter((m) => !modelOptions.some((option) => option.id === m.modelId))
-          .map((m) => ({ value: m.modelId, label: `${m.modelLabel}（已停用，可移出池）` }))
+          .map((m) => ({ value: m.modelId, label: `${m.modelLabel}${t('agentForm.staleModelSuffix')}` }))
   const modelPoolSelectOptions = [...availableModelOptions, ...stalePoolOptions]
   // 默认模型只能在**当前池**内选（保证默认模型恒为池成员，与后端一致）
   const defaultModelSelectOptions = modelPoolSelectOptions.filter((option) =>
@@ -529,16 +541,18 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
     <>
       <div className="page__head">
         <div>
-          <h1>{initialItem === undefined ? '创建智能体' : '编辑智能体'}</h1>
+          <h1>{initialItem === undefined ? t('agentForm.createTitle') : t('agentForm.editTitle')}</h1>
           <p className="page__lead">
-            保存会串行发出两个请求：先 <code>PATCH /api/agents/:id</code> 更新文本字段，再{' '}
-            <code>PUT /api/agents/:id/components</code> 整体替换组件绑定。任一失败都会停留本页，
-            并标出未保存的区块。
+            {t('agentForm.leadPrefix')}
+            <code>PATCH /api/agents/:id</code>
+            {t('agentForm.leadMid')}
+            <code>PUT /api/agents/:id/components</code>
+            {t('agentForm.leadSuffix')}
           </p>
         </div>
         <div className="page__head-actions">
           <Tag className="tag--accent">{AGENT_TYPE_LABEL[values.type]}</Tag>
-          {typeLocked && <Tag title="类型创建后不可修改">类型锁定</Tag>}
+          {typeLocked && <Tag title={t('agentForm.typeLockedTitle')}>{t('agentForm.typeLocked')}</Tag>}
         </div>
       </div>
 
@@ -568,18 +582,21 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               <Alert
                 type="error"
                 showIcon
-                message="以下区块没有保存成功"
+                message={t('agentForm.failuresTitle')}
                 description={
                   <>
                     <ul>
                       {failures.map((failure) => (
                         <li key={failure.section}>
-                          <strong>{AGENT_SECTION_LABEL[failure.section]}</strong>（{failure.code}）· {failure.message}
+                          <strong>{t(AGENT_SECTION_LABEL_KEY[failure.section])}</strong>（{failure.code}）·{' '}
+                          {failure.message}
                         </li>
                       ))}
                     </ul>
                     <p className="ratio">
-                      已经保存成功的部分<strong>不会回滚</strong> —— 修正后点「重试未保存的区块」只会重发还没落库的那部分。
+                      {t('agentForm.failuresNote')}
+                      <strong>{t('agentForm.failuresNoteStrong')}</strong>
+                      {t('agentForm.failuresNoteTail')}
                     </p>
                   </>
                 }
@@ -591,7 +608,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                       void runSave(values)
                     }}
                   >
-                    重试未保存的区块
+                    {t('agentForm.retryFailed')}
                   </Button>
                 }
               />
@@ -600,25 +617,25 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
             {/* ① 基本信息 */}
             <FormSection section="basic" dirty={dirtySections.includes('basic')} failed={failedSections.has('basic')}>
               <div className="stack stack--tight">
-                <Form.Item name="name" label="名称" rules={[{ required: true, message: '请输入智能体名称' }]}>
-                  <Input placeholder="例如：运维问答助手" />
+                <Form.Item name="name" label={t('agentForm.name')} rules={[{ required: true, message: t('agentForm.nameRequired') }]}>
+                  <Input placeholder={t('agentForm.namePlaceholder')} />
                 </Form.Item>
                 <Form.Item
                   name="description"
-                  label="描述"
-                  extra={`留空即清空该字段；最多 ${AGENT_DESCRIPTION_MAX_CHARS} 个字符。`}
+                  label={t('agentForm.description')}
+                  extra={t('agentForm.descriptionExtra', { max: AGENT_DESCRIPTION_MAX_CHARS })}
                 >
-                  <Input placeholder="一句话说清它做什么、边界在哪" />
+                  <Input placeholder={t('agentForm.descriptionPlaceholder')} />
                 </Form.Item>
                 <Form.Item
                   name="visibility"
-                  label="可见范围"
-                  extra="私有 = 仅所属人（你）与管理员；指定用户 = 只有你圈定的用户/组可见可用；公开 = 全员可看可用。"
+                  label={t('agentForm.visibility')}
+                  extra={t('agentForm.visibilityExtra')}
                 >
                   <Radio.Group>
                     {ASSET_VISIBILITIES.map((value) => (
                       <Radio key={value} value={value}>
-                        {ASSET_VISIBILITY_LABELS[value]}
+                        {translate(locale, ASSET_VISIBILITY_KEY[value])}
                       </Radio>
                     ))}
                   </Radio.Group>
@@ -626,25 +643,24 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 {values.visibility === 'SHARED' && (
                   <Form.Item
                     name="audience"
-                    label="受众"
+                    label={t('agentForm.audience')}
                     required
-                    extra="受众 = 你直接指定的用户 ∪ 你选的组里全部成员；至少选一位用户或一个组。"
+                    extra={t('agentForm.audienceExtra')}
                   >
-                    <AudienceField />
+                    <AudienceField knownUsers={item?.audience.users} />
                   </Form.Item>
                 )}
                 {(values.visibility === 'PUBLIC' || values.visibility === 'SHARED') && (
                   <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                    公开 / 指定用户后，该智能体引用的私有知识库 / MCP 工具内容、以及共享 Key 的模型额度，
-                    将对该受众可见 / 可用 —— 这属于自愿共享（不受引用的组件 / Provider 自身可见范围限制）。
+                    {t('agentForm.sharedNote')}
                   </p>
                 )}
                 {typeLocked ? (
                   <div>
-                    <p className="block-label">类型</p>
+                    <p className="block-label">{t('agentForm.type')}</p>
                     <span className="row">
                       <Tag>{AGENT_TYPE_LABEL[values.type]}</Tag>
-                      <span className="ratio">{AGENT_TYPE_HINT[values.type]}</span>
+                      <span className="ratio">{t(AGENT_TYPE_HINT_KEY[values.type])}</span>
                     </span>
                   </div>
                 ) : (
@@ -652,13 +668,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                   // ⚠️ 原型把 TaskAgent 画成 `disabled`（并配了个 `.check` 的 `opacity: .6`），
                   //    但 `06` P0-1-31 的验收是"**创建两种类型** Agent" —— 照抄原型会让这条验收
                   //    永远过不了。两种类型都可选，创建后由后端锁定（传异值 409）。
-                  <Form.Item name="type" label="类型">
+                  <Form.Item name="type" label={t('agentForm.type')}>
                     <Radio.Group>
                       <div className="stack stack--tight">
                         {AGENT_TYPES.map((type) => (
                           <Radio key={type} value={type} className="pick">
                             <span className="pick__title">{AGENT_TYPE_LABEL[type]}</span>
-                            <span className="pick__meta">{AGENT_TYPE_HINT[type]}</span>
+                            <span className="pick__meta">{t(AGENT_TYPE_HINT_KEY[type])}</span>
                           </Radio>
                         ))}
                       </div>
@@ -673,9 +689,9 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               <div className="stack stack--tight">
                 <Form.Item
                   name="modelIds"
-                  label="模型池"
-                  rules={[{ required: true, message: '请至少选择一个模型', type: 'array', min: 1 }]}
-                  extra="对话时可在这里选择的模型集合。仅列出「已启用」的 CHAT 模型（停用的模型不会出现在这里）；用户在对话页可从池中切换具体模型。"
+                  label={t('agentForm.modelPool')}
+                  rules={[{ required: true, message: t('agentForm.modelPoolRequired'), type: 'array', min: 1 }]}
+                  extra={t('agentForm.modelPoolExtra')}
                 >
                   <Select
                     mode="multiple"
@@ -683,8 +699,8 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                     optionFilterProp="label"
                     loading={modelQuery.isPending}
                     options={modelPoolSelectOptions}
-                    placeholder={modelQuery.isPending ? '正在读取可用模型…' : '选择一个或多个对话模型'}
-                    notFoundContent="没有可用的对话模型：需要管理员在模型池里启用一个 CHAT 模型（且它的 Provider 也启用）"
+                    placeholder={modelQuery.isPending ? t('agentForm.modelPoolLoading') : t('agentForm.modelPoolPlaceholder')}
+                    notFoundContent={t('agentForm.modelPoolEmpty')}
                     onChange={(next: string[]) => {
                       // 池里移除了当前默认模型 ⇒ 清空默认模型选择，逼用户重选（避免默认模型不在池里）
                       const currentDefault = form.getFieldValue('modelId') as string
@@ -697,29 +713,28 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 </Form.Item>
                 <Form.Item
                   name="modelId"
-                  label="默认模型"
-                  rules={[{ required: true, message: '请选择默认模型' }]}
-                  extra="对话时不指定模型时使用的默认模型。只能从上面的模型池中选择。"
+                  label={t('agentForm.defaultModel')}
+                  rules={[{ required: true, message: t('agentForm.defaultModelRequired') }]}
+                  extra={t('agentForm.defaultModelExtra')}
                 >
                   <Select
                     showSearch
                     optionFilterProp="label"
                     options={defaultModelSelectOptions}
-                    placeholder={values.modelIds.length === 0 ? '请先在上面选择模型池' : '从模型池中选一个默认模型'}
-                    notFoundContent="模型池为空：请先在上面选择至少一个模型"
+                    placeholder={values.modelIds.length === 0 ? t('agentForm.defaultModelNeedPool') : t('agentForm.defaultModelPlaceholder')}
+                    notFoundContent={t('agentForm.defaultModelEmpty')}
                   />
                 </Form.Item>
                 {unconfiguredCredProviders.length > 0 && (
                   <Alert
                     type="warning"
                     showIcon
-                    message={`所选模型的 Provider「${unconfiguredCredProviders.join('、')}」是「各自 Key」模式，你还没配置 Key`}
+                    message={t('agentForm.needKeyTitle', { providers: unconfiguredCredProviders.join(t('mcp.listSeparator')) })}
                     description={
                       <>
-                        这些 Provider 的模型选了也能保存，但发消息时会返回「尚未配置所需凭据」。
-                        请到「我的凭据」的「模型 Provider 凭据」分区配置你自己的 API Key。
+                        {t('agentForm.needKeyDescPrefix')}
                         <br />
-                        <Link to={credentialsSectionPath('provider')}>去我的凭据配置 →</Link>
+                        <Link to={credentialsSectionPath('provider')}>{t('agentForm.needKeyLink')}</Link>
                       </>
                     }
                   />
@@ -736,44 +751,45 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               <div className="stack stack--tight">
                 <Form.Item
                   name="systemPrompt"
-                  label="系统提示词"
-                  extra={`不自动裁剪首尾空白；最多 ${AGENT_SYSTEM_PROMPT_MAX_CHARS} 个字符。`}
+                  label={t('agentForm.systemPrompt')}
+                  extra={t('agentForm.systemPromptExtra', { max: AGENT_SYSTEM_PROMPT_MAX_CHARS })}
                 >
                   <Input.TextArea
                     rows={7}
-                    placeholder="你是……只依据检索到的内部资料回答；检索不到就直说，不要编造。"
+                    placeholder={t('agentForm.systemPromptPlaceholder')}
                   />
                 </Form.Item>
                 <Form.Item
                   name="openingRemarks"
-                  label="开场白"
-                  extra={`新会话里的第一条助手消息；最多 ${AGENT_OPENING_REMARKS_MAX_CHARS} 个字符。`}
+                  label={t('agentForm.openingRemarks')}
+                  extra={t('agentForm.openingRemarksExtra', { max: AGENT_OPENING_REMARKS_MAX_CHARS })}
                 >
-                  <Input.TextArea rows={3} placeholder="我是……你可以直接描述问题。" />
+                  <Input.TextArea rows={3} placeholder={t('agentForm.openingRemarksPlaceholder')} />
                 </Form.Item>
 
                 <div>
-                  <p className="block-label">引导问题</p>
+                  <p className="block-label">{t('agentForm.guideQuestions')}</p>
                   <Form.List name="guideQuestions">
                     {(fields, { add, remove }) => (
                       <div className="stack stack--tight">
                         {fields.map((field, index) => (
                           <div className="guide-row" key={field.key}>
                             <Form.Item {...field} noStyle>
-                              <Input placeholder={`引导问题 ${index + 1}`} maxLength={GUIDE_QUESTION_MAX_CHARS} />
+                              <Input placeholder={t('agentForm.guideQuestionPlaceholder', { n: index + 1 })} maxLength={GUIDE_QUESTION_MAX_CHARS} />
                             </Form.Item>
                             <Button size="small" onClick={() => remove(field.name)}>
-                              移除
+                              {t('agentForm.remove')}
                             </Button>
                           </div>
                         ))}
                         <div className="row row--wrap">
                           <Button size="small" disabled={fields.length >= GUIDE_QUESTIONS_MAX} onClick={() => add('')}>
-                            + 添加引导问题
+                            {t('agentForm.addGuideQuestion')}
                           </Button>
                           <span className="ratio">
-                            最多 {GUIDE_QUESTIONS_MAX} 条、每条 {GUIDE_QUESTION_MAX_CHARS} 字；留空的条目保存时会自动丢掉。
-                            对话页里点击它只<strong>填入输入框</strong>、可编辑后再发送（不直接发送）。
+                            {t('agentForm.guideQuestionsNotePrefix', { max: GUIDE_QUESTIONS_MAX, chars: GUIDE_QUESTION_MAX_CHARS })}
+                            <strong>{t('agentForm.guideQuestionsNoteStrong')}</strong>
+                            {t('agentForm.guideQuestionsNoteTail')}
                           </span>
                         </div>
                       </div>
@@ -791,14 +807,14 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
             >
               <div className="stack">
                 <div>
-                  <p className="block-label">知识库</p>
+                  <p className="block-label">{t('agentForm.knowledge')}</p>
                   {kbQuery.isPending ? (
-                    <p className="ratio">正在读取知识库列表…</p>
+                    <p className="ratio">{t('agentForm.kbLoading')}</p>
                   ) : kbQuery.isError ? (
                     <Alert
                       type="error"
                       showIcon
-                      message="知识库列表加载失败"
+                      message={t('agentForm.kbLoadFailed')}
                       description={describeError(kbQuery.error).message}
                       action={
                         <Button
@@ -807,12 +823,12 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                             void kbQuery.refetch()
                           }}
                         >
-                          重试
+                          {t('common.retry')}
                         </Button>
                       }
                     />
                   ) : kbItems.length === 0 ? (
-                    <Alert type="info" showIcon message="还没有任何知识库" />
+                    <Alert type="info" showIcon message={t('agentForm.noKb')} />
                   ) : (
                     <div className="stack stack--tight">
                       {/* ⚠️ `.pick` 落在 **AntD Checkbox 自己那个 `<label>` 根节点**上，
@@ -827,13 +843,13 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                         >
                           <span className="pick__title">{kb.name}</span>
                           <span className="pick__meta">
-                            {kb.documentCount} 个文档 · 已被 {kb.agentCount} 个智能体绑定
-                            {kb.embeddingModelChanged === true && ' · 嵌入模型已变更（需重建后才能检索）'}
+                            {t('agentForm.kbMeta', { docs: kb.documentCount, agents: kb.agentCount })}
+                            {kb.embeddingModelChanged === true && t('agentForm.kbEmbeddingChanged')}
                           </span>
                         </Checkbox>
                       ))}
                       <span className="ratio">
-                        一次列出 {kbItems.length} 个（limit 上限 100）。
+                        {t('agentForm.kbListNote', { count: kbItems.length })}
                       </span>
                     </div>
                   )}
@@ -851,11 +867,9 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                       {missingKbIds.map((kbId) => (
                         <Checkbox key={kbId} className="pick" checked onChange={() => toggleKb(kbId, false)}>
                           <span className="pick__title">
-                            已失效的知识库 <Tag className="tag--danger">需解绑</Tag>
+                            {t('agentForm.staleKb')} <Tag className="tag--danger">{t('agentForm.unbindTag')}</Tag>
                           </span>
-                          <span className="pick__meta">
-                            {kbId} · 它已被删除（或你的账号看不到它）。取消勾选即解绑，然后保存。
-                          </span>
+                          <span className="pick__meta">{t('agentForm.staleKbMeta', { id: kbId })}</span>
                         </Checkbox>
                       ))}
                     </div>
@@ -863,7 +877,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 </div>
 
                 <div>
-                  <p className="block-label">MCP 工具</p>
+                  <p className="block-label">{t('agentForm.mcpTools')}</p>
 
                   {mcpQuery.isPending ? (
                     <TableSkeleton rows={2} />
@@ -871,7 +885,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                     <Alert
                       type="error"
                       showIcon
-                      message="MCP server 列表加载失败"
+                      message={t('agentForm.mcpLoadFailed')}
                       description={describeError(mcpQuery.error).message}
                       action={
                         <Button
@@ -880,7 +894,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                             void mcpQuery.refetch()
                           }}
                         >
-                          重试
+                          {t('common.retry')}
                         </Button>
                       }
                     />
@@ -888,11 +902,11 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                     <Alert
                       type="info"
                       showIcon
-                      message="还没有注册任何 MCP server"
-                      description="先到 MCP 管理页注册一台（并握手成功），回到本页才能勾选它的工具。"
+                      message={t('agentForm.noMcp')}
+                      description={t('agentForm.noMcpDesc')}
                       action={
                         <Link to="/mcp">
-                          <Button size="small">去 MCP 管理页</Button>
+                          <Button size="small">{t('agentForm.goMcp')}</Button>
                         </Link>
                       }
                     />
@@ -914,18 +928,18 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                                   "不能绑"—— 绑得上，只是这个智能体跑到那个工具时会 424 */}
                               {needsCredential && (
                                 <Tag className="tag--warn" style={{ marginLeft: 'var(--sp-2)' }}>
-                                  未配置凭据
+                                  {t('agentForm.needCredential')}
                                 </Tag>
                               )}
                             </span>
                             <span className="pick__meta">
-                              {server.toolCount === 0 ? '还没有工具' : `${server.toolCount} 个工具`}
+                              {server.toolCount === 0 ? t('agentForm.noTools') : t('agentForm.toolCount', { count: server.toolCount })}
                               {' · mcp_'}
                               {server.slug}
                               {needsCredential ? (
                                 <>
                                   {' · '}
-                                  <Link to={credentialsPath(server.id)}>去配置凭据</Link>
+                                  <Link to={credentialsPath(server.id)}>{t('agentForm.configureCredential')}</Link>
                                 </>
                               ) : null}
                             </span>
@@ -933,8 +947,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                         )
                       })}
                       <span className="ratio">
-                        一次列出 {mcpItems.length} 个（limit 上限 100）。绑定后这个智能体就能调用它们的工具；
-                        需要你个人凭据的 server 会标「未配置凭据」—— 绑得上，但跑到那里会报 424。
+                        {t('agentForm.mcpListNotePrefix', { count: mcpItems.length })}
                       </span>
                     </div>
                   )}
@@ -944,10 +957,9 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                       工具少时本设置不生效（全部直接下发）。 */}
                   {selectedMcpIds.length > 0 && mcpItems.length > 0 && (
                     <div className="stack stack--tight" style={{ marginTop: 'var(--sp-3)' }}>
-                      <p className="block-label">常驻工具（可选）</p>
+                      <p className="block-label">{t('agentForm.pinnedTools')}</p>
                       <span className="ratio">
-                        选中的工具会直接提供给模型；其余工具仍可用，只是模型要先「列出」再「调用」。
-                        绑定的工具总数不多时本设置不生效（那时全部工具都直接提供）。
+                        {t('agentForm.pinnedToolsNote')}
                       </span>
                       {selectedMcpIds.map((serverId) => (
                         <McpPinnedToolsRow
@@ -973,11 +985,9 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                           onChange={() => toggleMcp(serverId, false)}
                         >
                           <span className="pick__title">
-                            已失效的 server <Tag className="tag--danger">需解绑</Tag>
+                            {t('agentForm.staleMcp')} <Tag className="tag--danger">{t('agentForm.unbindTag')}</Tag>
                           </span>
-                          <span className="pick__meta">
-                            {serverId} · 它已被删除（或你的账号看不到它）。取消勾选即解绑，然后保存。
-                          </span>
+                          <span className="pick__meta">{t('agentForm.staleMcpMeta', { id: serverId })}</span>
                         </Checkbox>
                       ))}
                     </div>
@@ -988,8 +998,8 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                       type="warning"
                       style={{ marginTop: 'var(--sp-3)' }}
                       showIcon
-                      message="凭据状态没有读出来"
-                      description="此刻列表里不会出现「未配置凭据」标记 —— 说不出来的事不冒充结论。这不影响保存绑定。"
+                      message={t('agentForm.credLoadFailed')}
+                      description={t('agentForm.credLoadFailedDesc')}
                     />
                   ) : null}
                 </div>
@@ -997,8 +1007,8 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 <Alert
                   type="info"
                   showIcon
-                  message="组件绑定保存时是整体替换"
-                  description="取消勾选即解除绑定，不会删除知识库或 MCP server 本身。绑定信息写入独立的 agent_components 表。"
+                  message={t('agentForm.componentsReplaceTitle')}
+                  description={t('agentForm.componentsReplaceDesc')}
                 />
               </div>
             </FormSection>
@@ -1013,17 +1023,19 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
             <div className="savebar">
               <span className="ratio">
                 {item === undefined
-                  ? '尚未保存（本页内容还在浏览器里）'
-                  : `最后保存：${formatUpdatedAt(item.updatedAt)} · 由 ${item.creatorName}`}
+                  ? t('agentForm.savebarUnsaved')
+                  : t('agentForm.savebarSaved', { time: formatUpdatedAt(item.updatedAt), creator: item.creatorName })}
                 {dirtySections.length > 0 &&
-                  ` · 未保存区块：${dirtySections.map((section) => AGENT_SECTION_LABEL[section]).join('、')}`}
+                  t('agentForm.savebarDirty', {
+                    sections: dirtySections.map((section) => t(AGENT_SECTION_LABEL_KEY[section])).join(t('mcp.listSeparator')),
+                  })}
               </span>
               <div className="row u-right" style={{ gap: 'var(--sp-3)' }}>
                 <Link to={AGENTS_PATH}>
-                  <Button type="text">取消</Button>
+                  <Button type="text">{t('common.cancel')}</Button>
                 </Link>
                 <Button type="primary" htmlType="submit" loading={saving}>
-                  保存
+                  {t('common.save')}
                 </Button>
               </div>
             </div>
@@ -1032,39 +1044,38 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
 
         <aside className="aside-card stack stack--tight">
           <div className="card bracket card--pad">
-            <p className="kicker">摘要</p>
-            <p className="aside-card__name">{values.name.trim() === '' ? '（未命名）' : values.name}</p>
+            <p className="kicker">{t('agentForm.summary')}</p>
+            <p className="aside-card__name">{values.name.trim() === '' ? t('agentForm.unnamed') : values.name}</p>
             <div className="stack stack--tight" style={{ marginTop: 'var(--sp-4)' }}>
-              <SummaryRow label="类型" value={AGENT_TYPE_LABEL[values.type]} />
+              <SummaryRow label={t('agentForm.summaryType')} value={AGENT_TYPE_LABEL[values.type]} />
               <SummaryRow
-                label="模型"
-                value={item?.modelName ?? modelOptions.find((option) => option.id === values.modelId)?.label ?? '未选择'}
+                label={t('agentForm.summaryModel')}
+                value={item?.modelName ?? modelOptions.find((option) => option.id === values.modelId)?.label ?? t('agentForm.summaryModelUnselected')}
               />
-              <SummaryRow label="知识库" value={`${selectedKbIds.length} 个`} />
-              <SummaryRow label="MCP 工具" value={`${selectedMcpIds.length} 个 server`} />
+              <SummaryRow label={t('agentForm.summaryKb')} value={t('agentForm.summaryKbCount', { count: selectedKbIds.length })} />
+              <SummaryRow label={t('agentForm.summaryMcp')} value={t('agentForm.summaryMcpCount', { count: selectedMcpIds.length })} />
 
               <SummaryRow
-                label="我的会话"
+                label={t('agentForm.summaryConversations')}
                 value={conversationCount.data === undefined ? '—' : String(conversationCount.data)}
                 last
               />
             </div>
             {item !== undefined && (
               <Link to={chatPath(item.id)} style={{ display: 'block', marginTop: 'var(--sp-5)' }}>
-                <Button style={{ width: '100%' }}>用这个智能体开一个会话</Button>
+                <Button style={{ width: '100%' }}>{t('agentForm.openSession')}</Button>
               </Link>
             )}
           </div>
 
           {item !== undefined && item.canEdit && (
             <div className="card card--flat card--pad">
-              <p className="kicker">危险区</p>
+              <p className="kicker">{t('agentForm.dangerZone')}</p>
               <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-                删除会解除 {item.components.length} 处组件绑定，并把它的全部会话转为只读保留（会话与消息不会被删除）。
-                没有恢复入口。
+                {t('agentForm.dangerNote', { components: item.components.length })}
               </p>
               <Button danger style={{ marginTop: 'var(--sp-4)' }} onClick={() => setDeleteOpen(true)}>
-                删除该智能体
+                {t('agentForm.deleteAgent')}
               </Button>
             </div>
           )}
@@ -1091,19 +1102,22 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
  * 本页的上下文只是"预选"，跳过去带 cookie 更省事）。
  */
 function OpenApiKeysHelp({ agentId }: { agentId: string | undefined }) {
+  const { t } = useT()
   return (
     <div className="stack stack--tight">
       <p className="ratio">
-        OpenAPI Key 是<strong>「你 × 这个智能体」</strong>的调用凭据（给外部系统用），
-        不是智能体的共享开关 —— 谁要调用，谁在自己的「我的凭据」里签一把。所以它的管理入口在
-        <strong>「我的凭据」</strong>，不在本页。
+        {t('agentForm.openApiHelpPrefix')}
+        <strong>{t('agentForm.openApiHelpStrong1')}</strong>
+        {t('agentForm.openApiHelpMid')}
+        <strong>{t('agentForm.openApiHelpStrong2')}</strong>
+        {t('agentForm.openApiHelpTail')}
       </p>
       <div className="row">
         <Link to={credentialsSectionPath('openapi')}>
-          <Button>去「我的凭据 · 开放调用」管理 Key</Button>
+          <Button>{t('agentForm.openApiLink')}</Button>
         </Link>
         {agentId !== undefined && (
-          <span className="ratio">进去后可按智能体筛选；你这个智能体签过的 Key 会带它的名字。</span>
+          <span className="ratio">{t('agentForm.openApiFilterNote')}</span>
         )}
       </div>
     </div>
@@ -1134,14 +1148,19 @@ function FormSection({
   failed: boolean
   children: ReactNode
 }) {
+  const { t } = useT()
   const className = failed ? 'form-section is-failed' : dirty ? 'form-section is-dirty' : 'form-section'
   return (
     <section className={className} data-section={section} data-dirty={dirty} data-failed={failed}>
       <div className="form-section__head">
         <span className="kicker">
-          {sectionOrdinal(section)} / {AGENT_SECTION_LABEL[section]}
+          {sectionOrdinal(section)} / {t(AGENT_SECTION_LABEL_KEY[section])}
         </span>
-        {failed ? <Tag className="tag--danger">保存失败</Tag> : dirty ? <Tag className="tag--warn">未保存</Tag> : null}
+        {failed ? (
+          <Tag className="tag--danger">{t('agentForm.sectionSaving')}</Tag>
+        ) : dirty ? (
+          <Tag className="tag--warn">{t('agentForm.sectionDirty')}</Tag>
+        ) : null}
       </div>
       {children}
     </section>
@@ -1174,6 +1193,7 @@ function McpPinnedToolsRow({
   value: string[]
   onChange: (names: string[]) => void
 }) {
+  const { t } = useT()
   const toolsQuery = useMcpServerTools(server)
   const tools = toolsQuery.data?.tools ?? []
   return (
@@ -1189,10 +1209,10 @@ function McpPinnedToolsRow({
         optionFilterProp="label"
         placeholder={
           toolsQuery.isPending
-            ? '加载工具列表…'
+            ? t('agentForm.mcpToolsLoading')
             : tools.length === 0
-              ? '该 server 还没有工具（先到 MCP 管理页点「测试」拉取）'
-              : '选择要常驻的工具（可留空）'
+              ? t('agentForm.mcpToolsEmpty')
+              : t('agentForm.mcpToolsPlaceholder')
         }
         options={tools.map((tool) => ({ label: tool.name, value: tool.name }))}
       />

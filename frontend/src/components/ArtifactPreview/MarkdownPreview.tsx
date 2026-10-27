@@ -20,7 +20,9 @@
  * ⚠️ **这是预期行为**，不是 bug：引擎产出的 MD 里带外链图时，预览里看到的是链接而不是图。
  */
 
+import { useMemo } from 'react'
 import { AssistantMarkdown } from '../../features/chat/AssistantMarkdown.js'
+import { useT, type Translate } from '../../app/i18n.js'
 import type { Components } from 'react-markdown'
 
 /**
@@ -37,22 +39,28 @@ function isRenderableImageSrc(src: string): boolean {
   return value.startsWith('/api/')
 }
 
-const PREVIEW_IMAGE_COMPONENTS: Components = {
-  img: ({ src, alt, title }) => {
-    const source = typeof src === 'string' ? src : ''
-    if (isRenderableImageSrc(source)) {
-      return <img src={source} alt={alt ?? ''} title={title} />
-    }
-    // 跨源图：给链接 + 说明，**不自动加载**
-    return (
-      <span className="preview__extimg">
-        <a href={source} target="_blank" rel="noreferrer noopener">
-          {alt === undefined || alt === '' ? source : alt}
-        </a>
-        <span className="ratio">（外链图片未自动加载，点击后用新标签页打开）</span>
-      </span>
-    )
-  },
+/**
+ * 图片覆盖组件工厂：`t` 从组件里传进来（模块级常量拿不到 locale）。
+ * `t` 在同一语言下引用稳定（见 `app/i18n.tsx`）⇒ 用 `useMemo` 包一层即可。
+ */
+function previewImageComponents(t: Translate): Components {
+  return {
+    img: ({ src, alt, title }) => {
+      const source = typeof src === 'string' ? src : ''
+      if (isRenderableImageSrc(source)) {
+        return <img src={source} alt={alt ?? ''} title={title} />
+      }
+      // 跨源图：给链接 + 说明，**不自动加载**
+      return (
+        <span className="preview__extimg">
+          <a href={source} target="_blank" rel="noreferrer noopener">
+            {alt === undefined || alt === '' ? source : alt}
+          </a>
+          <span className="ratio">{t('artifact.preview.mdExternalNote')}</span>
+        </span>
+      )
+    },
+  }
 }
 
 export interface MarkdownPreviewProps {
@@ -60,9 +68,11 @@ export interface MarkdownPreviewProps {
 }
 
 export function MarkdownPreview({ text }: MarkdownPreviewProps) {
+  const { t } = useT()
+  const components = useMemo(() => previewImageComponents(t), [t])
   return (
     <div className="preview preview--text">
-      <AssistantMarkdown text={text} components={PREVIEW_IMAGE_COMPONENTS} />
+      <AssistantMarkdown text={text} components={components} />
     </div>
   )
 }

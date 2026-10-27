@@ -56,6 +56,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 
 import { useMyCredentials, usePutMyCredential, useRemoveMyCredential } from '../../api/mcp.js'
 import {
+  INJECT_HINT_KEY,
   buildCredentialSubmitValues,
   credentialDraftsFromFields,
   credentialGroupAnchorId,
@@ -78,13 +79,9 @@ import {
   type CredentialsSection,
 } from '../../app/paths.js'
 import { useFeedback } from '../../app/feedback.js'
-
-/** 注入位置的中文读数（与模板编辑器同一份口径；这里只读 `shared` 的取值域） */
-const INJECT_HINT: Record<string, string> = {
-  HEADER: '请求头',
-  QUERY: '查询参数',
-  BODY: '报文体',
-}
+import { useT } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
+import { translate } from '@doubulea/shared'
 
 /** `?section=` → 分区键（非法值 / 缺省 ⇒ 默认 `mcp`，不报错也不造一个不存在的分区） */
 function resolveSection(raw: string | null): CredentialsSection {
@@ -95,6 +92,7 @@ function resolveSection(raw: string | null): CredentialsSection {
 
 export function McpCredentialsPage() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const [searchParams, setSearchParams] = useSearchParams()
   const query = useMyCredentials()
   const putCredential = usePutMyCredential()
@@ -155,14 +153,23 @@ export function McpCredentialsPage() {
   const head = (
     <div className="page__head">
       <div>
-        <h1>我的凭据</h1>
+        <h1>{t('mcpCred.title')}</h1>
         <p className="page__lead">
-          这里集中管理<strong>你个人</strong>的凭据，按来源分为四个分区：
-          <strong>MCP 工具凭据</strong>（代表你调用工具）、<strong>模型 Provider 凭据</strong>
-          （你是所属人的 Provider + 需要你自配的「各自 Key」Provider）、<strong>Git 凭据 / 身份</strong>
-          （Code 模式下 agent 在容器里 <code>git clone</code> 私有仓库）、
-          <strong>开放调用</strong>（给外部系统用的 API Key，代表<strong>你</strong>调用某个智能体）。凭据不会展示给他人，
-          也不会出现在会话记录里；列表接口永不返回明文或掩码 —— 保存之后界面上只剩一个「已配置」标记。
+          {t('mcpCred.leadPrefix')}
+          <strong>{t('mcpCred.leadStrong1')}</strong>
+          {t('mcpCred.leadMid1')}
+          <strong>{t('mcpCred.leadStrong2')}</strong>
+          {t('mcpCred.leadMid2')}
+          <strong>{t('mcpCred.leadStrong3')}</strong>
+          {t('mcpCred.leadMid3')}
+          <strong>{t('mcpCred.leadStrong4')}</strong>
+          {t('mcpCred.leadMid4')}
+          <code>git clone</code>
+          {t('mcpCred.leadMid5')}
+          <strong>{t('mcpCred.leadStrong5')}</strong>
+          {t('mcpCred.leadMid6')}
+          <strong>{t('mcpCred.leadStrong6')}</strong>
+          {t('mcpCred.leadSuffix')}
         </p>
       </div>
     </div>
@@ -173,7 +180,7 @@ export function McpCredentialsPage() {
     if (query.isError) {
       return (
         <ErrorState
-          title="凭据清单加载失败"
+          title={t('mcpCred.loadFailed')}
           error={query.error}
           retrying={query.isFetching}
           onRetry={() => {
@@ -187,11 +194,11 @@ export function McpCredentialsPage() {
       return (
         <div className="card">
           <EmptyState
-            title="还没有任何 MCP server"
-            lead="「我的凭据」是按 server 分组的 —— 先有人注册一台 server（并定义它需要哪些参数），这里才会有内容。"
+            title={t('mcpCred.emptyTitle')}
+            lead={t('mcpCred.emptyLead')}
             action={
               <Link to={MCP_PATH}>
-                <Button type="primary">去 MCP 管理页</Button>
+                <Button type="primary">{t('mcpCred.goMcp')}</Button>
               </Link>
             }
           />
@@ -206,11 +213,14 @@ export function McpCredentialsPage() {
             type="warning"
             showIcon
             style={{ marginBottom: 'var(--sp-5)' }}
-            message={`有 ${unconfigured.length} 台 server 你还没填过凭据，已置顶`}
+            message={t('mcpCred.unconfiguredBanner', { count: unconfigured.length })}
             description={unconfigured
               .map((server) =>
                 server.missingKeys.length > 0
-                  ? `${server.serverName}（缺 ${server.missingKeys.join('、')}）`
+                  ? t('mcpCred.unconfiguredTag', {
+                      server: server.serverName,
+                      keys: server.missingKeys.join(t('mcp.listSeparator')),
+                    })
                   : server.serverName,
               )
               .join(' · ')}
@@ -228,24 +238,24 @@ export function McpCredentialsPage() {
                 <div className="card__head">
                   <p className="card__title">{item.serverName}</p>
                   {item.configured ? (
-                    <Tag className="tag--ok">已配置</Tag>
+                    <Tag className="tag--ok">{t('mcpCred.configured')}</Tag>
                   ) : (
-                    <Tag className="tag--warn">未配置</Tag>
+                    <Tag className="tag--warn">{t('mcpCred.unconfigured')}</Tag>
                   )}
                   <div className="card__head-right">
                     <span className="ratio">
                       {item.updatedAt === null
-                        ? '你还没有填过这台 server 的凭据'
-                        : `你最后一次更新：${new Date(item.updatedAt).toLocaleString('zh-CN', { hour12: false })}`}
+                        ? t('mcpCred.neverFilled')
+                        : t('mcpCred.lastUpdated', {
+                            time: new Date(item.updatedAt).toLocaleString(localeTag(locale), { hour12: false }),
+                          })}
                     </span>
                   </div>
                 </div>
 
                 <div className="card__body stack stack--tight">
                   {rows.length === 0 ? (
-                    <p className="ratio">
-                      这台 server 的模板里没有需要用户填写的参数 —— 与你的凭据无关，直接用就行。
-                    </p>
+                    <p className="ratio">{t('mcpCred.noFieldsNote')}</p>
                   ) : (
                     rows.map((row) => (
                       <div key={row.key}>
@@ -255,10 +265,10 @@ export function McpCredentialsPage() {
                             完全没有样式的 `<label>`，且不报任何错。 */}
                         <label className="block-label" htmlFor={`cred-${item.serverId}-${row.key}`}>
                           {row.label}
-                          {row.required ? <span title="必填"> *</span> : null}
+                          {row.required ? <span title={t('mcpForm.requiredMarkTitle')}> *</span> : null}
                           {row.hasValue ? (
                             <Tag className="tag--ok" style={{ marginLeft: 'var(--sp-2)' }}>
-                              已配置 ✓
+                              {t('mcpCred.alreadyConfigured')}
                             </Tag>
                           ) : null}
                         </label>
@@ -267,7 +277,11 @@ export function McpCredentialsPage() {
                           value={row.value}
                           // ⚠️ 值永不回填（连掩码都没有）⇒ 占位符只能写"留空 = 不变"，
                           //    而**不能**把 `placeholder` 当成"当前值"来展示
-                          placeholder={row.placeholder === '' ? '留空 = 不变' : `${row.placeholder}（留空 = 不变）`}
+                          placeholder={
+                            row.placeholder === ''
+                              ? t('mcpCred.placeholderKeep')
+                              : t('mcpCred.placeholderWithHint', { placeholder: row.placeholder })
+                          }
                           onChange={(event) =>
                             setDrafts((current) => ({
                               ...current,
@@ -276,9 +290,9 @@ export function McpCredentialsPage() {
                           }
                         />
                         <p className="ratio" style={{ marginTop: 'var(--sp-1)' }}>
-                          注入位置：{INJECT_HINT[row.inject] ?? row.inject} · 参数名{' '}
+                          {t('mcpCred.injectMeta', { inject: translate(locale, INJECT_HINT_KEY[row.inject]) })}
                           <code>{row.key}</code>
-                          {row.hasValue ? ' · 已有一个值（重新填写会覆盖它）' : ''}
+                          {row.hasValue ? t('mcpCred.hasValue') : ''}
                         </p>
                       </div>
                     ))
@@ -297,44 +311,46 @@ export function McpCredentialsPage() {
                           if (values === null) return
                           if (blocked.length > 0) {
                             // 本地预检：必填项既没有旧值、这次也没填 ⇒ 交上去必然 400
-                            feedback.note(`还有必填参数没填：${blocked.join('、')}`)
+                            feedback.note(
+                              t('mcpCred.missingBeforeSave', { keys: blocked.join(t('mcp.listSeparator')) }),
+                            )
                             return
                           }
                           putCredential.mutate(
                             { serverId: item.serverId, values },
                             {
-                              onSuccess: () => feedback.ok(`${item.serverName} 的凭据已保存（仅你可见）`),
-                              onError: (error) => feedback.fail(error, '保存凭据失败'),
+                              onSuccess: () => feedback.ok(t('mcpCred.saved', { name: item.serverName })),
+                              onError: (error) => feedback.fail(error, t('mcpCred.saveFailed')),
                             },
                           )
                         }}
                       >
-                        保存该 server 的凭据
+                        {t('mcpCred.save')}
                       </Button>
 
                       {/* 「清除凭据」只在**已有值**时出现：`DELETE` 没配过的东西是 404，
                           摆一个必然 404 的按钮等于给用户一个必然的报错（见文件头 ②） */}
                       {item.configured ? (
                         <Popconfirm
-                          title={`清除 ${item.serverName} 的凭据？`}
-                          description="清除后，依赖这些凭据的工具会报「尚未配置所需凭据」，直到你重新填写。"
-                          okText="清除"
+                          title={t('mcpCred.clearTitle', { name: item.serverName })}
+                          description={t('mcpCred.clearDesc')}
+                          okText={t('mcpCred.clearOk')}
                           okButtonProps={{ danger: true }}
-                          cancelText="取消"
+                          cancelText={t('common.cancel')}
                           onConfirm={() => {
                             removeCredential.mutate(item.serverId, {
-                              onSuccess: (result) => feedback.ok(`已清除 ${result.serverName} 的凭据`),
-                              onError: (error) => feedback.fail(error, '清除凭据失败'),
+                              onSuccess: (result) => feedback.ok(t('mcpCred.cleared', { server: result.serverName })),
+                              onError: (error) => feedback.fail(error, t('mcpCred.clearFailed')),
                             })
                           }}
                         >
                           <Button danger disabled={changed}>
-                            清除凭据
+                            {t('mcpCred.clear')}
                           </Button>
                         </Popconfirm>
                       ) : null}
 
-                      <span className="ratio u-right">只提交你这次真的填过的参数，其余保持原样</span>
+                      <span className="ratio u-right">{t('mcpCred.mergeNote')}</span>
                     </div>
                   )}
                 </div>
@@ -356,14 +372,17 @@ export function McpCredentialsPage() {
         items={[
           {
             key: 'mcp',
-            label: `MCP 工具凭据${unconfigured.length > 0 ? `（${unconfigured.length} 未配置）` : ''}`,
+            label:
+              unconfigured.length > 0
+                ? t('mcpCred.sectionMcpCount', { count: unconfigured.length })
+                : t('mcpCred.sectionMcp'),
             children: (
               <section id={credentialsSectionAnchorId('mcp')} className="stack">
                 <Alert
                   type="info"
                   showIcon
-                  message="凭据仅用于代表你调用工具"
-                  description="这里的值只注入到 tools/call（对话里真调工具）；server 的「测试 / 工具列表」用的是**所属人**的凭据，与这里无关（见 MCP 管理页说明）。"
+                  message={t('mcpCred.mcpInfoTitle')}
+                  description={t('mcpCred.mcpInfoDesc')}
                 />
                 {mcpBody}
               </section>
@@ -371,7 +390,7 @@ export function McpCredentialsPage() {
           },
           {
             key: 'provider',
-            label: '模型 Provider 凭据',
+            label: t('mcpCred.sectionModel'),
             children: (
               <section id={credentialsSectionAnchorId('provider')}>
                 <ProviderKeySection />
@@ -380,7 +399,7 @@ export function McpCredentialsPage() {
           },
           {
             key: 'openapi',
-            label: '开放调用',
+            label: t('mcpCred.sectionOpenApi'),
             children: (
               <section id={credentialsSectionAnchorId('openapi')} className="stack">
                 <OpenApiKeysSection />
@@ -389,7 +408,7 @@ export function McpCredentialsPage() {
           },
           {
             key: 'git',
-            label: 'Git 凭据',
+            label: t('mcpCred.sectionGit'),
             children: (
               <section id={credentialsSectionAnchorId('git')} className="stack">
                 <GitCredentialsSection />

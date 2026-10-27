@@ -12,8 +12,11 @@
 
 import { App } from 'antd'
 import { useMemo } from 'react'
+import { translate, type Locale } from '@doubulea/shared'
 
 import { ApiError, describeError } from '../api/client.js'
+import { currentLocale } from '../stores/locale.js'
+import { failureMessage } from './feedbackModel.js'
 
 export interface Feedback {
   /** 成功：轻提示。文案由调用方给（它才知道自己做成了什么），格式统一在这里 */
@@ -33,9 +36,14 @@ export interface Feedback {
   fail: (error: unknown, title?: string) => void
 }
 
-/** 通知里"错误码"的呈现：与 `design/*.html` 的 toast 一致，等宽、括在文案后 */
-function withCode(text: string, code: string): string {
-  return code === 'UNKNOWN' ? text : `${text}（${code}）`
+/**
+ * 通知里"错误码"的呈现：与 `design/*.html` 的 toast 一致，括在文案后。
+ *
+ * ⚠️ 括号形态**跟着语言走**（zh 全角 `（）` / en 半角 `()`）—— 写死全角会让英文界面出现
+ * `Operation failed（INTERNAL）` 这种中英混排。见 `common.withCode`。
+ */
+function withCode(locale: Locale, text: string, code: string): string {
+  return code === 'UNKNOWN' ? text : translate(locale, 'common.withCode', { text, code })
 }
 
 export function useFeedback(): Feedback {
@@ -50,7 +58,16 @@ export function useFeedback(): Feedback {
         void message.info(text)
       },
       fail: (error, title) => {
-        const { code, message: text } = describeError(error)
+        const locale = currentLocale()
+        const { code, message } = describeError(error)
+        // 判据在 `feedbackModel.ts`（纯函数，零依赖验收档断言它）——
+        // ⚠️ 别把"非 zh 就换成 error.<CODE>"写回来：那会丢掉前端已经翻好的英文（见该文件头）
+        const text = failureMessage(
+          locale,
+          code,
+          message,
+          error instanceof ApiError ? error.msgKey : null,
+        )
 
         // 字段级错误（`data.fields`）在这里汇总展示：页面**愿意**标在输入框上的已经标了，
         // 剩下"没地方放"的（`.refine()` 的空路径、以及页面没实现的字段）至少要说出来，
@@ -61,10 +78,12 @@ export function useFeedback(): Feedback {
             : []
 
         void notification.error({
-          message: title ?? (code === 'UNKNOWN' ? '操作失败' : text),
+          message: title ?? (code === 'UNKNOWN' ? translate(locale, 'common.operationFailed') : text),
           // 用 ` · ` 串成一行而不是 `\n`：AntD 的 description 是普通 div，换行会被折叠成空格，
           // 看起来像"文案里多打了一个空格"。要真正的多行就得自带 white-space，不值得为它引入样式。
-          description: [withCode(text, code), ...fieldLines].join(' · '),
+          description: [withCode(locale, text, code), ...fieldLines].join(
+            translate(locale, 'common.listSeparator'),
+          ),
           duration: 6,
         })
       },

@@ -25,22 +25,33 @@
 
 import { Alert } from 'antd'
 
+import { appMessageText, type AppMessagePayload } from '@doubulea/shared'
+
+import { useT } from '../../app/i18n.js'
 import { chatErrorDescription, chatErrorTitle } from './streamErrors.js'
 
 export interface ErrorCardProps {
   /** `shared/src/errors.ts` 的错误码（客户端侧的网络故障用伪码 `NETWORK`） */
   code: string
   message: string
+  /**
+   * 服务端给的结构化消息（P1-23 收尾 ⑤）—— 有它时按当前语言渲染，没有就退回 `message`。
+   *
+   * ⚠️ 用 `appMessageText` 而不是"把 key 塞进 message"：`message` 同时被
+   * `streamErrors.ts` 的 `CONFLICT` 专用文案覆盖、以及日志/断言读，改它的形状会牵连一片。
+   */
+  msgKey?: AppMessagePayload
 }
 
-export function ErrorCard({ code, message }: ErrorCardProps) {
+export function ErrorCard({ code, message, msgKey }: ErrorCardProps) {
+  const { locale } = useT()
   return (
     <div data-testid="error-card">
       <Alert
         type="error"
         showIcon
-        message={chatErrorTitle(code)}
-        description={chatErrorDescription(code, message)}
+        message={chatErrorTitle(code, locale)}
+        description={chatErrorDescription(code, appMessageText(locale, message, msgKey ?? null))}
       />
     </div>
   )

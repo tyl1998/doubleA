@@ -23,7 +23,7 @@
  * 成为一个常态。
  */
 
-import { AppError, TITLE_MODEL_MUST_BE_CHAT_HINT, type TitleModelConfig, type UpdateTitleModelBody } from '@doubulea/shared'
+import { appMsg, AppError, TITLE_MODEL_MUST_BE_CHAT_HINT, type TitleModelConfig, type UpdateTitleModelBody } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
@@ -149,15 +149,15 @@ async function assertTitleModel(modelId: string | null): Promise<string | null> 
     where: { id: modelId },
     select: { id: true, type: true, enabled: true, label: true, provider: { select: { enabled: true } } },
   })
-  if (row === null) throw AppError.notFound('所选标题模型不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m224'))
   if (row.type !== 'CHAT') {
     throw AppError.validation(TITLE_MODEL_MUST_BE_CHAT_HINT, {
       fields: [{ path: 'body.modelId', message: TITLE_MODEL_MUST_BE_CHAT_HINT }],
     })
   }
-  if (!row.enabled) throw AppError.conflict(`所选标题模型「${row.label}」已停用，请先启用后再选它`)
+  if (!row.enabled) throw AppError.conflict(appMsg('app.m225', { p0: row.label }))
   if (!row.provider.enabled) {
-    throw AppError.conflict(`所选标题模型「${row.label}」所属的 Provider 已停用，请先启用`)
+    throw AppError.conflict(appMsg('app.m226', { p0: row.label }))
   }
   return row.id
 }

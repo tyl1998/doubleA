@@ -44,7 +44,7 @@
  * "吊销立即 401"，实现就是这里那次 `DEL`。
  */
 
-import {
+import { appMsg,
   AppError,
   canViewAsset,
   isConversationReadOnly,
@@ -104,7 +104,7 @@ async function viewerOf(viewer: OpenKeyViewer): Promise<{ id: string; role: User
  */
 async function assertAgentVisible(agentId: string, viewer: OpenKeyViewer): Promise<AgentAclRow> {
   const agent = await readAgentAcl(agentId)
-  if (agent === null || agent.deletedAt !== null) throw AppError.notFound('智能体不存在')
+  if (agent === null || agent.deletedAt !== null) throw AppError.notFound(appMsg('app.m000'))
   const resolved = await viewerOf(viewer)
   const visible = canViewAsset(
     {
@@ -116,7 +116,7 @@ async function assertAgentVisible(agentId: string, viewer: OpenKeyViewer): Promi
     },
     resolved,
   )
-  if (!visible) throw AppError.notFound('智能体不存在')
+  if (!visible) throw AppError.notFound(appMsg('app.m000'))
   return agent
 }
 
@@ -249,14 +249,14 @@ export async function createOpenApiKey(
     viewer.role === 'ADMIN' && body.userId !== undefined ? body.userId : viewer.id
   if (targetUserId !== viewer.id) {
     const target = await getPrisma().user.findUnique({ where: { id: targetUserId }, select: { id: true } })
-    if (target === null) throw AppError.validation('userId 指向的用户不存在')
+    if (target === null) throw AppError.validation(appMsg('app.m216'))
   }
   const expiresAt = body.expiresAt === undefined || body.expiresAt === null ? null : new Date(body.expiresAt)
   if (expiresAt !== null && Number.isNaN(expiresAt.getTime())) {
-    throw AppError.validation('过期时间不是合法的时间')
+    throw AppError.validation(appMsg('app.m030'))
   }
   if (expiresAt !== null && expiresAt.getTime() <= Date.now()) {
-    throw AppError.validation('过期时间必须晚于当前时刻')
+    throw AppError.validation(appMsg('app.m031'))
   }
 
   const plaintext = generateOpenApiKeyPlaintext()
@@ -306,8 +306,8 @@ export async function revokeOpenApiKey(
     where: { id: keyId },
     select: { id: true, agentId: true, userId: true, keyHash: true, revokedAt: true },
   })
-  if (row === null) throw AppError.notFound('API Key 不存在')
-  if (row.userId !== viewer.id && viewer.role !== 'ADMIN') throw AppError.notFound('API Key 不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m014'))
+  if (row.userId !== viewer.id && viewer.role !== 'ADMIN') throw AppError.notFound(appMsg('app.m014'))
 
   if (row.revokedAt === null) {
     await db.apiKey.update({ where: { id: row.id }, data: { revokedAt: new Date() } })
@@ -341,9 +341,9 @@ export async function updateOpenApiKey(
     where: { id: keyId },
     select: { id: true, userId: true, keyHash: true, revokedAt: true },
   })
-  if (row === null) throw AppError.notFound('API Key 不存在')
-  if (row.userId !== viewer.id && viewer.role !== 'ADMIN') throw AppError.notFound('API Key 不存在')
-  if (row.revokedAt !== null) throw AppError.conflict('Key 已吊销，不能编辑；请重新签发一把')
+  if (row === null) throw AppError.notFound(appMsg('app.m014'))
+  if (row.userId !== viewer.id && viewer.role !== 'ADMIN') throw AppError.notFound(appMsg('app.m014'))
+  if (row.revokedAt !== null) throw AppError.conflict(appMsg('app.m217'))
 
   // `expiresAt: null` = 显式改为"不过期"；非 null 必须是未来时刻（与签发同口径）
   let expiresAt: Date | null | undefined
@@ -352,8 +352,8 @@ export async function updateOpenApiKey(
       expiresAt = null
     } else {
       const parsed = new Date(body.expiresAt)
-      if (Number.isNaN(parsed.getTime())) throw AppError.validation('过期时间不是合法的时间')
-      if (parsed.getTime() <= Date.now()) throw AppError.validation('过期时间必须晚于当前时刻')
+      if (Number.isNaN(parsed.getTime())) throw AppError.validation(appMsg('app.m030'))
+      if (parsed.getTime() <= Date.now()) throw AppError.validation(appMsg('app.m031'))
       expiresAt = parsed
     }
   }

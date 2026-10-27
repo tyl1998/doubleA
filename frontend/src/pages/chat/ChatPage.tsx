@@ -64,7 +64,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import { CHAT_ATTACHMENT_MAX_COUNT, HTTP_STATUS_BY_ERROR_CODE } from '@doubulea/shared'
-import type { AgentItem, ConversationRunOrigin, RecallConversationResult } from '@doubulea/shared'
+import type { AgentItem, ConversationRunOrigin, Locale, MessageKey, RecallConversationResult } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 import { useAgent } from '../../api/agents.js'
 import { conversationArtifactsQueryKey, useConversationArtifacts } from '../../api/artifacts.js'
@@ -90,6 +91,7 @@ import {
 import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { AGENTS_PATH, agentEditPath, conversationPath, newConversationPath } from '../../app/paths.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
 import { EmptyState, TableSkeleton } from '../../components/ListStates.js'
@@ -160,31 +162,29 @@ export interface ChatPageProps {
  * ⚠️ 别退回"服务端仍在生成"这种模糊说法，也别默认说成定时任务：外部 Open API 调用、定时任务、
  * 另一个窗口/设备发起的轮次在界面上必须能区分开（2026-10-22 的 bug 就是这三者被说成了同一个）。
  */
-function serverRunLabel(origin: ConversationRunOrigin | null): string {
-  switch (origin) {
-    case 'SCHEDULED':
-      return '定时任务运行中'
-    case 'OPEN_API':
-      return '外部调用运行中'
-    case 'UI':
-      return '另一窗口正在生成'
-    default:
-      return '服务端仍在生成'
-  }
+function serverRunLabel(origin: ConversationRunOrigin | null, locale: Locale): string {
+  const key: MessageKey =
+    origin === 'SCHEDULED'
+      ? 'chat.serverRunScheduled'
+      : origin === 'OPEN_API'
+        ? 'chat.serverRunOpenApi'
+        : origin === 'UI'
+          ? 'chat.serverRunUi'
+          : 'chat.serverRunUnknown'
+  return translate(locale, key)
 }
 
 /** 头部标签的悬停说明（与 {@link serverRunLabel} 同源，补一句"为什么本页不能操作它"） */
-function serverRunTitle(origin: ConversationRunOrigin | null): string {
-  switch (origin) {
-    case 'SCHEDULED':
-      return '定时任务正在后台运行这一轮（可在任务中心查看，或在下方消息流里实时观察）'
-    case 'OPEN_API':
-      return '这一轮由外部系统通过开放接口发起，本页只读观察，不能在这里停止'
-    case 'UI':
-      return '这一轮由另一个窗口或设备发起，本页只读观察'
-    default:
-      return '服务端仍在生成这一轮（来源未知：可能是别的窗口发起，或刚切回来）'
-  }
+function serverRunTitle(origin: ConversationRunOrigin | null, locale: Locale): string {
+  const key: MessageKey =
+    origin === 'SCHEDULED'
+      ? 'chat.serverRunTitleScheduled'
+      : origin === 'OPEN_API'
+        ? 'chat.serverRunTitleOpenApi'
+        : origin === 'UI'
+          ? 'chat.serverRunTitleUi'
+          : 'chat.serverRunTitleUnknown'
+  return translate(locale, key)
 }
 
 /** 消息流的外框（三态共用，避免切换时布局跳动） */
@@ -231,6 +231,7 @@ export function ChatPage({
 }: ChatPageProps) {
   const navigate = useNavigate()
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const queryClient = useQueryClient()
 
   // `agentId` 为空串时不查（`useAgent` 的 `enabled` 判据是"不是 undefined"，空串会打出一个 400）
@@ -270,7 +271,7 @@ export function ChatPage({
           try {
             await setConversationInstance(created.id, instancePreset)
           } catch (error: unknown) {
-            feedback.fail(error, '所选实例没有生效，这一轮按自动落点')
+            feedback.fail(error, t('chat.instanceNotApplied'))
           }
         }
         // 新会话态下预置过自动审批 ⇒ 会话一建出来就先落地到服务端，再导航开流
@@ -283,7 +284,7 @@ export function ChatPage({
             await setConversationAutoApprove(created.id, true)
           } catch (error: unknown) {
             // 落不下就如实说，但**不拦发送**：这一轮退回逐次确认即可，用户仍能继续聊
-            feedback.fail(error, '自动审批开关没有保存')
+            feedback.fail(error, t('chat.autoApproveNotSaved'))
           }
         }
         // 新会话态下预置过 Code 模式 ⇒ 同样在开流前落地（容器 env 在建沙箱时注入，
@@ -295,7 +296,7 @@ export function ChatPage({
             await setConversationCodeMode(created.id, true)
           } catch (error: unknown) {
             // 落不下就如实说，但**不拦发送**：这一轮退回普通模式即可，用户仍能继续聊
-            feedback.fail(error, 'Code 模式开关没有保存')
+            feedback.fail(error, t('chat.codeModeNotSaved'))
           }
         }
         // 新会话态下预置过**运行时**（P1-17a）⇒ 同样在开流前落地（建沙箱时要按它选镜像）。
@@ -307,7 +308,7 @@ export function ChatPage({
             await setConversationRuntime(created.id, runtimePreset)
           } catch (error: unknown) {
             // 落不下就如实说，但**不拦发送**：这一轮退回默认运行时即可
-            feedback.fail(error, '运行时没有保存')
+            feedback.fail(error, t('chat.runtimeNotSaved'))
           }
         }
         // 新会话态下预置过「不记入记忆」⇒ 同样在开流前落地（否则第一轮就被写进长期记忆）。
@@ -319,7 +320,7 @@ export function ChatPage({
             await setConversationMemoryExcluded(created.id, true)
           } catch (error: unknown) {
             // 落不下就如实说，但**不拦发送**：这一轮可能仍会被记入记忆，用户可在记忆面板删掉
-            feedback.fail(error, '记忆开关没有保存')
+            feedback.fail(error, t('chat.memoryNotSaved'))
           }
         }
         // 导航到规范会话路径 `/c/:id`；`state.agentId` 是给外壳的兜底（跨智能体列表要等这一轮
@@ -586,7 +587,7 @@ export function ChatPage({
 
   const agent = agentQuery.data
   // 只读保留会话里 Agent 已软删（`useAgent` 404）⇒ 用会话列表项的快照兜名字/类型
-  const agentName = agent?.name ?? agentNameSnapshot ?? '智能体'
+  const agentName = agent?.name ?? agentNameSnapshot ?? t('chat.agentFallback')
   const agentTypeLabel =
     agent !== undefined
       ? AGENT_TYPE_LABEL[agent.type]
@@ -927,7 +928,7 @@ export function ChatPage({
     // ⚠️ 客户端伪码 `NETWORK` **不在**那张表里（它是前端造的，后端不认识）⇒ 取不到就是 0
     //（`api/client.ts` 的 `NETWORK_ERROR_CODE` 就是这么定义 `status` 的）
     const status = code === 'NETWORK' ? 0 : (HTTP_STATUS_BY_ERROR_CODE[code] ?? 0)
-    feedback.fail(new ApiError(code, round.error.message, status), chatErrorTitle(code))
+    feedback.fail(new ApiError(code, round.error.message, status), chatErrorTitle(code, locale))
   }, [round, feedback])
 
   /**
@@ -944,11 +945,11 @@ export function ChatPage({
       const picked = Array.from(files)
       const slots = CHAT_ATTACHMENT_MAX_COUNT - attachments.length
       if (slots <= 0) {
-        feedback.note(`最多只能带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`)
+        feedback.note(t('chat.maxAttachments', { count: CHAT_ATTACHMENT_MAX_COUNT }))
         return
       }
       const accepted = picked.slice(0, slots)
-      if (picked.length > slots) feedback.note(`最多只能带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件，多余的已忽略`)
+      if (picked.length > slots) feedback.note(t('chat.maxAttachmentsIgnored', { count: CHAT_ATTACHMENT_MAX_COUNT }))
 
       setUploading(true)
       void (async () => {
@@ -957,7 +958,7 @@ export function ChatPage({
           try {
             added.push(await uploadChatFile(file))
           } catch (error) {
-            feedback.fail(error, `附件「${file.name}」上传失败`)
+            feedback.fail(error, t('chat.attachmentUploadFailed', { name: file.name }))
           }
         }
         if (added.length > 0) setAttachments((previous) => [...previous, ...added])
@@ -1020,7 +1021,7 @@ export function ChatPage({
       // 这一轮一个字都没落库 ⇒ 界面上不该留下它，正文与附件还给输入区，用户不必重来
       setDraft(text)
       setAttachments(sentAttachments)
-      feedback.fail(outcome.error, '发送失败')
+      feedback.fail(outcome.error, t('chat.sendFailed'))
     }
   }, [agentQuery.data, attachments, availableModelsQuery.data, conversationId, draft, feedback, readOnly, send, selectedModelId])
 
@@ -1034,7 +1035,7 @@ export function ChatPage({
   const handleStop = useCallback((): void => {
     void stop().then((outcome) => {
       if (outcome.kind === 'stop-request-failed') {
-        feedback.fail(outcome.error, '停止失败')
+        feedback.fail(outcome.error, t('chat.stopFailed'))
       }
     })
   }, [feedback, stop])
@@ -1054,14 +1055,14 @@ export function ChatPage({
     void steer(text)
       .then((outcome) => {
         if (!outcome.ok) {
-          feedback.fail(outcome.error, '插话失败')
+          feedback.fail(outcome.error, t('chat.steerFailed'))
           return
         }
         if (outcome.accepted) {
           setDraft('')
-          feedback.ok('已插话：agent 会在当前步骤跑完后读到')
+          feedback.ok(t('chat.steerOk'))
         } else {
-          feedback.note('这一轮刚好结束了，插话没送到（内容已保留在输入框）')
+          feedback.note(t('chat.steerMissed'))
         }
       })
       .finally(() => {
@@ -1080,18 +1081,16 @@ export function ChatPage({
     (steerId: string, text: string): void => {
       void cancelSteer(steerId).then((outcome) => {
         if (!outcome.ok) {
-          feedback.fail(outcome.error, '取回失败')
+          feedback.fail(outcome.error, t('chat.recallSteerFailed'))
           return
         }
         if (!outcome.cancelled) {
-          feedback.note('这条插话已被 agent 读到，撤不回来了')
+          feedback.note(t('chat.steerAlreadyRead'))
           return
         }
         setDraft(text)
         feedback.ok(
-          outcome.scope === 'all'
-            ? '已取回（本轮其他还没投递的插话也一并撤回）'
-            : '已取回，内容在输入框里',
+          outcome.scope === 'all' ? t('chat.recallSteerAllOk') : t('chat.recallSteerOk'),
         )
       })
     },
@@ -1108,7 +1107,7 @@ export function ChatPage({
   const handleRegenerate = useCallback((): void => {
     if (regenerable === null) return
     void regenerate(regenerable.userText, selectedModelId).then((outcome) => {
-      if (!outcome.ok) feedback.fail(outcome.error, '重新生成失败')
+      if (!outcome.ok) feedback.fail(outcome.error, t('chat.regenerateFailed'))
     })
   }, [regenerable, regenerate, selectedModelId, feedback])
 
@@ -1160,15 +1159,15 @@ export function ChatPage({
       setConfirmPending(true)
       void confirmConversation(conversationId, { confirmId: confirm.confirmId, accepted })
         .then((result) => {
-          const ignored = confirmIgnoredNote(result.applied)
-          if (ignored === null) feedback.ok(confirmAnsweredText(result.accepted))
+          const ignored = confirmIgnoredNote(result.applied, locale)
+          if (ignored === null) feedback.ok(confirmAnsweredText(result.accepted, locale))
           else feedback.note(ignored)
         })
         .catch((error: unknown) => {
           // 请求自己失败了（网络层 / 401 / 404）。**卡片照样在 `finally` 里收掉**：
           // 悬着一张卡会挡住输入区（确认态是**锁输入**的），而用户此时真正需要的是
           // "能继续用这个页面"；他要是还想确认，服务端那边的等待窗口也还在（`expiresAt`）。
-          feedback.fail(error, '确认没有发出去')
+          feedback.fail(error, t('chat.confirmNotSent'))
         })
         .finally(() => {
           setConfirmPending(false)
@@ -1196,13 +1195,11 @@ export function ChatPage({
         .then((result) => {
           setAutoApprove(result.autoApprove)
           feedback.ok(
-            result.autoApprove
-              ? '已开启自动审批：本会话内危险工具不再逐次确认'
-              : '已关闭自动审批：恢复逐次确认',
+            result.autoApprove ? t('chat.autoApproveOn') : t('chat.autoApproveOff'),
           )
         })
         .catch((error: unknown) => {
-          feedback.fail(error, '自动审批开关没有保存')
+          feedback.fail(error, t('chat.autoApproveNotSaved'))
         })
         .finally(() => {
           setAutoApprovePending(false)
@@ -1228,10 +1225,10 @@ export function ChatPage({
       void setConversationMemoryExcluded(conversationId, next)
         .then((result) => {
           setMemoryExcluded(result.memoryExcluded)
-          feedback.ok(result.memoryExcluded ? '本次对话不记入记忆' : '本次对话恢复记入记忆')
+          feedback.ok(result.memoryExcluded ? t('chat.memoryOff') : t('chat.memoryOn'))
         })
         .catch((error: unknown) => {
-          feedback.fail(error, '记忆开关没有保存')
+          feedback.fail(error, t('chat.memoryNotSaved'))
         })
         .finally(() => {
           setMemoryExcludedPending(false)
@@ -1258,10 +1255,10 @@ export function ChatPage({
       void setConversationCodeMode(conversationId, next)
         .then((result) => {
           setCodeMode(result.codeMode)
-          feedback.ok(result.codeMode ? '已开启 Code 模式（下次派活生效）' : '已关闭 Code 模式')
+          feedback.ok(result.codeMode ? t('chat.codeModeOn') : t('chat.codeModeOff'))
         })
         .catch((error: unknown) => {
-          feedback.fail(error, 'Code 模式开关没有保存')
+          feedback.fail(error, t('chat.codeModeNotSaved'))
         })
         .finally(() => {
           setCodeModePending(false)
@@ -1295,23 +1292,23 @@ export function ChatPage({
         void setConversationInstance(conversationId, null, runtime)
           .then((result) => {
             setPreferredInstanceId(result.instanceId)
-            if (result.action === 'auto-reselected') feedback.note(result.hint ?? `已自动改到实例 ${result.instanceId}`)
-            else feedback.ok(`自动：当前在实例 ${result.instanceId ?? '（未钉机，首轮派活时按负载选择）'}`)
+            if (result.action === 'auto-reselected') feedback.note(result.hint ?? t('chat.autoReselected', { id: result.instanceId ?? '' }))
+            else feedback.ok(t('chat.autoCurrentInstance', { id: result.instanceId ?? t('chat.unpinned') }))
           })
           .catch((error: unknown) => {
             setPreferredInstanceId(previous)
-            feedback.fail(error, '自动落点没有生效')
+            feedback.fail(error, t('chat.autoPlacementFailed'))
           })
         return
       }
       void setConversationInstance(conversationId, next)
         .then((result) => {
           setPreferredInstanceId(result.instanceId)
-          feedback.ok(result.action === 'already' ? `该会话已在实例 ${next} 上` : `已指定实例 ${next}（下一次派活生效）`)
+          feedback.ok(result.action === 'already' ? t('chat.alreadyOnInstance', { id: next }) : t('chat.instancePinned', { id: next }))
         })
         .catch((error: unknown) => {
           setPreferredInstanceId(previous)
-          feedback.fail(error, '实例没有切换')
+          feedback.fail(error, t('chat.instanceSwitchFailed'))
         })
     },
     [conversationId, preferredInstanceId, runtime, feedback],
@@ -1334,22 +1331,22 @@ export function ChatPage({
             if (placement !== undefined) {
               setPreferredInstanceId(placement.instanceId)
               if (placement.action === 'auto-reselected') {
-                feedback.note(placement.hint ?? `已自动改到实例 ${placement.instanceId}`)
+                feedback.note(placement.hint ?? t('chat.autoReselected', { id: placement.instanceId ?? '' }))
               }
             }
           }
           // 区分三种情形：空环境（不选语言）/ 镜像已就绪 / 本机没有（需先构建）。
           // （选择本身只是持久化意图，真正的建容器/换镜在**下次派活**时发生，见 ensureSandbox 的 runtime 标签比对。）
           if (result.runtime === '') {
-            feedback.ok('已切换为空环境（仅基础工具链），下次派活生效')
+            feedback.ok(t('chat.runtimeEmpty'))
           } else if (ready) {
-            feedback.ok('已切换运行时，下次派活生效')
+            feedback.ok(t('chat.runtimeSwitched'))
           } else {
-            feedback.note('已切换运行时，但本机暂无该环境镜像，需先构建后才会生效（下次派活时）')
+            feedback.note(t('chat.runtimeNeedBuild'))
           }
         })
         .catch((error: unknown) => {
-          feedback.fail(error, '运行时没有保存')
+          feedback.fail(error, t('chat.runtimeNotSaved'))
         })
         .finally(() => {
           setRuntimePending(false)
@@ -1398,11 +1395,11 @@ export function ChatPage({
       // 居中，`EmptyState` 内部再水平居中 —— 不再是靠左的标题栏。
       <div className="chat-home__welcome" data-testid="chat-agent-error">
         <EmptyState
-          title="打不开这个对话"
-          lead="智能体取不到（可能已被删除，或链接里的 id 不对）。"
+          title={t('chat.agentErrorTitle')}
+          lead={t('chat.agentErrorLead')}
           action={
             <Link to={AGENTS_PATH}>
-              <Button type="primary">回智能体列表</Button>
+              <Button type="primary">{t('chat.agentErrorBack')}</Button>
             </Link>
           }
         />
@@ -1421,10 +1418,10 @@ export function ChatPage({
           codeMode ? ({ '--panel-w': `${wsPanel.width}px` } as CSSProperties) : undefined
         }
       >
-        <main className="chat__main" aria-label="当前会话">
+        <main className="chat__main" aria-label={t('chat.chatMainAria')}>
           <div className="chat__head">
             {/* 智能体 chip：点开 = 换智能体 ⇒ 进入它的**新会话态**（不建会话）。
-                只读保留会话里 Agent 已删，chip 仍显示名字快照（点开可换到别的智能体开新对话）。 */}
+                {t('chat.readOnlyTag')}会话里 Agent 已删，chip 仍显示名字快照（点开可换到别的智能体开新对话）。 */}
             <AgentPicker
               trigger={
                 <>
@@ -1434,16 +1431,16 @@ export function ChatPage({
                 </>
               }
               triggerClassName="chat__agent-chip"
-              triggerTitle="切换智能体（进入新会话）"
+              triggerTitle={t('chat.switchAgentTitle')}
               onPick={(nextAgentId) => navigate(newConversationPath(nextAgentId))}
             />
             {/* 只读保留（Agent 被软删）：明确告知历史可看、但不能再发消息 */}
             {readOnly ? (
               <Tag
                 className="tag--warn"
-                title="该智能体已被删除，此会话只读保留：历史可查看，但不能再发送消息"
+                title={t('chat.readOnlyChipTitle')}
               >
-                只读保留
+                {t('chat.readOnlyTag')}
               </Tag>
             ) : null}
 
@@ -1454,16 +1451,16 @@ export function ChatPage({
                 ⚠️ 没有"停止"按钮：停止走的是本页那条流的 abort 收口（`stopController`），
                 这里没有可收口的流；点了只会发一个信号而界面无从确认。 */}
             {serverRunning ? (
-              <Tag className="tag--warn" title={serverRunTitle(serverRunOrigin)}>
-                <span className="led led--run" aria-hidden="true" /> {serverRunLabel(serverRunOrigin)}
+              <Tag className="tag--warn" title={serverRunTitle(serverRunOrigin, locale)}>
+                <span className="led led--run" aria-hidden="true" /> {serverRunLabel(serverRunOrigin, locale)}
               </Tag>
             ) : null}
 
             {/* 标题栏右侧只留一枚**设置图标**（R4 / 用户反馈：直接进编辑智能体） */}
             <div className="chat__head-right">
               {agent === undefined ? null : (
-                <Tooltip title="编辑智能体">
-                  <Link to={agentEditPath(agent.id)} className="chat__settings" aria-label="编辑智能体">
+                <Tooltip title={t('chat.editAgent')}>
+                  <Link to={agentEditPath(agent.id)} className="chat__settings" aria-label={t('chat.editAgent')}>
                     <SettingOutlined />
                   </Link>
                 </Tooltip>
@@ -1487,7 +1484,7 @@ export function ChatPage({
           {round?.queuedPosition === null || round?.queuedPosition === undefined ? null : (
             <div className="queued" style={{ margin: 'var(--sp-2) var(--sp-5)' }}>
               <span className="led led--warn" aria-hidden="true" />
-              排队第 {round.queuedPosition} 位
+              {t('chat.queuedPosition', { position: round.queuedPosition ?? '' })}
             </div>
           )}
 
@@ -1499,9 +1496,9 @@ export function ChatPage({
           ) : conversationId !== undefined && messagesQuery.isError ? (
             <StreamFrame>
               <div className="card card--pad">
-                <p className="empty__title">历史没有读出来</p>
+                <p className="empty__title">{t('chat.historyLoadFailed')}</p>
                 <p className="empty__lead">
-                  这次没拿到消息历史，界面上的内容可能不完整。点下面重试，或刷新页面。
+                  {t('chat.historyLoadFailedLead')}
                 </p>
                 <Button
                   onClick={() => {
@@ -1509,7 +1506,7 @@ export function ChatPage({
                   }}
                   loading={messagesQuery.isFetching}
                 >
-                  重试
+                  {t('common.retry')}
                 </Button>
               </div>
             </StreamFrame>
@@ -1517,8 +1514,8 @@ export function ChatPage({
             <StreamFrame>
               <div className="empty">
                 <div className="empty__frame" aria-hidden="true" />
-                <p className="empty__title">这个智能体还没有开场白</p>
-                <p className="empty__lead">直接在下面输入第一条消息，会话会在这时创建。</p>
+                <p className="empty__title">{t('chat.noOpening')}</p>
+                <p className="empty__lead">{t('chat.noOpeningLead')}</p>
               </div>
             </StreamFrame>
           ) : (
@@ -1538,10 +1535,10 @@ export function ChatPage({
                       setHistoryExpanded(true)
                     }}
                   >
-                    显示更早的 {messageWindow.hiddenCount} 条消息
+                    {t('chat.showEarlierMessages', { count: messageWindow.hiddenCount })}
                   </Button>
                   <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                    为保持长时间对话流畅，更早的消息暂时收起（数据都在，点开后本次会话内保持展开）
+                    {t('chat.historyCollapsedNote')}
                   </p>
                 </div>
               ) : null}
@@ -1556,7 +1553,7 @@ export function ChatPage({
                       setHistoryExpanded(true)
                     }}
                   >
-                    加载更早的消息
+                    {t('chat.loadEarlier')}
                   </Button>
                 </div>
               ) : null}
@@ -1582,7 +1579,7 @@ export function ChatPage({
               会话就建出来了，那时引导问题作为"开场"的使命已经完成。 */}
           {conversationId === undefined && (agent?.guideQuestions ?? []).length > 0 ? (
             <div className="guide-questions" data-testid="guide-questions">
-              <span className="guide-questions__label">试试这样问：</span>
+              <span className="guide-questions__label">{t('chat.guideLabel')}</span>
               {(agent?.guideQuestions ?? []).map((question) => (
                 <button
                   key={question}
@@ -1600,8 +1597,8 @@ export function ChatPage({
               只读保留会话（Agent 已软删）**不给输入区** —— 换成一句说明（不能再发消息）。 ── */}
           {readOnly ? (
             <div className="chat__readonly" role="note">
-              <Tag className="tag--warn">只读保留</Tag>
-              <span>该智能体已被删除，此会话只保留历史记录，不能再发送消息。</span>
+              <Tag className="tag--warn">{t('chat.readOnlyTag')}</Tag>
+              <span>{t('chat.readOnlyNote')}</span>
             </div>
           ) : (
             <ChatInput
@@ -1669,12 +1666,12 @@ export function ChatPage({
           codeMode ? (
             conversationId !== undefined ? (
               // Code 模式：第三列换成**工作区面板**（P1-9 · P3）—— 人机共享可编辑（§六 4）
-              <aside className="panel" aria-label="工作区面板">
+              <aside className="panel" aria-label={t('chat.workspacePanelAria')}>
                 <div
                   className={`ws-resizer${wsPanel.dragging ? ' is-active' : ''}`}
                   role="separator"
                   aria-orientation="vertical"
-                  aria-label="调整工作区面板宽度"
+                  aria-label={t('chat.workspacePanelResizeAria')}
                   onPointerDown={wsPanel.onPointerDown}
                 />
                 <WorkspacePanel
@@ -1690,7 +1687,7 @@ export function ChatPage({
             ) : (
               // 新会话态（会话还没建出来）：Code 模式已开、工作区还没创建 ⇒ 给**空工作区占位**，
               // 不回落到产物面板（否则"开了 Code 模式"看起来没生效，且首条消息后会突变一列）。
-              <aside className="panel" aria-label="工作区面板">
+              <aside className="panel" aria-label={t('chat.workspacePanelAria')}>
                 <WorkspacePanelPlaceholder
                   runtime={runtime}
                   runtimePending={runtimePending}

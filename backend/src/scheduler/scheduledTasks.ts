@@ -23,7 +23,7 @@
  *   只是那一条读数停在哪一步；下一次该任务触发会把它覆盖成新状态。
  */
 
-import { AppError, nextCronRunParsed, parseCron, type NotifyType } from '@doubulea/shared'
+import { appMsg, AppError, nextCronRunParsed, parseCron, type NotifyType } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { decryptSecret } from '../infra/crypto.js'
@@ -126,7 +126,7 @@ let lastFailedCount: number | undefined
  * @throws {AppError} `CONFLICT`(409) —— 同一任务已在跑（仅"立即执行"这条会根据它回 409）
  */
 export async function triggerScheduledTaskRun(task: RunnableTask): Promise<{ conversationId: string }> {
-  if (inFlight.has(task.id)) throw AppError.conflict('这个任务正在运行中')
+  if (inFlight.has(task.id)) throw AppError.conflict(appMsg('app.m113'))
   return startRun(task)
 }
 

@@ -210,7 +210,7 @@ async function main(): Promise<void> {
     }
   })
 
-  await it('A4 内部管理三条都在 /api/open-keys 下（按人；Q13：不做 /open/v1/admin）', () => {
+  await it('A4 内部管理四条都在 /api/open-keys 下（按人；Q13：不做 /open/v1/admin）', () => {
     const admin = all
       .filter((route) => route.path.includes('/open-keys'))
       .map((route) => `${route.method} ${route.path}`)
@@ -219,9 +219,11 @@ async function main(): Promise<void> {
       // 2026-10-22 定案：管理面**按人**（`/api/open-keys`），关联哪个智能体是签发时的 `body.agentId`。
       // 旧的 `/api/agents/:id/open-keys` 必须**不存在** —— 那个路径读起来像"智能体的 Key"，
       // 会让编辑页的读者以为"开了 Key 大家都能用"。
+      // 2026-10-22 追加：`PUT`（元数据可编辑 —— 改名 / 改 scopes / 改限额），与签发同一条路径族。
       'DELETE /api/open-keys/:keyId',
       'GET /api/open-keys',
       'POST /api/open-keys',
+      'PUT /api/open-keys/:keyId',
     ]
     eq(admin, expected, '管理面三条')
     assert(!all.some((route) => route.path.startsWith('/open/v1/admin')), '不应有 /open/v1/admin/*')

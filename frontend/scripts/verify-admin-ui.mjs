@@ -139,47 +139,65 @@ function stripComments(source) {
 
 // ───────────────────────────── 被测对象 ─────────────────────────────
 
-const { USER_ROLES, USER_STATUSES } = await import('@doubulea/shared')
+const { USER_ROLES, USER_STATUSES, translate } = await import('@doubulea/shared')
+
+// P1-23 第十批：`adminModel` 的展示口径迁到 key（`labelKey`/`hintKey`/`*_KEY`），
+// 纯函数档断言按 zh 落译文（`translate('zh', ...)`）—— 中文形态逐字未变，只多喂一个 locale。
+const ZH = 'zh'
+const tr = (key, params) => translate(ZH, key, params)
 
 const {
-  USER_ROLE_LABELS,
-  USER_STATUS_LABELS,
+  USER_ROLE_LABEL_KEY,
+  USER_STATUS_LABEL_KEY,
   describeUserStatus,
   userRowActions,
   EMPTY_USER_FORM_VALUES,
   userEditValuesOf,
   buildCreateUserBody,
   buildUpdateUserBody,
-  initialPasswordNotice,
-  initialPasswordCopyText,
+  initialPasswordNotice: initialPasswordNoticeRaw,
+  initialPasswordCopyText: initialPasswordCopyTextRaw,
   EMPTY_PROVIDER_FORM_VALUES,
   providerEditValuesOf,
-  describeProviderKey,
+  describeProviderKey: describeProviderKeyRaw,
   providerKeyIntent,
   buildCreateProviderBody,
   buildProviderUpdateBody,
   protocolOptionsFor,
-  protocolBaseUrlHint,
-  PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON,
+  protocolBaseUrlHint: protocolBaseUrlHintRaw,
+  protocolLockedReason,
   EMPTY_MODEL_FORM_VALUES,
   modelEditValuesOf,
-  validateMaxContext,
-  maxContextText,
+  validateMaxContext: validateMaxContextRaw,
+  maxContextText: maxContextTextRaw,
   buildCreateModelBody,
   buildModelUpdateBody,
   modelTypeChangeBlocked,
-  modelDeleteBlockedNotice,
+  modelDeleteBlockedNotice: modelDeleteBlockedNoticeRaw,
   MAX_CONTEXT_MIN,
   MAX_CONTEXT_MAX,
   providerGroupSpans,
   countProviders,
   summarizeModels,
   remoteModelRows,
-  remoteModelNotice,
+  remoteModelNotice: remoteModelNoticeRaw,
   guessModelType,
   modelEditAffectsVectors,
   knowledgeBasesUsingModel,
 } = await import('../src/pages/admin/adminModel.ts')
+
+/** 夹具：纯函数统一补上 `locale='zh'`（各调用方不复述参数） */
+const USER_ROLE_LABELS = Object.fromEntries(Object.entries(USER_ROLE_LABEL_KEY).map(([k, m]) => [k, tr(m)]))
+const USER_STATUS_LABELS = Object.fromEntries(Object.entries(USER_STATUS_LABEL_KEY).map(([k, m]) => [k, tr(m)]))
+const initialPasswordNotice = (username, forReset) => initialPasswordNoticeRaw(username, forReset, ZH)
+const initialPasswordCopyText = (username, pw) => initialPasswordCopyTextRaw(username, pw, ZH)
+const describeProviderKey = (p) => describeProviderKeyRaw(p, ZH)
+const protocolBaseUrlHint = (protocol) => protocolBaseUrlHintRaw(protocol, ZH)
+const validateMaxContext = (value) => validateMaxContextRaw(value, ZH)
+const maxContextText = (value) => maxContextTextRaw(value, ZH)
+const modelDeleteBlockedNotice = (model) => modelDeleteBlockedNoticeRaw(model, ZH)
+const remoteModelNotice = (result, hasKey) => remoteModelNoticeRaw(result, hasKey, ZH)
+const PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON = protocolLockedReason(ZH)
 
 const { serialForPath, visibleNavItems } = await import('../src/app/nav.ts')
 
@@ -284,22 +302,22 @@ groupStart('A', '用户状态三态与操作矩阵（"不能操作自己"是业�
 await it('A1 `ACTIVE` + 不需改密 ⇒ ok / 「启用」/ 无附加说明', () => {
   const view = describeUserStatus(makeUser())
   assertEqual(view.led, 'ok', '状态灯')
-  assertEqual(view.label, USER_STATUS_LABELS.ACTIVE, '文案取自词表')
-  assertEqual(view.hint, null, '没有额外含义就不写废话')
+  assertEqual(tr(view.labelKey), USER_STATUS_LABELS.ACTIVE, '文案取自词表')
+  assertEqual(view.hintKey, null, '没有额外含义就不写废话')
 })
 
 await it('A2 `ACTIVE` + 待首次改密 ⇒ warn 且说明"只能改密/看自己/登出"', () => {
   const view = describeUserStatus(makeUser({ mustChangePassword: true }))
   assertEqual(view.led, 'warn', '这是**第三态**，不是 ACTIVE 也不是 DISABLED')
-  assertIncludes(view.label, '待首次改密', '标签要说清是哪一档')
-  assertIncludes(view.hint ?? '', '首登闸门', '要说清这一档意味着什么')
+  assertIncludes(tr(view.labelKey), '待首次改密', '标签要说清是哪一档')
+  assertIncludes(view.hintKey === null ? '' : tr(view.hintKey), '首登闸门', '要说清这一档意味着什么')
 })
 
 await it('A3 `DISABLED` ⇒ fail 且说明"下个请求即 401"', () => {
   const view = describeUserStatus(makeUser({ status: 'DISABLED' }))
   assertEqual(view.led, 'fail', '状态灯')
-  assertEqual(view.label, USER_STATUS_LABELS.DISABLED, '文案取自词表')
-  assertIncludes(view.hint ?? '', '401', '停用的后果要说出来（`01` §3.1 的验收要点）')
+  assertEqual(tr(view.labelKey), USER_STATUS_LABELS.DISABLED, '文案取自词表')
+  assertIncludes(view.hintKey === null ? '' : tr(view.hintKey), '401', '停用的后果要说出来（`01` §3.1 的验收要点）')
 })
 
 await it('A4 两张词表与 `shared` 的取值域**逐键同源**（漏一个键在这里就红）', () => {
@@ -317,7 +335,7 @@ await it('A5 对**别人**：三件操作都在，停用是红色、启用不是
   assertEqual(actions.every((action) => !action.disabled), true, '对别人没有一个是灰的')
   assertEqual(actions[1]?.danger, true, 'ACTIVE 的「停用」是危险操作')
   const enabling = userRowActions(makeUser({ status: 'DISABLED' }), 'me')
-  assertEqual(enabling[1]?.label, '启用', 'DISABLED 时标签变「启用」')
+  assertEqual(enabling[1] === undefined ? undefined : tr(enabling[1].labelKey), '启用', 'DISABLED 时标签变「启用」')
   assertEqual(enabling[1]?.danger, false, '「启用」不是危险操作')
 })
 
@@ -327,9 +345,9 @@ await it('A6 对**自己**：停用与重置标灰，且**各自写明原因**�
   assertEqual(actions[1]?.disabled, true, '不能停用自己')
   assertEqual(actions[2]?.disabled, true, '不能重置自己的密码')
   for (const action of actions.filter((item) => item.disabled)) {
-    assert(typeof action.reason === 'string' && action.reason.length > 10, `${action.key} 必须给出原因`)
+    assert(action.reasonKey !== null && tr(action.reasonKey).length > 10, `${action.key} 必须给出原因`)
   }
-  assertIncludes(actions[2]?.reason ?? '', '修改密码', '要指路到本人自助改密那一条')
+  assertIncludes(actions[2]?.reasonKey == null ? '' : tr(actions[2].reasonKey), '修改密码', '要指路到本人自助改密那一条')
 })
 
 await it('A7 `EMPTY_USER_FORM_VALUES` 的默认角色是 MEMBER（与 DB 默认一致）', () => {
@@ -1080,7 +1098,7 @@ await it('J14 ⚠️ 协议下拉按"有没有向量模型"标灰；Provider 表
   assertIncludes(modal.source, 'disabled={protocolLocked}', '协议选择器要按 protocolLocked 标灰')
   assertIncludes(
     modal.source,
-    'PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON',
+    'protocolLockedReason(',
     '标灰时要说清为什么（灰按钮不加解释等于页面坏了）',
   )
   // ② 判据入参是"有没有向量模型"，不是 Provider 的 type
@@ -1095,12 +1113,23 @@ await it('J14 ⚠️ 协议下拉按"有没有向量模型"标灰；Provider 表
     'Provider 表单不该再出现"改类型/协议收回"那套判据（类型列已删除）',
   )
   // ④ baseUrl 的提示随协议变（三条路后缀不同，填错的表现是 404）
-  assertIncludes(modal.source, 'protocolBaseUrlHint(protocol)', 'baseUrl 的提示要跟着协议走')
+  // P1-23 第十批：`protocolBaseUrlHint` 多收 `locale`（译文搬去 `shared/src/i18n`），
+  // 判据放宽为"调用它且带上 locale"，仍保证提示跟着协议走。
+  assert(
+    /protocolBaseUrlHint\(protocol(?:,\s*locale)?\)/.test(modal.source),
+    'baseUrl 的提示要跟着协议走：应含 "protocolBaseUrlHint(protocol, locale)"',
+  )
 
   const page = files.find((item) => item.name === 'pages/admin/ModelsPage.tsx')
   assert(page !== undefined, '找不到 ModelsPage.tsx')
-  assertIncludes(page.source, "title: '上游协议'", 'Provider 表要单独一列显示协议')
-  assertIncludes(page.source, 'UPSTREAM_PROTOCOL_LABELS[provider.protocol]', '列里读的是契约字段，不是自己拼的字符串')
+  assertIncludes(page.source, 'models.colProtocol', 'Provider 表要单独一列显示协议（用 key）')
+  assertIncludes(tr('models.colProtocol'), '上游协议', '字典那句是「上游协议」')
+  // P1-23 第十批：协议名改由 `UPSTREAM_PROTOCOL_KEY` + `t()` 出译文（旧 `*_LABELS` 已删除）。
+  // 判据仍是"列里读的是契约字段，不是自己拼的字符串"。
+  assert(
+    page.source.includes('UPSTREAM_PROTOCOL_KEY[provider.protocol]'),
+    '列里读的是契约字段，不是自己拼的字符串',
+  )
   assert(
     !page.source.includes('MODEL_TYPE_LABELS[provider.type]'),
     '⚠️ Provider 表不该再读 provider.type（列已删除）',
@@ -1112,7 +1141,9 @@ await it('J15 ⚠️ 拉取抽屉：类型在**每行**选（默认按型号名�
   const drawer = files.find((item) => item.name === 'pages/admin/RemoteModelsDrawer.tsx')
   assert(drawer !== undefined, '找不到 RemoteModelsDrawer.tsx')
   // ① 行内逐条选类型（类型是每个模型自己的属性）
-  assertIncludes(drawer.source, "title: '建成类型'", '型号表要有「建成类型」列，逐行选')
+  // P1-23 第十批：表头文案搬进字典（组件用 key `models.remoteColType`）⇒ 守门转向"key + 字典译文"。
+  assertIncludes(drawer.source, 'models.remoteColType', '型号表要有「建成类型」列，逐行选（用 key）')
+  assertIncludes(tr('models.remoteColType'), '建成类型', '字典那句是「建成类型」')
   assert(
     /typeOfRow\(row\)/.test(drawer.source) && /setTypeOverrides/.test(drawer.source),
     '每行的下拉用 typeOfRow(row) 取值、onChange 写 typeOverrides',
@@ -1133,6 +1164,30 @@ await it('J15 ⚠️ 拉取抽屉：类型在**每行**选（默认按型号名�
     !drawer.source.includes('Radio.Group'),
     '抽屉里不该再有「建成的类型」总单选（与筛选输入框并排，会被读成筛列表）',
   )
+})
+
+await it('J16 ⚠️ 后端 `agentCount` 必须是「默认模型 ∪ 模型池成员」口径（曾只数默认模型 ⇒ 池成员显示 0 却删不掉）', () => {
+  // 本档一贯只读 frontend/src；这一条破例读后端源码，因为该缺陷正是**跨层口径漂移**：
+  // 前端 `modelDeleteBlockedNotice` / `modelTypeChangeBlocked` 消费的是后端下发的 `agentCount`，
+  // 后端若只按 `agents.model_id`（仅默认模型）数，池成员模型会显示 0、前端给"可删"，点下去却被
+  // `removeModel` 409（用户可见症状：**没有提示却删不掉**）。本仓没有独立的后端模型 verify 档，故在此守门。
+  const src = stripComments(
+    readFileSync(
+      fileURLToPath(new URL('../../backend/src/services/model.service.ts', import.meta.url)),
+      'utf8',
+    ),
+  )
+  // ① 计数关系必须走池（`agentPool`），且**不得**再用「默认模型」关系（`agents`）当引用数
+  assertIncludes(src, 'agentPool', '`agentCount` / 类型守卫必须按 `Model.agentPool`（模型池成员）计数')
+  assertExcludes(src, '_count.agents', '不得再用 `_count.agents`（仅默认模型 —— 池成员会漏算）')
+  // ② 在线过滤口径：池成员行按其 agent 的 deletedAt 过滤（软删的智能体已解绑，不计入）
+  assertIncludes(
+    src,
+    'agentPool: { where: { agent: { deletedAt: null } } }',
+    '池计数要按所属 agent 的 `deletedAt: null` 过滤（只算在线智能体）',
+  )
+  // ③ 单删模型的守卫仍按并集数（默认模型 ∪ 池成员）—— 与 `agentCount` 同口径
+  assertIncludes(src, 'OR: [{ modelId: id }, { pool: { some: { modelId: id } } }]', '删模型守卫要数并集')
 })
 
 // ───────────────────────────── P1-5：编辑被引用的向量模型要提示"哪些库需重建" ─────────────────────────────

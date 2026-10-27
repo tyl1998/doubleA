@@ -47,7 +47,14 @@
  *    由分派层静默忽略（`03` §五 的 `ping` 行）。在这一层特判会让"事件全集"出现第二处定义。
  */
 
-import { SSE_EVENT_NAMES, SSE_PAYLOAD_SCHEMAS, type SseEvent, type SseEventName } from '@doubulea/shared'
+import {
+  SSE_EVENT_NAMES,
+  SSE_PAYLOAD_SCHEMAS,
+  translate,
+  type Locale,
+  type SseEvent,
+  type SseEventName,
+} from '@doubulea/shared'
 
 /** 一帧的原始形态（只有解析、还没有语义） */
 export interface RawSseFrame {
@@ -229,7 +236,7 @@ function stripTrailingCr(line: string): string {
  * `JSON.parse` 失败与 schema 失败都归 `invalid`：对调用方来说它们是同一件事
  * （**这一帧不能用**），而 `detail` 足以定位（前者给 `SyntaxError.message`，后者给 zod 明细）。
  */
-export function parseSseFrame(frame: RawSseFrame): SseParseOutcome {
+export function parseSseFrame(frame: RawSseFrame, locale: Locale = 'zh'): SseParseOutcome {
   // 没有 `data:` 行的帧按规范**不产生事件**。`SseFrameParser` 在成帧时就已经把这类帧丢掉了
   // （`finishFrame`），所以正常路径走不到这里；这里再挡一次是为了让 `SseParseOutcome` 的
   // `empty` 成员**真的可达** —— 联合类型里留一个"没有任何路径能产生"的分支，等于一处会骗人的
@@ -246,7 +253,11 @@ export function parseSseFrame(frame: RawSseFrame): SseParseOutcome {
     decoded = JSON.parse(frame.data)
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    return { kind: 'invalid', name: frame.event, detail: `data 不是合法 JSON：${detail}` }
+    return {
+      kind: 'invalid',
+      name: frame.event,
+      detail: translate(locale, 'api.sse.dataNotJson', { reason: detail }),
+    }
   }
 
   const parsed = SSE_PAYLOAD_SCHEMAS[frame.event].safeParse(decoded)
@@ -264,9 +275,9 @@ export function parseSseFrame(frame: RawSseFrame): SseParseOutcome {
 }
 
 /** 一段（或多段）文本 → 结果数组。测试与"一次性响应体"用得上；流式读用 {@link SseFrameParser} */
-export function parseSseText(text: string): SseParseOutcome[] {
+export function parseSseText(text: string, locale: Locale = 'zh'): SseParseOutcome[] {
   const parser = new SseFrameParser()
   const frames = parser.push(text)
   frames.push(...parser.flush())
-  return frames.map(parseSseFrame)
+  return frames.map((frame) => parseSseFrame(frame, locale))
 }

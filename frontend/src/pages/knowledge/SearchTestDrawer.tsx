@@ -29,13 +29,14 @@
  */
 
 import { Alert, Button, Drawer, Input, InputNumber, Select, Table, Tag, type TableColumnsType } from 'antd'
-import { RETRIEVAL_MODES, type RetrievalHit, type RetrievalMode } from '@doubulea/shared'
+import { RETRIEVAL_MODES, translate, type RetrievalHit, type RetrievalMode } from '@doubulea/shared'
 import { useState } from 'react'
 
 import { describeError } from '../../api/client.js'
 import { useSearchKnowledgeBase } from '../../api/knowledgeBases.js'
+import { useT } from '../../app/i18n.js'
 import {
-  RETRIEVAL_MODE_LABEL,
+  RETRIEVAL_MODE_LABEL_KEY,
   hitSourceText,
   rankText,
   rrfScoreText,
@@ -52,6 +53,7 @@ export interface SearchTestDrawerProps {
 }
 
 export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDrawerProps) {
+  const { t, locale } = useT()
   const search = useSearchKnowledgeBase(kbId)
   const [query, setQuery] = useState('')
   /**
@@ -63,7 +65,7 @@ export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDraw
   const [topK, setTopK] = useState<number | null>(null)
 
   const result = search.data
-  const notice = result === undefined ? null : searchNotice(result)
+  const notice = result === undefined ? null : searchNotice(result, locale)
 
   const run = (): void => {
     if (query.trim() === '') return
@@ -76,48 +78,62 @@ export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDraw
 
   const columns: TableColumnsType<RetrievalHit> = [
     {
-      title: '内容片段',
+      title: t('searchTest.colSnippet'),
       dataIndex: 'snippet',
       render: (_, hit) => <span className="kb-snippet">{hit.snippet}</span>,
     },
     {
-      title: '向量分',
+      title: t('searchTest.colVector'),
       dataIndex: 'vectorScore',
       width: 90,
       align: 'right',
       render: (_, hit) => (
-        <span className="num" title={hit.vectorRank === null ? '向量路未命中' : `向量路第 ${hit.vectorRank} 名`}>
+        <span
+          className="num"
+          title={
+            hit.vectorRank === null
+              ? t('searchTest.vectorMiss')
+              : t('searchTest.vectorRank', { rank: hit.vectorRank })
+          }
+        >
           {similarityText(hit.vectorScore)}
         </span>
       ),
     },
     {
-      title: '全文分',
+      title: t('searchTest.colFulltext'),
       dataIndex: 'fulltextScore',
       width: 90,
       align: 'right',
       render: (_, hit) => (
-        <span className="num" title={hit.fulltextRank === null ? '全文路未命中' : `全文路第 ${hit.fulltextRank} 名`}>
+        <span
+          className="num"
+          title={
+            hit.fulltextRank === null
+              ? t('searchTest.fulltextMiss')
+              : t('searchTest.fulltextRank', { rank: hit.fulltextRank })
+          }
+        >
           {similarityText(hit.fulltextScore)}
         </span>
       ),
     },
     {
-      title: '融合排名',
+      title: t('searchTest.colRank'),
       dataIndex: 'finalRank',
       width: 110,
       align: 'right',
       render: (_, hit) => (
-        <span className="num" title={`RRF 融合分 ${rrfScoreText(hit.rrfScore)}`}>
+        <span className="num" title={t('searchTest.rrfTitle', { score: rrfScoreText(hit.rrfScore) })}>
           {rankText(hit.finalRank)} · {rrfScoreText(hit.rrfScore)}
         </span>
       ),
     },
     {
-      title: '来源',
+      title: t('searchTest.colSource'),
       key: 'source',
       width: 200,
-      render: (_, hit) => <span className="ratio">{hitSourceText(hit)}</span>,
+      render: (_, hit) => <span className="ratio">{hitSourceText(hit, locale)}</span>,
     },
   ]
 
@@ -128,10 +144,10 @@ export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDraw
       width={880}
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          检索测试「{kbName}」
+          {t('searchTest.title', { name: kbName })}
           {result !== undefined && (
             <Tag>
-              {RETRIEVAL_MODE_LABEL[result.mode]} · topK {result.topK} · k={result.rrfK}
+              {translate(locale, RETRIEVAL_MODE_LABEL_KEY[result.mode])} · topK {result.topK} · k={result.rrfK}
             </Tag>
           )}
         </span>
@@ -140,60 +156,76 @@ export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDraw
       <div className="stack">
         <div className="row row--wrap" style={{ alignItems: 'flex-end' }}>
           <div style={{ flex: 1, minWidth: 260 }}>
-            <p className="block-label">查询</p>
+            <p className="block-label">{t('searchTest.query')}</p>
             <Input
               value={query}
               maxLength={1000}
-              aria-label="检索查询"
-              placeholder="例如：索引重建期间检索超时怎么处理"
+              aria-label={t('searchTest.queryAria')}
+              placeholder={t('searchTest.queryPlaceholder')}
               onChange={(event) => setQuery(event.target.value)}
               onPressEnter={run}
             />
           </div>
           <div style={{ width: 200 }}>
-            <p className="block-label">模式（可覆盖）</p>
+            <p className="block-label">{t('searchTest.mode')}</p>
             <Select
               value={mode}
               allowClear
               style={{ width: '100%' }}
-              aria-label="检索模式"
-              placeholder="跟随该库配置"
+              aria-label={t('searchTest.modeAria')}
+              placeholder={t('searchTest.modePlaceholder')}
               onChange={(value: RetrievalMode | undefined) => setMode(value)}
-              options={RETRIEVAL_MODES.map((item) => ({ value: item, label: RETRIEVAL_MODE_LABEL[item] }))}
+              options={RETRIEVAL_MODES.map((item) => ({
+                value: item,
+                label: translate(locale, RETRIEVAL_MODE_LABEL_KEY[item]),
+              }))}
             />
           </div>
           <div style={{ width: 140 }}>
-            <p className="block-label">topK（可覆盖）</p>
+            <p className="block-label">{t('searchTest.topK')}</p>
             <InputNumber
               value={topK}
               min={1}
               max={100}
               style={{ width: '100%' }}
-              aria-label="返回条数"
-              placeholder="跟随该库"
+              aria-label={t('searchTest.topKAria')}
+              placeholder={t('searchTest.topKPlaceholder')}
               onChange={(value) => setTopK(value === null ? null : Number(value))}
             />
           </div>
           <Button type="primary" loading={search.isPending} disabled={query.trim() === ''} onClick={run}>
-            检索
+            {t('searchTest.run')}
           </Button>
         </div>
 
         <p className="ratio">
-          这里的 mode / topK 只是<strong>本次试查</strong>的覆盖，不落库；库的检索口径在详情页的
-          「检索配置」里改。
+          {t('searchTest.notePrefix')}
+          <strong>{t('searchTest.noteStrong')}</strong>
+          {t('searchTest.noteSuffix')}
         </p>
 
-        {search.isError && <Alert type="error" showIcon message="检索失败" description={describeError(search.error).message} />}
+        {search.isError && (
+          <Alert
+            type="error"
+            showIcon
+            message={t('searchTest.failed')}
+            description={describeError(search.error).message}
+          />
+        )}
 
         {notice !== null && <Alert type={notice.tone === 'warn' ? 'warning' : 'info'} showIcon message={notice.text} />}
 
         {result !== undefined && (
           <>
             <p className="ratio">
-              生效口径：{RETRIEVAL_MODE_LABEL[result.mode]} · topK <span className="num">{result.topK}</span> ·
-              RRF k=<span className="num">{result.rrfK}</span> · 候选池 <span className="num">{result.candidatePool}</span> ·
-              耗时 <span className="num">{result.elapsedMs}</span> ms · 命中 <span className="num">{result.items.length}</span> 条
+              {t('searchTest.effective', {
+                mode: translate(locale, RETRIEVAL_MODE_LABEL_KEY[result.mode]),
+                topK: result.topK,
+                rrfK: result.rrfK,
+                pool: result.candidatePool,
+                ms: result.elapsedMs,
+                hits: result.items.length,
+              })}
             </p>
             <Table<RetrievalHit>
               rowKey="chunkId"
@@ -202,12 +234,12 @@ export function SearchTestDrawer({ kbId, kbName, open, onClose }: SearchTestDraw
               dataSource={[...result.items]}
               pagination={false}
               scroll={{ x: 860 }}
-              locale={{ emptyText: '没有命中任何内容' }}
+              locale={{ emptyText: t('searchTest.emptyTable') }}
             />
             <p className="ratio">
-              未命中的那一路显示为 <strong>—</strong>（接口返回空值而不是 0）：显示 0 会被读成
-              &quot;两路都算了、只是很低&quot;。融合排名是 RRF 复算后的最终顺序，与表格顺序一致；
-              同分时按 chunkId 升序（uuid7 时间有序 ⇒ 先入库的优先）。
+              {t('searchTest.nullNotePrefix')}
+              <strong>—</strong>
+              {t('searchTest.nullNoteMid')}
             </p>
           </>
         )}

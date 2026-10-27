@@ -35,6 +35,7 @@ import type { ConversationRunOrigin, SseEvent } from '@doubulea/shared'
 import { create } from 'zustand'
 
 import type { ClientErrorCode } from '../api/client.js'
+import { currentLocale } from './locale.js'
 import type { AttachmentView } from '../features/chat/messageModel.js'
 import {
   beginRound,
@@ -285,7 +286,7 @@ export const useChatStreamStore = create<ChatStreamState>((set) => ({
     set((state) => {
       const round = state.rounds[conversationId]
       if (round === undefined) return state
-      const next = reduceRound(round, event)
+      const next = reduceRound(round, event, currentLocale())
       // 归约层对 `ping` / 空 `delta` 等返回**同一引用** ⇒ 这里也返回同一 `state`，不触发任何重渲染
       // （内存优化 P5：流式期间一次白重渲染 = 整棵消息列表重走一遍元素树，长会话里代价可观）
       if (next === round) return state

@@ -39,7 +39,7 @@
 import { Alert, Input, Modal, Select, Switch } from 'antd'
 import {
   PROVIDER_CREDENTIAL_MODES,
-  PROVIDER_CREDENTIAL_MODE_LABELS,
+  PROVIDER_CREDENTIAL_MODE_KEY,
   type ModelProviderItem,
   type ProviderCredentialMode,
   type UpstreamProtocol,
@@ -54,13 +54,14 @@ import {
   useUpdateModelProvider,
 } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
   EMPTY_PROVIDER_FORM_VALUES,
-  PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON,
   buildCreateProviderBody,
   buildProviderUpdateBody,
   describeProviderKey,
   protocolBaseUrlHint,
+  protocolLockedReason,
   protocolOptionsFor,
   providerEditValuesOf,
 } from './adminModel.js'
@@ -74,6 +75,7 @@ export interface ProviderFormModalProps {
 
 export function ProviderFormModal({ provider, open, onClose }: ProviderFormModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const create = useCreateModelProvider()
   const update = useUpdateModelProvider()
   // P1-18：`PER_USER` 模式下表单里那把 Key 是**创建人自己的 Key** ⇒ 走「我的凭据」端点
@@ -138,21 +140,21 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
           try {
             await setMyCredential.mutateAsync({ id: created.id, apiKey: personalKey })
           } catch (error) {
-            feedback.fail(error, 'Provider 已创建，但你的 Key 没能存入「我的凭据」')
+            feedback.fail(error, t('providerForm.keyStoreFailed'))
             onClose()
             return
           }
-          feedback.ok(`已创建 Provider「${created.name}」，并把你的 Key 存入了「我的凭据」`)
+          feedback.ok(t('providerForm.createdWithKey', { name: created.name }))
           onClose()
           return
         }
         feedback.ok(
-          `已创建 Provider「${created.name}」` +
+          t('providerForm.created', { name: created.name }) +
             (credentialMode === 'PER_USER'
-              ? '（「各自 Key」模式：请到「我的凭据」配置你自己的 Key）'
+              ? t('providerForm.perUserHint')
               : created.hasKey
                 ? ''
-                : '（还没配 Key，可在编辑里补）'),
+                : t('providerForm.noKeyHint')),
         )
         onClose()
       } catch (error) {
@@ -168,7 +170,7 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     )
     const personalTouched = credentialMode === 'PER_USER' && (personalKey !== '' || clearRequested)
     if (body === null && !personalTouched) {
-      feedback.note('没有需要保存的改动')
+      feedback.note(t('providerForm.noChanges'))
       onClose()
       return
     }
@@ -181,15 +183,15 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
         body === null
           ? credentialMode === 'PER_USER'
             ? clearRequested
-              ? '（已清除你在「我的凭据」里的 Key）'
-              : '（已更新你在「我的凭据」里的 Key）'
+              ? t('providerForm.clearedMyKey')
+              : t('providerForm.updatedMyKey')
             : ''
           : body.apiKey === null
-            ? '（已清除 API Key）'
+            ? t('providerForm.clearedApiKey')
             : body.apiKey === undefined
               ? ''
-              : '（已更新 API Key）'
-      feedback.ok(`已保存「${provider.name}」${keyNote}`)
+              : t('providerForm.updatedApiKey')
+      feedback.ok(t('providerForm.saved', { name: provider.name, note: keyNote }))
       onClose()
     } catch (error) {
       setErrorText(describeError(error).message)
@@ -199,10 +201,10 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
   return (
     <Modal
       open={open}
-      title={editing ? `编辑 Provider「${provider.name}」` : '新建 Provider'}
-      okText={editing ? '保存' : '创建'}
+      title={editing ? t('providerForm.titleEdit', { name: provider.name }) : t('providerForm.titleCreate')}
+      okText={editing ? t('common.save') : t('userForm.okCreate')}
       okButtonProps={{ disabled: !canSubmit, loading: submitting }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={() => {
         void submit()
       }}
@@ -212,19 +214,19 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
     >
       <div className="stack">
         <div>
-          <p className="block-label">名称</p>
+          <p className="block-label">{t('providerForm.name')}</p>
           <Input
             value={name}
             maxLength={128}
-            aria-label="Provider 名称"
-            placeholder="例如：OpenAI 生产"
+            aria-label={t('providerForm.nameAria')}
+            placeholder={t('providerForm.namePlaceholder')}
             onChange={(event) => setName(event.target.value)}
             onPressEnter={() => {
               if (canSubmit) submit()
             }}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            名称不要求唯一（同名靠 id 区分）。它只是给人看的标签。
+            {t('providerForm.nameNote')}
           </p>
         </div>
 
@@ -238,96 +240,94 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
             onChange={(event) => setBaseUrl(event.target.value)}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            必须 http:// 或 https:// 开头；服务端会去掉<strong>尾部斜杠</strong>
-            （否则拼出来的 <code>/v1//chat/completions</code> 有的网关当 404）。
+            {t('providerForm.baseUrlRequired')}
             <br />
-            {customUrl ? '已开启「自定义 URL」：这里填的就是完整端点，后端原样发请求、不再拼后缀。' : protocolBaseUrlHint(protocol)}
+            {customUrl ? t('providerForm.customUrlNote') : protocolBaseUrlHint(protocol, locale)}
           </p>
         </div>
 
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
-            <Switch checked={customUrl} onChange={setCustomUrl} aria-label="自定义 URL" />
-            <p className="block-label" style={{ margin: 0 }}>自定义 URL</p>
+            <Switch checked={customUrl} onChange={setCustomUrl} aria-label={t('providerForm.customUrlAria')} />
+            <p className="block-label" style={{ margin: 0 }}>{t('providerForm.customUrl')}</p>
           </div>
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            第三方端点不按 <code>{'{host}/v1'}</code> + 固定后缀规范时开启：上面的 Base URL 会被
-            <strong>原样</strong>当作完整端点（可含完整路径、甚至 query），后端<strong>不再拼</strong>
-            <code>/chat/completions</code> 等后缀。
+            {t('providerForm.customUrlNotePrefix')}<code>{'{host}/v1'}</code>{t('providerForm.customUrlNoteMid')}
+            <strong>{t('providerForm.customUrlNoteStrong1')}</strong>{t('providerForm.customUrlNoteMid2')}
+            <strong>{t('providerForm.customUrlNoteStrong2')}</strong>
+            <code>/chat/completions</code>{t('providerForm.customUrlNoteMid3')}
             <br />
-            ⚠️ 开启后「拉取上游模型」（<code>GET /models</code> 探测）无法从后缀派生，型号名请手工录入。
+            {t('providerForm.customUrlWarn')}<code>GET /models</code>{t('providerForm.customUrlWarnMid')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">上游协议</p>
+          <p className="block-label">{t('providerForm.protocol')}</p>
           <Select<UpstreamProtocol>
             value={protocol}
-            options={protocolOptions}
+            options={protocolOptions.map((option) => ({ value: option.value, label: t(option.labelKey) }))}
             disabled={protocolLocked}
             style={{ width: '100%' }}
-            aria-label="上游协议"
+            aria-label={t('providerForm.protocolAria')}
             onChange={setProtocol}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {protocolLocked
-              ? PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON
-              : '这个 Provider 的上游"怎么说话"：决定请求打到哪个路径、用哪种鉴权头。' +
-                'OpenAI 兼容 = /chat/completions，Responses = /responses，Anthropic = /messages（x-api-key）。'}
+            {protocolLocked ? protocolLockedReason(locale) : t('providerForm.protocolNote')}
           </p>
         </div>
 
         <div>
           <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
             <p className="block-label" style={{ marginBottom: 0 }}>
-              启用
+              {t('providerForm.enable')}
             </p>
-            <Switch checked={enabled} aria-label="启用该 Provider" onChange={setEnabled} />
+            <Switch checked={enabled} aria-label={t('providerForm.enableAria')} onChange={setEnabled} />
           </div>
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            停用后它下面的模型<strong>不会</strong>出现在「可用模型」下拉里（含管理员建智能体时），
-            已有的智能体发消息会失败。停用是"先停下不再选它"，不是删除。
+            {t('providerForm.enableNotePrefix')}<strong>{t('providerForm.enableNoteStrong')}</strong>
+            {t('providerForm.enableNoteTail')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">凭据模式</p>
+          <p className="block-label">{t('providerForm.credentialMode')}</p>
           <Select
             value={credentialMode}
             options={PROVIDER_CREDENTIAL_MODES.map((mode) => ({
               value: mode,
-              label: PROVIDER_CREDENTIAL_MODE_LABELS[mode],
+              label: t(PROVIDER_CREDENTIAL_MODE_KEY[mode]),
             }))}
             style={{ width: '100%' }}
-            aria-label="凭据模式"
+            aria-label={t('providerForm.credentialModeAria')}
             onChange={setCredentialMode}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {credentialMode === 'PER_USER'
-              ? '「各自 Key」：每个使用者配自己的 API Key，调用模型时用他的那一把；未配置时对话返回 424「尚未配置所需凭据」。'
-              : '「共享 Key」：所有使用者共用上面这把 Key（额度和计费都算在它头上）。'}
+            {credentialMode === 'PER_USER' ? t('providerForm.perUserDesc') : t('providerForm.sharedDesc')}
           </p>
         </div>
 
         <div>
           <p className="ratio">
-            模型 Provider 没有单独的公开/私有：访问由<strong>所属人</strong>与管理员掌握。想给某位同事使用，
-            请保存后在该行点<strong>所属人</strong>把 Provider 转移给他。
+            {t('providerForm.ownerNotePrefix')}<strong>{t('providerForm.ownerNoteStrong1')}</strong>
+            {t('providerForm.ownerNoteMid')}<strong>{t('providerForm.ownerNoteStrong2')}</strong>
+            {t('providerForm.ownerNoteTail')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">{credentialMode === 'PER_USER' ? '你的 Key（各自 Key 模式）' : 'API Key'}</p>
+          <p className="block-label">
+            {credentialMode === 'PER_USER' ? t('providerForm.perUserKey') : t('providerForm.apiKey')}
+          </p>
 
           {editing && (
             <p className="num" style={{ marginBottom: 'var(--sp-2)' }}>
               {credentialMode === 'PER_USER'
                 ? provider.userHasKey
-                  ? '当前：已配置（你的 Key，存在「我的凭据」里）'
-                  : '当前：未配置'
+                  ? t('providerForm.currentConfiguredMyKey')
+                  : t('providerForm.currentUnconfigured')
                 : provider.hasKey
-                  ? `当前：${describeProviderKey(provider)}`
-                  : '当前：未配置'}
+                  ? t('providerForm.currentPrefixed', { value: describeProviderKey(provider, locale) })
+                  : t('providerForm.currentUnconfigured')}
             </p>
           )}
 
@@ -335,15 +335,15 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
             value={apiKey}
             maxLength={512}
             autoComplete="off"
-            aria-label="API Key"
+            aria-label={t('providerForm.apiKey')}
             placeholder={
               credentialMode === 'PER_USER'
                 ? editing
-                  ? '输入新的 Key 以替换「我的凭据」里的那一把'
-                  : '粘贴你的 API Key（可留空，稍后到「我的凭据」填）'
+                  ? t('providerForm.inputNewMyKey')
+                  : t('providerForm.inputApiKey')
                 : editing
-                  ? '留空表示保持现有 Key 不变'
-                  : '可留空：先建 Provider，之后再补 Key'
+                  ? t('providerForm.keepExisting')
+                  : t('providerForm.canLeaveBlank')
             }
             onChange={(event) => {
               setApiKey(event.target.value)
@@ -358,13 +358,13 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
               <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginTop: 'var(--sp-3)' }}>
                 <span style={{ flex: 1 }}>
                   {credentialMode === 'PER_USER'
-                    ? '清除你在「我的凭据」里的 Key'
-                    : '清除已配置的 Key（apiKey: null）'}
+                    ? t('providerForm.clearMyKey')
+                    : t('providerForm.clearApiKey')}
                 </span>
                 <Switch
                   checked={clearRequested}
                   disabled={apiKey.trim() !== ''}
-                  aria-label="清除已配置的 Key"
+                  aria-label={t('providerForm.clearAria')}
                   onChange={setClearRequested}
                 />
               </div>
@@ -373,14 +373,13 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
             {credentialMode === 'PER_USER' ? (
               <>
-                这把 Key <strong>只属于你自己</strong>：保存后写入「我的凭据」（仅你能读、能改），
-                调用模型时用你自己的那一把（额度、计费都算在你头上）。留空 = 不动；要清空请用上面的开关。
+                {t('providerForm.perUserKeyNotePrefix')}<strong>{t('providerForm.perUserKeyNoteStrong1')}</strong>
+                {t('providerForm.perUserKeyNoteTail')}
               </>
             ) : (
               <>
-                Key <strong>只进不出</strong>：保存后任何接口都不会再回显它（列表里那个 sk-****abcd
-                是后端解密后取首尾生成的掩码，用来核对配的是哪一把）。留空 = 不动原 Key；
-                要清空请用上面的开关 —— 空字符串会被服务端拒绝（400）。
+                {t('providerForm.sharedKeyNotePrefix')}<strong>{t('providerForm.sharedKeyNoteStrong1')}</strong>
+                {t('providerForm.sharedKeyNoteTail')}
               </>
             )}
           </p>
@@ -390,17 +389,22 @@ export function ProviderFormModal({ provider, open, onClose }: ProviderFormModal
           <Alert
             type="warning"
             showIcon
-            message={credentialMode === 'PER_USER' ? '保存后会清除你在「我的凭据」里的 Key' : '保存后会清除这把 Key'}
+            message={credentialMode === 'PER_USER' ? t('providerForm.clearWarnMyKey') : t('providerForm.clearWarnApiKey')}
             description={
               credentialMode === 'PER_USER'
-                ? '清除后，经该 Provider 的对话会报「尚未配置所需凭据」，直到你重新填写。'
-                : '该 Provider 下的模型将无法再被调用（对话会以鉴权失败告终）。密文删除后无法恢复，只能重新填写。'
+                ? t('providerForm.clearDescMyKey')
+                : t('providerForm.clearDescApiKey')
             }
           />
         )}
 
         {errorText !== null && (
-          <Alert type="error" showIcon message={editing ? '保存失败' : '创建失败'} description={errorText} />
+          <Alert
+            type="error"
+            showIcon
+            message={editing ? t('models.saveFailed') : t('models.createFailed')}
+            description={errorText}
+          />
         )}
       </div>
     </Modal>

@@ -35,7 +35,7 @@
  *    毫无信息量的 "fetch failed"。三种连不通都要给出可读原因靠它。
  */
 
-import { AppError, isAppError } from '@doubulea/shared'
+import { appMsg, AppError, isAppError } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { UPSTREAM_BODY_SNIPPET, redactSecret } from '../llm/upstream.js'
@@ -314,9 +314,7 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
   const sdkCode = sdkErrorCodeOf(error)
   if (sdkCode === MCP_SDK_CODE_REQUEST_TIMEOUT) {
     getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 调用超时')
-    throw AppError.upstreamTimeout(
-      `调用 MCP server 超时（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
-        `原始消息：${detail}`,
+    throw AppError.upstreamTimeout(appMsg('app.m248', { p0: stage, p1: endpoint.serverName, p2: endpoint.endpointUrl, p3: detail }),
     )
   }
 
@@ -350,9 +348,13 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
     )
     // -32022 = 协议版本不被支持（现代协议 negotiation 阶段的错误帧）
     throw AppError.upstreamError(
-      `MCP 服务端返回错误 ${error.code}（${stage}）：${endpoint.serverName}` +
-        `${hint === '' ? '' : `。${hint}`}` +
-        `${upstreamHint === '' ? '' : `。服务端提示：${upstreamHint}`}。原始消息：${detail}`,
+      appMsg('app.m278', {
+        p0: error.code,
+        p1: stage,
+        p2: endpoint.serverName,
+        p3: hint === '' ? '' : `。${hint}`,
+        p4: upstreamHint === '' ? '' : `。服务端提示：${upstreamHint}`,
+      }),
       { mcpRpcCode: error.code, ...(upstreamHint === '' ? {} : { mcpUpstreamHint: upstreamHint }) },
     )
   }
@@ -365,20 +367,14 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
     sdkCode === 'UNSUPPORTED_PROTOCOL_VERSION'
   ) {
     getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 协议版本协商失败')
-    throw AppError.upstreamError(
-      `MCP 服务端的协议版本无法与本客户端协商（${stage}）：${endpoint.serverName}。` +
-        `本客户端 legacy 支持集：${SUPPORTED_PROTOCOL_VERSIONS.join(' / ')}（另支持现代协议 2026-07-28）。` +
-        `原始消息：${detail}`,
+    throw AppError.upstreamError(appMsg('app.m249', { p0: stage, p1: endpoint.serverName, p2: SUPPORTED_PROTOCOL_VERSIONS.join(' / '), p3: detail }),
     )
   }
 
   // ⑤' 帧不是合法 JSON：`200 + 空体`（网关吞了 body）或"头写 application/json、内容其实是 HTML"
   if (error instanceof SyntaxError) {
     getLogger().warn({ ...describeMcpEndpoint(endpoint), stage }, 'MCP 端点返回的帧不是合法 JSON')
-    throw AppError.upstreamError(
-      `MCP 端点返回的内容不是合法 JSON（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
-        '常见原因：端点其实不是 MCP（回了 HTML），或中间有网关把响应体吞掉了。' +
-        `原始消息：${detail}`,
+    throw AppError.upstreamError(appMsg('app.m250', { p0: stage, p1: endpoint.serverName, p2: endpoint.endpointUrl, p3: detail }),
     )
   }
 
@@ -388,9 +384,7 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
       { ...describeMcpEndpoint(endpoint), stage, issues: summarizeSchemaIssues(error) },
       'MCP 端点返回的帧不符合协议 schema',
     )
-    throw AppError.upstreamError(
-      `MCP 端点返回的帧不符合 MCP 协议（${stage}）：${endpoint.serverName}。` +
-        `字段问题：${summarizeSchemaIssues(error)}`,
+    throw AppError.upstreamError(appMsg('app.m251', { p0: stage, p1: endpoint.serverName, p2: summarizeSchemaIssues(error) }),
     )
   }
 
@@ -402,16 +396,19 @@ export function toMcpFailure(error: unknown, context: McpFailureContext): never 
   )
   if (cause.reason !== null) {
     throw AppError.upstreamError(
-      `无法连接 MCP server（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
-        `${cause.reason}（${cause.code}）`,
+      appMsg('app.m252', {
+        p0: stage,
+        p1: endpoint.serverName,
+        p2: endpoint.endpointUrl,
+        p3: cause.reason ?? '',
+        p4: cause.code ?? '',
+      }),
     )
   }
 
   // ⑦ 兜底：把 `.cause` 链摊开，至少让下一次排查有东西可看
   const chainText = cause.chain.length > 1 ? `；原因链：${cause.chain.join(' ← ')}` : ''
-  throw AppError.upstreamError(
-    `调用 MCP server 失败（${stage}）：${endpoint.serverName}（${endpoint.endpointUrl}）。` +
-      `原始错误：${detail}${chainText}`,
+  throw AppError.upstreamError(appMsg('app.m253', { p0: stage, p1: endpoint.serverName, p2: endpoint.endpointUrl, p3: detail, p4: chainText }),
   )
 }
 

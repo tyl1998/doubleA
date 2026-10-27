@@ -54,25 +54,37 @@ import type {
 } from '@doubulea/shared'
 import {
   DEFAULT_UPSTREAM_PROTOCOL,
-  VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE,
   UPSTREAM_PROTOCOLS,
-  UPSTREAM_PROTOCOL_BASE_URL_HINTS,
-  UPSTREAM_PROTOCOL_LABELS,
+  UPSTREAM_PROTOCOL_BASE_URL_HINT_KEY,
+  UPSTREAM_PROTOCOL_KEY,
   vectorModelRequiresCompatProtocol,
+  translate,
+  type Locale,
+  type MessageKey,
 } from '@doubulea/shared'
 
 // ═══════════════════════════════ 词表 ═══════════════════════════════
 
 /** 角色词表（`01` §3.1 只有两种角色，无自注册）。刻意与 `USER_ROLES` 同键，漏一个编译期就红 */
-export const USER_ROLE_LABELS: Readonly<Record<UserRole, string>> = {
-  ADMIN: '管理员',
-  MEMBER: '成员',
+export const USER_ROLE_LABEL_KEY: Readonly<Record<UserRole, MessageKey>> = {
+  ADMIN: 'label.userRole.ADMIN',
+  MEMBER: 'label.userRole.MEMBER',
 }
 
-/** 状态词表。用「启用 / 已停用」而不是 `ACTIVE` / `DISABLED`：界面上不该出现数据库枚举 */
-export const USER_STATUS_LABELS: Readonly<Record<UserStatus, string>> = {
-  ACTIVE: '启用',
-  DISABLED: '已停用',
+/** 状态词表 → key。用「启用 / 已停用」而不是 `ACTIVE` / `DISABLED`：界面上不该出现数据库枚举 */
+export const USER_STATUS_LABEL_KEY: Readonly<Record<UserStatus, MessageKey>> = {
+  ACTIVE: 'label.userStatus.ACTIVE',
+  DISABLED: 'label.userStatus.DISABLED',
+}
+
+/** 便捷：角色 → 译文（组件不必自己 `translate(locale, USER_ROLE_LABEL_KEY[...])`） */
+export function userRoleLabel(role: UserRole, locale: Locale): string {
+  return translate(locale, USER_ROLE_LABEL_KEY[role])
+}
+
+/** 便捷：状态 → 译文 */
+export function userStatusLabel(status: UserStatus, locale: Locale): string {
+  return translate(locale, USER_STATUS_LABEL_KEY[status])
 }
 
 // ═══════════════════════════════ 用户列表 ═══════════════════════════════
@@ -81,9 +93,10 @@ export const USER_STATUS_LABELS: Readonly<Record<UserStatus, string>> = {
 export interface UserStatusView {
   /** 复用 `styles/app.css` 已有的 `.led--*` 三态灯 */
   led: 'ok' | 'warn' | 'fail'
-  label: string
-  /** 一句"这意味着什么"；没有额外含义时为 `null`（不写废话） */
-  hint: string | null
+  /** 状态标签的 i18n key（P1-23：存 key 不存文案） */
+  labelKey: MessageKey
+  /** 一句"这意味着什么"的 i18n key；`null` = 没有额外含义（不写废话） */
+  hintKey: MessageKey | null
 }
 
 /**
@@ -95,24 +108,26 @@ export interface UserStatusView {
  */
 export function describeUserStatus(user: Pick<UserListItem, 'status' | 'mustChangePassword'>): UserStatusView {
   if (user.status === 'DISABLED') {
-    return { led: 'fail', label: USER_STATUS_LABELS.DISABLED, hint: '下个请求即 401（会话快照已失效）' }
+    return { led: 'fail', labelKey: USER_STATUS_LABEL_KEY.DISABLED, hintKey: 'admin.statusHint.disabled' }
   }
   if (user.mustChangePassword) {
-    return { led: 'warn', label: '启用 · 待首次改密', hint: '首登闸门下只能改密 / 看自己 / 登出' }
+    return { led: 'warn', labelKey: 'admin.statusLabel.mustChange', hintKey: 'admin.statusHint.mustChange' }
   }
-  return { led: 'ok', label: USER_STATUS_LABELS.ACTIVE, hint: null }
+  return { led: 'ok', labelKey: USER_STATUS_LABEL_KEY.ACTIVE, hintKey: null }
 }
 
 export type AdminUserActionKey = 'edit' | 'toggle' | 'reset'
 
-/** 用户行的一个操作（`disabled` 时 `reason` 必须给全 —— 灰按钮不加解释等于"页面坏了"） */
+/** 用户行的一个操作（`disabled` 时 `reasonKey` 必须给全 —— 灰按钮不加解释等于"页面坏了"） */
 export interface AdminUserAction {
   key: AdminUserActionKey
-  label: string
+  labelKey: MessageKey
   danger: boolean
   disabled: boolean
-  /** `disabled` 的原因，挂在该按钮的 `title` 与 `Tooltip` 上 */
-  reason: string | null
+  /** `disabled` 的原因 key，挂在该按钮的 `title` 与 `Tooltip` 上 */
+  reasonKey: MessageKey | null
+  /** 需要参数的 reason（`toggle` / `reset` 各一），无参时为空 */
+  reasonParams?: Record<string, string | number>
 }
 
 /**
@@ -129,32 +144,31 @@ export interface AdminUserAction {
  */
 export function userRowActions(user: Pick<UserListItem, 'id' | 'status'>, currentUserId: string): AdminUserAction[] {
   const isSelf = user.id === currentUserId
-  const selfReason = '不能对自己做这个操作（后端会 409）：本系统只有管理员能进这一页，自锁后没人能改回来'
 
   return [
     {
       key: 'edit',
-      label: '编辑',
+      labelKey: 'common.edit',
       danger: false,
       // 改角色对"自己"也是被拒的（降级自己 = 自锁）；但**保留可点**，由弹窗说清楚，
       // 因为编辑弹窗里还有只读的 username/nickname 可看（它不只是"改角色"）
       disabled: false,
-      reason: null,
+      reasonKey: null,
     },
     {
       key: 'toggle',
-      label: user.status === 'ACTIVE' ? '停用' : '启用',
+      labelKey: user.status === 'ACTIVE' ? 'users.disable' : 'users.enable',
       // 危险操作用红色（§七 表格规范）；「启用」不是危险操作
       danger: user.status === 'ACTIVE',
       disabled: isSelf,
-      reason: isSelf ? selfReason : null,
+      reasonKey: isSelf ? 'admin.selfReason.toggle' : null,
     },
     {
       key: 'reset',
-      label: '重置密码',
+      labelKey: 'users.reset',
       danger: false,
       disabled: isSelf,
-      reason: isSelf ? '本人改密请走右上角头像菜单里的「修改密码」（后端同样拒绝对自己重置）' : null,
+      reasonKey: isSelf ? 'admin.selfReason.reset' : null,
     },
   ]
 }
@@ -212,17 +226,16 @@ export function buildUpdateUserBody(user: UserListItem, nextRole: UserRole): Upd
  * 否则界面上就是一串星号（P0-1-31 已踩过：JSX 文本子节点不认 Markdown，要加粗得用
  * `<strong>`）。所以这里只用标点与「」表达重点。
  */
-export function initialPasswordNotice(username: string, forReset: boolean): string {
-  const action = forReset ? '重置' : '创建'
-  return (
-    `${action}成功。下面的初始密码只会出现这一次（列表与详情接口此后都不再带它），` +
-    `请立刻复制并通过可靠渠道发给「${username}」；对方首次登录会被强制改密。`
-  )
+export function initialPasswordNotice(username: string, forReset: boolean, locale: Locale): string {
+  return translate(locale, 'admin.initialPasswordNotice', {
+    action: translate(locale, forReset ? 'admin.initialPasswordAction.reset' : 'admin.initialPasswordAction.create'),
+    username,
+  })
 }
 
 /** 复制按钮的候选文本（独立出来是为了让"复制什么"可被断言，而不是散在组件里拼） */
-export function initialPasswordCopyText(username: string, initialPassword: string): string {
-  return `用户名：${username}\n初始密码：${initialPassword}`
+export function initialPasswordCopyText(username: string, initialPassword: string, locale: Locale): string {
+  return translate(locale, 'admin.initialPasswordCopyText', { username, password: initialPassword })
 }
 
 // ═══════════════════════════════ Provider ═══════════════════════════════
@@ -284,8 +297,8 @@ export function providerEditValuesOf(provider: ModelProviderItem): ProviderFormV
 // ───────────────────────── 上游协议（P0-1-37） ─────────────────────────
 
 /** 协议下拉的选项（顺序 = `shared` 的 `UPSTREAM_PROTOCOLS`，也就是后端枚举的顺序） */
-export const PROTOCOL_OPTIONS: readonly { value: UpstreamProtocol; label: string }[] =
-  UPSTREAM_PROTOCOLS.map((protocol) => ({ value: protocol, label: UPSTREAM_PROTOCOL_LABELS[protocol] }))
+export const PROTOCOL_OPTIONS: readonly { value: UpstreamProtocol; labelKey: MessageKey }[] =
+  UPSTREAM_PROTOCOLS.map((protocol) => ({ value: protocol, labelKey: UPSTREAM_PROTOCOL_KEY[protocol] }))
 
 /**
  * Provider 的协议下拉里**可选**的取值。
@@ -302,14 +315,16 @@ export const PROTOCOL_OPTIONS: readonly { value: UpstreamProtocol; label: string
  * ⚠️ 返回**可变**数组（不是 `readonly`）：AntD 的 `Select.options` 收的是可变数组，
  * 传 `readonly` 会编译期报 TS4104。`.filter` 本来就产出一份新数组，没有共享可变状态的风险。
  */
-export function protocolOptionsFor(hasEmbeddingModel: boolean): { value: UpstreamProtocol; label: string }[] {
+export function protocolOptionsFor(hasEmbeddingModel: boolean): { value: UpstreamProtocol; labelKey: MessageKey }[] {
   return PROTOCOL_OPTIONS.filter((option) =>
     vectorModelRequiresCompatProtocol(hasEmbeddingModel, option.value),
   )
 }
 
-/** 协议被"该 Provider 下有向量模型"锁住时选择器的说明（就是后端那条 400 字段级文案，不加一个字的翻译） */
-export const PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON = VECTOR_MODEL_PROTOCOL_CONFLICT_MESSAGE
+/** 协议被"该 Provider 下有向量模型"锁住时选择器的说明（就是后端那条 400 字段级文案，逐字一致） */
+export function protocolLockedReason(locale: Locale): string {
+  return translate(locale, 'admin.protocolLockedByVectorModel', { protocol: DEFAULT_UPSTREAM_PROTOCOL })
+}
 
 /**
  * ⚠️ 2026-10-22 **删掉了** `protocolAfterTypeChange`（原用于"改 Provider 类型时把协议收回默认值"）。
@@ -320,14 +335,17 @@ export const PROTOCOL_LOCKED_BY_VECTOR_MODEL_REASON = VECTOR_MODEL_PROTOCOL_CONF
  */
 
 /** `baseUrl` 输入框下方的提示 —— 每种协议的路径后缀不同，填错的表现是 404（`02` §6.1） */
-export function protocolBaseUrlHint(protocol: UpstreamProtocol): string {
-  return UPSTREAM_PROTOCOL_BASE_URL_HINTS[protocol]
+export function protocolBaseUrlHint(protocol: UpstreamProtocol, locale: Locale): string {
+  return translate(locale, UPSTREAM_PROTOCOL_BASE_URL_HINT_KEY[protocol])
 }
 
 /** Key 那一列/那一行的读数：已配置给掩码（后端解密后生成），未配置给一句人话 */
-export function describeProviderKey(provider: Pick<ModelProviderItem, 'hasKey' | 'apiKeyPreview'>): string {
-  if (!provider.hasKey) return '未配置'
-  return provider.apiKeyPreview ?? '已配置'
+export function describeProviderKey(
+  provider: Pick<ModelProviderItem, 'hasKey' | 'apiKeyPreview'>,
+  locale: Locale,
+): string {
+  if (!provider.hasKey) return translate(locale, 'admin.providerKey.unconfigured')
+  return provider.apiKeyPreview ?? translate(locale, 'admin.providerKey.configured')
 }
 
 /**
@@ -509,17 +527,17 @@ export function modelEditValuesOf(model: ModelItem): ModelFormValues {
 export const MAX_CONTEXT_MIN = 1
 export const MAX_CONTEXT_MAX = 10_000_000
 
-export function validateMaxContext(value: number | null): string | null {
+export function validateMaxContext(value: number | null, locale: Locale): string | null {
   if (value === null) return null
-  if (!Number.isInteger(value)) return '上下文长度必须是整数'
-  if (value < MAX_CONTEXT_MIN) return `上下文长度至少为 ${MAX_CONTEXT_MIN}`
-  if (value > MAX_CONTEXT_MAX) return `上下文长度最多 ${MAX_CONTEXT_MAX}（填的是 token 数，不是字节数）`
+  if (!Number.isInteger(value)) return translate(locale, 'admin.maxContext.integer')
+  if (value < MAX_CONTEXT_MIN) return translate(locale, 'admin.maxContext.min', { min: MAX_CONTEXT_MIN })
+  if (value > MAX_CONTEXT_MAX) return translate(locale, 'admin.maxContext.max', { max: MAX_CONTEXT_MAX })
   return null
 }
 
 /** 上下文长度的读数（`null` ⇒ 「未知」而不是 `0`；与检索分那处同一口径） */
-export function maxContextText(value: number | null): string {
-  return value === null ? '未知' : value.toLocaleString('en-US')
+export function maxContextText(value: number | null, locale: Locale): string {
+  return value === null ? translate(locale, 'admin.maxContext.unknown') : value.toLocaleString('en-US')
 }
 
 export function buildCreateModelBody(values: ModelFormValues): CreateModelBody {
@@ -628,8 +646,7 @@ export function modelTypeChangeBlocked(model: Pick<ModelItem, 'agentCount'>): bo
   return model.agentCount > 0
 }
 
-export const MODEL_TYPE_LOCKED_REASON =
-  '该模型已被智能体绑定，后端不允许改类型（409）：对话模型与向量模型不可互换，改了等于让已上线的智能体悄悄换一类模型。请先到智能体列表改绑。'
+export const MODEL_TYPE_LOCKED_REASON_KEY: MessageKey = 'admin.typeLockedReason'
 
 /**
  * ⚠️ 2026-10-22 **删掉了** `defaultTypeForProvider`（原"新建模型时取所属 Provider 的 type 作初值"）。
@@ -639,37 +656,45 @@ export const MODEL_TYPE_LOCKED_REASON =
  * 真正的合法性判据在后端：`type=EMBEDDING` 要求该 Provider 的协议是 OpenAI 兼容
  * （`shared#embeddingModelAllowedOnProtocol`），前端按同一判据把提示写在表单里。
  */
-export const MODEL_TYPE_HINT =
-  '类型是**模型自己的用途**（对话 / 向量）。同一个 Provider（同一个 baseUrl / 同一把 Key）下可以同时挂两类模型；向量模型要求该 Provider 的协议是 OpenAI 兼容。'
+export const MODEL_TYPE_HINT_KEY: MessageKey = 'admin.modelTypeHint'
 
 /**
  * 删模型前的"点下去会怎样"。`null` = 可以直接删（走 Popconfirm）。
  *
  * ⚠️ 引用口径有**五处**（与后端 `removeModel` 逐条同口径）：
- *  ① 在线智能体（默认模型 / 模型池成员，`agentCount`）；
+ *  ① 在线智能体（默认模型 / 模型池成员 —— `agentCount` 是**两者并集**，同一智能体只算一次）；
  *  ② 知识库把它当**向量**模型用（`knowledgeBaseCount`）；
  *  ③ 知识库把它当**图片描述**模型用（`captionKnowledgeBaseCount`）；
  *  ④ 平台把它选为**会话标题**模型（`usedAsTitleModel`，单例）；
  *  ⑤ 均已按 `ON DELETE SET NULL` / `CASCADE` 会**静默**产生副作用 ⇒ 任一命中都不能删。
+ *
+ * ⚠️ 2026-10-26：①的口径曾漏过 —— 后端 `agentCount` 一度只数默认模型（`agents.model_id`），
+ * "只当池成员、不是默认模型"的模型显示 0、这里判成"可删"，点下去却被 `removeModel` 409（没有提示却删不掉）。
+ * 两边必须以**并集**同口径（后端按 `agent_models` 计数：默认模型恒为池成员 ⇒ 池 ⊇ 默认）。
  */
 export function modelDeleteBlockedNotice(
   model: Pick<ModelItem, 'agentCount' | 'knowledgeBaseCount' | 'captionKnowledgeBaseCount' | 'usedAsTitleModel'>,
+  locale: Locale,
 ): string | null {
   const reasons: string[] = []
-  if (model.agentCount > 0) reasons.push(`被 ${model.agentCount} 个在线智能体绑定`)
-  if (model.knowledgeBaseCount > 0) reasons.push(`被 ${model.knowledgeBaseCount} 个知识库用作向量模型`)
+  if (model.agentCount > 0) reasons.push(translate(locale, 'admin.modelDelete.agent', { count: model.agentCount }))
+  if (model.knowledgeBaseCount > 0)
+    reasons.push(translate(locale, 'admin.modelDelete.vectorKb', { count: model.knowledgeBaseCount }))
   if (model.captionKnowledgeBaseCount > 0)
-    reasons.push(`被 ${model.captionKnowledgeBaseCount} 个知识库用作图片描述模型`)
-  if (model.usedAsTitleModel) reasons.push('被平台用作会话标题生成模型')
+    reasons.push(translate(locale, 'admin.modelDelete.captionKb', { count: model.captionKnowledgeBaseCount }))
+  if (model.usedAsTitleModel) reasons.push(translate(locale, 'admin.modelDelete.titleModel'))
   if (reasons.length === 0) return null
 
   const targets: string[] = []
-  if (model.agentCount > 0) targets.push('智能体列表把它们改绑到别的模型')
-  if (model.knowledgeBaseCount > 0) targets.push('这些知识库改用别的向量模型')
-  if (model.captionKnowledgeBaseCount > 0) targets.push('这些知识库改用别的图片描述模型')
-  if (model.usedAsTitleModel) targets.push('「系统设置 · 会话标题模型」改用别的模型')
+  if (model.agentCount > 0) targets.push(translate(locale, 'admin.modelDelete.targetAgent'))
+  if (model.knowledgeBaseCount > 0) targets.push(translate(locale, 'admin.modelDelete.targetVectorKb'))
+  if (model.captionKnowledgeBaseCount > 0) targets.push(translate(locale, 'admin.modelDelete.targetCaptionKb'))
+  if (model.usedAsTitleModel) targets.push(translate(locale, 'admin.modelDelete.targetTitleModel'))
 
-  return `该模型正${reasons.join('、')}，后端会拒绝这次删除（409）。请先到${targets.join('、')}。`
+  return translate(locale, 'admin.modelDelete.notice', {
+    reasons: reasons.join(translate(locale, 'admin.modelDelete.join')),
+    targets: targets.join(translate(locale, 'admin.modelDelete.join')),
+  })
 }
 
 // ═══════════════════════════════ 按 Provider 分组（顺序不许重排） ═══════════════════════════════
@@ -737,8 +762,7 @@ export function summarizeModels(models: readonly ModelItem[]): {
  * 而 409 拦截；引用这些模型的在线智能体会被**自动解绑**（`agents.model_id` 置空）。
  * 弹窗改为提前列出"会解绑哪些模型"（见 `DeleteProviderModal.tsx` + `useProviderBoundModels`）。
  */
-export const PROVIDER_DELETE_IMPACT_HINT =
-  '删除 Provider 会连带删除它下面的**全部模型**（数据库外键是 ON DELETE CASCADE）。正在绑定这些模型的在线智能体会被自动解绑，变为"未绑定模型"，需到智能体编辑页重新绑定后才能对话。密文里的 API Key 也会一起消失，重建后需要重新填写。'
+export const PROVIDER_DELETE_IMPACT_HINT_KEY: MessageKey = 'admin.providerDeleteImpact'
 
 // ═══════════════════════════════ 拉取上游模型 ═══════════════════════════════
 
@@ -797,12 +821,12 @@ export function remoteModelRows(result: RemoteModelListResult): RemoteModelRow[]
  *   · `total === 0` —— 真的一个都没探到（不是"还在加载"）；
  *   · `!hasKey` 的 Provider 也可能探得到（内网实现常免鉴权），所以探到了不能说成"Key 配好了"。
  */
-export function remoteModelNotice(result: RemoteModelListResult, hasKey: boolean): string | null {
-  if (result.total === 0) return '上游没有返回任何模型。请核对 baseUrl；该实现可能不提供模型列表，那就手工录入型号名。'
+export function remoteModelNotice(result: RemoteModelListResult, hasKey: boolean, locale: Locale): string | null {
+  if (result.total === 0) return translate(locale, 'admin.remoteNotice.empty')
   const parts: string[] = []
   if (result.truncated) {
-    parts.push(`上游共 ${result.total} 个，这里只列了前 ${result.items.length} 个（上限截断，不是全部）`)
+    parts.push(translate(locale, 'admin.remoteNotice.truncated', { total: result.total, shown: result.items.length }))
   }
-  if (!hasKey) parts.push('这个 Provider 还没配 API Key —— 也能探到说明上游免鉴权，但不代表能正常调用')
-  return parts.length === 0 ? null : parts.join('；')
+  if (!hasKey) parts.push(translate(locale, 'admin.remoteNotice.noKey'))
+  return parts.length === 0 ? null : parts.join(translate(locale, 'admin.remoteNotice.join'))
 }

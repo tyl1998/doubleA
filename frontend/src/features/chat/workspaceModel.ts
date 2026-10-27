@@ -13,6 +13,9 @@ import {
   WORKSPACE_CONTENT_EVENT_TYPES,
   isWorkspaceTextMime,
   isWorkspaceHiddenPath,
+  translate,
+  type Locale,
+  type MessageKey,
   type WorkspaceChangeEntry,
   type WorkspaceEventItem,
   type WorkspaceFileEntry,
@@ -112,9 +115,10 @@ export { formatBytes } from '../../app/format.js'
  * ⚠️ 与后端容器扩展里那句（`请重新读取后再写`）是**同一件事的两种受众**：这里给人看，
  * 那里给模型看；两者都不许把它写成"保存失败"就完 —— 用户得知道**为什么**（别人/agent 改过）。
  */
-export function conflictText(currentVersion: number | undefined): string {
-  const version = currentVersion === undefined ? '' : `（当前 v${currentVersion}）`
-  return `文件已被他人修改${version}，请重新加载后再保存。`
+export function conflictText(currentVersion: number | undefined, locale: Locale): string {
+  return currentVersion === undefined
+    ? translate(locale, 'workspace.conflictNoVersion')
+    : translate(locale, 'workspace.conflictWithVersion', { version: currentVersion })
 }
 
 /** 文件图标用的后缀（纯展示；不认识回空串） */
@@ -277,11 +281,19 @@ export function workspaceCopyValue(kind: WorkspaceCopyKind, path: string): strin
  * 菜单里三种口径的文案（与 {@link workspaceCopyValue} **一一对应**，顺序也用这一份 ——
  * 免得"菜单写着一套、复制出来另一套"这种只有用户点了才知道的错位）。
  */
-export const WORKSPACE_COPY_ITEMS: readonly { key: WorkspaceCopyKind; label: string }[] = [
-  { key: 'relative', label: '相对路径' },
-  { key: 'absolute', label: `绝对路径（${WORKSPACE_CONTAINER_ROOT}）` },
-  { key: 'name', label: '名称' },
+export const WORKSPACE_COPY_ITEM_KEYS: readonly { key: WorkspaceCopyKind; labelKey: MessageKey }[] = [
+  { key: 'relative', labelKey: 'workspace.copyRelative' },
+  { key: 'absolute', labelKey: 'workspace.copyAbsolute' },
+  { key: 'name', labelKey: 'workspace.copyName' },
 ]
+
+/** 复制子菜单的项（`label` 已按当前语言译好；`absolute` 那条插进容器根路径） */
+export function workspaceCopyItems(locale: Locale): { key: WorkspaceCopyKind; label: string }[] {
+  return WORKSPACE_COPY_ITEM_KEYS.map((item) => ({
+    key: item.key,
+    label: translate(locale, item.labelKey, { root: WORKSPACE_CONTAINER_ROOT }),
+  }))
+}
 
 /**
  * git 分支 chip 上显示的文本（**纯函数**）。
@@ -289,16 +301,21 @@ export const WORKSPACE_COPY_ITEMS: readonly { key: WorkspaceCopyKind; label: str
  * 分支名直显；detached HEAD 时 `branch` 里装的是短 SHA ⇒ 显成 `detached@<短SHA>`（一眼看出不是分支）；
  * `branch === null`（HEAD 形状不认识 / 读不到）⇒ `未知分支`，**不猜**。
  */
-export function workspaceGitChipLabel(repo: { branch: string | null; detached: boolean }): string {
-  if (repo.branch === null) return '未知分支'
+export function workspaceGitChipLabel(repo: { branch: string | null; detached: boolean }, locale: Locale): string {
+  if (repo.branch === null) return translate(locale, 'workspace.branchUnknown')
   return repo.detached ? `detached@${repo.branch}` : repo.branch
 }
 
 /** git chip 的 `title`（鼠标悬停的完整口径：仓库位置 + detached 说明） */
-export function workspaceGitChipTitle(repo: { path: string; branch: string | null; detached: boolean }): string {
-  const where = repo.path === '' ? '工作区根' : repo.path
-  const what = workspaceGitChipLabel(repo)
-  return repo.detached ? `${where} · ${what}（detached HEAD，不在任何分支上）` : `${where} · 当前分支 ${what}`
+export function workspaceGitChipTitle(
+  repo: { path: string; branch: string | null; detached: boolean },
+  locale: Locale,
+): string {
+  const where = repo.path === '' ? translate(locale, 'workspace.gitRoot') : repo.path
+  const what = workspaceGitChipLabel(repo, locale)
+  return repo.detached
+    ? translate(locale, 'workspace.gitDetached', { where, what })
+    : translate(locale, 'workspace.gitTitle', { where, what })
 }
 
 /**
@@ -452,6 +469,13 @@ export function isImageMime(mime: string | null | undefined): boolean {
 }
 
 /** 编辑器语言 id → 状态栏人读文案（纯展示） */
+/**
+ * 语言 id → 读数。
+ *
+ * ⚠️ 除 `text` 外都是**专有名词**（JavaScript / TypeScript / JSON…），zh/en 两语言**同形**，
+ * 所以它们不是 i18n key（进字典只会得到两份一模一样的译文）。只有 `text` 的读法随语言变
+ * （中文「纯文本」/ 英文 `Plain text`）。
+ */
 const WORKSPACE_LANGUAGE_LABELS: Record<WorkspaceEditorLanguage, string> = {
   javascript: 'JavaScript',
   typescript: 'TypeScript',
@@ -460,11 +484,11 @@ const WORKSPACE_LANGUAGE_LABELS: Record<WorkspaceEditorLanguage, string> = {
   css: 'CSS',
   python: 'Python',
   markdown: 'Markdown',
-  text: '纯文本',
+  text: '',
 }
 
-export function workspaceLanguageLabel(language: WorkspaceEditorLanguage): string {
-  return WORKSPACE_LANGUAGE_LABELS[language]
+export function workspaceLanguageLabel(language: WorkspaceEditorLanguage, locale: Locale): string {
+  return language === 'text' ? translate(locale, 'workspace.languageText') : WORKSPACE_LANGUAGE_LABELS[language]
 }
 
 /**
@@ -569,17 +593,17 @@ export function mergeWorkspaceChanges(
 }
 
 /** 撤销落点动作 → 人读文案（「撤销本轮」报告用；纯展示） */
-const REVERT_ACTION_LABELS: Record<WorkspaceRevertAction, string> = {
-  restored: '已还原',
-  deleted: '已删除',
-  skipped: '跳过',
-  conflict: '冲突',
-  unavailable: '缺历史',
-  unsupported: '不支持',
+const REVERT_ACTION_KEYS: Record<WorkspaceRevertAction, MessageKey> = {
+  restored: 'workspace.revertActionRestored',
+  deleted: 'workspace.revertActionDeleted',
+  skipped: 'workspace.revertActionSkipped',
+  conflict: 'workspace.revertActionConflict',
+  unavailable: 'workspace.revertActionUnavailable',
+  unsupported: 'workspace.revertActionUnsupported',
 }
 
-export function revertActionLabel(action: WorkspaceRevertAction): string {
-  return REVERT_ACTION_LABELS[action]
+export function revertActionLabel(action: WorkspaceRevertAction, locale: Locale): string {
+  return translate(locale, REVERT_ACTION_KEYS[action])
 }
 
 /**
@@ -588,21 +612,27 @@ export function revertActionLabel(action: WorkspaceRevertAction): string {
  * `dryRun` 前置 `[预演]`；空结果 = "本轮无工作区改动"。冲突/不可用不隐藏 —— 它们正是
  * 用户需要知道"为什么没全撤销"的部分（`子方案` §七 5：冲突不静默覆盖）。
  */
-export function revertSummaryText(result: Pick<WorkspaceRevertResult, 'dryRun' | 'items'>): string {
+export function revertSummaryText(
+  result: Pick<WorkspaceRevertResult, 'dryRun' | 'items'>,
+  locale: Locale,
+): string {
   const count = (action: string): number => result.items.filter((item) => item.action === action).length
   const parts: string[] = []
-  const restored = count('restored')
-  const deleted = count('deleted')
-  const skipped = count('skipped')
-  const conflict = count('conflict')
-  const unavailable = count('unavailable')
-  const unsupported = count('unsupported')
-  if (restored > 0) parts.push(`还原 ${restored}`)
-  if (deleted > 0) parts.push(`删除 ${deleted}`)
-  if (skipped > 0) parts.push(`跳过 ${skipped}`)
-  if (conflict > 0) parts.push(`冲突 ${conflict}`)
-  if (unavailable > 0) parts.push(`缺历史 ${unavailable}`)
-  if (unsupported > 0) parts.push(`不支持 ${unsupported}`)
-  const body = parts.length === 0 ? '本轮无工作区改动' : parts.join('，')
-  return result.dryRun ? `[预演] ${body}` : body
+  const buckets: { action: WorkspaceRevertAction; key: MessageKey }[] = [
+    { action: 'restored', key: 'workspace.revertSummaryRestored' },
+    { action: 'deleted', key: 'workspace.revertSummaryDeleted' },
+    { action: 'skipped', key: 'workspace.revertSummarySkipped' },
+    { action: 'conflict', key: 'workspace.revertSummaryConflict' },
+    { action: 'unavailable', key: 'workspace.revertSummaryUnavailable' },
+    { action: 'unsupported', key: 'workspace.revertSummaryUnsupported' },
+  ]
+  for (const bucket of buckets) {
+    const n = count(bucket.action)
+    if (n > 0) parts.push(translate(locale, bucket.key, { count: n }))
+  }
+  const body =
+    parts.length === 0
+      ? translate(locale, 'workspace.revertSummaryNone')
+      : parts.join(translate(locale, 'workspace.revertSummarySeparator'))
+  return result.dryRun ? translate(locale, 'workspace.revertSummaryDryRunPrefix', { body }) : body
 }

@@ -74,7 +74,9 @@ it('O1 `AGENT_SECTIONS`（参与保存）不含 openKeys；`AGENT_PAGE_SECTIONS`
   assert(!model.AGENT_SECTIONS.includes('openKeys'), 'openKeys 不能进保存链路')
 })
 it('O2 编辑页的指路条：openKeys = 05 / 开放调用（文案只此一处）', () => {
-  eq(model.AGENT_SECTION_LABEL.openKeys, '开放调用', '标题')
+  // P1-23 第九批：区块标题改成 key（`AGENT_SECTION_LABEL_KEY`）⇒ 守门转向"key + 字典译文"。
+  eq(model.AGENT_SECTION_LABEL_KEY.openKeys, 'label.agentSection.openKeys', '标题用 key')
+  eq(shared.translate('zh', model.AGENT_SECTION_LABEL_KEY.openKeys), '开放调用', '字典那句是"开放调用"')
   eq(model.sectionOrdinal('openKeys'), '05', '序号')
   eq(model.sectionOrdinal('components'), '04', '原有区块序号不受影响')
 })
@@ -165,7 +167,8 @@ it('O11 智能体编辑页**不再**渲染 Key 管理组件，只给指路条（
 it('O12 「我的凭据」页有开放调用分区（tab + 锚点 + 文案）', () => {
   const page = read('src/pages/mcp/McpCredentialsPage.tsx')
   assert(page.includes("key: 'openapi'"), '要有 openapi tab')
-  assert(page.includes("label: '开放调用'"), 'tab 文案')
+  // P1-23 第八批：tab 文案改成 key（`mcpCred.sectionOpenApi`）—— 守门转向"组件用 key + 字典译文"。
+  assert(page.includes('mcpCred.sectionOpenApi'), 'tab 文案用 key')
   assert(page.includes('OpenApiKeysSection'), '分区内容 = 该组件')
   assert(read('src/app/paths.ts').includes("'openapi'"), 'CREDENTIALS_SECTIONS 含 openapi（深链可用）')
 })
@@ -199,7 +202,7 @@ it('O15 编辑弹窗：提交过同一份 shared schema；放宽作用域需确�
   assert(modal.includes('updateOpenApiKeyBodySchema.safeParse'), '编辑弹窗提交前过 shared 的同一份 schema')
   assert(modal.includes('confirmWiden'), '放宽作用域必须勾选确认（保存即扩大 Key 能力）')
   assert(modal.includes('agentName'), '关联智能体在编辑弹窗里只读展示（不可改）')
-  const actions = section.slice(section.indexOf("title: '操作'"), section.indexOf('function CreateKeyModal'))
+  const actions = section.slice(section.indexOf("t('openApi.colActions')"), section.indexOf('function CreateKeyModal'))
   assert(
     actions.split("disabled={row.status === 'REVOKED'}").length - 1 >= 2,
     '编辑与吊销按钮对已吊销的 Key 一并禁用（终态不可编辑）',

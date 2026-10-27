@@ -64,7 +64,7 @@
  *    两条路由都在写库（成功刷缓存 / 失败只写 `status`），见 ③④。
  */
 
-import {
+import { appMsg,
   AppError,
   assetVisibilityWhere,
   canEditMcpServer,
@@ -234,9 +234,7 @@ function sameJson(a: unknown, b: unknown): boolean {
  */
 function assertAuthTypeSupported(authType: McpAuthType | undefined): void {
   if (authType === 'OAUTH') {
-    throw AppError.validation(
-      'OAuth 2.1 授权登录属 P1（本阶段只支持 authType=NONE + 每用户凭据注入）：' +
-        '请改用 NONE 并在「我的凭据」里为每个使用者填各自的令牌',
+    throw AppError.validation(appMsg('app.m268'),
     )
   }
 }
@@ -519,9 +517,9 @@ export async function updateMcpServer(
   assertAuthTypeSupported(input.authType)
 
   const current = await db.mcpServer.findUnique({ where: { id }, select: MCP_SERVER_SELECT })
-  if (current === null) throw AppError.notFound('MCP server 不存在')
+  if (current === null) throw AppError.notFound(appMsg('app.m004'))
   if (!canEditMcpServer(current, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以修改它')
+    throw AppError.forbidden(appMsg('app.m178'))
   }
 
   /** 库里那份模板的**可用化**版本（jsonb 里可能混着坏条目，见 `normalizeCredentialSchema`） */
@@ -626,19 +624,18 @@ export async function removeMcpServer(id: string, viewer: McpViewer): Promise<Re
     where: { id },
     select: { id: true, name: true, createdBy: true },
   })
-  if (target === null) throw AppError.notFound('MCP server 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m004'))
   // ⚠️ 顺序：404 → **403** → 409。403 必须排在 409 前面（见 doc：不能让人靠"绑定数"这句话
   //    探到信息），也必须排在删除动作前面（否则就是"删完才发现没权限"）。
   if (!canEditMcpServer(target, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以删除它')
+    throw AppError.forbidden(appMsg('app.m179'))
   }
 
   const boundAgents = await db.agentComponent.count({
     where: { componentType: 'MCP', refId: id },
   })
   if (boundAgents > 0) {
-    throw AppError.conflict(
-      `该 MCP server 正被 ${boundAgents} 个智能体绑定，无法删除。请先在那些智能体里解绑`,
+    throw AppError.conflict(appMsg('app.m180', { p0: boundAgents }),
     )
   }
 
@@ -646,7 +643,7 @@ export async function removeMcpServer(id: string, viewer: McpViewer): Promise<Re
     await db.mcpServer.delete({ where: { id } })
   } catch (error) {
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2025') {
-      throw AppError.notFound('MCP server 不存在')
+      throw AppError.notFound(appMsg('app.m004'))
     }
     throw error
   }
@@ -674,19 +671,19 @@ export async function transferMcpServer(
 ): Promise<McpServerItem> {
   const db = getPrisma()
   const target = await db.mcpServer.findUnique({ where: { id }, select: MCP_SERVER_SELECT })
-  if (target === null) throw AppError.notFound('MCP server 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m004'))
   if (!canEditMcpServer(target, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.forbidden('只有该 MCP server 的注册者或管理员可以转移它')
+    throw AppError.forbidden(appMsg('app.m181'))
   }
   if (toUserId === target.createdBy) {
-    throw AppError.validation('接收人已经是该 MCP server 的所属人，无需转移')
+    throw AppError.validation(appMsg('app.m182'))
   }
   const newOwner = await db.user.findUnique({
     where: { id: toUserId },
     select: { id: true, status: true },
   })
   if (newOwner === null || newOwner.status !== 'ACTIVE') {
-    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+    throw AppError.validation(appMsg('app.m011'))
   }
   const updated = await db.mcpServer.update({
     where: { id },
@@ -739,14 +736,14 @@ export async function testMcpServer(id: string, viewer: McpViewer): Promise<McpS
       visibility: true,
     },
   })
-  if (target === null) throw AppError.notFound('MCP server 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m004'))
   // P1-13：私有 server 对他人 **404**（"测试/工具列表"是"用"，受可见性约束）
   if (!canViewAsset({ ownerId: target.createdBy, visibility: target.visibility }, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.notFound('MCP server 不存在')
+    throw AppError.notFound(appMsg('app.m004'))
   }
   // 2026-10-16 修订：连通测试只有所属人或 ADMIN 能发起（先 404 再 403 —— 见文件头）
   if (!canEditMcpServer({ createdBy: target.createdBy }, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.forbidden('只有该 server 的所属人或管理员可以测试连通')
+    throw AppError.forbidden(appMsg('app.m183'))
   }
 
   const { test } = await refreshServerTools(target)
@@ -812,10 +809,10 @@ export async function getMcpServerTools(
       toolCache: true,
     },
   })
-  if (row === null) throw AppError.notFound('MCP server 不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m004'))
   // P1-13：私有 server 对他人 **404**
   if (!canViewAsset({ ownerId: row.createdBy, visibility: row.visibility }, { id: viewer.userId, role: viewer.role })) {
-    throw AppError.notFound('MCP server 不存在')
+    throw AppError.notFound(appMsg('app.m004'))
   }
 
   /** 上一次**成功**拉到的缓存（库里那份解析不了时按"没有"处理，并留一条 warn） */
@@ -842,7 +839,7 @@ export async function getMcpServerTools(
     }
     // 出口之二：**缓存也空** ⇒ 拿 `{tools:[]}` 冒充"这个 server 没有工具"是一句**假话**，
     // 用户会去上游找一个其实不存在的配置问题 ⇒ 如实报"给不出工具列表"
-    throw AppError.upstreamError(`无法获取 MCP server 的工具列表：${row.name}。${test.error}`)
+    throw AppError.upstreamError(appMsg('app.m184', { p0: row.name, p1: test.error }))
   }
 
   // 成功：⚠️ 从**落库后的行**把值读回来（而不是直接用 `test.tools`）—— 顺带验了"写得进、读得出"。
@@ -851,7 +848,7 @@ export async function getMcpServerTools(
   if (fresh === null) {
     // 刚写进去的值读不出来 ⇒ 驱动或契约出了问题（不是用户输入问题 ⇒ 500，且消息要可上报）
     getLogger().error({ mcpServerId: id }, '刷新后写入的 tool_cache 无法解析（驱动或契约异常）')
-    throw AppError.internal('工具列表已刷新但读不回缓存，请重试；若持续出现请上报')
+    throw AppError.internal(appMsg('app.m185'))
   }
   return { tools: fresh.tools, fetchedAt: fresh.fetchedAt, cached: false }
 }

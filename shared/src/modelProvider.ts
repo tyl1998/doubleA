@@ -17,7 +17,10 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 import { offsetPageOf } from './envelope.js'
+import type { MessageKey } from './i18n/index.js'
 
 // ───────────────────────────── 取值域 ─────────────────────────────
 
@@ -35,6 +38,12 @@ export type ModelType = (typeof MODEL_TYPES)[number]
 export const MODEL_TYPE_LABELS: Readonly<Record<ModelType, string>> = {
   CHAT: '对话',
   EMBEDDING: '向量',
+}
+
+/** 类型 → i18n key（P1-23：前端据此取译文；中文那份 {@link MODEL_TYPE_LABELS} **保留**给后端） */
+export const MODEL_TYPE_KEY: Readonly<Record<ModelType, MessageKey>> = {
+  CHAT: 'label.modelType.CHAT',
+  EMBEDDING: 'label.modelType.EMBEDDING',
 }
 
 // ───────────────────────── 上游协议（P0-1-37） ─────────────────────────
@@ -63,6 +72,13 @@ export const UPSTREAM_PROTOCOL_LABELS: Readonly<Record<UpstreamProtocol, string>
   ANTHROPIC_MESSAGES: 'Anthropic Messages',
 }
 
+/** 协议 → i18n key（P1-23；中文那份 {@link UPSTREAM_PROTOCOL_LABELS} **保留**给后端日志/错误消息） */
+export const UPSTREAM_PROTOCOL_KEY: Readonly<Record<UpstreamProtocol, MessageKey>> = {
+  OPENAI_COMPAT: 'label.upstreamProtocol.OPENAI_COMPAT',
+  OPENAI_RESPONSES: 'label.upstreamProtocol.OPENAI_RESPONSES',
+  ANTHROPIC_MESSAGES: 'label.upstreamProtocol.ANTHROPIC_MESSAGES',
+}
+
 /**
  * 每个协议该往 `baseUrl` 里填什么。
  *
@@ -74,6 +90,13 @@ export const UPSTREAM_PROTOCOL_BASE_URL_HINTS: Readonly<Record<UpstreamProtocol,
   OPENAI_COMPAT: '如 https://api.openai.com/v1 —— 填到版本段为止（后端会拼 /chat/completions）',
   OPENAI_RESPONSES: '如 https://api.openai.com/v1 —— 填到版本段为止（后端会拼 /responses）',
   ANTHROPIC_MESSAGES: '如 https://api.anthropic.com/v1 —— 填到版本段为止（后端会拼 /messages）',
+}
+
+/** 协议 baseUrl 提示 → i18n key（P1-23；中文那份 {@link UPSTREAM_PROTOCOL_BASE_URL_HINTS} 保留给其它中文消费方） */
+export const UPSTREAM_PROTOCOL_BASE_URL_HINT_KEY: Readonly<Record<UpstreamProtocol, MessageKey>> = {
+  OPENAI_COMPAT: 'label.protocolBaseUrlHint.OPENAI_COMPAT',
+  OPENAI_RESPONSES: 'label.protocolBaseUrlHint.OPENAI_RESPONSES',
+  ANTHROPIC_MESSAGES: 'label.protocolBaseUrlHint.ANTHROPIC_MESSAGES',
 }
 
 /**
@@ -168,6 +191,12 @@ export const PROVIDER_CREDENTIAL_MODE_LABELS: Readonly<Record<ProviderCredential
   PER_USER: '各自 Key',
 }
 
+/** 凭据模式 → i18n key（P1-23；中文那份 {@link PROVIDER_CREDENTIAL_MODE_LABELS} 保留给其它中文消费方） */
+export const PROVIDER_CREDENTIAL_MODE_KEY: Readonly<Record<ProviderCredentialMode, MessageKey>> = {
+  SHARED: 'label.credentialMode.SHARED',
+  PER_USER: 'label.credentialMode.PER_USER',
+}
+
 /**
  * Provider 的**统一输出形态**（列表 / 建 / 改三个响应共用）。
  *
@@ -255,8 +284,13 @@ export type ModelProviderItem = z.infer<typeof modelProviderItemSchema>
 
 /** 列表分页参数（`02` §四：除消息外的列表用 offset/limit，默认 20） */
 export const listModelProvidersQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListModelProvidersQuery = z.infer<typeof listModelProvidersQuerySchema>
 
@@ -278,12 +312,15 @@ export type ModelProviderListResult = z.infer<typeof modelProviderListResultSche
  * 允许任意 scheme 等于把 URL 解析与协议选择交给配置者（SSRF 面变大）。
  */
 export const providerBaseUrlSchema = z
-  .string({ required_error: '请输入 baseUrl' })
+  .string({ required_error: validationMessage('validation.modelProvider.baseUrlRequired') })
   .trim()
-  .min(1, '请输入 baseUrl')
+  .min(1, validationMessage('validation.modelProvider.baseUrlRequired'))
   // 2048 是常见网关/浏览器的 URL 上限量级，超出基本可以断定填错了
-  .max(2048, 'baseUrl 最多 2048 个字符')
-  .refine((value) => /^https?:\/\//i.test(value), 'baseUrl 必须以 http:// 或 https:// 开头')
+  .max(2048, validationMessage('validation.modelProvider.baseUrlTooLong', { max: 2048 }))
+  .refine(
+    (value) => /^https?:\/\//i.test(value),
+    validationMessage('validation.modelProvider.baseUrlScheme'),
+  )
   .refine((value) => {
     try {
       // `new URL` 比正则严格得多（能挡掉 `http://`、`https://a b`、`http://x:abc` 等）
@@ -292,7 +329,7 @@ export const providerBaseUrlSchema = z
     } catch {
       return false
     }
-  }, 'baseUrl 不是合法的 URL')
+  }, validationMessage('validation.modelProvider.baseUrlInvalid'))
   .transform((value) => value.replace(/\/+$/, ''))
 
 /**
@@ -303,19 +340,19 @@ export const providerBaseUrlSchema = z
  * 传空串会得到 400 + `data.fields`，文案直接告诉调用方该怎么做。
  */
 export const providerApiKeySchema = z
-  .string({ required_error: 'apiKey 不能为空（要清空请传 null，不动则不传该字段）' })
+  .string({ required_error: validationMessage('validation.modelProvider.apiKeyRequired') })
   .trim()
-  .min(1, 'apiKey 不能为空字符串（要清空请传 null，不动则不传该字段）')
+  .min(1, validationMessage('validation.modelProvider.apiKeyEmpty'))
   // 512 远超任何厂商的 key 长度（常见 40~200）；超长基本是粘错了东西
-  .max(512, 'apiKey 最多 512 个字符')
+  .max(512, validationMessage('validation.modelProvider.apiKeyTooLong', { max: 512 }))
 
 /** 建 Provider 请求体 */
 export const createModelProviderBodySchema = z.object({
   name: z
-    .string({ required_error: '请输入名称' })
+    .string({ required_error: validationMessage('validation.modelProvider.nameRequired') })
     .trim()
-    .min(1, '请输入名称')
-    .max(128, '名称最多 128 个字符'),
+    .min(1, validationMessage('validation.modelProvider.nameRequired'))
+    .max(128, validationMessage('validation.modelProvider.nameTooLong', { max: 128 })),
   baseUrl: providerBaseUrlSchema,
   /**
    * 自定义 URL（非规范第三方端点）。缺省即 `false`（= 既有拼接行为）。
@@ -337,7 +374,11 @@ export const createModelProviderBodySchema = z.object({
    */
   protocol: z
     .enum(UPSTREAM_PROTOCOLS, {
-      errorMap: () => ({ message: `protocol 只能是 ${UPSTREAM_PROTOCOLS.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.modelProvider.protocolAllowed', {
+          allowed: UPSTREAM_PROTOCOLS.join('/'),
+        }),
+      }),
     })
     .optional(),
   enabled: z.boolean().optional(),
@@ -347,7 +388,11 @@ export const createModelProviderBodySchema = z.object({
    */
   credentialMode: z
     .enum(PROVIDER_CREDENTIAL_MODES, {
-      errorMap: () => ({ message: `credentialMode 只能是 ${PROVIDER_CREDENTIAL_MODES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.modelProvider.credentialModeAllowed', {
+          allowed: PROVIDER_CREDENTIAL_MODES.join('/'),
+        }),
+      }),
     })
     .optional(),
   /** 可缺省（先建 Provider 后配 Key 是正常流程）。`null` 与缺省同义：不配置 Key */
@@ -374,7 +419,12 @@ export type CreateModelProviderBody = z.infer<typeof createModelProviderBodySche
  */
 export const updateModelProviderBodySchema = z
   .object({
-    name: z.string().trim().min(1, '名称不能为空').max(128, '名称最多 128 个字符').optional(),
+    name: z
+      .string()
+      .trim()
+      .min(1, validationMessage('validation.modelProvider.nameEmpty'))
+      .max(128, validationMessage('validation.modelProvider.nameTooLong', { max: 128 }))
+      .optional(),
     baseUrl: providerBaseUrlSchema.optional(),
     /** 自定义 URL 开关（两态：不带 = 不动；给值 = 改成它）。不加 `.default()`，理由同 `protocol` */
     customUrl: z.boolean().optional(),
@@ -390,7 +440,11 @@ export const updateModelProviderBodySchema = z
      */
     protocol: z
       .enum(UPSTREAM_PROTOCOLS, {
-        errorMap: () => ({ message: `protocol 只能是 ${UPSTREAM_PROTOCOLS.join('/')}` }),
+        errorMap: () => ({
+        message: validationMessage('validation.modelProvider.protocolAllowed', {
+          allowed: UPSTREAM_PROTOCOLS.join('/'),
+        }),
+      }),
       })
       .optional(),
     enabled: z.boolean().optional(),
@@ -400,7 +454,11 @@ export const updateModelProviderBodySchema = z
      */
     credentialMode: z
       .enum(PROVIDER_CREDENTIAL_MODES, {
-        errorMap: () => ({ message: `credentialMode 只能是 ${PROVIDER_CREDENTIAL_MODES.join('/')}` }),
+        errorMap: () => ({
+        message: validationMessage('validation.modelProvider.credentialModeAllowed', {
+          allowed: PROVIDER_CREDENTIAL_MODES.join('/'),
+        }),
+      }),
       })
       .optional(),
     /**
@@ -420,13 +478,13 @@ export const updateModelProviderBodySchema = z
       // `apiKey: null`（清空）在这里也判为 true —— `null !== undefined`，正是想要的效果；
       // 只有"整个字段缺席"（undefined）才算没给。
       body.apiKey !== undefined,
-    { message: '至少要提供一个要修改的字段' },
+    { message: validationMessage('validation.common.atLeastOneField') },
   )
 export type UpdateModelProviderBody = z.infer<typeof updateModelProviderBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const modelProviderIdParamsSchema = z.object({
-  id: z.string().uuid('Provider ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.modelProvider.idNotUuid')),
 })
 export type ModelProviderIdParams = z.infer<typeof modelProviderIdParamsSchema>
 
@@ -506,7 +564,8 @@ export const providerBoundModelSchema = z.object({
   label: z.string(),
   /** 上游型号名 */
   modelName: z.string(),
-  /** 绑定这个模型的**在线**智能体数（可为 0 —— 该模型可能只被知识库绑定） */
+  /** 绑定这个模型的**在线**智能体数（可为 0 —— 该模型可能只被知识库绑定）
+   *  口径 = 默认模型 ∪ 池成员（与 `ModelItem.agentCount` / `removeModel` 守卫同口径，见 `shared/src/model.ts`） */
   agentCount: z.number().int().min(0),
   /**
    * 把该模型当**向量模型**用的知识库数（`knowledge_bases.embedding_model_id`）。
@@ -535,7 +594,7 @@ export type ProviderBoundModel = z.infer<typeof providerBoundModelSchema>
 export const providerBoundModelsResultSchema = z.object({
   providerId: z.string(),
   models: z.array(providerBoundModelSchema),
-  /** 受影响的在线智能体总数（去重） */
+  /** 受影响的在线智能体总数（去重：一个智能体在同一 Provider 下挂多个模型也只算一次） */
   agentTotal: z.number().int().min(0),
   /** 受影响的（向量模型或图片描述模型被清空的）知识库总数（去重） */
   knowledgeBaseTotal: z.number().int().min(0),
@@ -556,7 +615,7 @@ export const removeModelProviderResultSchema = z.object({
   name: z.string(),
   /** 连带删除的模型数 */
   deletedModels: z.number().int().min(0),
-  /** 被自动解绑（`model_id` 置空）的在线智能体数 */
+  /** 被自动解绑的**在线**智能体数（`agents.model_id` 置空 + 其 `agent_models` 池成员行级联删，去重一次） */
   unboundAgents: z.number().int().min(0),
   /** 向量 / 图片描述模型被清空（`embedding_model_id` 或 `caption_model_id` 置空）的知识库数 */
   clearedKnowledgeBases: z.number().int().min(0),

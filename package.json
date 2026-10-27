@@ -30,6 +30,7 @@
     "build:backend": "pnpm --filter @doubulea/backend build",
     "build:frontend": "pnpm --filter @doubulea/frontend build",
     "config:check": "pnpm --filter @doubulea/backend config:check",
+    "verify:i18n": "pnpm --filter @doubulea/frontend verify:i18n",
     "verify:chat-sse": "pnpm --filter @doubulea/frontend verify:chat-sse",
     "verify:chat-home": "pnpm --filter @doubulea/frontend verify:chat-home",
     "verify:knowledge-ui": "pnpm --filter @doubulea/frontend verify:knowledge-ui",

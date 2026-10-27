@@ -19,13 +19,14 @@ import type { NodeBootstrapJob, NodeBootstrapTaskStep } from '@doubulea/shared'
 
 import {
   activeStepKey,
-  JOB_STATUS_LABELS,
+  JOB_STATUS_LABEL_KEY,
   jobHeadline,
   jobProgressStatus,
   jobSummary,
   stepDurationText,
   stepIcon,
 } from './nodeBootstrapModel.js'
+import { useT } from '../../app/i18n.js'
 
 /** 每 500ms 重渲染一次，让"执行中"那行的耗时时走（只在有步骤在跑时开） */
 function useTicker(enabled: boolean): number {
@@ -47,6 +48,7 @@ function StepIcon({ state }: { state: NodeBootstrapTaskStep['state'] }) {
 }
 
 function StepRow({ step, active, now }: { step: NodeBootstrapTaskStep; active: boolean; now: number }) {
+  const { t } = useT()
   const duration = stepDurationText(step, now)
   const running = step.state === 'running'
   return (
@@ -56,11 +58,11 @@ function StepRow({ step, active, now }: { step: NodeBootstrapTaskStep; active: b
         <span className="node-step__label" title={step.label}>
           {step.label}
         </span>
-        {running && <span className="node-step__badge">执行中</span>}
-        {step.state === 'skipped' && <span className="node-step__badge node-step__badge--muted">已就绪，跳过</span>}
+        {running && <span className="node-step__badge">{t('bootstrap.executing')}</span>}
+        {step.state === 'skipped' && <span className="node-step__badge node-step__badge--muted">{t('bootstrap.skippedReady')}</span>}
         {duration !== null && step.state !== 'pending' && (
           <span className="node-step__time">
-            {running ? `已 ${duration}` : duration}
+            {duration}
           </span>
         )}
       </div>
@@ -89,6 +91,7 @@ export function NodeBootstrapProgressPanel({
   /** 表格展开态里空间有限：收起"跳过"的行 */
   compact?: boolean
 }) {
+  const { t, locale } = useT()
   const running = job.status === 'running'
   const now = useTicker(running)
   const active = activeStepKey(job)
@@ -99,15 +102,15 @@ export function NodeBootstrapProgressPanel({
     <div className="node-job" data-testid={`node-job-${job.jobId}`}>
       <div className="node-job__head">
         <Tag color={running ? 'processing' : jobProgressStatus(job) === 'success' ? 'green' : 'orange'}>
-          {JOB_STATUS_LABELS[job.status]}
+          {t(JOB_STATUS_LABEL_KEY[job.status])}
         </Tag>
-        <Typography.Text strong>{jobHeadline(job)}</Typography.Text>
+        <Typography.Text strong>{jobHeadline(job, locale)}</Typography.Text>
         <span className="node-job__meta">
-          {job.completed}/{job.total} 步
-          {summary.failed > 0 ? ` · ${String(summary.failed)} 项失败` : ''}
-          {!running && summary.skipped > 0 ? ` · ${String(summary.skipped)} 项本来就绪` : ''}
+          {t('bootstrap.steps', { done: job.completed, total: job.total })}
+          {summary.failed > 0 ? t('bootstrap.failedSteps', { count: summary.failed }) : ''}
+          {!running && summary.skipped > 0 ? t('bootstrap.skippedSteps', { count: summary.skipped }) : ''}
         </span>
-        <Tooltip title="任务由后端执行并记录在实例上：换页面 / 换实例查看都能接着看到进度">
+        <Tooltip title={t('bootstrap.tooltip')}>
           <span className="node-job__meta node-job__meta--dim">{job.jobId}</span>
         </Tooltip>
       </div>
@@ -132,9 +135,9 @@ export function NodeBootstrapProgressPanel({
             label: (
               <Space size={6}>
                 <CaretRightOutlined />
-                <span>步骤详情</span>
+                <span>{t('bootstrap.stepDetail')}</span>
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  （{compact ? '隐藏已就绪项' : '执行顺序：检查 → 修复 → 复检'}）
+                  （{compact ? t('bootstrap.hideReady') : t('bootstrap.order')}）
                 </Typography.Text>
               </Space>
             ),
@@ -149,22 +152,22 @@ export function NodeBootstrapProgressPanel({
         ]}
       />
 
-      {running && (
-        <div className="node-job__hint">
-          可以离开本页：初始化在实例上继续执行，回来时会自动显示最新进度。
-        </div>
-      )}
+      {running && <div className="node-job__hint">{t('bootstrap.leaveNote')}</div>}
 
       {!running && job.error !== undefined && job.error !== '' && (
-        <Alert style={{ marginTop: 8 }} type="error" showIcon message="初始化失败" description={job.error} />
+        <Alert style={{ marginTop: 8 }} type="error" showIcon message={t('bootstrap.failed')} description={job.error} />
       )}
 
       {!running && job.report !== undefined && (
         <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-          结束后复检：{job.report.ready ? '全部必需项就绪' : `仍有未就绪：${job.report.items
-            .filter((item) => item.required && !item.ok)
-            .map((item) => item.label)
-            .join('、')}`}
+          {job.report.ready
+            ? t('bootstrap.afterCheckReady')
+            : t('bootstrap.afterCheckNotReady', {
+                items: job.report.items
+                  .filter((item) => item.required && !item.ok)
+                  .map((item) => item.label)
+                  .join(t('tasks.form.cronNextSeparator')),
+              })}
         </Typography.Text>
       )}
     </div>

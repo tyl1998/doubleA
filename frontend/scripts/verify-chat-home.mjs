@@ -159,7 +159,7 @@ const conv = (patch) => ({
 })
 
 it('B1 视图带上智能体快照（跨智能体列表靠它一屏分清"这条是谁的"）', () => {
-  const view = conversationItemView(conv({ agentName: '周报生成', agentType: 'TASK_AGENT' }), NOW, new Set())
+  const view = conversationItemView(conv({ agentName: '周报生成', agentType: 'TASK_AGENT' }), NOW, new Set(), 'zh')
   eq(view.agentId, 'agent-1', 'agentId 快照')
   eq(view.agentName, '周报生成', 'agentName 快照（Agent 软删后仍有）')
   eq(view.agentType, 'TASK_AGENT', 'agentType 快照')
@@ -171,7 +171,7 @@ it('B2 分组契约不变：拼接各组 = 入参原序（一列都不动）', (
     conv({ id: 'today', lastMessageAt: '2026-10-12T12:00:00', agentId: 'a3' }),
     conv({ id: 'earlier', lastMessageAt: '2026-10-10T11:02:00', agentId: 'a4' }),
   ]
-  const groups = groupConversationViews(list, NOW, new Set(['today']))
+  const groups = groupConversationViews(list, NOW, new Set(['today']), 'zh')
   const flat = groups.flatMap((group) => group.items.map((item) => item.id))
   eq(flat.join('|'), list.map((item) => item.id).join('|'), '拼接顺序 = 入参顺序')
   eq(groups[0].label, '今天', '第一组是今天')
@@ -369,7 +369,9 @@ it('F8 新会话态开 Code 模式：第三列 = 空工作区占位（不回落�
   const panel = read('../src/features/chat/WorkspacePanel.tsx')
   includes(panel, 'export function WorkspacePanelPlaceholder', '导出 WorkspacePanelPlaceholder')
   includes(panel, 'workspace-panel-placeholder', '占位有稳定 testid')
-  includes(panel, '发送第一条消息后创建工作区', '空态说明指向"建会话后才创建工作区"')
+  // P1-23：空态文案已外置为 i18n key（原文案在字典里）；断言改为"走 key 取值"，
+  // 中文形态本身由 `verify-i18n` 的字典比对守着（这里不抄第二份真相）。
+  includes(panel, "t('workspace.placeholderEmpty')", '空态说明走 i18n key（指向"建会话后才创建工作区"）')
 })
 
 it('F9 非 Code 的产物面板可收起 / 展开（第三列开关）', () => {
@@ -388,23 +390,26 @@ it('F9 非 Code 的产物面板可收起 / 展开（第三列开关）', () => {
   includes(settings, 'FolderOpenOutlined', '收起 / 展开用图标按钮')
 })
 
-// ───────────────────────────── G 侧边栏两层（2026-10-13） ─────────────────────────────
+// ───────────────────────────── G 侧边栏两层（2026-10-26 修订） ─────────────────────────────
 
-console.log(`\n${c.b}── G 侧边栏两层（平台功能 35% / 会话 65%）──${c.x}`)
+console.log(`\n${c.b}── G 侧边栏两层（平台功能固定高 / 会话自动占满）──${c.x}`)
 
-it('G1 ConvRail 分两层：上层平台功能、下层会话；旧的「管理」popover 已删', () => {
+it('G1 ConvRail 分两层：上层平台功能、下层会话；旧的「管理」就地手风琴已删', () => {
   const convRail = read('../src/features/chat/ConvRail.tsx')
   includes(convRail, 'convrail__nav', '上层平台功能')
   includes(convRail, 'convrail__convos', '下层会话')
-  notIncludes(convRail, 'Popover', '不再用底部「管理」popover')
   notIncludes(convRail, 'rail-menu', '旧的 rail-menu 已删')
+  // 2026-10-26：管理**不再是就地手风琴** —— 展开态改由浮层持有（`manageOpen`），子项不再塞回本栏
+  notIncludes(convRail, 'convrail__nav-item--sub', '不再有"展开后就地插入"的子项类')
 })
 
-it('G2 上层六个直达入口 + 「管理」就地展开剩余；入口顺序 = 产品口径', () => {
+it('G2 上层五个直达入口（凭据收进管理）+ 「管理 ▸」向右浮层展开', () => {
   const convRail = read('../src/features/chat/ConvRail.tsx')
-  includes(convRail, "['AG', 'KB', 'MC', 'TK', 'CR', 'AH']", '顺序：智能体/知识库/MCP/任务/我的凭据/会话产物')
-  includes(convRail, 'manageExpanded', '「管理」就地展开')
-  includes(convRail, 'manageItems', '剩余入口（用量统计 / 用户管理 / 模型池）')
+  includes(convRail, "['AG', 'KB', 'MC', 'TK', 'AH']", '直达入口：智能体/知识库/MCP/任务/会话产物')
+  notIncludes(convRail, "'CR', 'AH'", '我的凭据不再是一级直达入口')
+  includes(convRail, 'manageOpen', '「管理」由浮层开关持有')
+  includes(convRail, "placement=\"rightTop\"", '「管理」向右展开（不是就地）')
+  includes(convRail, 'manageItems', '剩余入口（用量统计 / 我的凭据 / 用户管理 / 模型池 / 出网 / 沙箱实例）')
 })
 
 it('G3 会话分组（今天 / 更早）标题可点击收缩', () => {
@@ -414,10 +419,22 @@ it('G3 会话分组（今天 / 更早）标题可点击收缩', () => {
   includes(convRail, 'toggleGroup', '点标题切换收缩')
 })
 
-it('G4 两层高度比 35 / 65（flex-grow）', () => {
+it('G4 平台功能按内容固定高（不出滑块）；会话为唯一伸缩轴', () => {
   const css = read('../src/styles/app.css')
-  includes(css, 'flex: 35 35 0;', '平台功能约 35%')
-  includes(css, 'flex: 65 65 0;', '会话约 65%')
+  // 上层固定：`flex: 0 0 auto` 且**不再**有滚动（用户口径"顶层功能区固定死，不要有滑块"）
+  includes(css, '.convrail__nav {\n  flex: 0 0 auto;', '平台功能固定高')
+  includes(css, '.convrail__convos {\n  flex: 1 1 auto;', '会话占满剩余高度')
+  notIncludes(css, 'flex: 35 35 0;', '旧的 35% 伸缩比已删')
+})
+
+it('G5 会话历史：卡片样式切换 + 滑块仅 hover 显形', () => {
+  const convRail = read('../src/features/chat/ConvRail.tsx')
+  includes(convRail, 'toggleRailCardMode', '有"完整 / 省略"卡片样式切换')
+  includes(convRail, 'convrail__card-toggle', '切换按钮有稳定类名')
+  includes(convRail, "data-mode={cardMode}", '行按卡片样式分叉')
+  const css = read('../src/styles/app.css')
+  includes(css, '.convrail__convos-body:hover { scrollbar-color: var(--rule-strong) transparent; }', '滑块 hover 才显形')
+  includes(css, ".conv[data-mode='compact']", '省略模式样式存在')
 })
 
 // ───────────────────────────── H 新建对话模型 Key 预检（2026-10-16） ─────────────────────────────

@@ -17,6 +17,7 @@ import { useEffect, useState } from 'react'
 import type { MemoryNotice } from '@doubulea/shared'
 
 import { fetchMemoryNotices, useDeleteMemory, useMemoryNoticeAction } from '../../api/memory.js'
+import { useT } from '../../app/i18n.js'
 import { memoryKindLabel } from '../../pages/tasks/memoryModel.js'
 
 /**
@@ -36,6 +37,7 @@ export function MemoryNoticeStack({
   refreshKey: number
 }) {
   const [notices, setNotices] = useState<MemoryNotice[]>([])
+  const { t, locale } = useT()
   const action = useMemoryNoticeAction(conversationId)
   const removeMemory = useDeleteMemory()
 
@@ -113,8 +115,10 @@ export function MemoryNoticeStack({
         // 提示正文前缀（按提示类型/作用域）—— 与正文拼成一句话，供截断与悬浮完整展示共用
         const prefix =
           notice.kind === 'AUTO'
-            ? `已记入${notice.memoryScope === 'AGENT' ? '该 Agent 记忆' : '全局记忆'}：`
-            : '要记住这条吗？'
+            ? notice.memoryScope === 'AGENT'
+              ? t('memory.noticeAutoAgentPrefix')
+              : t('memory.noticeAutoGlobalPrefix')
+            : t('memory.noticeSuggestPrefix')
         const fullText = `${prefix}${notice.text}`
         return (
           <div
@@ -123,7 +127,7 @@ export function MemoryNoticeStack({
             data-testid="memory-notice"
             style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}
           >
-            <Tag>{memoryKindLabel(notice.memoryKind)}</Tag>
+            <Tag>{memoryKindLabel(notice.memoryKind, locale)}</Tag>
             {/* 正文**只占一行、超出省略**（否则一条长记忆会把右侧的动作按钮挤出可视区），
                 悬浮约 1s 用 tooltip 展示完整内容。 */}
             <Tooltip title={fullText} mouseEnterDelay={1} placement="topLeft">
@@ -142,15 +146,15 @@ export function MemoryNoticeStack({
             </Tooltip>
             {notice.kind === 'AUTO' ? (
               <Button type="link" size="small" style={{ padding: 0 }} onClick={() => reject(notice)}>
-                撤销
+                {t('memory.noticeUndo')}
               </Button>
             ) : (
               <>
                 <Button type="primary" size="small" onClick={() => accept(notice)}>
-                  记住
+                  {t('memory.noticeAccept')}
                 </Button>
                 <Button size="small" onClick={() => reject(notice)}>
-                  忽略
+                  {t('memory.noticeReject')}
                 </Button>
               </>
             )}
@@ -158,8 +162,8 @@ export function MemoryNoticeStack({
             <Button
               type="text"
               size="small"
-              aria-label="关闭提示"
-              title="关闭提示"
+              aria-label={t('memory.noticeClose')}
+              title={t('memory.noticeClose')}
               style={{ padding: 0, flexShrink: 0 }}
               onClick={() => dismiss(notice)}
             >

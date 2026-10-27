@@ -35,7 +35,7 @@
  * （`verify:app`，可进 CI）直接断言，这也正是 P0-1-18 把分块做成纯函数的同一条理由。
  */
 
-import {
+import { appMsg,
   AppError,
   FULLTEXT_PATH_SKIPPED_TOO_SHORT,
   FULLTEXT_QUERY_MAX_CHARS,
@@ -484,7 +484,7 @@ export async function searchKnowledgeBase(
     where: { id: input.kbId },
     select: { id: true, embeddingModel: true, embeddingModelId: true, embeddingDim: true, retrievalConfig: true, createdBy: true },
   })
-  if (kb === null) throw AppError.notFound('知识库不存在')
+  if (kb === null) throw AppError.notFound(appMsg('app.m003'))
 
   // 生效配置：库里的 jsonb 补全默认值（唯一入口），再叠本次请求的覆盖
   const kbConfig: RetrievalConfig = normalizeRetrievalConfig(kb.retrievalConfig)
@@ -507,7 +507,7 @@ export async function searchKnowledgeBase(
       if (vector === undefined) {
         // provider 的契约保证"条数相符"，走到这里说明契约被破坏了：宁可整次失败，
         // 也不要拿一个 undefined 去拼 SQL（那会变成 SQL 语法错误，排查方向完全不同）
-        throw AppError.internal('embedding 未返回 query 向量（provider 契约被破坏），本次检索已中止')
+        throw AppError.internal(appMsg('app.m218'))
       }
       const literal = `[${vector.join(',')}]`
       const rows = await vectorSearch(kbIds, literal, kb.embeddingDim ?? vector.length, candidatePool, kbConfig.score, input.docIds)
@@ -516,7 +516,7 @@ export async function searchKnowledgeBase(
     } else if (mode === 'VECTOR') {
       // VECTOR 模式没有可退的路：返回空数组会被读成"库里没有相关内容"（一句假话）。
       throw resolved.kind === 'MODEL_CHANGED'
-        ? AppError.conflict(`${resolved.message}；本次 mode=VECTOR 无法降级为全文检索`)
+        ? AppError.conflict(appMsg('app.m219', { p0: resolved.message }))
         : AppError.internal(resolved.message)
     } else {
       vectorPathSkipped = true

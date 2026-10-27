@@ -21,6 +21,9 @@ import { Button, Tag } from 'antd'
 import { memo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
+import type { MessageKey } from '@doubulea/shared'
+
+import { useT } from '../../app/i18n.js'
 import {
   canConfigureCredential,
   errorCodeLabel,
@@ -29,22 +32,22 @@ import {
 } from './messageModel.js'
 import { credentialsPath } from '../../app/paths.js'
 
-/** 状态 → 中文标签与刻度类（唯一一份映射，别在 JSX 里再判一次 status） */
-const STATUS_PRESENTATION: Record<ToolCallView['status'], { label: string; className: string }> = {
-  RUNNING: { label: '运行中', className: 'tool--run' },
-  SUCCESS: { label: '成功', className: 'tool--ok' },
-  ERROR: { label: '失败', className: 'tool--fail' },
+/** 状态 → 标签 key 与刻度类（唯一一份映射，别在 JSX 里再判一次 status） */
+const STATUS_PRESENTATION: Record<ToolCallView['status'], { labelKey: MessageKey; className: string }> = {
+  RUNNING: { labelKey: 'toolCard.statusRunning', className: 'tool--run' },
+  SUCCESS: { labelKey: 'toolCard.statusSuccess', className: 'tool--ok' },
+  ERROR: { labelKey: 'toolCard.statusError', className: 'tool--fail' },
 }
 
 /**
- * 工具来源 → 卡片上的中文名（唯一一份映射）。
+ * 工具来源 → 卡片上名字的 key（唯一一份映射）。
  * `BUILTIN` = 平台内置工具（当前只有「知识库检索」），它没有 MCP server，也没有凭据可配
  * ⇒ 卡片不会出现「去配置凭据」（判据在 `messageModel#canConfigureCredential`：缺 `serverId` 即不提供）。
  */
-const KIND_LABEL: Record<ToolCallView['kind'], string> = {
-  MCP: 'MCP 工具',
-  SANDBOX: '沙箱工具',
-  BUILTIN: '内置工具',
+const KIND_LABEL_KEY: Record<ToolCallView['kind'], MessageKey> = {
+  MCP: 'toolCard.kindMcp',
+  SANDBOX: 'toolCard.kindSandbox',
+  BUILTIN: 'toolCard.kindBuiltin',
 }
 
 export interface ToolCardProps {
@@ -57,6 +60,7 @@ export interface ToolCardProps {
  * 展开/收起状态与滚动位置都不会被无谓刷新。
  */
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
+  const { t, locale } = useT()
   const presentation = STATUS_PRESENTATION[tool.status]
   // 运行中的卡默认展开（用户此刻最想知道它在干什么）；终态默认折叠，把空间还给正文
   const [userChoice, setUserChoice] = useState<boolean | null>(null)
@@ -67,7 +71,8 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const detail = tool.output ?? tool.liveOutput
   const hasDetail = detail !== undefined && detail !== ''
   const needsCredential = canConfigureCredential(tool)
-  const hint = toolErrorHint(tool.errorCode)
+  const hint = toolErrorHint(tool.errorCode, locale)
+  const codeLabel = tool.errorCode === undefined ? null : errorCodeLabel(tool.errorCode)
 
   return (
     <details className={`tool ${presentation.className}`} open={open} data-testid="tool-card">
@@ -85,11 +90,11 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
           {tool.status === 'RUNNING' ? (
             <span className="row" style={{ gap: 'var(--sp-2)' }}>
               <span className="led led--run" />
-              <span className="ratio">运行中</span>
+              <span className="ratio">{t('toolCard.statusRunning')}</span>
             </span>
           ) : (
             <Tag className={tool.status === 'SUCCESS' ? 'tag--ok' : 'tag--danger'}>
-              {presentation.label}
+              {t(presentation.labelKey)}
             </Tag>
           )}
           <span className="think__caret" aria-hidden="true">
@@ -99,21 +104,24 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
       </summary>
       <div className="tool__body">
         <p className="kicker">
-          {KIND_LABEL[tool.kind]} · 调用 ID {tool.callId}
+          {t(KIND_LABEL_KEY[tool.kind])}
+          {t('toolCard.callId', { callId: tool.callId })}
           {/* 失败原因**必须显示**（`03` §4.1 第 4 行："失败卡片显示原因"）。
               ⚠️ 错误码与 HTTP 状态码是两回事：前者是 `shared/src/errors.ts` 的取值域。
               文案取自 `errorCodeLabel`（= `shared` 那张表的**唯一**来源，
               见 `messageModel#errorCodeLabel` 的注释：卡片手上是字符串、不是 `Error` 对象）。 */}
           {tool.errorCode === undefined
             ? null
-            : ` · ${tool.errorCode}${errorCodeLabel(tool.errorCode) === null ? '' : `（${errorCodeLabel(tool.errorCode)}）`}`}
+            : codeLabel === null
+              ? t('toolCard.errorCode', { code: tool.errorCode })
+              : t('toolCard.errorCodeWithLabel', { code: tool.errorCode, label: codeLabel })}
         </p>
         {/* 完整入参（摘要之外的那一份）：事件里给的是 `inputSummary`，完整入参由
             `messageContentSchema` 的 `tool_calls.arguments` 承载、**但刻意不上屏**
             （凭据值已在 `inputSummary` 里抹除，而 `arguments` 是原样 JSON）——
             所以这里如实说明"哪里能看到更全的"，而不是拿摘要冒充完整入参。 */}
         <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-          入参摘要：{tool.inputSummary}
+          {t('toolCard.inputSummary', { summary: tool.inputSummary })}
         </p>
         {hasDetail ? (
           <div className="code-block" style={{ marginTop: 'var(--sp-3)' }}>
@@ -121,7 +129,7 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
           </div>
         ) : (
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {tool.status === 'RUNNING' ? '等待结果…' : '本次调用没有返回内容'}
+            {tool.status === 'RUNNING' ? t('toolCard.waitingOutput') : t('toolCard.noOutput')}
           </p>
         )}
 
@@ -134,7 +142,7 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
             {needsCredential && tool.serverId !== undefined ? (
               <Link to={credentialsPath(tool.serverId)}>
                 <Button size="small" type="primary">
-                  去配置凭据
+                  {t('toolCard.configureCredential')}
                 </Button>
               </Link>
             ) : null}

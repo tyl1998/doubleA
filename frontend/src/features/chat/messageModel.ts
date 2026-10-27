@@ -41,9 +41,12 @@ import {
   steerRecordSchema,
   thinkingSegmentSchema,
   toolCallRecordSchema,
+  translate,
+  type AppMessagePayload,
   type ChatAttachmentKind,
   type CitationItem,
   type ErrorCode,
+  type Locale,
   type MessageItem,
   type MessageModelSegment,
   type SteerRecord,
@@ -130,14 +133,14 @@ export function canConfigureCredential(tool: {
  * 其余一律返回 `null` ⇒ 卡片只显示服务端给的原因原文，不叠加解释。
  * 这样"多一句解释"永远是有意为之，而不是某天顺手加的。
  */
-export function toolErrorHint(errorCode: string | undefined): string | null {
+export function toolErrorHint(errorCode: string | undefined, locale: Locale): string | null {
   switch (errorCode) {
     case 'NEED_CREDENTIAL':
-      return '这台 server 需要你个人的凭据。点「去配置凭据」填一次，之后这个工具就能用了。'
+      return translate(locale, 'tool.errorNeedCredential')
     case 'UPSTREAM_TIMEOUT':
-      return 'MCP server 没有在规定时间内应答。它可能正忙或已失联，可以稍后重试。'
+      return translate(locale, 'tool.errorUpstreamTimeout')
     case 'UPSTREAM_ERROR':
-      return 'MCP server 返回了异常。它那边的配置或运行状态可能有问题。'
+      return translate(locale, 'tool.errorUpstreamError')
     default:
       return null
   }
@@ -213,7 +216,7 @@ export interface ChatMessageView {
   /** token 用量：流式来自 `done` 事件的 `usage`、历史来自消息行 `tokensIn/Out`（P1-7） */
   usage?: SseDonePayload['usage']
   /** 流内错误卡的内容（`status === 'error'` 时才有） */
-  error?: { code: string; message: string }
+  error?: { code: string; message: string; msgKey?: AppMessagePayload }
   /**
    * 本轮生命周期的**中间态**（`status` 事件；TaskAgent 与 ChatBot 都会发）。
    * 只有流式助手消息有；一旦真实内容（正文/思考/工具卡）到达就被清掉。

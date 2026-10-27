@@ -68,6 +68,7 @@ import { z } from 'zod'
 import { AGENT_TYPES } from './agent.js'
 import { cursorPageOf, offsetPageOf } from './envelope.js'
 import { ERROR_CODES } from './errors.js'
+import { validationMessage } from './i18n/validation.js'
 
 // ───────────────────────────── 取值域与判据 ─────────────────────────────
 
@@ -178,8 +179,13 @@ export type ConversationItem = z.infer<typeof conversationItemSchema>
  * —— 给一个"只看活跃"的开关，会让"Agent 被删之后我的历史去哪了"变成一个要靠猜的问题。
  */
 export const listConversationsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListConversationsQuery = z.infer<typeof listConversationsQuerySchema>
 
@@ -201,8 +207,8 @@ export type ConversationListResult = z.infer<typeof conversationListResultSchema
  */
 export const createConversationBodySchema = z.object({
   agentId: z
-    .string({ required_error: '请选择智能体' })
-    .uuid('智能体 ID 不是合法 UUID'),
+    .string({ required_error: validationMessage('validation.conversation.agentRequired') })
+    .uuid(validationMessage('validation.conversation.agentIdNotUuid')),
   /**
    * Code 模式运行时（P1-17a；可选）。不给 = 用 Prisma 默认**空串**（= 空环境）。
    * ⚠️ 只在 Code 会话有意义 —— 运行时镜像只在派活建容器时才选；非 Code 会话从不建容器。
@@ -215,7 +221,7 @@ export type CreateConversationBody = z.infer<typeof createConversationBodySchema
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const conversationIdParamsSchema = z.object({
-  id: z.string().uuid('会话 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.conversation.idNotUuid')),
 })
 export type ConversationIdParams = z.infer<typeof conversationIdParamsSchema>
 
@@ -231,12 +237,15 @@ export type ConversationIdParams = z.infer<typeof conversationIdParamsSchema>
 export const renameConversationBodySchema = z.object({
   topic: z
     .string({
-      required_error: '请输入会话标题',
-      invalid_type_error: '会话标题必须是字符串（不支持传 null 清空，见本 schema 的注释）',
+      required_error: validationMessage('validation.conversation.topicRequired'),
+      invalid_type_error: validationMessage('validation.conversation.topicNotString'),
     })
     .trim()
-    .min(1, '会话标题不能为空')
-    .max(CONVERSATION_TOPIC_MAX_CHARS, `会话标题最多 ${CONVERSATION_TOPIC_MAX_CHARS} 个字符`),
+    .min(1, validationMessage('validation.conversation.topicEmpty'))
+    .max(
+      CONVERSATION_TOPIC_MAX_CHARS,
+      validationMessage('validation.conversation.topicTooLong', { max: CONVERSATION_TOPIC_MAX_CHARS }),
+    ),
 })
 export type RenameConversationBody = z.infer<typeof renameConversationBodySchema>
 
@@ -283,8 +292,8 @@ export type RecallConversationResult = z.infer<typeof recallConversationResultSc
  */
 export const setConversationAutoApproveBodySchema = z.object({
   enabled: z.boolean({
-    required_error: '缺少 enabled（true = 本会话自动审批，false = 恢复逐次确认）',
-    invalid_type_error: 'enabled 必须是布尔值',
+    required_error: validationMessage('validation.conversation.autoApproveEnabledMissing'),
+    invalid_type_error: validationMessage('validation.conversation.enabledNotBoolean'),
   }),
 })
 export type SetConversationAutoApproveBody = z.infer<typeof setConversationAutoApproveBodySchema>
@@ -307,8 +316,8 @@ export type SetConversationAutoApproveResult = z.infer<typeof setConversationAut
  */
 export const setConversationCodeModeBodySchema = z.object({
   enabled: z.boolean({
-    required_error: '缺少 enabled（true = 本会话走 Code 模式，false = 普通模式）',
-    invalid_type_error: 'enabled 必须是布尔值',
+    required_error: validationMessage('validation.conversation.codeModeEnabledMissing'),
+    invalid_type_error: validationMessage('validation.conversation.enabledNotBoolean'),
   }),
 })
 export type SetConversationCodeModeBody = z.infer<typeof setConversationCodeModeBodySchema>
@@ -329,8 +338,11 @@ export type SetConversationCodeModeResult = z.infer<typeof setConversationCodeMo
  */
 export const setConversationRuntimeBodySchema = z.object({
   runtime: z
-    .string({ required_error: '缺少 runtime（形如 python / python310 / node22-python38；空串 = 空环境）' })
-    .max(SANDBOX_RUNTIME_ID_MAX_LEN, `runtime 过长（> ${SANDBOX_RUNTIME_ID_MAX_LEN}）`),
+    .string({ required_error: validationMessage('validation.conversation.runtimeMissing') })
+    .max(
+      SANDBOX_RUNTIME_ID_MAX_LEN,
+      validationMessage('validation.conversation.runtimeTooLong', { max: SANDBOX_RUNTIME_ID_MAX_LEN }),
+    ),
 })
 export type SetConversationRuntimeBody = z.infer<typeof setConversationRuntimeBodySchema>
 
@@ -342,10 +354,10 @@ export type SetConversationRuntimeBody = z.infer<typeof setConversationRuntimeBo
  */
 export const setConversationInstanceBodySchema = z.object({
   instanceId: z
-    .string({ required_error: '缺少 instanceId（在线实例 id；null = 交还自动落点）' })
+    .string({ required_error: validationMessage('validation.conversation.instanceIdMissing') })
     .trim()
-    .min(1, 'instanceId 不能为空（要交还自动落点请传 null）')
-    .max(64, 'instanceId 过长')
+    .min(1, validationMessage('validation.conversation.instanceIdEmpty'))
+    .max(64, validationMessage('validation.conversation.instanceIdTooLong'))
     .nullable(),
   /**
    * 自动落点时**必须满足的运行时**（P1-14 × P1-17a）：后端据此挑一台"有该环境、否则能构建该环境"
@@ -716,12 +728,12 @@ export const ARTIFACT_PAGE_LIMIT_DEFAULT = 20
  * 需要额外 `count` 的操作（见 `envelope.ts#cursorPageOf` 的理由）。
  */
 export const listArtifactsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
   limit: z.coerce
     .number()
     .int()
-    .min(1, 'limit 至少为 1')
-    .max(ARTIFACT_PAGE_LIMIT_MAX, `limit 最多 ${ARTIFACT_PAGE_LIMIT_MAX}`)
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(ARTIFACT_PAGE_LIMIT_MAX, validationMessage('validation.conversation.artifactLimitMax', { max: ARTIFACT_PAGE_LIMIT_MAX }))
     .default(ARTIFACT_PAGE_LIMIT_DEFAULT),
 })
 export type ListArtifactsQuery = z.infer<typeof listArtifactsQuerySchema>
@@ -762,7 +774,7 @@ export type ArtifactListResult = z.infer<typeof artifactListResultSchema>
 
 /** 路径参数（`/api/artifacts/:id/...` 的 `:id` = `artifacts` 行主键，`uuid(7)`） */
 export const artifactIdParamsSchema = z.object({
-  id: z.string().uuid('产物 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.conversation.artifactIdNotUuid')),
 })
 export type ArtifactIdParams = z.infer<typeof artifactIdParamsSchema>
 
@@ -792,9 +804,12 @@ export const ARTIFACT_BATCH_DELETE_MAX = ARTIFACT_PAGE_LIMIT_MAX
  */
 export const batchDeleteArtifactsBodySchema = z.object({
   ids: z
-    .array(z.string().uuid('产物 ID 不是合法 UUID'))
-    .min(1, '至少选择一个产物')
-    .max(ARTIFACT_BATCH_DELETE_MAX, `一次最多删除 ${ARTIFACT_BATCH_DELETE_MAX} 个产物`),
+    .array(z.string().uuid(validationMessage('validation.conversation.artifactIdNotUuid')))
+    .min(1, validationMessage('validation.conversation.artifactsRequired'))
+    .max(
+      ARTIFACT_BATCH_DELETE_MAX,
+      validationMessage('validation.conversation.artifactBatchMax', { max: ARTIFACT_BATCH_DELETE_MAX }),
+    ),
 })
 export type BatchDeleteArtifactsBody = z.infer<typeof batchDeleteArtifactsBodySchema>
 
@@ -946,7 +961,7 @@ export type AttachmentItem = z.infer<typeof attachmentItemSchema>
 
 /** 路径参数（`/api/files/:id/content` 的 `:id` = `files` 行主键，`uuid(7)`） */
 export const fileIdParamsSchema = z.object({
-  id: z.string().uuid('附件 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.conversation.fileIdNotUuid')),
 })
 export type FileIdParams = z.infer<typeof fileIdParamsSchema>
 
@@ -1071,12 +1086,12 @@ export const MESSAGE_PAGE_LIMIT_DEFAULT = 20
  * 这件事有一个确定的上界（前端要全量就自己翻页）。
  */
 export const listMessagesQuerySchema = z.object({
-  beforeId: z.string().uuid('beforeId 不是合法 UUID').optional(),
+  beforeId: z.string().uuid(validationMessage('validation.conversation.beforeIdNotUuid')).optional(),
   limit: z.coerce
     .number()
     .int()
-    .min(1, 'limit 至少为 1')
-    .max(MESSAGE_PAGE_LIMIT_MAX, `limit 最多 ${MESSAGE_PAGE_LIMIT_MAX}`)
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(MESSAGE_PAGE_LIMIT_MAX, validationMessage('validation.conversation.messageLimitMax', { max: MESSAGE_PAGE_LIMIT_MAX }))
     .default(MESSAGE_PAGE_LIMIT_DEFAULT),
 })
 export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>
@@ -1110,7 +1125,7 @@ export const messageItemSchema = z.object({
    * （顺带：`z.unknown().refine(...)` 会把推断出的类型收成 `{} | null`，那就不叫"原样透出"了。）
    */
   content: z.custom<unknown>((value) => value !== undefined, {
-    message: 'content 必须存在（jsonb 列是 NOT NULL；`undefined` 会在序列化时丢掉这一列）',
+    message: validationMessage('validation.conversation.contentRequired'),
   }),
   /** ISO 8601 */
   createdAt: z.string(),

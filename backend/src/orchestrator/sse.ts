@@ -81,6 +81,7 @@
  */
 
 import {
+  appMsg,
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
   EMPTY_ACTIVE_SNAPSHOT,
@@ -968,7 +969,10 @@ class SseChannel {
     const parsed = SSE_PAYLOAD_SCHEMAS[event.name].safeParse(event.data)
     if (!parsed.success) {
       throw AppError.internal(
-        `内部事件形状不合法（${event.name}）：${parsed.error.issues.map((issue) => `${issue.path.join('.')} ${issue.message}`).join('；')}`,
+        appMsg('app.m279', {
+          p0: event.name,
+          p1: parsed.error.issues.map((issue) => `${issue.path.join('.')} ${issue.message}`).join('；'),
+        }),
         { event: event.name },
       )
     }
@@ -1395,7 +1399,12 @@ class SseChannel {
 
     await this.emit({
       name: 'error',
-      data: { code: appError.code, message: appError.message },
+      data: {
+        code: appError.code,
+        message: appError.message,
+        // 有结构化 key 就带上（P1-23 收尾 ⑤）—— 前端错误卡据此在 en 下显示真译文
+        ...(appError.msgKey === null ? {} : { msgKey: appError.msgKey }),
+      },
     })
   }
 

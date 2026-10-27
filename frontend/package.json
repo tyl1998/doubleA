@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:i18n": "node --import tsx scripts/verify-i18n.mjs",
     "verify:chat-sse": "node --import tsx scripts/verify-chat-sse.mjs",
     "verify:message-window": "node --import tsx scripts/verify-message-window.mjs",
     "verify:chat-home": "node --import tsx scripts/verify-chat-home.mjs",

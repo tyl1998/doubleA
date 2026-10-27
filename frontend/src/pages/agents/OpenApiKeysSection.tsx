@@ -36,12 +36,14 @@ import {
   OPEN_API_MAX_CONCURRENCY_LIMIT,
   OPEN_API_RATE_LIMIT_PER_MIN_LIMIT,
   OPEN_API_SCOPES,
-  OPEN_API_SCOPE_LABELS,
+  OPEN_API_SCOPE_KEY,
   OPEN_API_SCOPE_PRESETS,
   createOpenApiKeyBodySchema,
+  translate,
   updateOpenApiKeyBodySchema,
   type CreateOpenApiKeyBody,
   type CreateOpenApiKeyResult,
+  type MessageKey,
   type OpenApiKeyItem,
   type OpenApiKeyStatus,
   type OpenApiScope,
@@ -57,14 +59,15 @@ import { AGENTS_PAGE_LIMIT_MAX, useAgents } from '../../api/agents.js'
 import { describeError } from '../../api/client.js'
 import { useCreateOpenApiKey, useOpenApiKeys, useRevokeOpenApiKey, useUpdateOpenApiKey } from '../../api/openKeys.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { agentEditPath } from '../../app/paths.js'
 import { formatUpdatedAt } from './agentModel.js'
 
-/** 状态 → 徽标（与 `shared#OPEN_API_KEY_STATUSES` 一一对应） */
-const STATUS_LABEL: Readonly<Record<OpenApiKeyStatus, string>> = {
-  ACTIVE: '有效',
-  EXPIRED: '已过期',
-  REVOKED: '已吊销',
+/** 状态 → 徽标 key（与 `shared#OPEN_API_KEY_STATUSES` 一一对应）；P1-23：存 key 不存文案 */
+const STATUS_LABEL_KEY: Readonly<Record<OpenApiKeyStatus, MessageKey>> = {
+  ACTIVE: 'label.openApiStatus.ACTIVE',
+  EXPIRED: 'label.openApiStatus.EXPIRED',
+  REVOKED: 'label.openApiStatus.REVOKED',
 }
 
 const STATUS_CLASS: Readonly<Record<OpenApiKeyStatus, string>> = {
@@ -113,6 +116,7 @@ export interface OpenApiKeysSectionProps {
 
 export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   /**
    * 过滤用的智能体（`undefined` = 我名下的全部 Key）。
    * 初值来自 `initialAgentId`，用户可以在页内改 —— 它是一个**视图状态**，不是凭据本身。
@@ -129,14 +133,14 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
   /** 下拉的数据源：**我能看见的**智能体（服务端列表已按可见性过滤） */
   const agentOptions = (agentsQuery.data?.items ?? []).map((agent) => ({
     value: agent.id,
-    label: `${agent.name}${agent.type === 'CHATBOT' ? '' : '（非对话型：外部调不通）'}`,
+    label: `${agent.name}${agent.type === 'CHATBOT' ? '' : t('openApi.agentNonChat')}`,
   }))
   /** 过滤下拉：多一个"全部"，并且**必须**把当前过滤值（若已不在列表里）保留为一项，否则会显示裸 uuid */
   const filterOptions = [
-    { value: '', label: '全部智能体' },
+    { value: '', label: t('openApi.filterAll') },
     ...agentOptions,
     ...(filterAgentId !== undefined && !agentOptions.some((option) => option.value === filterAgentId)
-      ? [{ value: filterAgentId, label: '（已不可见的智能体）' }]
+      ? [{ value: filterAgentId, label: t('openApi.filterInvisible') }]
       : []),
   ]
 
@@ -147,14 +151,14 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
       <Alert
         type="info"
         showIcon
-        message="Key 是「你 × 某个智能体」的调用凭据，不是给智能体配的开关"
-        description="用这里的 Key 调用时，平台认定的是**你本人**：连接范围只限你选的智能体，产生的会话也出现在**你**的会话列表里。其他能看到这个智能体的人，仍然要各自签发自己的 Key —— 它不会因为某个智能体有 Key 就对所有人开放。"
+        message={t('openApi.infoTitle')}
+        description={t('openApi.infoDesc')}
       />
 
       <div className="row row--wrap" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
         <div className="row row--wrap" style={{ gap: 'var(--sp-3)', alignItems: 'center' }}>
           <span className="block-label" style={{ margin: 0 }}>
-            关联智能体
+            {t('openApi.agentFilter')}
           </span>
           <Select
             style={{ minWidth: 240 }}
@@ -164,11 +168,11 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
             onChange={(value: string) => setFilterAgentId(value === '' ? undefined : value)}
           />
           <span className="ratio">
-            {listQuery.isPending ? '正在读取…' : `共 ${items.length} 把，其中 ${activeCount} 把有效`}
+            {listQuery.isPending ? t('openApi.loading') : t('openApi.count', { total: items.length, active: activeCount })}
           </span>
         </div>
         <Button type="primary" onClick={() => setCreateOpen(true)}>
-          新建 Key
+          {t('openApi.create')}
         </Button>
       </div>
 
@@ -176,7 +180,7 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
         <Alert
           type="error"
           showIcon
-          message="Key 列表加载失败"
+          message={t('openApi.loadFailed')}
           description={describeError(listQuery.error).message}
           action={
             <Button
@@ -185,7 +189,7 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
                 void listQuery.refetch()
               }}
             >
-              重试
+              {t('common.retry')}
             </Button>
           }
         />
@@ -196,10 +200,10 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
           loading={listQuery.isPending}
           dataSource={items}
           pagination={false}
-          locale={{ emptyText: '还没有签发过 Key —— 外部系统还调不到你的智能体。' }}
+          locale={{ emptyText: t('openApi.emptyTable') }}
           columns={[
             {
-              title: '名称',
+              title: t('openApi.colName'),
               dataIndex: 'name',
               render: (name: string, row) => (
                 <span className="stack stack--tight" style={{ gap: 'var(--sp-1)' }}>
@@ -211,7 +215,7 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
               ),
             },
             {
-              title: '智能体',
+              title: t('openApi.colAgent'),
               dataIndex: 'agentName',
               render: (agentName: string, row) => (
                 <span className="stack stack--tight" style={{ gap: 'var(--sp-1)' }}>
@@ -221,72 +225,78 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
                     <span>{agentName}</span>
                   )}
                   {row.agentType !== 'CHATBOT' && (
-                    <Tag className="tag--warn" title="本期只开放对话型智能体（Q9）">
-                      非对话型 · 调不通
+                    <Tag className="tag--warn" title={t('openApi.nonChatTitle')}>
+                      {t('openApi.nonChatTag')}
                     </Tag>
                   )}
                 </span>
               ),
             },
             {
-              title: '作用域',
+              title: t('openApi.colScope'),
               dataIndex: 'scopes',
               render: (scopes: OpenApiScope[]) =>
                 scopes.length === 0 ? (
-                  <Tag className="tag--danger">无（等于停用）</Tag>
+                  <Tag className="tag--danger">{t('openApi.noScope')}</Tag>
                 ) : (
                   <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
                     {scopes.map((scope) => (
-                      <Tag key={scope}>{OPEN_API_SCOPE_LABELS[scope]}</Tag>
+                      <Tag key={scope}>{translate(locale, OPEN_API_SCOPE_KEY[scope])}</Tag>
                     ))}
                   </span>
                 ),
             },
             {
-              title: '状态',
+              title: t('openApi.colStatus'),
               dataIndex: 'status',
               width: 100,
-              render: (status: OpenApiKeyStatus) => <Tag className={STATUS_CLASS[status]}>{STATUS_LABEL[status]}</Tag>,
+              render: (status: OpenApiKeyStatus) => (
+                <Tag className={STATUS_CLASS[status]}>{t(STATUS_LABEL_KEY[status])}</Tag>
+              ),
             },
             {
-              title: '过期',
+              title: t('openApi.colExpires'),
               dataIndex: 'expiresAt',
               width: 130,
               render: (expiresAt: string | null) =>
-                expiresAt === null ? <span className="ratio">不过期</span> : formatUpdatedAt(expiresAt),
+                expiresAt === null ? <span className="ratio">{t('openApi.noExpire')}</span> : formatUpdatedAt(expiresAt),
             },
             {
-              title: '最后使用',
+              title: t('openApi.colLastUsed'),
               dataIndex: 'lastUsedAt',
               width: 130,
               render: (lastUsedAt: string | null) =>
-                lastUsedAt === null ? <span className="ratio">从未</span> : formatUpdatedAt(lastUsedAt),
+                lastUsedAt === null ? <span className="ratio">{t('openApi.never')}</span> : formatUpdatedAt(lastUsedAt),
             },
             {
-              title: '限额',
+              title: t('openApi.colLimit'),
               dataIndex: 'id',
               width: 190,
               render: (_id: string, row) => (
                 <span className="ratio">
-                  并发 {row.maxConcurrency ?? '默认'} · {row.rateLimitPerMin ?? '默认'} RPM ·{' '}
+                  {t('openApi.limitConcurrency', { value: row.maxConcurrency ?? t('openApi.limitDefault') })}
+                  {' · '}
+                  {row.rateLimitPerMin ?? t('openApi.limitDefault')}
+                  {t('openApi.limitRpm')}
+                  {' · '}
                   {row.dailyTokenLimit === null || row.dailyTokenLimit === 0
-                    ? '日 token 不限'
-                    : `日 token ${row.dailyTokenLimit}`}
-                  {row.allowAutoApprove ? ' · 允许自动审批' : ' · 禁自动审批'}
+                    ? t('openApi.limitDailyUnlimited')
+                    : t('openApi.limitDaily', { value: row.dailyTokenLimit })}
+                  {row.allowAutoApprove ? t('openApi.allowAutoApprove') : t('openApi.forbidAutoApprove')}
                 </span>
               ),
             },
             {
-              title: '操作',
+              title: t('openApi.colActions'),
               dataIndex: 'id',
               width: 150,
               render: (_id: string, row) => (
                 <span className="row" style={{ gap: 'var(--sp-2)' }}>
                   <Button size="small" disabled={row.status === 'REVOKED'} onClick={() => setEditing(row)}>
-                    编辑
+                    {t('common.edit')}
                   </Button>
                   <Button size="small" danger disabled={row.status === 'REVOKED'} onClick={() => setRevoking(row)}>
-                    吊销
+                    {t('openApi.revoke')}
                   </Button>
                 </span>
               ),
@@ -296,9 +306,13 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
       )}
 
       <span className="ratio">
-        名称 / 作用域 / 过期 / 限额可以随时「<strong>编辑</strong>」（保存立即生效；关联智能体与 Key 值不可改）。
-        吊销立即生效（外部下一次请求就是 401），但<strong>历史会话仍保留</strong>在你自己的会话列表里。
-        轮换 Key = 新建一把 + 吊销旧的：你在同一个智能体下的多把 Key <strong>共享同一批会话</strong>。
+        {t('openApi.footerPrefix')}
+        <strong>{t('openApi.footerStrong1')}</strong>
+        {t('openApi.footerMid')}
+        <strong>{t('openApi.footerStrong2')}</strong>
+        {t('openApi.footerTail')}
+        <strong>{t('openApi.footerStrong3')}</strong>
+        {t('openApi.footerEnd')}
       </span>
 
       <CreateKeyModal
@@ -320,7 +334,7 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
         onClose={() => setEditing(null)}
         onSaved={() => {
           setEditing(null)
-          feedback.ok('已保存：新的作用域/限额立即生效（无需换 Key）')
+          feedback.ok(t('openApi.editSaved'))
         }}
       />
 
@@ -329,7 +343,7 @@ export function OpenApiKeysSection({ initialAgentId }: OpenApiKeysSectionProps) 
         onClose={() => setRevoking(null)}
         onRevoked={() => {
           setRevoking(null)
-          feedback.ok('已吊销：外部携带这把 Key 的请求会立即被拒绝')
+          feedback.ok(t('openApi.revokedOk'))
         }}
       />
     </div>
@@ -354,6 +368,7 @@ function CreateKeyModal({
   onClose: () => void
   onCreated: (result: CreateOpenApiKeyResult) => void
 }) {
+  const { t, locale } = useT()
   const createKey = useCreateOpenApiKey()
   const [form] = Form.useForm<CreateKeyFormValues>()
   const [errorText, setErrorText] = useState<string | null>(null)
@@ -400,9 +415,9 @@ function CreateKeyModal({
   return (
     <Modal
       open={open}
-      title="新建调用 Key"
-      okText="签发"
-      cancelText="取消"
+      title={t('openApi.createTitle')}
+      okText={t('openApi.issue')}
+      cancelText={t('common.cancel')}
       confirmLoading={createKey.isPending}
       onOk={() => {
         void form.submit()
@@ -424,40 +439,40 @@ function CreateKeyModal({
         }}
       >
         <div className="stack stack--tight">
-          {errorText !== null && <Alert type="error" showIcon message="签发失败" description={errorText} />}
+          {errorText !== null && <Alert type="error" showIcon message={t('openApi.issueFailed')} description={errorText} />}
 
           <Form.Item
             name="agentId"
-            label="关联智能体"
-            rules={[{ required: true, message: '请选择要关联的智能体' }]}
-            extra="Key 只能调用这一个智能体，并且代表**你**调用。下拉里只列出你能看见的智能体。"
+            label={t('openApi.agentFilter')}
+            rules={[{ required: true, message: t('openApi.agentRequired') }]}
+            extra={t('openApi.agentExtra')}
           >
             <Select
               showSearch
               optionFilterProp="label"
-              placeholder="选择要开放的智能体"
+              placeholder={t('openApi.agentPlaceholder')}
               loading={agentsLoading}
               options={agentOptions}
-              notFoundContent={agentsLoading ? '正在读取…' : '没有可选的智能体'}
+              notFoundContent={agentsLoading ? t('openApi.loading') : t('openApi.agentEmpty')}
             />
           </Form.Item>
 
           <Form.Item
             name="name"
-            label="名称"
-            rules={[{ required: true, message: '请输入 Key 名称' }]}
-            extra={`给别人看的用途名（例如「订单助手 · 生产」），最多 ${OPEN_API_KEY_NAME_MAX} 个字符。名称可以重复，Key 本身不会。`}
+            label={t('openApi.colName')}
+            rules={[{ required: true, message: t('openApi.nameRequired') }]}
+            extra={t('openApi.nameExtra', { max: OPEN_API_KEY_NAME_MAX })}
           >
-            <Input placeholder="例如：订单助手 · 生产" />
+            <Input placeholder={t('openApi.namePlaceholder')} />
           </Form.Item>
 
-          <Form.Item label="作用域" extra="决定这把 Key 能做什么。默认全选；只读预设只允许查会话与看流。">
+          <Form.Item label={t('openApi.scope')} extra={t('openApi.scopeExtra')}>
             <Select
               value={scopePreset}
               options={[
-                { value: 'full', label: '全部（对话 + 读 + 写会话）' },
-                { value: 'readonly', label: '只读（仅读会话与观察流）' },
-                { value: 'custom', label: '自定义' },
+                { value: 'full', label: t('openApi.scopeFull') },
+                { value: 'readonly', label: t('openApi.scopeReadonly') },
+                { value: 'custom', label: t('openApi.scopeCustom') },
               ]}
               onChange={(value: CreateKeyFormValues['scopePreset']) => {
                 setScopePreset(value)
@@ -469,35 +484,35 @@ function CreateKeyModal({
 
           <Form.Item
             name="scopes"
-            label="具体作用域"
-            rules={[{ required: true, message: '至少选择一个作用域' }]}
+            label={t('openApi.scopeSpecific')}
+            rules={[{ required: true, message: t('openApi.scopeRequired') }]}
           >
             <Checkbox.Group
-              options={OPEN_API_SCOPES.map((scope) => ({ value: scope, label: OPEN_API_SCOPE_LABELS[scope] }))}
+              options={OPEN_API_SCOPES.map((scope) => ({ value: scope, label: translate(locale, OPEN_API_SCOPE_KEY[scope]) }))}
             />
           </Form.Item>
 
           <Form.Item
             name="expiresAt"
-            label="过期时间"
-            extra="留空 = 不过期。建议填写：Key 泄露的窗口期与它存在的时长成正比。"
+            label={t('openApi.expires')}
+            extra={t('openApi.expiresExtra')}
           >
-            <DatePicker showTime style={{ width: '100%' }} placeholder="不过期" />
+            <DatePicker showTime style={{ width: '100%' }} placeholder={t('openApi.noExpirePlaceholder')} />
           </Form.Item>
 
           <div className="row row--wrap" style={{ gap: 'var(--sp-4)' }}>
             <Form.Item
               name="maxConcurrency"
-              label="并发上限"
-              extra="留空 = 平台默认（2）"
+              label={t('openApi.maxConcurrency')}
+              extra={t('openApi.maxConcurrencyExtra')}
               rules={[{ type: 'number', min: 1, max: OPEN_API_MAX_CONCURRENCY_LIMIT, message: `1–${OPEN_API_MAX_CONCURRENCY_LIMIT}` }]}
             >
-              <InputNumber min={1} max={OPEN_API_MAX_CONCURRENCY_LIMIT} placeholder="默认" style={{ width: 140 }} />
+              <InputNumber min={1} max={OPEN_API_MAX_CONCURRENCY_LIMIT} placeholder={t('openApi.defaultPlaceholder')} style={{ width: 140 }} />
             </Form.Item>
             <Form.Item
               name="rateLimitPerMin"
-              label="每分钟请求上限"
-              extra="留空 = 平台默认（120）"
+              label={t('openApi.rateLimit')}
+              extra={t('openApi.rateLimitExtra')}
               rules={[
                 {
                   type: 'number',
@@ -510,29 +525,29 @@ function CreateKeyModal({
               <InputNumber
                 min={1}
                 max={OPEN_API_RATE_LIMIT_PER_MIN_LIMIT}
-                placeholder="默认"
+                placeholder={t('openApi.defaultPlaceholder')}
                 style={{ width: 160 }}
               />
             </Form.Item>
-            <Form.Item name="dailyTokenLimit" label="日 token 上限" extra="留空 / 0 = 不限">
-              <InputNumber min={0} placeholder="不限" style={{ width: 140 }} />
+            <Form.Item name="dailyTokenLimit" label={t('openApi.dailyToken')} extra={t('openApi.dailyTokenExtra')}>
+              <InputNumber min={0} placeholder={t('openApi.unlimitedPlaceholder')} style={{ width: 140 }} />
             </Form.Item>
           </div>
 
           <Form.Item
             name="allowAutoApprove"
-            label="允许自动审批"
+            label={t('openApi.allowAutoApproveLabel')}
             valuePropName="checked"
-            extra="打开后，外部可在会话里开启「自动审批」，危险工具将由服务端直接放行、不再等人确认。"
+            extra={t('openApi.allowAutoApproveExtra')}
           >
-            <Switch checkedChildren="允许" unCheckedChildren="禁止" />
+            <Switch checkedChildren={t('openApi.switchAllow')} unCheckedChildren={t('openApi.switchForbid')} />
           </Form.Item>
 
           <Alert
             type="warning"
             showIcon
-            message="开启自动审批等于把这把 Key 的持有者当成你自己"
-            description="Key 泄露时，持有者可以不经任何人确认就触发你的 MCP 工具（可能是破坏性的）。只在你信任对方、且它只是你自己的服务端时打开。"
+            message={t('openApi.autoApproveWarnTitle')}
+            description={t('openApi.autoApproveWarnDesc')}
           />
         </div>
       </Form>
@@ -612,6 +627,7 @@ function EditKeyModal({
   onClose: () => void
   onSaved: () => void
 }) {
+  const { t, locale } = useT()
   const updateKey = useUpdateOpenApiKey()
   const [form] = Form.useForm<EditKeyFormValues>()
   const [errorText, setErrorText] = useState<string | null>(null)
@@ -674,14 +690,14 @@ function EditKeyModal({
       open
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          编辑「{keyItem.name}」
+          {t('openApi.editTitle', { name: keyItem.name })}
           <span className="ratio num">
             {keyItem.keyPrefix}…{keyItem.keySuffix}
           </span>
         </span>
       }
-      okText="保存"
-      cancelText="取消"
+      okText={t('common.save')}
+      cancelText={t('common.cancel')}
       confirmLoading={updateKey.isPending}
       onOk={() => {
         void form.submit()
@@ -702,37 +718,37 @@ function EditKeyModal({
         }}
       >
         <div className="stack stack--tight">
-          {errorText !== null && <Alert type="error" showIcon message="保存失败" description={errorText} />}
+          {errorText !== null && <Alert type="error" showIcon message={t('openApi.saveFailed')} description={errorText} />}
 
           {keyItem.status === 'EXPIRED' && (
             <Alert
               type="info"
               showIcon
-              message="这把 Key 已过期"
-              description="把过期时间改到未来即可重新启用（Key 值不变，外部无需换 Key）。"
+              message={t('openApi.expiredTitle')}
+              description={t('openApi.expiredDesc')}
             />
           )}
 
-          <Form.Item label="关联智能体" extra="不可修改 —— 换调用目标等于换一批会话，请吊销后重新签发。">
+          <Form.Item label={t('openApi.agentFilter')} extra={t('openApi.agentLockedExtra')}>
             <Input value={keyItem.agentName} disabled />
           </Form.Item>
 
           <Form.Item
             name="name"
-            label="名称"
-            rules={[{ required: true, message: '请输入 Key 名称' }]}
-            extra={`给别人看的用途名（例如「订单助手 · 生产」），最多 ${OPEN_API_KEY_NAME_MAX} 个字符。`}
+            label={t('openApi.colName')}
+            rules={[{ required: true, message: t('openApi.nameRequired') }]}
+            extra={t('openApi.nameExtra', { max: OPEN_API_KEY_NAME_MAX })}
           >
-            <Input placeholder="例如：订单助手 · 生产" />
+            <Input placeholder={t('openApi.namePlaceholder')} />
           </Form.Item>
 
-          <Form.Item label="作用域" extra="决定这把 Key 能做什么。收紧立即生效；放宽需要下面的确认。">
+          <Form.Item label={t('openApi.scope')} extra={t('openApi.editScopeExtra')}>
             <Select
               value={scopePreset}
               options={[
-                { value: 'full', label: '全部（对话 + 读 + 写会话）' },
-                { value: 'readonly', label: '只读（仅读会话与观察流）' },
-                { value: 'custom', label: '自定义' },
+                { value: 'full', label: t('openApi.scopeFull') },
+                { value: 'readonly', label: t('openApi.scopeReadonly') },
+                { value: 'custom', label: t('openApi.scopeCustom') },
               ]}
               onChange={(value: EditKeyFormValues['scopePreset']) => {
                 setScopePreset(value)
@@ -744,11 +760,11 @@ function EditKeyModal({
 
           <Form.Item
             name="scopes"
-            label="具体作用域"
-            rules={[{ required: true, message: '至少选择一个作用域' }]}
+            label={t('openApi.scopeSpecific')}
+            rules={[{ required: true, message: t('openApi.scopeRequired') }]}
           >
             <Checkbox.Group
-              options={OPEN_API_SCOPES.map((scope) => ({ value: scope, label: OPEN_API_SCOPE_LABELS[scope] }))}
+              options={OPEN_API_SCOPES.map((scope) => ({ value: scope, label: translate(locale, OPEN_API_SCOPE_KEY[scope]) }))}
             />
           </Form.Item>
 
@@ -757,8 +773,8 @@ function EditKeyModal({
               <Alert
                 type="warning"
                 showIcon
-                message="这次保存会放宽作用域"
-                description="新增的作用域保存后立即生效 —— 外部携带这把 Key 的请求马上就能做以前做不了的事，无需任何再次授权。如果这把 Key 已经交给了你不完全信任的系统，请先吊销再签一把。"
+                message={t('openApi.widenTitle')}
+                description={t('openApi.widenDesc')}
               />
               <Form.Item
                 name="confirmWiden"
@@ -766,36 +782,36 @@ function EditKeyModal({
                 rules={[
                   {
                     validator: (_, value: boolean | undefined) =>
-                      value === true ? Promise.resolve() : Promise.reject(new Error('请先勾选确认放宽作用域')),
+                      value === true ? Promise.resolve() : Promise.reject(new Error(t('openApi.widenConfirmRequired'))),
                   },
                 ]}
               >
-                <Checkbox>我了解：保存后这把 Key 立即获得新增的作用域</Checkbox>
+                <Checkbox>{t('openApi.widenConfirm')}</Checkbox>
               </Form.Item>
             </>
           )}
 
           <Form.Item
             name="expiresAt"
-            label="过期时间"
-            extra="留空 = 不过期。改到未来可以续期 / 重新启用；改到过去没有意义，会被拒绝。"
+            label={t('openApi.expires')}
+            extra={t('openApi.editExpiresExtra')}
           >
-            <DatePicker showTime style={{ width: '100%' }} placeholder="不过期" />
+            <DatePicker showTime style={{ width: '100%' }} placeholder={t('openApi.noExpirePlaceholder')} />
           </Form.Item>
 
           <div className="row row--wrap" style={{ gap: 'var(--sp-4)' }}>
             <Form.Item
               name="maxConcurrency"
-              label="并发上限"
-              extra="留空 = 平台默认（2）"
+              label={t('openApi.maxConcurrency')}
+              extra={t('openApi.maxConcurrencyExtra')}
               rules={[{ type: 'number', min: 1, max: OPEN_API_MAX_CONCURRENCY_LIMIT, message: `1–${OPEN_API_MAX_CONCURRENCY_LIMIT}` }]}
             >
-              <InputNumber min={1} max={OPEN_API_MAX_CONCURRENCY_LIMIT} placeholder="默认" style={{ width: 140 }} />
+              <InputNumber min={1} max={OPEN_API_MAX_CONCURRENCY_LIMIT} placeholder={t('openApi.defaultPlaceholder')} style={{ width: 140 }} />
             </Form.Item>
             <Form.Item
               name="rateLimitPerMin"
-              label="每分钟请求上限"
-              extra="留空 = 平台默认（120）"
+              label={t('openApi.rateLimit')}
+              extra={t('openApi.rateLimitExtra')}
               rules={[
                 {
                   type: 'number',
@@ -808,22 +824,22 @@ function EditKeyModal({
               <InputNumber
                 min={1}
                 max={OPEN_API_RATE_LIMIT_PER_MIN_LIMIT}
-                placeholder="默认"
+                placeholder={t('openApi.defaultPlaceholder')}
                 style={{ width: 160 }}
               />
             </Form.Item>
-            <Form.Item name="dailyTokenLimit" label="日 token 上限" extra="留空 / 0 = 不限">
-              <InputNumber min={0} placeholder="不限" style={{ width: 140 }} />
+            <Form.Item name="dailyTokenLimit" label={t('openApi.dailyToken')} extra={t('openApi.dailyTokenExtra')}>
+              <InputNumber min={0} placeholder={t('openApi.unlimitedPlaceholder')} style={{ width: 140 }} />
             </Form.Item>
           </div>
 
           <Form.Item
             name="allowAutoApprove"
-            label="允许自动审批"
+            label={t('openApi.allowAutoApproveLabel')}
             valuePropName="checked"
-            extra="打开后，外部可在会话里开启「自动审批」，危险工具将由服务端直接放行、不再等人确认。"
+            extra={t('openApi.allowAutoApproveExtra')}
           >
-            <Switch checkedChildren="允许" unCheckedChildren="禁止" />
+            <Switch checkedChildren={t('openApi.switchAllow')} unCheckedChildren={t('openApi.switchForbid')} />
           </Form.Item>
         </div>
       </Form>
@@ -847,6 +863,7 @@ function ApiKeyPlaintextModal({
   onClose: () => void
 }) {
   const feedback = useFeedback()
+  const { t } = useT()
   const [copied, setCopied] = useState(false)
 
   if (result === null) return null
@@ -856,17 +873,17 @@ function ApiKeyPlaintextModal({
       .writeText(result.plaintext)
       .then(() => {
         setCopied(true)
-        feedback.ok('已复制 Key')
+        feedback.ok(t('openApi.copyOk'))
       })
       .catch(() => {
-        feedback.fail(new Error('浏览器拒绝了剪贴板访问，请手工选中后复制'), '复制失败')
+        feedback.fail(new Error(t('openApi.copyBlocked')), t('openApi.copyFailed'))
       })
   }
 
   return (
     <Modal
       open
-      title="Key 已签发"
+      title={t('openApi.plaintextTitle')}
       // ⚠️ 不给 ×、不响应遮罩与 Esc：这里装着**唯一一份**明文
       closable={false}
       maskClosable={false}
@@ -877,7 +894,7 @@ function ApiKeyPlaintextModal({
       }}
       footer={
         <>
-          <Button onClick={copy}>{copied ? '再复制一次' : '复制 Key'}</Button>
+          <Button onClick={copy}>{copied ? t('openApi.copyAgain') : t('openApi.copy')}</Button>
           <Button
             type="primary"
             onClick={() => {
@@ -885,7 +902,7 @@ function ApiKeyPlaintextModal({
               onClose()
             }}
           >
-            我已保存，关闭
+            {t('openApi.savedClose')}
           </Button>
         </>
       }
@@ -894,10 +911,10 @@ function ApiKeyPlaintextModal({
         <Alert
           type="warning"
           showIcon
-          message="明文只显示这一次"
-          description="后端只保存它的哈希（sha256），关闭之后再也取不回来。丢了只能吊销再签一把（历史会话不受影响）。"
+          message={t('openApi.plaintextWarnTitle')}
+          description={t('openApi.plaintextWarnDesc')}
         />
-        <p className="block-label">调用凭据</p>
+        <p className="block-label">{t('openApi.credentialLabel')}</p>
         <Input.TextArea
           readOnly
           value={result.plaintext}
@@ -906,7 +923,8 @@ function ApiKeyPlaintextModal({
           aria-label="API Key"
         />
         <p className="ratio">
-          用法：<code>curl -H &quot;Authorization: Bearer &lt;Key&gt;&quot; https://&lt;host&gt;/open/v1/agent</code>
+          {t('openApi.usagePrefix')}
+          <code>curl -H &quot;Authorization: Bearer &lt;Key&gt;&quot; https://&lt;host&gt;/open/v1/agent</code>
         </p>
       </div>
     </Modal>
@@ -924,6 +942,7 @@ function RevokeKeyModal({
   onClose: () => void
   onRevoked: () => void
 }) {
+  const { t } = useT()
   const revoke = useRevokeOpenApiKey()
   const [errorText, setErrorText] = useState<string | null>(null)
 
@@ -949,13 +968,13 @@ function RevokeKeyModal({
       open
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          吊销「{keyItem.name}」
-          <Tag className="tag--danger">立即生效</Tag>
+          {t('openApi.revokeTitle', { name: keyItem.name })}
+          <Tag className="tag--danger">{t('openApi.revokeTag')}</Tag>
         </span>
       }
-      okText="确认吊销"
+      okText={t('openApi.revokeOkText')}
       okButtonProps={{ danger: true, loading: revoke.isPending }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={confirm}
       onCancel={() => {
         setErrorText(null)
@@ -964,20 +983,26 @@ function RevokeKeyModal({
       maskClosable={!revoke.isPending}
     >
       <div className="stack stack--tight">
-        {errorText !== null && <Alert type="error" showIcon message="吊销失败" description={errorText} />}
+        {errorText !== null && <Alert type="error" showIcon message={t('openApi.revokeFailed')} description={errorText} />}
         <p>
-          吊销后，外部系统携带 <code className="num">{keyItem.keyPrefix}…{keyItem.keySuffix}</code> 的请求会
-          <strong>立刻</strong>被拒绝（401）。这个动作<strong>不可撤销</strong>。
+          {t('openApi.revokeBodyPrefix')}
+          <code className="num">{keyItem.keyPrefix}…{keyItem.keySuffix}</code>
+          {t('openApi.revokeBodyMid')}
+          <strong>{t('openApi.revokeBodyStrong1')}</strong>
+          {t('openApi.revokeBodyTail')}
+          <strong>{t('openApi.revokeBodyStrong2')}</strong>
+          {t('openApi.revokeBodyEnd')}
         </p>
         <p className="ratio">
-          已经通过这把 Key 建出来的会话<strong>不会被删除</strong> —— 它们属于你，仍可在平台界面里继续聊。
-          需要继续给外部用时，请新建一把。
+          {t('openApi.revokeKeepPrefix')}
+          <strong>{t('openApi.revokeKeepStrong')}</strong>
+          {t('openApi.revokeKeepTail')}
         </p>
         <Alert
           type="info"
           showIcon
-          message="吊销不影响其他 Key"
-          description="同一个用户在这个智能体下的其他 Key 可以继续用；它们看到的是同一批会话。"
+          message={t('openApi.revokeOtherTitle')}
+          description={t('openApi.revokeOtherDesc')}
         />
       </div>
     </Modal>

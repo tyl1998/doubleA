@@ -22,16 +22,25 @@
  */
 
 import { Alert, Button, Select, Space, Spin, Tag, Typography } from 'antd'
+import {
+  EGRESS_SCOPES,
+  EGRESS_SCOPE_KEY,
+  type EgressPolicyMode,
+  type EgressScope,
+  type MessageKey,
+} from '@doubulea/shared'
 import { useEffect, useState } from 'react'
-import { EGRESS_SCOPES, EGRESS_SCOPE_LABELS, type EgressPolicyMode, type EgressScope } from '@doubulea/shared'
 
 import { useEgressPolicy, useUpdateEgressPolicy } from '../../api/egressPolicy.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
 
-const MODE_LABELS: Record<EgressPolicyMode, string> = {
-  ALLOW_ALL: '全放行',
-  WHITELIST: '仅白名单',
-  BLACKLIST: '黑名单',
+/** 推导模式 → 文案 key（三档语义与「口径」列表里的三条同名，不另造词） */
+const MODE_LABEL_KEY: Record<EgressPolicyMode, MessageKey> = {
+  ALLOW_ALL: 'egress.noteScopeAll',
+  WHITELIST: 'egress.noteAllowStrong',
+  BLACKLIST: 'egress.noteDenyStrong',
 }
 
 const MODE_TAG_COLOR: Record<EgressPolicyMode, string> = {
@@ -42,6 +51,7 @@ const MODE_TAG_COLOR: Record<EgressPolicyMode, string> = {
 
 export function EgressPolicyPage() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const query = useEgressPolicy()
   const save = useUpdateEgressPolicy()
 
@@ -59,9 +69,9 @@ export function EgressPolicyPage() {
     save.mutate(form, {
       onSuccess: (data) => {
         setForm({ scope: data.scope, allowHosts: data.allowHosts, denyHosts: data.denyHosts })
-        feedback.ok('出网策略已保存（代理将在同步间隔内热更新）')
+        feedback.ok(t('egress.saved'))
       },
-      onError: (error) => feedback.fail(error, '保存出网策略失败'),
+      onError: (error) => feedback.fail(error, t('egress.saveFailed')),
     })
   }
 
@@ -71,10 +81,15 @@ export function EgressPolicyPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>出网策略</h1>
+          <h1>{t('egress.title')}</h1>
           <p className="page__lead">
-            沙箱在专用内网上<strong>没有公网路由</strong>，出网只可能经 egress 代理。这里配置代理的
-            <strong>出网范围 + 黑白名单</strong>（平台级，所有会话共用）。<strong>默认全放行</strong>。
+            {t('egress.leadPrefix')}
+            <strong>{t('egress.leadStrong1')}</strong>
+            {t('egress.leadMid')}
+            <strong>{t('egress.leadStrong2')}</strong>
+            {t('egress.leadTail')}
+            <strong>{t('egress.leadStrong3')}</strong>
+            {t('egress.leadEnd')}
           </p>
         </div>
       </div>
@@ -83,20 +98,53 @@ export function EgressPolicyPage() {
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="口径"
+        message={t('egress.noteTitle')}
         description={
           <ul style={{ margin: 0, paddingInlineStart: 20 }}>
             <li>
-              <strong>出网范围</strong>：<strong>全放行</strong>（默认，除黑名单外都放行）/
-              <strong>仅模型</strong>（只放行模型池，容器仍能调模型）/ <strong>模型 + 取包</strong>
-              （模型池 + 注册表 + git 主机，可 clone / 装依赖）。模型池主机<strong>恒放行</strong>。
+              <strong>{t('egress.noteScopeStrong')}</strong>
+              {t('egress.noteScopeMid')}
+              <strong>{t('egress.noteScopeAll')}</strong>
+              {t('egress.noteScopeAllTail')}
+              <strong>{t('egress.noteScopeNone')}</strong>
+              {t('egress.noteScopeNoneTail')}
+              <strong>{t('egress.noteScopeRegistry')}</strong>
+              {t('egress.noteScopeRegistryTail')}
+              <strong>{t('egress.noteScopeAlways')}</strong>
+              {t('egress.noteScopeEnd')}
             </li>
             <li>
-              <strong>白名单</strong>：在范围之上<strong>再加</strong>零散主机（如某个内网 git 源）；范围是全放行时它无意义。
+              <strong>{t('egress.noteAllowStrong')}</strong>
+              {t('egress.noteAllowMid')}
+              <strong>{t('egress.noteAllowStrong2')}</strong>
+              {t('egress.noteAllowTail')}
             </li>
-            <li><strong>黑名单</strong>：命中即拒，<strong>优先级最高</strong>（任何范围都拦得住）。</li>
-            <li>条目形状：<code>host</code>、<code>host:port</code>、<code>*.host</code>（如 <code>github.com</code>、<code>*.example.com</code>）。</li>
-            <li>保存后由 <code>egress-up.sh --watch</code> 同步到代理，生效有几十秒延迟；<strong>SSH(22) 不走该代理</strong>（git 请用 HTTPS）。</li>
+            <li>
+              <strong>{t('egress.noteDenyStrong')}</strong>
+              {t('egress.noteDenyMid')}
+              <strong>{t('egress.noteDenyStrong2')}</strong>
+              {t('egress.noteDenyTail')}
+            </li>
+            <li>
+              {t('egress.noteShapePrefix')}
+              <code>host</code>
+              {t('egress.noteShapeMid1')}
+              <code>host:port</code>
+              {t('egress.noteShapeMid2')}
+              <code>*.host</code>
+              {t('egress.noteShapeMid3')}
+              <code>github.com</code>
+              {t('egress.noteShapeMid4')}
+              <code>*.example.com</code>
+              {t('egress.noteShapeTail')}
+            </li>
+            <li>
+              {t('egress.noteSyncPrefix')}
+              <code>egress-up.sh --watch</code>
+              {t('egress.noteSyncMid')}
+              <strong>{t('egress.noteSyncStrong')}</strong>
+              {t('egress.noteSyncTail')}
+            </li>
           </ul>
         }
       />
@@ -106,36 +154,38 @@ export function EgressPolicyPage() {
       ) : (
         <Space direction="vertical" size="large" style={{ display: 'flex' }}>
           <div>
-            <Typography.Text strong>当前模式</Typography.Text>{' '}
+            <Typography.Text strong>{t('egress.currentMode')}</Typography.Text>{' '}
             {mode === undefined ? (
               <Tag>—</Tag>
             ) : (
-              <Tag color={MODE_TAG_COLOR[mode]}>{MODE_LABELS[mode]}</Tag>
+              <Tag color={MODE_TAG_COLOR[mode]}>{t(MODE_LABEL_KEY[mode])}</Tag>
             )}
             {query.data !== undefined && (
               <Typography.Text type="secondary" style={{ marginInlineStart: 8 }}>
-                范围 {EGRESS_SCOPE_LABELS[query.data.scope]}｜上次更新{' '}
-                {new Date(query.data.updatedAt).toLocaleString()}
+                {t('egress.scopePrefix')}
+                {t(EGRESS_SCOPE_KEY[query.data.scope])}
+                {t('egress.scopeMid')}
+                {new Date(query.data.updatedAt).toLocaleString(localeTag(locale))}
               </Typography.Text>
             )}
           </div>
 
           <div>
-            <Typography.Text strong>出网范围</Typography.Text>
+            <Typography.Text strong>{t('egress.scopeLabel')}</Typography.Text>
             <Select
               style={{ width: '100%', marginTop: 8 }}
               value={form.scope}
               onChange={(value: EgressScope) => setForm({ ...form, scope: value })}
-              options={EGRESS_SCOPES.map((scope) => ({ value: scope, label: EGRESS_SCOPE_LABELS[scope] }))}
+              options={EGRESS_SCOPES.map((scope) => ({ value: scope, label: t(EGRESS_SCOPE_KEY[scope]) }))}
             />
           </div>
 
           <div>
-            <Typography.Text strong>白名单（allowHosts）</Typography.Text>
+            <Typography.Text strong>{t('egress.allowLabel')}</Typography.Text>
             <Select
               mode="tags"
               style={{ width: '100%', marginTop: 8 }}
-              placeholder="在范围之上再加主机；留空 = 不加；如 github.com、*.githubusercontent.com"
+              placeholder={t('egress.allowPlaceholder')}
               value={form.allowHosts}
               tokenSeparators={[',', ' ', '\n']}
               onChange={(value: string[]) => setForm({ ...form, allowHosts: value })}
@@ -145,11 +195,11 @@ export function EgressPolicyPage() {
           </div>
 
           <div>
-            <Typography.Text strong>黑名单（denyHosts）</Typography.Text>
+            <Typography.Text strong>{t('egress.denyLabel')}</Typography.Text>
             <Select
               mode="tags"
               style={{ width: '100%', marginTop: 8 }}
-              placeholder="留空 = 不启用黑名单；命中即拒，优先级最高"
+              placeholder={t('egress.denyPlaceholder')}
               value={form.denyHosts}
               tokenSeparators={[',', ' ', '\n']}
               onChange={(value: string[]) => setForm({ ...form, denyHosts: value })}
@@ -160,7 +210,7 @@ export function EgressPolicyPage() {
 
           <div>
             <Button type="primary" loading={save.isPending} onClick={submit}>
-              保存
+              {t('egress.save')}
             </Button>
           </div>
         </Space>

@@ -15,7 +15,7 @@
  *    只认识"打一次上游请求、把失败翻译成人话、绝不下发凭据"。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 
@@ -227,18 +227,15 @@ export function toUpstreamFailure(
 ): never {
   if (isAppError(error)) throw error
   if (deadline.expired) {
-    throw AppError.upstreamTimeout(
-      `调用上游超时（${stage} · ${deadline.currentStage}）：${describeForMessage(endpoint)}。` +
-        '请检查上游可用性或调大超时配置',
+    throw AppError.upstreamTimeout(appMsg('app.m247', { p0: stage, p1: deadline.currentStage, p2: describeForMessage(endpoint) }),
     )
   }
   if (isAbortError(error)) {
     // 走到这里说明不是超时也不是调用方中断（那两种在调用点已单独处理）——多半是守卫提前 abort
-    throw AppError.upstreamError(`调用上游被中断（${stage}）：${describeForMessage(endpoint)}`)
+    throw AppError.upstreamError(appMsg('app.m056', { p0: stage, p1: describeForMessage(endpoint) }))
   }
   const detail = error instanceof Error ? error.message : String(error)
-  throw AppError.upstreamError(
-    `无法连接上游（${stage}）：${endpoint.providerName}（${endpoint.baseUrl}）。原始错误：${redactSecret(detail, endpoint.apiKey)}`,
+  throw AppError.upstreamError(appMsg('app.m057', { p0: stage, p1: endpoint.providerName, p2: endpoint.baseUrl, p3: redactSecret(detail, endpoint.apiKey) }),
   )
 }
 
@@ -285,8 +282,7 @@ export async function throwUpstreamStatus(
     },
     '上游返回非 2xx',
   )
-  throw AppError.upstreamError(
-    `上游返回 ${response.status}${hint}：${describeForMessage(endpoint)}。响应：${body}`,
+  throw AppError.upstreamError(appMsg('app.m058', { p0: response.status, p1: hint, p2: describeForMessage(endpoint), p3: body }),
     { upstreamStatus: response.status },
   )
 }
@@ -355,8 +351,7 @@ export async function fetchUpstreamJson(
   try {
     return JSON.parse(rawBody)
   } catch {
-    throw AppError.upstreamError(
-      `上游响应不是合法 JSON（${request.path}）：${describeForMessage(endpoint)}。响应：${snippet(rawBody, endpoint.apiKey)}`,
+    throw AppError.upstreamError(appMsg('app.m059', { p0: request.path, p1: describeForMessage(endpoint), p2: snippet(rawBody, endpoint.apiKey) }),
     )
   }
 }

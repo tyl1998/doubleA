@@ -10,38 +10,34 @@
  *   · **不需要接收方确认**（用户 2026-10-16 定案）—— 所以这里只做一次危险确认，不写"等对方接受"。
  *
  * ⚠️ MCP 的 `created_by` 同时是**探测主语**（测试 / 工具列表用所属人的凭据），转移会静默改变
- * 那两条链路用谁的身份 —— 故 MCP 单独给一条强提示（{@link MCP_TRANSFER_WARNING}）。
+ * 那两条链路用谁的身份 —— 故 MCP 单独给一条强提示（`transfer.mcpWarning`）。
+ *
+ * ⚠️ P1-23 末批：本文件此前**整屏中文**（用户 2026-10-26 实测反馈「智能体转让弹窗没有中英文」），
+ * 现全部走字典；带内联 `<strong>` / `<br>` 的那两段按 `03` 的"分段 key"口径拆开，渲染保留原标记。
  */
 
 import { Alert, Modal } from 'antd'
 import { useEffect, useState } from 'react'
+import { translate, type MessageKey } from '@doubulea/shared'
 
 import { useTransferAgent } from '../api/agents.js'
 import { useTransferKnowledgeBase } from '../api/knowledgeBases.js'
 import { useTransferMcpServer } from '../api/mcp.js'
 import { useTransferModelProvider } from '../api/modelPool.js'
 import { useFeedback } from '../app/feedback.js'
+import { useT } from '../app/i18n.js'
 import { AssetUserPicker } from './AssetUserPicker.js'
 
 /** 四类可转移资产 */
 export type TransferableAssetKind = 'AGENT' | 'KNOWLEDGE' | 'MCP' | 'PROVIDER'
 
-const ASSET_KIND_LABEL: Readonly<Record<TransferableAssetKind, string>> = {
-  AGENT: '智能体',
-  KNOWLEDGE: '知识库',
-  MCP: 'MCP server',
-  PROVIDER: 'Provider',
+/** 资产种类 → i18n key（弹窗标题与成功提示里都要说"转的是哪种东西"） */
+const ASSET_KIND_KEY: Readonly<Record<TransferableAssetKind, MessageKey>> = {
+  AGENT: 'label.assetKind.AGENT',
+  KNOWLEDGE: 'label.assetKind.KNOWLEDGE',
+  MCP: 'label.assetKind.MCP',
+  PROVIDER: 'label.assetKind.PROVIDER',
 }
-
-/**
- * MCP 转移的专属警告（`子方案` §3.5 定案原文）。
- *
- * 为什么只对 MCP 说：`created_by` 在 MCP 上是**探测主语** —— 测试 / 工具列表用**所属人**的凭据
- * 连上游（`mcpServer.service.ts#probeServer`）。转移后若新所属人没配凭据，那两条链路会失败，
- * 而用户会以为是"server 坏了"。
- */
-export const MCP_TRANSFER_WARNING =
-  '转移后测试/工具列表将使用新所属人的凭据；若其未配置凭据，测试与工具列表会失败'
 
 export interface TransferOwnershipModalProps {
   open: boolean
@@ -65,6 +61,7 @@ export function TransferOwnershipModal({
   onClose,
   onTransferred,
 }: TransferOwnershipModalProps) {
+  const { t, locale } = useT()
   const feedback = useFeedback()
   // 四个 hook 无条件调用（不能按 assetKind 条件调用 hook —— 违反 hooks 规则）
   const transferAgent = useTransferAgent()
@@ -85,17 +82,17 @@ export function TransferOwnershipModal({
     transferMcpServer.isPending ||
     transferModelProvider.isPending
 
-  const kindLabel = ASSET_KIND_LABEL[assetKind]
+  const kindLabel = translate(locale, ASSET_KIND_KEY[assetKind])
   const canSubmit = toUserId.trim() !== '' && !pending
 
   const confirm = () => {
     const payload = { id: assetId, toUserId: toUserId.trim() }
     const onSuccess = (): void => {
-      feedback.ok(`已把${kindLabel}「${assetName}」转移给新所属人`)
+      feedback.ok(t('transfer.ok', { kind: kindLabel, name: assetName }))
       onTransferred?.()
       onClose()
     }
-    const onError = (error: unknown): void => feedback.fail(error, '转移失败')
+    const onError = (error: unknown): void => feedback.fail(error, t('transfer.failed'))
 
     if (assetKind === 'AGENT') transferAgent.mutate(payload, { onSuccess, onError })
     else if (assetKind === 'KNOWLEDGE') transferKnowledgeBase.mutate(payload, { onSuccess, onError })
@@ -106,34 +103,35 @@ export function TransferOwnershipModal({
   return (
     <Modal
       open={open}
-      title={`转移${kindLabel}所属人`}
-      okText="确认转移"
+      title={t('transfer.title', { kind: kindLabel })}
+      okText={t('transfer.okText')}
       okButtonProps={{ disabled: !canSubmit, loading: pending }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!pending}
     >
       <div className="stack stack--tight">
         <p>
-          资产：<strong>{assetName}</strong>
+          {t('transfer.assetLabel')}
+          <strong>{assetName}</strong>
           <br />
-          当前所属人：<span>{currentOwnerName}</span>
+          {t('transfer.currentOwnerLabel')}
+          <span>{currentOwnerName}</span>
         </p>
 
         <div>
-          <p className="block-label">新所属人</p>
+          <p className="block-label">{t('transfer.newOwnerLabel')}</p>
           <AssetUserPicker value={toUserId} onChange={setToUserId} disabled={pending} />
         </div>
 
         <p className="ratio">
-          转移后，编辑 / 删除 / 改可见性 / 再转移的权限都会交给新所属人（管理员仍可操作全部）。
-          这个动作<strong>不需要对方确认</strong>，请确认对方确实是该资产的负责人。
+          {t('transfer.bodyPrefix')}
+          <strong>{t('transfer.bodyStrong')}</strong>
+          {t('transfer.bodySuffix')}
         </p>
 
-        {assetKind === 'MCP' && (
-          <Alert type="warning" showIcon message={MCP_TRANSFER_WARNING} />
-        )}
+        {assetKind === 'MCP' && <Alert type="warning" showIcon message={t('transfer.mcpWarning')} />}
       </div>
     </Modal>
   )

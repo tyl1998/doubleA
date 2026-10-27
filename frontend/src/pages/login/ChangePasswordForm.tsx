@@ -33,6 +33,7 @@ import { useState } from 'react'
 import { useChangePassword } from '../../api/auth.js'
 import { ApiError } from '../../api/client.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 interface FormValues {
   oldPassword?: string
@@ -64,6 +65,7 @@ export interface ChangePasswordFormProps {
 export function ChangePasswordForm({ knownOldPassword, submitLabel, onSuccess }: ChangePasswordFormProps) {
   const [form] = Form.useForm<FormValues>()
   const feedback = useFeedback()
+  const { t } = useT()
   const changePassword = useChangePassword()
 
   /** 表单级提示（字段级错误标在输入框上，剩下的放这里） */
@@ -97,7 +99,7 @@ export function ChangePasswordForm({ knownOldPassword, submitLabel, onSuccess }:
 
     changePassword.mutate(parsed.data, {
       onSuccess: (user) => {
-        feedback.ok('密码已更新')
+        feedback.ok(t('login.passwordSaved'))
         onSuccess(user)
       },
       onError: (error) => {
@@ -113,7 +115,7 @@ export function ChangePasswordForm({ knownOldPassword, submitLabel, onSuccess }:
           if (newMessage !== undefined) form.setFields([{ name: 'newPassword', errors: [newMessage] }])
           if (oldMessage === undefined && newMessage === undefined) setFormError(error.message)
         }
-        feedback.fail(error, '修改密码失败')
+        feedback.fail(error, t('login.changeFailed'))
       },
     })
   }
@@ -123,39 +125,46 @@ export function ChangePasswordForm({ knownOldPassword, submitLabel, onSuccess }:
       {needOldPasswordInput && (
         <Form.Item
           name="oldPassword"
-          label="当前密码"
-          rules={[{ required: true, message: '请输入当前密码' }]}
+          label={t('login.currentPasswordLabel')}
+          rules={[{ required: true, message: t('login.currentPasswordRequired') }]}
         >
-          <Input.Password autoComplete="current-password" placeholder="初始密码 / 你现在的密码" />
+          <Input.Password
+            autoComplete="current-password"
+            placeholder={t('login.currentPasswordPlaceholder')}
+          />
         </Form.Item>
       )}
 
       <Form.Item
         name="newPassword"
-        label="新密码"
-        extra={`至少 ${PASSWORD_MIN_LENGTH} 个字符，最多 ${PASSWORD_MAX_LENGTH} 个字符（${PASSWORD_MAX_BYTES} 字节，中文按 3 字节计）`}
-        rules={[{ required: true, message: '请输入新密码' }]}
+        label={t('login.newPasswordLabel')}
+        extra={t('login.newPasswordExtra', {
+          min: PASSWORD_MIN_LENGTH,
+          max: PASSWORD_MAX_LENGTH,
+          bytes: PASSWORD_MAX_BYTES,
+        })}
+        rules={[{ required: true, message: t('login.newPasswordRequired') }]}
       >
-        <Input.Password autoComplete="new-password" placeholder="设置一个新密码" />
+        <Input.Password autoComplete="new-password" placeholder={t('login.newPasswordPlaceholder')} />
       </Form.Item>
 
       <Form.Item
         name="confirmPassword"
-        label="确认新密码"
+        label={t('login.confirmPasswordLabel')}
         dependencies={['newPassword']}
         rules={[
-          { required: true, message: '请再次输入新密码' },
+          { required: true, message: t('login.confirmPasswordRequired') },
           ({ getFieldValue }) => ({
             validator(_rule, value: unknown) {
               if (value === undefined || value === '' || value === getFieldValue('newPassword')) {
                 return Promise.resolve()
               }
-              return Promise.reject(new Error('两次输入的密码不一致'))
+              return Promise.reject(new Error(t('login.passwordMismatch')))
             },
           }),
         ]}
       >
-        <Input.Password autoComplete="new-password" placeholder="再输入一次" />
+        <Input.Password autoComplete="new-password" placeholder={t('login.confirmPasswordPlaceholder')} />
       </Form.Item>
 
       {formError !== null && (

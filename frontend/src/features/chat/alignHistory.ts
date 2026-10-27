@@ -30,7 +30,8 @@
  * 于是"丢哪一份"这件事可以被无依赖档逐种输入断言（含上面三种错法各自的输入）。
  */
 
-import type { ConversationActive, MessageItem } from '@doubulea/shared'
+import type { ConversationActive, Locale, MessageItem } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 /** 对齐的结论（三种，互斥且穷尽） */
 export type AlignOutcomeKind =
@@ -68,12 +69,16 @@ export function shouldDropStreamVersion(
 }
 
 /** `/active` 快照 → 一句进度（`queuedPosition` / `currentTool` 都可能为 `null`） */
-function progressNote(active: ConversationActive | null): string {
+function progressNote(active: ConversationActive | null, locale: Locale): string {
   if (active === null) return ''
   const parts: string[] = []
-  if (active.queuedPosition !== null) parts.push(`排队第 ${active.queuedPosition} 位`)
-  if (active.currentTool !== null) parts.push(`当前工具：${active.currentTool}`)
-  return parts.length === 0 ? '' : `（${parts.join(' · ')}）`
+  if (active.queuedPosition !== null) {
+    parts.push(translate(locale, 'align.queuedPosition', { position: active.queuedPosition }))
+  }
+  if (active.currentTool !== null) parts.push(translate(locale, 'align.currentTool', { tool: active.currentTool }))
+  return parts.length === 0
+    ? ''
+    : translate(locale, 'align.progressWrapper', { progress: parts.join(translate(locale, 'align.progressSeparator')) })
 }
 
 /**
@@ -89,14 +94,15 @@ export function decideAlign(input: {
   before: readonly MessageItem[]
   after: readonly MessageItem[]
   active: ConversationActive | null
+  locale: Locale
 }): AlignOutcome {
-  const { before, after, active } = input
+  const { before, after, active, locale } = input
 
   if (active !== null && active.streaming) {
     return {
       kind: 'server-still-streaming',
       dropStreamVersion: false,
-      note: `服务端仍在生成这一轮${progressNote(active)}，先不要重复发送`,
+      note: translate(locale, 'align.serverStillStreaming', { progress: progressNote(active, locale) }),
     }
   }
 
@@ -104,13 +110,13 @@ export function decideAlign(input: {
     return {
       kind: 'recovered',
       dropStreamVersion: true,
-      note: '已用服务端保存的版本对齐',
+      note: translate(locale, 'align.recovered'),
     }
   }
 
   return {
     kind: 'not-persisted',
     dropStreamVersion: false,
-    note: '服务端没有这一轮的记录，界面上这份是唯一副本（保留）',
+    note: translate(locale, 'align.notPersisted'),
   }
 }

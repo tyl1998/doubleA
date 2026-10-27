@@ -20,7 +20,7 @@
  *    `infra/logger.ts#LOG_REDACT_PATHS` 已含 `*_enc` 兜底。
  */
 
-import {
+import { appMsg,
   AppError,
   GIT_CREDENTIAL_MAX_PER_USER_DEFAULT,
   missingGitCredentialSecretFields,
@@ -188,9 +188,7 @@ export async function createGitCredential(
   const db = getPrisma()
   const count = await db.gitCredential.count({ where: { userId: viewer.userId } })
   if (count >= maxPerUser()) {
-    throw AppError.validation(
-      `git 凭据最多 ${maxPerUser()} 条（当前 ${count} 条）。每建一个容器都会把凭据解密注入，` +
-        '没上限时一次注入几十把私钥是自伤 —— 请先删掉不再需要的再来加。',
+    throw AppError.validation(appMsg('app.m264', { p0: maxPerUser(), p1: count }),
     )
   }
 
@@ -202,8 +200,7 @@ export async function createGitCredential(
   }
   const missing = missingGitCredentialSecretFields(input.kind, secret)
   if (missing.length > 0) {
-    throw AppError.validation(
-      `${input.kind === 'SSH_KEY' ? 'SSH 私钥' : 'HTTPS 令牌'}凭据缺少必填字段：${missing.join('、')}`,
+    throw AppError.validation(appMsg('app.m159', { p0: input.kind === 'SSH_KEY' ? 'SSH 私钥' : 'HTTPS 令牌', p1: missing.join('、') }),
     )
   }
 
@@ -218,7 +215,7 @@ export async function createGitCredential(
   try {
     row = await db.gitCredential.create({ data, select: GIT_CREDENTIAL_SELECT })
   } catch (error) {
-    if (isUniqueViolation(error)) throw AppError.conflict(`你已经有一条名为「${input.label}」的 git 凭据了`)
+    if (isUniqueViolation(error)) throw AppError.conflict(appMsg('app.m026', { p0: input.label }))
     throw error
   }
   getLogger().info({ userId: viewer.userId, kind: input.kind, label: input.label }, '已新建 git 凭据')
@@ -240,7 +237,7 @@ export async function updateGitCredential(
 ): Promise<GitCredentialItem> {
   const db = getPrisma()
   const existing = await db.gitCredential.findFirst({ where: { id, userId: viewer.userId }, select: GIT_CREDENTIAL_SELECT })
-  if (existing === null) throw AppError.notFound('git 凭据不存在')
+  if (existing === null) throw AppError.notFound(appMsg('app.m027'))
 
   const nextLabel = input.label ?? existing.label
   const currentSecret = decryptSecretOf(viewer.userId, existing.kind, existing.label, existing.secretEnc) ?? {}
@@ -253,7 +250,7 @@ export async function updateGitCredential(
   // 合并后仍缺必填 ⇒ 拒绝（不能让一条已存在的凭据被改成"没有值"）
   const missing = missingGitCredentialSecretFields(existing.kind, nextSecret)
   if (missing.length > 0) {
-    throw AppError.validation(`合并后仍缺少必填字段：${missing.join('、')}（若要清掉请直接删除该条凭据）`)
+    throw AppError.validation(appMsg('app.m160', { p0: missing.join('、') }))
   }
 
   const data = {
@@ -266,7 +263,7 @@ export async function updateGitCredential(
   try {
     row = await db.gitCredential.update({ where: { id: existing.id }, data, select: GIT_CREDENTIAL_SELECT })
   } catch (error) {
-    if (isUniqueViolation(error)) throw AppError.conflict(`你已经有一条名为「${nextLabel}」的 git 凭据了`)
+    if (isUniqueViolation(error)) throw AppError.conflict(appMsg('app.m026', { p0: nextLabel }))
     throw error
   }
   getLogger().info({ userId: viewer.userId, kind: existing.kind, label: nextLabel }, '已更新 git 凭据')
@@ -286,7 +283,7 @@ export async function removeGitCredential(
     where: { id, userId: viewer.userId },
     select: { id: true, label: true },
   })
-  if (existing === null) throw AppError.notFound('git 凭据不存在')
+  if (existing === null) throw AppError.notFound(appMsg('app.m027'))
   await db.gitCredential.delete({ where: { id: existing.id } })
   getLogger().info({ userId: viewer.userId, gitCredentialId: existing.id }, '已删除 git 凭据')
   return { id: existing.id, label: existing.label }

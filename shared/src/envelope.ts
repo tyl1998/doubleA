@@ -19,6 +19,7 @@ import {
   isAppError,
   type ErrorCode,
 } from './errors.js'
+import type { AppMessagePayload } from './i18n/appMessage.js'
 
 /** 成功码字面量 */
 export const OK_CODE = 0 as const
@@ -40,6 +41,14 @@ export interface SuccessEnvelope<T = unknown> extends Envelope<T> {
 /** 失败响应 */
 export interface ErrorEnvelope extends Envelope<unknown> {
   code: ErrorCode
+  /**
+   * 细节消息的**结构化形态**（P1-23 收尾 ⑤）—— 可选。
+   *
+   * 有它时前端按当前语言渲染 `msgKey`，没有就退回 `msg`（中文正文）。
+   * 为什么是**新增可选字段**而不是把 `msg` 换成 key：`msg` 是既有契约
+   * （`02` §四 规则 1），日志、zh 界面、以及所有既有断言都读它 —— 换掉是净损失。
+   */
+  msgKey?: AppMessagePayload
 }
 
 /** 构造成功信封 */
@@ -135,7 +144,12 @@ export function cursorPageOf<T extends z.ZodTypeAny>(item: T) {
  *   原始错误请在后端侧用日志记（`infra/logger.ts` 的 err 序列化）。
  */
 export function toErrorEnvelope(error: unknown): ErrorEnvelope {
-  if (isAppError(error)) return fail(error.code, error.message, error.data ?? null)
+  if (isAppError(error)) {
+    const envelope: ErrorEnvelope = fail(error.code, error.message, error.data ?? null)
+    // `AppError.msgKey` 只在用 `appMsg(...)` 构造时才有（见 `i18n/appMessage.ts`）
+    if (error.msgKey !== null && error.msgKey !== undefined) envelope.msgKey = error.msgKey
+    return envelope
+  }
   return fail('INTERNAL', DEFAULT_MESSAGE_BY_ERROR_CODE.INTERNAL, null)
 }
 

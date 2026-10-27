@@ -148,13 +148,18 @@ const {
   REUPLOAD_UNCHANGED_HINT,
   isDocumentSearchable,
   DEFAULT_RETRIEVAL_CONFIG,
+  translate,
 } = await import('@doubulea/shared')
+
+// P1-23 第七批：`pages/knowledge` 的纯函数多收一个 `locale`（译文搬去 `shared/src/i18n`）。
+// 本档统一用 `'zh'` 断言 —— 中文形态逐字未变，这里只多喂一个参数（同 6a/6b/6c 的做法）。
+const ZH = 'zh'
 
 const {
   UPLOAD_ACCEPT_ATTRIBUTE,
   extensionOf,
-  screenPickedFiles,
-  screenLegacyDocContent,
+  screenPickedFiles: screenPickedFilesRaw,
+  screenLegacyDocContent: screenLegacyDocContentRaw,
   sniffLegacyDocHead,
   documentExtensionLabel,
   DOCUMENT_STATUS_META,
@@ -164,27 +169,46 @@ const {
   DOCUMENT_POLL_INTERVAL_MS,
   shouldPollDocuments,
   documentRefetchInterval,
-  RETRIEVAL_MODE_LABEL,
-  SPLIT_STRATEGY_LABEL,
-  describeRetrieval,
-  describeChunking,
-  embeddingChangedNotice,
+  RETRIEVAL_MODE_LABEL_KEY,
+  SPLIT_STRATEGY_LABEL_KEY,
+  describeRetrieval: describeRetrievalRaw,
+  describeChunking: describeChunkingRaw,
+  embeddingChangedNotice: embeddingChangedNoticeRaw,
   similarityText,
   rrfScoreText,
   rankText,
-  hitSourceText,
-  chunkLocationText,
-  chunkLengthText,
-  searchNotice,
+  hitSourceText: hitSourceTextRaw,
+  chunkLocationText: chunkLocationTextRaw,
+  chunkLengthText: chunkLengthTextRaw,
+  searchNotice: searchNoticeRaw,
   buildCreateBody,
   buildKnowledgeUpdateBody,
   buildRetrievalPatch,
   retrievalValuesOf,
   editValuesOf,
-  validateChunking,
+  validateChunking: validateChunkingRaw,
   summarizeDocuments,
   EMPTY_KNOWLEDGE_FORM_VALUES,
 } = await import('../src/pages/knowledge/knowledgeModel.ts')
+
+/** 文案取值为 key 的映射，断言时按 zh 落译文（与界面同一条取文路径） */
+const RETRIEVAL_MODE_LABEL = Object.fromEntries(
+  Object.entries(RETRIEVAL_MODE_LABEL_KEY).map(([key, messageKey]) => [key, translate(ZH, messageKey)]),
+)
+const SPLIT_STRATEGY_LABEL = Object.fromEntries(
+  Object.entries(SPLIT_STRATEGY_LABEL_KEY).map(([key, messageKey]) => [key, translate(ZH, messageKey)]),
+)
+/** 被测项的统一夹具：补上 `locale`（各调用方不复述参数，中文形态与原断言一致） */
+const screenPickedFiles = (files) => screenPickedFilesRaw(files, ZH)
+const screenLegacyDocContent = (name, head) => screenLegacyDocContentRaw(name, head, ZH)
+const describeRetrieval = (config) => describeRetrievalRaw(config, ZH)
+const describeChunking = (kb) => describeChunkingRaw(kb, ZH)
+const embeddingChangedNotice = (changed) => embeddingChangedNoticeRaw(changed, ZH)
+const hitSourceText = (hit) => hitSourceTextRaw(hit, ZH)
+const chunkLocationText = (chunk) => chunkLocationTextRaw(chunk, ZH)
+const chunkLengthText = (content) => chunkLengthTextRaw(content, ZH)
+const searchNotice = (result) => searchNoticeRaw(result, ZH)
+const validateChunking = (size, overlap) => validateChunkingRaw(size, overlap, ZH)
 
 const { fileNameFromContentDisposition } = await import('../src/api/client.ts')
 
@@ -337,11 +361,16 @@ await it('B1 三态各有颜色，且 `READY` 的绿与 `isDocumentSearchable` *
   }
 })
 
-await it('B2 `PARSING` 的说明文案来自 `shared`（"暂不参与检索"那句）', () => {
-  assertEqual(DOCUMENT_STATUS_META.PARSING.hint, DOCUMENT_PARSING_HINT, '必须是同一个常量（前后端共用一句）')
+await it('B2 `PARSING` 的说明文案与 `shared` 那句**逐字一致**（"暂不参与检索"）', () => {
+  // P1-23：界面侧改成存 key（`hintKey`），真相仍在 `shared` 那句常量 —— 守门转向"ZH 译文 === 常量"。
+  assertEqual(
+    translate(ZH, DOCUMENT_STATUS_META.PARSING.hintKey),
+    DOCUMENT_PARSING_HINT,
+    '界面按 key 取的 zh 译文必须与 shared 那句逐字相同（否则"传完搜不到"会出现两种说法）',
+  )
   assertIncludes(DOCUMENT_PARSING_HINT, '暂不参与检索', '这句话是"传完搜不到"的唯一解释')
-  assertEqual(DOCUMENT_STATUS_META.READY.hint, null, 'READY 不需要额外说明')
-  assertEqual(DOCUMENT_STATUS_META.FAILED.hint, null, 'FAILED 的原因来自 errorMsg（每篇都不同）')
+  assertEqual(DOCUMENT_STATUS_META.READY.hintKey, null, 'READY 不需要额外说明')
+  assertEqual(DOCUMENT_STATUS_META.FAILED.hintKey, null, 'FAILED 的原因来自 errorMsg（每篇都不同）')
 })
 
 await it('B3 片段数：非 `READY` 显示 `—` 而不是 0', () => {
@@ -394,8 +423,8 @@ await it('C3b 「查看片段」的可见性与 `isDocumentSearchable` **同源*
 })
 
 await it('C4 两种状态下的「重试」说明**不是同一句**', () => {
-  const parsing = documentActions('PARSING').retryHint
-  const failed = documentActions('FAILED').retryHint
+  const parsing = translate(ZH, documentActions('PARSING').retryHintKey)
+  const failed = translate(ZH, documentActions('FAILED').retryHintKey)
   assert(parsing !== failed, '同句会让"解析中"那个按钮看起来像"重试一个失败的东西"')
   assertIncludes(parsing, '解析中', '解析中那条要说明"卡住时可以重来"')
 })
@@ -630,7 +659,9 @@ await it('G5 删除弹窗不再逐字确认、也不因"被智能体绑定"而�
   assertExcludes(modal, 'disabled: bound', '不再因被绑定而禁用删除按钮')
   assertExcludes(modal, '409', '不再宣称"后端会拒绝（409）"')
   assertIncludes(modal, 'unboundAgents', '成功提示带上"解绑了几个智能体"')
-  assertIncludes(modal, '会自动解除这些智能体的绑定', '被引用时给出"自动解绑"的说明')
+  // P1-23 第七批：文案搬进字典（组件存 key）⇒ 守门转向"组件用 key + 字典里那句含自动解绑"。
+  assertIncludes(modal, 'deleteKb.boundDesc', '被引用时给出"自动解绑"的说明（key）')
+  assertIncludes(translate(ZH, 'deleteKb.boundDesc'), '会自动解除这些智能体的绑定', '字典那句要写明"自动解绑"')
 })
 
 await it('G6 覆盖重建"内容未变化"的提示只有一处写法（shared 常量）', () => {
@@ -775,7 +806,9 @@ await it('J4 表格里「查看片段」按钮受 `actions.canPreviewChunks` 门
   const table = sourceFiles().find(({ name }) => name === 'pages/knowledge/DocumentTable.tsx')
   assert(table !== undefined, '找不到 DocumentTable.tsx')
   assertIncludes(table.source, 'actions.canPreviewChunks', '按钮可见性必须来自 documentActions')
-  assertIncludes(table.source, '查看片段', '按钮文案')
+  // P1-23 第七批：按钮文案改成 key（`docTable.previewChunks`）—— 守门转向"组件用 key + 字典译文"。
+  assertIncludes(table.source, 'docTable.previewChunks', '按钮文案用 key')
+  assertIncludes(translate(ZH, 'docTable.previewChunks'), '查看片段', '字典那句是"查看片段"')
 })
 
 // ───────────────────────────── 结论表 ─────────────────────────────

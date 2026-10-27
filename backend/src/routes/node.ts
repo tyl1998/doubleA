@@ -21,7 +21,7 @@
  */
 
 import { z } from 'zod'
-import { AppError, ok } from '@doubulea/shared'
+import { appMsg, AppError, ok } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
 
 import { config } from '../config.js'
@@ -60,7 +60,7 @@ async function resolveTarget(instanceId: string): Promise<NodeTarget> {
   const { items } = await listSandboxInstances()
   const found = items.find((item) => item.instanceId === instanceId)
   if (found !== undefined) return { instanceId, advertiseAddr: found.advertiseAddr }
-  throw AppError.notFound(`实例 ${instanceId} 不在线（注册表里没有它），无法操作`)
+  throw AppError.notFound(appMsg('app.m102', { p0: instanceId }))
 }
 
 function toAppError(error: unknown): never {
@@ -102,7 +102,7 @@ export function registerNodeRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAdmin, schema: { params: jobParamsSchema } },
     async (request) => {
       const job = await getJob(request.params.instanceId, request.params.jobId)
-      if (job === undefined) throw AppError.notFound('初始化任务不存在或已过期（快照保留 2 小时）')
+      if (job === undefined) throw AppError.notFound(appMsg('app.m103'))
       return ok(job)
     },
   )

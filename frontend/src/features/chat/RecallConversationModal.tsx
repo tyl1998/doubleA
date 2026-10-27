@@ -21,6 +21,7 @@ import type { RecallConversationResult } from '@doubulea/shared'
 import { useRecallLastRound } from '../../api/conversations.js'
 import { describeError } from '../../api/client.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 /** 撤回目标：`null` = 弹窗关闭 */
 export interface RecallTarget {
@@ -49,6 +50,7 @@ export function RecallConversationModal({
   onRecalled,
 }: RecallConversationModalProps) {
   const feedback = useFeedback()
+  const { t } = useT()
   const recall = useRecallLastRound(agentId)
   const [errorText, setErrorText] = useState<string | null>(null)
 
@@ -66,12 +68,18 @@ export function RecallConversationModal({
     recall.mutate(conversationId, {
       onSuccess: (result) => {
         if (target.resend) {
-          feedback.ok('已撤回，正文已放回输入框（可修改后重新发送）')
+          feedback.ok(t('recall.okResendDone'))
         } else {
           feedback.ok(
             result.deletedMessages === 0
-              ? '已撤回最新一轮'
-              : `已撤回最新一轮（删除 ${result.deletedMessages} 条消息${result.deletedArtifacts > 0 ? `、${result.deletedArtifacts} 个产物` : ''}）`,
+              ? t('recall.okRecallDone')
+              : t('recall.okRecallDoneWithCount', {
+                  messages: result.deletedMessages,
+                  artifacts:
+                    result.deletedArtifacts > 0
+                      ? t('recall.okRecallDoneArtifacts', { count: result.deletedArtifacts })
+                      : '',
+                }),
           )
         }
         onRecalled(result, target)
@@ -87,37 +95,43 @@ export function RecallConversationModal({
       open
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          {target.resend ? '修改重发' : '撤回最新一轮'}
-          <Tag className="tag--danger">仅最新一轮</Tag>
+          {target.resend ? t('recall.titleResend') : t('recall.titleRecall')}
+          <Tag className="tag--danger">{t('recall.tag')}</Tag>
         </span>
       }
-      okText={target.resend ? '撤回并修改' : '确认撤回'}
+      okText={target.resend ? t('recall.okResend') : t('recall.okRecall')}
       okButtonProps={{ danger: true, loading: recalling }}
-      cancelText="取消"
+      cancelText={t('confirm.reject')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!recalling}
     >
       <div className="stack stack--tight">
         <p>
-          将删除本会话<strong>最新一轮</strong>（你的问题与这一轮的回答）。
-          {target.resend && <>正文会放回输入框，改完再发会生成一轮新的回答。</>}
+          {t('recall.bodyPrefix')}
+          <strong>{t('recall.bodyStrong')}</strong>
+          {t('recall.bodySuffix')}
+          {target.resend && <>{t('recall.bodyResendSuffix')}</>}
         </p>
 
         {target.hadTools && (
           <Alert
             type="warning"
             showIcon
-            message="这一轮调用过工具"
-            description="工具的执行效果（如写入数据、调用外部系统）已经发生，撤回无法复原这些操作。"
+            message={t('recall.toolsTitle')}
+            description={t('recall.toolsDescription')}
           />
         )}
 
         <p className="ratio">
-          撤回不会影响更早的对话；已删除的这一轮<strong>无法恢复</strong>（P0 没有回收站）。
+          {t('recall.footPrefix')}
+          <strong>{t('recall.footStrong')}</strong>
+          {t('recall.footSuffix')}
         </p>
 
-        {errorText !== null && <Alert type="error" showIcon message="撤回失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('recall.failed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

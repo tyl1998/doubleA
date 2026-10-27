@@ -39,16 +39,16 @@ import { useCurrentUser } from '../../api/auth.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { InitialPasswordModal } from './InitialPasswordModal.js'
 import { UserFormModal } from './UserFormModal.js'
 import { UserGroupsPanel } from './UserGroupsPanel.js'
-import { USER_ROLE_LABELS, describeUserStatus, userRowActions } from './adminModel.js'
+import { describeUserStatus, userRowActions, userRoleLabel } from './adminModel.js'
 
-/** 建号成功的提示里要提一句密码口径 —— 读数来自 `shared` 的常量，不写死数字 */
-const PASSWORD_RULE_HINT = `后端生成的初始密码是 18 位随机串；本人自助改密时要求 8~64 字符、不超过 ${PASSWORD_MAX_BYTES} 字节（中文按 3 字节计）。`
 
 export function UsersListPage() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const { data: currentUser } = useCurrentUser()
   const { data, isPending, isError, error, isFetching, refetch } = useAdminUsers()
   const update = useUpdateUser()
@@ -84,11 +84,11 @@ export function UsersListPage() {
         onSuccess: (saved) => {
           feedback.ok(
             disabling
-              ? `已停用「${saved.username}」，他的下一个请求会立刻 401`
-              : `已启用「${saved.username}」`,
+              ? t('users.disabledOk', { name: saved.username })
+              : t('users.enabledOk', { name: saved.username }),
           )
         },
-        onError: (error_) => feedback.fail(error_, disabling ? '停用失败' : '启用失败'),
+        onError: (error_) => feedback.fail(error_, disabling ? t('users.disableFailed') : t('users.enableFailed')),
       },
     )
   }
@@ -99,13 +99,13 @@ export function UsersListPage() {
         setPasswordForReset(true)
         setPasswordResult(result)
       },
-      onError: (error_) => feedback.fail(error_, '重置密码失败'),
+      onError: (error_) => feedback.fail(error_, t('users.resetFailed')),
     })
   }
 
   const columns: TableColumnsType<UserListItem> = [
     {
-      title: '用户',
+      title: t('users.colUser'),
       dataIndex: 'username',
       render: (_, user) => (
         <div className="kb-cell">
@@ -114,31 +114,31 @@ export function UsersListPage() {
             {user.id === currentUserId && (
               // 标出"这是我自己"：下面两个灰掉的操作键看起来才不像"权限不够"
               <Tag className="tag--accent" style={{ marginLeft: 'var(--sp-2)' }}>
-                你自己
+                {t('users.selfTag')}
               </Tag>
             )}
           </span>
-          <span className="kb-cell__sub">{user.nickname ?? '（未设置显示名）'}</span>
+          <span className="kb-cell__sub">{user.nickname ?? t('users.noNickname')}</span>
         </div>
       ),
     },
     {
-      title: '角色',
+      title: t('users.colRole'),
       dataIndex: 'role',
       width: 100,
       render: (_, user) => (
-        <Tag className={user.role === 'ADMIN' ? 'tag--warn' : undefined}>{USER_ROLE_LABELS[user.role]}</Tag>
+        <Tag className={user.role === 'ADMIN' ? 'tag--warn' : undefined}>{userRoleLabel(user.role, locale)}</Tag>
       ),
     },
     {
       // P1-18：该用户**所在的用户组**（服务端下发，已按组名排序）。组是 Agent「指定用户」受众的
       // 主授权单位 ⇒ "谁在哪些组里"应当在用户列表一眼可见（与「用户组」tab 同源，不另算一份）。
-      title: '所在组',
+      title: t('users.colGroups'),
       dataIndex: 'groups',
       width: 200,
       render: (_, user) =>
         user.groups.length === 0 ? (
-          <span className="ratio">未分组</span>
+          <span className="ratio">{t('users.noGroup')}</span>
         ) : (
           <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
             {user.groups.map((group) => (
@@ -148,7 +148,7 @@ export function UsersListPage() {
         ),
     },
     {
-      title: '状态',
+      title: t('users.colStatus'),
       dataIndex: 'status',
       width: 220,
       render: (_, user) => {
@@ -158,21 +158,21 @@ export function UsersListPage() {
             {/* 状态灯 + 文案两重表达（`.led--*` 是 P0-1-31 起在用的那三个） */}
             <span className="row" style={{ gap: 'var(--sp-2)' }}>
               <span className={`led led--${view.led}`} aria-hidden="true" />
-              <span>{view.label}</span>
+              <span>{t(view.labelKey)}</span>
             </span>
-            {view.hint !== null && <span className="kb-cell__sub">{view.hint}</span>}
+            {view.hintKey !== null && <span className="kb-cell__sub">{t(view.hintKey)}</span>}
           </div>
         )
       },
     },
     {
-      title: '创建时间',
+      title: t('users.colCreated'),
       dataIndex: 'createdAt',
       width: 130,
       render: (_, user) => <span className="num">{formatUpdatedAt(user.createdAt)}</span>,
     },
     {
-      title: '操作',
+      title: t('users.colActions'),
       key: 'actions',
       width: 250,
       align: 'right',
@@ -187,31 +187,31 @@ export function UsersListPage() {
           <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
             {/* 编辑恒可点（弹窗里还有只读的用户名/显示名可看，不只是"改角色"） */}
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setEditing(user)}>
-              编辑
+              {t('common.edit')}
             </Button>
 
             {toggleAction?.disabled === true ? (
               // 灰掉的操作键**必须**能说出为什么（`title` 是给鼠标的，`aria-disabled` 给读屏）
-              <Tooltip title={toggleAction.reason ?? ''}>
+              <Tooltip title={toggleAction.reasonKey === null ? '' : t(toggleAction.reasonKey)}>
                 <span>
                   <Button type="link" size="small" style={{ padding: 0 }} disabled>
-                    {toggleAction.label}
+                    {toggleAction.labelKey === undefined ? null : t(toggleAction.labelKey)}
                   </Button>
                 </span>
               </Tooltip>
             ) : (
               <Popconfirm
                 title={
-                  user.status === 'ACTIVE' ? `停用「${user.username}」？` : `启用「${user.username}」？`
+                  user.status === 'ACTIVE'
+                    ? t('users.disableTitle', { name: user.username })
+                    : t('users.enableTitle', { name: user.username })
                 }
                 description={
-                  user.status === 'ACTIVE'
-                    ? '停用后他的下一个请求就会 401（后端会失效会话快照），正在进行的对话也会被打断。账号与数据都保留，可以随时启用回来。'
-                    : '启用后他可以重新登录。如果他还处于"待首次改密"状态，登录后仍会先被要求改密。'
+                  user.status === 'ACTIVE' ? t('users.disableDesc') : t('users.enableDesc')
                 }
-                okText={user.status === 'ACTIVE' ? '停用' : '启用'}
+                okText={user.status === 'ACTIVE' ? t('users.disable') : t('users.enable')}
                 okButtonProps={{ danger: user.status === 'ACTIVE' }}
-                cancelText="取消"
+                cancelText={t('common.cancel')}
                 onConfirm={() => toggleStatus(user)}
               >
                 <Button
@@ -220,29 +220,29 @@ export function UsersListPage() {
                   danger={user.status === 'ACTIVE'}
                   style={{ padding: 0 }}
                 >
-                  {toggleAction?.label}
+                  {toggleAction === undefined ? null : t(toggleAction.labelKey)}
                 </Button>
               </Popconfirm>
             )}
 
             {resetAction?.disabled === true ? (
-              <Tooltip title={resetAction.reason ?? ''}>
+              <Tooltip title={resetAction.reasonKey === null ? '' : t(resetAction.reasonKey)}>
                 <span>
                   <Button type="link" size="small" style={{ padding: 0 }} disabled>
-                    重置密码
+                    {t('users.reset')}
                   </Button>
                 </span>
               </Tooltip>
             ) : (
               <Popconfirm
-                title={`重置「${user.username}」的密码？`}
-                description="会生成一个新的初始密码（只显示一次），对方当前密码立即失效、必须在下次登录时改密；他的连续登录失败计数也会被清掉。"
-                okText="重置"
-                cancelText="取消"
+                title={t('users.resetTitle', { name: user.username })}
+                description={t('users.resetDesc')}
+                okText={t('users.reset')}
+                cancelText={t('common.cancel')}
                 onConfirm={() => doReset(user)}
               >
                 <Button type="link" size="small" style={{ padding: 0 }} loading={reset.isPending && reset.variables === user.id}>
-                  重置密码
+                  {t('users.reset')}
                 </Button>
               </Popconfirm>
             )}
@@ -255,11 +255,15 @@ export function UsersListPage() {
   const head = (
     <div className="page__head">
       <div>
-        <h1>用户管理</h1>
+        <h1>{t('users.title')}</h1>
         <p className="page__lead">
-          管理平台账号（<strong>用户</strong>）与 Agent 受众用的<strong>用户组</strong>。
-          建号后的初始密码<strong>只显示一次</strong>；停用会立刻失效（下一个请求即 401）。
-          管理员不能对自己做停用 / 降级 / 重置密码 —— 这一条是后端定的（防止把自己锁在门外）。
+          {t('users.leadPrefix')}
+          <strong>{t('users.leadStrong1')}</strong>
+          {t('users.leadMid')}
+          <strong>{t('users.leadStrong2')}</strong>
+          {t('users.leadSuffix')}
+          <strong>{t('users.leadStrong3')}</strong>
+          {t('users.leadMid2')}
         </p>
       </div>
     </div>
@@ -272,22 +276,22 @@ export function UsersListPage() {
           allowClear
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
-          placeholder="搜索用户名或显示名…"
+          placeholder={t('users.searchPlaceholder')}
           style={{ width: 260 }}
-          aria-label="搜索用户"
+          aria-label={t('users.searchAria')}
         />
         <span className="ratio">
-          共 <span className="num">{total}</span> 个账号 · 缓存 30s
+          {t('users.sourceCount', { total })}
           {total > items.length && (
             <>
               {' '}
-              · 本次取回前 <span className="num">{items.length}</span> 个（<code>limit</code> 上限 100）
+              {t('users.sourceMore', { shown: items.length })}
             </>
           )}
         </span>
         <div className="u-right">
           <Button type="primary" onClick={() => setCreating(true)}>
-            创建用户
+            {t('users.create')}
           </Button>
         </div>
       </div>
@@ -296,8 +300,8 @@ export function UsersListPage() {
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="关于密码"
-        description={PASSWORD_RULE_HINT}
+        message={t('users.passwordNoteTitle')}
+        description={t('users.passwordNoteDesc', { hint: t('users.passwordRuleHint', { max: PASSWORD_MAX_BYTES }) })}
       />
 
       {isPending ? (
@@ -305,11 +309,11 @@ export function UsersListPage() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有用户"
-            lead="系统里至少会有一个种子脚本创建的管理员（就是当前登录的你）。如果这一页是空的，说明种子没播或数据库被清过 —— 可以先建一个成员账号试一条链路。"
+            title={t('users.emptyTitle')}
+            lead={t('users.emptyLead')}
             action={
               <Button type="primary" onClick={() => setCreating(true)}>
-                创建用户
+                {t('users.create')}
               </Button>
             }
           />
@@ -317,15 +321,15 @@ export function UsersListPage() {
       ) : filtered.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="没有匹配的用户"
-            lead={`当前筛选条件下没有结果（关键字「${keyword.trim()}」）。`}
+            title={t('users.noMatchTitle')}
+            lead={t('users.noMatchLead', { keyword: keyword.trim() })}
             action={
               <Button
                 onClick={() => {
                   setKeyword('')
                 }}
               >
-                清空筛选
+                {t('users.clearFilter')}
               </Button>
             }
           />
@@ -339,7 +343,7 @@ export function UsersListPage() {
             dataSource={filtered}
             // 加载态由页面骨架屏承担，这里不再叠一层 AntD 遮罩转圈
             loading={false}
-            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 个 · 每页 20` }}
+            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => t('users.total', { count }) }}
             scroll={{ x: 1000 }}
           />
         </div>
@@ -352,7 +356,7 @@ export function UsersListPage() {
       <>
         {head}
         <ErrorState
-          title="用户列表加载失败"
+          title={t('users.loadFailed')}
           error={error}
           retrying={isFetching}
           onRetry={() => {
@@ -371,8 +375,8 @@ export function UsersListPage() {
         activeKey={tab}
         onChange={(key) => setTab(key as 'users' | 'groups')}
         items={[
-          { key: 'users', label: '用户', children: usersTab },
-          { key: 'groups', label: '用户组', children: <UserGroupsPanel /> },
+          { key: 'users', label: t('users.tabUsers'), children: usersTab },
+          { key: 'groups', label: t('users.tabGroups'), children: <UserGroupsPanel /> },
         ]}
       />
 

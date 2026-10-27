@@ -6,12 +6,21 @@
  * 能进无依赖验收档（`verify-sandbox-instances-ui.mjs`）逐条断言。
  */
 
-import type { NodeBootstrapJob, NodeBootstrapStatus, NodeBootstrapStepState, NodeBootstrapTaskStep } from '@doubulea/shared'
+import type {
+  Locale,
+  MessageKey,
+  NodeBootstrapJob,
+  NodeBootstrapStatus,
+  NodeBootstrapStepState,
+  NodeBootstrapTaskStep,
+} from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
-export const JOB_STATUS_LABELS: Readonly<Record<NodeBootstrapStatus, string>> = {
-  running: '初始化中',
-  succeeded: '已完成',
-  failed: '未通过',
+/** 任务状态 → i18n key（P1-23：存 key 不存文案） */
+export const JOB_STATUS_LABEL_KEY: Readonly<Record<NodeBootstrapStatus, MessageKey>> = {
+  running: 'bootstrap.state.running',
+  succeeded: 'bootstrap.state.succeeded',
+  failed: 'bootstrap.state.failed',
 }
 
 /** antd 进度条状态：跑着 = active（有条纹动效）；失败 = exception；成功 = success */
@@ -77,12 +86,14 @@ export function shouldShowJob(job: NodeBootstrapJob | null | undefined): job is 
 }
 
 /** 结论一句话（结果区标题） */
-export function jobHeadline(job: NodeBootstrapJob): string {
-  if (job.status === 'running') return `正在初始化实例 ${job.instanceId}（只修未就绪项，已就绪的会跳过）`
+export function jobHeadline(job: NodeBootstrapJob, locale: Locale): string {
+  if (job.status === 'running') return translate(locale, 'bootstrap.running', { id: job.instanceId })
   if (job.status === 'failed' && job.ok !== true) {
-    return job.report?.ready === true
-      ? `实例 ${job.instanceId} 初始化结束（自检已就绪）`
-      : `实例 ${job.instanceId} 初始化结束，但仍有未就绪项`
+    return translate(
+      locale,
+      job.report?.ready === true ? 'bootstrap.finishedReady' : 'bootstrap.finishedNotReady',
+      { id: job.instanceId },
+    )
   }
-  return `实例 ${job.instanceId} 初始化完成，已就绪`
+  return translate(locale, 'bootstrap.completed', { id: job.instanceId })
 }

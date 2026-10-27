@@ -70,11 +70,16 @@ const {
   revertActionLabel,
   isWorkspacePathInDir,
   WORKSPACE_CONTAINER_ROOT,
-  WORKSPACE_COPY_ITEMS,
+  WORKSPACE_COPY_ITEM_KEYS,
+  workspaceCopyItems,
   workspaceCopyValue,
   workspaceGitChipLabel,
   workspaceGitChipTitle,
 } = await import('../src/features/chat/workspaceModel.ts')
+
+// P1-23：读数改为"多收 locale 的纯函数"（译文在 `shared/src/i18n`）。本档统一用 zh 断言，
+// 中文形态与旧断言逐字一致（字典齐平由 `verify-i18n` 守着）。
+const ZH = 'zh'
 
 const entry = (path, size = 10, mime = 'text/plain') => ({
   path,
@@ -128,8 +133,8 @@ it('W6 formatBytes', () => {
   eq(formatBytes(5 * 1024 * 1024), '5.0 MB', 'MB')
 })
 it('W7 conflictText（讲清当前版本）', () => {
-  assert(conflictText(7).includes('v7'), '带当前版本')
-  eq(conflictText(undefined).includes('他人修改'), true, '无版本也给因由')
+  assert(conflictText(7, ZH).includes('v7'), '带当前版本')
+  eq(conflictText(undefined, ZH).includes('他人修改'), true, '无版本也给因由')
 })
 it('W8 fileExtension', () => {
   eq(fileExtension('a/b.TS'), 'ts', '小写')
@@ -149,22 +154,25 @@ it('W10 changeTagColor（变更类型 → 标签色）', () => {
 
 console.log('── W6 撤销本轮汇总（revertSummaryText，P1-9 · P4 · R2）──')
 it('W11 按落点动作计数汇总；冲突/缺历史/不支持如实展示', () => {
-  const text = revertSummaryText({
-    dryRun: false,
-    items: [
-      { path: 'a', action: 'restored', currentVersion: 7, fromVersion: 5, toVersion: 8 },
-      { path: 'b', action: 'deleted', currentVersion: 1, fromVersion: null, toVersion: null },
-      { path: 'c', action: 'conflict', currentVersion: 9, fromVersion: 5, toVersion: null },
-      { path: 'd', action: 'unavailable', currentVersion: 3, fromVersion: 2, toVersion: null },
-    ],
-  })
+  const text = revertSummaryText(
+    {
+      dryRun: false,
+      items: [
+        { path: 'a', action: 'restored', currentVersion: 7, fromVersion: 5, toVersion: 8 },
+        { path: 'b', action: 'deleted', currentVersion: 1, fromVersion: null, toVersion: null },
+        { path: 'c', action: 'conflict', currentVersion: 9, fromVersion: 5, toVersion: null },
+        { path: 'd', action: 'unavailable', currentVersion: 3, fromVersion: 2, toVersion: null },
+      ],
+    },
+    ZH,
+  )
   assert(text.includes('还原 1') && text.includes('删除 1'), `应含还原/删除计数：${text}`)
   assert(text.includes('冲突 1') && text.includes('缺历史 1'), `应含冲突/缺历史：${text}`)
   eq(text.startsWith('[预演]'), false, '非 dryRun 不加前缀')
 })
 it('W12 dryRun 加前缀；空结果 = "本轮无工作区改动"', () => {
-  eq(revertSummaryText({ dryRun: true, items: [] }), '[预演] 本轮无工作区改动', '空 + 预演')
-  eq(revertSummaryText({ dryRun: false, items: [] }), '本轮无工作区改动', '空')
+  eq(revertSummaryText({ dryRun: true, items: [] }, ZH), '[预演] 本轮无工作区改动', '空 + 预演')
+  eq(revertSummaryText({ dryRun: false, items: [] }, ZH), '本轮无工作区改动', '空')
 })
 
 console.log('── W7 编辑器语言映射（workspaceEditorLanguage，P1-9 · R7）──')
@@ -250,8 +258,8 @@ it('W20 isImageMime：image/* 才是图片', () => {
   eq(isImageMime(null), false, '空安全')
 })
 it('W21 workspaceLanguageLabel：语言 id → 人读文案', () => {
-  eq(workspaceLanguageLabel('typescript'), 'TypeScript', 'ts')
-  eq(workspaceLanguageLabel('text'), '纯文本', 'text')
+  eq(workspaceLanguageLabel('typescript', ZH), 'TypeScript', 'ts')
+  eq(workspaceLanguageLabel('text', ZH), '纯文本', 'text')
 })
 
 console.log('── W10 面板宽度夹取（P1-9 · R12）──')
@@ -315,9 +323,9 @@ it('W30 unionExpandedDirs：并入去重、保持既有顺序', () => {
   eq(unionExpandedDirs([], ['a', 'a/b']).join(','), 'a,a/b', '空集合照单并入')
 })
 it('W31 revertActionLabel：落点动作 → 人读文案', () => {
-  eq(revertActionLabel('restored'), '已还原', 'restored')
-  eq(revertActionLabel('conflict'), '冲突', 'conflict')
-  eq(revertActionLabel('unavailable'), '缺历史', 'unavailable')
+  eq(revertActionLabel('restored', ZH), '已还原', 'restored')
+  eq(revertActionLabel('conflict', ZH), '冲突', 'conflict')
+  eq(revertActionLabel('unavailable', ZH), '缺历史', 'unavailable')
 })
 it('W32 isWorkspacePathInDir：删除文件夹只命中该目录之下（带尾斜杠，不误伤同前缀兄弟）', () => {
   eq(isWorkspacePathInDir('out/a.ts', 'out'), true, '直接子文件')
@@ -334,20 +342,21 @@ it('W33 workspaceCopyValue：三种口径（相对 / 容器绝对 / 名称），
   eq(workspaceCopyValue('absolute', 'a/b'), '/work/a/b', '目录：绝对路径同样拼 /work')
   eq(workspaceCopyValue('name', 'a/b'), 'b', '目录：名称 = 末段目录名')
 })
-it('W34 WORKSPACE_COPY_ITEMS 与 workspaceCopyValue 一一对应（菜单文案不会与复制内容错位）', () => {
-  eq(WORKSPACE_COPY_ITEMS.map((item) => item.key).join(','), 'relative,absolute,name', '三种口径、固定顺序')
-  eq(WORKSPACE_COPY_ITEMS[1].label, '绝对路径（/work）', '绝对路径那条把 /work 写进文案（用户一眼知道复制的是什么）')
-  for (const item of WORKSPACE_COPY_ITEMS) {
+it('W34 copy 项与 workspaceCopyValue 一一对应（菜单文案不会与复制内容错位）', () => {
+  eq(WORKSPACE_COPY_ITEM_KEYS.map((item) => item.key).join(','), 'relative,absolute,name', '三种口径、固定顺序')
+  const items = workspaceCopyItems(ZH)
+  eq(items[1].label, '绝对路径（/work）', '绝对路径那条把 /work 写进文案（用户一眼知道复制的是什么）')
+  for (const item of WORKSPACE_COPY_ITEM_KEYS) {
     assert(workspaceCopyValue(item.key, 'x/y.ts') !== '', `口径 ${item.key} 必须有可复制的内容`)
   }
 })
 it('W35 workspaceGitChipLabel / Title：分支直显、detached 标出来、读不到说未知（不猜）', () => {
-  eq(workspaceGitChipLabel({ branch: 'master', detached: false }), 'master', '分支名直显')
-  eq(workspaceGitChipLabel({ branch: '9f1c0d2', detached: true }), 'detached@9f1c0d2', 'detached ⇒ 短 SHA 加前缀')
-  eq(workspaceGitChipLabel({ branch: null, detached: false }), '未知分支', '读不到就说不认识')
-  eq(workspaceGitChipTitle({ path: '', branch: 'main', detached: false }), '工作区根 · 当前分支 main', '根仓库的 title')
+  eq(workspaceGitChipLabel({ branch: 'master', detached: false }, ZH), 'master', '分支名直显')
+  eq(workspaceGitChipLabel({ branch: '9f1c0d2', detached: true }, ZH), 'detached@9f1c0d2', 'detached ⇒ 短 SHA 加前缀')
+  eq(workspaceGitChipLabel({ branch: null, detached: false }, ZH), '未知分支', '读不到就说不认识')
+  eq(workspaceGitChipTitle({ path: '', branch: 'main', detached: false }, ZH), '工作区根 · 当前分支 main', '根仓库的 title')
   eq(
-    workspaceGitChipTitle({ path: 'qatt-platform-qa', branch: '9f1c0d2', detached: true }),
+    workspaceGitChipTitle({ path: 'qatt-platform-qa', branch: '9f1c0d2', detached: true }, ZH),
     'qatt-platform-qa · detached@9f1c0d2（detached HEAD，不在任何分支上）',
     '子目录仓库 + detached 的 title',
   )

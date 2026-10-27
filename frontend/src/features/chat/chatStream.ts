@@ -28,8 +28,9 @@
  * 而不是安静地把半条回答当作完整回答。
  */
 
-import type { SseEvent } from '@doubulea/shared'
+import { translate, type SseEvent } from '@doubulea/shared'
 
+import { currentLocale } from '../../stores/locale.js'
 import { SseFrameParser, parseSseFrame, type SseParseOutcome } from './sseParser.js'
 
 /** 解析过程中的异常信号（形状不对 / 不认识的事件名）—— 由调用方决定记日志还是忽略 */
@@ -51,7 +52,13 @@ export interface SseStreamIssue {
  */
 export function reportSseIssue(issue: SseStreamIssue): void {
   // eslint-disable-next-line no-console -- 见上方说明：前端没有日志框架，且这条只在开发期有用
-  console.warn(`[chat] ${issue.kind} 事件被忽略：${issue.name} —— ${issue.detail}`)
+  console.warn(
+    translate(currentLocale(), 'api.sse.issueLine', {
+      kind: issue.kind,
+      name: issue.name,
+      detail: issue.detail,
+    }),
+  )
 }
 
 export interface ReadChatStreamHandlers {
@@ -102,7 +109,10 @@ export async function readChatEventStream(
     handlers.onIssue?.({
       kind: outcome.kind,
       name: outcome.name,
-      detail: outcome.kind === 'invalid' ? outcome.detail : '不认识的事件名（已忽略）',
+      detail:
+        outcome.kind === 'invalid'
+          ? outcome.detail
+          : translate(currentLocale(), 'api.sse.unknownEventIgnored'),
     })
   }
 
@@ -111,16 +121,16 @@ export async function readChatEventStream(
     if (done) break
     // ⚠️ `{ stream: true }`：见文件头 ①。少了它，中文增量会在 chunk 边界变成替换字符
     for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
-      dispatch(parseSseFrame(frame))
+      dispatch(parseSseFrame(frame, currentLocale()))
     }
   }
 
   // 收尾：先把解码器残留吐出来（不完整的多字节序列），再 flush 解析器
   const tail = decoder.decode()
   if (tail !== '') {
-    for (const frame of parser.push(tail)) dispatch(parseSseFrame(frame))
+    for (const frame of parser.push(tail)) dispatch(parseSseFrame(frame, currentLocale()))
   }
-  for (const frame of parser.flush()) dispatch(parseSseFrame(frame))
+  for (const frame of parser.flush()) dispatch(parseSseFrame(frame, currentLocale()))
 
   return { terminated, pending: parser.pending, events }
 }

@@ -30,7 +30,7 @@
  * 累积到 `chunk_size` 才封块（`子方案①` §4-2），多几个段不影响块边界。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { buildParseResult, type ParseResult, type ParsedBlock } from './types.js'
 
@@ -46,9 +46,7 @@ function decoderFor(label: string) {
   try {
     return new TextDecoder(label)
   } catch (error) {
-    throw AppError.internal(
-      `当前 Node 运行时无法解码 ${label}（${String(error)}）。本功能依赖 Node 的完整 ICU ` +
-        '（官方发行版默认带）；若使用 small-icu 精简构建，请换用官方构建。',
+    throw AppError.internal(appMsg('app.m261', { p0: label, p1: String(error) }),
     )
   }
 }

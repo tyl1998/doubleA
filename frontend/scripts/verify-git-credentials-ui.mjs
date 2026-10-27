@@ -44,11 +44,16 @@ const here = dirname(fileURLToPath(import.meta.url))
 const read = (rel) => readFileSync(resolve(here, '..', rel), 'utf8')
 
 const {
-  GIT_CREDENTIAL_KIND_LABEL,
+  GIT_CREDENTIAL_KIND_KEY,
   gitCredentialHost,
   gitCredentialCreateBody,
   gitCredentialUpdateBody,
 } = await import('../src/pages/settings/gitCredentialModel.ts')
+
+// P1-23：类型读数已由"中文常量"改为"i18n key"（判据仍在本文件里，归属 `gitCredentialModel`）。
+// 断言随之改为"两种 kind 各有 key、且 key 指向字典里真实存在的条目"——
+// 文案内容本身由 `verify-i18n` 的字典比对守着（这里再抄一遍中文就等于第二份真相）。
+const { zh: ZH_DICT } = await import('@doubulea/shared')
 
 const item = (over) => ({
   id: 'c1',
@@ -118,9 +123,12 @@ it('G3c 只填了替换私钥 ⇒ 只带 privateKey', () => {
 })
 
 console.log('── G4 类型读数 ──')
-it('G4 两种类型都有中文读数', () => {
-  eq(GIT_CREDENTIAL_KIND_LABEL.SSH_KEY, 'SSH 私钥')
-  eq(GIT_CREDENTIAL_KIND_LABEL.HTTPS_TOKEN, 'HTTPS 令牌')
+it('G4 两种类型都有 i18n key，且 key 在字典里存在', () => {
+  eq(GIT_CREDENTIAL_KIND_KEY.SSH_KEY, 'label.gitCredentialKind.ssh')
+  eq(GIT_CREDENTIAL_KIND_KEY.HTTPS_TOKEN, 'label.gitCredentialKind.httpsToken')
+  for (const key of Object.values(GIT_CREDENTIAL_KIND_KEY)) {
+    assert(Object.prototype.hasOwnProperty.call(ZH_DICT, key), `key「${key}」应在 zh 字典里`)
+  }
 })
 
 console.log('── G5 接线（静态）──')

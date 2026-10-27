@@ -31,6 +31,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 import { MESSAGE_ROLES } from './conversation.js'
 import { offsetPageOf } from './envelope.js'
 
@@ -129,19 +131,19 @@ export const memoryItemSchema = z.object({
 export type MemoryItem = z.infer<typeof memoryItemSchema>
 
 export const listMemoriesQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
   limit: z.coerce
     .number()
     .int()
-    .min(1, 'limit 至少为 1')
-    .max(MEMORY_PAGE_LIMIT_MAX, `limit 最多 ${MEMORY_PAGE_LIMIT_MAX}`)
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(MEMORY_PAGE_LIMIT_MAX, validationMessage('validation.memory.limitMax', { max: MEMORY_PAGE_LIMIT_MAX }))
     .default(20),
   /** 只看某一类（省略 = 全部） */
   kind: z.enum(MEMORY_KINDS).optional(),
   /** 只看某个作用域（P1-8a：`USER`=全局记忆 / `AGENT`=Agent 记忆；省略 = 全部） */
   scope: z.enum(MEMORY_SCOPES).optional(),
   /** 关键词（对正文做不区分大小写的包含匹配；省略 = 不过滤） */
-  q: z.string().trim().max(200, '关键词过长').optional(),
+  q: z.string().trim().max(200, validationMessage('validation.memory.keywordTooLong')).optional(),
 })
 export type ListMemoriesQuery = z.infer<typeof listMemoriesQuerySchema>
 
@@ -151,21 +153,26 @@ export type MemoryListResult = z.infer<typeof memoryListResultSchema>
 /** 手动新增一条记忆（**用户显式添加**：任何类型都允许，含敏感信息） */
 export const createMemoryBodySchema = z.object({
   text: z
-    .string({ required_error: '请填写记忆内容' })
+    .string({ required_error: validationMessage('validation.memory.textRequired') })
     .trim()
-    .min(1, '记忆内容不能为空')
-    .max(MEMORY_TEXT_MAX, `记忆内容最长 ${MEMORY_TEXT_MAX} 个字符`),
+    .min(1, validationMessage('validation.memory.textEmpty'))
+    .max(MEMORY_TEXT_MAX, validationMessage('validation.memory.textTooLong', { max: MEMORY_TEXT_MAX })),
   kind: z.enum(MEMORY_KINDS).default('OTHER'),
   pinned: z.boolean().default(false),
   /** 可选：绑定到某个 Agent（省略 = 全体通用） */
-  agentId: z.string().uuid('智能体 ID 不是合法 UUID').optional(),
+  agentId: z.string().uuid(validationMessage('validation.memory.agentIdNotUuid')).optional(),
 })
 export type CreateMemoryBody = z.infer<typeof createMemoryBodySchema>
 
 /** 改一条记忆（逐字段可选：正文 / 类型 / 置顶 / **作用域**） */
 export const updateMemoryBodySchema = z
   .object({
-    text: z.string().trim().min(1, '记忆内容不能为空').max(MEMORY_TEXT_MAX).optional(),
+    text: z
+      .string()
+      .trim()
+      .min(1, validationMessage('validation.memory.textEmpty'))
+      .max(MEMORY_TEXT_MAX)
+      .optional(),
     kind: z.enum(MEMORY_KINDS).optional(),
     pinned: z.boolean().optional(),
     /**
@@ -174,13 +181,13 @@ export const updateMemoryBodySchema = z
      *   · Agent id   ⇒ **移到该 Agent**（AGENT）；
      *   · 省略        ⇒ 不改作用域。
      */
-    agentId: z.string().uuid('智能体 ID 不是合法 UUID').nullable().optional(),
+    agentId: z.string().uuid(validationMessage('validation.memory.agentIdNotUuid')).nullable().optional(),
   })
-  .refine((value) => Object.keys(value).length > 0, '至少要改一项')
+  .refine((value) => Object.keys(value).length > 0, validationMessage('validation.memory.atLeastOneChange'))
 export type UpdateMemoryBody = z.infer<typeof updateMemoryBodySchema>
 
 export const memoryIdParamsSchema = z.object({
-  id: z.string().uuid('记忆 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.memory.idNotUuid')),
 })
 export type MemoryIdParams = z.infer<typeof memoryIdParamsSchema>
 
@@ -213,11 +220,17 @@ export const updateMemorySettingsBodySchema = z
     memoryProfileMax: z
       .number()
       .int()
-      .min(MEMORY_PROFILE_MAX_MIN, `至少 ${MEMORY_PROFILE_MAX_MIN}`)
-      .max(MEMORY_PROFILE_MAX_LIMIT, `最多 ${MEMORY_PROFILE_MAX_LIMIT}`)
+      .min(
+        MEMORY_PROFILE_MAX_MIN,
+        validationMessage('validation.memory.profileMaxMin', { min: MEMORY_PROFILE_MAX_MIN }),
+      )
+      .max(
+        MEMORY_PROFILE_MAX_LIMIT,
+        validationMessage('validation.memory.profileMaxLimit', { max: MEMORY_PROFILE_MAX_LIMIT }),
+      )
       .optional(),
   })
-  .refine((value) => Object.keys(value).length > 0, '至少要改一项')
+  .refine((value) => Object.keys(value).length > 0, validationMessage('validation.memory.atLeastOneChange'))
 export type UpdateMemorySettingsBody = z.infer<typeof updateMemorySettingsBodySchema>
 
 // ═════════════════════════════ L2 · 待展示提示（toast 晚一拍）═════════════════════════════
@@ -261,7 +274,12 @@ export type MemoryNoticesResult = z.infer<typeof memoryNoticesResultSchema>
  */
 export const memoryNoticeActionBodySchema = z.object({
   action: z.enum(['ACCEPT', 'REJECT']),
-  text: z.string().trim().min(1, '记忆内容不能为空').max(MEMORY_TEXT_MAX).optional(),
+  text: z
+      .string()
+      .trim()
+      .min(1, validationMessage('validation.memory.textEmpty'))
+      .max(MEMORY_TEXT_MAX)
+      .optional(),
 })
 export type MemoryNoticeActionBody = z.infer<typeof memoryNoticeActionBodySchema>
 
@@ -277,8 +295,8 @@ export type MemoryNoticeActionResult = z.infer<typeof memoryNoticeActionResultSc
 /** `PUT /api/conversations/:id/memory-excluded` 的请求体（HCI §5.2.1） */
 export const setConversationMemoryExcludedBodySchema = z.object({
   excluded: z.boolean({
-    required_error: '缺少 excluded（true = 本次对话不记入记忆）',
-    invalid_type_error: 'excluded 必须是布尔值',
+    required_error: validationMessage('validation.memory.excludedMissing'),
+    invalid_type_error: validationMessage('validation.memory.excludedNotBoolean'),
   }),
 })
 export type SetConversationMemoryExcludedBody = z.infer<typeof setConversationMemoryExcludedBodySchema>
@@ -340,10 +358,15 @@ export const activityItemSchema = z.object({
 export type ActivityItem = z.infer<typeof activityItemSchema>
 
 export const listActivityQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
   /** 关键词（对会话标题做不区分大小写的包含匹配；省略 = 不过滤） */
-  q: z.string().trim().max(200, '关键词过长').optional(),
+  q: z.string().trim().max(200, validationMessage('validation.memory.keywordTooLong')).optional(),
 })
 export type ListActivityQuery = z.infer<typeof listActivityQuerySchema>
 
@@ -369,12 +392,17 @@ export type ActivitySearchHit = z.infer<typeof activitySearchHitSchema>
 
 export const searchActivityQuerySchema = z.object({
   q: z
-    .string({ required_error: '请输入搜索关键词' })
+    .string({ required_error: validationMessage('validation.memory.keywordRequired') })
     .trim()
-    .min(1, '请输入搜索关键词')
-    .max(200, '关键词过长'),
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+    .min(1, validationMessage('validation.memory.keywordRequired'))
+    .max(200, validationMessage('validation.memory.keywordTooLong')),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type SearchActivityQuery = z.infer<typeof searchActivityQuerySchema>
 

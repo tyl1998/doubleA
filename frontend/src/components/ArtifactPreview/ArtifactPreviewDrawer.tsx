@@ -38,6 +38,7 @@ import type { ArtifactItem } from '@doubulea/shared'
 
 import { fetchArtifactText } from '../../api/artifacts.js'
 import { describeError } from '../../api/client.js'
+import { useT } from '../../app/i18n.js'
 import { CsvPreview } from './CsvPreview.js'
 import { HtmlPreview } from './HtmlPreview.js'
 import { ImagePreview } from './ImagePreview.js'
@@ -71,6 +72,7 @@ export interface ArtifactPreviewDrawerProps {
 }
 
 export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPreviewDrawerProps) {
+  const { t } = useT()
   // 下载的实现只有一处（`useArtifactDownload`）：产物卡上的那个按钮走的是同一个 hook
   // —— P0-3-11 起「下载」有了第二个入口，两处的文案与禁用判据必须同源
   const { downloading, download } = useArtifactDownload()
@@ -137,13 +139,13 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
         <Alert
           type="warning"
           showIcon
-          message="这个文件的编码不是 UTF-8"
-          description="预览只支持 UTF-8（宽松解码会得到满屏问号，那比报错更糟）。请点「下载」后用本地工具打开。"
+          message={t('artifact.preview.notUtf8Title')}
+          description={t('artifact.preview.notUtf8Body')}
         />
       )
     }
     if (text.phase === 'error') {
-      return <Alert type="error" showIcon message="没能取到文件内容" description={text.message} />
+      return <Alert type="error" showIcon message={t('artifact.preview.fetchFailed')} description={text.message} />
     }
     if (text.phase !== 'ready') return null
 
@@ -162,7 +164,7 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
       // 而这弹层在会话存续期间一直是挂载着的 —— 每次预览过的 PDF 都会留下一个活的 iframe。
       // AntD 5.29 起用 `destroyOnHidden`（`destroyOnClose` 已弃用，此处按新名写）。
       destroyOnHidden
-      title={fileName === '' ? '产物预览' : fileName}
+      title={fileName === '' ? t('artifact.preview.drawerTitle') : fileName}
       extra={
         <Button
           size="small"
@@ -172,14 +174,14 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
             if (artifact !== null) download({ artifactId: artifact.artifactId, fileName: artifact.fileName })
           }}
         >
-          下载
+          {t('artifact.download')}
         </Button>
       }
     >
       {artifact !== null && view !== null && (
         <div className="stack">
           <p className="ratio">
-            {formatBytes(size)} · {mime === '' ? '未知类型' : mime}
+            {formatBytes(size)} · {mime === '' ? t('artifact.preview.unknownMime') : mime}
           </p>
 
           {!view.available && (
@@ -187,8 +189,12 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
               type="info"
               showIcon
               // 两种原因的文案**刻意不同**：一个是"这个格式没有预览"，一个是"这份太大"
-              message={view.kind === 'none' ? '该格式不支持在线预览' : '文件较大，未在线预览'}
-              description={`${view.reason ?? ''}。「下载」拿到的始终是没有改过字节的原文件。`}
+              message={
+                view.kind === 'none'
+                  ? t('artifact.preview.unsupportedTitle')
+                  : t('artifact.preview.tooLargeTitle')
+              }
+              description={`${view.reason === null ? '' : t(view.reason.key, view.reason.params)}${t('artifact.preview.downloadHint')}`}
             />
           )}
 

@@ -25,6 +25,7 @@ import { useEffect, useState } from 'react'
 import { describeError } from '../../api/client.js'
 import { useRemoveKnowledgeBase } from '../../api/knowledgeBases.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 export interface DeleteKnowledgeBaseModalProps {
   /** 要删的库；`null` = 弹窗关闭 */
@@ -36,6 +37,7 @@ export interface DeleteKnowledgeBaseModalProps {
 
 export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: DeleteKnowledgeBaseModalProps) {
   const feedback = useFeedback()
+  const { t } = useT()
   const remove = useRemoveKnowledgeBase()
   const [errorText, setErrorText] = useState<string | null>(null)
 
@@ -54,10 +56,14 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
     remove.mutate(kb.id, {
       onSuccess: (result) => {
         const unbound =
-          result.unboundAgents > 0 ? `，并解绑了 ${result.unboundAgents} 个智能体` : ''
+          result.unboundAgents > 0 ? t('deleteKb.unboundSuffix', { count: result.unboundAgents }) : ''
         feedback.ok(
-          `已删除知识库「${result.name}」：连带删除 ${result.deletedDocuments} 篇文档` +
-            `（清理 ${result.deletedObjects} 个原始文件对象）${unbound}`,
+          t('deleteKb.deleted', {
+            name: result.name,
+            docs: result.deletedDocuments,
+            objects: result.deletedObjects,
+            unbound,
+          }),
         )
         onClose()
         onDeleted?.(result)
@@ -74,13 +80,13 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
       open={open}
       title={
         <span className="row" style={{ gap: 'var(--sp-3)' }}>
-          删除知识库「{kb.name}」
-          <Tag className="tag--danger">级联删除</Tag>
+          {t('deleteKb.title', { name: kb.name })}
+          <Tag className="tag--danger">{t('deleteKb.cascadeTag')}</Tag>
         </span>
       }
-      okText="确认删除"
+      okText={t('deleteKb.okText')}
       okButtonProps={{ danger: true, loading: removing }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={confirm}
       onCancel={onClose}
       maskClosable={!removing}
@@ -88,17 +94,17 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
       <div className="stack stack--tight">
         <div>
           <p>
-            <strong>此操作会连带做三件事：</strong>
+            <strong>{t('deleteKb.bodyTitle')}</strong>
           </p>
           <ul>
-            <li>
-              删除库内的 <span className="num">{kb.documentCount}</span> 篇文档记录
-            </li>
-            <li>连同它们的全部片段（chunk）与向量一起清除</li>
-            <li>删除对象存储里的原始文件</li>
+            <li>{t('deleteKb.bodyDoc1', { count: kb.documentCount })}</li>
+            <li>{t('deleteKb.bodyDoc2')}</li>
+            <li>{t('deleteKb.bodyDoc3')}</li>
           </ul>
           <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-            操作<strong>不可恢复</strong>：没有回收站，删错了只能重新建库并重传文档。
+            {t('deleteKb.irreversiblePrefix')}
+            <strong>{t('deleteKb.irreversibleStrong')}</strong>
+            {t('deleteKb.irreversibleSuffix')}
           </p>
         </div>
 
@@ -106,12 +112,14 @@ export function DeleteKnowledgeBaseModal({ kb, open, onClose, onDeleted }: Delet
           <Alert
             type="warning"
             showIcon
-            message={`该库正被 ${kb.agentCount} 个智能体引用`}
-            description="删除后会自动解除这些智能体的绑定（无需先去手动解绑）；它们本身不受影响，只是对话时检索不到这个库的内容。"
+            message={t('deleteKb.boundTitle', { count: kb.agentCount })}
+            description={t('deleteKb.boundDesc')}
           />
         )}
 
-        {errorText !== null && <Alert type="error" showIcon message="删除失败" description={errorText} />}
+        {errorText !== null && (
+          <Alert type="error" showIcon message={t('deleteKb.failed')} description={errorText} />
+        )}
       </div>
     </Modal>
   )

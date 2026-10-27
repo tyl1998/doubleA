@@ -64,6 +64,7 @@ import {
   canEditAsset,
 } from './assetAcl.js'
 import { offsetPageOf } from './envelope.js'
+import { validationMessage } from './i18n/validation.js'
 
 // ───────────────────────────── 取值域 ─────────────────────────────
 
@@ -122,10 +123,10 @@ export const AGENT_OPENING_REMARKS_MAX_CHARS = 2000
 
 /** 名称（列 `VARCHAR(128)`） */
 const agentNameSchema = z
-  .string({ required_error: '请输入智能体名称' })
+  .string({ required_error: validationMessage('validation.agent.nameRequired') })
   .trim()
-  .min(1, '请输入智能体名称')
-  .max(AGENT_NAME_MAX_CHARS, `名称最多 ${AGENT_NAME_MAX_CHARS} 个字符`)
+  .min(1, validationMessage('validation.agent.nameRequired'))
+  .max(AGENT_NAME_MAX_CHARS, validationMessage('validation.agent.nameTooLong', { max: AGENT_NAME_MAX_CHARS }))
 
 /**
  * 描述（列 `TEXT`，无硬上限）。2000 字是**防误操作**上限（与知识库描述同口径：
@@ -134,7 +135,10 @@ const agentNameSchema = z
 const agentDescriptionSchema = z
   .string()
   .trim()
-  .max(AGENT_DESCRIPTION_MAX_CHARS, `描述最多 ${AGENT_DESCRIPTION_MAX_CHARS} 个字符`)
+  .max(
+    AGENT_DESCRIPTION_MAX_CHARS,
+    validationMessage('validation.agent.descriptionTooLong', { max: AGENT_DESCRIPTION_MAX_CHARS }),
+  )
 
 /**
  * 图标（列 `VARCHAR(255)`）。
@@ -143,7 +147,10 @@ const agentDescriptionSchema = z
  * 但 P0-1 没有文件上传端点（`files` 表要到 P1 的附件/图标功能才用）。给一个 `VARCHAR(255)`
  * 就能表达的字段是对的 —— 将来真做上传时，存进去的内容变成 URL，**契约不用改**。
  */
-const agentIconSchema = z.string().trim().max(AGENT_ICON_MAX_CHARS, `图标最多 ${AGENT_ICON_MAX_CHARS} 个字符`)
+const agentIconSchema = z
+  .string()
+  .trim()
+  .max(AGENT_ICON_MAX_CHARS, validationMessage('validation.agent.iconTooLong', { max: AGENT_ICON_MAX_CHARS }))
 
 /**
  * 系统提示词 / 开场白：**刻意不 `trim()`**（与名称/描述相反）。
@@ -152,12 +159,14 @@ const agentIconSchema = z.string().trim().max(AGENT_ICON_MAX_CHARS, `图标最�
  * "先空一行再写角色设定"这种常见写法悄悄改掉，而用户看不到自己写的内容被改了。
  * 上限是防误操作（`TEXT` 列本身没有上限）。
  */
-const agentSystemPromptSchema = z
-  .string()
-  .max(AGENT_SYSTEM_PROMPT_MAX_CHARS, `系统提示词最多 ${AGENT_SYSTEM_PROMPT_MAX_CHARS} 个字符`)
-const agentOpeningRemarksSchema = z
-  .string()
-  .max(AGENT_OPENING_REMARKS_MAX_CHARS, `开场白最多 ${AGENT_OPENING_REMARKS_MAX_CHARS} 个字符`)
+const agentSystemPromptSchema = z.string().max(
+  AGENT_SYSTEM_PROMPT_MAX_CHARS,
+  validationMessage('validation.agent.systemPromptTooLong', { max: AGENT_SYSTEM_PROMPT_MAX_CHARS }),
+)
+const agentOpeningRemarksSchema = z.string().max(
+  AGENT_OPENING_REMARKS_MAX_CHARS,
+  validationMessage('validation.agent.openingRemarksTooLong', { max: AGENT_OPENING_REMARKS_MAX_CHARS }),
+)
 
 /** 引导问题条数上限（`03` §4.2："可增删的列表"；防误操作，不是存储约束——jsonb 不限） */
 export const GUIDE_QUESTIONS_MAX = 10
@@ -177,18 +186,21 @@ export const GUIDE_QUESTION_MAX_CHARS = 200
 export const guideQuestionsSchema = z
   .array(
     z
-      .string({ invalid_type_error: '引导问题必须是字符串' })
+      .string({ invalid_type_error: validationMessage('validation.agent.guideQuestionNotString') })
       .trim()
-      .min(1, '引导问题不能为空')
-      .max(GUIDE_QUESTION_MAX_CHARS, `每个引导问题最多 ${GUIDE_QUESTION_MAX_CHARS} 个字符`),
-    { invalid_type_error: '引导问题必须是字符串数组' },
+      .min(1, validationMessage('validation.agent.guideQuestionEmpty'))
+      .max(
+        GUIDE_QUESTION_MAX_CHARS,
+        validationMessage('validation.agent.guideQuestionTooLong', { max: GUIDE_QUESTION_MAX_CHARS }),
+      ),
+    { invalid_type_error: validationMessage('validation.agent.guideQuestionsNotArray') },
   )
-  .max(GUIDE_QUESTIONS_MAX, `引导问题最多 ${GUIDE_QUESTIONS_MAX} 条`)
+  .max(GUIDE_QUESTIONS_MAX, validationMessage('validation.agent.guideQuestionsTooMany', { max: GUIDE_QUESTIONS_MAX }))
 
 /** 绑定的模型（`:modelId` 是 uuid(7) 字符串） */
 const agentModelIdSchema = z
-  .string({ required_error: '请选择模型' })
-  .uuid('模型 ID 不是合法 UUID')
+  .string({ required_error: validationMessage('validation.agent.modelRequired') })
+  .uuid(validationMessage('validation.agent.modelIdNotUuid'))
 
 /** 模型池上限（防误操作；池是"对话时可选的模型集合"，几十个足够，不是存储约束） */
 export const AGENT_MODEL_POOL_MAX = 50
@@ -205,8 +217,8 @@ export const AGENT_MODEL_POOL_MAX = 50
  */
 const agentModelPoolSchema = z
   .array(agentModelIdSchema)
-  .min(1, '请至少选择一个模型')
-  .max(AGENT_MODEL_POOL_MAX, `模型池最多 ${AGENT_MODEL_POOL_MAX} 个模型`)
+  .min(1, validationMessage('validation.agent.modelPoolEmpty'))
+  .max(AGENT_MODEL_POOL_MAX, validationMessage('validation.agent.modelPoolTooMany', { max: AGENT_MODEL_POOL_MAX }))
 
 // ───────────────────────────── 补默认值（读取端唯一入口） ─────────────────────────────
 
@@ -384,18 +396,25 @@ export type AgentItem = z.infer<typeof agentItemSchema>
  */
 export const agentComponentInputSchema = z.object({
   componentType: z.enum(COMPONENT_TYPES, {
-    errorMap: () => ({ message: `componentType 只能是 ${COMPONENT_TYPES.join('/')}` }),
+    errorMap: () => ({
+      message: validationMessage('validation.agent.componentTypeAllowed', { allowed: COMPONENT_TYPES.join('/') }),
+    }),
   }),
   refId: z
-    .string({ required_error: '请提供组件引用 ID' })
-    .uuid('组件引用 ID 不是合法 UUID（KNOWLEDGE 必须是知识库 id）'),
+    .string({ required_error: validationMessage('validation.agent.componentRefRequired') })
+    .uuid(validationMessage('validation.agent.componentRefNotUuid')),
   /**
    * 常驻的 MCP 工具原始名（仅 `MCP`；P1-19）。省略 / 空数组 = 无常驻。
    * ⚠️ 常驻只是"**优先直接下发**"：工具总数没超阈值时本来就全部下发，常驻不起作用。
    */
   pinnedToolNames: z
-    .array(z.string().trim().min(1).max(256), { invalid_type_error: 'pinnedToolNames 必须是字符串数组' })
-    .max(MCP_PINNED_TOOL_NAMES_MAX, `常驻工具最多 ${MCP_PINNED_TOOL_NAMES_MAX} 个`)
+    .array(z.string().trim().min(1).max(256), {
+      invalid_type_error: validationMessage('validation.agent.pinnedToolNamesNotArray'),
+    })
+    .max(
+      MCP_PINNED_TOOL_NAMES_MAX,
+      validationMessage('validation.agent.pinnedToolNamesTooMany', { max: MCP_PINNED_TOOL_NAMES_MAX }),
+    )
     .optional(),
 })
 export type AgentComponentInput = z.infer<typeof agentComponentInputSchema>
@@ -423,8 +442,8 @@ export type AgentComponentInput = z.infer<typeof agentComponentInputSchema>
 export const replaceAgentComponentsBodySchema = z
   .object({
     components: z.array(agentComponentInputSchema, {
-      required_error: '请提供 components（全量替换；要清空请传空数组）',
-      invalid_type_error: 'components 必须是数组',
+      required_error: validationMessage('validation.agent.componentsRequired'),
+      invalid_type_error: validationMessage('validation.agent.componentsNotArray'),
     }),
   })
   .superRefine((body, ctx) => {
@@ -435,7 +454,7 @@ export const replaceAgentComponentsBodySchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['components', index, 'refId'],
-          message: '同一条绑定重复提交了（全量替换里每对 componentType + refId 只能出现一次）',
+          message: validationMessage('validation.agent.duplicateBinding'),
         })
         return
       }
@@ -453,8 +472,13 @@ export type ReplaceAgentComponentsBody = z.infer<typeof replaceAgentComponentsBo
  * 加一个没人要的参数，等于让"列表为什么少了几条"变成一件要靠猜的事。
  */
 export const listAgentsQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListAgentsQuery = z.infer<typeof listAgentsQuerySchema>
 
@@ -484,7 +508,9 @@ export const createAgentBodySchema = z
     description: agentDescriptionSchema.nullish(),
     icon: agentIconSchema.nullish(),
     type: z.enum(AGENT_TYPES, {
-      errorMap: () => ({ message: `type 只能是 ${AGENT_TYPES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.agent.typeAllowed', { allowed: AGENT_TYPES.join('/') }),
+      }),
     }),
     systemPrompt: agentSystemPromptSchema.nullish(),
     openingRemarks: agentOpeningRemarksSchema.nullish(),
@@ -503,7 +529,11 @@ export const createAgentBodySchema = z
      */
     visibility: z
       .enum(ASSET_VISIBILITIES, {
-        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+        errorMap: () => ({
+          message: validationMessage('validation.agent.visibilityAllowed', {
+            allowed: ASSET_VISIBILITIES.join('/'),
+          }),
+        }),
       })
       .optional(),
     /** P1-18：受众（仅 `visibility=SHARED` 允许给；`SHARED` 时至少一个主体非空） */
@@ -514,7 +544,7 @@ export const createAgentBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['modelId'],
-        message: '默认模型必须在模型池中',
+        message: validationMessage('validation.agent.defaultModelNotInPool'),
       })
     }
     // P1-18：可见范围 × 受众（创建时缺省即 PRIVATE ⇒ 不允许带 audience）
@@ -524,14 +554,14 @@ export const createAgentBodySchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['audience'],
-          message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+          message: validationMessage('validation.audience.required'),
         })
       }
     } else if (body.audience !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '只有可见范围为「指定用户」时才能设置受众',
+        message: validationMessage('validation.audience.notAllowed'),
       })
     }
   })
@@ -577,7 +607,11 @@ export const updateAgentBodySchema = z
     icon: agentIconSchema.nullable().optional(),
     /** ⚠️ 可传但不可改（不同值 → 409），见上 */
     type: z
-      .enum(AGENT_TYPES, { errorMap: () => ({ message: `type 只能是 ${AGENT_TYPES.join('/')}` }) })
+      .enum(AGENT_TYPES, {
+        errorMap: () => ({
+          message: validationMessage('validation.agent.typeAllowed', { allowed: AGENT_TYPES.join('/') }),
+        }),
+      })
       .optional(),
     systemPrompt: agentSystemPromptSchema.nullable().optional(),
     openingRemarks: agentOpeningRemarksSchema.nullable().optional(),
@@ -589,7 +623,11 @@ export const updateAgentBodySchema = z
     /** P1-18：可见范围（`SHARED` 需带非空 `audience`；合并后的一致性由服务层最终判定） */
     visibility: z
       .enum(ASSET_VISIBILITIES, {
-        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+        errorMap: () => ({
+          message: validationMessage('validation.agent.visibilityAllowed', {
+            allowed: ASSET_VISIBILITIES.join('/'),
+          }),
+        }),
       })
       .optional(),
     /** P1-18：受众（整体替换；`visibility≠SHARED` 时不得给） */
@@ -609,7 +647,7 @@ export const updateAgentBodySchema = z
       body.modelIds !== undefined ||
       body.visibility !== undefined ||
       body.audience !== undefined,
-    { message: '至少要提供一个要修改的字段' },
+    { message: validationMessage('validation.common.atLeastOneField') },
   )
   .superRefine((body, ctx) => {
     // 同一请求同时给了默认模型与模型池 ⇒ 默认模型必须在池里（只给其一时由服务层结合库里现状补齐）
@@ -617,7 +655,7 @@ export const updateAgentBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['modelId'],
-        message: '默认模型必须在模型池中',
+        message: validationMessage('validation.agent.defaultModelNotInPool'),
       })
     }
     // P1-18：同请求内 visibility × audience 的**局部**一致性（合并库里现状后的最终判定在服务层）
@@ -625,7 +663,7 @@ export const updateAgentBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '只有可见范围为「指定用户」时才能设置受众',
+        message: validationMessage('validation.audience.notAllowed'),
       })
     }
     if (
@@ -636,7 +674,7 @@ export const updateAgentBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+        message: validationMessage('validation.audience.required'),
       })
     }
   })
@@ -646,7 +684,7 @@ export type UpdateAgentBody = z.infer<typeof updateAgentBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const agentIdParamsSchema = z.object({
-  id: z.string().uuid('智能体 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.agent.idNotUuid')),
 })
 export type AgentIdParams = z.infer<typeof agentIdParamsSchema>
 

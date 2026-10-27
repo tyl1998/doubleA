@@ -28,6 +28,7 @@ import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react'
 
 import { CHAT_ATTACHMENT_MAX_COUNT } from '@doubulea/shared'
 
+import { useT } from '../../app/i18n.js'
 import { fileContentUrl } from '../../api/files.js'
 import { ConfirmCard } from './ConfirmCard.js'
 import { composeState, isSubmitKey } from './composerState.js'
@@ -142,7 +143,8 @@ export function ChatInput({
   steerPending,
   controls,
 }: ChatInputProps) {
-  const view = composeState({ round, sending, stopping, draft, steerable, serverRunning })
+  const { t, locale } = useT()
+  const view = composeState({ round, sending, stopping, draft, steerable, serverRunning }, locale)
 
   /**
    * 输入框高度**跟着正文走**（`app.css` 里 `.composer textarea` 的 `min-height`/`max-height`）。
@@ -232,7 +234,7 @@ export function ChatInput({
                 <button
                   type="button"
                   className="attachment-chip__remove"
-                  aria-label={`移除附件 ${item.name}`}
+                  aria-label={t('chatInput.removeAttachment', { name: item.name })}
                   onClick={() => onRemoveAttachment(item.fileId)}
                 >
                   ×
@@ -264,8 +266,8 @@ export function ChatInput({
             className="composer__attach"
             title={
               attachments.length >= CHAT_ATTACHMENT_MAX_COUNT
-                ? `最多 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`
-                : '添加附件（图片 / PDF / Word / 文本 / JSON / CSV）'
+                ? t('chatInput.maxAttachments', { count: CHAT_ATTACHMENT_MAX_COUNT })
+                : t('chatInput.addAttachment')
             }
             data-disabled={!view.canType || uploading || attachments.length >= CHAT_ATTACHMENT_MAX_COUNT}
           >
@@ -296,7 +298,7 @@ export function ChatInput({
             value={draft}
             disabled={!view.canType}
             placeholder={view.placeholder}
-            aria-label="输入消息"
+            aria-label={t('chatInput.ariaLabel')}
             data-testid="composer-input"
             onChange={(event) => {
               onDraftChange(event.target.value)
@@ -315,7 +317,7 @@ export function ChatInput({
               loading={steerPending}
               onClick={onSteer}
             >
-              插话
+              {t('chatInput.steer')}
             </Button>
           ) : null}
 
@@ -342,7 +344,7 @@ export function ChatInput({
               disabled={view.primary.disabled || uploading}
               loading={view.primary.kind === 'busy' || uploading}
             >
-              {uploading ? '附件上传中…' : view.primary.label}
+              {uploading ? t('chatInput.uploading') : view.primary.label}
             </Button>
           )}
         </div>
@@ -352,7 +354,7 @@ export function ChatInput({
 
         <div className="composer__hint">
           <span>
-            <kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行
+            <kbd>Enter</kbd> {t('chatInput.kbdSend')} · <kbd>Shift</kbd>+<kbd>Enter</kbd> {t('chatInput.kbdNewline')}
           </span>
           {/* 提示文案与按钮同源（`composerState.ts` 的 TEXT）：不会出现"按钮说停止、提示说发送"。
               ⚠️ `idle` 的文案（"Enter 发送 · Shift+Enter 换行"）与左边那行键盘约定**逐字相同**

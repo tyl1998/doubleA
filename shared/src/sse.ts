@@ -59,6 +59,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 import {
   artifactItemSchema,
   CHAT_ATTACHMENT_MAX_COUNT,
@@ -389,6 +391,18 @@ export type SseDonePayload = z.infer<typeof sseDonePayloadSchema>
 export const sseErrorPayloadSchema = z.object({
   code: z.enum(ERROR_CODES),
   message: z.string(),
+  /**
+   * 细节消息的**结构化形态**（P1-23 收尾 ⑤）—— 可选。
+   *
+   * 有它时前端按当前语言渲染，没有就退回 `message`（中文正文）。与 HTTP 信封的
+   * `msgKey` 同一套形状与理由（见 `shared/src/i18n/appMessage.ts`）。
+   */
+  msgKey: z
+    .object({
+      key: z.string(),
+      params: z.record(z.union([z.string(), z.number()])).optional(),
+    })
+    .optional(),
 })
 export type SseErrorPayload = z.infer<typeof sseErrorPayloadSchema>
 
@@ -456,22 +470,28 @@ export const MAX_CHAT_CONTENT_CHARS = 20_000
 export const chatRequestBodySchema = z.object({
   content: z
     .string({
-      required_error: '请输入消息内容',
-      invalid_type_error: '消息内容必须是文本',
+      required_error: validationMessage('validation.chat.contentRequired'),
+      invalid_type_error: validationMessage('validation.chat.contentNotText'),
     })
     .trim()
-    .min(1, '消息内容不能为空')
-    .max(MAX_CHAT_CONTENT_CHARS, `单条消息最多 ${MAX_CHAT_CONTENT_CHARS} 个字符`),
+    .min(1, validationMessage('validation.chat.contentEmpty'))
+    .max(
+      MAX_CHAT_CONTENT_CHARS,
+      validationMessage('validation.chat.contentTooLong', { max: MAX_CHAT_CONTENT_CHARS }),
+    ),
   /**
    * 本轮**指定使用的模型**（模型池特性）。**可省**：省略时走该会话所属智能体的默认模型
    * （`agents.model_id`）。给了就必须是该智能体**模型池的成员**且当前可用 ——
    * 服务层（`assertConversationSendable`）负责校验归属与可用性，非成员/已停用一律 409，
    * 不存在 404。这样"对话时选具体模型"不必新建会话，也不会绕过智能体的模型白名单。
    */
-  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
+  modelId: z.string().uuid(validationMessage('validation.chat.modelIdNotUuid')).optional(),
   attachmentFileIds: z
-    .array(z.string().uuid('附件 ID 不是合法 UUID'))
-    .max(CHAT_ATTACHMENT_MAX_COUNT, `一次最多携带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`)
+    .array(z.string().uuid(validationMessage('validation.chat.fileIdNotUuid')))
+    .max(
+      CHAT_ATTACHMENT_MAX_COUNT,
+      validationMessage('validation.chat.attachmentsTooMany', { max: CHAT_ATTACHMENT_MAX_COUNT }),
+    )
     .optional(),
 })
 export type ChatRequestBody = z.infer<typeof chatRequestBodySchema>
@@ -491,7 +511,7 @@ export type ChatRequestBody = z.infer<typeof chatRequestBodySchema>
  * 变成一个随字段有无而变的隐式判据。
  */
 export const regenerateConversationBodySchema = z.object({
-  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
+  modelId: z.string().uuid(validationMessage('validation.chat.modelIdNotUuid')).optional(),
 })
 export type RegenerateConversationBody = z.infer<typeof regenerateConversationBodySchema>
 
@@ -529,12 +549,15 @@ export const STEER_MESSAGE_MAX_CHARS = MAX_CHAT_CONTENT_CHARS
 export const steerConversationBodySchema = z.object({
   message: z
     .string({
-      required_error: '请输入插话内容',
-      invalid_type_error: '插话内容必须是文本',
+      required_error: validationMessage('validation.chat.steerRequired'),
+      invalid_type_error: validationMessage('validation.chat.steerNotText'),
     })
     .trim()
-    .min(1, '插话内容不能为空')
-    .max(STEER_MESSAGE_MAX_CHARS, `插话内容最多 ${STEER_MESSAGE_MAX_CHARS} 个字符`),
+    .min(1, validationMessage('validation.chat.steerEmpty'))
+    .max(
+      STEER_MESSAGE_MAX_CHARS,
+      validationMessage('validation.chat.steerTooLong', { max: STEER_MESSAGE_MAX_CHARS }),
+    ),
 })
 export type SteerConversationBody = z.infer<typeof steerConversationBodySchema>
 
@@ -563,7 +586,9 @@ export const steerConversationResultSchema = z.object({
  *   · 已经被模型读走 ⇒ 撤不回来（`cancelled:false`）。
  */
 export const steerCancelBodySchema = z.object({
-  id: z.string({ required_error: '缺少插话标识' }).min(1, '缺少插话标识'),
+  id: z
+    .string({ required_error: validationMessage('validation.chat.steerIdMissing') })
+    .min(1, validationMessage('validation.chat.steerIdMissing')),
 })
 export type SteerCancelBody = z.infer<typeof steerCancelBodySchema>
 
@@ -601,13 +626,13 @@ export type SteerConversationResult = z.infer<typeof steerConversationResultSche
 export const confirmRequestBodySchema = z.object({
   confirmId: z
     .string({
-      required_error: '缺少 confirmId（应回传 confirm 事件里的那个值）',
-      invalid_type_error: 'confirmId 必须是字符串',
+      required_error: validationMessage('validation.chat.confirmIdMissing'),
+      invalid_type_error: validationMessage('validation.chat.confirmIdNotString'),
     })
-    .min(1, 'confirmId 不能为空'),
+    .min(1, validationMessage('validation.chat.confirmIdEmpty')),
   accepted: z.boolean({
-    required_error: '缺少 accepted（true = 确认执行，false = 取消）',
-    invalid_type_error: 'accepted 必须是布尔值',
+    required_error: validationMessage('validation.chat.acceptedMissing'),
+    invalid_type_error: validationMessage('validation.chat.acceptedNotBoolean'),
   }),
 })
 export type ConfirmRequestBody = z.infer<typeof confirmRequestBodySchema>

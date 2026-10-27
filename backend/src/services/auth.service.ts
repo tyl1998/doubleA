@@ -16,7 +16,7 @@
  *   2. **用户名先归一化再查库**（`normalizeUsername`，与 P0-1-8 建号同一个函数）。
  */
 
-import {
+import { appMsg,
   AppError,
   PASSWORD_MAX_BYTES,
   normalizeUsername,
@@ -85,7 +85,7 @@ export async function login(input: LoginBody): Promise<AuthUser> {
       '登录被拒：账号已锁定',
     )
     // 429 而不是 401：这不是"凭据不对"，而是"现在不允许再试"；data 带上剩余秒数供前端倒计时
-    throw AppError.busy(`账号已锁定，请 ${minutes} 分钟后重试`, { retryAfterSec: lock.retryAfterSec })
+    throw AppError.busy(appMsg('app.m131', { p0: minutes }), { retryAfterSec: lock.retryAfterSec })
   }
 
   const user = await getPrisma().user.findUnique({ where: { username }, select: USER_AUTH_SELECT })
@@ -98,7 +98,7 @@ export async function login(input: LoginBody): Promise<AuthUser> {
     // 日志里区分"账号不存在"与"密码错"是有意为之：这是**运维**信息（排查撞库 vs 用户忘了密码），
     // 而响应文案两者完全一致、耗时才已对齐，不外泄给调用方。
     getLogger().warn({ username, failures, accountExists: user !== null }, '登录失败：用户名或密码错误')
-    throw AppError.unauthorized('用户名或密码错误')
+    throw AppError.unauthorized(appMsg('app.m132'))
   }
 
   // ③ 凭据正确 → 清计数（否则"错 4 次→成功→再错 1 次"就会被锁，与用户直觉不符）
@@ -109,7 +109,7 @@ export async function login(input: LoginBody): Promise<AuthUser> {
   //    能立刻知道原因、不必反复重试到把计数刷满。
   if (user.status !== UserStatus.ACTIVE) {
     getLogger().warn({ userId: user.id, username }, '登录被拒：账号已停用')
-    throw AppError.unauthorized('账号已停用，请联系管理员')
+    throw AppError.unauthorized(appMsg('app.m018'))
   }
 
   // ⑤ 预写快照缓存：前端登录成功后通常立刻打 `/auth/me` 与若干初始化请求，
@@ -147,12 +147,12 @@ export async function changePassword(userId: string, input: ChangePasswordBody):
   const db = getPrisma()
   const user = await db.user.findUnique({ where: { id: userId }, select: USER_AUTH_SELECT })
   // 会话有效但用户已不在（缓存窗口内的竞态）：当作未登录处理
-  if (user === null) throw AppError.unauthorized('未登录或会话已失效')
+  if (user === null) throw AppError.unauthorized(appMsg('app.m005'))
 
   const oldPasswordOk = await verifyPassword(input.oldPassword, user.passwordHash)
   if (!oldPasswordOk) {
     getLogger().info({ userId }, '改密失败：当前密码不正确')
-    throw AppError.validation('当前密码不正确', {
+    throw AppError.validation(appMsg('app.m133'), {
       fields: [{ path: 'body.oldPassword', message: '当前密码不正确' }],
     })
   }
@@ -160,7 +160,7 @@ export async function changePassword(userId: string, input: ChangePasswordBody):
   // 双保险：schema 已按字节卡过一遍，但 service 也可能被直接调用（脚本/将来的内部调用），
   // 而 bcrypt 对超长密码是**静默截断**（`issue_fix/问题记录-P0-1-6-...` 坑 2），必须在写入前拦住。
   if (utf8ByteLength(input.newPassword) > PASSWORD_MAX_BYTES) {
-    throw AppError.validation(`新密码过长（最多 ${PASSWORD_MAX_BYTES} 字节，中文按 3 字节计）`, {
+    throw AppError.validation(appMsg('app.m134', { p0: PASSWORD_MAX_BYTES }), {
       fields: [{ path: 'body.newPassword', message: `新密码最多 ${PASSWORD_MAX_BYTES} 字节（中文按 3 字节计）` }],
     })
   }

@@ -14,7 +14,7 @@
  * 初始化"的落点（P0-1-3 只打 WARN，不拦启动）。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { config } from '../../config.js'
 import { ApiEmbeddingProvider } from './api.js'
@@ -90,7 +90,7 @@ export function getEmbeddingProvider(): EmbeddingProvider {
 
   const readiness = embeddingReadiness()
   if (!readiness.ready) {
-    throw AppError.internal(`embedding 未就绪（EMBEDDING_MODE=${mode}）：${readiness.problems.join('；')}`)
+    throw AppError.internal(appMsg('app.m042', { p0: mode, p1: readiness.problems.join('；') }))
   }
 
   const provider = buildProvider(mode)
@@ -160,7 +160,7 @@ function buildProvider(mode: EmbeddingMode): EmbeddingProvider {
   const { apiUrl, apiKey, apiModel, dim, batchSize, localModelPath, localRuntimeModule } = config.embedding
   if (mode === 'api') {
     if (apiUrl === undefined || apiModel === undefined) {
-      throw AppError.internal('EMBEDDING_MODE=api 但 EMBEDDING_API_URL / EMBEDDING_API_MODEL 未配置')
+      throw AppError.internal(appMsg('app.m043'))
     }
     return new ApiEmbeddingProvider({
       apiUrl,
@@ -247,12 +247,11 @@ export async function probeEmbeddingDim(
   })
   const [vector] = await provider.embed([DIM_PROBE_TEXT])
   if (vector === undefined) {
-    throw AppError.internal(
-      `无法确定 embedding 维度：模型「${target.apiModel}」没有返回向量（请核对该 Provider 的 /embeddings 端点）`,
+    throw AppError.internal(appMsg('app.m044', { p0: target.apiModel }),
     )
   }
   if (vector.length < 1 || !Number.isInteger(vector.length)) {
-    throw AppError.internal(`embedding 返回了非法维度（${vector.length}），无法用于知识库`)
+    throw AppError.internal(appMsg('app.m045', { p0: vector.length }))
   }
   return vector.length
 }

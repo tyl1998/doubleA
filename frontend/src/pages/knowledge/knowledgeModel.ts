@@ -18,18 +18,19 @@
  */
 
 import {
-  DOCUMENT_PARSING_HINT,
   LEGACY_DOC_EXTENSION,
-  LEGACY_DOC_HINT,
   UPLOAD_EXTENSIONS,
   isDocumentSearchable,
   isImageUploadExtension,
+  translate,
   type AssetVisibility,
   type ChunkItem,
   type DocumentItem,
   type DocumentStatus,
   type ImageRecognition,
   type KnowledgeBaseItem,
+  type Locale,
+  type MessageKey,
   type RetrievalConfig,
   type RetrievalHit,
   type RetrievalMode,
@@ -176,16 +177,16 @@ export type FileScreenResult =
  * 前端读不到 ⇒ 写死一个数字就是造一份会与部署配置分叉的事实。超限交回后端的 413 文案
  * （`errorHandler` 保留了原状态码与文案）。
  */
-export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenResult {
+export function screenPickedFiles(files: readonly PickedFileLike[], locale: Locale): FileScreenResult {
   if (files.length === 0) {
-    return { kind: 'reject', code: 'NO_FILE', message: '没有选中文件。', hint: null }
+    return { kind: 'reject', code: 'NO_FILE', message: translate(locale, 'kb.upload.noFile'), hint: null }
   }
   if (files.length > 1) {
     return {
       kind: 'reject',
       code: 'MULTIPLE',
-      message: `一次只能上传一个文件（本次选中 ${files.length} 个）。`,
-      hint: '上传接口只接受单个 file 字段：请逐个上传。',
+      message: translate(locale, 'kb.upload.multiple', { count: files.length }),
+      hint: translate(locale, 'kb.upload.multipleHint'),
     }
   }
 
@@ -196,18 +197,19 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
   //    本可正常解析 ⇒ 这里放行，内容判定由调用方读文件头走 {@link screenLegacyDocContent}。
   //    真正的把关始终在后端 `detectFormat`（前端这份只是提前提示）。
   if (extension === null || (extension !== LEGACY_DOC_EXTENSION && !(UPLOAD_EXTENSIONS as readonly string[]).includes(extension))) {
+    const extensions = UPLOAD_EXTENSIONS.join(' / ')
     return {
       kind: 'reject',
       code: 'UNSUPPORTED',
       message:
         extension === null
-          ? `无法从文件名「${file.name}」识别格式（缺少扩展名）。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}`
-          : `不支持的文件类型 .${extension}。支持的格式：${UPLOAD_EXTENSIONS.join(' / ')}`,
+          ? translate(locale, 'kb.upload.noExtension', { name: file.name, extensions })
+          : translate(locale, 'kb.upload.unsupported', { extension, extensions }),
       hint: null,
     }
   }
   if (file.size === 0) {
-    return { kind: 'reject', code: 'EMPTY', message: `「${file.name}」是空文件（0 字节）。`, hint: null }
+    return { kind: 'reject', code: 'EMPTY', message: translate(locale, 'kb.upload.empty', { name: file.name }), hint: null }
   }
 
   return { kind: 'accept', fileName: file.name }
@@ -220,7 +222,7 @@ export function screenPickedFiles(files: readonly PickedFileLike[]): FileScreenR
  * ⚠️ 与 {@link screenPickedFiles} **分两步**是刻意的：文件头要读字节（异步），而
  * `screenPickedFiles` 是同步纯函数（验收档直接跑）。判定口径镜像后端 `sniffLegacyDoc`。
  */
-export function screenLegacyDocContent(fileName: string, head: Uint8Array): FileScreenResult {
+export function screenLegacyDocContent(fileName: string, head: Uint8Array, locale: Locale): FileScreenResult {
   const kind = sniffLegacyDocHead(head)
   if (kind === 'html' || kind === 'mhtml') {
     return { kind: 'accept', fileName }
@@ -228,8 +230,8 @@ export function screenLegacyDocContent(fileName: string, head: Uint8Array): File
   return {
     kind: 'reject',
     code: 'LEGACY_DOC',
-    message: `「${fileName}」是旧版 Word 二进制格式（.doc）：本平台只解析 ${UPLOAD_EXTENSIONS.join(' / ')} 这些格式，旧版 .doc 需先转换。`,
-    hint: LEGACY_DOC_HINT,
+    message: translate(locale, 'kb.upload.legacyDoc', { name: fileName, extensions: UPLOAD_EXTENSIONS.join(' / ') }),
+    hint: translate(locale, 'hint.legacyDoc'),
   }
 }
 
@@ -267,15 +269,16 @@ export type DocumentLed = 'run' | 'ok' | 'fail'
 
 export interface DocumentStatusMeta {
   led: DocumentLed
-  label: string
+  /** 状态标签的 i18n key（P1-23：存 key 不存文案；渲染处 `translate(locale, labelKey)`） */
+  labelKey: MessageKey
   /**
-   * 该状态下必须显示的一句说明；`null` = 无。
+   * 该状态下必须显示的一句说明的 i18n key；`null` = 无。
    *
-   * `PARSING` 那句来自 `shared`（`DOCUMENT_PARSING_HINT` = "更新中，暂不参与检索"）：
+   * `PARSING` 那句对应 `shared` 的 `DOCUMENT_PARSING_HINT`（"更新中，暂不参与检索"）：
    * "先删后建"的覆盖重建有一段检索空窗，不提示的话用户会以为"文档在、就是搜不到"是 bug。
-   * 这里是**搬用**而不是重写 —— 那句话是前后端共用的一条契约（后端注释同款）。
+   * 两处逐字一致（`verify-knowledge-ui` 的「zh 译文 === shared 常量」守门兜住漂移）。
    */
-  hint: string | null
+  hintKey: MessageKey | null
 }
 
 /**
@@ -283,9 +286,9 @@ export interface DocumentStatusMeta {
  * `FAILED` 是"要你处理"（去点重试）—— 混成一种"失败"会让用户去重试一件正在正常进行的事。
  */
 export const DOCUMENT_STATUS_META: Readonly<Record<DocumentStatus, DocumentStatusMeta>> = {
-  PARSING: { led: 'run', label: '解析中', hint: DOCUMENT_PARSING_HINT },
-  READY: { led: 'ok', label: '已完成', hint: null },
-  FAILED: { led: 'fail', label: '失败', hint: null },
+  PARSING: { led: 'run', labelKey: 'label.docStatus.PARSING', hintKey: 'hint.documentParsing' },
+  READY: { led: 'ok', labelKey: 'label.docStatus.READY', hintKey: null },
+  FAILED: { led: 'fail', labelKey: 'label.docStatus.FAILED', hintKey: null },
 }
 
 /**
@@ -311,8 +314,8 @@ export interface DocumentActions {
   /** 「查看片段」—— 只有 `READY` 才有块可看（见下方矩阵） */
   canPreviewChunks: boolean
   canDelete: boolean
-  /** 「重试」按钮的说明（两种状态下的含义不同，见下） */
-  retryHint: string
+  /** 「重试」按钮的说明 key（两种状态下的含义不同，见下） */
+  retryHintKey: MessageKey
 }
 
 /**
@@ -348,8 +351,8 @@ export function documentActions(status: DocumentStatus): DocumentActions {
     canRetry: status !== 'READY',
     canPreviewChunks: isDocumentSearchable(status),
     canDelete: true,
-    retryHint:
-      status === 'PARSING' ? '长时间停在「解析中」时可重新入队' : '重新入队解析（失败原因多来自扫描件或格式问题）',
+    retryHintKey:
+      status === 'PARSING' ? 'kb.retryHint.parsing' : 'kb.retryHint.failed',
   }
 }
 
@@ -409,29 +412,40 @@ export function documentRefetchInterval(items: readonly Pick<DocumentItem, 'stat
 
 // ───────────────────────────── 检索配置的展示 ─────────────────────────────
 
-export const RETRIEVAL_MODE_LABEL: Readonly<Record<RetrievalMode, string>> = {
-  HYBRID: '向量 + 全文',
-  VECTOR: '仅向量',
-  FULLTEXT: '仅全文',
+export const RETRIEVAL_MODE_LABEL_KEY: Readonly<Record<RetrievalMode, MessageKey>> = {
+  HYBRID: 'label.retrievalMode.HYBRID',
+  VECTOR: 'label.retrievalMode.VECTOR',
+  FULLTEXT: 'label.retrievalMode.FULLTEXT',
 }
 
-export const SPLIT_STRATEGY_LABEL: Readonly<Record<SplitStrategy, string>> = {
-  hybrid: '按标题切（回退定长）',
-  fixed: '定长切分',
+export const SPLIT_STRATEGY_LABEL_KEY: Readonly<Record<SplitStrategy, MessageKey>> = {
+  hybrid: 'label.splitStrategy.hybrid',
+  fixed: 'label.splitStrategy.fixed',
 }
 
 /** 一句话说清这个库的检索口径（详情页头部与「检索测试」抽屉的 tag 都用它） */
-export function describeRetrieval(config: RetrievalConfig): string {
+export function describeRetrieval(config: RetrievalConfig, locale: Locale): string {
   const weights = config.weights
-  return (
-    `${RETRIEVAL_MODE_LABEL[config.mode]} · topK ${config.topK} · 相似度下限 ${config.score} · ` +
-    `RRF k=${config.rrfK}（权重 ${weights.vector}/${weights.fulltext}）`
-  )
+  return translate(locale, 'kb.describe.retrieval', {
+    mode: translate(locale, RETRIEVAL_MODE_LABEL_KEY[config.mode]),
+    topK: config.topK,
+    score: config.score,
+    rrfK: config.rrfK,
+    vector: weights.vector,
+    fulltext: weights.fulltext,
+  })
 }
 
 /** 分块口径（`chunkSize` / `chunkOverlap` 的单位是**字符**，不是 token —— `shared` 的注释） */
-export function describeChunking(kb: Pick<KnowledgeBaseItem, 'chunkSize' | 'chunkOverlap' | 'retrievalConfig'>): string {
-  return `${kb.chunkSize} 字 / 重叠 ${kb.chunkOverlap} 字 · ${SPLIT_STRATEGY_LABEL[kb.retrievalConfig.splitStrategy]}`
+export function describeChunking(
+  kb: Pick<KnowledgeBaseItem, 'chunkSize' | 'chunkOverlap' | 'retrievalConfig'>,
+  locale: Locale,
+): string {
+  return translate(locale, 'kb.describe.chunking', {
+    chunkSize: kb.chunkSize,
+    chunkOverlap: kb.chunkOverlap,
+    strategy: translate(locale, SPLIT_STRATEGY_LABEL_KEY[kb.retrievalConfig.splitStrategy]),
+  })
 }
 
 export interface EmbeddingNotice {
@@ -446,17 +460,17 @@ export interface EmbeddingNotice {
  * （业务的活），`null` 是"服务端 embedding 未就绪、判断不了"（运维的活）。合报会让用户去
  * 重做一个治不好的动作（P0-1-20 已为同一对原因立过规矩：**两条原因分开报**）。
  */
-export function embeddingChangedNotice(changed: boolean | null): EmbeddingNotice | null {
+export function embeddingChangedNotice(changed: boolean | null, locale: Locale): EmbeddingNotice | null {
   if (changed === true) {
     return {
       tone: 'warn',
-      text: '该库快照的 embedding 模型与当前服务端不一致：向量路会被跳过（需要重建该库才能恢复向量检索）。',
+      text: translate(locale, 'kb.embedding.changed'),
     }
   }
   if (changed === null) {
     return {
       tone: 'info',
-      text: '当前无法判定 embedding 模型是否变更（服务端 embedding 未就绪）。这不影响全文检索。',
+      text: translate(locale, 'kb.embedding.unknown'),
     }
   }
   return null
@@ -504,8 +518,10 @@ export function rankText(rank: number | null): string {
  * 而是把一列有用信息换成了一句废话（`03` §七：不造假；`06` §六：原型的**数值与口径**以契约
  * 为准）。库名已经在页面标题与抽屉副标题上了。
  */
-export function hitSourceText(hit: Pick<RetrievalHit, 'docName' | 'page' | 'seq'>): string {
-  return hit.page === null ? `${hit.docName} · 块 #${hit.seq}` : `${hit.docName} · 第 ${hit.page} 页`
+export function hitSourceText(hit: Pick<RetrievalHit, 'docName' | 'page' | 'seq'>, locale: Locale): string {
+  return hit.page === null
+    ? translate(locale, 'kb.hit.sourceDocChunk', { doc: hit.docName, seq: hit.seq })
+    : translate(locale, 'kb.hit.sourceDocPage', { doc: hit.docName, page: hit.page })
 }
 
 // ───────────────────────────── 片段预览（P0-1-35 增量）─────────────────────────────
@@ -517,11 +533,15 @@ export function hitSourceText(hit: Pick<RetrievalHit, 'docName' | 'page' | 'seq'
  * 标题层级 —— 给它们补一个 `第 — 页` / `（无标题）` 只是噪音（与 `hitSourceText` 同款取舍）。
  * `headingPath` 用 ` / ` 连接，对应流水线写入的层级数组（`子方案①` §4-4）。
  */
-export function chunkLocationText(chunk: Pick<ChunkItem, 'seq' | 'page' | 'headingPath'>): string {
-  const parts = [`块 #${chunk.seq}`]
-  if (chunk.page !== null) parts.push(`第 ${chunk.page} 页`)
+export function chunkLocationText(
+  chunk: Pick<ChunkItem, 'seq' | 'page' | 'headingPath'>,
+  locale: Locale,
+): string {
+  const separator = translate(locale, 'kb.chunk.separator')
+  const parts = [translate(locale, 'kb.chunk.locationChunk', { seq: chunk.seq })]
+  if (chunk.page !== null) parts.push(translate(locale, 'kb.chunk.locationPage', { page: chunk.page }))
   if (chunk.headingPath.length > 0) parts.push(chunk.headingPath.join(' / '))
-  return parts.join(' · ')
+  return parts.join(separator)
 }
 
 /**
@@ -529,8 +549,8 @@ export function chunkLocationText(chunk: Pick<ChunkItem, 'seq' | 'page' | 'headi
  * 用 `[...text].length` 码点数而不是 `text.length`：与后端分块/窗口的**码点口径**一致
  * （`retrieval.ts#buildSnippet` 同款），否则含 emoji 的块会数出偏移的字数。
  */
-export function chunkLengthText(content: string): string {
-  return `${[...content].length} 字`
+export function chunkLengthText(content: string, locale: Locale): string {
+  return translate(locale, 'kb.chunk.length', { count: [...content].length })
 }
 
 export interface SearchNotice {
@@ -551,23 +571,26 @@ export interface SearchNotice {
  * 或"服务端 embedding 未就绪…"）—— **前端不重新拼一句**：那两个原因对应两种完全不同的
  * 下一步动作（重建库 vs 找运维）。
  */
-export function searchNotice(result: {
-  items: readonly unknown[]
-  vectorPathSkipped: boolean
-  warnings: readonly string[]
-}): SearchNotice | null {
+export function searchNotice(
+  result: {
+    items: readonly unknown[]
+    vectorPathSkipped: boolean
+    warnings: readonly string[]
+  },
+  locale: Locale,
+): SearchNotice | null {
   if (result.vectorPathSkipped) {
     const reason = result.warnings[0]
     return {
       tone: 'warn',
       text:
         reason === undefined
-          ? '本次没有走向量路（服务端未说明原因），结果只来自全文检索。'
-          : `本次没有走向量路：${reason}`,
+          ? translate(locale, 'kb.search.noVectorPathBare')
+          : translate(locale, 'kb.search.noVectorPath', { reason }),
     }
   }
   if (result.items.length === 0) {
-    return { tone: 'info', text: '没有命中任何内容。全文路是字面匹配，长问句很难命中 —— 可以换更短的关键词再试。' }
+    return { tone: 'info', text: translate(locale, 'kb.search.noHit') }
   }
   return null
 }
@@ -707,9 +730,9 @@ export function isEmbeddingModelChanged(baseline: KnowledgeBaseItem, embeddingMo
  * 前端判是为了**当场**把错误指到输入框上；即便这里漏判，后端也会 400
  * （`chunkOverlap（N）必须小于 chunkSize（M），否则分块无法前进`）。
  */
-export function validateChunking(chunkSize: number, chunkOverlap: number): string | null {
+export function validateChunking(chunkSize: number, chunkOverlap: number, locale: Locale): string | null {
   if (chunkOverlap >= chunkSize) {
-    return `重叠字符数（${chunkOverlap}）必须小于分块字符数（${chunkSize}），否则分块无法前进`
+    return translate(locale, 'kb.validate.chunking', { size: chunkSize, overlap: chunkOverlap })
   }
   return null
 }

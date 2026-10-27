@@ -22,10 +22,11 @@
 
 import { Alert, Button, Table, type TableColumnsType } from 'antd'
 import { useState } from 'react'
-import { USAGE_GROUP_KEY_LABELS, USAGE_GROUP_LABELS, type UsageGroupBy, type UsageSummaryItem } from '@doubulea/shared'
+import { USAGE_GROUP_HEADER_KEY, USAGE_GROUP_KEY, translate, type Locale, type UsageGroupBy, type UsageSummaryItem } from '@doubulea/shared'
 
 import { useUsageSummary } from '../../api/usage.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
+import { useT, type Translate } from '../../app/i18n.js'
 import {
   coverageText,
   dateInputValue,
@@ -39,61 +40,61 @@ import {
 } from './usageModel.js'
 
 /** 名称列的表头随维度变（"用户"/"智能体"/"模型"） */
-function columnsFor(groupBy: UsageGroupBy): TableColumnsType<UsageSummaryItem> {
+function columnsFor(groupBy: UsageGroupBy, locale: Locale, t: Translate): TableColumnsType<UsageSummaryItem> {
   return [
     {
-      title: USAGE_GROUP_KEY_LABELS[groupBy],
+      title: translate(locale, USAGE_GROUP_HEADER_KEY[groupBy]),
       dataIndex: 'label',
       render: (_, item) => <span className="kb-cell__name">{item.label}</span>,
     },
     {
-      title: '记录数',
+      title: t('usage.colRecords'),
       dataIndex: 'records',
       width: 90,
       align: 'right',
       render: (_, item) => <span className="num">{formatCount(item.records)}</span>,
     },
     {
-      title: '输入 tokens',
+      title: t('usage.colInput'),
       dataIndex: 'tokensIn',
       width: 130,
       align: 'right',
       render: (_, item) => <span className="num">{formatTokens(item.tokensIn)}</span>,
     },
     {
-      title: '输出 tokens',
+      title: t('usage.colOutput'),
       dataIndex: 'tokensOut',
       width: 130,
       align: 'right',
       render: (_, item) => <span className="num">{formatTokens(item.tokensOut)}</span>,
     },
     {
-      title: '合计',
+      title: t('usage.colTotal'),
       dataIndex: 'tokensTotal',
       width: 130,
       align: 'right',
       render: (_, item) => <span className="num">{formatTokens(item.tokensTotal)}</span>,
     },
     {
-      title: '上报覆盖',
+      title: t('usage.colCoverage'),
       key: 'coverage',
       width: 150,
       align: 'right',
       render: (_, item) => (
-        <span className="ratio" title="有多少条记录真的上报了 token（其余为“未上报”，不是 0）">
-          {coverageText(item.tokenRecords, item.records)}
+        <span className="ratio" title={t('usage.coverageTooltip')}>
+          {coverageText(item.tokenRecords, item.records, locale)}
         </span>
       ),
     },
     {
-      title: '时长',
+      title: t('usage.colDuration'),
       dataIndex: 'durationMs',
       width: 110,
       align: 'right',
-      render: (_, item) => <span className="num">{formatDurationMs(item.durationMs)}</span>,
+      render: (_, item) => <span className="num">{formatDurationMs(item.durationMs, locale)}</span>,
     },
     {
-      title: '轮次',
+      title: t('usage.colRounds'),
       dataIndex: 'rounds',
       width: 90,
       align: 'right',
@@ -104,15 +105,16 @@ function columnsFor(groupBy: UsageGroupBy): TableColumnsType<UsageSummaryItem> {
 
 /** 一张维度表（三张共用；三态各自独立 —— 一个维度失败不遮挡另外两个） */
 function UsageTable({ groupBy, range }: { groupBy: UsageGroupBy; range: UsageRange }) {
+  const { t, locale } = useT()
   const query = useUsageSummary({ groupBy, from: range.from, to: range.to })
   const items = query.data?.items ?? []
 
   const title = (
     <span>
-      {USAGE_GROUP_LABELS[groupBy]}
+      {translate(locale, USAGE_GROUP_KEY[groupBy])}
       {query.isSuccess && (
         <span className="ratio" style={{ marginLeft: 'var(--sp-3)' }}>
-          共 {formatCount(items.length)} 组
+          {t('usage.groupCount', { count: formatCount(items.length) })}
         </span>
       )}
     </span>
@@ -130,7 +132,7 @@ function UsageTable({ groupBy, range }: { groupBy: UsageGroupBy; range: UsageRan
       ) : query.isError ? (
         <div style={{ padding: 'var(--sp-4)' }}>
           <ErrorState
-            title={`${USAGE_GROUP_LABELS[groupBy]}加载失败`}
+            title={t('usage.loadFailed')}
             error={query.error}
             retrying={query.isFetching}
             onRetry={() => {
@@ -141,15 +143,15 @@ function UsageTable({ groupBy, range }: { groupBy: UsageGroupBy; range: UsageRan
       ) : items.length === 0 ? (
         <div style={{ padding: 'var(--sp-4)' }}>
           <EmptyState
-            title="该区间没有用量记录"
-            lead="换一个时间区间，或先让智能体跑几轮对话（ChatBot 与任务型智能体都会记账）。"
+            title={t('usage.emptyTitle')}
+            lead={t('usage.emptyLead')}
           />
         </div>
       ) : (
         <Table<UsageSummaryItem>
           rowKey="key"
           size="middle"
-          columns={columnsFor(groupBy)}
+          columns={columnsFor(groupBy, locale, t)}
           dataSource={items}
           loading={false}
           pagination={items.length > 20 ? { pageSize: 20, showSizeChanger: false } : false}
@@ -161,6 +163,7 @@ function UsageTable({ groupBy, range }: { groupBy: UsageGroupBy; range: UsageRan
 }
 
 export function UsagePage() {
+  const { t, locale } = useT()
   const presets = usageRangePresets()
   const [range, setRange] = useState<UsageRange>(presets[0]!.range)
   const [activePreset, setActivePreset] = useState<UsageRangePresetKey | null>('thisMonth')
@@ -188,11 +191,11 @@ export function UsagePage() {
     <>
       <div className="page__head">
         <div>
-          <h1>用量统计</h1>
+          <h1>{t('usage.title')}</h1>
           <p className="page__lead">
-            按用户 / 智能体 / 模型汇总 <code>usage_records</code> 的 token、时长与轮次
-            （每轮对话记一条；ChatBot 与任务型智能体都计入）。默认区间是本月 ——
-            每张表按合计降序，第一行就是"用得最多"。
+            {t('usage.leadPrefix')}
+            <code>usage_records</code>
+            {t('usage.leadMid')}
           </p>
         </div>
       </div>
@@ -201,17 +204,21 @@ export function UsagePage() {
         type="info"
         showIcon
         style={{ marginBottom: 'var(--sp-5)' }}
-        message="关于读数"
+        message={t('usage.noteTitle')}
         description={
           <>
-            表里<strong>没有费用</strong> —— 平台不知道各 provider 的计价，只统计 token / 时长 / 轮次。
-            token 显示 <code>—</code> 表示该组<strong>没有任何一条上报过</strong>（上游流式阶段不报 usage 时就是
-            "不知道"，不是 0）；「上报覆盖」那一列给出分母，避免把"部分未上报"误读成"用得少"。
+            {t('usage.notePrefix')}
+            <strong>{t('usage.noteStrong1')}</strong>
+            {t('usage.noteMid1')}
+            <code>—</code>
+            {t('usage.noteMid2')}
+            <strong>{t('usage.noteStrong2')}</strong>
+            {t('usage.noteMid3')}
           </>
         }
       />
 
-      <div className="usage-range" role="group" aria-label="时间区间">
+      <div className="usage-range" role="group" aria-label={t('usage.rangeAria')}>
         {presets.map((preset) => (
           <Button
             key={preset.key}
@@ -221,12 +228,12 @@ export function UsagePage() {
               applyPreset(preset.key)
             }}
           >
-            {preset.label}
+            {translate(locale, preset.labelKey)}
           </Button>
         ))}
         <span className="usage-range__sep" aria-hidden="true" />
         <label className="usage-range__field">
-          从
+          {t('usage.from')}
           <input
             type="date"
             value={fromDay}
@@ -237,7 +244,7 @@ export function UsagePage() {
           />
         </label>
         <label className="usage-range__field">
-          到
+          {t('usage.to')}
           <input
             type="date"
             value={toDay}
@@ -248,9 +255,9 @@ export function UsagePage() {
           />
         </label>
         <Button size="small" type="primary" disabled={customRange === null} onClick={applyCustom}>
-          查询
+          {t('usage.query')}
         </Button>
-        {customRange === null && <span className="ratio">请选择合法的起止日期（起不晚于止）</span>}
+        {customRange === null && <span className="ratio">{t('usage.invalidRange')}</span>}
       </div>
 
       <UsageTable groupBy="user" range={range} />

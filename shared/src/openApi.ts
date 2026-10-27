@@ -49,6 +49,8 @@ import { z } from 'zod'
 import { AGENT_TYPES } from './agent.js'
 import { CHAT_ATTACHMENT_MAX_COUNT, CONVERSATION_RUN_ORIGINS, CONVERSATION_STATUSES } from './conversation.js'
 import { cursorPageOf } from './envelope.js'
+import type { MessageKey } from './i18n/index.js'
+import { validationMessage } from './i18n/validation.js'
 import { MAX_CHAT_CONTENT_CHARS } from './sse.js'
 
 // ═════════════════════════════ 常量与判据 ═════════════════════════════
@@ -74,6 +76,16 @@ export const OPEN_API_SCOPE_LABELS: Readonly<Record<OpenApiScope, string>> = {
   chat: '对话（发消息/停止/插话/确认/附件）',
   'conversation:read': '读会话（列表/详情/历史/观察流）',
   'conversation:write': '写会话（新建/删除）',
+}
+
+/**
+ * 作用域 → i18n key（P1-23：前端据此取译文）。
+ * ⚠️ 中文那份 {@link OPEN_API_SCOPE_LABELS} **保留**：后端 `openV1Spec.ts` 仍在消费（OpenAPI 文档）。
+ */
+export const OPEN_API_SCOPE_KEY: Readonly<Record<OpenApiScope, MessageKey>> = {
+  chat: 'label.openApiScope.chat',
+  'conversation:read': 'label.openApiScope.conversationRead',
+  'conversation:write': 'label.openApiScope.conversationWrite',
 }
 
 /** 界面预设：默认全选；"只读"只给 `conversation:read` */
@@ -169,14 +181,19 @@ export type ListOpenApiKeysResult = z.infer<typeof listOpenApiKeysResultSchema>
 // ─── 签发与编辑**共用**的字段校验（文案与上限只有一处；两边各自 `.optional()`） ───
 
 const openApiKeyNameField = z
-  .string({ required_error: '请输入 Key 名称' })
+  .string({ required_error: validationMessage('validation.openApi.keyNameRequired') })
   .trim()
-  .min(1, 'Key 名称不能为空')
-  .max(OPEN_API_KEY_NAME_MAX, `Key 名称最多 ${OPEN_API_KEY_NAME_MAX} 个字符`)
+  .min(1, validationMessage('validation.openApi.keyNameEmpty'))
+  .max(OPEN_API_KEY_NAME_MAX, validationMessage('validation.openApi.keyNameTooLong', { max: OPEN_API_KEY_NAME_MAX }))
 
-const openApiKeyScopesField = z.array(z.enum(OPEN_API_SCOPES)).min(1, '至少选择一个作用域')
+const openApiKeyScopesField = z
+  .array(z.enum(OPEN_API_SCOPES))
+  .min(1, validationMessage('validation.openApi.scopesRequired'))
 
-const openApiKeyExpiresAtField = z.string().datetime({ message: '过期时间必须是 ISO 8601 时间' }).nullable()
+const openApiKeyExpiresAtField = z
+  .string()
+  .datetime({ message: validationMessage('validation.openApi.expiresAtNotIso') })
+  .nullable()
 
 const openApiKeyConfirmTimeoutField = z
   .number()
@@ -204,7 +221,9 @@ export const createOpenApiKeyBodySchema = z.object({
    * 关联的智能体（**必填**，2026-10-22 起从路径挪到体里）：Key 的身份是「我 × 这个智能体」。
    * 服务端校验"我能看见它 ∧ 未软删"，否则 404（与资产族同口径，不泄漏存在性）。
    */
-  agentId: z.string({ required_error: '请选择要关联的智能体' }).uuid('智能体 ID 不是合法 UUID'),
+  agentId: z
+    .string({ required_error: validationMessage('validation.openApi.agentRequired') })
+    .uuid(validationMessage('validation.openApi.agentIdNotUuid')),
   name: openApiKeyNameField,
   scopes: openApiKeyScopesField.optional(),
   expiresAt: openApiKeyExpiresAtField.optional(),
@@ -214,7 +233,7 @@ export const createOpenApiKeyBodySchema = z.object({
   rateLimitPerMin: openApiKeyRateLimitField.optional(),
   dailyTokenLimit: openApiKeyDailyTokenField.optional(),
   /** **仅 ADMIN**：把 Key 记到另一个用户头上（R2） */
-  userId: z.string().uuid('用户 ID 不是合法 UUID').optional(),
+  userId: z.string().uuid(validationMessage('validation.openApi.userIdNotUuid')).optional(),
 })
 export type CreateOpenApiKeyBody = z.infer<typeof createOpenApiKeyBodySchema>
 
@@ -261,7 +280,7 @@ export type RevokeOpenApiKeyResult = z.infer<typeof revokeOpenApiKeyResultSchema
 
 /** `GET /api/open-keys` 的查询参数：可只列某个智能体下的（"这个智能体我签过几把"） */
 export const listOpenApiKeysQuerySchema = z.object({
-  agentId: z.string().uuid('智能体 ID 不是合法 UUID').optional(),
+  agentId: z.string().uuid(validationMessage('validation.openApi.agentIdNotUuid')).optional(),
   /** 是否把**已吊销 / 已过期**的也列出来（默认列 —— 界面要能看出"外部为什么进不来"） */
   includeInactive: z.coerce.boolean().default(true),
 })
@@ -269,7 +288,7 @@ export type ListOpenApiKeysQuery = z.infer<typeof listOpenApiKeysQuerySchema>
 
 /** 路径参数：`/api/open-keys/:keyId`（吊销） */
 export const openApiKeyIdParamsSchema = z.object({
-  keyId: z.string().uuid('Key ID 不是合法 UUID'),
+  keyId: z.string().uuid(validationMessage('validation.openApi.keyIdNotUuid')),
 })
 export type OpenApiKeyIdParams = z.infer<typeof openApiKeyIdParamsSchema>
 
@@ -365,7 +384,12 @@ export type OpenConversation = z.infer<typeof openConversationSchema>
  * ⚠️ 建会话**只能**落到 Key 绑定的那个 Agent 上，请求体里**刻意没有** `agentId`。
  */
 export const openCreateConversationBodySchema = z.object({
-  title: z.string().trim().min(1, '会话标题不能为空').max(255, '会话标题最多 255 个字符').optional(),
+  title: z
+    .string()
+    .trim()
+    .min(1, validationMessage('validation.openApi.titleEmpty'))
+    .max(255, validationMessage('validation.openApi.titleTooLong', { max: 255 }))
+    .optional(),
 })
 export type OpenCreateConversationBody = z.infer<typeof openCreateConversationBodySchema>
 
@@ -383,7 +407,7 @@ export type OpenConversationListResult = z.infer<typeof openConversationListResu
 
 /** 路径参数：`/open/v1/conversations/:id` */
 export const openConversationIdParamsSchema = z.object({
-  id: z.string().uuid('会话 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.openApi.conversationIdNotUuid')),
 })
 export type OpenConversationIdParams = z.infer<typeof openConversationIdParamsSchema>
 
@@ -561,21 +585,24 @@ export type OpenConversationActive = z.infer<typeof openConversationActiveSchema
  */
 export const openChatBodySchema = z.object({
   content: z
-    .string({ required_error: '请输入消息内容', invalid_type_error: '消息内容必须是文本' })
+    .string({
+      required_error: validationMessage('validation.openApi.contentRequired'),
+      invalid_type_error: validationMessage('validation.openApi.contentNotText'),
+    })
     .trim()
-    .min(1, '消息内容不能为空')
-    .max(MAX_CHAT_CONTENT_CHARS, `单条消息最多 ${MAX_CHAT_CONTENT_CHARS} 个字符`),
-  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
+    .min(1, validationMessage('validation.openApi.contentEmpty'))
+    .max(MAX_CHAT_CONTENT_CHARS, validationMessage('validation.openApi.contentTooLong', { max: MAX_CHAT_CONTENT_CHARS })),
+  modelId: z.string().uuid(validationMessage('validation.openApi.modelIdNotUuid')).optional(),
   attachmentFileIds: z
-    .array(z.string().uuid('附件 ID 不是合法 UUID'))
-    .max(CHAT_ATTACHMENT_MAX_COUNT, `一次最多携带 ${CHAT_ATTACHMENT_MAX_COUNT} 个附件`)
+    .array(z.string().uuid(validationMessage('validation.openApi.fileIdNotUuid')))
+    .max(CHAT_ATTACHMENT_MAX_COUNT, validationMessage('validation.openApi.attachmentsTooMany', { max: CHAT_ATTACHMENT_MAX_COUNT }))
     .optional(),
 })
 export type OpenChatBody = z.infer<typeof openChatBodySchema>
 
 /** `POST /open/v1/conversations/:id/regenerate` 请求体（与内部同口径：不收正文） */
 export const openRegenerateBodySchema = z.object({
-  modelId: z.string().uuid('模型 ID 不是合法 UUID').optional(),
+  modelId: z.string().uuid(validationMessage('validation.openApi.modelIdNotUuid')).optional(),
 })
 export type OpenRegenerateBody = z.infer<typeof openRegenerateBodySchema>
 
@@ -588,10 +615,10 @@ export type OpenStopResult = z.infer<typeof openStopResultSchema>
 
 export const openSteerBodySchema = z.object({
   message: z
-    .string({ required_error: '请输入插话内容' })
+    .string({ required_error: validationMessage('validation.openApi.steerRequired') })
     .trim()
-    .min(1, '插话内容不能为空')
-    .max(MAX_CHAT_CONTENT_CHARS, `插话内容最多 ${MAX_CHAT_CONTENT_CHARS} 个字符`),
+    .min(1, validationMessage('validation.openApi.steerEmpty'))
+    .max(MAX_CHAT_CONTENT_CHARS, validationMessage('validation.openApi.steerTooLong', { max: MAX_CHAT_CONTENT_CHARS })),
 })
 export type OpenSteerBody = z.infer<typeof openSteerBodySchema>
 
@@ -603,8 +630,10 @@ export const openSteerResultSchema = z.object({
 export type OpenSteerResult = z.infer<typeof openSteerResultSchema>
 
 export const openConfirmBodySchema = z.object({
-  confirmId: z.string({ required_error: '缺少 confirmId' }).min(1, 'confirmId 不能为空'),
-  accepted: z.boolean({ required_error: '缺少 accepted（true = 确认执行，false = 取消）' }),
+  confirmId: z
+    .string({ required_error: validationMessage('validation.openApi.confirmIdMissing') })
+    .min(1, validationMessage('validation.openApi.confirmIdEmpty')),
+  accepted: z.boolean({ required_error: validationMessage('validation.openApi.acceptedMissing') }),
 })
 export type OpenConfirmBody = z.infer<typeof openConfirmBodySchema>
 
@@ -624,7 +653,7 @@ export type OpenConfirmResult = z.infer<typeof openConfirmResultSchema>
  * 关掉后本端点对该 Key 恒 403 `FORBIDDEN`（不是静默不生效 —— 那会让外部以为破坏性工具已经放行）。
  */
 export const openSetAutoApproveBodySchema = z.object({
-  enabled: z.boolean({ required_error: '缺少 enabled' }),
+  enabled: z.boolean({ required_error: validationMessage('validation.openApi.enabledMissing') }),
 })
 export type OpenSetAutoApproveBody = z.infer<typeof openSetAutoApproveBodySchema>
 

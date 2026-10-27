@@ -26,7 +26,7 @@
  *    单次调用 + 明确报错，把"要不要重试"留给上层，避免两处各重试一遍（放大上游压力）。
  */
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { config } from '../../config.js'
 import { fetchUpstreamJson, snippet, type UpstreamEndpoint } from '../upstream.js'
@@ -105,7 +105,7 @@ export class ApiEmbeddingProvider implements EmbeddingProvider {
 
   constructor(options: ApiEmbeddingOptions) {
     if (options.apiUrl.endsWith('/')) {
-      throw AppError.internal(`ApiEmbeddingProvider 的 apiUrl 必须是归一化后的地址（去掉尾斜杠）：${options.apiUrl}`)
+      throw AppError.internal(appMsg('app.m036', { p0: options.apiUrl }))
     }
     this.#options = options
     this.#dim = options.dim
@@ -124,7 +124,7 @@ export class ApiEmbeddingProvider implements EmbeddingProvider {
   /** 已知维度；尚未探测到时抛错（调用方应先 `embed()` 探测，或在构造时给已知维度） */
   dim(): number {
     if (this.#dim === null) {
-      throw AppError.internal(`embedding 维度尚未确定（model=${this.#options.apiModel}）：请先完成一次 embedding 调用`)
+      throw AppError.internal(appMsg('app.m037', { p0: this.#options.apiModel }))
     }
     return this.#dim
   }
@@ -137,8 +137,7 @@ export class ApiEmbeddingProvider implements EmbeddingProvider {
     // （静默降级会让"图片内容没进向量空间"变成一个事后无法解释的检索缺失）
     const multimodal = this.#options.multimodal === true
     if (!multimodal && inputs.some(hasImage)) {
-      throw AppError.internal(
-        `所选 embedding 模型不支持多模态，无法向量化图片（model=${this.#options.apiModel}）`,
+      throw AppError.internal(appMsg('app.m038', { p0: this.#options.apiModel }),
       )
     }
 
@@ -207,8 +206,7 @@ export function readEmbeddingPayload(
   expectedDim: number | null,
 ): number[][] {
   if (typeof payload !== 'object' || payload === null) {
-    throw AppError.upstreamError(
-      `上游 embedding 响应结构异常（不是对象）：${endpoint.providerName}。响应：${snippet(JSON.stringify(payload), endpoint.apiKey)}`,
+    throw AppError.upstreamError(appMsg('app.m039', { p0: endpoint.providerName, p1: snippet(JSON.stringify(payload), endpoint.apiKey) }),
     )
   }
   const record = payload as Record<string, unknown>
@@ -217,16 +215,21 @@ export function readEmbeddingPayload(
   if (typeof record.error === 'object' && record.error !== null) {
     const message = (record.error as { message?: unknown }).message
     throw AppError.upstreamError(
-      `上游以 200 返回了错误：${endpoint.providerName} / ${endpoint.subject}。` +
-        snippet(String(message ?? '(无 message)'), endpoint.apiKey),
+      appMsg('app.m275', {
+        p0: endpoint.providerName,
+        p1: endpoint.subject ?? '',
+        p2: snippet(String(message ?? '(无 message)'), endpoint.apiKey),
+      }),
     )
   }
 
   const rows = collectRows(record)
   if (rows.length === 0) {
-    throw AppError.upstreamError(
-      `上游 embedding 响应里没有向量（既没有 data[].embedding 也没有 embeddings）：${endpoint.providerName} / ${endpoint.subject}。` +
-        `响应：${snippet(JSON.stringify(record), endpoint.apiKey)}`,
+    throw AppError.upstreamError(appMsg('app.m243', {
+        p0: endpoint.providerName,
+        p1: endpoint.subject ?? '',
+        p2: snippet(JSON.stringify(record), endpoint.apiKey),
+      }),
     )
   }
 
@@ -239,16 +242,19 @@ export function readEmbeddingPayload(
     const valid = sorted.every((row, position) => row.index === position)
     if (!valid) {
       throw AppError.upstreamError(
-        `上游 embedding 响应的 index 不是 0..${rows.length - 1} 的排列（无法安全归位）：${endpoint.providerName} / ${endpoint.subject}`,
+        appMsg('app.m040', { p0: rows.length - 1, p1: endpoint.providerName, p2: endpoint.subject ?? '' }),
       )
     }
     ordered = sorted
   }
 
   if (ordered.length !== expectedCount) {
-    throw AppError.upstreamError(
-      `上游返回的向量条数与输入不符（输入 ${expectedCount} 条，返回 ${ordered.length} 条）：${endpoint.providerName} / ${endpoint.subject}。` +
-        '出现这种情况说明该实现不支持批量输入，请把 EMBEDDING_BATCH_SIZE 调小到 1 试试',
+    throw AppError.upstreamError(appMsg('app.m244', {
+        p0: expectedCount,
+        p1: ordered.length,
+        p2: endpoint.providerName,
+        p3: endpoint.subject ?? '',
+      }),
     )
   }
 
@@ -256,9 +262,12 @@ export function readEmbeddingPayload(
     const vector = row.vector
     // `expectedDim === null` = 首次探测（建库时）⇒ 不校验，把真实维度作为结果返回
     if (expectedDim !== null && vector.length !== expectedDim) {
-      throw AppError.upstreamError(
-        `上游返回 ${vector.length} 维向量，与期望的 ${expectedDim} 维不一致：${endpoint.providerName} / ${endpoint.subject}。` +
-          '同一知识库内的向量维度必须一致 —— 请核对所选 embedding 模型是否被改动。',
+      throw AppError.upstreamError(appMsg('app.m245', {
+          p0: vector.length,
+          p1: expectedDim,
+          p2: endpoint.providerName,
+          p3: endpoint.subject ?? '',
+        }),
       )
     }
     return vector
@@ -311,8 +320,7 @@ function toVector(values: unknown[]): number[] {
   const vector: number[] = []
   for (const value of values) {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
-      throw AppError.upstreamError(
-        `上游返回的向量里含非数字元素（${JSON.stringify(value)}）—— 该响应不可用`,
+      throw AppError.upstreamError(appMsg('app.m041', { p0: JSON.stringify(value) }),
       )
     }
     vector.push(value)

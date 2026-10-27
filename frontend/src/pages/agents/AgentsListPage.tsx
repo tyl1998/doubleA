@@ -37,6 +37,7 @@ import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStat
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { AGENTS_NEW_PATH, chatPath, agentEditPath } from '../../app/paths.js'
 
 /** 类型筛选：`ALL` 是"全部"，其余取 `AGENT_TYPES` 的字面量 */
@@ -48,6 +49,7 @@ type OwnerFilter = 'ALL' | 'MINE'
 export function AgentsListPage() {
   const navigate = useNavigate()
   const feedback = useFeedback()
+  const { t } = useT()
   const [keyword, setKeyword] = useState('')
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL')
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>('ALL')
@@ -76,17 +78,17 @@ export function AgentsListPage() {
 
   const columns: TableColumnsType<AgentItem> = [
     {
-      title: '名称',
+      title: t('agents.colName'),
       dataIndex: 'name',
       render: (_, agent) => (
         <div className="agent-cell">
           <span className="agent-cell__name">{agent.name}</span>
-          <span className="agent-cell__sub">{agent.description ?? '（没有描述）'}</span>
+          <span className="agent-cell__sub">{agent.description ?? t('agents.noDescription')}</span>
         </div>
       ),
     },
     {
-      title: '类型',
+      title: t('agents.colType'),
       dataIndex: 'type',
       width: 120,
       render: (_, agent) => (
@@ -94,7 +96,7 @@ export function AgentsListPage() {
       ),
     },
     {
-      title: '模型',
+      title: t('agents.colModel'),
       dataIndex: 'modelName',
       width: 200,
       render: (_, agent) =>
@@ -102,9 +104,9 @@ export function AgentsListPage() {
           // 未绑定模型（多因所属模型商/模型被删除而自动解绑）：如实标注、指向"去编辑页重新绑定"
           <div className="agent-cell">
             <span className="num">
-              <Tag className="tag--danger">未绑定模型</Tag>
+              <Tag className="tag--danger">{t('agents.modelUnbound')}</Tag>
             </span>
-            <span className="agent-cell__sub">所属模型商/模型已删除，编辑智能体重新绑定后才能对话</span>
+            <span className="agent-cell__sub">{t('agents.modelUnboundHint')}</span>
           </div>
         ) : (
           <div className="agent-cell">
@@ -113,26 +115,28 @@ export function AgentsListPage() {
               {!agent.modelAvailable && (
                 <>
                   {' '}
-                  <Tag className="tag--danger">已停用</Tag>
+                  <Tag className="tag--danger">{t('agents.modelDisabled')}</Tag>
                 </>
               )}
             </span>
-            <span className="agent-cell__sub">{agent.modelAvailable ? agent.modelLabel : '该模型或所属 Provider 已停用，发消息会被拒'}</span>
+            <span className="agent-cell__sub">
+              {agent.modelAvailable ? agent.modelLabel : t('agents.modelDisabledHint')}
+            </span>
           </div>
         ),
     },
     {
-      title: '组件绑定',
+      title: t('agents.colComponents'),
       dataIndex: 'components',
       width: 180,
       render: (_, agent) => {
         const knowledge = agent.components.filter((c) => c.componentType === 'KNOWLEDGE').length
         const mcp = mcpRefsOf(agent.components).length
-        if (knowledge === 0 && mcp === 0) return <Tag>无绑定</Tag>
+        if (knowledge === 0 && mcp === 0) return <Tag>{t('agents.noBinding')}</Tag>
         return (
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
-            {knowledge > 0 && <Tag>知识库 ×{knowledge}</Tag>}
-            {mcp > 0 && <Tag className="tag--warn">MCP ×{mcp}</Tag>}
+            {knowledge > 0 && <Tag>{t('agents.knowledgeCount', { count: knowledge })}</Tag>}
+            {mcp > 0 && <Tag className="tag--warn">{t('agents.mcpCount', { count: mcp })}</Tag>}
           </span>
         )
       },
@@ -140,7 +144,7 @@ export function AgentsListPage() {
     {
       // P1-13：所属人（= `createdBy`/`creatorName`）。列表对全员可见，这是"这条是谁的"的读数
       //（判据都是服务端下发的字段，前端不自己算）。
-      title: '所属人',
+      title: t('agents.colOwner'),
       dataIndex: 'creatorName',
       width: 140,
       render: (_, agent) =>
@@ -149,7 +153,7 @@ export function AgentsListPage() {
         // ⚠️ 可见性徽标与受众人数**移到独立的「可见性」列**（2026-10-16 复议）：原先三者挤在
         // 一个 160px 列里，指定用户分享后 `名字 + 徽标 + 「N 人 / M 组」` 溢出换行、看着错乱。
         agent.canEdit ? (
-          <Tooltip title="点击转移所属人">
+          <Tooltip title={t('agents.ownerTransferTitle')}>
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setTransferFor(agent)}>
               {agent.creatorName}
             </Button>
@@ -160,35 +164,35 @@ export function AgentsListPage() {
     },
     {
       // P1-18：可见性徽标 + （指定用户时）受众规模；判据都来自服务端下发字段，前端不自己算。
-      title: '可见性',
+      title: t('agents.colVisibility'),
       dataIndex: 'visibility',
       width: 170,
       render: (_, agent) => (
         <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
           <VisibilityBadge visibility={agent.visibility} />
           {agent.visibility === 'SHARED' && (
-            <span className="ratio" title="受众 = 直接指定的用户 ∪ 指定组里的成员">
-              {agent.audience.users.length} 人 / {agent.audience.groups.length} 组
+            <span className="ratio" title={t('agents.audienceTitle')}>
+              {t('agents.audienceCount', { users: agent.audience.users.length, groups: agent.audience.groups.length })}
             </span>
           )}
         </span>
       ),
     },
     {
-      title: '最近更新',
+      title: t('agents.colUpdated'),
       dataIndex: 'updatedAt',
       width: 130,
       render: (_, agent) => <span className="num">{formatUpdatedAt(agent.updatedAt)}</span>,
     },
     {
-      title: '操作',
+      title: t('agents.colActions'),
       key: 'actions',
       // 复制对所有行都提供（不需要编辑权限，见服务层 `copyAgent` 口径 ①）⇒ 比原来宽一点
       width: 320,
       align: 'right',
       render: (_, agent) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
-          <Link to={chatPath(agent.id)}>对话</Link>
+          <Link to={chatPath(agent.id)}>{t('agents.chat')}</Link>
           <Button
             type="link"
             size="small"
@@ -197,22 +201,22 @@ export function AgentsListPage() {
             loading={copy.isPending && copy.variables === agent.id}
             onClick={() => {
               copy.mutate(agent.id, {
-                onSuccess: (created) => feedback.ok(`已复制为「${created.name}」`),
-                onError: (error) => feedback.fail(error, '复制失败'),
+                onSuccess: (created) => feedback.ok(t('agents.copied', { name: created.name })),
+                onError: (error) => feedback.fail(error, t('agents.copyFailed')),
               })
             }}
           >
-            复制
+            {t('agents.copy')}
           </Button>
           {agent.canEdit ? (
             <>
-              <Link to={agentEditPath(agent.id)}>编辑</Link>
+              <Link to={agentEditPath(agent.id)}>{t('common.edit')}</Link>
               <Button type="link" danger size="small" onClick={() => setPendingDelete(agent)} style={{ padding: 0 }}>
-                删除
+                {t('common.delete')}
               </Button>
             </>
           ) : (
-            <span className="ratio">无编辑权限</span>
+            <span className="ratio">{t('agents.noEditPerm')}</span>
           )}
         </div>
       ),
@@ -223,21 +227,18 @@ export function AgentsListPage() {
     <>
       <div className="page__head">
         <div>
-          <h1>智能体</h1>
+          <h1>{t('agents.title')}</h1>
           <p className="page__lead">
             {isPending ? (
-              '正在读取智能体列表…'
+              t('agents.loading')
             ) : (
-              <>
-                你可见的智能体共 <span className="num">{total}</span> 个，其中你能编辑的{' '}
-                <span className="num">{editableCount}</span> 个（创建者或管理员），其余只读。列表按最近更新排序。
-              </>
+              t('agents.leadPrefix', { total, editable: editableCount })
             )}
           </p>
         </div>
         <div className="page__head-actions">
           <Button type="primary" onClick={() => navigate(AGENTS_NEW_PATH)}>
-            创建智能体
+            {t('agents.create')}
           </Button>
         </div>
       </div>
@@ -249,7 +250,7 @@ export function AgentsListPage() {
       <>
         {head}
         <ErrorState
-          title="智能体列表加载失败"
+          title={t('agents.loadFailed')}
           error={error}
           retrying={isFetching}
           onRetry={() => {
@@ -269,13 +270,13 @@ export function AgentsListPage() {
           allowClear
           value={keyword}
           onChange={(event) => setKeyword(event.target.value)}
-          placeholder="搜索名称或描述…"
+          placeholder={t('agents.searchPlaceholder')}
           style={{ width: 260 }}
-          aria-label="搜索智能体"
+          aria-label={t('agents.searchAria')}
         />
-        <div className="seg" role="group" aria-label="按类型筛选">
+        <div className="seg" role="group" aria-label={t('agents.filterTypeAria')}>
           <button type="button" aria-pressed={typeFilter === 'ALL'} onClick={() => setTypeFilter('ALL')}>
-            全部
+            {t('agents.filterAll')}
           </button>
           {AGENT_TYPES.map((type) => (
             <button
@@ -288,21 +289,22 @@ export function AgentsListPage() {
             </button>
           ))}
         </div>
-        <div className="seg" role="group" aria-label="按所属人筛选">
+        <div className="seg" role="group" aria-label={t('agents.filterOwnerAria')}>
           <button type="button" aria-pressed={ownerFilter === 'ALL'} onClick={() => setOwnerFilter('ALL')}>
-            全部可见
+            {t('agents.filterAllVisible')}
           </button>
           <button type="button" aria-pressed={ownerFilter === 'MINE'} onClick={() => setOwnerFilter('MINE')}>
-            只看我的
+            {t('agents.filterMine')}
           </button>
         </div>
         <span className="ratio u-right">
-          数据来自 GET /api/agents · 缓存 30s
+          {t('agents.source')}
           {total > items.length && (
             <>
               {' '}
-              · 共 <span className="num">{total}</span> 个，本次取回前 <span className="num">{items.length}</span> 个
-              （<code>limit</code> 上限 100，更早的不在此页）
+              {t('agents.sourceMorePrefix', { total, shown: items.length })}
+              <code>limit</code>
+              {t('agents.sourceMoreSuffix')}
             </>
           )}
         </span>
@@ -313,11 +315,11 @@ export function AgentsListPage() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有智能体"
-            lead="创建一个智能体：选一个对话模型、写清它的角色与边界。需要私有知识就挂知识库，需要动手就挂 MCP 工具。"
+            title={t('agents.emptyTitle')}
+            lead={t('agents.emptyLead')}
             action={
               <Button type="primary" onClick={() => navigate(AGENTS_NEW_PATH)}>
-                创建智能体
+                {t('agents.create')}
               </Button>
             }
           />
@@ -325,8 +327,11 @@ export function AgentsListPage() {
       ) : filtered.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="没有匹配的智能体"
-            lead={`当前筛选条件下没有结果（关键字「${keyword.trim()}」${typeFilter === 'ALL' ? '' : ` · 类型 ${AGENT_TYPE_LABEL[typeFilter]}`}）。`}
+            title={t('agents.noMatchTitle')}
+            lead={t('agents.noMatchLead', {
+              keyword: keyword.trim(),
+              type: typeFilter === 'ALL' ? '' : t('agents.noMatchType', { type: AGENT_TYPE_LABEL[typeFilter] }),
+            })}
             action={
               <Button
                 onClick={() => {
@@ -335,7 +340,7 @@ export function AgentsListPage() {
                   setOwnerFilter('ALL')
                 }}
               >
-                清空筛选
+                {t('agents.clearFilter')}
               </Button>
             }
           />
@@ -349,7 +354,7 @@ export function AgentsListPage() {
             dataSource={filtered}
             // 加载态已由 TableSkeleton 承担 ⇒ 这里不再叠一层 AntD 的遮罩转圈
             loading={false}
-            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => `共 ${count} 条 · 每页 20` }}
+            pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (count) => t('agents.pageTotal', { count }) }}
           />
         </div>
       )}

@@ -796,11 +796,11 @@
 .convrail__new-btn:hover { background: var(--accent); color: var(--paper); }
 /* 欢迎态里那枚按钮是内联的、不占整行 */
 .chat-home__welcome .convrail__new-btn { width: auto; min-height: 38px; padding: 0 var(--sp-4); }
-/* 上层：平台功能（约 35% 高；自身可滚）。六条直达入口 + 「管理 ▸」就地展开的剩余入口。 */
+/* 上层：平台功能。**按内容固定高度、不出滑块**（用户 2026-10-26 口径）：直接入口 + 「管理 ▸」。
+   ⚠️ 这里刻意不是 flex 伸缩轴：固定的功能入口不该随窗口高度被压出滚动条；滚动只留给下层会话。
+   「管理」的其余入口走 `Popover`（`placement="rightTop"`）**向右**弹出，portal 到 body、不挤本栏。 */
 .convrail__nav {
-  flex: 35 35 0;
-  min-height: 0;
-  overflow-y: auto;
+  flex: 0 0 auto;
   padding: var(--sp-2) var(--sp-3) var(--sp-3);
   border-bottom: 1px solid var(--rule);
 }
@@ -843,26 +843,81 @@
 .convrail__nav-icon { display: inline-flex; flex: 0 0 auto; color: var(--muted); }
 .convrail__nav-item[data-current='true'] .convrail__nav-icon { color: var(--accent-ink); }
 .convrail__nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 「管理 ▸」尾部的箭头：静态指向右（点它向右弹浮层），不再有就地展开的旋转态 */
 .convrail__nav-caret {
   margin-left: auto;
   font-size: 10px;
   color: var(--muted-2);
-  transition: transform var(--dur-micro) ease-out;
 }
-.convrail__nav-caret[data-open='false'] { transform: rotate(-90deg); }
-/* 「管理」展开后的子项：缩进一级，与直达入口分层 */
-.convrail__nav-item--sub { padding-left: calc(var(--sp-2) + 22px); }
+/* 浮层内容 = 一列与栏内同款的导航项（`rightTop` 从「管理」那枚按钮右侧弹出）；
+   命中当前页的那条复用 `.convrail__nav-item[data-current='true']` 的高亮，此处不另写一份。 */
+.convrail__manage-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 168px;
+  padding: var(--sp-1);
+}
 
-/* 下层：会话（约 65% 高；自身可滚） */
+/* 下层：会话（自身可滚；**滑块只在鼠标指向本区域时才显形**）。顶部一行小标题 + 卡片样式切换。
+   ⚠️ 拆成「固定头 + 可滚体」两条，避免标题行随列表滚走（sticky 会与 `padding` 打架）。 */
 .convrail__convos {
-  flex: 65 65 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-2) var(--sp-3) var(--sp-2);
+  gap: var(--sp-1);
+}
+.convrail__convos-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+}
+.convrail__convos-title {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.12em;
+  color: var(--muted-2);
+}
+.convrail__card-toggle {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--dur-micro) ease-out, background var(--dur-micro) ease-out,
+    border-color var(--dur-micro) ease-out;
+}
+.convrail__card-toggle:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+  border-color: var(--rule);
+}
+.convrail__card-toggle[data-mode='compact'] { color: var(--accent-ink); }
+.convrail__convos-body {
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--sp-3) var(--sp-3) var(--sp-2);
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  /* ⚠️ 滑块**默认透明、hover 才显形**（不改变占位宽度 ⇒ 无跳动）：用户口径"鼠标不在这范围内不展示"。 */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
 }
+.convrail__convos-body:hover { scrollbar-color: var(--rule-strong) transparent; }
+.convrail__convos-body::-webkit-scrollbar-thumb { background: transparent; background-clip: content-box; }
+.convrail__convos-body:hover::-webkit-scrollbar-thumb { background: var(--rule-strong); }
 .convrail__empty { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
 .convrail__hint { margin: 0; color: var(--muted); font-size: var(--fs-sm); }
 .convrail__list { margin: 0; padding: 0; list-style: none; }
@@ -900,15 +955,9 @@
   border-top: 1px solid var(--rule);
   padding: var(--sp-2) var(--sp-3);
   display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-}
-/* 「管理」入口已从底部 popover 上移为上层 `.convrail__nav` 里可就地展开的一项（2026-10-13）。 */
-.convrail__user {
-  display: flex;
   align-items: center;
-  gap: var(--sp-2);
   justify-content: space-between;
+  gap: var(--sp-2);
 }
 /* ★ 会话栏的收起/展开已**移出会话栏**（P1-15 R3）：按钮是主区左上角的浮层 `.app-shell__toggle`，
    点击整体隐藏/唤回（`.app-shell--rail-hidden`）。故这里不再有图标条收起态。
@@ -1516,16 +1565,21 @@
   text-align: left;
   cursor: pointer;
 }
+/* ⚠️ 密集列表（100 条）里标题**不该成为最重的一层**（用户反馈"脚重头轻"）：
+   故只给中等字重、正常字色，与上方用等宽小字的分组标题分层：标题在下、读数在上，
+   但两者都不抢眼 —— 重量放在"当前会话"（`[data-current]`）与状态灯上，而不是压在标题上。 */
 .conv__title {
   display: block;
   font-size: var(--fs-sm);
   font-weight: 500;
+  color: var(--ink-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   /* 给右侧的操作按钮留出位置：hover 时它们会盖在标题右端 */
   padding-right: 44px;
 }
+.conv[data-current='true'] .conv__title { color: var(--ink); }
 .conv__meta {
   display: flex;
   align-items: center;
@@ -1534,6 +1588,21 @@
   font-size: var(--fs-2xs);
   color: var(--muted);
 }
+/* ── 省略模式（`.conv[data-mode='compact']`）───────────────────────────────
+   用户口径：不留时间、只留标题 + 状态色点，行更矮。故收起纵向堆叠改成**单行**，
+   色点收到行尾（`led` 为 `conv__open` 的第二个孩子，`margin-left: auto` 顶到右端）。
+   ⚠️ 这里是**纯样式**层：`aria-label`/`title` 仍在色点上带状态文案（可访问性不降级）。 */
+.conv[data-mode='compact'] .conv__open {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+}
+.conv[data-mode='compact'] .conv__title { padding-right: 0; /* flex 行里可收缩（否则长标题把色点挤出可视区） */ min-width: 0; }
+.conv[data-mode='compact'] .led { margin-left: auto; }
+/* 省略模式行矮 ⇒ hover 浮出的 [重命名][删除] 会盖住行尾那枚状态色点；让色点让位（本来就有 title/aria 兜底） */
+.conv[data-mode='compact']:hover .led,
+.conv[data-mode='compact']:focus-within .led { opacity: 0; }
 .conv__ops {
   position: absolute;
   top: var(--sp-2);

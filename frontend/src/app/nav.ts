@@ -14,14 +14,22 @@
  * 不是照抄原型。
  */
 
-import type { UserRole } from '@doubulea/shared'
+import type { MessageKey, UserRole } from '@doubulea/shared'
 
 import { ADMIN_EGRESS_PATH, ADMIN_SANDBOX_INSTANCES_PATH, AGENTS_PATH, HOME_PATH } from './paths.js'
 
 export interface NavItem {
   /** 导航项的稳定标识（本仓用它映射图标；原型里是左侧栏上的等宽字形） */
   code: string
-  label: string
+  /**
+   * 导航项文案的 i18n key（P1-23：**不再存中文**）。
+   *
+   * ⚠️ 为什么存 key 而不是存字符串：导航文案要在**每屏**跟着界面语言变
+   * （侧栏 / 面包屑 / 页面地标 `aria-label`）。存字符串的话，这三处消费方各要
+   * 记住"这条得翻译"，漏一处就是"导航中文、其它英文"。存 key 则**类型**就在推着走
+   * （`MessageKey` 的联合类型），漏译由 `tsc` 拦下。
+   */
+  labelKey: MessageKey
   path: string
   /** 仪器读数式的屏号，显示在左侧栏底部（`design/*.html` 的 `.rail__serial`） */
   serial: string
@@ -50,20 +58,20 @@ export interface NavItem {
 export const NAV_ITEMS: readonly NavItem[] = [
   // 已落地 ⇒ 不带 `batch`。⚠️ **P1-15 起 `/` 是聊天主页**，智能体列表搬到这里（管理目的地之一）；
   // 对话从聊天主页进，不再从列表进 —— 列表页仍保留「对话」入口（直达新会话态）。
-  { code: 'AG', label: '智能体', path: AGENTS_PATH, serial: 'S-02 · 智能体' },
+  { code: 'AG', labelKey: 'nav.agents', path: AGENTS_PATH, serial: 'S-02 · 智能体' },
   // 已落地 ⇒ 不带 `batch`（P0-1-35 把知识库列表与详情换成真实页面）
-  { code: 'KB', label: '知识库', path: '/knowledge', serial: 'S-05 · 知识库' },
+  { code: 'KB', labelKey: 'nav.knowledge', path: '/knowledge', serial: 'S-05 · 知识库' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页换成真实页面）
-  { code: 'MC', label: 'MCP', path: '/mcp', serial: 'S-06 · MCP' },
+  { code: 'MC', labelKey: 'nav.mcp', path: '/mcp', serial: 'S-06 · MCP' },
   // 已落地 ⇒ 不带 `batch`（P1-6 把任务中心占位页换成真页面：**定时任务**管理）
-  { code: 'TK', label: '任务', path: '/tasks', serial: 'S-09 · 任务中心' },
+  { code: 'TK', labelKey: 'nav.tasks', path: '/tasks', serial: 'S-09 · 任务中心' },
   // 已落地 ⇒ 不带 `batch`（会话产物：跨会话汇总本人全部产物，登录即可、可预览/下载/删除）
-  { code: 'AH', label: '会话产物', path: '/artifacts', serial: 'S-10 · 会话产物' },
+  { code: 'AH', labelKey: 'nav.artifacts', path: '/artifacts', serial: 'S-10 · 会话产物' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把凭据页换成真实页面）。⚠️ **与 MCP 解耦**：路由归入
   // `/settings` 一族（个人设置族），排在个人项这一端，不跟在 `MC` 后面。
   // ⚠️ Git 凭据（P1-9 · R11）**不单列导航项**：它是本页内嵌的一个区块（`GitCredentialsSection`），
   // 「我的凭据」是个人凭据的唯一入口。
-  { code: 'CR', label: '我的凭据', path: '/settings/credentials', serial: 'S-08b · 凭据' },
+  { code: 'CR', labelKey: 'nav.credentials', path: '/settings/credentials', serial: 'S-08b · 凭据' },
   /**
    * 用量统计（P1-7 落地；**P1-15 起登录即可**）。
    *
@@ -72,19 +80,19 @@ export const NAV_ITEMS: readonly NavItem[] = [
    * `adminOnly` —— 放开的是"平台级用量报表"这一份共享事实，与会话/凭据那类私有资源无关。
    * 故它从"管理三条"移到普通分组（放在 `CR` 之后、ADMIN 两条之前）。
    */
-  { code: 'UT', label: '用量统计', path: '/admin/usage', serial: 'S-07c · 用量' },
+  { code: 'UT', labelKey: 'nav.usage', path: '/admin/usage', serial: 'S-07c · 用量' },
   // 管理面**两条**（P0-1-36 落地；仅 ADMIN）。
   // ⚠️ 为什么必须拆而不是"留一条、另一条走头像菜单"：`serialForPath` 的读数来自 `matchNavItem`，
   // 而 `/admin/models` 若不在表里，左侧栏底部会显示兜底的「S-00 · 工作台」。
-  { code: 'US', label: '用户管理', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
+  { code: 'US', labelKey: 'nav.users', path: '/admin/users', serial: 'S-07 · 用户管理', adminOnly: true },
   // ⚠️ P1-13：模型池**不再 adminOnly** —— `/api/model-providers/**` 与 `/api/models/**` 已从
   // `requireAdmin` 改成 `requireAuth` + **行级**权限：ADMIN 看全部，其他人看/管"公开 + 自己的 +
   // 分享给自己的"。故它对任何登录用户都可见（`03` §三 原话的"模型池仅 ADMIN"已被本批取代）。
-  { code: 'ML', label: '模型池', path: '/admin/models', serial: 'S-07b · 模型池' },
+  { code: 'ML', labelKey: 'nav.models', path: '/admin/models', serial: 'S-07b · 模型池' },
   // 出网策略（egress 黑白名单；平台级，仅 ADMIN）—— 排在模型池之后
-  { code: 'EG', label: '出网策略', path: ADMIN_EGRESS_PATH, serial: 'S-07d · 出网', adminOnly: true },
+  { code: 'EG', labelKey: 'nav.egress', path: ADMIN_EGRESS_PATH, serial: 'S-07d · 出网', adminOnly: true },
   // 沙箱实例（P1-14 · R5；实例在线注册表只读视图，平台级运维事实，仅 ADMIN）
-  { code: 'SI', label: '沙箱实例', path: ADMIN_SANDBOX_INSTANCES_PATH, serial: 'S-07e · 沙箱实例', adminOnly: true },
+  { code: 'SI', labelKey: 'nav.sandboxInstances', path: ADMIN_SANDBOX_INSTANCES_PATH, serial: 'S-07e · 沙箱实例', adminOnly: true },
 ] as const
 
 /**
@@ -128,9 +136,13 @@ export function serialForPath(pathname: string): string {
 
 /**
  * 顶栏面包屑的一段。`to` 有值且**不是最后一段** ⇒ 渲染成链接；最后一段恒为「当前页」。
+ *
+ * ⚠️ P1-23：这里存的是 **i18n key**（`labelKey`），由 `AppShell` 用 `useT()` 取值 ——
+ * 面包屑是"每屏都看得见"的公共面，必须跟界面语言走。二级页的**细节段**（知识库名 / 智能体名）
+ * 仍是**运行时数据**（不是 key），由页面经 `usePageCrumb` 上报，`AppShell` 原样渲染。
  */
 export interface CrumbSegment {
-  label: string
+  labelKey: MessageKey
   to?: string
 }
 
@@ -138,8 +150,8 @@ export interface CrumbSegment {
  * 少数路由的模块名与导航项标签不同（面包屑沿用页面原本的写法，不为了统一而改文案）。
  * 目前只有 MCP：导航里叫「MCP」，面包屑里一直是「MCP server」。
  */
-const CRUMB_MODULE_LABEL: Record<string, string> = {
-  '/mcp': 'MCP server',
+const CRUMB_MODULE_KEY: Record<string, MessageKey> = {
+  '/mcp': 'nav.mcpServer',
 }
 
 /**
@@ -152,20 +164,20 @@ const CRUMB_MODULE_LABEL: Record<string, string> = {
  * 有细节段 ⇒ 前缀各段都是链接；没有 ⇒ 末段就是当前页。
  */
 export function crumbBaseForPath(pathname: string): CrumbSegment[] {
-  const trail: CrumbSegment[] = [{ label: '工作台', to: HOME_PATH }]
+  const trail: CrumbSegment[] = [{ labelKey: 'nav.workspace', to: HOME_PATH }]
   const item = matchNavItem(pathname)
   if (item !== undefined && item.path !== HOME_PATH) {
-    trail.push({ label: CRUMB_MODULE_LABEL[item.path] ?? item.label, to: item.path })
+    trail.push({ labelKey: CRUMB_MODULE_KEY[item.path] ?? item.labelKey, to: item.path })
     return trail
   }
   if (item !== undefined) {
     // 首页（`/`）：模块名本身就是当前页
-    trail.push({ label: item.label })
+    trail.push({ labelKey: item.labelKey })
     return trail
   }
   // 不在导航里的页面
   if (pathname.startsWith('/settings/password')) {
-    trail.push({ label: '修改密码' })
+    trail.push({ labelKey: 'nav.password' })
     return trail
   }
   // 占位页 / 未找到：只给「工作台」，细节段（页面标题）由 `NoticePage` 交给顶栏

@@ -23,21 +23,22 @@ import type {
   AgentType,
   AssetVisibility,
   CreateAgentBody,
+  MessageKey,
   UpdateAgentBody,
 } from '@doubulea/shared'
 
 // ───────────────────────────── 展示口径（文案词表只此一处） ─────────────────────────────
 
-/** `03` §七 文案词表：界面统一用「智能体」；类型名沿用产品命名而不是枚举字面量 */
+/** `03` §七 文案词表：界面统一用「智能体」；类型名沿用产品命名而不是枚举字面量。值是产品名（非中文），zh/en 相同 ⇒ 不迁 i18n */
 export const AGENT_TYPE_LABEL: Readonly<Record<AgentType, string>> = {
   CHATBOT: 'ChatBot',
   TASK_AGENT: 'TaskAgent',
 }
 
-/** 类型选择器的副标题（`design/agent-edit.html` 的 `.check__meta`） */
-export const AGENT_TYPE_HINT: Readonly<Record<AgentType, string>> = {
-  CHATBOT: '即时问答，一轮一轮对话',
-  TASK_AGENT: '带沙箱与产物面板；类型创建后不可改',
+/** 类型选择器的副标题（`design/agent-edit.html` 的 `.check__meta`）—— 存 key 不存文案（P1-23） */
+export const AGENT_TYPE_HINT_KEY: Readonly<Record<AgentType, MessageKey>> = {
+  CHATBOT: 'label.agentTypeHint.CHATBOT',
+  TASK_AGENT: 'label.agentTypeHint.TASK_AGENT',
 }
 
 // 类型选项**不在这里再定义一份**：`shared` 的 `AGENT_TYPES` 就是取值域，编辑页直接迭代它。
@@ -64,13 +65,13 @@ export type AgentSectionKey = (typeof AGENT_SECTIONS)[number]
 export const AGENT_PAGE_SECTIONS = [...AGENT_SECTIONS, 'openKeys'] as const
 export type AgentPageSectionKey = (typeof AGENT_PAGE_SECTIONS)[number]
 
-/** 区块标题（参与保存的四区 + `openKeys`，唯一文案来源） */
-export const AGENT_SECTION_LABEL: Readonly<Record<AgentPageSectionKey, string>> = {
-  basic: '基本信息',
-  model: '模型',
-  prompt: '提示词',
-  components: '组件绑定',
-  openKeys: '开放调用',
+/** 区块标题（参与保存的四区 + `openKeys`，唯一文案来源）—— 存 key 不存文案（P1-23） */
+export const AGENT_SECTION_LABEL_KEY: Readonly<Record<AgentPageSectionKey, MessageKey>> = {
+  basic: 'label.agentSection.basic',
+  model: 'label.agentSection.model',
+  prompt: 'label.agentSection.prompt',
+  components: 'label.agentSection.components',
+  openKeys: 'label.agentSection.openKeys',
 }
 
 /** 区块序号（原型左侧的 `01 / …`） */

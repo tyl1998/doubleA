@@ -15,6 +15,7 @@ import { Alert, Button } from 'antd'
 import type { ReactNode } from 'react'
 
 import { describeError } from '../api/client.js'
+import { useT } from '../app/i18n.js'
 
 export interface EmptyStateProps {
   title: string
@@ -81,6 +82,7 @@ export interface ErrorStateProps {
  * 读出来 —— 编一个 id 上去比不显示更糟。
  */
 export function ErrorState({ title, error, onRetry, retrying = false }: ErrorStateProps) {
+  const { t } = useT()
   const { code, message } = describeError(error)
   return (
     <div className="card card--pad">
@@ -91,7 +93,7 @@ export function ErrorState({ title, error, onRetry, retrying = false }: ErrorSta
         description={`${code} · ${message}`}
         action={
           <Button onClick={onRetry} loading={retrying}>
-            重试
+            {t('common.retry')}
           </Button>
         }
       />

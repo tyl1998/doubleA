@@ -106,6 +106,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 import { canEditAsset, KB_MCP_VISIBILITIES } from './assetAcl.js'
 import { type UserRole } from './auth.js'
 import { offsetPageOf } from './envelope.js'
@@ -443,30 +445,41 @@ export type McpToolDescriptor = z.infer<typeof mcpToolDescriptorSchema>
 export const credentialSchemaEntrySchema = z.object({
   /** 参数名（HEADER 里是头名、QUERY 里是查询键、BODY 里是顶层键） */
   key: z
-    .string({ required_error: '请填写凭据参数名' })
+    .string({ required_error: validationMessage('validation.mcp.credentialKeyRequired') })
     .trim()
-    .min(1, '请填写凭据参数名')
-    .max(MCP_CREDENTIAL_KEY_MAX, `凭据参数名最多 ${MCP_CREDENTIAL_KEY_MAX} 个字符`),
+    .min(1, validationMessage('validation.mcp.credentialKeyRequired'))
+    .max(
+      MCP_CREDENTIAL_KEY_MAX,
+      validationMessage('validation.mcp.credentialKeyTooLong', { max: MCP_CREDENTIAL_KEY_MAX }),
+    ),
   /** 给填值的人看的说明（`03` §4.5 的表单逐行显示它） */
   label: z
-    .string({ required_error: '请填写参数说明' })
+    .string({ required_error: validationMessage('validation.mcp.credentialLabelRequired') })
     .trim()
-    .min(1, '请填写参数说明')
-    .max(64, '参数说明最多 64 个字符'),
+    .min(1, validationMessage('validation.mcp.credentialLabelRequired'))
+    .max(64, validationMessage('validation.mcp.credentialLabelTooLong', { max: 64 })),
   /**
    * 取值类型。**P0 只支持 `string`**（`02` §九 原文如此）—— 不做 number/boolean/file。
    * 接回点：`credentialValueSchema` 上按 `type` 分支，不影响别处。
    */
   type: z.literal('string', {
-    errorMap: () => ({ message: 'type 目前只支持 string' }),
+    errorMap: () => ({ message: validationMessage('validation.mcp.credentialTypeOnlyString') }),
   }),
   inject: z.enum(CREDENTIAL_INJECT_LOCATIONS, {
-    errorMap: () => ({ message: `inject 只能是 ${CREDENTIAL_INJECT_LOCATIONS.join('/')}` }),
+    errorMap: () => ({
+      message: validationMessage('validation.mcp.credentialInjectAllowed', {
+        allowed: CREDENTIAL_INJECT_LOCATIONS.join('/'),
+      }),
+    }),
   }),
   /** 是否必填（P0-2-4 用来判"整体是否已配置"）；省略 = 非必填 */
   required: z.boolean().optional(),
   /** 输入框的占位提示（纯展示） */
-  placeholder: z.string().trim().max(128, 'placeholder 最多 128 个字符').optional(),
+  placeholder: z
+    .string()
+    .trim()
+    .max(128, validationMessage('validation.mcp.credentialPlaceholderTooLong', { max: 128 }))
+    .optional(),
 })
 export type CredentialSchemaEntry = z.infer<typeof credentialSchemaEntrySchema>
 
@@ -510,33 +523,36 @@ function credentialSchemaDeepIssues(
       if (isReservedHeaderName(key)) {
         issues.push({
           path: [index, 'key'],
-          message: `「${key}」是平台自己要用到的请求头，不能作为凭据参数名（换个名字，例如 X-User-Token）`,
+          message: validationMessage('validation.mcp.reservedHeaderKey', { key }),
         })
       } else if (!isValidHttpHeaderName(key)) {
         issues.push({
           path: [index, 'key'],
-          message: 'HTTP 头名不能含空格、冒号或非 ASCII 字符（只能用小写/大写字母、数字与 !#$%&\'*+-.^_`|~）',
+          message: validationMessage('validation.mcp.invalidHttpHeaderName'),
         })
       }
     } else if (inject === 'QUERY') {
       if (hasQueryDelimiter(key)) {
         issues.push({
           path: [index, 'key'],
-          message: 'URL 查询参数名不能含 `&` 或 `=`（它们会把查询串切开，服务端收到的键名与这里写的不同）',
+          message: validationMessage('validation.mcp.queryDelimiter'),
         })
       }
     } else if (isReservedJsonRpcKey(key)) {
       // BODY：顶层额外字段本身可行（H 组有取证），但撞上保留键会覆盖报文语义
       issues.push({
         path: [index, 'key'],
-        message: `「${key}」是 JSON-RPC 报文的保留字段，作为 BODY 参数会把报文本身覆盖掉`,
+        message: validationMessage('validation.mcp.reservedJsonRpcKey', { key }),
       })
     }
 
     const first = firstSeenAt.get(key)
     if (first === undefined) firstSeenAt.set(key, index)
     else {
-      issues.push({ path: [index, 'key'], message: `参数名「${key}」与第 ${first + 1} 个参数重复` })
+      issues.push({
+        path: [index, 'key'],
+        message: validationMessage('validation.mcp.duplicateKey', { key, index: first + 1 }),
+      })
     }
   }
   return issues
@@ -554,13 +570,13 @@ function credentialSchemaDeepIssues(
  */
 export function validateCredentialSchema(raw: unknown): CredentialSchemaValidation {
   if (!Array.isArray(raw)) {
-    return { ok: false, issues: [{ path: [], message: '凭据参数模板必须是一个数组' }] }
+    return { ok: false, issues: [{ path: [], message: validationMessage('validation.mcp.schemaNotArray') }] }
   }
   const issues: CredentialSchemaIssue[] = []
   if (raw.length > MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES) {
     issues.push({
       path: [],
-      message: `凭据参数最多 ${MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES} 个`,
+      message: validationMessage('validation.mcp.schemaTooMany', { max: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES }),
     })
   }
 
@@ -589,7 +605,10 @@ export function validateCredentialSchema(raw: unknown): CredentialSchemaValidati
  */
 export const credentialSchemaSchema = z
   .array(credentialSchemaEntrySchema)
-  .max(MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES, `凭据参数最多 ${MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES} 个`)
+  .max(
+    MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES,
+    validationMessage('validation.mcp.schemaTooMany', { max: MCP_CREDENTIAL_SCHEMA_MAX_ENTRIES }),
+  )
   .superRefine((entries, ctx) => {
     for (const issue of credentialSchemaDeepIssues(
       entries.map((entry, index) => ({ index, entry })),
@@ -874,11 +893,14 @@ export const putMyCredentialBodySchema = z.object({
   values: z
     .record(
       z
-        .string({ required_error: '凭据值必须是字符串' })
-        .max(MCP_CREDENTIAL_VALUE_MAX, `单个凭据值最多 ${MCP_CREDENTIAL_VALUE_MAX} 个字符`),
+        .string({ required_error: validationMessage('validation.mcp.credentialValueNotString') })
+        .max(
+          MCP_CREDENTIAL_VALUE_MAX,
+          validationMessage('validation.mcp.credentialValueTooLong', { max: MCP_CREDENTIAL_VALUE_MAX }),
+        ),
     )
     .refine((values) => Object.keys(values).length > 0, {
-      message: '请至少提交一个凭据参数（要清空整份凭据请用 DELETE）',
+      message: validationMessage('validation.mcp.valuesEmpty'),
     }),
 })
 export type PutMyCredentialBody = z.infer<typeof putMyCredentialBodySchema>
@@ -1093,7 +1115,7 @@ export const mcpServerToolsQuerySchema = z.object({
   //    "同时给 `errorMap` 与 `required_error`" 时**模块加载期就抛**（`types.js:50`），
   //    而 `message` 这条短路既够用、又不碰那个雷（enum 的 `invalid_enum_value` 会取它）
   refresh: z
-    .enum(MCP_REFRESH_VALUES, { message: 'refresh 只接受 1 / 0 / true / false' })
+    .enum(MCP_REFRESH_VALUES, { message: validationMessage('validation.mcp.refreshValue') })
     .default('0')
     .transform(isRefreshRequested),
 })
@@ -1144,8 +1166,13 @@ export type RemoveMcpServerResult = z.infer<typeof removeMcpServerResultSchema>
 
 /** `GET /api/mcp/servers` 查询参数（offset/limit，与 `/api/users`、`/api/knowledge-bases` 同口径） */
 export const listMcpServersQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListMcpServersQuery = z.infer<typeof listMcpServersQuerySchema>
 
@@ -1157,10 +1184,10 @@ export type McpServerListResult = z.infer<typeof mcpServerListResultSchema>
 
 /** server 名（列 `VARCHAR(128)`） */
 const mcpServerNameSchema = z
-  .string({ required_error: '请输入 MCP server 名称' })
+  .string({ required_error: validationMessage('validation.mcp.serverNameRequired') })
   .trim()
-  .min(1, '请输入 MCP server 名称')
-  .max(MCP_SERVER_NAME_MAX, `名称最多 ${MCP_SERVER_NAME_MAX} 个字符`)
+  .min(1, validationMessage('validation.mcp.serverNameRequired'))
+  .max(MCP_SERVER_NAME_MAX, validationMessage('validation.mcp.serverNameTooLong', { max: MCP_SERVER_NAME_MAX }))
 
 /**
  * 端点 URL：**只接受 `http` / `https`**（`06` P0-2-2 验收门槛 5）。
@@ -1177,22 +1204,28 @@ const mcpServerNameSchema = z
  * ⇒ 这条**必须留在文档里**，否则它就是一个没人知道的洞。
  */
 const mcpEndpointUrlSchema = z
-  .string({ required_error: '请填写 endpoint URL' })
+  .string({ required_error: validationMessage('validation.mcp.endpointRequired') })
   .trim()
-  .min(1, '请填写 endpoint URL')
-  .max(MCP_ENDPOINT_URL_MAX, `endpoint URL 最多 ${MCP_ENDPOINT_URL_MAX} 个字符`)
+  .min(1, validationMessage('validation.mcp.endpointRequired'))
+  .max(
+    MCP_ENDPOINT_URL_MAX,
+    validationMessage('validation.mcp.endpointTooLong', { max: MCP_ENDPOINT_URL_MAX }),
+  )
   .superRefine((value, ctx) => {
     let protocol: string
     try {
       protocol = new URL(value).protocol
     } catch {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'endpoint URL 不是合法的 URL' })
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: validationMessage('validation.mcp.endpointNotUrl'),
+      })
       return
     }
     if (protocol !== 'http:' && protocol !== 'https:') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'endpoint URL 只支持 http / https（Streamable HTTP）',
+        message: validationMessage('validation.mcp.endpointScheme'),
       })
     }
   })
@@ -1214,14 +1247,20 @@ export const createMcpServerBodySchema = z.object({
   endpointUrl: mcpEndpointUrlSchema,
   authType: z
     .enum(MCP_AUTH_TYPES, {
-      errorMap: () => ({ message: `authType 只能是 ${MCP_AUTH_TYPES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.mcp.authTypeAllowed', { allowed: MCP_AUTH_TYPES.join('/') }),
+      }),
     })
     .optional(),
   credentialSchema: credentialSchemaSchema.optional(),
   /** P1-18：可见范围（**两档**：私有 / 公开）。**可省** ⇒ 服务层按 `PRIVATE`（安全默认） */
   visibility: z
     .enum(KB_MCP_VISIBILITIES, {
-      errorMap: () => ({ message: `visibility 只能是 ${KB_MCP_VISIBILITIES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.mcp.visibilityAllowed', {
+          allowed: KB_MCP_VISIBILITIES.join('/'),
+        }),
+      }),
     })
     .optional(),
 })
@@ -1254,7 +1293,9 @@ export const updateMcpServerBodySchema = z
     endpointUrl: mcpEndpointUrlSchema.optional(),
     authType: z
       .enum(MCP_AUTH_TYPES, {
-        errorMap: () => ({ message: `authType 只能是 ${MCP_AUTH_TYPES.join('/')}` }),
+        errorMap: () => ({
+        message: validationMessage('validation.mcp.authTypeAllowed', { allowed: MCP_AUTH_TYPES.join('/') }),
+      }),
       })
       .optional(),
     /** 整体替换（数组语义，"提交什么就是什么"）；清空提交 `[]` */
@@ -1262,7 +1303,11 @@ export const updateMcpServerBodySchema = z
     /** P1-18：可见范围（两档：私有 / 公开） */
     visibility: z
       .enum(KB_MCP_VISIBILITIES, {
-        errorMap: () => ({ message: `visibility 只能是 ${KB_MCP_VISIBILITIES.join('/')}` }),
+        errorMap: () => ({
+        message: validationMessage('validation.mcp.visibilityAllowed', {
+          allowed: KB_MCP_VISIBILITIES.join('/'),
+        }),
+      }),
       })
       .optional(),
   })
@@ -1273,7 +1318,7 @@ export const updateMcpServerBodySchema = z
       body.authType !== undefined ||
       body.credentialSchema !== undefined ||
       body.visibility !== undefined,
-    { message: '至少要提供一个要修改的字段' },
+    { message: validationMessage('validation.common.atLeastOneField') },
   )
 export type UpdateMcpServerBody = z.infer<typeof updateMcpServerBodySchema>
 
@@ -1281,7 +1326,7 @@ export type UpdateMcpServerBody = z.infer<typeof updateMcpServerBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const mcpServerIdParamsSchema = z.object({
-  id: z.string().uuid('MCP server ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.mcp.serverIdNotUuid')),
 })
 export type McpServerIdParams = z.infer<typeof mcpServerIdParamsSchema>
 
@@ -1294,6 +1339,6 @@ export type McpServerIdParams = z.infer<typeof mcpServerIdParamsSchema>
  * 少一个 `id` 就少一整类越权可能（`02` §4.7 的"收窄在 `user_id` 上，不在角色上"。
  */
 export const mcpCredentialServerIdParamsSchema = z.object({
-  serverId: z.string().uuid('MCP server ID 不是合法 UUID'),
+  serverId: z.string().uuid(validationMessage('validation.mcp.serverIdNotUuid')),
 })
 export type McpCredentialServerIdParams = z.infer<typeof mcpCredentialServerIdParamsSchema>

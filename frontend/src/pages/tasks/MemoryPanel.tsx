@@ -41,14 +41,15 @@ import {
   MEMORY_PAGE_LIMIT,
 } from '../../api/memory.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { formatUpdatedAt } from '../../app/format.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import {
-  MEMORY_KIND_OPTIONS,
-  MEMORY_SCOPE_OPTIONS,
   memoryKindColor,
   memoryKindLabel,
+  memoryKindOptions,
   memoryScopeLabel,
+  memoryScopeOptions,
   memorySourceText,
 } from './memoryModel.js'
 
@@ -67,6 +68,7 @@ interface MemoryFormValues {
 
 export function MemoryPanel() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const [offset, setOffset] = useState(0)
   const [kindFilter, setKindFilter] = useState<MemoryKind | undefined>(undefined)
   const [scopeFilter, setScopeFilter] = useState<MemoryScope | undefined>(undefined)
@@ -96,8 +98,8 @@ export function MemoryPanel() {
   const items = query.data?.items ?? []
 
   const scopeOptions = [
-    { value: GLOBAL_SCOPE_VALUE, label: '全局记忆（所有 Agent 共用）' },
-    ...agents.map((agent) => ({ value: agent.id, label: `Agent 记忆：${agent.name}` })),
+    { value: GLOBAL_SCOPE_VALUE, label: t('memory.globalScopeOption') },
+    ...agents.map((agent) => ({ value: agent.id, label: t('memory.agentScopeOption', { name: agent.name }) })),
   ]
 
   function openCreate() {
@@ -129,10 +131,10 @@ export function MemoryPanel() {
         }
         create.mutate(body, {
           onSuccess: () => {
-            feedback.ok('记忆已添加')
+            feedback.ok(t('memory.addedOk'))
             setFormOpen(false)
           },
-          onError: (error) => feedback.fail(error, '添加失败'),
+          onError: (error) => feedback.fail(error, t('memory.addFailed')),
         })
         return
       }
@@ -140,10 +142,10 @@ export function MemoryPanel() {
         { id: editing.id, body: { text: values.text, kind: values.kind, pinned: values.pinned, agentId } },
         {
           onSuccess: () => {
-            feedback.ok('记忆已保存')
+            feedback.ok(t('memory.savedOk'))
             setFormOpen(false)
           },
-          onError: (error) => feedback.fail(error, '保存失败'),
+          onError: (error) => feedback.fail(error, t('memory.saveFailed')),
         },
       )
     })
@@ -152,7 +154,7 @@ export function MemoryPanel() {
   function togglePin(memory: MemoryItem) {
     update.mutate(
       { id: memory.id, body: { pinned: !memory.pinned } },
-      { onError: (error) => feedback.fail(error, '操作失败') },
+      { onError: (error) => feedback.fail(error, t('memory.opFailed')) },
     )
   }
 
@@ -161,15 +163,15 @@ export function MemoryPanel() {
     update.mutate(
       { id: memory.id, body: { agentId: null } },
       {
-        onSuccess: () => feedback.ok('已提升为全局记忆'),
-        onError: (error) => feedback.fail(error, '操作失败'),
+        onSuccess: () => feedback.ok(t('memory.promotedOk')),
+        onError: (error) => feedback.fail(error, t('memory.opFailed')),
       },
     )
   }
 
   const columns: ColumnsType<MemoryItem> = [
     {
-      title: '内容',
+      title: t('memory.colText'),
       dataIndex: 'text',
       // ⚠️ **必须给宽度**：不给宽度时这一列会按正文的 max-content 撑开（记忆正文上限 2000 字），
       // 整张表被顶宽 ⇒ 右侧的「作用域 / 类型 / 来源 / 时间 / 操作」几列被挤出可视区、根本看不到。
@@ -180,46 +182,53 @@ export function MemoryPanel() {
           <Tooltip title={memory.text} mouseEnterDelay={1} placement="topLeft">
             <span className="agent-cell__name">{memory.text}</span>
           </Tooltip>
-          {memory.agentName !== null ? <span className="agent-cell__sub">Agent：{memory.agentName}</span> : null}
+          {memory.agentName !== null ? (
+            <span className="agent-cell__sub">{t('memory.agentPrefix', { name: memory.agentName })}</span>
+          ) : null}
         </div>
       ),
     },
     {
-      title: '作用域',
+      title: t('memory.colScope'),
       dataIndex: 'scope',
       width: 110,
       render: (_value, memory) => (
-        <Tag color={memory.scope === 'USER' ? 'gold' : 'geekblue'}>{memoryScopeLabel(memory.scope)}</Tag>
+        <Tag color={memory.scope === 'USER' ? 'gold' : 'geekblue'}>{memoryScopeLabel(memory.scope, locale)}</Tag>
       ),
     },
     {
-      title: '类型',
+      title: t('memory.colKind'),
       dataIndex: 'kind',
       width: 90,
-      render: (_value, memory) => <Tag color={memoryKindColor(memory.kind)}>{memoryKindLabel(memory.kind)}</Tag>,
+      render: (_value, memory) => (
+        <Tag color={memoryKindColor(memory.kind)}>{memoryKindLabel(memory.kind, locale)}</Tag>
+      ),
     },
     {
-      title: '来源',
+      title: t('memory.colSource'),
       key: 'source',
       width: 180,
       render: (_value, memory) => (
         <span className="ratio">
-          {memorySourceText({
-            sourceConversationId: memory.sourceConversationId,
-            sourceAvailable: memory.sourceAvailable,
-            sourceTopic: memory.sourceTopic,
-          })}
+          {memorySourceText(
+            {
+              sourceConversationId: memory.sourceConversationId,
+              sourceAvailable: memory.sourceAvailable,
+              sourceTopic: memory.sourceTopic,
+            },
+            locale,
+          )}
         </span>
       ),
     },
     {
-      title: '创建时间',
+      title: t('memory.colCreatedAt'),
       dataIndex: 'createdAt',
       width: 150,
       render: (value: string) => <span className="num">{formatUpdatedAt(value)}</span>,
     },
     {
-      title: '操作',
+      title: t('memory.colActions'),
       key: 'actions',
       width: 240,
       align: 'right',
@@ -227,34 +236,34 @@ export function MemoryPanel() {
       render: (_value, memory) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
           <Button type="link" size="small" style={{ padding: 0 }} onClick={() => togglePin(memory)}>
-            {memory.pinned ? '取消置顶' : '置顶'}
+            {memory.pinned ? t('memory.unpin') : t('memory.pin')}
           </Button>
           {memory.scope === 'AGENT' ? (
             <Button type="link" size="small" style={{ padding: 0 }} onClick={() => promoteToGlobal(memory)}>
-              提升为全局
+              {t('memory.promote')}
             </Button>
           ) : null}
           <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openEdit(memory)}>
-            编辑
+            {t('memory.edit')}
           </Button>
           <Popconfirm
-            title="删除这条记忆？"
-            description="删除后不会再被任何对话使用。"
-            okText="删除"
+            title={t('memory.deleteTitle')}
+            description={t('memory.deleteDescription')}
+            okText={t('memory.delete')}
             okButtonProps={{ danger: true }}
-            cancelText="取消"
+            cancelText={t('common.cancel')}
             onConfirm={() => {
               remove.mutate(memory.id, {
                 onSuccess: () => {
-                  feedback.ok('记忆已删除')
+                  feedback.ok(t('memory.deletedOk'))
                   if (items.length === 1 && offset > 0) setOffset(Math.max(0, offset - MEMORY_PAGE_LIMIT))
                 },
-                onError: (error) => feedback.fail(error, '删除失败'),
+                onError: (error) => feedback.fail(error, t('memory.deleteFailed')),
               })
             }}
           >
             <Button type="link" danger size="small" style={{ padding: 0 }}>
-              删除
+              {t('memory.delete')}
             </Button>
           </Popconfirm>
         </div>
@@ -274,10 +283,13 @@ export function MemoryPanel() {
               checked={settingsValue?.enabled ?? true}
               loading={updateSettings.isPending}
               onChange={(checked) => {
-                updateSettings.mutate({ enabled: checked }, { onError: (error) => feedback.fail(error, '切换失败') })
+                updateSettings.mutate(
+                  { enabled: checked },
+                  { onError: (error) => feedback.fail(error, t('memory.switchFailed')) },
+                )
               }}
             />
-            记忆（总开关）
+            {t('memory.masterSwitch')}
           </span>
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
             <Switch
@@ -288,11 +300,11 @@ export function MemoryPanel() {
               onChange={(checked) => {
                 updateSettings.mutate(
                   { autoExtract: checked },
-                  { onError: (error) => feedback.fail(error, '切换失败') },
+                  { onError: (error) => feedback.fail(error, t('memory.switchFailed')) },
                 )
               }}
             />
-            自动提取
+            {t('memory.autoExtract')}
           </span>
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
             <Switch
@@ -305,17 +317,17 @@ export function MemoryPanel() {
                   { fullAuto: checked },
                   {
                     onSuccess: () => {
-                      if (checked) feedback.note('已开启全自动：以后关于你的偏好会直接记住，可在本面板管理')
+                      if (checked) feedback.note(t('memory.fullAutoOn'))
                     },
-                    onError: (error) => feedback.fail(error, '切换失败'),
+                    onError: (error) => feedback.fail(error, t('memory.switchFailed')),
                   },
                 )
               }}
             />
-            全自动（偏好不再逐条确认）
+            {t('memory.fullAuto')}
           </span>
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
-            画像常驻上限
+            {t('memory.profileMax')}
             <InputNumber
               size="small"
               min={1}
@@ -326,12 +338,12 @@ export function MemoryPanel() {
                 if (typeof value !== 'number') return
                 updateSettings.mutate(
                   { memoryProfileMax: value },
-                  { onError: (error) => feedback.fail(error, '保存失败') },
+                  { onError: (error) => feedback.fail(error, t('memory.saveFailed')) },
                 )
               }}
             />
           </span>
-          <span className="ratio">条目上限 {settingsValue?.maxPerUser ?? '—'} 条</span>
+          <span className="ratio">{t('memory.entryLimit', { count: settingsValue?.maxPerUser ?? '—' })}</span>
         </div>
       </div>
 
@@ -339,10 +351,10 @@ export function MemoryPanel() {
         <div className="row" style={{ gap: 'var(--sp-3)', flexWrap: 'wrap' }}>
           <Select
             allowClear
-            placeholder="全部作用域"
+            placeholder={t('memory.filterScope')}
             style={{ minWidth: 150 }}
             value={scopeFilter}
-            options={MEMORY_SCOPE_OPTIONS}
+            options={memoryScopeOptions(locale)}
             onChange={(value: MemoryScope | undefined) => {
               setScopeFilter(value)
               setOffset(0)
@@ -350,17 +362,17 @@ export function MemoryPanel() {
           />
           <Select
             allowClear
-            placeholder="全部类型"
+            placeholder={t('memory.filterKind')}
             style={{ minWidth: 130 }}
             value={kindFilter}
-            options={MEMORY_KIND_OPTIONS}
+            options={memoryKindOptions(locale)}
             onChange={(value: MemoryKind | undefined) => {
               setKindFilter(value)
               setOffset(0)
             }}
           />
           <Input.Search
-            placeholder="按内容搜索"
+            placeholder={t('memory.searchPlaceholder')}
             style={{ width: 220 }}
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
@@ -372,13 +384,13 @@ export function MemoryPanel() {
           />
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-          添加记忆
+          {t('memory.add')}
         </Button>
       </div>
 
       {query.isError ? (
         <ErrorState
-          title="记忆没读出来"
+          title={t('memory.loadFailed')}
           error={query.error}
           onRetry={() => {
             void query.refetch()
@@ -390,8 +402,8 @@ export function MemoryPanel() {
       ) : items.length === 0 ? (
         <div className="card">
           <EmptyState
-            title="还没有记忆"
-            lead="对话中说到值得长期记住的事时，可以点“记住”，或直接对我说“记住：…”。"
+            title={t('memory.emptyTitle')}
+            lead={t('memory.emptyLead')}
           />
         </div>
       ) : (
@@ -423,9 +435,9 @@ export function MemoryPanel() {
 
       <Modal
         open={formOpen}
-        title={editing === null ? '添加记忆' : '编辑记忆'}
-        okText={editing === null ? '添加' : '保存'}
-        cancelText="取消"
+        title={editing === null ? t('memory.modalAddTitle') : t('memory.modalEditTitle')}
+        okText={editing === null ? t('memory.okAdd') : t('memory.okSave')}
+        cancelText={t('common.cancel')}
         confirmLoading={create.isPending || update.isPending}
         onOk={submit}
         onCancel={() => setFormOpen(false)}
@@ -434,19 +446,22 @@ export function MemoryPanel() {
         <Form form={form} layout="vertical" initialValues={{ kind: 'OTHER', agentId: GLOBAL_SCOPE_VALUE, pinned: false }}>
           <Form.Item
             name="text"
-            label="内容"
-            rules={[{ required: true, message: '请填写记忆内容' }, { max: 2000, message: '最多 2000 个字符' }]}
+            label={t('memory.textLabel')}
+            rules={[
+              { required: true, message: t('memory.textRequired') },
+              { max: 2000, message: t('memory.textMax') },
+            ]}
           >
-            <TextArea rows={3} placeholder="要长期记住的一句话" />
+            <TextArea rows={3} placeholder={t('memory.textPlaceholder')} />
           </Form.Item>
-          <Form.Item name="agentId" label="作用域" extra="全局记忆对所有 Agent 生效；Agent 记忆只对该 Agent 生效">
+          <Form.Item name="agentId" label={t('memory.scopeLabel')} extra={t('memory.scopeExtra')}>
             <Select options={scopeOptions} />
           </Form.Item>
-          <Form.Item name="kind" label="类型">
-            <Select options={MEMORY_KIND_OPTIONS} />
+          <Form.Item name="kind" label={t('memory.kindLabel')}>
+            <Select options={memoryKindOptions(locale)} />
           </Form.Item>
           <Form.Item name="pinned" valuePropName="checked">
-            <Checkbox>置顶</Checkbox>
+            <Checkbox>{t('memory.pinnedLabel')}</Checkbox>
           </Form.Item>
         </Form>
       </Modal>

@@ -21,6 +21,7 @@ import { memo, useState } from 'react'
 import type { ConversationRunOrigin } from '@doubulea/shared'
 
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { fileContentUrl } from '../../api/files.js'
 import { AssistantMessage } from './AssistantMessage.js'
 import type { AttachmentView, ChatMessageView } from './messageModel.js'
@@ -142,6 +143,7 @@ const UserMessage = memo(function UserMessage({
   onRecallSteer?: (steerId: string, text: string) => void
 }) {
   const feedback = useFeedback()
+  const { t } = useT()
   const [copying, setCopying] = useState(false)
   const stamp = formatStamp(view.createdAt)
   // `recallable?.key` 一次覆盖 `null` / `undefined` / key 不匹配三种"不提供撤回"的情况
@@ -153,10 +155,10 @@ const UserMessage = memo(function UserMessage({
     setCopying(true)
     try {
       await navigator.clipboard.writeText(view.text)
-      feedback.ok('已复制')
+      feedback.ok(t('messageList.copyOk'))
     } catch (error) {
       // 复制失败不静默：用户要的是那段文字，不是"点了按钮"（与助手消息的复制同一口径）
-      feedback.fail(error, '复制失败')
+      feedback.fail(error, t('messageList.copyFailed'))
     } finally {
       setCopying(false)
     }
@@ -171,11 +173,11 @@ const UserMessage = memo(function UserMessage({
   return (
     <article className="msg msg--user" data-testid={isSteer ? 'steer-message' : 'user-message'}>
       <p className="msg__head">
-        {stamp === null ? '刚刚' : <span className="num">{stamp}</span>}
-        {isSteer ? <span className="ratio"> · 插话</span> : null}
+        {stamp === null ? t('messageList.justNow') : <span className="num">{stamp}</span>}
+        {isSteer ? <span className="ratio">{t('messageList.steerTag')}</span> : null}
         {isSteer && view.steerState !== undefined ? (
           <span className="ratio" data-testid="steer-state">
-            {view.steerState === 'delivered' ? ' · 已投递' : ' · 待接收'}
+            {view.steerState === 'delivered' ? t('messageList.steerDelivered') : t('messageList.steerQueued')}
           </span>
         ) : null}
       </p>
@@ -184,7 +186,7 @@ const UserMessage = memo(function UserMessage({
       <div className="msg__tools">
         {/* 快捷复制（产品优化 2026-09-29）：用户消息也要能快速复制 —— 之前只有助手消息有 */}
         <button type="button" onClick={() => void copy()} disabled={copying || view.text === ''}>
-          复制
+          {t('messageList.copy')}
         </button>
         {/* 取回编辑（2026-10-21）：插话气泡专属；撤回成功后正文放回输入框供重新编辑。
             只在"还在排队"时给 —— 模型读走之后引擎不支持回滚（见 `useChatStream#cancelSteer`）。 */}
@@ -195,19 +197,19 @@ const UserMessage = memo(function UserMessage({
               if (view.steerId === undefined || onRecallSteer === undefined) return
               onRecallSteer(view.steerId, view.text)
             }}
-            title="撤回这条插话，并把内容放回输入框"
+            title={t('messageList.recallSteerTitle')}
           >
-            取回编辑
+            {t('messageList.recallSteer')}
           </button>
         ) : null}
         {/* 撤回 / 修改重发（产品优化 2026-09-29）：只挂在"最新一轮"的用户消息上 */}
         {isRecallable && onRecall !== undefined && onResend !== undefined && (
           <>
             <button type="button" onClick={() => onRecall(view.text, hadTools)}>
-              撤回
+              {t('messageList.recall')}
             </button>
             <button type="button" onClick={() => onResend(view.text, hadTools)}>
-              修改重发
+              {t('messageList.resend')}
             </button>
           </>
         )}
@@ -218,11 +220,12 @@ const UserMessage = memo(function UserMessage({
 
 /** 开场白：纯文本气泡（`plain`），头部标"开场白"以免被误读成一条回答（`memo` 理由同 `UserMessage`） */
 const OpeningMessage = memo(function OpeningMessage({ view, agentName }: { view: ChatMessageView; agentName: string }) {
+  const { t } = useT()
   return (
     <article className="msg msg--agent" data-testid="opening-message">
       <p className="msg__head">
         <span className="led led--idle" aria-hidden="true" />
-        {agentName} · 开场白
+        {agentName} · {t('messageList.opening')}
       </p>
       <div className="bubble bubble--agent">{view.text}</div>
     </article>

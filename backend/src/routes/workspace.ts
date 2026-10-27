@@ -25,7 +25,7 @@
  * （文本走 `GET .../file` 的 JSON 内联）。
  */
 
-import {
+import { appMsg,
   AppError,
   conversationIdParamsSchema,
   isWorkspaceTextMime,
@@ -285,23 +285,23 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
       for await (const part of request.parts()) {
         if (part.type === 'file') {
           const bytes = await part.toBuffer()
-          if (part.file.truncated) throw AppError.validation(`文件超过上传上限：${part.filename || WORKSPACE_UPLOAD_FILE_FIELD}`)
-          if (uploaded !== undefined) throw AppError.validation('一次只能上传一个文件')
+          if (part.file.truncated) throw AppError.validation(appMsg('app.m110', { p0: part.filename || WORKSPACE_UPLOAD_FILE_FIELD }))
+          if (uploaded !== undefined) throw AppError.validation(appMsg('app.m111'))
           uploaded = { fileName: part.filename, bytes }
         } else if (part.fieldname === WORKSPACE_UPLOAD_DIR_FIELD) {
           dir = String(part.value ?? '')
         }
       }
       if (uploaded === undefined) {
-        throw AppError.validation(`没有收到文件：请用 multipart/form-data 上传，文件字段名为 ${WORKSPACE_UPLOAD_FILE_FIELD}`)
+        throw AppError.validation(appMsg('app.m020', { p0: WORKSPACE_UPLOAD_FILE_FIELD }))
       }
       if (uploaded.bytes.length === 0) {
-        throw AppError.validation(`上传的文件是空的（0 字节）：${uploaded.fileName || '未命名文件'}`)
+        throw AppError.validation(appMsg('app.m010', { p0: uploaded.fileName || '未命名文件' }))
       }
       // 文件名只取末段（浏览器选择目录上传时可能带相对路径），再与目标目录拼成工作区相对路径
       const baseName = uploaded.fileName.split(/[\\/]/u).filter((seg) => seg !== '').pop() ?? uploaded.fileName
       const target = normalizeWorkspacePath(dir === '' ? baseName : `${dir}/${baseName}`)
-      if (target === null) throw AppError.validation('目标路径不合法（不许绝对路径 / `..` / 空）', { path: dir })
+      if (target === null) throw AppError.validation(appMsg('app.m112'), { path: dir })
       return ok(await uploadWorkspaceFile(request.params.id, target, uploaded.bytes, userAuthor(userId)))
     },
   )

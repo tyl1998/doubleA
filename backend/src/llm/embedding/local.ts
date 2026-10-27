@@ -45,7 +45,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs'
 import { basename } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 
 import { getLogger } from '../../infra/logger.js'
 import type { EmbeddingInput, EmbeddingProvider } from './index.js'
@@ -185,22 +185,19 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (inputs.length === 0) return []
     // 本地 bge-m3 是**纯文本**模型：收到图片直接拒绝（静默当文本处理会把图片内容悄悄丢掉）
     if (inputs.some((input) => typeof input !== 'string' && (input.images?.length ?? 0) > 0)) {
-      throw AppError.internal('本地 embedding 模型（bge-m3）不支持图片，请改用支持多模态的向量模型或"图片转文字（OCR）"')
+      throw AppError.internal(appMsg('app.m046'))
     }
     const texts = inputs.map((input) => (typeof input === 'string' ? input : input.text))
     await this.#ensureWorker()
     const response = await this.#send({ type: 'embed', texts })
     const vectors = response.vectors ?? []
     if (vectors.length !== texts.length) {
-      throw AppError.internal(
-        `本地 embedding 返回的向量条数与输入不符（输入 ${texts.length} 条，返回 ${vectors.length} 条）—— 运行时模块未遵守契约（docs/02 §八）`,
+      throw AppError.internal(appMsg('app.m047', { p0: texts.length, p1: vectors.length }),
       )
     }
     for (const [position, vector] of vectors.entries()) {
       if (vector.length !== this.#options.dim) {
-        throw AppError.internal(
-          `本地 embedding 第 ${position} 条返回 ${vector.length} 维，与 EMBEDDING_DIM=${this.#options.dim} 不一致。` +
-            `chunks.embedding 是 vector(${this.#options.dim})，维度不符会写坏数据（子方案① §4-4）`,
+        throw AppError.internal(appMsg('app.m246', { p0: position, p1: vector.length, p2: this.#options.dim, p3: this.#options.dim }),
         )
       }
     }
@@ -218,7 +215,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
       // 先请运行时自己释放（onnx session），再强杀线程 —— 后者是兜底，不能省
       await this.#send({ type: 'dispose' }, worker).catch(() => undefined)
     } finally {
-      this.#failAll(AppError.internal('本地 embedding 已释放'))
+      this.#failAll(AppError.internal(appMsg('app.m048')))
       await worker.terminate()
     }
   }
@@ -240,7 +237,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     // 就绪自检放在起线程**之前**：问题清单一句话说完，而不是让模块加载抛出个 ERR_MODULE_NOT_FOUND
     const problems = localEmbeddingProblems(this.#options)
     if (problems.length > 0) {
-      throw AppError.internal(`本地 embedding 未就绪：${problems.join('；')}`)
+      throw AppError.internal(appMsg('app.m049', { p0: problems.join('；') }))
     }
 
     const entry = workerEntryUrl()
@@ -261,11 +258,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     // ⚠️ worker 崩了必须**立刻**让所有在途请求失败：否则调用方会永久等一个永远不会来的回复
     worker.on('error', (error) => {
       getLogger().error({ err: error }, '本地 embedding worker 崩溃')
-      this.#failAll(AppError.internal(`本地 embedding worker 崩溃：${error.message}`))
+      this.#failAll(AppError.internal(appMsg('app.m050', { p0: error.message })))
     })
     worker.on('exit', (code) => {
       if (this.#worker === worker) this.#worker = null
-      this.#failAll(AppError.internal(`本地 embedding worker 退出（code=${code}）`))
+      this.#failAll(AppError.internal(appMsg('app.m051', { p0: code })))
     })
 
     const init = await this.#send(
@@ -297,7 +294,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     target?: Worker,
   ): Promise<LocalWorkerSuccess> {
     const worker = target ?? this.#worker
-    if (worker === null) return Promise.reject(AppError.internal('本地 embedding worker 尚未启动'))
+    if (worker === null) return Promise.reject(AppError.internal(appMsg('app.m052')))
 
     this.#seq += 1
     const id = this.#seq
@@ -307,10 +304,12 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     }).then((response) => {
       if (!response.ok) {
         throw AppError.internal(
-          `本地 embedding 调用失败：${response.error.message}` +
-            (response.error.modelMissing
+          appMsg('app.m276', {
+            p0: response.error.message,
+            p1: response.error.modelMissing
               ? '（运行时模块尚未安装或路径不对 —— 见 LOCAL_EMBEDDING_RUNTIME_MODULE）'
-              : ''),
+              : '',
+          }),
         )
       }
       return response
@@ -342,7 +341,6 @@ function workerEntryUrl(): URL {
     const url = new URL(relative, import.meta.url)
     if (existsSync(url)) return url
   }
-  throw AppError.internal(
-    '找不到 embedding worker 入口（embedding.worker.js / .ts）—— 构建产物不完整，请重新 pnpm build',
+  throw AppError.internal(appMsg('app.m053'),
   )
 }

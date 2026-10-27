@@ -16,6 +16,7 @@ import { useEffect } from 'react'
 import { useGitIdentity, useUpdateGitIdentity } from '../../api/gitIdentity.js'
 import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 interface FormValues {
   name?: string
@@ -24,6 +25,7 @@ interface FormValues {
 
 export function GitIdentitySection() {
   const feedback = useFeedback()
+  const { t } = useT()
   const query = useGitIdentity()
   const update = useUpdateGitIdentity()
   const [form] = Form.useForm<FormValues>()
@@ -41,9 +43,8 @@ export function GitIdentitySection() {
         // 两个字段始终一起提交：空串 = 清空该字段（服务端归一成 null）
         { name: values.name ?? '', email: values.email ?? '' },
         {
-          onSuccess: () =>
-            feedback.ok('已保存 git 身份（下一次重建容器时生效）'),
-          onError: (error) => feedback.fail(error, '保存 git 身份失败'),
+          onSuccess: () => feedback.ok(t('settings.gitIdentity.saved')),
+          onError: (error) => feedback.fail(error, t('settings.gitIdentity.saveFailed')),
         },
       )
     })
@@ -56,18 +57,20 @@ export function GitIdentitySection() {
     >
       <div className="row" style={{ alignItems: 'flex-start' }}>
         <div>
-          <h2 className="card__title">Git 提交身份</h2>
+          <h2 className="card__title">{t('settings.gitIdentity.title')}</h2>
           <p className="page__lead">
-            Code 模式下 agent 在容器里 <code>git commit</code> 时用的署名（<code>user.name</code> /{' '}
-            <code>user.email</code>）。配好后<strong>按你注入</strong>，agent 不必自己猜、也不写仓库本地 config。
-            两个都留空 = 不注入（由 agent 自行处理）。
+            {t('settings.gitIdentity.leadA')} <code>git commit</code> {t('settings.gitIdentity.leadB')}
+            <code>user.name</code> / <code>user.email</code>
+            {t('settings.gitIdentity.leadC')}
+            <strong>{t('settings.gitIdentity.leadStrong')}</strong>
+            {t('settings.gitIdentity.leadD')}
           </p>
         </div>
       </div>
 
       {query.isError ? (
         <ErrorState
-          title="git 身份加载失败"
+          title={t('settings.gitIdentity.loadFailed')}
           error={query.error}
           retrying={query.isFetching}
           onRetry={() => {
@@ -78,25 +81,25 @@ export function GitIdentitySection() {
         <TableSkeleton rows={2} />
       ) : (
         <Form form={form} layout="vertical" style={{ maxWidth: 480 }}>
-          <Form.Item name="name" label="名字（user.name）">
-            <Input placeholder="如 Zhang San" maxLength={128} />
+          <Form.Item name="name" label={t('settings.gitIdentity.nameLabel')}>
+            <Input placeholder={t('settings.gitIdentity.namePlaceholder')} maxLength={128} />
           </Form.Item>
           <Form.Item
             name="email"
-            label="邮箱（user.email）"
+            label={t('settings.gitIdentity.emailLabel')}
             rules={[
               {
                 validator: (_, value: string | undefined) =>
                   value === undefined || value === '' || /^[^\s@]+@[^\s@]+$/u.test(value)
                     ? Promise.resolve()
-                    : Promise.reject(new Error('邮箱格式不正确（应形如 name@example.com）')),
+                    : Promise.reject(new Error(t('settings.gitIdentity.emailInvalid'))),
               },
             ]}
           >
-            <Input placeholder="如 zhangsan@example.com" maxLength={255} />
+            <Input placeholder={t('settings.gitIdentity.emailPlaceholder')} maxLength={255} />
           </Form.Item>
           <Button type="primary" loading={update.isPending} onClick={submit}>
-            保存
+            {t('common.save')}
           </Button>
         </Form>
       )}

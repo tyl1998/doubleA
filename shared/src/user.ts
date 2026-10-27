@@ -15,6 +15,7 @@ import { z } from 'zod'
 
 import { USER_ROLES, USER_STATUSES, USERNAME_MAX_LENGTH } from './auth.js'
 import { offsetPageOf } from './envelope.js'
+import { validationMessage } from './i18n/validation.js'
 
 // ───────────────────────────── 列表项 ─────────────────────────────
 
@@ -52,8 +53,13 @@ export type UserListItem = z.infer<typeof userListItemSchema>
 
 /** 列表分页参数（`02` §四：除消息外的列表用 offset/limit，默认 20） */
 export const listUsersQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>
 
@@ -71,11 +77,11 @@ export type UserListResult = z.infer<typeof userListResultSchema>
  * 归一化（转小写）由 `normalizeUsername` 在服务层做，这里只拒绝明显不可用的形态。
  */
 export const newUsernameSchema = z
-  .string({ required_error: '请输入用户名' })
+  .string({ required_error: validationMessage('validation.usernameRequired') })
   .trim()
-  .min(1, '请输入用户名')
-  .max(USERNAME_MAX_LENGTH, `用户名最多 ${USERNAME_MAX_LENGTH} 个字符`)
-  .regex(/^\S+$/, '用户名不能包含空格等空白字符')
+  .min(1, validationMessage('validation.usernameRequired'))
+  .max(USERNAME_MAX_LENGTH, validationMessage('validation.usernameTooLong', { max: USERNAME_MAX_LENGTH }))
+  .regex(/^\S+$/, validationMessage('validation.user.usernameNoWhitespace'))
 
 /** 建号请求体：`role` 缺省为 MEMBER（与 DB 默认一致）；初始密码由服务端生成，**不由调用方指定** */
 export const createUserBodySchema = z.object({
@@ -83,11 +89,15 @@ export const createUserBodySchema = z.object({
   nickname: z
     .string()
     .trim()
-    .max(64, '显示名最多 64 个字符')
+    .max(64, validationMessage('validation.user.nicknameTooLong', { max: 64 }))
     // 空串按"没填"处理（否则会在库里留下一个空字符串的 nickname，前端还得区分 '' 与 null）
     .transform((value) => (value === '' ? undefined : value))
     .optional(),
-  role: z.enum(USER_ROLES, { errorMap: () => ({ message: `role 只能是 ${USER_ROLES.join('/')}` }) }).optional(),
+  role: z
+    .enum(USER_ROLES, {
+      errorMap: () => ({ message: validationMessage('validation.user.roleAllowed', { allowed: USER_ROLES.join('/') }) }),
+    })
+    .optional(),
 })
 export type CreateUserBody = z.infer<typeof createUserBodySchema>
 
@@ -100,17 +110,29 @@ export type CreateUserBody = z.infer<typeof createUserBodySchema>
  */
 export const updateUserBodySchema = z
   .object({
-    status: z.enum(USER_STATUSES, { errorMap: () => ({ message: `status 只能是 ${USER_STATUSES.join('/')}` }) }).optional(),
-    role: z.enum(USER_ROLES, { errorMap: () => ({ message: `role 只能是 ${USER_ROLES.join('/')}` }) }).optional(),
+    status: z
+      .enum(USER_STATUSES, {
+        errorMap: () => ({
+          message: validationMessage('validation.user.statusAllowed', { allowed: USER_STATUSES.join('/') }),
+        }),
+      })
+      .optional(),
+    role: z
+      .enum(USER_ROLES, {
+        errorMap: () => ({
+          message: validationMessage('validation.user.roleAllowed', { allowed: USER_ROLES.join('/') }),
+        }),
+      })
+      .optional(),
   })
   .refine((body) => body.status !== undefined || body.role !== undefined, {
-    message: '至少要提供 status 或 role 之一',
+    message: validationMessage('validation.user.statusOrRoleRequired'),
   })
 export type UpdateUserBody = z.infer<typeof updateUserBodySchema>
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const userIdParamsSchema = z.object({
-  id: z.string().uuid('用户 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.user.idNotUuid')),
 })
 export type UserIdParams = z.infer<typeof userIdParamsSchema>
 
@@ -126,10 +148,10 @@ export type UserIdParams = z.infer<typeof userIdParamsSchema>
  */
 export const userSearchQuerySchema = z.object({
   q: z
-    .string({ required_error: '请输入搜索关键词' })
+    .string({ required_error: validationMessage('validation.user.searchKeywordRequired') })
     .trim()
-    .min(1, '请输入搜索关键词')
-    .max(USERNAME_MAX_LENGTH, `关键词最多 ${USERNAME_MAX_LENGTH} 个字符`),
+    .min(1, validationMessage('validation.user.searchKeywordRequired'))
+    .max(USERNAME_MAX_LENGTH, validationMessage('validation.user.searchKeywordTooLong', { max: USERNAME_MAX_LENGTH })),
 })
 export type UserSearchQuery = z.infer<typeof userSearchQuerySchema>
 

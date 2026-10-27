@@ -93,7 +93,17 @@ function assertIncludes(haystack, needle, label) {
 
 // ───────────────────────────── 被测对象 ─────────────────────────────
 
+const { translate } = await import('@doubulea/shared')
+
+// P1-23：译文只在字典一处 —— 这里把它绑成"zh 取值器"，断言才不必逐条手写 `translate('zh', ...)`
+// （本档不再抄任何中文字面量；字典齐平与 en 无中文由 `verify-i18n` 守着）。
+const tz = (key, params) => translate('zh', key, params)
+
 const { describeConversationTime } = await import('../src/features/chat/conversationList.ts')
+
+// P1-23：读数改为"多收 locale 的纯函数"（译文在 `shared/src/i18n`）。本档统一用 `'zh'` 断言，
+// 句子的中文形态与旧断言**逐字一致**（字典齐平由 `verify-i18n` 守着，这里不抄第二份真相）。
+const ZH = 'zh'
 
 const {
   ARTIFACT_PANEL_TITLE,
@@ -244,21 +254,21 @@ groupStart('C', '`artifactTimeText(createdAt, now)`：`null` / 解析不出 / �
 const NOW = new Date('2026-09-27T12:00:00.000Z')
 
 await it('C1 `null`（这一轮刚产出、还没落库）⇒ 「刚生成」，而不是"没有消息"之类别的话', () => {
-  assertEqual(artifactTimeText(null, NOW), ARTIFACT_TIME_JUST, 'null')
+  assertEqual(artifactTimeText(null, NOW, ZH), tz(ARTIFACT_TIME_JUST), 'null')
 })
 
 await it('★ C2 解析不出时刻 ⇒ 「时间未知」——**与 `null` 必须分得开**', () => {
-  assertEqual(artifactTimeText('not-a-date', NOW), ARTIFACT_TIME_UNKNOWN, '非法 ISO')
-  assertEqual(artifactTimeText('', NOW), ARTIFACT_TIME_UNKNOWN, '空串也算解析不出')
+  assertEqual(artifactTimeText('not-a-date', NOW, ZH), tz(ARTIFACT_TIME_UNKNOWN), '非法 ISO')
+  assertEqual(artifactTimeText('', NOW, ZH), tz(ARTIFACT_TIME_UNKNOWN), '空串也算解析不出')
   // ⚠️ 反例：`conversationList` 那边解析不出时说的是"还没有消息" —— 那是**会话**的语义，
   //    套到产物上是一句假话（产物明明已经产出了，只是不知道什么时候）
-  assert(ARTIFACT_TIME_UNKNOWN !== '还没有消息', '不许拿会话那边的回落文案冒充')
+  assert(tz(ARTIFACT_TIME_UNKNOWN) !== tz('sidebar.timeNoMessage'), '不许拿会话那边的回落文案冒充')
 })
 
 await it('C3 正常时刻 ⇒ 与 `describeConversationTime` **逐字同口径**（同一个函数，不写第二份）', () => {
   const at = '2026-09-27T11:55:00.000Z' // 5 分钟前
-  assertEqual(artifactTimeText(at, NOW), describeConversationTime(at, NOW), '与侧栏同一口径')
-  assertEqual(artifactTimeText(at, NOW), '5 分钟前', '顺带把读数本身钉住')
+  assertEqual(artifactTimeText(at, NOW, ZH), describeConversationTime(at, NOW, ZH), '与侧栏同一口径')
+  assertEqual(artifactTimeText(at, NOW, ZH), '5 分钟前', '顺带把读数本身钉住')
 })
 
 // ───────────────────────────── D 溢出读数 ─────────────────────────────
@@ -266,40 +276,40 @@ await it('C3 正常时刻 ⇒ 与 `describeConversationTime` **逐字同口径**
 groupStart('D', '`artifactPanelOverflowNote(shown, total)`：只在**真的**截断了时才出现', '⚠️ 拿 `items.length` 当"共 N 个"会在超过一页时说谎')
 
 await it('D1 `total` 拿不到（`undefined`）⇒ 什么都不说，而不是编一个数', () => {
-  assertEqual(artifactPanelOverflowNote(3, undefined), null, 'undefined')
+  assertEqual(artifactPanelOverflowNote(3, undefined, ZH), null, 'undefined')
 })
 
 await it('D2 ★ 边界：`total === shown` ⇒ **不出现**这一行（没有截断就别说截断）', () => {
-  assertEqual(artifactPanelOverflowNote(100, 100), null, '恰好等于')
-  assertEqual(artifactPanelOverflowNote(1, 1), null, '一个也是')
+  assertEqual(artifactPanelOverflowNote(100, 100, ZH), null, '恰好等于')
+  assertEqual(artifactPanelOverflowNote(1, 1, ZH), null, '一个也是')
 })
 
 await it('D3 `total > shown` ⇒ 读数把**两个数**都说出来（"最近 100 个 / 共 120 个"）', () => {
-  const note = artifactPanelOverflowNote(100, 120)
+  const note = artifactPanelOverflowNote(100, 120, ZH)
   assert(note !== null, '应当出现')
   assertIncludes(note, '100', '显示数')
   assertIncludes(note, '120', '总数')
 })
 
 await it('D4 `total < shown`（服务端说少了 / 防御）⇒ 也不出现，而不是编一句负数', () => {
-  assertEqual(artifactPanelOverflowNote(5, 3), null, '倒挂')
+  assertEqual(artifactPanelOverflowNote(5, 3, ZH), null, '倒挂')
 })
 
 // ───────────────────────────── E 文案常量 ─────────────────────────────
 
 groupStart('E', '面板文案的三个常量（各只有一处写法，组件里不许再抄一遍）')
 
-await it('E1 标题是「产物」（`design/chat.html` 的 `产物 · 3` 那一格前缀）', () => {
-  assertEqual(ARTIFACT_PANEL_TITLE, '产物', '标题')
+await it('E1 标题取「产物」（`design/chat.html` 的 `产物 · 3` 那一格前缀）', () => {
+  assertEqual(tz(ARTIFACT_PANEL_TITLE), '产物', '标题译文')
 })
 
 await it('E2 空态那句话**不是错误态**（新会话的常态），且指明"文件会列在这里"', () => {
-  assert(ARTIFACT_PANEL_EMPTY.length > 0, '非空')
-  assertIncludes(ARTIFACT_PANEL_EMPTY, 'TaskAgent', '要说清是谁产出的')
+  assert(tz(ARTIFACT_PANEL_EMPTY).length > 0, '非空')
+  assertIncludes(tz(ARTIFACT_PANEL_EMPTY), 'TaskAgent', '要说清是谁产出的')
 })
 
 await it('E3 常驻说明要落在"空闲回收后仍可下载"这条保证上', () => {
-  assertIncludes(ARTIFACT_PANEL_NOTE, '回收', '要点是"回收之后还能下载"')
+  assertIncludes(tz(ARTIFACT_PANEL_NOTE), '回收', '要点是"回收之后还能下载"')
 })
 
 // ───────────────────────────── 结论表 ─────────────────────────────

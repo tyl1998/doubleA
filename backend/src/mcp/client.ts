@@ -72,7 +72,7 @@
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import type { ElicitRequestParams, ElicitResult } from '@modelcontextprotocol/client'
 
-import { AppError, type McpToolDescriptor } from '@doubulea/shared'
+import { appMsg, AppError, type McpToolDescriptor } from '@doubulea/shared'
 
 import { config } from '../config.js'
 import { getLogger, SERVICE_VERSION } from '../infra/logger.js'
@@ -317,8 +317,7 @@ export class McpClient {
     try {
       url = new URL(options.url)
     } catch {
-      throw AppError.upstreamError(
-        `MCP server 的 endpoint_url 不是合法 URL：${options.name}（${options.url}）`,
+      throw AppError.upstreamError(appMsg('app.m060', { p0: options.name, p1: options.url }),
       )
     }
 
@@ -528,8 +527,8 @@ export class McpClient {
 
   /** 未连接 / 已关闭时调用是**编程错误**（不是用户输入问题）⇒ 500，且消息要指出漏了哪一步 */
   private assertUsable(stage: string): void {
-    if (this.closed) throw AppError.internal(`MCP 客户端已关闭，无法执行 ${stage}`)
-    if (!this.connected) throw AppError.internal(`MCP 客户端尚未 connect()，无法执行 ${stage}`)
+    if (this.closed) throw AppError.internal(appMsg('app.m061', { p0: stage }))
+    if (!this.connected) throw AppError.internal(appMsg('app.m062', { p0: stage }))
   }
 }
 

@@ -28,8 +28,8 @@
 import { Alert, Input, InputNumber, Modal, Radio, Select } from 'antd'
 import {
   ASSET_VISIBILITIES,
-  ASSET_VISIBILITY_LABELS,
-  EMBEDDING_MODEL_CHANGE_REBUILD_HINT,
+  ASSET_VISIBILITY_KEY,
+  translate,
   type AssetVisibility,
   type KnowledgeBaseItem,
 } from '@doubulea/shared'
@@ -44,6 +44,7 @@ import {
 import { useAvailableChatModels, useAvailableEmbeddingModels } from '../../api/models.js'
 import { AudiencePicker } from '../../components/AudiencePicker.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
   buildCreateBody,
   buildKnowledgeUpdateBody,
@@ -65,6 +66,7 @@ export interface KnowledgeBaseFormModalProps {
 
 export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: KnowledgeBaseFormModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const create = useCreateKnowledgeBase()
   const update = useUpdateKnowledgeBase()
   // 换模型后自动触发整库重建（`kb` 为 null 时是创建形态，永不调用它）
@@ -139,7 +141,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
 
   /** 两端共用的"能不能提交"：名字必填；两个分块参数**都填了**才判跨字段（见文件头 ①） */
   const chunkingError =
-    chunkSize !== null && chunkOverlap !== null ? validateChunking(chunkSize, chunkOverlap) : null
+    chunkSize !== null && chunkOverlap !== null ? validateChunking(chunkSize, chunkOverlap, locale) : null
   /** 「指定用户」至少要有一个受众主体（与后端同一条不变量，前端先拦一次给出即时的按钮禁用） */
   const audienceMissing =
     visibility === 'SHARED' && audience.userIds.length === 0 && audience.groupIds.length === 0
@@ -164,16 +166,16 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   /** 触发整库重建；无文档时无事可做，如实说明（后端也会 409） */
   const triggerRebuild = (documentCount: number): void => {
     if (documentCount === 0) {
-      feedback.ok('已保存（该库还没有文档，无需重建索引）')
+      feedback.ok(t('kbForm.rebuildNoDocs'))
       return
     }
     rebuild.mutate(undefined, {
       onSuccess: (result) =>
         result.failed > 0
-          ? feedback.note(`已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请到文档列表逐篇重试`)
-          : feedback.ok(`已开始重建 ${result.enqueued} 篇文档`),
+          ? feedback.note(t('kbForm.rebuildSubmitted', { enqueued: result.enqueued, failed: result.failed }))
+          : feedback.ok(t('kbForm.rebuildStarted', { enqueued: result.enqueued })),
       // 重建没提交成功也不能说"保存失败"——模型/配置已经存好了，只是重建没排上队
-      onError: (error) => feedback.fail(error, '整库重建未提交成功，请稍后重试'),
+      onError: (error) => feedback.fail(error, t('kbForm.rebuildFailed')),
     })
   }
 
@@ -197,7 +199,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       }
       create.mutate(buildCreateBody(values), {
         onSuccess: (created) => {
-          feedback.ok(`已创建知识库「${created.name}」`)
+          feedback.ok(t('kbForm.created', { name: created.name }))
           onClose()
           onCreated?.(created)
         },
@@ -223,7 +225,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
       onClose()
       // 没有字段要改、但该库仍需重建（模型池改名等）⇒ 保存动作直接触发重建
       if (needsRebuild) triggerRebuild(kb.documentCount)
-      else feedback.note('没有需要保存的改动')
+      else feedback.note(t('kbForm.noChanges'))
       return
     }
     update.mutate(
@@ -233,7 +235,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
           onClose()
           // 该库需重建（换了模型 / 模型池改名）⇒ 保存后立刻触发重建，否则向量检索实际停用。
           if (needsRebuild) triggerRebuild(saved.documentCount)
-          else feedback.ok(`已保存「${saved.name}」`)
+          else feedback.ok(t('kbForm.saved', { name: saved.name }))
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -243,94 +245,101 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
   return (
     <Modal
       open={open}
-      title={editing ? `编辑「${kb.name}」` : '创建知识库'}
-      okText={editing ? '保存' : '创建'}
+      title={editing ? t('kbForm.titleEdit', { name: kb.name }) : t('kbForm.titleCreate')}
+      okText={editing ? t('common.save') : t('kbForm.okCreate')}
       okButtonProps={{ disabled: !canSubmit, loading: submitting }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={submit}
       onCancel={onClose}
       maskClosable={!submitting}
     >
       <div className="stack">
         <div>
-          <p className="block-label">名称</p>
+          <p className="block-label">{t('kbForm.name')}</p>
           <Input
             value={name}
             maxLength={128}
-            aria-label="知识库名称"
-            placeholder="例如：运维手册"
+            aria-label={t('kbForm.nameAria')}
+            placeholder={t('kbForm.namePlaceholder')}
             onChange={(event) => setName(event.target.value)}
             onPressEnter={() => {
               if (canSubmit) submit()
             }}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            最多 128 个字符。建库是配置动作；但需要先有一个可用的<strong>向量模型</strong>（见下）。
+            {t('kbForm.nameHelpPrefix')}
+            <strong>{t('kbForm.nameHelpStrong')}</strong>
+            {t('kbForm.nameHelpSuffix')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">描述</p>
+          <p className="block-label">{t('kbForm.description')}</p>
           <Input.TextArea
             value={description}
             rows={3}
             maxLength={2000}
-            aria-label="知识库描述"
-            placeholder="这个库里放什么、给谁用（留空表示不写）"
+            aria-label={t('kbForm.descriptionAria')}
+            placeholder={t('kbForm.descriptionPlaceholder')}
             onChange={(event) => setDescription(event.target.value)}
           />
         </div>
 
         <div>
-          <p className="block-label">可见性</p>
+          <p className="block-label">{t('kbForm.visibility')}</p>
           <Radio.Group value={visibility} onChange={(event) => setVisibility(event.target.value as AssetVisibility)}>
             {ASSET_VISIBILITIES.map((value) => (
               <Radio key={value} value={value}>
-                {ASSET_VISIBILITY_LABELS[value]}
+                {translate(locale, ASSET_VISIBILITY_KEY[value])}
               </Radio>
             ))}
           </Radio.Group>
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            私有 = 仅所属人（你）与管理员可见；指定用户 = 只有你圈定的用户 / 组可见可用；
-            公开 = 全员可看可用。⚠️ 设为「指定用户 / 公开」后，本库被引用时其内容对受众 / 全员可见。
+            {t('kbForm.visibilityHelp')}
           </p>
           {visibility === 'SHARED' && (
             <div style={{ marginTop: 'var(--sp-3)' }}>
-              <p className="block-label">受众</p>
+              <p className="block-label">{t('kbForm.audience')}</p>
               <AudiencePicker
                 userIds={audience.userIds}
                 groupIds={audience.groupIds}
+                knownUsers={kb?.audience?.users}
                 onChange={setAudience}
               />
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                受众 = 你直接指定的用户 ∪ 你选的组里全部成员；至少选一位用户或一个组。
+                {t('kbForm.audienceHelp')}
               </p>
             </div>
           )}
         </div>
 
         <div>
-          <p className="block-label">Embedding 模型</p>
+          <p className="block-label">{t('kbForm.embedding')}</p>
           <Select
             value={embeddingModelId === '' ? undefined : embeddingModelId}
             options={embeddingOptions}
             loading={embeddingModels.isPending}
-            placeholder="选择一个向量模型（模型池里「向量」类型的模型）"
+            placeholder={t('kbForm.embeddingPlaceholder')}
             style={{ width: '100%' }}
-            aria-label="Embedding 模型"
+            aria-label={t('kbForm.embeddingAria')}
             onChange={setEmbeddingModelId}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
             {editing ? (
               <>
-                本库的文本用它向量化。更换后会向新模型<strong>重探一次维度</strong>；
-                因为旧文档的向量是旧模型产出的，保存后平台会<strong>自动触发整库重建</strong>。
+                {t('kbForm.embeddingHelpEditPrefix')}
+                <strong>{t('kbForm.embeddingHelpEditStrong1')}</strong>
+                {t('kbForm.embeddingHelpEditMid')}
+                <strong>{t('kbForm.embeddingHelpEditStrong2')}</strong>
+                {t('kbForm.embeddingHelpEditSuffix')}
               </>
             ) : (
               <>
-                本库的文本将用它向量化。建库时后端会向它<strong>探测一次维度</strong>并快照到本库；
-                之后入库与检索都按该维度进行。下拉里没有可选项？请先到「模型池」新增一个
-                <strong>向量类型</strong>的 Provider 及其模型。
+                {t('kbForm.embeddingHelpCreatePrefix')}
+                <strong>{t('kbForm.embeddingHelpCreateStrong1')}</strong>
+                {t('kbForm.embeddingHelpCreateMid')}
+                <strong>{t('kbForm.embeddingHelpCreateStrong2')}</strong>
+                {t('kbForm.embeddingHelpCreateSuffix')}
               </>
             )}
           </p>
@@ -339,52 +348,50 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
               type="warning"
               showIcon
               style={{ marginTop: 'var(--sp-2)' }}
-              message={EMBEDDING_MODEL_CHANGE_REBUILD_HINT}
+              message={t('hint.embeddingModelChangeRebuild')}
             />
           )}
         </div>
 
         <div>
-          <p className="block-label">图片描述模型（可选）</p>
+          <p className="block-label">{t('kbForm.caption')}</p>
           <Select
             value={captionModelId === '' ? undefined : captionModelId}
             options={captionOptions}
             loading={chatModels.isPending}
             allowClear
-            placeholder="不启用（不产出图片描述）"
+            placeholder={t('kbForm.captionPlaceholder')}
             style={{ width: '100%' }}
-            aria-label="图片描述模型"
+            aria-label={t('kbForm.captionAria')}
             onChange={(value) => setCaptionModelId(value ?? '')}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            传图片文档（选「图片转文字」或「图片向量化」）时，用这个 vision 模型读出图的<strong>含义</strong>
-            （摘要 / 流程图转 Mermaid / 关键标签），补 OCR 只能识别文字的不足。留空则不启用；
-            下拉里只列支持图片的对话模型（模型池里勾选「支持图片」的）。⚠️ 低清图不会交给模型（防止乱编）。
+            {t('kbForm.captionHelp')}
           </p>
         </div>
 
         <div className="row" style={{ gap: 'var(--sp-4)', alignItems: 'flex-start' }}>
           <div style={{ flex: 1 }}>
-            <p className="block-label">分块字符数</p>
+            <p className="block-label">{t('kbForm.chunkSize')}</p>
             <InputNumber
               value={chunkSize}
               min={1}
               max={8192}
               style={{ width: '100%' }}
-              aria-label="分块字符数"
-              placeholder={editing ? undefined : '留空则用服务端默认值'}
+              aria-label={t('kbForm.chunkSizeAria')}
+              placeholder={editing ? undefined : t('kbForm.chunkPlaceholderEmpty')}
               onChange={(value) => setChunkSize(value === null ? null : Number(value))}
             />
           </div>
           <div style={{ flex: 1 }}>
-            <p className="block-label">相邻块重叠字符数</p>
+            <p className="block-label">{t('kbForm.chunkOverlap')}</p>
             <InputNumber
               value={chunkOverlap}
               min={0}
               max={8191}
               style={{ width: '100%' }}
-              aria-label="相邻块重叠字符数"
-              placeholder={editing ? undefined : '留空则用服务端默认值'}
+              aria-label={t('kbForm.chunkOverlapAria')}
+              placeholder={editing ? undefined : t('kbForm.chunkPlaceholderEmpty')}
               onChange={(value) => setChunkOverlap(value === null ? null : Number(value))}
             />
           </div>
@@ -397,13 +404,15 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
         <p className="ratio">
           {editing ? (
             <>
-              分块参数改动只影响<strong>之后</strong>入库的内容；已入库的文档要重新上传（覆盖重传）
-              才会按新参数重切。
+              {t('kbForm.chunkHelpEditPrefix')}
+              <strong>{t('kbForm.chunkHelpEditStrong')}</strong>
+              {t('kbForm.chunkHelpEditSuffix')}
             </>
           ) : (
             <>
-              分块参数留空时，服务端会用部署配置里的默认值<strong>快照</strong>到这个库上；
-              建库之后仍可单独修改。
+              {t('kbForm.chunkHelpCreatePrefix')}
+              <strong>{t('kbForm.chunkHelpCreateStrong')}</strong>
+              {t('kbForm.chunkHelpCreateSuffix')}
             </>
           )}
         </p>
@@ -413,7 +422,7 @@ export function KnowledgeBaseFormModal({ kb, open, onClose, onCreated }: Knowled
           <Alert
             type="error"
             showIcon
-            message={editing ? '保存失败' : '创建失败'}
+            message={editing ? t('kbForm.saveFailed') : t('kbForm.createFailed')}
             description={errorText}
           />
         )}

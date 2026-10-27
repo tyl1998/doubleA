@@ -37,6 +37,7 @@ import type {
   SseDonePayload,
   SseEvent,
 } from '@doubulea/shared'
+import { translate, type AppMessagePayload, type Locale } from '@doubulea/shared'
 
 import {
   artifactViewFromEvent,
@@ -96,7 +97,7 @@ export interface StreamRound {
   assistant: StreamAssistant
   status: RoundStatus
   /** 流内 `error` 事件的载荷（`status === 'error'` 时才有） */
-  error: { code: string; message: string } | null
+  error: { code: string; message: string; msgKey?: AppMessagePayload } | null
   /**
    * 这一轮的失败是**谁**发现的（P0-1-33 新增）—— 它决定用哪个通道告诉用户：
    *   · `'server'` = 流内 `error` 事件（后端主动收口，含 `CONFLICT` / 上游故障）
@@ -295,8 +296,11 @@ export function withoutQueuedInterjections(round: StreamRound): StreamRound {
  *   · 返回新对象 ⇒ 有可渲染的变化；
  *   · 返回 `round` 本身也用于"未知事件"（本层拿到的 `SseEvent` 已经过 schema 校验，
  *     所以"未知"只可能是上游加了新事件而这里没跟上 —— 忽略即可，不该让整条流失败）。
+ *
+ * ⚠️ P1-23：多收一个 `locale` —— 本层唯一一处**自造**文案（`done{finishReason:ERROR}` 没有
+ * 服务端正文，只能由前端兜一句）。其余错误文案都来自服务端（`error` 事件的 `message`）。
  */
-export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
+export function reduceRound(round: StreamRound, event: SseEvent, locale: Locale): StreamRound {
   // 已经收口（`done` / `error` 各一次，见 `shared/src/sse.ts` 文件头 ③）⇒ 之后**一切**都忽略：
   // 既保护已经渲染出来的内容不被后续帧改花，也让"第一个终态"成为唯一终态
   if (isSettled(round)) return round
@@ -470,7 +474,7 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
         assistantMessageId: event.data.messageId,
         ...(event.data.finishReason === 'ERROR'
           ? {
-              error: { code: 'INTERNAL', message: '生成过程中断，已生成的内容保留' },
+              error: { code: 'INTERNAL', message: translate(locale, 'chat.internalInterrupted') },
               // 这是**服务端**说的失败（它自己给的 `finishReason:ERROR`）⇒ 与流内 `error` 事件同一个通道
               errorSource: 'server' as const,
             }
@@ -481,7 +485,12 @@ export function reduceRound(round: StreamRound, event: SseEvent): StreamRound {
       return {
         ...round,
         status: 'error',
-        error: { code: event.data.code, message: event.data.message },
+        error: {
+          code: event.data.code,
+          message: event.data.message,
+          // 服务端给了结构化 key 就带上（P1-23 收尾 ⑤）⇒ en 下错误卡显示真译文
+          ...(event.data.msgKey === undefined ? {} : { msgKey: event.data.msgKey }),
+        },
         errorSource: 'server',
       }
 

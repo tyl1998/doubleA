@@ -31,6 +31,7 @@ import type { InitialPasswordResult } from '@doubulea/shared'
 import { useEffect, useState } from 'react'
 
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { initialPasswordCopyText, initialPasswordNotice } from './adminModel.js'
 
 export interface InitialPasswordModalProps {
@@ -42,6 +43,7 @@ export interface InitialPasswordModalProps {
 
 export function InitialPasswordModal({ result, forReset, onClose }: InitialPasswordModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const [copied, setCopied] = useState(false)
 
   // 每次打开都复位"已复制"标记：不复位会让下一次打开时按钮写着"已复制"而其实没复制
@@ -53,21 +55,21 @@ export function InitialPasswordModal({ result, forReset, onClose }: InitialPassw
 
   const copy = (): void => {
     void navigator.clipboard
-      .writeText(initialPasswordCopyText(result.user.username, result.initialPassword))
+      .writeText(initialPasswordCopyText(result.user.username, result.initialPassword, locale))
       .then(() => {
         setCopied(true)
-        feedback.ok('已复制用户名与初始密码')
+        feedback.ok(t('initPassword.copied'))
       })
       .catch(() => {
         // 剪贴板在非 https / 无权限时会失败 —— 这时**不能**说"已复制"
-        feedback.fail(new Error('浏览器拒绝了剪贴板访问，请手工选中后复制'), '复制失败')
+        feedback.fail(new Error(t('initPassword.copyBlocked')), t('models.copyFailed'))
       })
   }
 
   return (
     <Modal
       open
-      title={forReset ? '密码已重置' : '账号已创建'}
+      title={forReset ? t('initPassword.titleReset') : t('initPassword.titleCreated')}
       // ⚠️ 不给 ×、不响应点遮罩：这个弹窗里装着**唯一一份明文**，误关的代价无法补救
       closable={false}
       maskClosable={false}
@@ -75,30 +77,32 @@ export function InitialPasswordModal({ result, forReset, onClose }: InitialPassw
       onCancel={onClose}
       footer={
         <>
-          <Button onClick={copy}>{copied ? '再复制一次' : '复制用户名与密码'}</Button>
+          <Button onClick={copy}>{copied ? t('initPassword.copyAgain') : t('initPassword.copy')}</Button>
           <Button type="primary" onClick={onClose}>
-            我已保存，关闭
+            {t('initPassword.savedClose')}
           </Button>
         </>
       }
     >
       <div className="stack stack--tight">
-        <Alert type="warning" showIcon message="初始密码只显示这一次" description={initialPasswordNotice(result.user.username, forReset)} />
+        <Alert
+          type="warning"
+          showIcon
+          message={t('initPassword.warnTitle')}
+          description={initialPasswordNotice(result.user.username, forReset, locale)}
+        />
 
         <div>
-          <p className="block-label">用户名</p>
-          <Input readOnly value={result.user.username} className="num" aria-label="用户名" />
+          <p className="block-label">{t('initPassword.username')}</p>
+          <Input readOnly value={result.user.username} className="num" aria-label={t('initPassword.username')} />
         </div>
 
         <div>
-          <p className="block-label">初始密码</p>
-          <Input readOnly value={result.initialPassword} className="num" aria-label="初始密码" />
+          <p className="block-label">{t('initPassword.password')}</p>
+          <Input readOnly value={result.initialPassword} className="num" aria-label={t('initPassword.password')} />
         </div>
 
-        <p className="ratio">
-          关闭这个弹窗之后，这份明文就再也取不回来了（后端只在这一次响应里下发）。如果没记住，
-          只能重新建号或再重置一次 —— 那会让对方手上的旧密码作废。
-        </p>
+        <p className="ratio">{t('initPassword.footNote')}</p>
       </div>
     </Modal>
   )

@@ -23,9 +23,14 @@ import { CloudServerOutlined, PlusOutlined } from '@ant-design/icons'
 import { AutoComplete, Button, Checkbox, Modal, Progress, Radio, Tag, Tooltip, Typography, message } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
-import { sandboxVariantIdFromSelection, sandboxVariantLabel } from '@doubulea/shared'
+import {
+  SANDBOX_BUILD_PHASE_KEY,
+  sandboxVariantIdFromSelection,
+  sandboxVariantLabel,
+} from '@doubulea/shared'
 import type { SandboxBuildJob, SandboxInstanceRuntimeItem, SandboxRuntimeSelection } from '@doubulea/shared'
 
+import { useT, type Translate } from '../../app/i18n.js'
 import {
   cancelSandboxBuildJob,
   fetchSandboxBuildJob,
@@ -37,14 +42,33 @@ import {
 /** 构建任务查询 key（按 `buildId`） */
 const buildJobQueryKey = (buildId: string | null) => ['sandbox-build-job', buildId] as const
 
+/**
+ * 构建进度那一行：`phase` 的译文 + `detail`（组件名 / RUN 概要）由**前端**拼成人话。
+ *
+ * ⚠️ 不再读 `phaseLabel`（已废弃，仅为"新后端 + 旧前端"的灰度期保留）。
+ * `detail` 为空（或旧后端没给）时只显示阶段名 —— **不要**产出 `(null)`。
+ */
+function buildPhaseText(job: SandboxBuildJob | undefined, t: Translate): string | null {
+  if (job === undefined) return null
+  const phase = t(SANDBOX_BUILD_PHASE_KEY[job.phase])
+  const detail = job.detail
+  if (detail === undefined || detail === null || detail === '') return phase
+  return t('runtime.buildPhaseWithDetail', { phase, detail })
+}
+
 /** 繁忙度：槽位占用率 → 文案（没有负载快照 ⇒ "繁忙度未知"，不假装 0%） */
-function busyText(item: SandboxInstanceRuntimeItem): string {
+function busyText(item: SandboxInstanceRuntimeItem, t: Translate): string {
   const load = item.load
-  if (load === null) return '繁忙度未知'
-  if (load.slotsTotal <= 0) return '繁忙度未知'
+  if (load === null) return t('runtime.busyUnknown')
+  if (load.slotsTotal <= 0) return t('runtime.busyUnknown')
   const ratio = Math.round((load.slotsUsed / load.slotsTotal) * 100)
-  const queue = load.queueDepth > 0 ? `，排队 ${load.queueDepth}` : ''
-  return `占用 ${load.slotsUsed}/${load.slotsTotal}（${ratio}%）${queue}`
+  const queue = load.queueDepth > 0 ? t('runtime.busyQueue', { depth: load.queueDepth }) : ''
+  return t('runtime.busy', {
+    used: load.slotsUsed,
+    total: load.slotsTotal,
+    percent: ratio,
+    queue,
+  })
 }
 
 export interface RuntimeSelectProps {
@@ -68,6 +92,7 @@ export function RuntimeSelect({
   preferredInstance = null,
   onPreferredInstanceChange,
 }: RuntimeSelectProps) {
+  const { t } = useT()
   const query = useSandboxRuntimes()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -131,7 +156,12 @@ export function RuntimeSelect({
   useEffect(() => {
     if (job === undefined) return
     if (job.status === 'succeeded') {
-      message.success(`运行时已就绪：${job.label}（实例 ${job.instanceId ?? '未知'}）`)
+      message.success(
+        t('runtime.readyOk', {
+          label: job.label,
+          instance: job.instanceId ?? t('runtime.unknownInstance'),
+        }),
+      )
       void queryClient.invalidateQueries({ queryKey: sandboxRuntimesQueryKey })
       setPickerOpen(false)
       resetPicker()
@@ -142,12 +172,19 @@ export function RuntimeSelect({
       onPreferredInstanceChange?.(job.instanceId)
       onSelect(job.variant, true)
     } else if (job.status === 'failed') {
-      message.error(`构建失败${job.instanceId === null ? '' : `（实例 ${job.instanceId}）`}：${job.error ?? '未知错误'}`)
+      message.error(
+        job.instanceId === null
+          ? t('runtime.buildFailedPlain', { reason: job.error ?? t('runtime.unknownError') })
+          : t('runtime.buildFailedWithInstance', {
+              instance: job.instanceId,
+              reason: job.error ?? t('runtime.unknownError'),
+            }),
+      )
       setBuildId(null)
       setBuildingVariant(null)
       setBuildInstanceId(null)
     } else if (job.status === 'canceled') {
-      message.info('已取消构建')
+      message.info(t('runtime.buildCanceled'))
       setBuildId(null)
       setBuildingVariant(null)
       setBuildInstanceId(null)
@@ -173,11 +210,15 @@ export function RuntimeSelect({
         setBuildInstanceId(started.instanceId)
         setBuildId(started.buildId)
         if (started.instanceId !== null && started.instanceId !== buildTarget && started.status === 'failed') {
-          message.warning(`构建请求落到了实例 ${started.instanceId}，不是所选实例 ${buildTarget}，请重试`)
+          message.warning(
+            t('runtime.buildMismatch', { actual: started.instanceId, target: buildTarget }),
+          )
         }
       })
       .catch((error: unknown) => {
-        message.error(`构建启动失败：${error instanceof Error ? error.message : String(error)}`)
+        message.error(
+          t('runtime.buildStartFailed', { detail: error instanceof Error ? error.message : String(error) }),
+        )
       })
       .finally(() => setStarting(false))
   }
@@ -186,7 +227,9 @@ export function RuntimeSelect({
     if (buildId === null || canceling) return
     setCanceling(true)
     cancelSandboxBuildJob(buildId, buildInstanceId)
-      .catch((error: unknown) => message.error(`取消失败：${error instanceof Error ? error.message : String(error)}`))
+      .catch((error: unknown) =>
+        message.error(t('runtime.cancelFailed', { detail: error instanceof Error ? error.message : String(error) })),
+      )
       .finally(() => setCanceling(false))
   }
 
@@ -206,8 +249,8 @@ export function RuntimeSelect({
   }
 
   /** 按钮上显示"在哪台 · 什么环境"（没有选择时是"自动"） */
-  const summary = `${preferredInstance ?? '自动'}`
-  const envLabel = runtime === '' ? '空环境' : sandboxVariantLabel(runtime)
+  const summary = `${preferredInstance ?? t('runtime.auto')}`
+  const envLabel = runtime === '' ? t('runtime.emptyEnv') : sandboxVariantLabel(runtime)
   /**
    * 点名了实例，但它不在 `instances` 里（未就绪被后端滤掉 / 已离线）：
    * 这时弹窗里没有任何一张卡是选中的，用户会以为"选择丢了"—— 如实说出来。
@@ -216,7 +259,7 @@ export function RuntimeSelect({
 
   return (
     <>
-      <Tooltip title="选择这个会话在哪台实例上跑、用哪个环境（下次派活生效）">
+      <Tooltip title={t('runtime.selectTooltip')}>
         <Button size="small" icon={<CloudServerOutlined />} loading={pending} onClick={() => setOpen(true)}>
           {summary} · {envLabel}
         </Button>
@@ -224,22 +267,23 @@ export function RuntimeSelect({
 
       {/* ── ① 选实例 + 选环境（按实例列卡片）────────────────────────────── */}
       <Modal
-        title="运行位置与环境"
+        title={t('runtime.modalTitle')}
         open={open}
         width={640}
         onCancel={() => setOpen(false)}
         onOk={confirm}
-        okText="确定"
+        okText={t('common.ok')}
         okButtonProps={{ loading: pending }}
       >
         <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-          会话的容器与 Code 工作区都在**选定实例**上；不选实例则由网关按负载自动选择。
-          {selected === undefined || selected.known ? null : ' 该实例尚未上报环境能力，显示可能不全。'}
+          {t('runtime.modalLead')}
+          {selected === undefined || selected.known ? null : t('runtime.modalLeadUnknown')}
         </Typography.Paragraph>
         {missingInstance ? (
           <Typography.Paragraph type="warning" style={{ marginBottom: 8 }}>
-            这条会话在实例 <strong>{preferredInstance}</strong> 上，但它此刻不在可选列表里（未就绪或已离线）。
-            派活会失败，请等它就绪，或在本会话回收后选择别的实例。
+            {t('runtime.missingInstancePrefix')}
+            <strong>{preferredInstance}</strong>
+            {t('runtime.missingInstanceSuffix')}
           </Typography.Paragraph>
         ) : null}
         <Radio.Group
@@ -255,10 +299,8 @@ export function RuntimeSelect({
             >
               <Radio value="" />
               <div className="ws-env-card__body">
-                <div className="ws-env-card__title">自动（按负载选择实例）</div>
-                <div className="ws-env-card__meta">
-                  不钉机：按所选环境挑一台**具备它**（或能构建它）的实例；以下环境取自所有在线实例的并集
-                </div>
+                <div className="ws-env-card__title">{t('runtime.autoCardTitle')}</div>
+                <div className="ws-env-card__meta">{t('runtime.autoCardMeta')}</div>
                 <div className="ws-env-card__envs">
                   <Tag
                     color={runtime === '' ? 'blue' : undefined}
@@ -269,10 +311,15 @@ export function RuntimeSelect({
                       onSelect('', true)
                     }}
                   >
-                    空环境（仅基础工具链）
+                    {t('runtime.emptyEnvFull')}
                   </Tag>
                   {union.map((entry) => (
-                    <Tooltip key={entry.id} title={`可用实例：${entry.instances.join('、')}`}>
+                    <Tooltip
+                      key={entry.id}
+                      title={t('runtime.environmentsIn', {
+                        instances: entry.instances.join(t('runtime.listSeparator')),
+                      })}
+                    >
                       <Tag
                         color={runtime === entry.id ? 'blue' : undefined}
                         style={{ cursor: 'pointer' }}
@@ -289,14 +336,14 @@ export function RuntimeSelect({
                   ))}
                   {union.length === 0 && instances.length > 0 ? (
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      所有实例都只有空环境
+                      {t('runtime.allEmptyOnly')}
                     </Typography.Text>
                   ) : null}
                   <Tooltip
                     title={
                       autoBuildable === null
-                        ? '当前没有能按需构建的实例'
-                        : `将自动选一台可构建的实例（优先较空闲）并切换到它：${autoBuildable}`
+                        ? t('runtime.noBuildableInstance')
+                        : t('runtime.autoPickBuildable', { instance: autoBuildable })
                     }
                   >
                     <Button
@@ -309,13 +356,13 @@ export function RuntimeSelect({
                         if (autoBuildable !== null) openBuild(autoBuildable)
                       }}
                     >
-                      构建新环境
+                      {t('runtime.buildNewEnv')}
                     </Button>
                   </Tooltip>
                 </div>
                 {runtime !== '' && !union.some((entry) => entry.id === runtime) ? (
                   <Typography.Text type="warning" style={{ fontSize: 12 }}>
-                    当前没有实例具备「{envLabel}」：可点「构建新环境」自动选一台可构建的实例
+                    {t('runtime.noneHasEnv', { env: envLabel })}
                   </Typography.Text>
                 ) : null}
               </div>
@@ -334,13 +381,17 @@ export function RuntimeSelect({
                   <Radio value={item.instanceId} disabled={unavailable} />
                   <div className="ws-env-card__body">
                     <div className="ws-env-card__title">
-                      实例 {item.instanceId}
+                      {t('runtime.instanceLabel', { id: item.instanceId })}
                       <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
                         {item.advertiseAddr}
                       </Typography.Text>
                     </div>
                     <div className="ws-env-card__meta">
-                      {unavailable ? `未就绪：${item.missing.join('、') || '节点自检未通过'}（不可选）` : busyText(item)}
+                      {unavailable
+                        ? t('runtime.notReady', {
+                            missing: item.missing.join(t('runtime.listSeparator')) || t('runtime.notReadyDefault'),
+                          })
+                        : busyText(item, t)}
                     </div>
                     <div className="ws-env-card__envs">
                       {/* ★ 空环境恒可用（派活时回退 SANDBOX_IMAGE，不依赖任何运行时镜像） */}
@@ -352,13 +403,13 @@ export function RuntimeSelect({
                           onSelect('', true)
                         }}
                       >
-                        空环境
+                        {t('runtime.emptyEnv')}
                       </Tag>
                       {item.known ? (
                         <>
                           {item.runtimes.length === 0 ? (
                             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                              （无额外运行时）
+                              {t('runtime.noExtraRuntime')}
                             </Typography.Text>
                           ) : null}
                           {item.runtimes.map((entry) => (
@@ -377,14 +428,12 @@ export function RuntimeSelect({
                         </>
                       ) : (
                         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                          环境能力未知（该实例未上报）
+                          {t('runtime.capabilityUnknown')}
                         </Typography.Text>
                       )}
                       <Tooltip
                         title={
-                          item.canBuild
-                            ? '在这台实例上按需构建一个环境（勾选语言 + 版本）'
-                            : '该实例不能按需构建（构建上下文不可见）；请在能构建的实例上构建，或运维预先分发镜像'
+                          item.canBuild ? t('runtime.buildHereTooltip') : t('runtime.cannotBuildTooltip')
                         }
                       >
                         <Button
@@ -394,13 +443,13 @@ export function RuntimeSelect({
                           disabled={!item.canBuild}
                           onClick={() => openBuild(item.instanceId)}
                         >
-                          构建新环境
+                          {t('runtime.buildNewEnv')}
                         </Button>
                       </Tooltip>
                     </div>
                     {runtime !== '' && item.known && !has && draftInstance === item.instanceId ? (
                       <Typography.Text type="warning" style={{ fontSize: 12 }}>
-                        这台没有「{envLabel}」：派活会回退空环境并在日志留 warn；可点「构建新环境」
+                        {t('runtime.thisLacksEnv', { env: envLabel })}
                       </Typography.Text>
                     ) : null}
                   </div>
@@ -408,7 +457,9 @@ export function RuntimeSelect({
               )
             })}
             {instances.length === 0 ? (
-              <Typography.Text type="secondary">{query.isLoading ? '加载实例中…' : '当前没有在线实例'}</Typography.Text>
+              <Typography.Text type="secondary">
+              {query.isLoading ? t('runtime.loadingInstances') : t('runtime.noOnlineInstance')}
+            </Typography.Text>
             ) : null}
           </div>
         </Radio.Group>
@@ -418,8 +469,11 @@ export function RuntimeSelect({
       <Modal
         title={
           building
-            ? `在实例 ${job?.instanceId ?? buildInstanceId ?? '（未知）'} 上构建运行时镜像（${buildingVariant ?? ''}）`
-            : `构建运行时镜像（实例：${buildTarget ?? '未选择'}）`
+            ? t('runtime.buildModalTitleRunning', {
+                instance: job?.instanceId ?? buildInstanceId ?? t('runtime.unknownShort'),
+                variant: buildingVariant ?? '',
+              })
+            : t('runtime.buildModalTitleIdle', { instance: buildTarget ?? t('runtime.notSelected') })
         }
         open={pickerOpen}
         width={520}
@@ -428,26 +482,35 @@ export function RuntimeSelect({
           setPickerOpen(false)
         }}
         onOk={doBuild}
-        okText={starting ? '启动中…' : '构建并选用'}
+        okText={starting ? t('runtime.starting') : t('runtime.buildAndUse')}
         okButtonProps={{ disabled: selection.length === 0 || starting || building }}
         cancelButtonProps={{ disabled: building }}
         confirmLoading={starting}
         maskClosable={!building}
         closable={!building}
-        footer={building ? [<Button key="cancel-build" danger loading={canceling} onClick={doCancel}>取消构建</Button>] : undefined}
+        footer={
+          building
+            ? [
+                <Button key="cancel-build" danger loading={canceling} onClick={doCancel}>
+                  {t('runtime.cancelBuild')}
+                </Button>,
+              ]
+            : undefined
+        }
       >
         {building ? (
           <>
             <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-              构建实例：<Tag color="blue">{job?.instanceId ?? buildInstanceId ?? '（未知）'}</Tag>
+              {t('runtime.buildInstanceLabel')}
+              <Tag color="blue">{job?.instanceId ?? buildInstanceId ?? t('runtime.unknownShort')}</Tag>
               {buildTarget !== null && job?.instanceId !== null && job?.instanceId !== undefined && job.instanceId !== buildTarget ? (
-                <Tag color="orange">与所选实例 {buildTarget} 不一致</Tag>
+                <Tag color="orange">{t('runtime.buildMismatchTag', { target: buildTarget })}</Tag>
               ) : null}
-              {job?.phaseLabel ?? '构建中…'}
+              {buildPhaseText(job, t) ?? t('runtime.building')}
             </Typography.Paragraph>
             <Progress percent={progressPercent} status="active" />
             <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-              构建可能需要几分钟（会下载语言运行时）；可点「取消构建」中止。
+              {t('runtime.buildingHint')}
             </Typography.Paragraph>
             {job !== undefined && job.log !== '' ? (
               <Typography.Paragraph style={{ marginTop: 8, marginBottom: 0, maxHeight: 120, overflow: 'auto' }} code>
@@ -458,8 +521,9 @@ export function RuntimeSelect({
         ) : (
           <>
             <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-              构建将在实例 <Tag color="blue">{buildTarget ?? '未选择'}</Tag> 上执行；勾选需要的语言并填版本号
-              （该组合在那台已有镜像则直接命中缓存）。⚠️ 版本构建期固定，**依赖**在运行期安装。
+              {t('runtime.buildWillRunPrefix')}
+              <Tag color="blue">{buildTarget ?? t('runtime.notSelected')}</Tag>
+              {t('runtime.buildWillRunSuffix')}
             </Typography.Paragraph>
             {languages.map((lang) => {
               const on = checked[lang.language] === true
@@ -490,15 +554,18 @@ export function RuntimeSelect({
                   ) : (
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                       {lang.hint}
-                      {lang.baseVersion !== null ? `（自带 ${lang.baseVersion}）` : ''}
+                      {lang.baseVersion !== null ? t('runtime.baseVersion', { version: lang.baseVersion }) : ''}
                     </Typography.Text>
                   )}
                 </div>
               )
             })}
             <div style={{ marginTop: 12 }}>
-              将构建：<Tag color="blue">{sandboxVariantLabel(pickedVariant)}</Tag>
-              {selection.length === 0 ? <Typography.Text type="secondary">（还没选语言）</Typography.Text> : null}
+              {t('runtime.willBuild')}
+              <Tag color="blue">{sandboxVariantLabel(pickedVariant)}</Tag>
+              {selection.length === 0 ? (
+                <Typography.Text type="secondary">{t('runtime.noLanguagePicked')}</Typography.Text>
+              ) : null}
             </div>
           </>
         )}

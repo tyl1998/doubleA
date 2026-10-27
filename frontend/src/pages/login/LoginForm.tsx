@@ -26,6 +26,7 @@ import { useState } from 'react'
 import { useLogin } from '../../api/auth.js'
 import { ApiError } from '../../api/client.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { formatCountdown, useLockCountdown } from './useLockCountdown.js'
 
 interface FormValues {
@@ -55,6 +56,7 @@ export interface LoginFormProps {
 export function LoginForm({ onAuthenticated, onGoToPasswordView }: LoginFormProps) {
   const [form] = Form.useForm<FormValues>()
   const feedback = useFeedback()
+  const { t } = useT()
   const login = useLogin()
   const lock = useLockCountdown()
 
@@ -66,9 +68,9 @@ export function LoginForm({ onAuthenticated, onGoToPasswordView }: LoginFormProp
   const handleSubmit = (values: FormValues) => {
     const parsed = loginBodySchema.safeParse(values)
     if (!parsed.success) {
-      // 形状不对（空用户名 / 超长）不该发请求；文案直接用 shared 的（与后端同一份）
+      // 形状不对（空用户名 / 超长）不该发请求；文案直接用 shared 的（与后端同一份，**故仍是中文**）
       const first = parsed.error.issues[0]
-      setNotice({ tone: 'warn', text: first?.message ?? '请检查用户名与密码' })
+      setNotice({ tone: 'warn', text: first?.message ?? t('login.checkInput') })
       form.setFields(
         parsed.error.issues.flatMap((issue) => {
           const name = issue.path[0]
@@ -99,21 +101,29 @@ export function LoginForm({ onAuthenticated, onGoToPasswordView }: LoginFormProp
             return
           }
         }
-        const message = error instanceof ApiError ? error.message : '登录失败，请稍后重试'
+        const message = error instanceof ApiError ? error.message : t('login.loginFailedRetry')
         setNotice({ tone: 'danger', text: message })
-        feedback.fail(error, '登录失败')
+        feedback.fail(error, t('login.loginFailedTitle'))
       },
     })
   }
 
   return (
     <Form form={form} layout="vertical" onFinish={handleSubmit} autoComplete="on">
-      <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
-        <Input autoComplete="username" placeholder="例如 zhangh" autoFocus />
+      <Form.Item
+        name="username"
+        label={t('login.usernameLabel')}
+        rules={[{ required: true, message: t('login.usernameRequired') }]}
+      >
+        <Input autoComplete="username" placeholder={t('login.usernamePlaceholder')} autoFocus />
       </Form.Item>
 
-      <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
-        <Input.Password autoComplete="current-password" placeholder="密码" />
+      <Form.Item
+        name="password"
+        label={t('login.passwordLabel')}
+        rules={[{ required: true, message: t('login.passwordRequired') }]}
+      >
+        <Input.Password autoComplete="current-password" placeholder={t('login.passwordPlaceholder')} />
       </Form.Item>
 
       {notice !== null && (
@@ -126,7 +136,7 @@ export function LoginForm({ onAuthenticated, onGoToPasswordView }: LoginFormProp
                 <span>
                   {notice.text}
                   <span className="num" style={{ marginLeft: 'var(--sp-3)', fontFamily: 'var(--font-mono)' }}>
-                    剩余 {formatCountdown(lock.remaining)}
+                    {t('login.remaining', { time: formatCountdown(lock.remaining) })}
                   </span>
                 </span>
               ) : (
@@ -144,15 +154,15 @@ export function LoginForm({ onAuthenticated, onGoToPasswordView }: LoginFormProp
           block
           loading={login.isPending}
           disabled={locked}
-          title={locked ? '账号已锁定，倒计时结束后可重试' : undefined}
+          title={locked ? t('login.lockedTitle') : undefined}
         >
-          登录
+          {t('login.tabLogin')}
         </Button>
       </Form.Item>
 
       <div className="row" style={{ marginTop: 'var(--sp-2)' }}>
         <Button type="link" size="small" onClick={onGoToPasswordView} style={{ padding: 0 }}>
-          首次登录？先改初始密码
+          {t('login.firstLoginHint')}
         </Button>
       </div>
     </Form>

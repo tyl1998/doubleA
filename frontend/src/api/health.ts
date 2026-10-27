@@ -17,6 +17,7 @@
  */
 
 import { useQuery } from '@tanstack/react-query'
+import type { MessageKey } from '@doubulea/shared'
 
 import { request } from './client.js'
 
@@ -49,11 +50,17 @@ export interface HealthSummary {
 
 export const HEALTH_QUERY_KEY = ['health'] as const
 
-/** 依赖名的中文口径（与 `docs/02` §4.9 的运维叫法一致，别在 JSX 里散着写） */
-export const HEALTH_TARGET_LABEL: Readonly<Record<HealthTarget, string>> = {
-  postgres: 'PostgreSQL',
-  redis: 'Redis',
-  s3: '对象存储',
+/**
+ * 依赖名 → 读数 key（P1-23：**存 key 不存中文**，口径同 §3.5 的 `label.*` 覆盖）。
+ *
+ * ⚠️ `PostgreSQL` / `Redis` 是**专有名词**，zh/en 两语相同（字典里两条译文一致，是刻意的）；
+ * 只有 `s3` 的读法随语言变（中文「对象存储」/ 英文 `Object storage`）。
+ * 取值交给调用方（`useT()`）；本文件不再持有任何用户可见文案。
+ */
+export const HEALTH_TARGET_KEY: Readonly<Record<HealthTarget, MessageKey>> = {
+  postgres: 'label.healthTarget.postgres',
+  redis: 'label.healthTarget.redis',
+  s3: 'label.healthTarget.s3',
 }
 
 /**

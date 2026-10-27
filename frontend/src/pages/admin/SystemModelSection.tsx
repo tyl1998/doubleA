@@ -29,9 +29,12 @@ import { useEffect, useState } from 'react'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useTitleModel, useUpdateTitleModel } from '../../api/titleModel.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
+import { localeTag } from '../../app/locale.js'
 
 export function SystemModelSection() {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const query = useTitleModel()
   const models = useAvailableChatModels()
   const save = useUpdateTitleModel()
@@ -50,8 +53,8 @@ export function SystemModelSection() {
     save.mutate(
       { enabled: form.enabled, modelId: form.modelId === '' ? null : form.modelId },
       {
-        onSuccess: () => feedback.ok('标题模型配置已保存'),
-        onError: (error) => feedback.fail(error, '保存标题模型配置失败'),
+        onSuccess: () => feedback.ok(t('systemModel.saved')),
+        onError: (error) => feedback.fail(error, t('systemModel.saveFailed')),
       },
     )
   }
@@ -67,17 +70,17 @@ export function SystemModelSection() {
     <section className="admin-section">
       <div className="card">
         <div className="card__head">
-          <h2 className="card__title">系统模型</h2>
-          <Tag>平台级</Tag>
+          <h2 className="card__title">{t('systemModel.title')}</h2>
+          <Tag>{t('systemModel.platformTag')}</Tag>
           <div className="card__head-right">
             <span className="ratio">
-              会话标题：
+              {t('systemModel.titlePrefix')}
               {active ? (
                 <Tag color="green" style={{ marginInlineStart: 6 }}>
-                  {query.data?.modelLabel ?? '已启用'}
+                  {query.data?.modelLabel ?? t('systemModel.enabledDefault')}
                 </Tag>
               ) : (
-                <Tag style={{ marginInlineStart: 6 }}>原文截断</Tag>
+                <Tag style={{ marginInlineStart: 6 }}>{t('systemModel.rawTruncateTag')}</Tag>
               )}
             </span>
           </div>
@@ -87,22 +90,32 @@ export function SystemModelSection() {
           <Alert
             type="info"
             showIcon
-            message="会话标题生成"
+            message={t('systemModel.genTitle')}
             description={
               <ul style={{ margin: 0, paddingInlineStart: 20 }}>
                 <li>
-                  会话标题默认取自<strong>首条消息的原文截断</strong>；指定一个<strong>廉价模型</strong>
-                  后，会用它把首条消息压成更精炼的短标题（平台级，所有会话共用）。
+                  {t('systemModel.genNotePrefix')}
+                  <strong>{t('systemModel.genNoteStrong1')}</strong>
+                  {t('systemModel.genNoteMid')}
+                  <strong>{t('systemModel.genNoteStrong2')}</strong>
+                  {t('systemModel.genNoteTail')}
                 </li>
                 <li>
-                  <strong>失败一律回落</strong>：未配置 / 模型被删 / 停用 / Provider 停用 / 缺 Key / 调用报错，
-                  都<strong>保留</strong>原文截断的标题 —— 本配置不会让标题变成「新会话」。
+                  <strong>{t('systemModel.fallbackStrong')}</strong>
+                  {t('systemModel.fallbackTail')}
+                  <strong>{t('systemModel.fallbackStrong2')}</strong>
+                  {t('systemModel.fallbackEnd')}
                 </li>
                 <li>
-                  生成发生在<strong>首条消息落库之后、异步</strong>，不阻塞回答；只升级<strong>自动生成</strong>
-                  的标题，<strong>用户手动改过的标题永不被覆盖</strong>。
+                  {t('systemModel.asyncPrefix')}
+                  <strong>{t('systemModel.asyncStrong')}</strong>
+                  {t('systemModel.asyncMid')}
+                  <strong>{t('systemModel.asyncStrong2')}</strong>
+                  {t('systemModel.asyncTail')}
+                  <strong>{t('systemModel.asyncStrong3')}</strong>
+                  {t('systemModel.asyncEnd')}
                 </li>
-                <li>要求所选 Provider 已配 Key；「各自 Key」模式的 Provider 不适用于平台级标题生成。</li>
+                <li>{t('systemModel.reqNote')}</li>
               </ul>
             }
           />
@@ -115,19 +128,19 @@ export function SystemModelSection() {
                 <div className="row" style={{ gap: 'var(--sp-3)' }}>
                   <Switch checked={form.enabled} onChange={(checked) => setForm({ ...form, enabled: checked })} />
                   <span className="block-label" style={{ marginBottom: 0 }}>
-                    启用模型生成标题
+                    {t('systemModel.enableLabel')}
                   </span>
-                  <span className="ratio">关闭 = 只用原文截断</span>
+                  <span className="ratio">{t('systemModel.enableOff')}</span>
                 </div>
 
                 <label className="block-label" htmlFor="system-title-model">
-                  标题模型
+                  {t('systemModel.titleModel')}
                 </label>
                 <Select
                   id="system-title-model"
                   style={{ width: '100%' }}
                   allowClear
-                  placeholder="留空 = 未配置（回落原文截断）"
+                  placeholder={t('systemModel.titleModelPlaceholder')}
                   value={form.modelId === '' ? undefined : form.modelId}
                   loading={models.isLoading}
                   options={options}
@@ -137,10 +150,12 @@ export function SystemModelSection() {
 
               <div className="row" style={{ gap: 'var(--sp-3)' }}>
                 <Button type="primary" loading={save.isPending} onClick={submit}>
-                  保存
+                  {t('common.save')}
                 </Button>
                 {query.data !== undefined && (
-                  <span className="ratio">上次更新 {new Date(query.data.updatedAt).toLocaleString()}</span>
+                  <span className="ratio">
+                    {t('systemModel.lastUpdated', { time: new Date(query.data.updatedAt).toLocaleString(localeTag(locale)) })}
+                  </span>
                 )}
               </div>
             </>

@@ -20,7 +20,7 @@
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
-import {
+import { appMsg,
   AppError,
   WORKSPACE_CONTENT_EVENT_TYPES,
   foldWorkspaceEvents,
@@ -247,10 +247,10 @@ export async function openWorkspaceFileSource(conversationId: string, rawPath: u
 
   let row = await findLiveRow(conversationId, relative)
   if (row === null) {
-    if ((await workspaceFileSize(absolute)) === undefined) throw AppError.notFound('文件不存在')
+    if ((await workspaceFileSize(absolute)) === undefined) throw AppError.notFound(appMsg('app.m033'))
     await syncFileFromDisk(conversationId, handle.rootPath, relative, { actor: 'SYSTEM' })
     row = await findLiveRow(conversationId, relative)
-    if (row === null) throw AppError.notFound('文件不存在')
+    if (row === null) throw AppError.notFound(appMsg('app.m033'))
   }
 
   const body = await readWorkspaceBytes(absolute)
@@ -271,7 +271,7 @@ export async function openWorkspaceFileSource(conversationId: string, rawPath: u
  */
 export async function assertWorkspaceOwner(conversationId: string, userId: string): Promise<void> {
   const owned = await getPrisma().conversation.findFirst({ where: { id: conversationId, userId }, select: { id: true } })
-  if (owned === null) throw AppError.notFound('会话不存在')
+  if (owned === null) throw AppError.notFound(appMsg('app.m001'))
 }
 
 /**
@@ -470,7 +470,7 @@ async function resolveRevertWindow(
   }
   const marker = await readWorkspaceRoundWindow(conversationId)
   if (marker.start === undefined) {
-    throw AppError.validation('没有可撤销的轮次（未记录本轮起点；可显式传 since）')
+    throw AppError.validation(appMsg('app.m237'))
   }
   return { since: marker.start, ...(marker.end === undefined ? {} : { until: marker.end }) }
 }
@@ -630,7 +630,7 @@ async function writeWorkspaceFileBytes(
   // `overwrite`（上传）不做 CAS：目标已存在就直接覆盖（文件管理器"上传"的常见语义）；
   // 文本保存（默认）仍严格 CAS，冲突即 409。
   if (options.overwrite !== true && baseVersion !== currentVersion) {
-    throw AppError.conflict('文件已被修改，请重新读取后再写', {
+    throw AppError.conflict(appMsg('app.m238'), {
       path: relative,
       currentVersion,
       expectedVersion: baseVersion,
@@ -812,7 +812,7 @@ export async function deleteWorkspaceDirectory(
 
   // 目标若是个文件 ⇒ 走错端点了（前端只对"目录行"提供本操作，见 `WorkspacePanel`）
   if ((await workspaceFileSize(absolute)) !== undefined) {
-    throw AppError.validation('该路径是一个文件，请使用「删除文件」')
+    throw AppError.validation(appMsg('app.m239'))
   }
 
   const prefix = workspaceDirPrefix(relative)
@@ -872,16 +872,16 @@ export async function moveWorkspaceFile(
   const from = resolveWorkspacePath(handle.rootPath, rawFrom)
   const to = resolveWorkspacePath(handle.rootPath, rawTo)
   if (from.relative === to.relative) {
-    throw AppError.validation('源路径与目标路径相同')
+    throw AppError.validation(appMsg('app.m240'))
   }
   // P1-17b：依赖目录是环境不是内容 ⇒ 不许移动进依赖目录（同写闸门一条判据）
   assertNotDependencyPath(to.relative)
 
   const sourceRow = await findLiveRow(conversationId, from.relative)
-  if (sourceRow === null) throw AppError.notFound('源文件不存在')
+  if (sourceRow === null) throw AppError.notFound(appMsg('app.m241'))
   const targetRow = await findRow(conversationId, to.relative)
   if (targetRow !== null && targetRow.deletedAt === null) {
-    throw AppError.conflict('目标路径已存在文件', { path: to.relative })
+    throw AppError.conflict(appMsg('app.m242'), { path: to.relative })
   }
 
   await fsMove(from.absolute, to.absolute)
@@ -1101,9 +1101,7 @@ async function findLiveRow(conversationId: string, path: string): Promise<FileRo
  */
 function assertNotDependencyPath(relative: string): void {
   if (!isWorkspaceDependencyPath(relative)) return
-  throw AppError.validation(
-    `依赖目录不接受写入（${relative}）：依赖由运行期安装（npm/pip 等）产生，不属于工作区内容。` +
-      '如果确实要改依赖，请改依赖清单后重装。',
+  throw AppError.validation(appMsg('app.m273', { p0: relative }),
   )
 }
 

@@ -26,7 +26,7 @@ import { Alert, App as AntdApp, AutoComplete, Button, Input, InputNumber, Modal,
 import {
   DEFAULT_UPSTREAM_PROTOCOL,
   MODEL_TYPES,
-  MODEL_TYPE_LABELS,
+  MODEL_TYPE_KEY,
   type ModelItem,
   type ModelProviderItem,
   type ModelType,
@@ -43,12 +43,13 @@ import {
   useUpdateModel,
 } from '../../api/modelPool.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
   EMPTY_MODEL_FORM_VALUES,
   MAX_CONTEXT_MAX,
   MAX_CONTEXT_MIN,
-  MODEL_TYPE_HINT,
-  MODEL_TYPE_LOCKED_REASON,
+  MODEL_TYPE_HINT_KEY,
+  MODEL_TYPE_LOCKED_REASON_KEY,
   buildCreateModelBody,
   buildModelUpdateBody,
   knowledgeBasesUsingModel,
@@ -70,10 +71,9 @@ export interface ModelFormModalProps {
   onClose: () => void
 }
 
-const TYPE_OPTIONS = MODEL_TYPES.map((type) => ({ value: type, label: MODEL_TYPE_LABELS[type] }))
-
 export function ModelFormModal({ model, open, providers, defaultProviderId, onClose }: ModelFormModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const { modal } = AntdApp.useApp()
   const create = useCreateModel()
   const update = useUpdateModel()
@@ -106,9 +106,10 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
    * 后端 409）—— 那与"跟随 Provider"是两件不同的事。
    */
   const typeLocked = editing && modelTypeChangeBlocked(model)
-  const typeLockedReason = editing ? MODEL_TYPE_LOCKED_REASON : MODEL_TYPE_HINT
+  const typeLockedReason = editing ? t(MODEL_TYPE_LOCKED_REASON_KEY) : t(MODEL_TYPE_HINT_KEY)
   /** 向量模型：界面只显示"维度"，隐藏上下文/图片/思考等对话侧字段 */
   const isEmbedding = type === 'EMBEDDING'
+  const typeOptions = MODEL_TYPES.map((option) => ({ value: option, label: t(MODEL_TYPE_KEY[option]) }))
 
   // 拉取上游模型：型号名下拉的来源（获取失败/为空时 AutoComplete 仍可手动输入，见下方渲染）。
   // ⚠️ 只在**新建**态、且已选 Provider 时探一次；编辑态不自动打上游（避免打开编辑弹窗就发探测请求）。
@@ -129,9 +130,12 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
     () =>
       remoteRows.map((row) => ({
         value: row.id,
-        label: row.contextLength === null ? row.id : `${row.id} · 上下文 ${row.contextLength.toLocaleString('en-US')}`,
+        label:
+          row.contextLength === null
+            ? row.id
+            : t('models.remoteOptionContext', { id: row.id, context: row.contextLength.toLocaleString('en-US') }),
       })),
-    [remoteRows],
+    [remoteRows, t],
   )
   const filteredOptions = useMemo(() => {
     const keyword = modelName.trim().toLowerCase()
@@ -174,7 +178,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
   }, [open, model, defaultProviderId])
 
   const submitting = create.isPending || update.isPending
-  const contextError = validateMaxContext(maxContext)
+  const contextError = validateMaxContext(maxContext, locale)
   /**
    * 想建/改成向量模型，但所属 Provider 用的不是 OpenAI 兼容协议 ⇒ 这次必然被后端 400
    * （embedding 只有 `/embeddings` 一条路，判据 = `shared#embeddingModelAllowedOnProtocol`）。
@@ -201,7 +205,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       {
         onSuccess: (result) => {
           setEmbeddingDim(result.dim)
-          feedback.ok(`探测成功：维度 ${result.dim}。请求 ${result.url}`)
+          feedback.ok(t('models.probeOk', { dim: result.dim, url: result.url }))
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -215,8 +219,8 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
       { providerId, modelName: modelName.trim() },
       {
         onSuccess: (result) => {
-          const reply = result.reply.trim() === '' ? '（空回复）' : result.reply.trim()
-          feedback.ok(`连通成功（${result.durationMs} ms）：${reply}`)
+          const reply = result.reply.trim() === '' ? t('models.probeEmptyReply') : result.reply.trim()
+          feedback.ok(t('models.connectOk', { ms: result.durationMs, reply }))
         },
         onError: (error) => setErrorText(describeError(error).message),
       },
@@ -235,7 +239,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
     if (model === null) {
       create.mutate(buildCreateModelBody(values), {
         onSuccess: (created) => {
-          feedback.ok(`已创建模型「${created.label}」（${created.modelName}）`)
+          feedback.ok(t('models.created', { label: created.label, name: created.modelName }))
           onClose()
         },
         onError: (error) => setErrorText(describeError(error).message),
@@ -245,7 +249,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
     const body = buildModelUpdateBody(model, values)
     if (body === null) {
-      feedback.note('没有需要保存的改动')
+      feedback.note(t('models.formNoChanges'))
       onClose()
       return
     }
@@ -255,7 +259,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         { id: model.id, body },
         {
           onSuccess: (saved) => {
-            feedback.ok(`已保存「${saved.label}」`)
+            feedback.ok(t('models.saved', { label: saved.label }))
             onClose()
           },
           onError: (error) => setErrorText(describeError(error).message),
@@ -267,11 +271,13 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
     if (modelEditAffectsVectors(model, values) && model.knowledgeBaseCount > 0) {
       const affected = knowledgeBasesUsingModel(model.id, knowledgeBases.data?.items ?? [])
       modal.confirm({
-        title: '保存后这些知识库需要重建索引',
+        title: t('models.kbRebuildTitle'),
         content: (
           <div>
             <p>
-              模型「{model.label}」正被 <strong>{model.knowledgeBaseCount}</strong> 个知识库用作向量模型：
+              {t('models.kbRebuildPrefix', { label: model.label })}
+              <strong>{model.knowledgeBaseCount}</strong>
+              {t('models.kbRebuildMid')}
             </p>
             {affected.length > 0 && (
               <ul style={{ margin: 'var(--sp-2) 0 var(--sp-3)', paddingLeft: 'var(--sp-5)' }}>
@@ -281,13 +287,14 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
               </ul>
             )}
             <p>
-              改动型号 / 维度 / 多模态或停用后，这些库已有的向量会作废、<strong>向量检索会停用</strong>；
-              需到各库「编辑」里保存以重建索引（全文检索不受影响）。
+              {t('models.kbRebuildNotePrefix')}
+              <strong>{t('models.kbRebuildNoteStrong')}</strong>
+              {t('models.kbRebuildNoteTail')}
             </p>
           </div>
         ),
-        okText: '继续保存',
-        cancelText: '取消',
+        okText: t('models.continueSave'),
+        cancelText: t('common.cancel'),
         onOk: doSave,
       })
       return
@@ -297,16 +304,16 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
 
   const providerOptions = providers.map((provider) => ({
     value: provider.id,
-    label: `${provider.name}${provider.enabled ? '' : '（已停用）'}`,
+    label: `${provider.name}${provider.enabled ? '' : t('models.providerDisabledSuffix')}`,
   }))
 
   return (
     <Modal
       open={open}
-      title={editing ? `编辑模型「${model.label}」` : '新建模型'}
-      okText={editing ? '保存' : '创建'}
+      title={editing ? t('models.formTitleEdit', { label: model.label }) : t('models.formTitleCreate')}
+      okText={t('common.save')}
       okButtonProps={{ disabled: !canSubmit, loading: submitting }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={submit}
       onCancel={onClose}
       maskClosable={!submitting}
@@ -317,8 +324,8 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
           <Alert
             type="warning"
             showIcon
-            message="还没有 Provider"
-            description="模型必须挂在某个 Provider 下（它提供 baseUrl 与 API Key）。请先在上面的表里新建一个 Provider。"
+            message={t('models.noProviderTitle')}
+            description={t('models.noProviderFormDesc')}
           />
         )}
 
@@ -328,17 +335,16 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
             <>
               <p>{model.providerName}</p>
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                模型不能迁移到别的 Provider（后端会 409）：迁移会静默改变已绑定智能体走的是哪个上游。
-                要换，请新建一条模型再去智能体编辑页改绑。
+                {t('models.providerImmutableNote')}
               </p>
             </>
           ) : (
             <Select
               value={providerId === '' ? undefined : providerId}
               options={providerOptions}
-              placeholder="选择 Provider"
+              placeholder={t('models.providerPlaceholder')}
               style={{ width: '100%' }}
-              aria-label="所属 Provider"
+              aria-label={t('models.providerAria')}
               onChange={(next) => {
                 setProviderId(next)
                 // 2026-10-22：类型初值固定 CHAT（Provider 已无类型列），不随 Provider 变化
@@ -348,14 +354,14 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         </div>
 
         <div>
-          <p className="block-label">型号名</p>
+          <p className="block-label">{t('models.modelName')}</p>
           <AutoComplete
             value={modelName}
             options={filteredOptions}
             filterOption={false}
             style={{ width: '100%' }}
-            aria-label="型号名"
-            placeholder="上游的 model id，例如 gpt-4o-mini（可下拉选择或手动输入）"
+            aria-label={t('models.modelNameAria')}
+            placeholder={t('models.modelNamePlaceholder')}
             onChange={(value) => setModelName(value)}
             onSelect={(value: string) => {
               setModelName(value)
@@ -377,27 +383,28 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
           {!editing && providerId !== '' && (
             <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
               {probe.isPending
-                ? '正在向上游拉取可选型号…（内网地址可能较慢）'
+                ? t('models.remoteLoading')
                 : probe.isError
-                  ? '拉取上游型号失败，可直接手动输入型号名（不影响创建）。'
+                  ? t('models.remoteFailed')
                   : remoteOptions.length > 0
-                    ? `下拉列出上游 ${remoteOptions.length} 个型号，选中会自动带入上下文长度（若上游提供）；也可手动输入。`
-                    : '上游没有返回可选型号，请手动输入型号名。'}
+                    ? t('models.remoteListed', { count: remoteOptions.length })
+                    : t('models.remoteEmpty')}
             </p>
           )}
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            会<strong>原样</strong>放进调用上游的请求里，所以不能含空格（含空格只会在第一次发消息时
-            变成 404，很难排查）。
+            {t('models.modelNameNotePrefix')}
+            <strong>{t('models.modelNameNoteStrong')}</strong>
+            {t('models.modelNameNoteTail')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">别名</p>
+          <p className="block-label">{t('models.label')}</p>
           <Input
             value={label}
             maxLength={128}
-            aria-label="别名"
-            placeholder="给业务同学看的名字，可以是中文"
+            aria-label={t('models.labelAria')}
+            placeholder={t('models.labelPlaceholder')}
             onChange={(event) => setLabel(event.target.value)}
             onPressEnter={() => {
               if (canSubmit) submit()
@@ -406,13 +413,13 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         </div>
 
         <div>
-          <p className="block-label">类型</p>
+          <p className="block-label">{t('models.typeLabel')}</p>
           <Select<ModelType>
             value={type}
-            options={TYPE_OPTIONS}
+            options={typeOptions}
             disabled={typeLocked}
             style={{ width: '100%' }}
-            aria-label="模型类型"
+            aria-label={t('models.typeAria')}
             onChange={setType}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
@@ -423,7 +430,7 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
               type="warning"
               showIcon
               style={{ marginTop: 'var(--sp-2)' }}
-              message={`所属 Provider 用的不是 ${DEFAULT_UPSTREAM_PROTOCOL} 协议，不能建向量模型（embedding 只有 /embeddings 一条路）。请先到模型池把该 Provider 的协议改成 OpenAI 兼容，或改选「对话」类型。`}
+              message={t('models.embeddingConflict', { protocol: DEFAULT_UPSTREAM_PROTOCOL })}
             />
           )}
         </div>
@@ -431,92 +438,118 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         {isEmbedding ? (
           <>
             <div>
-              <p className="block-label">向量维度</p>
+              <p className="block-label">{t('models.embeddingDim')}</p>
               <div className="row" style={{ gap: 'var(--sp-2)', alignItems: 'flex-start' }}>
                 <InputNumber
                   value={embeddingDim}
                   min={1}
                   max={1_000_000}
                   style={{ flex: 1 }}
-                  aria-label="向量维度"
-                  placeholder="留空则在保存时尽力向上游探测"
+                  aria-label={t('models.embeddingDimAria')}
+                  placeholder={t('models.embeddingDimPlaceholder')}
                   onChange={(value) => setEmbeddingDim(value === null ? null : Number(value))}
                 />
                 <Button onClick={runProbe} loading={probeEmbedding.isPending} disabled={!canProbe}>
-                  探测
+                  {t('models.probe')}
                 </Button>
               </div>
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                点「探测」会<strong>当场</strong>向该模型发一次极小 embedding（不保存）：成功即回填维度；失败会把上游原文
-                显示在下方。留空直接保存时后端也会尽力探测一次，探测不到<strong>不影响保存</strong>，
-                但请在此<strong>手动填写维度</strong> —— 否则建知识库时会提示补填。
+                {t('models.probeNotePrefix')}
+                <strong>{t('models.probeNoteStrong1')}</strong>
+                {t('models.probeNoteMid')}
+                <strong>{t('models.probeNoteStrong2')}</strong>
+                {t('models.probeNoteMid2')}
+                <strong>{t('models.probeNoteStrong3')}</strong>
+                {t('models.probeNoteTail')}
               </p>
             </div>
 
             <div>
               <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>多模态 embedding 端点</span>
+                <span>{t('models.multimodal')}</span>
                 <Switch
                   checked={embeddingMultimodal}
-                  aria-label="多模态 embedding 端点"
+                  aria-label={t('models.multimodalAria')}
                   onChange={setEmbeddingMultimodal}
                 />
               </div>
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                某些向量模型（如火山 <code>doubao-embedding-vision</code>）只提供
-                <code>POST /embeddings/multimodal</code>，且 <code>input</code> 是 content 数组。开启后本平台按
-                <code>{'[{type:"text",text}]'}</code> 形状请求该端点（本平台的知识库是纯文本，只发文本分片）。
-                标准 OpenAI 兼容端点<strong>不要</strong>开。
+                {t('models.multimodalNotePrefix')}
+                <code>doubao-embedding-vision</code>
+                {t('models.multimodalNoteMid1')}
+                <code>POST /embeddings/multimodal</code>
+                {t('models.multimodalNoteMid2')}
+                <code>input</code>
+                {t('models.multimodalNoteMid3')}
+                <code>{'[{type:"text",text}]'}</code>
+                {t('models.multimodalNoteMid4')}
+                <strong>{t('models.multimodalNoteStrong')}</strong>
+                {t('models.multimodalNoteTail')}
               </p>
             </div>
           </>
         ) : (
           <>
             <div>
-              <p className="block-label">上下文长度（token）</p>
+              <p className="block-label">{t('models.maxContextLabel')}</p>
               <InputNumber
                 value={maxContext}
                 min={MAX_CONTEXT_MIN}
                 max={MAX_CONTEXT_MAX}
                 style={{ width: '100%' }}
-                aria-label="上下文长度"
-                placeholder="留空表示未知"
+                aria-label={t('models.maxContextAria')}
+                placeholder={t('models.maxContextPlaceholder')}
                 onChange={(value) => setMaxContext(value === null ? null : Number(value))}
               />
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                只是给选模型的人看的读数（不参与任何计算）。留空会显示成「未知」——比填一个猜的数字好。
+                {t('models.maxContextNote')}
               </p>
             </div>
 
             <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>支持图片输入</span>
-              <Switch checked={supportsVision} aria-label="支持图片输入" onChange={setSupportsVision} />
+              <span>{t('models.supportsVision')}</span>
+              <Switch checked={supportsVision} aria-label={t('models.supportsVisionAria')} onChange={setSupportsVision} />
             </div>
 
             <div>
               <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>支持深度思考</span>
-                <Switch checked={supportsReasoning} aria-label="支持深度思考" onChange={setSupportsReasoning} />
+                <span>{t('models.supportsReasoning')}</span>
+                <Switch
+                  checked={supportsReasoning}
+                  aria-label={t('models.supportsReasoningAria')}
+                  onChange={setSupportsReasoning}
+                />
               </div>
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                开启后对话会向上游请求"深度思考"（reasoning / thinking）：OpenAI 兼容走
-                <code>reasoning_effort</code>、Responses 走 <code>reasoning</code>、Anthropic 走
-                <code>thinking</code>。只对<strong>真正支持思考的模型</strong>勾选 —— 上游若不认这个参数会报错，
-                那时关掉它即可。
+                {t('models.reasoningNotePrefix')}
+                <code>reasoning_effort</code>
+                {t('models.reasoningNoteMid1')}
+                <code>reasoning</code>
+                {t('models.reasoningNoteMid2')}
+                <code>thinking</code>
+                {t('models.reasoningNoteMid3')}
+                <strong>{t('models.reasoningNoteStrong')}</strong>
+                {t('models.reasoningNoteTail')}
               </p>
             </div>
 
             <div>
               <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>连通测试</span>
+                <span>{t('models.connectTest')}</span>
                 <Button onClick={runChatProbe} loading={probeChat.isPending} disabled={!canProbe}>
-                  测试
+                  {t('models.test')}
                 </Button>
               </div>
               <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-                点「测试」会<strong>当场</strong>向该模型发一次极小对话请求（<code>max_tokens:1</code>，不保存），
-                验证 <code>baseUrl</code> / Key / 协议 / 型号名这一整条链路 —— 成功提示上游回的短文本与耗时；
-                失败会把上游原文显示在下方。与真实对话走<strong>同一条</strong>调用路径，因此"探测通、一发消息就错"不会发生。
+                {t('models.testNotePrefix')}
+                <strong>{t('models.testNoteStrong1')}</strong>
+                {t('models.testNoteMid1')}
+                <code>max_tokens:1</code>
+                {t('models.testNoteMid2')}
+                <code>baseUrl</code>
+                {t('models.testNoteMid3')}
+                <strong>{t('models.testNoteStrong2')}</strong>
+                {t('models.testNoteTail')}
               </p>
             </div>
           </>
@@ -525,19 +558,24 @@ export function ModelFormModal({ model, open, providers, defaultProviderId, onCl
         <div>
           <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
             <p className="block-label" style={{ marginBottom: 0 }}>
-              启用
+              {t('models.enableLabel')}
             </p>
-            <Switch checked={enabled} aria-label="启用该模型" onChange={setEnabled} />
+            <Switch checked={enabled} aria-label={t('models.enableAria')} onChange={setEnabled} />
           </div>
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            停用后它不会出现在「可用模型」下拉里；已绑定它的智能体发消息会失败。
+            {t('models.enableNote')}
           </p>
         </div>
 
         {contextError !== null && <Alert type="warning" showIcon message={contextError} />}
 
         {errorText !== null && (
-          <Alert type="error" showIcon message={editing ? '保存失败' : '创建失败'} description={errorText} />
+          <Alert
+            type="error"
+            showIcon
+            message={editing ? t('models.saveFailed') : t('models.createFailed')}
+            description={errorText}
+          />
         )}
       </div>
     </Modal>

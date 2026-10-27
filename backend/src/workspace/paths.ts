@@ -20,7 +20,7 @@
 import { existsSync, realpathSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
 
-import { AppError, normalizeWorkspacePath } from '@doubulea/shared'
+import { appMsg, AppError, normalizeWorkspacePath } from '@doubulea/shared'
 
 /**
  * watcher 事件去抖窗口（毫秒，**代码常量**，不进 env —— 同 `子方案` §十一 的取舍）。
@@ -53,7 +53,7 @@ export interface ResolvedWorkspacePath {
 export function resolveWorkspacePath(rootDir: string, rawPath: unknown): ResolvedWorkspacePath {
   const relative = normalizeWorkspacePath(rawPath)
   if (relative === null) {
-    throw AppError.validation('不是合法的工作区相对路径（不许绝对路径 / `..` / 空）')
+    throw AppError.validation(appMsg('app.m234'))
   }
   const absolute = join(rootDir, relative)
   assertRealPathInside(rootDir, absolute)
@@ -74,7 +74,7 @@ export function assertRealPathInside(rootDir: string, absolute: string): void {
   if (probeReal === rootReal) return
   const prefix = rootReal.endsWith(sep) ? rootReal : `${rootReal}${sep}`
   if (probeReal.startsWith(prefix)) return
-  throw AppError.forbidden('路径越出了工作区范围（检测到符号链接逃逸）')
+  throw AppError.forbidden(appMsg('app.m235'))
 }
 
 /** `realpath`（native，返回系统路径形态）；根不存在/无权限时返回 `undefined` */

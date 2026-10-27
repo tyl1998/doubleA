@@ -52,6 +52,9 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
+import type { MessageKey } from './i18n/index.js'
 import { type UserRole } from './auth.js'
 
 // ───────────────────────────── 取值域 ─────────────────────────────
@@ -70,6 +73,16 @@ export const ASSET_VISIBILITY_LABELS: Readonly<Record<AssetVisibility, string>> 
   PRIVATE: '私有',
   SHARED: '指定用户',
   PUBLIC: '公开',
+}
+
+/**
+ * 可见性 → i18n key（P1-23：前端据此取译文；**中文那份 {@link ASSET_VISIBILITY_LABELS} 保留**
+ * 给后端与其它中文消费方用，见 `子方案/界面语言切换.md` §3.5）。
+ */
+export const ASSET_VISIBILITY_KEY: Readonly<Record<AssetVisibility, MessageKey>> = {
+  PRIVATE: 'label.visibility.PRIVATE',
+  SHARED: 'label.visibility.SHARED',
+  PUBLIC: 'label.visibility.PUBLIC',
 }
 
 /** 受众主体类型（与 `schema.prisma` 的 `enum AudienceSubjectType` 逐字一致） */
@@ -250,8 +263,8 @@ export type AgentAudience = z.infer<typeof agentAudienceSchema>
  *   create/update schema 用 `superRefine` 拦（见 `agent.ts`），不在这里判（这里看不到 `visibility`）。
  */
 export const agentAudienceInputSchema = z.object({
-  userIds: z.array(z.string().uuid('受众用户 ID 不是合法 UUID')).optional(),
-  groupIds: z.array(z.string().uuid('受众组 ID 不是合法 UUID')).optional(),
+  userIds: z.array(z.string().uuid(validationMessage('validation.assetAcl.audienceUserIdNotUuid'))).optional(),
+  groupIds: z.array(z.string().uuid(validationMessage('validation.assetAcl.audienceGroupIdNotUuid'))).optional(),
 })
 export type AgentAudienceInput = z.infer<typeof agentAudienceInputSchema>
 
@@ -280,8 +293,8 @@ export function audienceIsEmpty(audience: { userIds: readonly string[]; groupIds
  */
 export const transferAssetBodySchema = z.object({
   toUserId: z
-    .string({ required_error: '请选择接收人' })
-    .uuid('接收人 ID 不是合法 UUID'),
+    .string({ required_error: validationMessage('validation.assetAcl.recipientRequired') })
+    .uuid(validationMessage('validation.assetAcl.recipientIdNotUuid')),
 })
 export type TransferAssetBody = z.infer<typeof transferAssetBodySchema>
 

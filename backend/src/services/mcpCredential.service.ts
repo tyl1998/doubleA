@@ -54,7 +54,7 @@
  *    纵深防御：`infra/logger.ts` 的 `LOG_REDACT_PATHS` 已含 `values` / `*.values`。
  */
 
-import {
+import { appMsg,
   AppError,
   credentialValueKeys,
   isCredentialConfigured,
@@ -317,7 +317,7 @@ export async function putMyCredential(
 ): Promise<McpCredentialItem> {
   const db = getPrisma()
   const server = await db.mcpServer.findUnique({ where: { id: serverId }, select: CREDENTIAL_SERVER_SELECT })
-  if (server === null) throw AppError.notFound('MCP server 不存在')
+  if (server === null) throw AppError.notFound(appMsg('app.m004'))
 
   const schema: CredentialSchemaEntry[] = normalizeCredentialSchema(server.credentialSchema)
   const templateKeys = new Set(schema.map((entry) => entry.key))
@@ -325,9 +325,7 @@ export async function putMyCredential(
   // ⚠️ 只报**键名**（绝不含值）：这条错误会进日志与响应体，是"借错误消息漏凭据"的经典入口
   const unknownKeys = Object.keys(input.values).filter((key) => !templateKeys.has(key))
   if (unknownKeys.length > 0) {
-    throw AppError.validation(
-      `这些凭据参数不在该 MCP server 的模板里：${unknownKeys.join('、')}` +
-        '（模板由注册者维护；存下不会被注入的值只会造成"我明明填了"的错觉）',
+    throw AppError.validation(appMsg('app.m267', { p0: unknownKeys.join('、') }),
     )
   }
 
@@ -406,10 +404,10 @@ export async function removeMyCredential(
     where: { id: serverId },
     select: { id: true, name: true },
   })
-  if (server === null) throw AppError.notFound('MCP server 不存在')
+  if (server === null) throw AppError.notFound(appMsg('app.m004'))
 
   const deleted = await db.mcpCredential.deleteMany({ where: { serverId, userId: viewer.userId } })
-  if (deleted.count === 0) throw AppError.notFound('你还没有为这个 MCP server 配置凭据')
+  if (deleted.count === 0) throw AppError.notFound(appMsg('app.m177'))
 
   getLogger().info({ mcpServerId: serverId, userId: viewer.userId }, '已删除我的 MCP 凭据')
   return { serverId: server.id, serverName: server.name }

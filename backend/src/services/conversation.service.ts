@@ -84,7 +84,7 @@
  *   症状是"确认点了没反应"，且**两处各自看都是对的**。
  */
 
-import {
+import { appMsg,
   AppError,
   canViewAsset,
   EMPTY_ACTIVE_SNAPSHOT,
@@ -214,7 +214,7 @@ export async function listConversationsForAgent(
   // 不带 `deletedAt` 过滤（见 ①）；用 findUnique 而不是 findFirst 是刻意的：
   // 这里**没有**第二个过滤条件，写 findFirst 会让人以为"还有个条件被省略了"。
   const agent = await db.agent.findUnique({ where: { id: agentId }, select: { id: true } })
-  if (agent === null) throw AppError.notFound('智能体不存在')
+  if (agent === null) throw AppError.notFound(appMsg('app.m000'))
 
   const where = { agentId, userId: viewer.id } as const
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照（与 `listAgents` 同款）
@@ -303,7 +303,7 @@ export async function createConversation(
     where: { id: input.agentId, deletedAt: null },
     select: { id: true, createdBy: true, visibility: true },
   })
-  if (agent === null) throw AppError.notFound('智能体不存在')
+  if (agent === null) throw AppError.notFound(appMsg('app.m000'))
   // P1-13：私有智能体对他人 **404**（不泄漏存在性）—— 与列表/详情同判据。
   // 路由层一般会带 `role`；不带（后台路径）时现查一次。
   const viewerRole =
@@ -316,7 +316,7 @@ export async function createConversation(
       { id: viewer.id, role: viewerRole },
     )
   ) {
-    throw AppError.notFound('智能体不存在')
+    throw AppError.notFound(appMsg('app.m000'))
   }
 
   const created = await db.conversation.create({
@@ -356,7 +356,7 @@ async function findMyConversation(
     where: { id, userId: viewer.id },
     select: { ...CONVERSATION_SELECT, _count: { select: { messages: true } } },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
   const { _count, ...rest } = row
   return { ...(rest as ConversationRow), messageCount: _count.messages }
 }
@@ -679,7 +679,7 @@ export async function setConversationCodeMode(
     where: { id, userId: viewer.id },
     data: { codeMode: enabled },
   })
-  if (updated.count === 0) throw AppError.notFound('会话不存在')
+  if (updated.count === 0) throw AppError.notFound(appMsg('app.m001'))
   return enabled
 }
 
@@ -699,7 +699,7 @@ export async function setConversationRuntime(
     where: { id, userId: viewer.id },
     data: { runtime },
   })
-  if (updated.count === 0) throw AppError.notFound('会话不存在')
+  if (updated.count === 0) throw AppError.notFound(appMsg('app.m001'))
   return runtime
 }
 
@@ -826,7 +826,7 @@ export async function listMessages(
       where: { id: query.beforeId, conversationId: target.id },
       select: { id: true, createdAt: true },
     })
-    if (before === null) throw AppError.validation('beforeId 不是该会话的消息（游标无效）')
+    if (before === null) throw AppError.validation(appMsg('app.m135'))
   }
 
   /**
@@ -913,7 +913,7 @@ export async function assertConversationOwner(
     where: { id: conversationId, userId: viewer.id },
     select: { id: true },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
 }
 
 /**
@@ -929,7 +929,7 @@ export async function getConversationRuntimeForViewer(
     where: { id: conversationId, userId: viewer.id },
     select: { id: true, runtime: true, codeMode: true },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
   return { id: row.id, runtime: row.runtime, codeMode: row.codeMode }
 }
 
@@ -976,10 +976,10 @@ export async function assertConversationSendable(
     where: { id, userId: viewer.id },
     select: { id: true, agentId: true, status: true, agent: { select: { modelId: true, type: true } } },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
 
   if (isConversationReadOnly(row.status)) {
-    throw AppError.conflict('该会话已结束，不能再发送消息')
+    throw AppError.conflict(appMsg('app.m021'))
   }
 
   // ③′ 解析"这一轮到底用哪个模型"：默认走 agent.model_id；请求指定了别的就必须是池成员。
@@ -990,7 +990,7 @@ export async function assertConversationSendable(
       select: { modelId: true },
     })
     if (member === null) {
-      throw AppError.conflict('所选模型不在该智能体的模型池中，请重新选择模型')
+      throw AppError.conflict(appMsg('app.m136'))
     }
     chosenModelId = requestedModelId
   }
@@ -1015,7 +1015,7 @@ export async function assertConversationSendable(
   if (attachments.length > 0) {
     const hasImage = attachments.some((item) => item.kind === 'IMAGE')
     if (hasImage && !target.supportsVision) {
-      throw AppError.conflict('所选模型不支持图片输入，请换一个支持图片的模型，或去掉图片附件后重发')
+      throw AppError.conflict(appMsg('app.m137'))
     }
   }
 
@@ -1076,12 +1076,12 @@ export async function assertConversationRegenerable(
     select: { content: true },
   })
   if (lastUser === null) {
-    throw AppError.conflict('这个会话还没有可以重新生成的消息，请先发送一条')
+    throw AppError.conflict(appMsg('app.m138'))
   }
 
   const content = textOfMessageContent(lastUser.content)
   if (content === '') {
-    throw AppError.conflict('最后一条用户消息没有正文，无法重新生成')
+    throw AppError.conflict(appMsg('app.m139'))
   }
 
   return { ...sendable, content }

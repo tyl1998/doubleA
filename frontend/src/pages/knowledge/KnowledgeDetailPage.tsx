@@ -33,11 +33,7 @@
  */
 
 import { Alert, Button, Tag, Tooltip } from 'antd'
-import {
-  KNOWLEDGE_BASE_NEEDS_REBUILD_HINT,
-  REBUILD_SEARCHABLE_HINT,
-  type DocumentItem,
-} from '@doubulea/shared'
+import type { DocumentItem } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
@@ -50,6 +46,7 @@ import {
 } from '../../api/knowledgeBases.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { KNOWLEDGE_PATH } from '../../app/paths.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { ChunkPreviewDrawer } from './ChunkPreviewDrawer.js'
@@ -70,6 +67,7 @@ import {
 export function KnowledgeDetailPage() {
   const { id = '' } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { t, locale } = useT()
 
   const feedback = useFeedback()
   const kbQuery = useKnowledgeBase(id)
@@ -89,7 +87,7 @@ export function KnowledgeDetailPage() {
   const documents = documentsQuery.data?.items ?? []
   const documentTotal = documentsQuery.data?.total ?? 0
   const summary = summarizeDocuments(documents)
-  const notice = kb === undefined ? null : embeddingChangedNotice(kb.embeddingModelChanged)
+  const notice = kb === undefined ? null : embeddingChangedNotice(kb.embeddingModelChanged, locale)
   /**
    * 该库必须先**整库重建**（模型被删/停用/改名，或维度变了）。
    *
@@ -103,19 +101,17 @@ export function KnowledgeDetailPage() {
     rebuild.mutate(undefined, {
       onSuccess: (result) => {
         if (result.failed > 0) {
-          feedback.note(
-            `已提交 ${result.enqueued} 篇重建，另有 ${result.failed} 篇入队失败，请稍后在文档列表逐篇重试`,
-          )
+          feedback.note(t('kbDetail.rebuildSubmittedToast', { enqueued: result.enqueued, failed: result.failed }))
         } else {
-          feedback.ok(`已开始重建 ${result.enqueued} 篇文档，进度见下方文档列表`)
+          feedback.ok(t('kbDetail.rebuildStartedToast', { enqueued: result.enqueued }))
         }
       },
-      onError: (error) => feedback.fail(error, '整库重建未提交成功'),
+      onError: (error) => feedback.fail(error, t('kbDetail.rebuildFailedToast')),
     })
   }
 
   // 面包屑已挪到顶栏：把知识库名作为「细节段」上报（顶栏渲染 `工作台 / 知识库 / <name>`）
-  usePageCrumb(kb?.name ?? '详情')
+  usePageCrumb(kb?.name ?? t('kbDetail.crumbFallback'))
 
   // ── 三态：加载 / 失败（404 单独一档） / 正常 ──────────────────────────────
 
@@ -124,8 +120,8 @@ export function KnowledgeDetailPage() {
       <>
         <div className="page__head">
           <div>
-            <h1>知识库</h1>
-            <p className="page__lead">正在读取知识库…</p>
+            <h1>{t('kbDetail.title')}</h1>
+            <p className="page__lead">{t('kbDetail.loadingLead')}</p>
           </div>
         </div>
         <TableSkeleton />
@@ -139,18 +135,18 @@ export function KnowledgeDetailPage() {
       <>
         <div className="page__head">
           <div>
-            <h1>{notFound ? '知识库不存在' : '知识库加载失败'}</h1>
+            <h1>{notFound ? t('kbDetail.notFoundTitle') : t('kbDetail.loadFailedTitle')}</h1>
           </div>
         </div>
         {notFound ? (
           <div className="card">
             <EmptyState
-              title="这个知识库不存在或已被删除"
-              lead="地址里的 id 可能写错了，也可能是别的用户刚刚把它删掉了。知识库是共享资源，任何登录用户都能删除它。"
+              title={t('kbDetail.notFoundEmptyTitle')}
+              lead={t('kbDetail.notFoundLead')}
               action={
                 <div className="row" style={{ gap: 'var(--sp-3)' }}>
                   <Link to={KNOWLEDGE_PATH}>
-                    <Button type="primary">回到知识库列表</Button>
+                    <Button type="primary">{t('kbDetail.backToList')}</Button>
                   </Link>
                   <Button
                     onClick={() => {
@@ -158,7 +154,7 @@ export function KnowledgeDetailPage() {
                     }}
                     loading={kbQuery.isFetching}
                   >
-                    重试
+                    {t('common.retry')}
                   </Button>
                 </div>
               }
@@ -166,7 +162,7 @@ export function KnowledgeDetailPage() {
           </div>
         ) : (
           <ErrorState
-            title="知识库加载失败"
+            title={t('kbDetail.loadFailedTitle')}
             error={kbQuery.error}
             retrying={kbQuery.isFetching}
             onRetry={() => {
@@ -192,28 +188,31 @@ export function KnowledgeDetailPage() {
             {kb.name}{' '}
             {/* `embeddingModel` 是"库里已有向量由谁产出"的快照；模型在模型池被改名后它刻意不变，
                 要等重建完成才刷新。两者不同时显示 `旧 → 新`，避免"模型都改了、界面还显示旧名"。 */}
-            <span className="kicker" title="embedding 模型：向量来源（快照）→ 当前选定">
+            <span className="kicker" title={t('kbDetail.embeddingSnapshotTitle')}>
               {kb.embeddingModelChanged && kb.embeddingModelCurrent !== null
                 ? `${kb.embeddingModel} → ${kb.embeddingModelCurrent}`
                 : kb.embeddingModel}
             </span>
           </h1>
           <p className="page__lead">
-            {kb.description === null || kb.description === '' ? '（没有描述）' : kb.description}
+            {kb.description === null || kb.description === '' ? t('kbDetail.noDescription') : kb.description}
           </p>
           <p className="ratio">
-            文档 <span className="num">{kb.documentCount}</span> 篇 · 被{' '}
-            <span className="num">{kb.agentCount}</span> 个智能体引用 · {describeRetrieval(kb.retrievalConfig)}
+            {t('kbDetail.headStats', {
+              docs: kb.documentCount,
+              agents: kb.agentCount,
+              retrieval: describeRetrieval(kb.retrievalConfig, locale),
+            })}
           </p>
         </div>
         <div className="page__head-actions">
-          <Button onClick={() => setSearchOpen(true)}>检索测试</Button>
+          <Button onClick={() => setSearchOpen(true)}>{t('kbDetail.searchTest')}</Button>
           {/* 没有**常驻**的「重建索引」按钮：正常换模型在「编辑」弹窗里做、保存即自动重建；
               只有"需重建"异常态才在下面告警里给一个强制入口 */}
-          <Button onClick={() => setEditing(true)}>编辑</Button>
-          <Tooltip title={needsRebuild ? KNOWLEDGE_BASE_NEEDS_REBUILD_HINT : undefined}>
+          <Button onClick={() => setEditing(true)}>{t('common.edit')}</Button>
+<Tooltip title={needsRebuild ? t('hint.knowledgeBaseNeedsRebuild') : undefined}>
             <Button type="primary" disabled={needsRebuild} onClick={() => setUploadTarget('new')}>
-              上传文档
+              {t('kbDetail.upload')}
             </Button>
           </Tooltip>
         </div>
@@ -227,11 +226,14 @@ export function KnowledgeDetailPage() {
             <Alert
               type="warning"
               showIcon
-              message="该知识库需要重建索引"
-              description={`${KNOWLEDGE_BASE_NEEDS_REBUILD_HINT}。${REBUILD_SEARCHABLE_HINT}。`}
+              message={t('kbDetail.needsRebuildTitle')}
+              description={t('kbDetail.needsRebuildDesc', {
+                needsRebuild: t('hint.knowledgeBaseNeedsRebuild'),
+                searchable: t('hint.rebuildSearchable'),
+              })}
               action={
                 <Button size="small" loading={rebuild.isPending} onClick={handleRebuild}>
-                  重建整库索引
+                  {t('kbDetail.rebuildNow')}
                 </Button>
               }
             />
@@ -244,11 +246,10 @@ export function KnowledgeDetailPage() {
 
           <div className="card">
             <div className="card__head">
-              <p className="card__title">文档</p>
+              <p className="card__title">{t('kbDetail.docsCard')}</p>
               <div className="card__head-right">
                 <span className="ratio">
-                  解析中 <span className="num">{summary.parsing}</span> · 失败{' '}
-                  <span className="num">{summary.failed}</span>
+                  {t('kbDetail.docsStats', { parsing: summary.parsing, failed: summary.failed })}
                 </span>
               </div>
             </div>
@@ -258,7 +259,7 @@ export function KnowledgeDetailPage() {
             ) : documentsQuery.isError ? (
               <div style={{ padding: 'var(--sp-5)' }}>
                 <ErrorState
-                  title="文档列表加载失败"
+                  title={t('kbDetail.docsLoadFailed')}
                   error={documentsQuery.error}
                   retrying={documentsQuery.isFetching}
                   onRetry={() => {
@@ -268,11 +269,11 @@ export function KnowledgeDetailPage() {
               </div>
             ) : documents.length === 0 ? (
               <EmptyState
-                title="这个库里还没有文档"
-                lead="上传 md / pdf / docx / txt：上传后由后台流水线解析、分块并生成向量，完成后才能被检索到。"
+                title={t('kbDetail.docsEmptyTitle')}
+                lead={t('kbDetail.docsEmptyLead')}
                 action={
                   <Button type="primary" onClick={() => setUploadTarget('new')}>
-                    上传文档
+                    {t('kbDetail.upload')}
                   </Button>
                 }
               />
@@ -288,40 +289,36 @@ export function KnowledgeDetailPage() {
 
             {documents.length > 0 && (
               <p className="ratio" style={{ padding: '0 var(--sp-5) var(--sp-5)' }}>
-                共 <span className="num">{documentTotal}</span> 篇
+                {t('kbDetail.totalDocs', { total: documentTotal })}
                 {documentTotal > documents.length && (
                   <>
-                    ，本次取回前 <span className="num">{documents.length}</span> 篇（<code>limit</code> 上限 100）
+                    {t('kbDetail.totalMorePrefix', { shown: documents.length })}
+                    <code>limit</code>
+                    {t('kbDetail.totalMoreSuffix')}
                   </>
                 )}
-                {summary.parsing > 0 && (
-                  <>
-                    ；本页有 <span className="num">{summary.parsing}</span> 篇正在解析，状态每{' '}
-                    <span className="num">{DOCUMENT_POLL_INTERVAL_MS / 1000}</span> 秒自动刷新（全部解析完即停）
-                  </>
-                )}
+                {summary.parsing > 0 && t('kbDetail.polling', { parsing: summary.parsing, seconds: DOCUMENT_POLL_INTERVAL_MS / 1000 })}
               </p>
             )}
           </div>
 
           <div className="card">
             <div className="card__head">
-              <p className="card__title">检索配置</p>
+              <p className="card__title">{t('kbDetail.retrievalCard')}</p>
               <div className="card__head-right">
                 {/* ⚠️ 原型这里挂的是"不落库 · 每次请求传入"——**反了**（那句描述的是检索测试
                     抽屉的参数）。库级配置改了就是落库、对所有人的检索都生效。 */}
-                <Tag>落库 · 对这个库的所有检索生效</Tag>
+                <Tag>{t('kbDetail.retrievalPersisted')}</Tag>
                 <Button size="small" onClick={() => setEditingConfig(true)}>
-                  编辑配置
+                  {t('kbDetail.editConfig')}
                 </Button>
               </div>
             </div>
             <div className="card__body stack stack--tight">
-              <p className="num">{describeRetrieval(kb.retrievalConfig)}</p>
-              <p className="num">{describeChunking(kb)}</p>
+              <p className="num">{describeRetrieval(kb.retrievalConfig, locale)}</p>
+              <p className="num">{describeChunking(kb, locale)}</p>
               <p className="ratio">
-                分块与检索口径是这个库的属性；「检索测试」里的 mode / topK 只是那一次试查的覆盖，
-                不落库，也不影响这里。
+                {t('kbDetail.retrievalNote')}
               </p>
             </div>
           </div>
@@ -329,51 +326,50 @@ export function KnowledgeDetailPage() {
 
         <aside className="stack stack--tight aside-card">
           <div className="card bracket card--pad">
-            <p className="kicker">体量</p>
+            <p className="kicker">{t('kbDetail.volume')}</p>
             <div className="stack stack--tight" style={{ marginTop: 'var(--sp-4)' }}>
               <div className="summary-row">
-                <span className="summary-row__label">文档（权威）</span>
+                <span className="summary-row__label">{t('kbDetail.rowDocs')}</span>
                 <span className="num">{kb.documentCount}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-row__label">可检索（本页）</span>
+                <span className="summary-row__label">{t('kbDetail.rowReadable')}</span>
                 <span className="num">{summary.readable}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-row__label">解析中（本页）</span>
+                <span className="summary-row__label">{t('kbDetail.rowParsing')}</span>
                 <span className="num">{summary.parsing}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-row__label">失败（本页）</span>
+                <span className="summary-row__label">{t('kbDetail.rowFailed')}</span>
                 <span className="num">{summary.failed}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-row__label">引用它的智能体</span>
+                <span className="summary-row__label">{t('kbDetail.rowAgents')}</span>
                 <span className="num">{kb.agentCount}</span>
               </div>
             </div>
             {/* "片段总数"与"向量维度"两个数字在原型上有，本仓**取不到**（没有任何端点给它们），
                 所以这里不放 —— 编一个出来就是造假数据（`03` §七）。 */}
             <p className="ratio" style={{ marginTop: 'var(--sp-5)' }}>
-              只有"文档"是服务端 count 出来的权威值；三个"（本页）"是当前这一页的分布。
+              {t('kbDetail.volumeNote')}
             </p>
             {kb.agentCount > 0 && (
               <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-                被智能体引用时删除会返回 409：先去智能体编辑页解绑。
+                {t('kbDetail.agentBoundNote')}
               </p>
             )}
           </div>
 
           <div className="card card--flat card--pad">
-            <p className="kicker">解析失败怎么看</p>
+            <p className="kicker">{t('kbDetail.failureCard')}</p>
             <p className="ratio" style={{ marginTop: 'var(--sp-3)' }}>
-              扫描件、加密 PDF、纯图片文档都会落在「失败」，表格里直接给出原因与「重试」。
-              上传后有一段检索空窗（旧片段先删后建），期间显示「更新中，暂不参与检索」。
+              {t('kbDetail.failureNote')}
             </p>
           </div>
 
           <Button danger block onClick={() => setDeleting(true)}>
-            删除这个知识库
+            {t('kbDetail.deleteKb')}
           </Button>
         </aside>
       </div>

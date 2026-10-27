@@ -17,7 +17,7 @@
  * 建/改由本文件算。两处各算一遍，迟早出现"改完 cron 后要等到旧周期才生效"这种静默错位。
  */
 
-import {
+import { appMsg,
   AppError,
   nextCronRun,
   type CreateScheduledTaskBody,
@@ -106,7 +106,7 @@ function nextRunAtFor(cronExpr: string, enabled: boolean, now: Date = new Date()
   const next = nextCronRun(cronExpr, now)
   if (next === null) {
     // cron 合法但 5 年内无解（如 `0 0 30 2 *`）—— 如实拒绝，而不是留一个永远不会触发的任务
-    throw AppError.validation('cron 表达式在可预见的未来没有匹配时刻（检查 日/月 组合）')
+    throw AppError.validation(appMsg('app.m221'))
   }
   return next
 }
@@ -117,7 +117,7 @@ async function assertSchedulableAgent(agentId: string): Promise<void> {
     where: { id: agentId, deletedAt: null },
     select: { id: true },
   })
-  if (agent === null) throw AppError.notFound('智能体不存在')
+  if (agent === null) throw AppError.notFound(appMsg('app.m000'))
 }
 
 /** webhook 地址 / 密钥的加密：`undefined` = 不改（update）；空串 = 清除；非空 = 加密存储 */
@@ -130,7 +130,7 @@ function encryptOrNull(plain: string | undefined): string | null | undefined {
 /** 选了渠道却没地址 ⇒ 拒绝（一条永远发不出去的通知没有意义） */
 function assertNotifyUsable(notifyType: NotifyType, urlCipher: string | null): void {
   if (notifyType !== 'NONE' && urlCipher === null) {
-    throw AppError.validation('选择了通知渠道就必须填写 webhook 地址')
+    throw AppError.validation(appMsg('app.m222'))
   }
 }
 
@@ -175,7 +175,7 @@ export async function findMyScheduledTask(
     where: { id, userId: viewer.id },
     select: SCHEDULED_TASK_SELECT,
   })
-  if (row === null) throw AppError.notFound('定时任务不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m223'))
   return row as unknown as ScheduledTaskRow
 }
 

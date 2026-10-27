@@ -31,7 +31,7 @@
  */
 
 import cookie from '@fastify/cookie'
-import { AppError } from '@doubulea/shared'
+import { appMsg, AppError } from '@doubulea/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 
 import { config } from '../config.js'
@@ -190,7 +190,7 @@ async function failSession(sid: string, reply: FastifyReply, error: AppError): P
 /** 会话存储（Redis）不可用的统一出口 —— 见文件头「②」 */
 function storageUnavailable(scope: string, error: unknown): AppError {
   getLogger().error({ err: error, scope }, '会话存储不可用，无法完成会话校验')
-  return AppError.internal('会话存储暂不可用，请稍后重试')
+  return AppError.internal(appMsg('app.m088'))
 }
 
 /**
@@ -206,7 +206,7 @@ function storageUnavailable(scope: string, error: unknown): AppError {
 async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   const sid = request.cookies?.[SESSION_COOKIE_NAME]
   if (sid === undefined || sid === '') {
-    throw AppError.unauthorized('未登录或会话已失效')
+    throw AppError.unauthorized(appMsg('app.m005'))
   }
 
   let userId: string | undefined
@@ -218,7 +218,7 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
   if (userId === undefined) {
     // 会话键不在（登出/过期/伪造）：清掉客户端那枚 Cookie，避免它每个请求都再走一遍
     clearSessionCookie(reply)
-    throw AppError.unauthorized('未登录或会话已失效')
+    throw AppError.unauthorized(appMsg('app.m005'))
   }
 
   let snapshot: UserSnapshot | undefined
@@ -229,11 +229,11 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
     throw storageUnavailable('resolve-snapshot', error)
   }
   if (snapshot === undefined) {
-    return failSession(sid, reply, AppError.unauthorized('未登录或会话已失效'))
+    return failSession(sid, reply, AppError.unauthorized(appMsg('app.m005')))
   }
   // `02` §十：停用账号立即失效 —— 每请求都对照快照里的 status（缓存 60s，写侧主动失效）
   if (snapshot.status === UserStatus.DISABLED) {
-    return failSession(sid, reply, AppError.unauthorized('账号已停用，请联系管理员'))
+    return failSession(sid, reply, AppError.unauthorized(appMsg('app.m018')))
   }
 
   request.auth = { sessionId: sid, user: snapshot }
@@ -246,8 +246,8 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promi
   await requireAuth(request, reply)
   const auth = request.auth
   // requireAuth 成功必然写入 auth；这里的判断只是给类型收窄 + 兜住"有人误把它当独立钩子用"
-  if (auth === null) throw AppError.unauthorized('未登录或会话已失效')
-  if (auth.user.role !== UserRole.ADMIN) throw AppError.forbidden('该操作仅限管理员')
+  if (auth === null) throw AppError.unauthorized(appMsg('app.m005'))
+  if (auth.user.role !== UserRole.ADMIN) throw AppError.forbidden(appMsg('app.m089'))
 }
 
 /**
@@ -261,7 +261,7 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promi
  */
 export function requireAuthContext(request: FastifyRequest): AuthContext {
   const auth = request.auth
-  if (auth === null) throw AppError.unauthorized('未登录或会话已失效')
+  if (auth === null) throw AppError.unauthorized(appMsg('app.m005'))
   return auth
 }
 

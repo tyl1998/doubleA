@@ -18,7 +18,23 @@
  * · **不支持**：秒、`@daily` 之类别名、`L`/`W`/`#`、月份/星期英文名、`?`（要就给上界写法）
  * · **日 vs 周 的合并语义**：两者**都**被限定（都不是 `*`）时按标准 cron —— **命中其一即触发**；
  *   否则按"都要命中"（未限定的那一侧恒真，两种写法等价）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * P1-23（末批）：`describeCron` 的"人话描述"改走字典（**多收 `locale`**）
+ * ─────────────────────────────────────────────────────────────────────
+ * 本文件此前是**零外部依赖**（纯函数 + 常量）。`describeCron` 曾经直接拼中文，
+ * 于是英文界面下任务表单仍显示「约 每天 09:00；」。
+ *
+ * 处置口径（`子方案/界面语言切换.md` §3.5 的"纯函数多收 locale"）：
+ *   · 描述文案的**真相搬进字典**（`cron.desc.*`），本文件只保留"认出哪种形状"的判据；
+ *   · 于是本文件多了**唯一一个**依赖：`./i18n/index.js`（`translate` + `Locale`），
+ *     与 `document.ts` 同款。⚠️ **不要把 i18n 的别的东西引进来**（尤其别引前端 store）——
+ *     本文件仍要能被后端与零依赖验收档直接 import。
+ *   · 代价与收益：`describeCron` 不再是"零参数纯函数"，但它仍是**纯函数**（同输入同输出），
+ *     且"中文形态逐字未变"由 `backend/scripts/cron-regression.ts` 的 E1 守住。
  */
+
+import { translate, type Locale } from './i18n/index.js'
 
 /** 解析后的 cron 五段（集合形态，供匹配与下一次计算共用） */
 export interface ParsedCron {
@@ -219,8 +235,16 @@ export function nextCronRuns(expr: string, count: number, from: Date = new Date(
   return out
 }
 
-/** 星期中文（`0` = 周日） */
-const WEEKDAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as const
+/** 星期 → i18n key（`0` = 周日；与 `label.weekday.*` 同一份真相，前端读数也用这组 key） */
+const WEEKDAY_KEYS = [
+  'label.weekday.0',
+  'label.weekday.1',
+  'label.weekday.2',
+  'label.weekday.3',
+  'label.weekday.4',
+  'label.weekday.5',
+  'label.weekday.6',
+] as const
 
 /** 两位补零 */
 const pad2 = (value: number): string => String(value).padStart(2, '0')
@@ -231,34 +255,40 @@ const pad2 = (value: number): string => String(value).padStart(2, '0')
  * ⚠️ 刻意**不做**"通用表达式 → 自然语言"的完整翻译：那是个坑（多值/区间/步长/日周 OR 语义组合起来
  * 极易描述错，而**描述错的代价比不给描述大**）。认得出的给一句话，认不出的让调用方回落去显示
  * "接下来 N 次执行时间"（{@link nextCronRuns}，那才是权威读数）。
+ *
+ * ⚠️ `locale` 是**必填**（P1-23 末批）：早先它是"零参纯函数、直接返回中文"，英文界面下这里就成了
+ * 界面上唯一的汉语。现在只保留"认出哪种形状"的判据，文案一律 `translate(locale, 'cron.desc.*')`。
+ * **zh 的译文与旧版逐字一致**（`backend/scripts/cron-regression.ts` 的 E1 逐条守着）。
  */
-export function describeCron(expr: string): string | null {
+export function describeCron(expr: string, locale: Locale): string | null {
   const parts = expr.trim().split(/\s+/)
   if (parts.length !== 5) return null
   const [min, hour, dom, month, dow] = parts as [string, string, string, string, string]
   const isInt = (value: string): boolean => /^\d+$/.test(value)
   const hhmm = (h: string, m: string): string => `${pad2(Number(h))}:${pad2(Number(m))}`
 
-  if (min === '*' && hour === '*' && dom === '*' && month === '*' && dow === '*') return '每分钟'
+  if (min === '*' && hour === '*' && dom === '*' && month === '*' && dow === '*') {
+    return translate(locale, 'cron.desc.everyMinute')
+  }
   const step = /^\*\/(\d+)$/.exec(min)
   if (step !== null && hour === '*' && dom === '*' && month === '*' && dow === '*') {
-    return `每 ${step[1]} 分钟`
+    return translate(locale, 'cron.desc.everyNMinutes', { n: step[1] ?? '' })
   }
   if (isInt(min) && hour === '*' && dom === '*' && month === '*' && dow === '*') {
-    return `每小时的 ${pad2(Number(min))} 分`
+    return translate(locale, 'cron.desc.hourlyAtMinute', { minute: pad2(Number(min)) })
   }
   if (isInt(min) && isInt(hour) && dom === '*' && month === '*' && dow === '*') {
-    return `每天 ${hhmm(hour, min)}`
+    return translate(locale, 'cron.desc.dailyAt', { time: hhmm(hour, min) })
   }
   if (isInt(min) && isInt(hour) && dom === '*' && month === '*' && dow === '1-5') {
-    return `工作日 ${hhmm(hour, min)}`
+    return translate(locale, 'cron.desc.weekdaysAt', { time: hhmm(hour, min) })
   }
   if (isInt(min) && isInt(hour) && dom === '*' && month === '*' && isInt(dow)) {
-    const day = WEEKDAY_LABELS[Number(dow) % 7]
-    return `每${day} ${hhmm(hour, min)}`
+    const day = translate(locale, WEEKDAY_KEYS[Number(dow) % 7] ?? 'label.weekday.0')
+    return translate(locale, 'cron.desc.weeklyAt', { day, time: hhmm(hour, min) })
   }
   if (isInt(min) && isInt(hour) && isInt(dom) && month === '*' && dow === '*') {
-    return `每月 ${Number(dom)} 日 ${hhmm(hour, min)}`
+    return translate(locale, 'cron.desc.monthlyAt', { day: Number(dom), time: hhmm(hour, min) })
   }
   return null
 }

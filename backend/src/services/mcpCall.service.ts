@@ -79,7 +79,7 @@
  * 等于把它变成一个提醒，而"提醒"在第三次改代码时就不见了。
  */
 
-import {
+import { appMsg,
   AppError,
   MCP_GATEWAY_TOOL_NAMES,
   missingRequiredCredentialKeys,
@@ -182,7 +182,7 @@ export async function resolveMcpCallContext(
   if (server === null) {
     // ⚠️ 404 而不 500：这是"Agent 还绑着一台已经删掉的 server"的正常中间态
     //    （P0-2-2 定案：删 server 不去清 Agent 的绑定），不是平台故障
-    throw AppError.notFound('MCP server 不存在（可能已被删除）')
+    throw AppError.notFound(appMsg('app.m176'))
   }
 
   // ② 我的凭据（主语 = `viewer.userId`，文件头 ①）
@@ -204,9 +204,7 @@ export async function resolveMcpCallContext(
       },
       'MCP 凭据未配齐 ⇒ 已在上游请求之前拦下（缺必填项；解不开的 key 已按「没值」计入）',
     )
-    throw AppError.needCredential(
-      `调用「${server.name}」的工具需要先配置凭据（还缺：${missingKeys.join('、')}）。` +
-        '请到「我的凭据」页填写后重试。',
+    throw AppError.needCredential(appMsg('app.m266', { p0: server.name, p1: missingKeys.join('、') }),
       { serverId: server.id, serverName: server.name, missingKeys },
     )
   }

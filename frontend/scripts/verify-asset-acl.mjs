@@ -52,6 +52,7 @@ const knowledge = await import('../src/pages/knowledge/knowledgeModel.ts')
 const mcp = await import('../src/pages/mcp/mcpModel.ts')
 const admin = await import('../src/pages/admin/adminModel.ts')
 const agent = await import('../src/pages/agents/agentModel.ts')
+const { translate } = await import('@doubulea/shared')
 
 // ───────────────────────────── A 纯函数：body 构造器 ─────────────────────────────
 
@@ -222,7 +223,12 @@ it('C3 AssetUserPicker 对非 ADMIN 退回"粘贴 uuid"，不造一个必然 403
   const src = read('src/components/AssetUserPicker.tsx')
   assert(src.includes('useCurrentUser'), '按角色分派')
   assert(src.includes("role === 'ADMIN'") || src.includes("=== 'ADMIN'"), '判 ADMIN')
-  assert(src.includes('UUID'), '非管理员提示粘贴 uuid')
+  // P1-23 末批：提示走 key（`assetPicker.notAdminNote`），源码里不再有中文字面量
+  assert(
+    src.includes('assetPicker.pastePlaceholder') || src.includes('UUID'),
+    '非管理员提示粘贴 uuid（走 key）',
+  )
+  assert(/UUID/.test(translate('zh', 'assetPicker.pastePlaceholder')), '字典那句要写明 uuid')
 })
 
 it('C3b 我的凭据页有「模型 Provider 凭据」区（各自 Key 可配、共享 Key 只读展示）', () => {
@@ -230,7 +236,13 @@ it('C3b 我的凭据页有「模型 Provider 凭据」区（各自 Key 可配、
   assert(section.includes('useMyProviderCredentials'), '「我的凭据」页的 Provider 凭据清单（列全部 Provider）')
   assert(section.includes('useSetMyProviderCredential') && section.includes('useDeleteMyProviderCredential'), '「各自 Key」可就地保存 / 清除')
   assert(section.includes('PER_USER') && section.includes('SHARED'), '两种模式都列（PER_USER 可配 + SHARED 只读）')
-  assert(section.includes('只读'), '共享 Key 是只读展示（改它去模型池）')
+  // P1-23 末批：共享 Key 的"你无需也无权改"那段已拆成分段 key（`sharedBody*`）；
+  // 守门改为"组件用 key + 字典那句仍写明只读/无权"，不再依赖源码里的中文字面量。
+  assert(
+    section.includes('settings.providerKey.sharedBodyA') || section.includes('只读展示'),
+    '共享 Key 是只读展示（改它去模型池）',
+  )
+  assert(/无权/.test(translate('zh', 'settings.providerKey.sharedBodyStrongNoRight')), '字典那句要写明「无权」')
   assert(read('src/pages/mcp/McpCredentialsPage.tsx').includes('ProviderKeySection'), '挂在「我的凭据」页')
 })
 
@@ -241,9 +253,11 @@ it('C4 AudiencePicker 按 人 / 组 圈选（用户走登录可用搜索，组�
   assert(src.includes('userIds') && src.includes('groupIds'), '两类受众主体')
 })
 
-it('C5 VisibilityBadge 用 shared 的标签常量，且处理 SHARED', () => {
+it('C5 VisibilityBadge 用 shared 的标签 key，且处理 SHARED', () => {
   const src = read('src/components/VisibilityBadge.tsx')
-  assert(src.includes('ASSET_VISIBILITY_LABELS'), '读 shared 常量')
+  // P1-23 第七批起：徽标按 key 取译文（`ASSET_VISIBILITY_KEY`），中文那份 `ASSET_VISIBILITY_LABELS`
+  // 仍留在 `shared` 给后端与未迁批次用 —— 两者都由 `shared/src/assetAcl.ts` 定，界面不自己拼。
+  assert(src.includes('ASSET_VISIBILITY_KEY'), '读 shared 的 key 表（不再直接用中文常量）')
   assert(src.includes('SHARED'), '三档里要处理 SHARED')
 })
 
@@ -272,8 +286,9 @@ it('D2 模型池：Provider 行无行内「我的 Key」「转移所属人」按
   assert(src.includes('assetKind="PROVIDER"'), '转移的是 Provider')
   assert(!src.includes('ShareProviderModal'), '分享弹窗应已删除')
   // 原来讲 Key 的两列（「共享 Key」+「凭据」）已合并为一列「凭据」
-  assert(src.includes("title: '凭据'") && !src.includes("title: '共享 Key'"), '共享 Key 与凭据两列已合并')
-  assert(src.includes('PROVIDER_CREDENTIAL_MODE_LABELS'), '凭据模式列')
+  assert(src.includes('models.colCredential') && !src.includes("title: '共享 Key'"), '共享 Key 与凭据两列已合并')
+  // P1-23 末批：凭据模式列改读 `PROVIDER_CREDENTIAL_MODE_KEY`（中文那份仍留在 shared 给后端/日志）
+  assert(src.includes('PROVIDER_CREDENTIAL_MODE_KEY'), '凭据模式列走 key 表（不直接用中文常量）')
   assert(src.includes('credentialsSectionPath'), '「各自 Key」未配置时去「我的凭据」的 Provider 分区')
   assert(src.includes('providerBaseUrl'), '模型行显示所属 Provider 的 baseUrl')
 })
@@ -306,7 +321,12 @@ it('D6 三类列表：所属人列即转移入口（点击弹出 TransferOwnersh
     'src/pages/mcp/McpServersPage.tsx',
   ]) {
     const src = read(file)
-    assert(src.includes('点击转移所属人'), `${file} 所属人列应可点转移`)
+    // P1-23：知识库与 MCP 两页已迁到 i18n（tooltip 存 key），agents 页尚未迁（仍是字面量）。
+    // 守门只关心"所属人列可点转移"，三形态都算通过 —— 待 agents 批迁完，这里可收敛成单一 key 判断。
+    assert(
+      src.includes('点击转移所属人') || src.includes('ownerTransferTitle') || src.includes('ownerTitle'),
+      `${file} 所属人列应可点转移`,
+    )
     assert(src.includes('TransferOwnershipModal'), `${file} 应挂转移弹窗`)
     assert(!src.includes('ShareProviderModal'), `${file} 不该有分享弹窗`)
   }
@@ -314,7 +334,13 @@ it('D6 三类列表：所属人列即转移入口（点击弹出 TransferOwnersh
 
 it('D7 用户列表新增「所在组」列；改组成员 / 组名会失效用户清单', () => {
   const src = read('src/pages/admin/UsersListPage.tsx')
-  assert(src.includes("title: '所在组'"), '用户列表要有「所在组」列')
+  // P1-23（pages/admin 批）起列标题走 key（`users.colGroups`）；守门转向"key + 字典那句仍是'所在组'"，
+  // 不再要求源码里留中文字面量 —— 否则"迁到 i18n"反而会把这条守门判红。
+  assert(
+    src.includes("t('users.colGroups')") || src.includes("title: '所在组'"),
+    '用户列表要有「所在组」列',
+  )
+  assert(/所在组/.test(translate('zh', 'users.colGroups')), '字典那句要写明「所在组」')
   assert(src.includes('user.groups'), '读服务端下发的 groups（不自己算）')
   assert(
     read('src/api/userGroups.ts').includes('ADMIN_USERS_QUERY_KEY'),
@@ -344,7 +370,9 @@ it('E1 智能体表单三档 + 受众；知识库 / MCP 表单可见范围（202
 
 it('E2 Agent 表单在公开/指定用户时提示"自愿共享"', () => {
   const agentForm = read('src/pages/agents/AgentFormPage.tsx')
-  assert(agentForm.includes('自愿共享'), '要说明公开/指定用户属于自愿共享')
+  // P1-23 第九批：说明文案搬进字典（组件用 key `agentForm.sharedNote`）⇒ 守门转向"key + 字典译文"。
+  assert(agentForm.includes('agentForm.sharedNote'), '要说明公开/指定用户属于自愿共享（用 key）')
+  assert(/自愿共享/.test(translate('zh', 'agentForm.sharedNote')), '字典那句要写明"自愿共享"')
 })
 
 it('E3 表单失败展示服务端文案', () => {

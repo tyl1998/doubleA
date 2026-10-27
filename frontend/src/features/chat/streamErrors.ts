@@ -22,24 +22,29 @@
  * （这样"将来服务端改了口径"与"前端自己编了一句"能被区分开）。
  */
 
+import { translate, type Locale, type MessageKey } from '@doubulea/shared'
+
 /**
- * 流内错误码 → **面向用户的短标题**（没有列出的错误码走通用标题）。
+ * 流内错误码 → **面向用户的短标题**的 key（没有列出的错误码走通用标题）。
  *
  * 目前只有一条：`CONFLICT`。为什么不把 `BUSY` / `NEED_CREDENTIAL` 也列上：
  *   · `BUSY`（沙箱并发闸满）在 P0 阶段**没有产生路径**，且它的文案与"排队位次"绑定（P0-3）；
  *   · `NEED_CREDENTIAL` 的处理是"给一个跳转按钮"（`03` §4.1 的工具卡那一行），属 P0-2。
  * 提前写只会是猜的文案 —— 契约没写的，不发明（`06` §六 第 ③ 条）。
+ *
+ * ⚠️ P1-23：存 **key 不存文案**（`translate(locale, ...)` 落译文）—— 原来的一份中文常量
+ * 是"第二真相"，改了字典漏了这里就会出现"字典英文、这一格中文"。
  */
-export const CHAT_ERROR_TITLE_BY_CODE: Readonly<Record<string, string>> = Object.freeze({
-  CONFLICT: '该会话正在生成中',
+export const CHAT_ERROR_TITLE_KEY_BY_CODE: Readonly<Record<string, MessageKey>> = Object.freeze({
+  CONFLICT: 'chat.errorConflictTitle',
 })
 
-/** 兜底标题（错误码未收录时的通用说法 —— 与 `ErrorCard` P0-1-32 的原文一致） */
-export const CHAT_ERROR_TITLE_FALLBACK = '这一轮没有生成成功'
+/** 兜底标题的 key（错误码未收录时的通用说法 —— 与 `ErrorCard` P0-1-32 的原文一致） */
+export const CHAT_ERROR_TITLE_FALLBACK_KEY: MessageKey = 'chat.errorFallbackTitle'
 
 /** 流内错误 → 标题（`CONFLICT` 走专用文案，见文件头） */
-export function chatErrorTitle(code: string): string {
-  return CHAT_ERROR_TITLE_BY_CODE[code] ?? CHAT_ERROR_TITLE_FALLBACK
+export function chatErrorTitle(code: string, locale: Locale): string {
+  return translate(locale, CHAT_ERROR_TITLE_KEY_BY_CODE[code] ?? CHAT_ERROR_TITLE_FALLBACK_KEY)
 }
 
 /**
@@ -84,7 +89,6 @@ export function shouldToastChatError(round: {
  * （错误码 / 服务端答复），而不是给三种情况各编一套说辞 ——
  * 用户要做的事（点黄条对齐）与它的结果（以服务端为准）本来就一样。
  */
-export const DISCONNECT_BANNER_TITLE = '这一轮和服务器可能没对上'
-export const DISCONNECT_BANNER_ACTION = '对齐历史'
-export const DISCONNECT_BANNER_DETAIL =
-  '本地已经中断了这一轮，但没收到服务端的收口确认。点它会立刻拉取历史对齐（以服务端为准）——已经生成的内容不会因此消失。'
+export const DISCONNECT_BANNER_TITLE_KEY: MessageKey = 'chat.disconnectTitle'
+export const DISCONNECT_BANNER_ACTION_KEY: MessageKey = 'chat.disconnectAction'
+export const DISCONNECT_BANNER_DETAIL_KEY: MessageKey = 'chat.disconnectDetail'

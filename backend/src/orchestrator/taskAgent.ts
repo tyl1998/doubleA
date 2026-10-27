@@ -111,7 +111,7 @@
  * （`02` §五 的前置失败口径），比流内 `error{NEED_CREDENTIAL}` 对用户更清楚。
  */
 
-import {
+import { appMsg,
   AppError,
   MCP_CALL_TOOL_TOOL_NAME,
   MCP_LIST_TOOLS_TOOL_NAME,
@@ -1250,11 +1250,11 @@ export function engineFailureError(reason: TurnFailureReason, message: string): 
   switch (reason) {
     case 'engine-exited':
     case 'closed':
-      return AppError.upstreamError('沙箱引擎已退出，本次生成中断。请重新发送消息（系统会自动重建沙箱）')
+      return AppError.upstreamError(appMsg('app.m066'))
     case 'rejected':
-      return AppError.upstreamError('沙箱引擎拒绝了这次任务，本次生成中断。请重新发送消息')
+      return AppError.upstreamError(appMsg('app.m067'))
     case 'timeout':
-      return AppError.upstreamTimeout('沙箱引擎长时间没有响应，本次生成已中断。请重新发送消息')
+      return AppError.upstreamTimeout(appMsg('app.m068'))
     case 'aborted':
       return AppError.busy(message)
   }

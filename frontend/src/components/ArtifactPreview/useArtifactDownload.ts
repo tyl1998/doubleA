@@ -24,6 +24,7 @@ import { useState } from 'react'
 
 import { saveArtifactFile } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 
 export interface ArtifactDownload {
   /** 这一次下载在飞（按钮据此 `disabled` + `loading`，防连点） */
@@ -34,16 +35,17 @@ export interface ArtifactDownload {
 
 export function useArtifactDownload(): ArtifactDownload {
   const feedback = useFeedback()
+  const { t } = useT()
   const [downloading, setDownloading] = useState(false)
 
   function download(artifact: { artifactId: string; fileName: string }): void {
     setDownloading(true)
     void saveArtifactFile(artifact)
       .then(() => {
-        feedback.ok('已开始下载')
+        feedback.ok(t('artifact.preview.downloadOk'))
       })
       .catch((error: unknown) => {
-        feedback.fail(error, '下载失败')
+        feedback.fail(error, t('artifact.preview.downloadFailed'))
       })
       .finally(() => {
         setDownloading(false)

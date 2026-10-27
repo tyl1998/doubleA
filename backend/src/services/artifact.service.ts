@@ -55,7 +55,7 @@
 
 import type { Readable } from 'node:stream'
 
-import {
+import { appMsg,
   AppError,
   type ArtifactListResult,
   type ArtifactListItem,
@@ -126,7 +126,7 @@ export async function listArtifacts(
     where: { id: conversationId, userId: viewer.id },
     select: { id: true },
   })
-  if (owned === null) throw AppError.notFound('会话不存在')
+  if (owned === null) throw AppError.notFound(appMsg('app.m001'))
 
   const where = { conversationId: owned.id }
   const [rows, total] = await db.$transaction([
@@ -287,10 +287,10 @@ async function openArtifactSourceWhere(
         { artifactId: row.id, fileKey: row.fileKey },
         '产物行存在但 S3 对象已丢失，下载返回 404（行保留不动：它是"这个会话产出过什么"的历史）',
       )
-      throw AppError.notFound('该产物已超过保留期或被清理，请重新运行任务生成')
+      throw AppError.notFound(appMsg('app.m129'))
     }
     getLogger().error({ err: error, artifactId: row.id, fileKey: row.fileKey }, '读取产物对象元数据失败')
-    throw AppError.internal('存储服务暂时不可用，请稍后重试')
+    throw AppError.internal(appMsg('app.m012'))
   }
 
   const body = await s3.getObject(bucket, row.fileKey)
@@ -333,7 +333,7 @@ export async function deleteArtifact(params: { artifactId: string; userId: strin
     where: { id: params.artifactId, userId: params.userId },
     select: { id: true, fileKey: true },
   })
-  if (row === null) throw AppError.notFound('产物不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m130'))
 
   const bucket = config.s3.bucket
   try {
@@ -341,7 +341,7 @@ export async function deleteArtifact(params: { artifactId: string; userId: strin
     await getS3Client().removeObject(bucket, row.fileKey)
   } catch (error) {
     getLogger().error({ err: error, artifactId: row.id, fileKey: row.fileKey }, '删除产物对象失败（行保留）')
-    throw AppError.internal('存储服务暂时不可用，请稍后重试')
+    throw AppError.internal(appMsg('app.m012'))
   }
 
   await db.artifact.delete({ where: { id: row.id } })
@@ -386,7 +386,7 @@ export async function deleteArtifacts(params: {
         { err: error, artifactId: row.id, fileKey: row.fileKey, deleted },
         '批量删除产物对象失败（该行及其之后的行保留，可重试）',
       )
-      throw AppError.internal('存储服务暂时不可用，请稍后重试')
+      throw AppError.internal(appMsg('app.m012'))
     }
     await db.artifact.delete({ where: { id: row.id } })
     deleted += 1

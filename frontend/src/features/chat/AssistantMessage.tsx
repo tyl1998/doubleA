@@ -20,9 +20,11 @@
  */
 
 import { memo, useEffect, useState } from 'react'
-import type { ConversationRunOrigin } from '@doubulea/shared'
+import type { ConversationRunOrigin, Locale, MessageKey } from '@doubulea/shared'
+import { translate } from '@doubulea/shared'
 
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import { ArtifactCard } from './ArtifactCard.js'
 import { AssistantMarkdown } from './AssistantMarkdown.js'
 import { CitationCard } from './CitationCard.js'
@@ -67,16 +69,16 @@ function usageText(usage: ChatMessageView['usage']): string | null {
  * 收尾行要说的那句话（`03` §五 的 `done` 行："结束流；`finishReason=STOPPED` 标注「已停止」
  * （COMPLETE 为正常结束）"）。返回 `null` = 这一行不出现。
  */
-function footerText(view: ChatMessageView): string | null {
+function footerText(view: ChatMessageView, locale: Locale): string | null {
   if (view.status === 'streaming') return null
   // 失败由错误卡承担（它就在同一个 `<article>` 里），这里再来一句是重复
   if (view.status === 'error') return null
 
   const usage = usageText(view.usage)
   if (view.status === 'stopped') {
-    return ['已停止 · 已生成的内容保留', usage].filter((part) => part !== null).join(' · ')
+    return [translate(locale, 'assistant.stoppedFooter'), usage].filter((part) => part !== null).join(' · ')
   }
-  return ['已完成', usage].filter((part) => part !== null).join(' · ')
+  return [translate(locale, 'assistant.completedFooter'), usage].filter((part) => part !== null).join(' · ')
 }
 
 /** 头部状态灯：在写 = 脉冲；收尾后按结果给颜色（与 `led--*` 同一套语义） */
@@ -104,20 +106,21 @@ export const AssistantMessage = memo(function AssistantMessage({
   serverRunOrigin = null,
 }: AssistantMessageProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const [copying, setCopying] = useState(false)
 
   const empty = isAssistantEmpty(view)
-  const footer = footerText(view)
+  const footer = footerText(view, locale)
 
   const copyAll = async (): Promise<void> => {
     if (view.text === '') return
     setCopying(true)
     try {
       await navigator.clipboard.writeText(view.text)
-      feedback.ok('已复制全文')
+      feedback.ok(t('assistant.copyOk'))
     } catch (error) {
       // 复制失败不静默（见文件头）：用户要的是那段文字，不是"点了按钮"
-      feedback.fail(error, '复制失败')
+      feedback.fail(error, t('assistant.copyFailed'))
     } finally {
       setCopying(false)
     }
@@ -138,9 +141,9 @@ export const AssistantMessage = memo(function AssistantMessage({
             // 就是**两条提示叠一起**，用户看起来像两件事（产品反馈题 3：只保留那一条）。
             <span className="caret" aria-hidden="true" />
           ) : view.status === 'stopped' ? (
-            '已停止：本轮没有产生内容'
+            t('assistant.emptyStopped')
           ) : (
-            '本轮没有产生内容'
+            t('assistant.emptyPlain')
           )}
         </p>
       ) : (
@@ -185,19 +188,19 @@ export const AssistantMessage = memo(function AssistantMessage({
           只说"还在跑"，不编造正文 / 工具进度（那些帧没有经过本页）。 */}
       {serverRunning && view.status !== 'streaming' ? (
         <p className="msg__streaming ratio" data-testid="server-streaming-status">
-          {serverRunStatusText(serverRunOrigin)}
+          {serverRunStatusText(serverRunOrigin, locale)}
           <ServerElapsed startedAt={serverStartedAt} />
         </p>
       ) : null}
 
       {view.status === 'error' && view.error !== undefined ? (
-        <ErrorCard code={view.error.code} message={view.error.message} />
+        <ErrorCard code={view.error.code} message={view.error.message} msgKey={view.error.msgKey} />
       ) : null}
 
       {footer === null ? null : (
         <p className="ratio num" data-testid="assistant-footer">
           {footer}
-          {view.persisted === false ? ' · 本轮没有可保存的内容（刷新后不会出现在历史里）' : ''}
+          {view.persisted === false ? t('assistant.notPersisted') : ''}
         </p>
       )}
 
@@ -209,7 +212,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           }}
           disabled={copying || view.text === ''}
         >
-          复制全文
+          {t('assistant.copyAll')}
         </button>
         {/* 重新生成（P1-3）：只挂在最新一轮的回答上（判据在页面）。流式中不提供
             （页面在"有流在跑"时根本不会传这个回调）⇒ 不会出现"点了两次"的入口。 */}
@@ -218,9 +221,9 @@ export const AssistantMessage = memo(function AssistantMessage({
             type="button"
             onClick={onRegenerate}
             disabled={view.status === 'streaming'}
-            title="重跑这一轮的问题，用新的回答替换当前回答"
+            title={t('assistant.regenerateTitle')}
           >
-            重新生成
+            {t('assistant.regenerate')}
           </button>
         )}
       </div>
@@ -235,17 +238,16 @@ export const AssistantMessage = memo(function AssistantMessage({
  * 而最常见的两种情形（定时任务、外部 Open API 调用）**本页都停不掉**，说清楚比含糊更好。
  * `null`（旧后端 / 值坏）= 来源不明，用中性措辞，**不猜**。
  */
-function serverRunStatusText(origin: ConversationRunOrigin | null): string {
-  switch (origin) {
-    case 'SCHEDULED':
-      return '定时任务正在后台运行这一轮'
-    case 'OPEN_API':
-      return '外部调用正在生成这一轮'
-    case 'UI':
-      return '另一个窗口正在生成这一轮'
-    default:
-      return '服务端仍在生成这一轮'
-  }
+function serverRunStatusText(origin: ConversationRunOrigin | null, locale: Locale): string {
+  const key: MessageKey =
+    origin === 'SCHEDULED'
+      ? 'assistant.serverRunScheduled'
+      : origin === 'OPEN_API'
+        ? 'assistant.serverRunOpenApi'
+        : origin === 'UI'
+          ? 'assistant.serverRunUi'
+          : 'assistant.serverRunUnknown'
+  return translate(locale, key)
 }
 
 /**
@@ -265,9 +267,10 @@ const StreamingStatusLine = memo(function StreamingStatusLine({
   statusText?: string
   startedAt?: string
 }) {
+  const { t } = useT()
   return (
     <p className="msg__streaming ratio" data-testid="streaming-status">
-      {statusText ?? '正在生成…'}
+      {statusText ?? t('assistant.generating')}
       <Elapsed startedAt={startedAt} />
     </p>
   )
@@ -278,6 +281,7 @@ const StreamingStatusLine = memo(function StreamingStatusLine({
  * （**不知道就不说**：编一个 0s 会让用户以为刚发出）。
  */
 function Elapsed({ startedAt }: { startedAt?: string | null }) {
+  const { t } = useT()
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000)
@@ -285,7 +289,7 @@ function Elapsed({ startedAt }: { startedAt?: string | null }) {
   }, [])
   const start = startedAt === undefined || startedAt === null ? Number.NaN : Date.parse(startedAt)
   if (Number.isNaN(start)) return null
-  return <>{` · 已用时 ${Math.max(0, Math.floor((now - start) / 1000))}s`}</>
+  return <>{t('assistant.elapsed', { seconds: Math.max(0, Math.floor((now - start) / 1000)) })}</>
 }
 
 /**

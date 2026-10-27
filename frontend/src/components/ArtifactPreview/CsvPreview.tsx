@@ -21,6 +21,7 @@
 
 import { Table, type TableColumnsType } from 'antd'
 
+import { useT } from '../../app/i18n.js'
 import { buildCsvTable, csvTableNote, type CsvTable } from './artifactPreview.js'
 
 /** 一行（AntD 的 `dataSource` 要对象 + `rowKey` ⇒ 包一层，单元格数组原样带着） */
@@ -37,8 +38,9 @@ export interface CsvPreviewProps {
 }
 
 export function CsvPreview({ text, delimiter }: CsvPreviewProps) {
+  const { locale, t } = useT()
   const table: CsvTable = buildCsvTable(text, delimiter)
-  const note = csvTableNote(table)
+  const note = csvTableNote(table, locale)
 
   const columns: TableColumnsType<CsvRow> = [
     {
@@ -50,7 +52,7 @@ export function CsvPreview({ text, delimiter }: CsvPreviewProps) {
     },
     ...table.header.map((name, index) => ({
       // 空表头（`,,` 这种）也要有一列 ⇒ 给一个"第 N 列"的占位名，否则整列看起来是空的
-      title: name === '' ? `第 ${index + 1} 列` : name,
+      title: name === '' ? t('artifact.preview.csvColPlaceholder', { index: index + 1 }) : name,
       key: `c${index}`,
       width: 160,
       ellipsis: true,
@@ -63,8 +65,7 @@ export function CsvPreview({ text, delimiter }: CsvPreviewProps) {
   return (
     <div className="preview preview--csv">
       <p className="ratio">
-        首行按表头渲染 · 共 <span className="num">{table.totalRows}</span> 行 ·
-        <span className="num"> {table.totalCols}</span> 列
+        {t('artifact.preview.csvHeaderNote', { rows: table.totalRows, cols: table.totalCols })}
       </p>
       {note !== null && <p className="ratio">{note}</p>}
       <Table<CsvRow>
@@ -75,7 +76,7 @@ export function CsvPreview({ text, delimiter }: CsvPreviewProps) {
         dataSource={dataSource}
         pagination={false}
         scroll={{ y: 460, x: 'max-content' }}
-        locale={{ emptyText: '这个文件没有数据行' }}
+        locale={{ emptyText: t('artifact.preview.csvEmpty') }}
       />
     </div>
   )

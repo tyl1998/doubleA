@@ -12,6 +12,8 @@
  *
  * 判据是当前用户的 `role`（`useCurrentUser`），不是"页面在哪个路由下"：模型池页现在对
  * 全员开放（P1-13），同一个页面两种身份都会进来。
+ *
+ * ⚠️ P1-23 末批：文案全部走字典（此前是裸中文，转移弹窗因此在 en 下半边中文）。
  */
 
 import { useQuery } from '@tanstack/react-query'
@@ -19,6 +21,7 @@ import { Input, Select } from 'antd'
 
 import { useCurrentUser } from '../api/auth.js'
 import { fetchAdminUsers } from '../api/adminUsers.js'
+import { useT } from '../app/i18n.js'
 
 export interface AssetUserPickerProps {
   /** 已选用户 id（空串 = 未选） */
@@ -29,6 +32,7 @@ export interface AssetUserPickerProps {
 }
 
 export function AssetUserPicker({ value, onChange, disabled, placeholder }: AssetUserPickerProps) {
+  const { t } = useT()
   const { data: me } = useCurrentUser()
   const isAdmin = me?.role === 'ADMIN'
 
@@ -45,13 +49,11 @@ export function AssetUserPicker({ value, onChange, disabled, placeholder }: Asse
         <Input
           value={value}
           disabled={disabled}
-          placeholder={placeholder ?? '粘贴对方的用户 ID（UUID）'}
-          aria-label="接收人用户 ID"
+          placeholder={placeholder ?? t('assetPicker.pastePlaceholder')}
+          aria-label={t('assetPicker.pasteAria')}
           onChange={(event) => onChange(event.target.value)}
         />
-        <span className="ratio">
-          你当前不是管理员，没有"列出用户"的权限 —— 请向对方索取用户 ID（UUID）后粘贴到这里。
-        </span>
+        <span className="ratio">{t('assetPicker.notAdminNote')}</span>
       </div>
     )
   }
@@ -71,10 +73,10 @@ export function AssetUserPicker({ value, onChange, disabled, placeholder }: Asse
       options={options}
       loading={users.isPending}
       disabled={disabled}
-      placeholder={placeholder ?? '搜索并选择一个用户'}
+      placeholder={placeholder ?? t('assetPicker.searchPlaceholder')}
       style={{ width: '100%' }}
-      aria-label="接收人"
-      notFoundContent={users.isPending ? '正在读取用户列表…' : '没有匹配的用户'}
+      aria-label={t('assetPicker.aria')}
+      notFoundContent={users.isPending ? t('assetPicker.loadingUsers') : t('assetPicker.noMatch')}
       onChange={onChange}
     />
   )

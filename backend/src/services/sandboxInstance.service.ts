@@ -15,7 +15,7 @@
  * ⚠️ 本文件**不写**注册表：心跳写入只在 `sandbox/owner.ts`（同 `token.ts` 的纪律）。
  */
 
-import {
+import { appMsg,
   AppError,
   mergeUpstreams,
   parseInstanceRegistrationWithPort,
@@ -143,7 +143,7 @@ export async function setSandboxInstanceDrained(instanceId: string, drained: boo
   const redis = await ensureRedisConnected()
   const registered = await redis.exists(sandboxInstanceKey(instanceId))
   if (registered === 0) {
-    throw AppError.notFound(`实例 ${instanceId} 不在在线注册表里（可能已下线，或 id 写错）`)
+    throw AppError.notFound(appMsg('app.m220', { p0: instanceId }))
   }
   const key = sandboxDrainedKey(instanceId)
   if (drained) await redis.set(key, '1')

@@ -31,6 +31,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 import {
   ASSET_VISIBILITIES,
   agentAudienceInputSchema,
@@ -269,8 +271,13 @@ export type KnowledgeBaseItem = z.infer<typeof knowledgeBaseItemSchema>
 
 /** `GET /api/knowledge-bases` 查询参数（offset/limit，与 `/api/users`、`/api/models` 同口径） */
 export const listKnowledgeBasesQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListKnowledgeBasesQuery = z.infer<typeof listKnowledgeBasesQuerySchema>
 
@@ -282,69 +289,83 @@ export type KnowledgeBaseListResult = z.infer<typeof knowledgeBaseListResultSche
 
 /** 库名（列 `VARCHAR(128)`） */
 const kbNameSchema = z
-  .string({ required_error: '请输入知识库名称' })
+  .string({ required_error: validationMessage('validation.knowledgeBase.nameRequired') })
   .trim()
-  .min(1, '请输入知识库名称')
-  .max(128, '名称最多 128 个字符')
+  .min(1, validationMessage('validation.knowledgeBase.nameRequired'))
+  .max(128, validationMessage('validation.knowledgeBase.nameTooLong', { max: 128 }))
 
 /**
  * 描述（列是 `TEXT`，无硬上限）。
  * 2000 字是**防误操作**的上限（把整篇文档粘进描述框是最常见的脏数据），不是存储约束。
  */
-const kbDescriptionSchema = z.string().trim().max(2000, '描述最多 2000 个字符')
+const kbDescriptionSchema = z
+  .string()
+  .trim()
+  .max(2000, validationMessage('validation.knowledgeBase.descriptionTooLong', { max: 2000 }))
 
 /**
  * 分块大小（字符，非 token）。上限 8192 出自 `子方案①` §二：bge-m3 的输入上限是 8192 token，
  * 而本参数单位是**字符** —— 超过 8192 字符的实施只可能来自单位误解（把 token 当字符）。
  */
 const chunkSizeSchema = z
-  .number({ invalid_type_error: 'chunkSize 必须是数字' })
-  .int('chunkSize 必须是整数')
-  .min(1, 'chunkSize 至少为 1')
-  .max(8192, 'chunkSize 最多 8192 个字符')
+  .number({ invalid_type_error: validationMessage('validation.knowledgeBase.chunkSizeNotNumber') })
+  .int(validationMessage('validation.knowledgeBase.chunkSizeNotInteger'))
+  .min(1, validationMessage('validation.knowledgeBase.chunkSizeMin', { min: 1 }))
+  .max(8192, validationMessage('validation.knowledgeBase.chunkSizeMax', { max: 8192 }))
 
 /** 相邻块重叠（字符）。下界 0 合法（不重叠），上界由"必须小于 chunkSize"在服务层兜（跨字段） */
 const chunkOverlapSchema = z
-  .number({ invalid_type_error: 'chunkOverlap 必须是数字' })
-  .int('chunkOverlap 必须是整数')
-  .min(0, 'chunkOverlap 不能为负')
-  .max(8191, 'chunkOverlap 最多 8191')
+  .number({ invalid_type_error: validationMessage('validation.knowledgeBase.chunkOverlapNotNumber') })
+  .int(validationMessage('validation.knowledgeBase.chunkOverlapNotInteger'))
+  .min(0, validationMessage('validation.knowledgeBase.chunkOverlapMin', { min: 0 }))
+  .max(8191, validationMessage('validation.knowledgeBase.chunkOverlapMax', { max: 8191 }))
 
 /** 检索配置的**局部**形态：允许只给要改的键（其余按当前值/默认值补齐） */
 export const retrievalConfigInputSchema = z.object({
   topK: z
-    .number({ invalid_type_error: 'topK 必须是数字' })
-    .int('topK 必须是整数')
-    .min(1, 'topK 至少为 1')
-    .max(100, 'topK 最多 100')
+    .number({ invalid_type_error: validationMessage('validation.knowledgeBase.topKNotNumber') })
+    .int(validationMessage('validation.knowledgeBase.topKNotInteger'))
+    .min(1, validationMessage('validation.knowledgeBase.topKMin', { min: 1 }))
+    .max(100, validationMessage('validation.knowledgeBase.topKMax', { max: 100 }))
     .optional(),
   score: z
-    .number({ invalid_type_error: 'score 必须是数字' })
-    .min(0, 'score 不能小于 0')
-    .max(1, 'score 不能大于 1')
+    .number({ invalid_type_error: validationMessage('validation.knowledgeBase.scoreNotNumber') })
+    .min(0, validationMessage('validation.knowledgeBase.scoreMin', { min: 0 }))
+    .max(1, validationMessage('validation.knowledgeBase.scoreMax', { max: 1 }))
     .optional(),
   mode: z
-    .enum(RETRIEVAL_MODES, { errorMap: () => ({ message: `mode 只能是 ${RETRIEVAL_MODES.join('/')}` }) })
+    .enum(RETRIEVAL_MODES, {
+      errorMap: () => ({
+        message: validationMessage('validation.knowledgeBase.modeAllowed', { allowed: RETRIEVAL_MODES.join('/') }),
+      }),
+    })
     .optional(),
   splitStrategy: z
     .enum(SPLIT_STRATEGIES, {
-      errorMap: () => ({ message: `splitStrategy 只能是 ${SPLIT_STRATEGIES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.knowledgeBase.splitStrategyAllowed', {
+          allowed: SPLIT_STRATEGIES.join('/'),
+        }),
+      }),
     })
     .optional(),
   rrfK: z
-    .number({ invalid_type_error: 'rrfK 必须是数字' })
-    .int('rrfK 必须是整数')
-    .min(1, 'rrfK 至少为 1')
-    .max(1000, 'rrfK 最多 1000')
+    .number({ invalid_type_error: validationMessage('validation.knowledgeBase.rrfKNotNumber') })
+    .int(validationMessage('validation.knowledgeBase.rrfKNotInteger'))
+    .min(1, validationMessage('validation.knowledgeBase.rrfKMin', { min: 1 }))
+    .max(1000, validationMessage('validation.knowledgeBase.rrfKMax', { max: 1000 }))
     .optional(),
   /** 两路权重要么都给、要么都不给（给一半会让另一半静默取默认值，容易被当成"设了没生效"） */
   weights: z
     .object({
-      vector: z.number({ invalid_type_error: 'weights.vector 必须是数字' }).min(0, 'weights.vector 不能为负').max(100, 'weights.vector 最多 100'),
+      vector: z
+        .number({ invalid_type_error: validationMessage('validation.knowledgeBase.weightVectorNotNumber') })
+        .min(0, validationMessage('validation.knowledgeBase.weightVectorMin', { min: 0 }))
+        .max(100, validationMessage('validation.knowledgeBase.weightVectorMax', { max: 100 })),
       fulltext: z
-        .number({ invalid_type_error: 'weights.fulltext 必须是数字' })
-        .min(0, 'weights.fulltext 不能为负')
-        .max(100, 'weights.fulltext 最多 100'),
+        .number({ invalid_type_error: validationMessage('validation.knowledgeBase.weightFulltextNotNumber') })
+        .min(0, validationMessage('validation.knowledgeBase.weightFulltextMin', { min: 0 }))
+        .max(100, validationMessage('validation.knowledgeBase.weightFulltextMax', { max: 100 })),
     })
     .optional(),
 })
@@ -370,13 +391,13 @@ export const createKnowledgeBaseBodySchema = z.object({
    * 后端据此**探测维度**并快照，此后入库与检索都用它。不可后改（换模型需重建）。
    */
   embeddingModelId: z
-    .string({ required_error: '请选择 embedding 模型' })
-    .uuid('embeddingModelId 不是合法 UUID'),
+    .string({ required_error: validationMessage('validation.knowledgeBase.embeddingModelRequired') })
+    .uuid(validationMessage('validation.knowledgeBase.embeddingModelIdNotUuid')),
   /**
    * 可选：图片"含义"理解（VLM 描述）用的 vision 对话模型 id（P1-11）。
    * `null` 与省略同义（都表示"不启用图片描述"）。设置时后端会校验它是 `CHAT` 且 `supportsVision`。
    */
-  captionModelId: z.string().uuid('captionModelId 不是合法 UUID').nullish(),
+  captionModelId: z.string().uuid(validationMessage('validation.knowledgeBase.captionModelIdNotUuid')).nullish(),
   chunkSize: chunkSizeSchema.optional(),
   chunkOverlap: chunkOverlapSchema.optional(),
   /** 局部覆盖：只给 `{topK: 10, score: 0.5}` 也行，其余键取默认值 */
@@ -388,7 +409,11 @@ export const createKnowledgeBaseBodySchema = z.object({
    */
   visibility: z
     .enum(ASSET_VISIBILITIES, {
-      errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+      errorMap: () => ({
+        message: validationMessage('validation.knowledgeBase.visibilityAllowed', {
+          allowed: ASSET_VISIBILITIES.join('/'),
+        }),
+      }),
     })
     .optional(),
   /** P1-18.x：受众（仅 `visibility=SHARED` 允许给；`SHARED` 时至少一个主体非空） */
@@ -402,14 +427,14 @@ export const createKnowledgeBaseBodySchema = z.object({
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['audience'],
-          message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+          message: validationMessage('validation.audience.required'),
         })
       }
     } else if (body.audience !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '只有可见范围为「指定用户」时才能设置受众',
+        message: validationMessage('validation.audience.notAllowed'),
       })
     }
   })
@@ -451,16 +476,24 @@ export const updateKnowledgeBaseBodySchema = z
     chunkOverlap: chunkOverlapSchema.optional(),
     retrievalConfig: retrievalConfigInputSchema.optional(),
     /** 更换该库的向量模型（`models` 里 `type=EMBEDDING` 的 id）；换完需重建索引 */
-    embeddingModelId: z.string().uuid('embeddingModelId 不是合法 UUID').optional(),
+    embeddingModelId: z.string().uuid(validationMessage('validation.knowledgeBase.embeddingModelIdNotUuid')).optional(),
     /**
      * 图片描述模型（P1-11）**三态**：**不带 = 不动** / `null` = **清除（不启用图片描述）** /
      * uuid = 设置。设置时后端校验它是 `CHAT` 且 `supportsVision`（{@link CAPTION_MODEL_MUST_SUPPORT_VISION_HINT}）。
      */
-    captionModelId: z.string().uuid('captionModelId 不是合法 UUID').nullable().optional(),
+    captionModelId: z
+      .string()
+      .uuid(validationMessage('validation.knowledgeBase.captionModelIdNotUuid'))
+      .nullable()
+      .optional(),
     /** P1-18.x：可见范围（三档：私有 / 指定用户 / 公开） */
     visibility: z
       .enum(ASSET_VISIBILITIES, {
-        errorMap: () => ({ message: `visibility 只能是 ${ASSET_VISIBILITIES.join('/')}` }),
+        errorMap: () => ({
+          message: validationMessage('validation.knowledgeBase.visibilityAllowed', {
+            allowed: ASSET_VISIBILITIES.join('/'),
+          }),
+        }),
       })
       .optional(),
     /** P1-18.x：受众（整体替换；`visibility≠SHARED` 时不得给） */
@@ -478,7 +511,7 @@ export const updateKnowledgeBaseBodySchema = z
       body.captionModelId !== undefined ||
       body.visibility !== undefined ||
       body.audience !== undefined,
-    { message: '至少要提供一个要修改的字段' },
+    { message: validationMessage('validation.common.atLeastOneField') },
   )
   .superRefine((body, ctx) => {
     // P1-18.x：同请求内 visibility × audience 的**局部**一致性（合并库里现状后的最终判定在服务层）
@@ -486,7 +519,7 @@ export const updateKnowledgeBaseBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '只有可见范围为「指定用户」时才能设置受众',
+        message: validationMessage('validation.audience.notAllowed'),
       })
     }
     if (
@@ -497,7 +530,7 @@ export const updateKnowledgeBaseBodySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['audience'],
-        message: '可见范围为「指定用户」时，至少要选择一位用户或一个组',
+        message: validationMessage('validation.audience.required'),
       })
     }
   })
@@ -507,7 +540,7 @@ export type UpdateKnowledgeBaseBody = z.infer<typeof updateKnowledgeBaseBodySche
 
 /** 路径参数（`:id` 是 uuid(7) 字符串） */
 export const knowledgeBaseIdParamsSchema = z.object({
-  id: z.string().uuid('知识库 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.knowledgeBase.idNotUuid')),
 })
 export type KnowledgeBaseIdParams = z.infer<typeof knowledgeBaseIdParamsSchema>
 
@@ -661,22 +694,26 @@ export const FULLTEXT_PATH_SKIPPED_TOO_SHORT = `检索内容不足 ${FULLTEXT_QU
  */
 export const searchKnowledgeBaseBodySchema = z.object({
   query: z
-    .string({ required_error: '请输入检索内容' })
+    .string({ required_error: validationMessage('validation.knowledgeBase.queryRequired') })
     .trim()
-    .min(1, '请输入检索内容')
+    .min(1, validationMessage('validation.knowledgeBase.queryRequired'))
     /**
      * 上限 1000 字符：query 最终要变成一次 embedding 调用（`bge-m3` 输入上限 8192 token，
      * 1000 字符远在其内），也是防误操作的门槛（把整篇文章粘进搜索框）。
      */
-    .max(1000, '检索内容最多 1000 个字符'),
+    .max(1000, validationMessage('validation.knowledgeBase.queryTooLong', { max: 1000 })),
   topK: z
-    .number({ invalid_type_error: 'topK 必须是数字' })
-    .int('topK 必须是整数')
-    .min(1, 'topK 至少为 1')
-    .max(100, 'topK 最多 100')
+    .number({ invalid_type_error: validationMessage('validation.knowledgeBase.topKNotNumber') })
+    .int(validationMessage('validation.knowledgeBase.topKNotInteger'))
+    .min(1, validationMessage('validation.knowledgeBase.topKMin', { min: 1 }))
+    .max(100, validationMessage('validation.knowledgeBase.topKMax', { max: 100 }))
     .optional(),
   mode: z
-    .enum(RETRIEVAL_MODES, { errorMap: () => ({ message: `mode 只能是 ${RETRIEVAL_MODES.join('/')}` }) })
+    .enum(RETRIEVAL_MODES, {
+      errorMap: () => ({
+        message: validationMessage('validation.knowledgeBase.modeAllowed', { allowed: RETRIEVAL_MODES.join('/') }),
+      }),
+    })
     .optional(),
 })
 export type SearchKnowledgeBaseBody = z.infer<typeof searchKnowledgeBaseBodySchema>

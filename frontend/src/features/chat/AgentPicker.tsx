@@ -28,6 +28,7 @@ import { AGENT_TYPES, type AgentItem, type AgentType } from '@doubulea/shared'
 
 import { useAgents, AGENTS_PAGE_LIMIT_MAX } from '../../api/agents.js'
 import { useAvailableChatModels } from '../../api/models.js'
+import { useT } from '../../app/i18n.js'
 import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
 import { MissingModelKeyModal } from './MissingModelKeyModal.js'
 import {
@@ -59,6 +60,7 @@ function AgentOption({ agent, onPick }: { agent: AgentItem; onPick: (agent: Agen
 }
 
 export function AgentPicker({ trigger, onPick, triggerClassName, triggerTitle }: AgentPickerProps) {
+  const { t } = useT()
   const [open, setOpen] = useState(false)
   const [keyword, setKeyword] = useState('')
   const agentsQuery = useAgents({ offset: 0, limit: AGENTS_PAGE_LIMIT_MAX })
@@ -109,18 +111,18 @@ export function AgentPicker({ trigger, onPick, triggerClassName, triggerTitle }:
         allowClear
         autoFocus
         prefix={<SearchOutlined />}
-        placeholder="搜索智能体"
+        placeholder={t('agentPicker.searchPlaceholder')}
         value={keyword}
         onChange={(event) => setKeyword(event.target.value)}
       />
       <div className="agent-pick__scroll">
         {agentsQuery.isPending ? (
-          <p className="agent-pick__hint">正在读取智能体…</p>
+          <p className="agent-pick__hint">{t('agentPicker.loading')}</p>
         ) : agentsQuery.isError ? (
-          <p className="agent-pick__hint">智能体列表没有读出来，稍后再试。</p>
+          <p className="agent-pick__hint">{t('agentPicker.loadFailed')}</p>
         ) : groups.length === 0 ? (
           <p className="agent-pick__hint">
-            {agents.length === 0 ? '还没有可用的智能体，先去「管理 · 智能体」建一个。' : '没有匹配的智能体。'}
+            {agents.length === 0 ? t('agentPicker.emptyNoAgents') : t('agentPicker.emptyNoMatch')}
           </p>
         ) : (
           groups.map((group: { type: AgentType; items: AgentItem[] }) => (

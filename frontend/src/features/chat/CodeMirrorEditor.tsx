@@ -36,6 +36,7 @@ import { markdown } from '@codemirror/lang-markdown'
 import { python } from '@codemirror/lang-python'
 import { useEffect, useRef } from 'react'
 
+import { useUiStore } from '../../stores/ui.js'
 import type { WorkspaceEditorLanguage } from './workspaceModel.js'
 
 /** 语言 id → 语言包（`'text'` = 不高亮）。**唯一**的 CodeMirror 语言绑定点。 */
@@ -60,13 +61,46 @@ function languageExtensions(language: WorkspaceEditorLanguage): Extension {
   }
 }
 
-/** 编辑器主题（浅色，配 antd 默认；等宽字体；撑满父容器）。 */
+/** 编辑器布局主题（等宽字体；撑满父容器）。配色见 {@link colorModeExtension}。 */
 const editorTheme = EditorView.theme({
   '&': { height: '100%', fontSize: '12px' },
   '.cm-scroller': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', overflow: 'auto' },
   '.cm-content': { minHeight: '160px' },
   '&.cm-focused': { outline: 'none' },
 })
+
+/**
+ * 编辑器配色的**唯一**落点（行号栏 / 当前行）。**只有一份**：值全读 CSS 变量，两种主题自然各取各的
+ * （`EditorView.theme` 每调用一次就生成一个新 class 并注入一个 style 模块 —— 按模式各建一份会让
+ * 每次切主题都多挂一个模块，故这里提到模块级，切主题只切 `darkTheme` 门面）。
+ *
+ * ⚠️ **为什么写在这里而不是 `styles/app.css`**：CodeMirror 的 `baseTheme` 是**运行时注入
+ * `<head>`** 的，里面把 `.cm-gutters` 写死成 `#f5f5f5` 底 + `#6c6c6c` 字、`.cm-activeLineGutter`
+ * 写死成 `#e2f2ff`。静态样式表与它**同特异度**，谁后注入谁赢（CM 注入晚）⇒ 写在 app.css 里会被
+ * 它盖掉；`EditorView.theme` 的角色样式排在 baseTheme **之后**（后者包了 `Prec.lowest`），才真能覆盖。
+ *
+ * 此前行号栏固定是 baseTheme 的浅色底，切暗色后编辑器黑了、它还是白的一条
+ * （用户反馈 2026-10-26「行号一片白，很刺眼」）。走令牌后两种主题各自对齐。
+ */
+const editorTokenTheme = EditorView.theme({
+  '.cm-gutters': {
+    backgroundColor: 'var(--surface-2)',
+    color: 'var(--muted-2)',
+    borderRight: '1px solid var(--rule)',
+  },
+  // 当前行的行号：比普通行号重一档，但仍用底色而不是硬编码的浅蓝
+  '.cm-activeLineGutter': { backgroundColor: 'var(--surface-3)', color: 'var(--ink-2)' },
+  // 当前行的行底：与站内其它「当前行」同款强调淡底（`.node-step.is-active`）
+  '.cm-activeLine': { backgroundColor: 'var(--accent-wash)' },
+})
+
+/**
+ * 配色模式 → 扩展：`darkTheme` 门面决定 baseTheme 走 `&light` 还是 `&dark` 分支
+ * （光标 / 选区 / 搜索面板这些**写死在 baseTheme 里**的部件跟着变），令牌主题负责行号栏与当前行。
+ */
+function colorModeExtension(mode: 'light' | 'dark'): Extension {
+  return [EditorView.darkTheme.of(mode === 'dark'), editorTokenTheme]
+}
 
 export function CodeMirrorEditor(props: {
   value: string
@@ -100,6 +134,18 @@ export function CodeMirrorEditor(props: {
   onSaveRef.current = props.onSave
 
   const readOnly = props.readOnly ?? false
+  /**
+   * 配色模式：编辑器**必须**跟着站内主题走。
+   *
+   * CodeMirror 有一个 `darkTheme` 门面：不打开时它永远用 `baseTheme` 的 **light** 分支 ——
+   * 光标是黑的、选区是浅灰、搜索面板是 `#f5f5f5`、行号栏是 `#f5f5f5`。站内切到暗色后，
+   * `.ws__editor` 的底色来自令牌（变黑），于是这些写死的浅色就成了黑底上的一块白
+   * （用户 2026-10-26 反馈的"行号一片白、很刺眼"就是它）。
+   *
+   * 用 `Compartment` 热切换（同 language / readOnly）：切主题不重建视图、不丢光标与滚动位置。
+   */
+  const themeMode = useUiStore((state) => state.themeMode)
+  const colorModeCompartment = useRef(new Compartment())
 
   // ── 建视图（只一次）──
   useEffect(() => {
@@ -123,6 +169,7 @@ export function CodeMirrorEditor(props: {
           EditorState.allowMultipleSelections.of(true),
           EditorView.lineWrapping,
           editorTheme,
+          colorModeCompartment.current.of(colorModeExtension(themeMode)),
           languageCompartment.current.of([]),
           readOnlyCompartment.current.of([]),
           keymap.of([
@@ -180,6 +227,13 @@ export function CodeMirrorEditor(props: {
       effects: languageCompartment.current.reconfigure(languageExtensions(props.language)),
     })
   }, [props.language])
+
+  // ── 主题热切换（compartment，不重建视图 ⇒ 切主题不丢光标与滚动位置）──
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: colorModeCompartment.current.reconfigure(colorModeExtension(themeMode)),
+    })
+  }, [themeMode])
 
   // ── 只读热切换 ──
   useEffect(() => {

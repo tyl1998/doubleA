@@ -52,7 +52,7 @@
  */
 
 
-import {
+import { appMsg,
   AppError,
   assetVisibilityWhere,
   canEditAsset,
@@ -392,11 +392,11 @@ export async function updateModelProvider(
       createdBy: true,
     },
   })
-  if (target === null) throw AppError.notFound('Provider 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m002'))
 
   // P1-13：编 = 仅所属人 / ADMIN（系统级 Provider 的 owner 是 ADMIN ⇒ 非 ADMIN 恒 false）
   if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以修改它')
+    throw AppError.forbidden(appMsg('app.m187'))
   }
 
   const hasEmbeddingModel = await hasEmbeddingModelOf(id)
@@ -434,7 +434,7 @@ export async function updateModelProvider(
     })
   } catch (error) {
     // 极小的竞态窗口：查到了但更新前被删了
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('Provider 不存在')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m002'))
     throw error
   }
 
@@ -472,7 +472,7 @@ export async function getProviderBoundModels(
     where: { id },
     select: { id: true },
   })
-  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (provider === null) throw AppError.notFound(appMsg('app.m002'))
   // 2026-10-16 修订：Provider 读 = 全体登录用户（平台模型池）⇒ 不再按所属人拦；只有"不存在"才 404。
 
   const models = await db.model.findMany({
@@ -483,7 +483,8 @@ export async function getProviderBoundModels(
       modelName: true,
       _count: {
         select: {
-          agents: { where: { deletedAt: null } },
+          // 与 `removeModel` 守卫同口径：默认模型 ∪ 池成员（池 ⊇ 默认 ⇒ 数池即可，见 MODEL_MANAGE_SELECT）
+          agentPool: { where: { agent: { deletedAt: null } } },
           // 有多少知识库把它当向量 / 图片描述模型用（级联删除时会静默清空这些引用）
           knowledgeBases: true,
           captionKnowledgeBases: true,
@@ -498,7 +499,7 @@ export async function getProviderBoundModels(
   const bound = models
     .filter(
       (m) =>
-        m._count.agents > 0 ||
+        m._count.agentPool > 0 ||
         m._count.knowledgeBases > 0 ||
         m._count.captionKnowledgeBases > 0 ||
         m._count.titleModelConfigs > 0,
@@ -507,13 +508,16 @@ export async function getProviderBoundModels(
       modelId: m.id,
       label: m.label,
       modelName: m.modelName,
-      agentCount: m._count.agents,
+      agentCount: m._count.agentPool,
       knowledgeBaseCount: m._count.knowledgeBases,
       captionKnowledgeBaseCount: m._count.captionKnowledgeBases,
       usedAsTitleModel: m._count.titleModelConfigs > 0,
     }))
-  // 每个在线智能体只绑一个模型 ⇒ 各模型的计数之和即受影响智能体总数（无重复计数）
-  const agentTotal = bound.reduce((sum, m) => sum + m.agentCount, 0)
+  // 受影响的在线智能体总数：用**去重后**的一次数（`pool.some`），而非把各模型的 `agentCount` 相加 ——
+  // 池改口径后一个智能体可能在同一 Provider 下挂多个模型，相加会重复计数。也与单删模型的守卫同口径。
+  const agentTotal = await db.agent.count({
+    where: { deletedAt: null, pool: { some: { model: { providerId: id } } } },
+  })
   // 每个知识库至多各绑一个向量模型 + 一个图片描述模型：用"去重后的知识库并集"数更准（一个库可能同时
   // 用了同一 Provider 下的向量模型与图片描述模型），故这里直接查一次库数而非把两个计数相加。
   const knowledgeBaseTotal = await db.knowledgeBase.count({
@@ -554,15 +558,16 @@ export async function removeModelProvider(
     where: { id },
     select: { id: true, name: true, createdBy: true, _count: { select: { models: true } } },
   })
-  if (target === null) throw AppError.notFound('Provider 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m002'))
   // P1-13：删 = 仅所属人 / ADMIN（系统级 Provider 只有 ADMIN 能删）
   if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以删除它')
+    throw AppError.forbidden(appMsg('app.m188'))
   }
 
-  // 删除前数一遍"会被自动解绑的在线智能体"（删除后 SetNull 已生效，就数不到了）
+  // 删除前数一遍"会被自动解绑的在线智能体"（删除后 SetNull 已生效，就数不到了）。
+  // 与单删模型守卫同口径 = 默认模型 ∪ 池成员（池 ⊇ 默认 ⇒ 数池即可），去重后一次数。
   const unboundAgents = await db.agent.count({
-    where: { deletedAt: null, model: { providerId: id } },
+    where: { deletedAt: null, pool: { some: { model: { providerId: id } } } },
   })
   /**
    * 删除前数一遍"向量 / 图片描述模型会被清空的知识库"（2026-10-22 补）。
@@ -589,7 +594,7 @@ export async function removeModelProvider(
     // 级联：其下 models 随 Provider 删除，引用这些模型的 agent 由 ON DELETE SET NULL 自动解绑
     await db.modelProvider.delete({ where: { id } })
   } catch (error) {
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('Provider 不存在')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m002'))
     throw error
   }
 
@@ -638,7 +643,7 @@ async function readMyCredentialItem(providerId: string, userId: string): Promise
 /** 确认 Provider 存在（`my-credential` 三条端点的共同前置；不存在 ⇒ 404） */
 async function assertProviderExists(providerId: string): Promise<void> {
   const row = await getPrisma().modelProvider.findUnique({ where: { id: providerId }, select: { id: true } })
-  if (row === null) throw AppError.notFound('Provider 不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m002'))
 }
 
 /**
@@ -801,19 +806,19 @@ export async function transferModelProvider(
     where: { id },
     select: { id: true, createdBy: true },
   })
-  if (target === null) throw AppError.notFound('Provider 不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m002'))
   if (!canEditAsset({ ownerId: target.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以转移它')
+    throw AppError.forbidden(appMsg('app.m189'))
   }
   if (toUserId === target.createdBy) {
-    throw AppError.validation('接收人已经是该 Provider 的所属人，无需转移')
+    throw AppError.validation(appMsg('app.m190'))
   }
   const newOwner = await db.user.findUnique({
     where: { id: toUserId },
     select: { id: true, status: true },
   })
   if (newOwner === null || newOwner.status !== 'ACTIVE') {
-    throw AppError.validation('接收人不存在或不是有效（ACTIVE）用户')
+    throw AppError.validation(appMsg('app.m011'))
   }
   const updated = await db.modelProvider.update({
     where: { id },
@@ -858,12 +863,15 @@ const MODEL_MANAGE_SELECT = {
       creator: { select: { username: true, nickname: true } },
     },
   },
-  // 只算**在线**智能体（未软删）：软删的智能体删除时已把 model_id 置空、不再占用模型；
-  // 但为兼容历史软删行（迁移前置空逻辑上线前留下的），这里显式过滤 deletedAt: null，
-  // 保证"删了智能体、模型就不再显示被绑定"（删智能体自动解绑）。
+  // `agentCount` 必须与 `removeModel` 守卫**同口径** = 「默认模型 ∪ 模型池成员」的**在线**智能体数。
+  // 池成员走 `agent_models`（`Model.agentPool`），默认模型走 `agents.model_id`（`Model.agents`）。
+  // ⚠️ 只数 `agentPool`：不变式「默认模型恒为池成员」（`agent.service.ts` 建/改/复制三处都保证，
+  // 迁移 `20260928130000_agent_model_pool` 也回填过）⇒ 池成员集合 ⊇ 默认集合，故池计数 = 并集计数。
+  // 之前误用 `agents`（仅默认模型）⇒「只当池成员、不是默认模型」的模型显示 0，删除时却被打回 409
+  // （用户可见症状：没有提示却删不掉）。
   _count: {
     select: {
-      agents: { where: { deletedAt: null } },
+      agentPool: { where: { agent: { deletedAt: null } } },
       // 有多少知识库把它当 embedding 用（编辑被引用的向量模型时要提示这些库需重建）
       knowledgeBases: true,
       // 2026-10-22 同族补漏：有多少知识库把它当**图片描述（VLM）**用（`caption_model_id`）
@@ -890,7 +898,7 @@ interface ModelRow {
   createdAt: Date
   updatedAt: Date
   provider: { name: string; baseUrl: string; enabled: boolean; createdBy: string; creator: { username: string; nickname: string | null } }
-  _count: { agents: number; knowledgeBases: number; captionKnowledgeBases: number; titleModelConfigs: number }
+  _count: { agentPool: number; knowledgeBases: number; captionKnowledgeBases: number; titleModelConfigs: number }
 }
 
 /** 可选列表的查询字段（`GET /api/models/available`）：只要下拉需要的，管理字段一律不带 */
@@ -937,7 +945,7 @@ function toModelItem(row: ModelRow, viewer: AssetViewer): ModelItem {
     supportsVision: row.supportsVision,
     supportsReasoning: row.supportsReasoning,
     enabled: row.enabled,
-    agentCount: row._count.agents,
+    agentCount: row._count.agentPool,
     knowledgeBaseCount: row._count.knowledgeBases,
     captionKnowledgeBaseCount: row._count.captionKnowledgeBases,
     usedAsTitleModel: row._count.titleModelConfigs > 0,
@@ -1119,10 +1127,10 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
     where: { id: input.providerId },
     select: { id: true, protocol: true, createdBy: true },
   })
-  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (provider === null) throw AppError.notFound(appMsg('app.m002'))
   // P1-13：模型随 Provider 编删 —— 只有 Provider 的所属人 / ADMIN 能在其下建模型
   if (!canEditAsset({ ownerId: provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以在其下创建模型')
+    throw AppError.forbidden(appMsg('app.m191'))
   }
 
   // ② 向量模型 × 上游协议：拦在建之前，给出可读的字段级 400（判据与"改 Provider 协议"共用一份）
@@ -1137,7 +1145,7 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
     select: { id: true },
   })
   if (duplicated !== null) {
-    throw AppError.conflict(`该 Provider 下已存在同型号同类型的模型：${input.modelName}`)
+    throw AppError.conflict(appMsg('app.m013', { p0: input.modelName }))
   }
 
   // ③ 向量模型：维度优先用请求里显式给的；否则**尽力**探测一次（探测失败不阻断保存，留空由管理员补填）
@@ -1172,10 +1180,10 @@ export async function createModel(input: CreateModelBody, viewer: AssetViewer): 
   } catch (error) {
     // 并发窗口：上面的 findFirst 与这里的 create 之间有人插了同一条
     if (hasPrismaCode(error, 'P2002')) {
-      throw AppError.conflict(`该 Provider 下已存在同型号同类型的模型：${input.modelName}`)
+      throw AppError.conflict(appMsg('app.m013', { p0: input.modelName }))
     }
     // Provider 在两次查询之间被删了（`@@unique` 之外的另一条并发路径）
-    if (hasPrismaCode(error, 'P2003')) throw AppError.notFound('Provider 不存在')
+    if (hasPrismaCode(error, 'P2003')) throw AppError.notFound(appMsg('app.m002'))
     throw error
   }
 
@@ -1223,26 +1231,25 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
       embeddingDim: true,
       embeddingMultimodal: true,
       provider: { select: { createdBy: true, protocol: true } },
-      _count: { select: { agents: true } },
+      // 与 `agentCount` / `removeModel` 同口径 = 默认模型 ∪ 模型池成员（池 ⊇ 默认 ⇒ 数池即可，见 MODEL_MANAGE_SELECT）。
+      // 前端 `modelTypeChangeBlocked` 就是 `agentCount > 0`，两边必须同源，否则会出现"前端锁类型、后端却放行"。
+      _count: { select: { agentPool: { where: { agent: { deletedAt: null } } } } },
     },
   })
-  if (target === null) throw AppError.notFound('模型不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m009'))
   // P1-13：模型随 Provider 编删 —— 仅 Provider 的所属人 / ADMIN
   if (!canEditAsset({ ownerId: target.provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该模型所属 Provider 的所属人或管理员可以修改它')
+    throw AppError.forbidden(appMsg('app.m192'))
   }
 
   if (input.providerId !== undefined && input.providerId !== target.providerId) {
-    throw AppError.conflict(
-      '模型不能迁移到其他 Provider。请在该 Provider 下新建一条，并改绑使用它的 Agent',
+    throw AppError.conflict(appMsg('app.m193'),
     )
   }
 
   const nextType = input.type ?? target.type
-  if (input.type !== undefined && input.type !== target.type && target._count.agents > 0) {
-    throw AppError.conflict(
-      `该模型已被 ${target._count.agents} 个 Agent 使用，不能改类型（对话模型与向量模型不可互换）。` +
-        '请先删除或改绑这些 Agent',
+  if (input.type !== undefined && input.type !== target.type && target._count.agentPool > 0) {
+    throw AppError.conflict(appMsg('app.m269', { p0: target._count.agentPool }),
     )
   }
 
@@ -1266,7 +1273,7 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
       select: { id: true },
     })
     if (duplicated !== null) {
-      throw AppError.conflict(`该 Provider 下已存在同型号同类型的模型：${nextModelName}`)
+      throw AppError.conflict(appMsg('app.m013', { p0: nextModelName }))
     }
   }
 
@@ -1314,9 +1321,9 @@ export async function updateModel(id: string, input: UpdateModelBody, viewer: As
       select: MODEL_MANAGE_SELECT,
     })
   } catch (error) {
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('模型不存在')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m009'))
     if (hasPrismaCode(error, 'P2002')) {
-      throw AppError.conflict(`该 Provider 下已存在同型号同类型的模型：${nextModelName}`)
+      throw AppError.conflict(appMsg('app.m013', { p0: nextModelName }))
     }
     throw error
   }
@@ -1353,10 +1360,10 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
     where: { id },
     select: { id: true, modelName: true, provider: { select: { createdBy: true } } },
   })
-  if (target === null) throw AppError.notFound('模型不存在')
+  if (target === null) throw AppError.notFound(appMsg('app.m009'))
   // P1-13：模型随 Provider 编删 —— 仅 Provider 的所属人 / ADMIN
   if (!canEditAsset({ ownerId: target.provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该模型所属 Provider 的所属人或管理员可以删除它')
+    throw AppError.forbidden(appMsg('app.m194'))
   }
 
   // 默认模型引用 或 模型池成员引用，任一命中即算"在被在线智能体使用"
@@ -1364,8 +1371,7 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
     where: { deletedAt: null, OR: [{ modelId: id }, { pool: { some: { modelId: id } } }] },
   })
   if (referencedAgents > 0) {
-    throw AppError.conflict(
-      `该模型正被 ${referencedAgents} 个智能体使用（默认模型或模型池），无法删除。请先删除或改绑这些智能体`,
+    throw AppError.conflict(appMsg('app.m195', { p0: referencedAgents }),
     )
   }
 
@@ -1376,8 +1382,7 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
    */
   const referencedKnowledgeBases = await db.knowledgeBase.count({ where: { embeddingModelId: id } })
   if (referencedKnowledgeBases > 0) {
-    throw AppError.conflict(
-      `该模型正被 ${referencedKnowledgeBases} 个知识库用作向量模型，无法删除。请先到这些知识库改用别的向量模型（换模型后旧向量需重建）`,
+    throw AppError.conflict(appMsg('app.m196', { p0: referencedKnowledgeBases }),
     )
   }
 
@@ -1387,8 +1392,7 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
    */
   const captionKnowledgeBases = await db.knowledgeBase.count({ where: { captionModelId: id } })
   if (captionKnowledgeBases > 0) {
-    throw AppError.conflict(
-      `该模型正被 ${captionKnowledgeBases} 个知识库用作图片描述模型，无法删除。请先到这些知识库改用别的图片描述模型`,
+    throw AppError.conflict(appMsg('app.m197', { p0: captionKnowledgeBases }),
     )
   }
 
@@ -1398,18 +1402,17 @@ export async function removeModel(id: string, viewer: AssetViewer): Promise<{ id
    */
   const titleModelConfigs = await db.titleModelConfig.count({ where: { modelId: id } })
   if (titleModelConfigs > 0) {
-    throw AppError.conflict(
-      '该模型正被平台用作会话标题生成模型，无法删除。请先到「系统设置 · 会话标题模型」改用别的模型',
+    throw AppError.conflict(appMsg('app.m198'),
     )
   }
 
   try {
     await db.model.delete({ where: { id } })
   } catch (error) {
-    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound('模型不存在')
+    if (hasPrismaCode(error, 'P2025')) throw AppError.notFound(appMsg('app.m009'))
     // `P2003` = 外键约束失败：理论上已被上面的检查拦住，留作并发兜底（换成可读文案而不是 500）
     if (hasPrismaCode(error, 'P2003')) {
-      throw AppError.conflict('该模型正被其他数据引用，无法删除')
+      throw AppError.conflict(appMsg('app.m199'))
     }
     throw error
   }
@@ -1445,7 +1448,7 @@ async function readProviderCredential(
       credentialMode: true,
     },
   })
-  if (row === null) throw AppError.notFound('Provider 不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m002'))
   const base = {
     providerName: row.name,
     baseUrl: row.baseUrl,
@@ -1456,8 +1459,7 @@ async function readProviderCredential(
   // P1-18：**各自 Key** 模式 ⇒ 取**调用者自己的** Key；缺 ⇒ 424 `NEED_CREDENTIAL`
   if (row.credentialMode === 'PER_USER') {
     if (subjectUserId === null) {
-      throw AppError.needCredential(
-        `Provider「${row.name}」使用「各自 Key」模式，但当前上下文无法确定调用者。请重新发起请求`,
+      throw AppError.needCredential(appMsg('app.m200', { p0: row.name }),
       )
     }
     const cred = await db.providerUserCredential.findUnique({
@@ -1465,18 +1467,14 @@ async function readProviderCredential(
       select: { apiKeyEnc: true },
     })
     if (cred === null) {
-      throw AppError.needCredential(
-        `Provider「${row.name}」使用「各自 Key」模式，你还没有配置自己的 API Key。` +
-          '请在「我的凭据」页（或个人模型池里的「我的 Key」）为它配置后重试',
+      throw AppError.needCredential(appMsg('app.m270', { p0: row.name }),
       )
     }
     try {
       return { ...base, apiKey: decryptSecret(cred.apiKeyEnc, providerUserKeyAad(subjectUserId, providerId)) }
     } catch (error) {
       getLogger().warn({ providerId, subjectUserId, err: error }, '用户级 Provider Key 解密失败（无法解析上游目标）')
-      throw AppError.internal(
-        `你在 Provider「${row.name}」上的 API Key 无法解密（密文可能已损坏，或 CREDENTIAL_MASTER_KEY 已更换）。` +
-          '请重新设置你的 Key',
+      throw AppError.internal(appMsg('app.m271', { p0: row.name }),
       )
     }
   }
@@ -1491,9 +1489,7 @@ async function readProviderCredential(
     // 与列表页的降级不同：这里**不能**降级成"没配 Key" —— 那会让调用方以为"换个能用的
     // Provider 就行"，而真相是"这一条的密文坏了/主密钥换了"。要显式说清楚该怎么修。
     getLogger().warn({ providerId, err: error }, 'Provider Key 解密失败（无法解析上游目标）')
-    throw AppError.internal(
-      `该 Provider 的 API Key 无法解密（密文可能已损坏，或 CREDENTIAL_MASTER_KEY 已更换）。` +
-        '请在模型池管理页重新设置这一项的 Key',
+    throw AppError.internal(appMsg('app.m272'),
     )
   }
 }
@@ -1523,8 +1519,7 @@ export async function resolveChatTarget(
   subjectUserId: string | null = null,
 ): Promise<LlmTarget> {
   if (modelId === null) {
-    throw AppError.conflict(
-      '该智能体未绑定模型（可能因所属模型商/模型被删除而自动解绑）。请在智能体编辑页重新绑定一个模型后再对话',
+    throw AppError.conflict(appMsg('app.m201'),
     )
   }
   const db = getPrisma()
@@ -1543,24 +1538,22 @@ export async function resolveChatTarget(
       provider: { select: { name: true, baseUrl: true, customUrl: true, enabled: true, protocol: true } },
     },
   })
-  if (row === null) throw AppError.notFound('模型不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m009'))
 
   if (row.type !== 'CHAT') {
-    throw AppError.conflict(`该模型是向量模型（EMBEDDING），不能用于对话：${row.modelName}`)
+    throw AppError.conflict(appMsg('app.m202', { p0: row.modelName }))
   }
   if (!row.enabled) {
-    throw AppError.conflict(`模型已停用，无法调用：${row.modelName}。请在模型池管理页启用它或改用其他模型`)
+    throw AppError.conflict(appMsg('app.m203', { p0: row.modelName }))
   }
   if (!row.provider.enabled) {
-    throw AppError.conflict(
-      `该模型所属的 Provider「${row.provider.name}」已停用，无法调用。请启用该 Provider 或改用其他模型`,
+    throw AppError.conflict(appMsg('app.m204', { p0: row.provider.name }),
     )
   }
 
   const credential = await readProviderCredential(row.providerId, subjectUserId)
   if (credential.apiKey === null) {
-    throw AppError.needCredential(
-      `Provider「${row.provider.name}」尚未配置 API Key，无法调用模型。请在模型池管理页为它设置 Key`,
+    throw AppError.needCredential(appMsg('app.m205', { p0: row.provider.name }),
     )
   }
 
@@ -1612,8 +1605,7 @@ export async function resolveEmbeddingTarget(
   apiKey: string | null
 }> {
   if (modelId === null) {
-    throw AppError.conflict(
-      '该知识库未绑定 embedding 模型（可能因建库时未选择、或所选模型已被删除）。请重建知识库并重新选择 embedding 模型',
+    throw AppError.conflict(appMsg('app.m206'),
     )
   }
   const db = getPrisma()
@@ -1631,13 +1623,13 @@ export async function resolveEmbeddingTarget(
       provider: { select: { name: true, enabled: true } },
     },
   })
-  if (row === null) throw AppError.notFound('embedding 模型不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m207'))
   if (row.type !== 'EMBEDDING') {
-    throw AppError.conflict(`所选模型不是向量模型（EMBEDDING），不能用于知识库：${row.modelName}`)
+    throw AppError.conflict(appMsg('app.m208', { p0: row.modelName }))
   }
-  if (!row.enabled) throw AppError.conflict(`所选 embedding 模型已停用：${row.modelName}`)
+  if (!row.enabled) throw AppError.conflict(appMsg('app.m209', { p0: row.modelName }))
   if (!row.provider.enabled) {
-    throw AppError.conflict(`所选 embedding 模型所属的 Provider「${row.provider.name}」已停用`)
+    throw AppError.conflict(appMsg('app.m210', { p0: row.provider.name }))
   }
 
   const credential = await readProviderCredential(row.providerId, subjectUserId)
@@ -1676,11 +1668,11 @@ export async function probeModelEmbedding(
     where: { id: input.providerId },
     select: { id: true, enabled: true, createdBy: true },
   })
-  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (provider === null) throw AppError.notFound(appMsg('app.m002'))
   if (!canEditAsset({ ownerId: provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以探测它')
+    throw AppError.forbidden(appMsg('app.m211'))
   }
-  if (!provider.enabled) throw AppError.conflict('该 Provider 已停用，无法探测；请先启用它')
+  if (!provider.enabled) throw AppError.conflict(appMsg('app.m212'))
 
   const credential = await readProviderCredential(input.providerId, viewer.id)
   const multimodal = input.embeddingMultimodal === true
@@ -1736,11 +1728,11 @@ export async function probeModelChat(
     where: { id: input.providerId },
     select: { id: true, enabled: true, createdBy: true },
   })
-  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (provider === null) throw AppError.notFound(appMsg('app.m002'))
   if (!canEditAsset({ ownerId: provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以测试它')
+    throw AppError.forbidden(appMsg('app.m213'))
   }
-  if (!provider.enabled) throw AppError.conflict('该 Provider 已停用，无法测试；请先启用它')
+  if (!provider.enabled) throw AppError.conflict(appMsg('app.m214'))
 
   const credential = await readProviderCredential(input.providerId, viewer.id)
   // 手工组装一个"未落库"的目标：`modelId` 给空串（日志里用 label 区分），其余字段与
@@ -1802,10 +1794,10 @@ export async function listProviderRemoteModels(
     where: { id: providerId },
     select: { id: true, createdBy: true },
   })
-  if (provider === null) throw AppError.notFound('Provider 不存在')
+  if (provider === null) throw AppError.notFound(appMsg('app.m002'))
   // P1-13：探测用的是**该 Provider 的 Key** ⇒ 仅所属人 / ADMIN
   if (!canEditAsset({ ownerId: provider.createdBy }, viewer)) {
-    throw AppError.forbidden('只有该 Provider 的所属人或管理员可以拉取它的上游模型')
+    throw AppError.forbidden(appMsg('app.m215'))
   }
   const credential = await readProviderCredential(providerId, viewer.id)
   const result = await fetchRemoteModels(credential)

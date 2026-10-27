@@ -28,7 +28,7 @@
  *    `SUGGEST` **留到用户作答或 TTL 到期**（作答要读回它才能落库，见 `drainMemoryNotices`）。
  */
 
-import {
+import { appMsg,
   AppError,
   MEMORY_KIND_LABELS,
   MEMORY_RECALL_TOPK_DEFAULT,
@@ -217,7 +217,7 @@ export async function createMemory(
       where: { id: body.agentId, deletedAt: null },
       select: { id: true },
     })
-    if (agent === null) throw AppError.validation('指定的智能体不存在或已被删除')
+    if (agent === null) throw AppError.validation(appMsg('app.m028'))
   }
   await assertMemoryQuota(viewer.id)
   const created = await db.memory.create({
@@ -246,14 +246,14 @@ export async function updateMemory(
   const db = getPrisma()
   // 先按 `user_id` 收窄（别人的 id 与不存在返回同一个 404）
   const existing = await db.memory.findFirst({ where: { id, userId: viewer.id } })
-  if (existing === null) throw AppError.notFound('记忆不存在')
+  if (existing === null) throw AppError.notFound(appMsg('app.m029'))
   // 作用域变更（提升/降级）：非 null 的 agentId 必须存在且未软删
   if (typeof body.agentId === 'string') {
     const agent = await db.agent.findFirst({
       where: { id: body.agentId, deletedAt: null },
       select: { id: true },
     })
-    if (agent === null) throw AppError.validation('指定的智能体不存在或已被删除')
+    if (agent === null) throw AppError.validation(appMsg('app.m028'))
   }
   const updated = await db.memory.update({
     where: { id },
@@ -282,7 +282,7 @@ export async function updateMemory(
 export async function removeMemory(id: string, viewer: MemoryViewer): Promise<{ id: string }> {
   const db = getPrisma()
   const existing = await db.memory.findFirst({ where: { id, userId: viewer.id }, select: { id: true } })
-  if (existing === null) throw AppError.notFound('记忆不存在')
+  if (existing === null) throw AppError.notFound(appMsg('app.m029'))
   await db.memory.delete({ where: { id } })
   return { id }
 }
@@ -300,7 +300,7 @@ export async function getMemorySettings(userId: string): Promise<MemorySettings>
       memoryProfileMax: true,
     },
   })
-  if (user === null) throw AppError.notFound('用户不存在')
+  if (user === null) throw AppError.notFound(appMsg('app.m008'))
   return {
     enabled: user.memoryEnabled,
     autoExtract: user.memoryAutoExtract,
@@ -317,7 +317,7 @@ export async function updateMemorySettings(
 ): Promise<MemorySettings> {
   const db = getPrisma()
   const user = await db.user.findUnique({ where: { id: userId }, select: { id: true } })
-  if (user === null) throw AppError.notFound('用户不存在')
+  if (user === null) throw AppError.notFound(appMsg('app.m008'))
   await db.user.update({
     where: { id: userId },
     data: {
@@ -713,8 +713,7 @@ function parseNoticeList(raw: string | null): MemoryNotice[] {
 /** `over-limit` 的统一异常（`createMemory` / 内置工具用） */
 async function assertMemoryQuota(userId: string): Promise<void> {
   if ((await countMemories(userId)) >= config.memory.maxPerUser) {
-    throw AppError.conflict(
-      `记忆条目已达上限（${config.memory.maxPerUser} 条），请先在「任务中心 · 记忆」里整理后再添加`,
+    throw AppError.conflict(appMsg('app.m186', { p0: config.memory.maxPerUser }),
     )
   }
 }
@@ -734,7 +733,7 @@ export async function requireMemoryConversation(
     where: { id: conversationId, userId: viewer.id },
     select: { agentId: true },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
   return { agentId: row.agentId }
 }
 
@@ -757,7 +756,7 @@ export async function setConversationMemoryExcluded(
     where: { id: conversationId, userId: viewer.id },
     select: { id: true },
   })
-  if (existing === null) throw AppError.notFound('会话不存在')
+  if (existing === null) throw AppError.notFound(appMsg('app.m001'))
   await db.conversation.update({ where: { id: conversationId }, data: { memoryExcluded: excluded } })
   return { id: conversationId, memoryExcluded: excluded }
 }

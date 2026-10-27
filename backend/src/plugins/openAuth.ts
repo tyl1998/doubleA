@@ -46,7 +46,7 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 
-import {
+import { appMsg,
   AppError,
   canViewAsset,
   openApiKeyStatusOf,
@@ -426,12 +426,12 @@ export async function acquireOpenConcurrency(
 /** 依赖故障的统一出口（文件头 ②：**500，不是 401**） */
 function dependencyUnavailable(scope: string, error: unknown): AppError {
   getLogger().error({ err: error, scope }, '开放平台鉴权依赖不可用')
-  return AppError.internal('鉴权服务暂不可用，请稍后重试')
+  return AppError.internal(appMsg('app.m084'))
 }
 
 /** ④a 的统一拒绝文案（四种原因**同一句**，见文件头 ②） */
 function invalidKey(): AppError {
-  return AppError.unauthorized('API Key 无效或已失效')
+  return AppError.unauthorized(appMsg('app.m085'))
 }
 
 /**
@@ -466,7 +466,7 @@ async function authenticate(
     const user = await getPrisma().user.findUnique({ where: { id: snapshot.userId }, select: { role: true } })
     const role: 'ADMIN' | 'MEMBER' = user?.role === 'ADMIN' ? 'ADMIN' : 'MEMBER'
     if (!(await isAgentOpenable(snapshot, role))) {
-      throw AppError.forbidden('该智能体当前不开放调用（已停用、非对话型或你已无权访问）')
+      throw AppError.forbidden(appMsg('app.m086'))
     }
   } catch (error) {
     if (error instanceof AppError) throw error
@@ -476,7 +476,7 @@ async function authenticate(
   // ⑤ 作用域
   const scopes = snapshot.scopes.filter((scope): scope is OpenApiScope => typeof scope === 'string') as OpenApiScope[]
   if (requiredScope !== null && !scopes.includes(requiredScope)) {
-    throw AppError.forbidden(`该 API Key 缺少作用域 ${requiredScope}`, { requiredScope, scopes })
+    throw AppError.forbidden(appMsg('app.m087', { p0: requiredScope }), { requiredScope, scopes })
   }
 
   const context: OpenRequestContext = {
@@ -543,10 +543,10 @@ export async function assertOpenConversation(
     where: { id: conversationId, userId: context.userId },
     select: { id: true, agentId: true, status: true },
   })
-  if (row === null) throw AppError.notFound('会话不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m001'))
   if (row.agentId !== context.agentId) {
     // **404 而不是 403**：与"不是我的会话"同一个结论 —— 不泄漏"'这个 id 在你的另一个智能体下存在"
-    throw AppError.notFound('会话不存在')
+    throw AppError.notFound(appMsg('app.m001'))
   }
   return row
 }

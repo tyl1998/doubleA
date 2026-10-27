@@ -26,6 +26,9 @@ import {
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   ARTIFACT_PREVIEW_MAX_TEXT_BYTES,
   previewKindOf,
+  translate,
+  type Locale,
+  type MessageKey,
   type PreviewKind,
 } from '@doubulea/shared'
 
@@ -117,18 +120,30 @@ export function formatBytes(bytes: number): string {
  *
  * 边界：**恰好等于上限 ⇒ 放行**（`>` 而不是 `>=` —— `子方案④` §七 2 的 D 组就是验这一条）。
  */
+/**
+ * 「为什么不能预览」的**结构化原因**（P1-23 收尾 ③）。
+ *
+ * ⚠️ 这里**刻意不返回译文**：本函数是**零 locale 依赖**的纯函数，`ArtifactCard.tsx`
+ * （已迁、且 F 账本在册）也调它 —— 给它加 `locale` 参数会逼着改那个文件。
+ * 组件那边 `t(reason.key, reason.params)` 落正文（`03` §六"读数簇"的第二档）。
+ */
+export interface PreviewUnavailableReason {
+  key: MessageKey
+  params?: Readonly<Record<string, string | number>>
+}
+
 export interface PreviewAvailability {
   /** 预览形态（`shared#previewKindOf` 的返回值，前后端同源） */
   kind: PreviewKind
   available: boolean
-  /** 不可预览时给用户看的一句话（可预览时为 `null`）；两种原因的文案**刻意不同** */
-  reason: string | null
+  /** 不可预览时给用户看的原因（可预览时为 `null`）；两种原因的文案**刻意不同** */
+  reason: PreviewUnavailableReason | null
 }
 
 export function previewAvailability(artifact: { mime: string; size: number }): PreviewAvailability {
   const kind = previewKindOf(artifact.mime)
   if (kind === 'none') {
-    return { kind, available: false, reason: '该格式不支持在线预览，请下载后用本地工具打开' }
+    return { kind, available: false, reason: { key: 'artifact.preview.unsupported' } }
   }
   // `text` 那一路要**取回文本进 JS 字符串**，闸门比"交给浏览器直连渲染"更紧
   const limit = kind === 'text' ? ARTIFACT_PREVIEW_MAX_TEXT_BYTES : ARTIFACT_PREVIEW_MAX_INLINE_BYTES
@@ -136,7 +151,10 @@ export function previewAvailability(artifact: { mime: string; size: number }): P
     return {
       kind,
       available: false,
-      reason: `文件较大（${formatBytes(artifact.size)}，超过在线预览上限 ${formatBytes(limit)}），请下载查看`,
+      reason: {
+        key: 'artifact.preview.tooLarge',
+        params: { size: formatBytes(artifact.size), limit: formatBytes(limit) },
+      },
     }
   }
   return { kind, available: true, reason: null }
@@ -355,12 +373,29 @@ export function buildCsvTable(text: string, delimiter: string): CsvTable {
  *
  * 三处截断各说各的，最后统一补一句"下载可看完整文件" —— 否则用户会以为
  * "这份文件只有 5000 行"，而那是一句假话。
+ *
+ * ⚠️ 唯一调用方是 `CsvPreview.tsx`（本批要迁的组件）⇒ 走"多收 `locale`"这一档
+ * （同 `describeCron` / `taskModel` 的既定口径），而不是结构化返回。
  */
-export function csvTableNote(table: CsvTable): string | null {
+export function csvTableNote(table: CsvTable, locale: Locale): string | null {
   const parts: string[] = []
-  if (table.rowTruncated) parts.push(`仅显示前 ${table.shownRows} 行（共 ${table.totalRows} 行）`)
-  if (table.colTruncated) parts.push(`仅显示前 ${table.shownCols} 列（共 ${table.totalCols} 列）`)
-  if (table.cellTruncated) parts.push(`单元格超过 ${ARTIFACT_PREVIEW_CSV_CELL_CHARS} 字符的部分已截断`)
+  if (table.rowTruncated) {
+    parts.push(
+      translate(locale, 'artifact.preview.rowsTruncated', { shown: table.shownRows, total: table.totalRows }),
+    )
+  }
+  if (table.colTruncated) {
+    parts.push(
+      translate(locale, 'artifact.preview.colsTruncated', { shown: table.shownCols, total: table.totalCols }),
+    )
+  }
+  if (table.cellTruncated) {
+    parts.push(
+      translate(locale, 'artifact.preview.cellsTruncated', { limit: ARTIFACT_PREVIEW_CSV_CELL_CHARS }),
+    )
+  }
   if (parts.length === 0) return null
-  return `${parts.join('；')} —— 完整内容请下载原文件`
+  return translate(locale, 'artifact.preview.csvNote', {
+    parts: parts.join(translate(locale, 'artifact.preview.listSeparator')),
+  })
 }

@@ -29,12 +29,14 @@ import { useEffect, useState } from 'react'
 import { describeError } from '../../api/client.js'
 import { useCreateUser, useUpdateUser } from '../../api/adminUsers.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT } from '../../app/i18n.js'
 import {
   EMPTY_USER_FORM_VALUES,
-  USER_ROLE_LABELS,
+  USER_ROLE_LABEL_KEY,
   buildCreateUserBody,
   buildUpdateUserBody,
   userEditValuesOf,
+  userRoleLabel,
 } from './adminModel.js'
 
 export interface UserFormModalProps {
@@ -47,12 +49,15 @@ export interface UserFormModalProps {
   onCreated: (result: InitialPasswordResult) => void
 }
 
-const ROLE_OPTIONS = USER_ROLES.map((role) => ({ value: role, label: USER_ROLE_LABELS[role] }))
+const ROLE_VALUES = USER_ROLES.map((role) => ({ value: role, labelKey: USER_ROLE_LABEL_KEY[role] }))
 
 export function UserFormModal({ user, open, currentUserId, onClose, onCreated }: UserFormModalProps) {
   const feedback = useFeedback()
+  const { t, locale } = useT()
   const create = useCreateUser()
   const update = useUpdateUser()
+
+  const roleOptions = ROLE_VALUES.map((option) => ({ value: option.value, label: t(option.labelKey) }))
 
   const [username, setUsername] = useState('')
   const [nickname, setNickname] = useState('')
@@ -98,7 +103,7 @@ export function UserFormModal({ user, open, currentUserId, onClose, onCreated }:
 
     const body = buildUpdateUserBody(user, role)
     if (body === null) {
-      feedback.note('没有需要保存的改动')
+      feedback.note(t('userForm.noChanges'))
       onClose()
       return
     }
@@ -106,7 +111,7 @@ export function UserFormModal({ user, open, currentUserId, onClose, onCreated }:
       { id: user.id, body },
       {
         onSuccess: (saved) => {
-          feedback.ok(`已把「${saved.username}」的角色改为 ${USER_ROLE_LABELS[saved.role]}`)
+          feedback.ok(t('userForm.roleChanged', { name: saved.username, role: userRoleLabel(saved.role, locale) }))
           onClose()
         },
         onError: (error) => setErrorText(describeError(error).message),
@@ -117,25 +122,25 @@ export function UserFormModal({ user, open, currentUserId, onClose, onCreated }:
   return (
     <Modal
       open={open}
-      title={editing ? `编辑「${user.username}」` : '创建用户'}
-      okText={editing ? '保存' : '创建'}
+      title={editing ? t('userForm.titleEdit', { name: user.username }) : t('userForm.titleCreate')}
+      okText={editing ? t('common.save') : t('userForm.okCreate')}
       okButtonProps={{ disabled: !canSubmit, loading: submitting }}
-      cancelText="取消"
+      cancelText={t('common.cancel')}
       onOk={submit}
       onCancel={onClose}
       maskClosable={!submitting}
     >
       <div className="stack">
         <div>
-          <p className="block-label">用户名</p>
+          <p className="block-label">{t('userForm.username')}</p>
           {editing ? (
             <p className="num">{user.username}</p>
           ) : (
             <Input
               value={username}
               maxLength={64}
-              aria-label="用户名"
-              placeholder="登录名，例如 zhangsan（不含空格）"
+              aria-label={t('userForm.usernameAria')}
+              placeholder={t('userForm.usernamePlaceholder')}
               onChange={(event) => setUsername(event.target.value)}
               onPressEnter={() => {
                 if (canSubmit) submit()
@@ -143,45 +148,41 @@ export function UserFormModal({ user, open, currentUserId, onClose, onCreated }:
             />
           )}
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {editing
-              ? '用户名创建后不可修改（后端没有这个字段）。'
-              : '最多 64 个字符，不能含空格；服务端会去掉首尾空白并转成小写后保存。'}
+            {editing ? t('userForm.usernameLocked') : t('userForm.usernameHelp')}
           </p>
         </div>
 
         <div>
-          <p className="block-label">显示名</p>
+          <p className="block-label">{t('userForm.nickname')}</p>
           {editing ? (
-            <p>{user.nickname ?? '（未设置）'}</p>
+            <p>{user.nickname ?? t('userForm.nicknameUnset')}</p>
           ) : (
             <Input
               value={nickname}
               maxLength={64}
-              aria-label="显示名"
-              placeholder="留空表示不设置（界面回落到用户名）"
+              aria-label={t('userForm.nicknameAria')}
+              placeholder={t('userForm.nicknamePlaceholder')}
               onChange={(event) => setNickname(event.target.value)}
               onPressEnter={() => {
                 if (canSubmit) submit()
               }}
             />
           )}
-          {editing && <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>显示名同样不可修改（后端只接受 status 与 role）。</p>}
+          {editing && <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>{t('userForm.nicknameLocked')}</p>}
         </div>
 
         <div>
-          <p className="block-label">角色</p>
+          <p className="block-label">{t('userForm.role')}</p>
           <Select<UserRole>
             value={role}
-            options={ROLE_OPTIONS}
+            options={roleOptions}
             disabled={isSelf}
             style={{ width: '100%' }}
-            aria-label="角色"
+            aria-label={t('userForm.roleAria')}
             onChange={setRole}
           />
           <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-            {isSelf
-              ? '不能改自己的角色（后端会 409）：本系统只有管理员能进这一页，把自己降级后没有任何入口能改回来。'
-              : '管理员可进「用户管理」与「模型池管理」；成员只能用智能体、知识库与对话。'}
+            {isSelf ? t('userForm.roleSelfBlocked') : t('userForm.roleHelp')}
           </p>
         </div>
 
@@ -189,13 +190,18 @@ export function UserFormModal({ user, open, currentUserId, onClose, onCreated }:
           <Alert
             type="info"
             showIcon
-            message="初始密码由服务端生成"
-            description="创建成功后只会显示一次（18 位、无易混字符）。对方首次登录会被强制改密，之后这个密码就作废了。"
+            message={t('userForm.passwordNoteTitle')}
+            description={t('userForm.passwordNoteDesc')}
           />
         )}
 
         {errorText !== null && (
-          <Alert type="error" showIcon message={editing ? '保存失败' : '创建失败'} description={errorText} />
+          <Alert
+            type="error"
+            showIcon
+            message={editing ? t('userForm.saveFailed') : t('userForm.createFailed')}
+            description={errorText}
+          />
         )}
       </div>
     </Modal>

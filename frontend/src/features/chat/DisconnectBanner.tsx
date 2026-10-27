@@ -23,10 +23,11 @@
  *    黄条若跟着轮次走，它会在对齐丢掉轮次的那一刻自己消失，用户就看不到"对齐完了"这个动作。
  */
 
+import { useT } from '../../app/i18n.js'
 import {
-  DISCONNECT_BANNER_ACTION,
-  DISCONNECT_BANNER_DETAIL,
-  DISCONNECT_BANNER_TITLE,
+  DISCONNECT_BANNER_ACTION_KEY,
+  DISCONNECT_BANNER_DETAIL_KEY,
+  DISCONNECT_BANNER_TITLE_KEY,
 } from './streamErrors.js'
 
 export interface DisconnectBannerProps {
@@ -38,6 +39,7 @@ export interface DisconnectBannerProps {
 }
 
 export function DisconnectBanner({ extra, onAlign, aligning }: DisconnectBannerProps) {
+  const { t } = useT()
   return (
     <button
       type="button"
@@ -48,13 +50,13 @@ export function DisconnectBanner({ extra, onAlign, aligning }: DisconnectBannerP
     >
       <span className="led led--warn" aria-hidden="true" />
       <span className="banner__text">
-        <strong>{DISCONNECT_BANNER_TITLE}</strong>
+        <strong>{t(DISCONNECT_BANNER_TITLE_KEY)}</strong>
         <span className="banner__detail">
-          {DISCONNECT_BANNER_DETAIL}
+          {t(DISCONNECT_BANNER_DETAIL_KEY)}
           {extra === null ? null : <span className="num"> （{extra}）</span>}
         </span>
       </span>
-      <span className="banner__action num">{aligning ? '对齐中…' : DISCONNECT_BANNER_ACTION}</span>
+      <span className="banner__action num">{aligning ? t('chat.disconnectAligning') : t(DISCONNECT_BANNER_ACTION_KEY)}</span>
     </button>
   )
 }

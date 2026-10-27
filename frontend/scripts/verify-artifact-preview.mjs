@@ -92,6 +92,9 @@ function assertDeepEqual(actual, expected, label) {
   assert(a === b, `${label}：期望 ${b}，实际 ${a}`)
 }
 
+/** 该串里有没有 CJK 汉字（判断"en 译文里还留着中文"） */
+const CJK = /[\u4e00-\u9fff]/
+
 /**
  * 去掉注释再搜源码字面量（`verify-knowledge-ui.mjs` 同款）。
  *
@@ -106,6 +109,7 @@ function stripComments(source) {
 
 const {
   previewKindOf,
+  translate,
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   ARTIFACT_PREVIEW_MAX_TEXT_BYTES,
 } = await import('@doubulea/shared')
@@ -274,7 +278,15 @@ await it('C1 超行：保留 MAX_ROWS 行，**读数报原始总数**', () => {
   assertEqual(table.shownRows, ARTIFACT_PREVIEW_CSV_MAX_ROWS, 'shownRows')
   assertEqual(table.totalRows, rows, '★ totalRows 必须是截断前的数')
   assertEqual(table.rowTruncated, true, 'rowTruncated')
-  assertIncludes(csvTableNote(table), `共 ${rows} 行`, '读数文案含原始总数')
+  assertIncludes(csvTableNote(table, 'zh'), `共 ${rows} 行`, '读数文案含原始总数')
+  assertEqual(
+    csvTableNote(table, 'zh'),
+    `仅显示前 ${ARTIFACT_PREVIEW_CSV_MAX_ROWS} 行（共 ${rows} 行） —— 完整内容请下载原文件`,
+    'zh 读数与迁移前逐字一致',
+  )
+  const noteEn = csvTableNote(table, 'en')
+  assertIncludes(noteEn, String(rows), 'en 读数含原始总数')
+  assert(!CJK.test(noteEn), `en 读数不该有汉字：${noteEn}`)
 })
 
 await it('C2 超列：保留 MAX_COLS 列，读数报原始列数', () => {
@@ -284,7 +296,7 @@ await it('C2 超列：保留 MAX_COLS 列，读数报原始列数', () => {
   assertEqual(table.rows[0]?.length, ARTIFACT_PREVIEW_CSV_MAX_COLS, '数据行单元格数')
   assertEqual(table.totalCols, cols, '★ totalCols 必须是截断前的数')
   assertEqual(table.colTruncated, true, 'colTruncated')
-  assertIncludes(csvTableNote(table), `共 ${cols} 列`, '读数文案含原始列数')
+  assertIncludes(csvTableNote(table, 'zh'), `共 ${cols} 列`, '读数文案含原始列数')
 })
 
 await it('C3 超长单元格：截断 + 标 `…`，**边界值（恰好等于上限）不截断**', () => {
@@ -299,12 +311,12 @@ await it('C3 超长单元格：截断 + 标 `…`，**边界值（恰好等于�
   const cell = table.rows[0]?.[0] ?? ''
   assertEqual([...cell].length, ARTIFACT_PREVIEW_CSV_CELL_CHARS + 1, '截断到上限 + 一个省略号（按**码点**算）')
   assert(cell.endsWith('…'), `应以省略号结尾，实际结尾 ${JSON.stringify(cell.slice(-3))}`)
-  assertIncludes(csvTableNote(table), '已截断', '读数文案说明截断')
+  assertIncludes(csvTableNote(table, 'zh'), '已截断', '读数文案说明截断')
 })
 
 await it('C4 没截断时**不给**那行读数（不制造"好像截了"的错觉）', () => {
   const table = buildCsvTable('a,b\n1,2\n', ',')
-  assertEqual(csvTableNote(table), null, '小文件没有读数')
+  assertEqual(csvTableNote(table, 'zh'), null, '小文件没有读数')
   assertEqual(table.rowTruncated, false, 'rowTruncated')
   assertEqual(table.colTruncated, false, 'colTruncated')
 })
@@ -327,7 +339,9 @@ await it('D1 内联类（图片 / PDF）：上限放行、+1 拒绝，且文案�
 
   const over = previewAvailability({ mime: 'image/png', size: ARTIFACT_PREVIEW_MAX_INLINE_BYTES + 1 })
   assertEqual(over.available, false, '上限 +1 ⇒ 只给下载')
-  assertIncludes(over.reason ?? '', '较大', '原因是"文件较大"而不是"不支持"')
+  assertEqual(over.reason?.key, 'artifact.preview.tooLarge', '原因是"文件较大"而不是"不支持"')
+  assertIncludes(translate('zh', over.reason.key, over.reason.params), '较大', 'zh 原因文案')
+  assert(!CJK.test(translate('en', over.reason.key, over.reason.params)), 'en 原因文案不含汉字')
 })
 
 await it('D2 文本类（MD / CSV）：用**更紧**的那个闸门', () => {
@@ -344,7 +358,9 @@ await it('D2 文本类（MD / CSV）：用**更紧**的那个闸门', () => {
 await it('D3 `none` 与体积无关（再小也不给预览），原因是"不支持"而不是"较大"', () => {
   const small = previewAvailability({ mime: 'application/zip', size: 10 })
   assertEqual(small.available, false, 'zip 再小也不预览')
-  assertIncludes(small.reason ?? '', '不支持在线预览', '原因文案')
+  assertEqual(small.reason?.key, 'artifact.preview.unsupported', '原因 key')
+  assertIncludes(translate('zh', small.reason.key), '不支持在线预览', 'zh 原因文案')
+  assert(!CJK.test(translate('en', small.reason.key)), 'en 原因文案不含汉字')
 })
 
 // ───────────────────────────── E 两个 URL ─────────────────────────────

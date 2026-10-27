@@ -13,7 +13,7 @@
  * 全部端点登录即可读/用 —— 它们不含任何秘密，是"这台机器的运行时能力"。
  */
 
-import {
+import { appMsg,
   AppError,
   buildSandboxRuntimeBodySchema,
   buildSandboxRuntimeResultSchema,
@@ -140,7 +140,7 @@ export function registerSandboxRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth, schema: { params: instanceBuildIdParamsSchema } },
     async (request) => {
       const job = getSandboxBuildJob(request.params.buildId, request.params.instanceId)
-      if (job === undefined) throw AppError.notFound('构建任务不存在或已过期（可能是后端重启过，或该任务在另一台实例上）')
+      if (job === undefined) throw AppError.notFound(appMsg('app.m022'))
       return ok(sandboxBuildJobSchema.parse(job))
     },
   )
@@ -150,7 +150,7 @@ export function registerSandboxRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth, schema: { params: buildIdParamsSchema } },
     async (request) => {
       const job = getSandboxBuildJob(request.params.buildId)
-      if (job === undefined) throw AppError.notFound('构建任务不存在或已过期（可能是后端重启过）')
+      if (job === undefined) throw AppError.notFound(appMsg('app.m023'))
       return ok(sandboxBuildJobSchema.parse(job))
     },
   )
@@ -161,7 +161,7 @@ export function registerSandboxRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth, schema: { params: instanceBuildIdParamsSchema } },
     async (request) => {
       const job = cancelSandboxBuild(request.params.buildId, request.params.instanceId)
-      if (job === undefined) throw AppError.notFound('构建任务不存在或已过期（可能是后端重启过，或该任务在另一台实例上）')
+      if (job === undefined) throw AppError.notFound(appMsg('app.m022'))
       return ok(sandboxBuildJobSchema.parse(job))
     },
   )
@@ -172,7 +172,7 @@ export function registerSandboxRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth, schema: { params: buildIdParamsSchema } },
     async (request) => {
       const job = cancelSandboxBuild(request.params.buildId)
-      if (job === undefined) throw AppError.notFound('构建任务不存在或已过期（可能是后端重启过）')
+      if (job === undefined) throw AppError.notFound(appMsg('app.m023'))
       return ok(sandboxBuildJobSchema.parse(job))
     },
   )

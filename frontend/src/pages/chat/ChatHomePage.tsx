@@ -24,11 +24,13 @@ import { isConversationReadOnly } from '@doubulea/shared'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import { MY_CONVERSATIONS_PAGE_LIMIT_MAX, useMyConversations } from '../../api/conversations.js'
+import { useT } from '../../app/i18n.js'
 import { HOME_PATH, newConversationPath } from '../../app/paths.js'
 import { AgentPicker } from '../../features/chat/AgentPicker.js'
 import { ChatPage } from './ChatPage.js'
 
 export function ChatHomePage() {
+  const { t } = useT()
   const params = useParams<{ agentId?: string; conversationId?: string }>()
   const location = useLocation()
   const navigate = useNavigate()
@@ -68,14 +70,12 @@ export function ChatHomePage() {
         <div className="chat-home__welcome">
           <div className="empty">
             <div className="empty__frame" aria-hidden="true" />
-            <p className="empty__title">开始一段对话</p>
-            <p className="empty__lead">
-              左侧是你的历史会话（含全部智能体）。选一个智能体即可开始新对话 —— 首条消息发出时才会创建会话。
-            </p>
+            <p className="empty__title">{t('chat.welcomeTitle')}</p>
+            <p className="empty__lead">{t('chat.welcomeLead')}</p>
             <AgentPicker
-              trigger="＋ 新对话"
+              trigger={t('chat.newConversation')}
               triggerClassName="convrail__new-btn"
-              triggerTitle="新建对话（选择智能体）"
+              triggerTitle={t('chat.newConversationTitle')}
               onPick={(agentId) => navigate(newConversationPath(agentId))}
             />
           </div>
@@ -88,18 +88,16 @@ export function ChatHomePage() {
       if (listQuery.isPending) {
         return (
           <div className="chat-home__welcome">
-            <p className="convrail__hint">正在打开会话…</p>
+            <p className="convrail__hint">{t('chat.openConversation')}</p>
           </div>
         )
       }
       return (
         <div className="chat-home__welcome">
           <div className="empty">
-            <p className="empty__title">找不到这个会话</p>
+            <p className="empty__title">{t('chat.conversationNotFound')}</p>
             <p className="empty__lead">
-              {listQuery.isError
-                ? '会话列表没有读出来，请刷新页面重试。'
-                : '它可能已被删除，或链接里的 id 不对。'}
+              {listQuery.isError ? t('chat.conversationListFailed') : t('chat.conversationNotFoundLead')}
             </p>
             <Button
               type="primary"
@@ -107,7 +105,7 @@ export function ChatHomePage() {
                 navigate(HOME_PATH, { replace: true })
               }}
             >
-              回到聊天主页
+              {t('chat.backToHome')}
             </Button>
           </div>
         </div>

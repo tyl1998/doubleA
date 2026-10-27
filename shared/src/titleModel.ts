@@ -28,6 +28,8 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
 /**
  * 标题模型生成的**指令 prompt**（`titleGenerate.ts` 用它组装这一次上游调用）。
  *
@@ -160,12 +162,12 @@ export type TitleModelConfig = z.infer<typeof titleModelConfigSchema>
  */
 export const updateTitleModelBodySchema = z.object({
   enabled: z.boolean({
-    required_error: '缺少 enabled（true = 启用模型生成标题，false = 只用确定性截断）',
-    invalid_type_error: 'enabled 必须是布尔值',
+    required_error: validationMessage('validation.titleModel.enabledMissing'),
+    invalid_type_error: validationMessage('validation.titleModel.enabledNotBoolean'),
   }),
   modelId: z
-    .string({ invalid_type_error: 'modelId 必须是字符串 UUID 或 null' })
-    .uuid('标题模型 ID 不是合法 UUID')
+    .string({ invalid_type_error: validationMessage('validation.titleModel.modelIdNotString') })
+    .uuid(validationMessage('validation.titleModel.modelIdNotUuid'))
     .nullable()
     .optional(),
 })

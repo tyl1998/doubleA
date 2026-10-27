@@ -17,23 +17,38 @@ export type UiThemeMode = 'light' | 'dark'
 
 /** localStorage 键名（前缀统一成 `doubulea.`，便于一眼看出是本应用的键） */
 const THEME_STORAGE_KEY = 'doubulea.theme'
+/** 会话栏卡片样式（完整 / 省略）的持久化键 —— 与配色同款"纯客户端偏好" */
+const RAIL_COMPACT_STORAGE_KEY = 'doubulea.railCompact'
 
-/** localStorage 在隐私模式 / 存储被禁用时会抛异常 —— 配色偏好丢失不值得让页面挂掉 */
-function readStoredMode(): UiThemeMode | undefined {
+/** localStorage 在隐私模式 / 存储被禁用时会抛异常 —— 偏好丢失不值得让页面挂掉 */
+function readStoredString(key: string): string | undefined {
   try {
-    const raw = window.localStorage.getItem(THEME_STORAGE_KEY)
-    return raw === 'light' || raw === 'dark' ? raw : undefined
+    return window.localStorage.getItem(key) ?? undefined
   } catch {
     return undefined
   }
 }
 
-function writeStoredMode(mode: UiThemeMode): void {
+function writeStoredString(key: string, value: string): void {
   try {
-    window.localStorage.setItem(THEME_STORAGE_KEY, mode)
+    window.localStorage.setItem(key, value)
   } catch {
     // 存不下就只在本次会话生效，不打扰用户
   }
+}
+
+function readStoredMode(): UiThemeMode | undefined {
+  const raw = readStoredString(THEME_STORAGE_KEY)
+  return raw === 'light' || raw === 'dark' ? raw : undefined
+}
+
+function writeStoredMode(mode: UiThemeMode): void {
+  writeStoredString(THEME_STORAGE_KEY, mode)
+}
+
+/** 缺省 = 完整模式（原型与本仓的既有外观） */
+function readStoredCompact(): boolean {
+  return readStoredString(RAIL_COMPACT_STORAGE_KEY) === '1'
 }
 
 /**
@@ -56,10 +71,22 @@ export function applyThemeMode(mode: UiThemeMode): void {
  */
 const INITIAL_MODE: UiThemeMode = readStoredMode() ?? 'light'
 
+/**
+ * 会话栏卡片样式：`full` = 现有观感（标题 + 状态灯 + 状态文案 + 智能体徽标 + 时间）；
+ * `compact` = 省略态（只留标题 + 状态色点，行更矮）。**纯客户端偏好**（存 localStorage），
+ * 与配色 / 语言同款口径 —— 它只影响会话栏怎么画，不影响任何服务端事实。
+ */
+export type RailCardMode = 'full' | 'compact'
+
+const INITIAL_CARD_MODE: RailCardMode = readStoredCompact() ? 'compact' : 'full'
+
 interface UiState {
   themeMode: UiThemeMode
   setThemeMode: (mode: UiThemeMode) => void
   toggleThemeMode: () => void
+  /** 会话栏卡片样式（完整 / 省略） */
+  railCardMode: RailCardMode
+  toggleRailCardMode: () => void
 }
 
 export const useUiStore = create<UiState>((set, get) => ({
@@ -71,6 +98,12 @@ export const useUiStore = create<UiState>((set, get) => ({
   },
   toggleThemeMode: () => {
     get().setThemeMode(get().themeMode === 'dark' ? 'light' : 'dark')
+  },
+  railCardMode: INITIAL_CARD_MODE,
+  toggleRailCardMode: () => {
+    const next: RailCardMode = get().railCardMode === 'compact' ? 'full' : 'compact'
+    writeStoredString(RAIL_COMPACT_STORAGE_KEY, next === 'compact' ? '1' : '0')
+    set({ railCardMode: next })
   },
 }))
 

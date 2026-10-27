@@ -31,6 +31,7 @@ import { z } from 'zod'
 
 import { isValidCron } from './cron.js'
 import { offsetPageOf } from './envelope.js'
+import { validationMessage } from './i18n/validation.js'
 
 // ───────────────────────────── 取值域与上限 ─────────────────────────────
 
@@ -122,8 +123,13 @@ export type ScheduledTaskItem = z.infer<typeof scheduledTaskItemSchema>
 // ───────────────────────────── 列表 ─────────────────────────────
 
 export const listScheduledTasksQuerySchema = z.object({
-  offset: z.coerce.number().int().min(0, 'offset 不能为负').default(0),
-  limit: z.coerce.number().int().min(1, 'limit 至少为 1').max(100, 'limit 最多 100').default(20),
+  offset: z.coerce.number().int().min(0, validationMessage('validation.common.offsetNotNegative')).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, validationMessage('validation.common.limitMin'))
+    .max(100, validationMessage('validation.common.limitMax'))
+    .default(20),
 })
 export type ListScheduledTasksQuery = z.infer<typeof listScheduledTasksQuerySchema>
 
@@ -134,25 +140,30 @@ export type ScheduledTaskListResult = z.infer<typeof scheduledTaskListResultSche
 
 /** cron 字段的**唯一校验**（前后端共用，见文件头 ②）；错误文案直接给用户看 */
 const cronExprSchema = z
-  .string({ required_error: '请填写 cron 表达式' })
+  .string({ required_error: validationMessage('validation.task.cronRequired') })
   .trim()
-  .min(1, '请填写 cron 表达式')
-  .max(SCHEDULED_TASK_CRON_MAX, `cron 表达式最长 ${SCHEDULED_TASK_CRON_MAX} 个字符`)
-  .refine(isValidCron, 'cron 表达式不合法（5 段：分 时 日 月 周）')
+  .min(1, validationMessage('validation.task.cronRequired'))
+  .max(SCHEDULED_TASK_CRON_MAX, validationMessage('validation.task.cronTooLong', { max: SCHEDULED_TASK_CRON_MAX }))
+  .refine(isValidCron, validationMessage('validation.task.cronInvalid'))
 
 export const createScheduledTaskBodySchema = z.object({
   /** 必须是 **TASK_AGENT**（ChatBot 没有沙箱，定时派活无意义）—— 服务端会再校验一次 */
-  agentId: z.string({ required_error: '请选择智能体' }).uuid('智能体 ID 不是合法 UUID'),
+  agentId: z
+    .string({ required_error: validationMessage('validation.task.agentRequired') })
+    .uuid(validationMessage('validation.task.agentIdNotUuid')),
   name: z
-    .string({ required_error: '请填写任务名' })
+    .string({ required_error: validationMessage('validation.task.nameRequired') })
     .trim()
-    .min(1, '请填写任务名')
-    .max(SCHEDULED_TASK_NAME_MAX, `任务名最长 ${SCHEDULED_TASK_NAME_MAX} 个字符`),
+    .min(1, validationMessage('validation.task.nameRequired'))
+    .max(SCHEDULED_TASK_NAME_MAX, validationMessage('validation.task.nameTooLong', { max: SCHEDULED_TASK_NAME_MAX })),
   prompt: z
-    .string({ required_error: '请填写指令' })
+    .string({ required_error: validationMessage('validation.task.promptRequired') })
     .trim()
-    .min(1, '请填写指令')
-    .max(SCHEDULED_TASK_PROMPT_MAX, `指令最长 ${SCHEDULED_TASK_PROMPT_MAX} 个字符`),
+    .min(1, validationMessage('validation.task.promptRequired'))
+    .max(
+      SCHEDULED_TASK_PROMPT_MAX,
+      validationMessage('validation.task.promptTooLong', { max: SCHEDULED_TASK_PROMPT_MAX }),
+    ),
   cronExpr: cronExprSchema,
   /** 省略 = 建完即启用 */
   enabled: z.boolean().default(true),
@@ -164,11 +175,15 @@ export const createScheduledTaskBodySchema = z.object({
   /** 通知渠道（省略 = 不通知）。非 `NONE` 时必须给 `notifyUrl`（服务层校验） */
   notifyType: z.enum(NOTIFY_TYPES).default('NONE'),
   /** webhook 地址（企微/飞书群机器人的完整 URL，含 key）；非空才会被加密存储 */
-  notifyUrl: z.string().trim().max(2048, 'webhook 地址过长').optional(),
+  notifyUrl: z.string().trim().max(2048, validationMessage('validation.task.notifyUrlTooLong')).optional(),
   /** 飞书自定义机器人的签名密钥（可选） */
-  notifySecret: z.string().trim().max(512, '签名密钥过长').optional(),
+  notifySecret: z.string().trim().max(512, validationMessage('validation.task.notifySecretTooLong')).optional(),
   /** 通知模板（可选；留空 = 内置默认）。占位符见 `NOTIFY_TEMPLATE_PLACEHOLDERS` */
-  notifyTemplate: z.string().trim().max(NOTIFY_TEMPLATE_MAX, `通知模板最长 ${NOTIFY_TEMPLATE_MAX} 个字符`).optional(),
+  notifyTemplate: z
+    .string()
+    .trim()
+    .max(NOTIFY_TEMPLATE_MAX, validationMessage('validation.task.notifyTemplateTooLong', { max: NOTIFY_TEMPLATE_MAX }))
+    .optional(),
 })
 export type CreateScheduledTaskBody = z.infer<typeof createScheduledTaskBodySchema>
 
@@ -181,8 +196,18 @@ export type CreateScheduledTaskBody = z.infer<typeof createScheduledTaskBodySche
  */
 export const updateScheduledTaskBodySchema = z
   .object({
-    name: z.string().trim().min(1, '请填写任务名').max(SCHEDULED_TASK_NAME_MAX).optional(),
-    prompt: z.string().trim().min(1, '请填写指令').max(SCHEDULED_TASK_PROMPT_MAX).optional(),
+    name: z
+      .string()
+      .trim()
+      .min(1, validationMessage('validation.task.nameRequired'))
+      .max(SCHEDULED_TASK_NAME_MAX)
+      .optional(),
+    prompt: z
+      .string()
+      .trim()
+      .min(1, validationMessage('validation.task.promptRequired'))
+      .max(SCHEDULED_TASK_PROMPT_MAX)
+      .optional(),
     cronExpr: cronExprSchema.optional(),
     enabled: z.boolean().optional(),
     autoApprove: z.boolean().optional(),
@@ -194,7 +219,7 @@ export const updateScheduledTaskBodySchema = z
     /** 传空串 = 清除模板（回落内置默认）；省略 = 不改 */
     notifyTemplate: z.string().trim().max(NOTIFY_TEMPLATE_MAX).optional(),
   })
-  .refine((value) => Object.keys(value).length > 0, '至少要改一项')
+  .refine((value) => Object.keys(value).length > 0, validationMessage('validation.task.atLeastOneChange'))
 export type UpdateScheduledTaskBody = z.infer<typeof updateScheduledTaskBodySchema>
 
 /** 「立即执行」的响应：本次运行的会话 id（去对话页看过程/产物） */
@@ -206,6 +231,6 @@ export type RunScheduledTaskResult = z.infer<typeof runScheduledTaskResultSchema
 
 /** 路径参数 `:id`（改 / 删 / 立即执行共用） */
 export const scheduledTaskIdParamsSchema = z.object({
-  id: z.string().uuid('定时任务 ID 不是合法 UUID'),
+  id: z.string().uuid(validationMessage('validation.task.idNotUuid')),
 })
 export type ScheduledTaskIdParams = z.infer<typeof scheduledTaskIdParamsSchema>

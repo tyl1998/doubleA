@@ -30,6 +30,10 @@
 
 import { z } from 'zod'
 
+import { validationMessage } from './i18n/validation.js'
+
+import type { MessageKey } from './i18n/index.js'
+
 /** 单条主机规则上限 / 单表条数上限（防"贴一整份 CN 域名表"） */
 export const EGRESS_HOST_MAX = 253
 export const EGRESS_POLICY_MAX_HOSTS = 500
@@ -170,6 +174,13 @@ export const EGRESS_SCOPE_LABELS: Record<EgressScope, string> = {
   REGISTRY: '模型 + 取包',
 }
 
+/** 范围 → i18n key（P1-23；中文那份 {@link EGRESS_SCOPE_LABELS} 保留给日志等中文消费方） */
+export const EGRESS_SCOPE_KEY: Record<EgressScope, MessageKey> = {
+  ALL: 'label.egressScope.ALL',
+  NONE: 'label.egressScope.NONE',
+  REGISTRY: 'label.egressScope.REGISTRY',
+}
+
 /**
  * 「注册表」范围放行的取包主机（P1-16a 的保守默认；P1-16b 会换成网内镜像）。
  * ⚠️ 清单属 `子方案` §十三 待决 13 ④（注册表清单与是否允许 git 依赖）—— 待拍板前只放"官方公共源"。
@@ -231,8 +242,11 @@ export function resolveEgressPolicy(input: {
 
 /** 一组规则字段（请求体用；逐条归一化、去非法、去重、限条数） */
 const hostListSchema = z
-  .array(z.string(), { invalid_type_error: '必须是字符串数组' })
-  .max(EGRESS_POLICY_MAX_HOSTS, `单表最多 ${EGRESS_POLICY_MAX_HOSTS} 条`)
+  .array(z.string(), { invalid_type_error: validationMessage('validation.egressPolicy.hostsNotStringArray') })
+  .max(
+    EGRESS_POLICY_MAX_HOSTS,
+    validationMessage('validation.egressPolicy.hostsTooMany', { max: EGRESS_POLICY_MAX_HOSTS }),
+  )
   .transform((items) => normalizeEgressHostList(items))
 
 /**
@@ -245,7 +259,9 @@ const hostListSchema = z
 export const updateEgressPolicyBodySchema = z.object({
   scope: z
     .enum(EGRESS_SCOPES, {
-      invalid_type_error: `出网范围必须是 ${EGRESS_SCOPES.join(' / ')} 之一`,
+      invalid_type_error: validationMessage('validation.egressPolicy.scopeAllowed', {
+        allowed: EGRESS_SCOPES.join(' / '),
+      }),
     })
     .default(EGRESS_SCOPE_DEFAULT),
   allowHosts: hostListSchema,

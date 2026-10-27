@@ -38,7 +38,7 @@
  * 真正的把关交给第三道（文件头），它不依赖任何声明。
  */
 
-import {
+import { appMsg,
   AppError,
   CHAT_ATTACHMENT_EXTENSIONS,
   IMAGE_UPLOAD_EXTENSIONS,
@@ -317,8 +317,7 @@ export function detectFormat<T extends string>(input: FormatProbeInput, profile:
 export function detectFormat(input: FormatProbeInput, profile: FormatProfile<string> = DOCUMENT_FORMAT_PROFILE): string {
   const extension = extensionOf(input.fileName)
   if (extension === null) {
-    throw AppError.validation(
-      `无法从文件名「${input.fileName}」识别格式（缺少扩展名）。支持的格式：${profile.extensions.join(' / ')}`,
+    throw AppError.validation(appMsg('app.m077', { p0: input.fileName, p1: profile.extensions.join(' / ') }),
     )
   }
 
@@ -332,13 +331,11 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
       const kind = sniffLegacyDoc(input.bytes)
       if (kind === 'html' || kind === 'mhtml') return 'html'
     }
-    throw AppError.validation(`暂不支持 .doc（旧版 Word 二进制格式），${LEGACY_DOC_HINT}`)
+    throw AppError.validation(appMsg('app.m078', { p0: LEGACY_DOC_HINT }))
   }
   // ② 白名单
   if (!profile.extensions.includes(extension)) {
-    throw AppError.validation(
-      `不支持的文件类型 .${extension}。支持的格式：${profile.extensions.join(' / ')}` +
-        `（.doc ${LEGACY_DOC_HINT}）`,
+    throw AppError.validation(appMsg('app.m255', { p0: extension, p1: profile.extensions.join(' / '), p2: LEGACY_DOC_HINT }),
     )
   }
 
@@ -347,9 +344,12 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
   if (declared !== '' && declared !== 'application/octet-stream') {
     const allowed = profile.mimeByExtension[extension] ?? []
     if (!allowed.includes(declared)) {
-      throw AppError.validation(
-        `Content-Type「${input.declaredMime}」与扩展名 .${extension} 不符` +
-          `（.${extension} 应为 ${allowed.join(' 或 ')}）。请确认文件没有被改名，或换用正确的上传方式。`,
+      throw AppError.validation(appMsg('app.m256', {
+          p0: input.declaredMime ?? '',
+          p1: extension,
+          p2: extension,
+          p3: allowed.join(' 或 '),
+        }),
       )
     }
   }
@@ -360,16 +360,12 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
   if (matched !== undefined) {
     if (!matched.extensions.includes(extension)) {
       const hint = matched.hint === undefined ? '' : `（${matched.hint}）`
-      throw AppError.validation(
-        `文件内容与扩展名不符：内容是「${matched.label}」，却被命名为 .${extension}${hint}。` +
-          '请确认文件没有被改名，或改用正确的文件格式。',
+      throw AppError.validation(appMsg('app.m257', { p0: matched.label, p1: extension, p2: hint }),
       )
     }
     // ZIP 签名命中 .docx：再确认它真是 OOXML 包（防"任意 zip 改名成 docx"）
     if (extension === 'docx' && !looksLikeOoxml(input.bytes)) {
-      throw AppError.validation(
-        '文件内容与扩展名不符：这是一个不含 OOXML 结构的压缩包，不是 Word 文档（.docx）。' +
-          '请确认文件没有被改名或损坏。',
+      throw AppError.validation(appMsg('app.m258'),
       )
     }
     return extension
@@ -377,16 +373,11 @@ export function detectFormat(input: FormatProbeInput, profile: FormatProfile<str
 
   // 没有任何二进制签名 ⇒ 应当是纯文本：只允许画像里的文本格式，且不能含 NUL（NUL 是二进制内容的铁证）
   if (!profile.textExtensions.includes(extension)) {
-    throw AppError.validation(
-      `文件内容与扩展名不符：.${extension} 应当是二进制格式` +
-        `（${extension === 'pdf' ? 'PDF 文件头必须是 %PDF-' : 'docx 必须是 ZIP/OOXML 包'}），` +
-        '而该文件看起来是纯文本。请确认文件没有被改名。',
+    throw AppError.validation(appMsg('app.m259', { p0: extension, p1: extension === 'pdf' ? 'PDF 文件头必须是 %PDF-' : 'docx 必须是 ZIP/OOXML 包' }),
     )
   }
   if (head.includes(0)) {
-    throw AppError.validation(
-      `文件内容与扩展名不符：.${extension} 是文本格式，但该文件包含二进制内容（NUL 字节）。` +
-        '请确认文件没有被改名。',
+    throw AppError.validation(appMsg('app.m260', { p0: extension }),
     )
   }
   return extension

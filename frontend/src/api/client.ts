@@ -20,7 +20,18 @@
  *    **不在这里 import router**，否则 api 层反向依赖路由，测试与复用都会变难。
  */
 
-import { DEFAULT_MESSAGE_BY_ERROR_CODE, OK_CODE, type Envelope, type ErrorCode } from '@doubulea/shared'
+import {
+  DEFAULT_MESSAGE_BY_ERROR_CODE,
+  OK_CODE,
+  translate,
+  validationText,
+  type AppMessagePayload,
+  type Envelope,
+  type ErrorCode,
+  type MessageKey,
+} from '@doubulea/shared'
+
+import { currentLocale } from '../stores/locale.js'
 
 /** 服务端 `data.fields` 的一项（`02` §四 规则 3） */
 export interface FieldIssue {
@@ -54,14 +65,28 @@ export class ApiError extends Error {
    */
   readonly data: unknown
   readonly fields: readonly FieldIssue[]
+  /**
+   * 服务端给的**结构化消息**（P1-23 收尾 ⑤）—— 有它时按当前语言渲染，没有就退回 `message`。
+   *
+   * 服务端的 `AppError` 细节消息仍是中文（`msg`），但会附带 `msgKey`；于是 en 界面
+   * 不必再退化成一句笼统的 `error.<CODE>`（见 `app/feedbackModel.ts`）。
+   */
+  readonly msgKey: AppMessagePayload | null
 
-  constructor(code: ClientErrorCode, message: string, status: number, data: unknown = null) {
+  constructor(
+    code: ClientErrorCode,
+    message: string,
+    status: number,
+    data: unknown = null,
+    msgKey: AppMessagePayload | null = null,
+  ) {
     super(message)
     this.name = 'ApiError'
     this.code = code
     this.status = status
     this.data = data
     this.fields = readFieldIssues(data)
+    this.msgKey = msgKey
   }
 
   /** 会话失效：上层据此把人送回登录页 */
@@ -129,17 +154,58 @@ function isEnvelope(value: unknown): value is Envelope<unknown> {
   )
 }
 
-/** 从信封的 `data` 里抽出字段级错误；形状不符时返回空数组（不因为"错误信息本身畸形"再炸一次） */
+/**
+ * 从信封的 `data` 里抽出字段级错误；形状不符时返回空数组（不因为"错误信息本身畸形"再炸一次）。
+ *
+ * ⚠️ **这里是字段级消息的唯一出口**（P1-23 末批）：`shared` 里已迁的 zod 消息以
+ * `@validation.*|{json}` 的形态回来（见 `shared/src/i18n/validation.ts`），在此统一
+ * {@link validationText} 落成当前语言；**没迁的仍是中文正文，原样透传**（零影响）。
+ * 之所以放在这里而不是各页面：`fieldMessage()` / `formMessages` / `feedback` 的兜底
+ * 都从 `fields` 读，散到页面里必然漏。
+ *
+ * 语义是**构造期快照**：`ApiError` 建好那一刻的语言。用户随后切语言时，已经弹出来的
+ * 那条提示不会改词（重发一次请求即可）—— 这是刻意的，不做"错误对象自己订阅语言"。
+ */
 function readFieldIssues(data: unknown): FieldIssue[] {
   if (typeof data !== 'object' || data === null) return []
   const raw = (data as { fields?: unknown }).fields
   if (!Array.isArray(raw)) return []
+  const locale = currentLocale()
   return raw.flatMap((item) => {
     if (typeof item !== 'object' || item === null) return []
     const { path, message } = item as { path?: unknown; message?: unknown }
     if (typeof message !== 'string') return []
-    return [{ path: typeof path === 'string' ? path : '', message }]
+    return [{ path: typeof path === 'string' ? path : '', message: validationText(locale, message) }]
   })
+}
+
+/**
+ * 网络层自造句的落译文（P1-23 收尾 ④）。
+ *
+ * 为什么不走 `@validation.*` 那套：那套是**后端 zod** 的消息编码，而这批句子是
+ * **前端 fetch 自己发现的**（拿不到信封 / 响应形状不符 / 被 abort），从来没经过后端。
+ * 它们由 `ApiError` 直接持有成 `message`，所以必须在**构造期**就落好当前语言 ——
+ * 语言从 {@link currentLocale} 取，与其他非组件上下文（`feedback.ts`）同一口径。
+ *
+ * ⚠️ 刻意**不给 `ApiError` 加 locale 字段**：`ApiError.message` 已经是"可直接展示的文案"，
+ * 再加一份 locale 就变成"同一份数据两种形状"（页面到底信哪个？）。代价是**构造期快照** ——
+ * 用户随后切语言时已经弹出的那条提示不改词，与 `readFieldIssues` 的既定语义一致。
+ */
+function clientText(key: MessageKey, params?: Readonly<Record<string, string | number>>): string {
+  return translate(currentLocale(), key, params)
+}
+
+/** 网络层失败的三种形态（`fetch` 抛错、被 abort、拿不到信封）—— 生成 {@link ApiError} 的唯一来源 */
+function networkError(error: unknown, signal: AbortSignal | undefined): ApiError {
+  if (signal?.aborted === true) return new ApiError(NETWORK_ERROR_CODE, clientText('api.network.aborted'), 0)
+  const reason = error instanceof Error ? error.message : ''
+  return new ApiError(
+    NETWORK_ERROR_CODE,
+    reason === ''
+      ? clientText('api.network.unreachable')
+      : clientText('api.network.unreachableWithReason', { reason }),
+    0,
+  )
 }
 
 export interface RequestOptions {
@@ -169,17 +235,8 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     })
   } catch (error) {
     // 网络不可达 / 被 CORS 拦下 / 请求被 abort。abort 由调用方识别（`signal.aborted`），
-    // 这里统一给一条"能照着做点什么"的文案（`docs/06` §六：落库的失败原因是给人看的）
-    if (signal?.aborted === true) {
-      throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
-    }
-    throw new ApiError(
-      NETWORK_ERROR_CODE,
-      error instanceof Error && error.message !== ''
-        ? `无法连接后端：${error.message}`
-        : '无法连接后端，请检查网络或后端是否已启动',
-      0,
-    )
+    // 文案统一在 `networkError` 里按当前语言取（`docs/06` §六：落库的失败原因是给人看的）
+    throw networkError(error, signal)
   }
 
   let payload: unknown
@@ -187,7 +244,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     payload = await response.json()
   } catch {
     // 拿到 2xx 却不是 JSON：网关/代理回了个 HTML（本机最典型的成因是 vite proxy 串到了别的服务）
-    throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
+    throw new ApiError('INTERNAL', clientText('api.response.notJson', { status: response.status }), response.status)
   }
 
   return unwrapEnvelope<T>(payload, response.status)
@@ -203,11 +260,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
  */
 function unwrapEnvelope<T>(payload: unknown, status: number): T {
   if (!isEnvelope(payload)) {
-    throw new ApiError('INTERNAL', `响应不符合统一信封约定（HTTP ${status}）`, status)
+    throw new ApiError('INTERNAL', clientText('api.response.notEnvelope', { status }), status)
   }
   if (payload.code === OK_CODE) return payload.data as T
 
-  const error = new ApiError(payload.code, payload.msg, status, payload.data)
+  // `msgKey` 只在 `ErrorEnvelope` 上有（成功信封没有该字段）
+  const msgKey = (payload as { msgKey?: AppMessagePayload }).msgKey ?? null
+  const error = new ApiError(payload.code, payload.msg, status, payload.data, msgKey)
   if (error.isUnauthorized) onUnauthorized?.()
   throw error
 }
@@ -247,14 +306,7 @@ export async function openEventStream(
       ...(signal === undefined ? {} : { signal }),
     })
   } catch (error) {
-    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
-    throw new ApiError(
-      NETWORK_ERROR_CODE,
-      error instanceof Error && error.message !== ''
-        ? `无法连接后端：${error.message}`
-        : '无法连接后端，请检查网络或后端是否已启动',
-      0,
-    )
+    throw networkError(error, signal)
   }
 
   const contentType = response.headers.get('content-type') ?? ''
@@ -270,14 +322,14 @@ export async function openEventStream(
   } catch {
     throw new ApiError(
       'INTERNAL',
-      `期望事件流，但响应不是 JSON 也不是事件流（HTTP ${response.status}）`,
+      clientText('api.response.expectedStreamGotOther', { status: response.status }),
       response.status,
     )
   }
   const data = unwrapEnvelope<unknown>(payload, response.status)
   throw new ApiError(
     'INTERNAL',
-    `期望事件流，但响应是统一信封（HTTP ${response.status}）`,
+    clientText('api.response.expectedStreamGotEnvelope', { status: response.status }),
     response.status,
     data,
   )
@@ -317,21 +369,14 @@ export async function requestFormData<T>(
       ...(signal === undefined ? {} : { signal }),
     })
   } catch (error) {
-    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
-    throw new ApiError(
-      NETWORK_ERROR_CODE,
-      error instanceof Error && error.message !== ''
-        ? `无法连接后端：${error.message}`
-        : '无法连接后端，请检查网络或后端是否已启动',
-      0,
-    )
+    throw networkError(error, signal)
   }
 
   let payload: unknown
   try {
     payload = await response.json()
   } catch {
-    throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
+    throw new ApiError('INTERNAL', clientText('api.response.notJson', { status: response.status }), response.status)
   }
 
   return unwrapEnvelope<T>(payload, response.status)
@@ -406,14 +451,7 @@ export async function requestBlob(path: string, options: { signal?: AbortSignal 
       ...(signal === undefined ? {} : { signal }),
     })
   } catch (error) {
-    if (signal?.aborted === true) throw new ApiError(NETWORK_ERROR_CODE, '请求已取消', 0)
-    throw new ApiError(
-      NETWORK_ERROR_CODE,
-      error instanceof Error && error.message !== ''
-        ? `无法连接后端：${error.message}`
-        : '无法连接后端，请检查网络或后端是否已启动',
-      0,
-    )
+    throw networkError(error, signal)
   }
 
   const contentType = response.headers.get('content-type') ?? ''
@@ -422,16 +460,25 @@ export async function requestBlob(path: string, options: { signal?: AbortSignal 
     try {
       payload = await response.json()
     } catch {
-      throw new ApiError('INTERNAL', `响应不是合法的 JSON（HTTP ${response.status}）`, response.status)
+      throw new ApiError('INTERNAL', clientText('api.response.notJson', { status: response.status }), response.status)
     }
     // 信封里的失败会在这里抛出去；成功信封（理论上不会出现）会被下面那句拦下
     const data = unwrapEnvelope<unknown>(payload, response.status)
-    throw new ApiError('INTERNAL', `期望文件字节流，但响应是统一信封（HTTP ${response.status}）`, response.status, data)
+    throw new ApiError(
+      'INTERNAL',
+      clientText('api.response.expectedBlobGotEnvelope', { status: response.status }),
+      response.status,
+      data,
+    )
   }
 
   if (!response.ok) {
     // 非 JSON 且非 2xx：网关回了个 HTML（本机最典型的成因是 vite proxy 串到了别的服务）
-    throw new ApiError('INTERNAL', `下载失败：响应不是 JSON 信封也不是文件（HTTP ${response.status}）`, response.status)
+    throw new ApiError(
+      'INTERNAL',
+      clientText('api.response.notBlob', { status: response.status }),
+      response.status,
+    )
   }
 
   return {

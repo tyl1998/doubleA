@@ -16,7 +16,7 @@
  * 翻译成 shared 世界的 `AppError`**，翻译完就交给 `toErrorEnvelope` / `toHttpStatus`。
  */
 
-import {
+import { appMsg,
   AppError,
   DEFAULT_MESSAGE_BY_ERROR_CODE,
   type Envelope,
@@ -211,7 +211,7 @@ export function installErrorHandler(app: FastifyInstance): void {
 
   // 404 也走信封（默认 Fastify 404 返回的是 `{statusCode,error,message}`，前端解析器会懵）
   app.setNotFoundHandler((request, reply) => {
-    const appError = AppError.notFound(`接口不存在：${request.method} ${request.url}`)
+    const appError = AppError.notFound(appMsg('app.m083', { p0: request.method, p1: request.url }))
     void reply.status(toHttpStatus(appError)).send(toErrorEnvelope(appError))
   })
 }

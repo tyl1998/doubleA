@@ -58,7 +58,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { Readable } from 'node:stream'
 
-import {
+import { appMsg,
   AppError,
   canTransitionDocumentStatus,
   hasAnyImageOption,
@@ -187,7 +187,7 @@ async function assertImageOptionsUsable(
 ): Promise<void> {
   if (!hasAnyImageOption(options)) {
     if (isImageFormat(format)) {
-      throw AppError.validation(`上传的是图片文件，${IMAGE_FILE_REQUIRES_MODE_HINT}`)
+      throw AppError.validation(appMsg('app.m140', { p0: IMAGE_FILE_REQUIRES_MODE_HINT }))
     }
     return
   }
@@ -252,7 +252,7 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
 
   // ① 知识库必须存在 —— 放在格式校验**之前**：库不存在时"文件格式不对"这类提示毫无意义
   const kb = await db.knowledgeBase.findUnique({ where: { id: input.kbId }, select: { id: true } })
-  if (kb === null) throw AppError.notFound('知识库不存在')
+  if (kb === null) throw AppError.notFound(appMsg('app.m003'))
 
   // ①b 该库若"需整库重建"（模型/维度已变），单篇上传会写出混合维度 ⇒ 拒绝，要求先整库重建
   await assertKbReadyForSingleDoc(input.kbId)
@@ -292,7 +292,7 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
     })
   } catch (error) {
     logger.error({ err: error, bucket, fileKey }, '原文件写入 S3 失败，已中止上传（未建文档行）')
-    throw AppError.internal(`原文件写入对象存储失败，上传已中止：${String(error)}`)
+    throw AppError.internal(appMsg('app.m141', { p0: String(error) }))
   }
 
   // ⑤ 落库（`status=PARSING` —— 等 P0-1-17 的 worker 消费）
@@ -316,7 +316,7 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
     await removeQuietly(bucket, fileKey)
     if (hasPrismaCode(error, 'P2003')) {
       // 外键失败 = 知识库在"查存在"与"建行"之间被删了（并发）。给 404 而不是 500
-      throw AppError.notFound('知识库不存在（可能在本次上传期间被删除）')
+      throw AppError.notFound(appMsg('app.m142'))
     }
     throw error
   }
@@ -331,10 +331,7 @@ export async function uploadDocument(input: UploadDocumentInput): Promise<Upload
     })
   } catch (error) {
     await rollbackRegistration(created.id, bucket, fileKey, error)
-    throw AppError.internal(
-      `任务入队失败（队列不可用），本次上传已回滚，请稍后重试：${
-        error instanceof Error ? error.message : String(error)
-      }`,
+    throw AppError.internal(appMsg('app.m143', { p0: error instanceof Error ? error.message : String(error) }),
     )
   }
 
@@ -416,7 +413,7 @@ export async function listDocuments(params: {
 }): Promise<DocumentListResult> {
   const db = getPrisma()
   const kb = await db.knowledgeBase.findUnique({ where: { id: params.kbId }, select: { id: true } })
-  if (kb === null) throw AppError.notFound('知识库不存在')
+  if (kb === null) throw AppError.notFound(appMsg('app.m003'))
 
   // 两次查询放进一个事务：`total` 与当页数据必须来自同一快照，否则分页器会错位（与知识库列表同款）
   const [rows, total] = await db.$transaction([
@@ -464,14 +461,13 @@ export async function renameDocument(params: {
     where: { id: params.docId, kbId: params.kbId },
     select: DOCUMENT_SELECT,
   })
-  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (row === null) throw AppError.notFound(appMsg('app.m007'))
 
   const nextName = params.fileName.trim()
   if (nextName === row.fileName) return toItem(row)
 
   if (fileNameExtension(nextName) !== fileNameExtension(row.fileName)) {
-    throw AppError.validation(
-      '重命名不能改变文件格式：扩展名要与原来的保持一致（文件内容并没有变，换了扩展名会让下载 / 预览的类型对不上）',
+    throw AppError.validation(appMsg('app.m144'),
     )
   }
 
@@ -631,7 +627,7 @@ export async function openDocumentSource(params: {
     where: { id: params.docId, kbId: params.kbId },
     select: { id: true, fileName: true, fileKey: true },
   })
-  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (row === null) throw AppError.notFound(appMsg('app.m007'))
 
   const bucket = config.s3.bucket
   const s3 = getS3Client()
@@ -646,10 +642,10 @@ export async function openDocumentSource(params: {
         { kbId: params.kbId, docId: row.id, fileKey: row.fileKey },
         '文档行存在但 S3 对象已丢失，下载返回 404',
       )
-      throw AppError.notFound('原始文件已不在存储中（可能已被清理），请重新上传该文档')
+      throw AppError.notFound(appMsg('app.m145'))
     }
     getLogger().error({ err: error, docId: row.id, fileKey: row.fileKey }, '读取对象元数据失败')
-    throw AppError.internal('存储服务暂时不可用，请稍后重试')
+    throw AppError.internal(appMsg('app.m012'))
   }
 
   const body = await s3.getObject(bucket, row.fileKey)
@@ -712,7 +708,7 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
     where: { id: input.docId, kbId: input.kbId },
     select: DOCUMENT_MUTATION_SELECT,
   })
-  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (row === null) throw AppError.notFound(appMsg('app.m007'))
 
   // ② 三道前置校验（与上传同一个入口 —— 覆盖重建不能成为绕过校验的后门）
   const format: ParseFormat = detectFormat(input)
@@ -743,7 +739,7 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
   // ④ 状态机守卫（防御性）：三种在库状态都允许回到 PARSING，所以正常永远进不来；
   //    真进来了说明状态值与状态机脱节了，宁可 409 也不要写坏那行
   if (!canTransitionDocumentStatus(row.status as DocumentItem['status'], 'PARSING')) {
-    throw AppError.conflict(`该文档当前状态（${row.status}）不允许覆盖重建`)
+    throw AppError.conflict(appMsg('app.m146', { p0: row.status }))
   }
 
   // ⑤ 新对象（新随机段 —— 与上传同款理由：不共享对象，见文件头）
@@ -757,7 +753,7 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
     })
   } catch (error) {
     logger.error({ err: error, bucket, fileKey }, '覆盖重建：原文件写入 S3 失败，已中止（未改动任何行）')
-    throw AppError.internal(`原文件写入对象存储失败，覆盖重建已中止：${String(error)}`)
+    throw AppError.internal(appMsg('app.m147', { p0: String(error) }))
   }
 
   // ⑥ 事务：删旧 chunk + 改行（`§七` 步骤 2 的 a/b 两条，必须原子）
@@ -807,10 +803,7 @@ export async function reuploadDocument(input: ReuploadDocumentInput): Promise<Re
     await enqueuePipelineJob({ docId: row.id, kbId: input.kbId, contentHash, mode: 'REBUILD' })
   } catch (error) {
     logger.error({ err: error, docId: row.id }, '覆盖重建：内容已替换但入队失败（文档留在 PARSING）')
-    throw AppError.internal(
-      '内容已替换成功，但任务入队失败（队列不可用）。' +
-        '该文档暂时停在「处理中」且内容尚未入库，请稍后在该文档上点「重试」；' +
-        `原因：${error instanceof Error ? error.message : String(error)}`,
+    throw AppError.internal(appMsg('app.m263', { p0: error instanceof Error ? error.message : String(error) }),
     )
   }
 
@@ -850,9 +843,9 @@ export async function retryDocument(params: { kbId: string; docId: string }): Pr
     where: { id: params.docId, kbId: params.kbId },
     select: DOCUMENT_MUTATION_SELECT,
   })
-  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (row === null) throw AppError.notFound(appMsg('app.m007'))
   if (row.status === 'READY') {
-    throw AppError.conflict('该文档已是就绪状态，无需重试；如需替换内容请使用覆盖重建')
+    throw AppError.conflict(appMsg('app.m148'))
   }
 
   // 该库若"需整库重建"（模型/维度已变），重试单篇会写出混合维度 ⇒ 拒绝，要求先整库重建
@@ -876,15 +869,12 @@ export async function retryDocument(params: { kbId: string; docId: string }): Pr
     })
   } catch (error) {
     logger.error({ err: error, docId: row.id }, '重试入队失败')
-    throw AppError.internal(
-      `任务入队失败（队列不可用），请稍后再次点击重试：${
-        error instanceof Error ? error.message : String(error)
-      }`,
+    throw AppError.internal(appMsg('app.m149', { p0: error instanceof Error ? error.message : String(error) }),
     )
   }
 
   const fresh = await db.document.findUnique({ where: { id: row.id }, select: DOCUMENT_SELECT })
-  if (fresh === null) throw AppError.notFound('文档不存在（可能刚被删除）')
+  if (fresh === null) throw AppError.notFound(appMsg('app.m150'))
 
   logger.info({ kbId: params.kbId, docId: row.id, from: row.status, to: next }, '文档已重新入队')
   return { document: toItem(fresh) }
@@ -913,12 +903,12 @@ export async function deleteDocument(params: {
     where: { id: params.docId, kbId: params.kbId },
     select: { id: true, fileName: true, fileKey: true },
   })
-  if (row === null) throw AppError.notFound('文档不存在（或不属于该知识库）')
+  if (row === null) throw AppError.notFound(appMsg('app.m007'))
 
   const deletedChunks = await db.chunk.count({ where: { docId: row.id } })
   // `deleteMany` 而不是 `delete`：与"查到了但已经没了"的竞态正面相遇时，`delete` 会抛 P2025
   const { count } = await db.document.deleteMany({ where: { id: row.id } })
-  if (count === 0) throw AppError.notFound('文档不存在（可能在本次请求期间已被删除）')
+  if (count === 0) throw AppError.notFound(appMsg('app.m151'))
 
   await removeQuietly(config.s3.bucket, row.fileKey)
 

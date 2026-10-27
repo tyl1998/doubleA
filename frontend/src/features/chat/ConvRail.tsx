@@ -1,13 +1,17 @@
 /**
  * 会话栏（P1-15 · `子方案/聊天主页与信息架构改造.md` §四）
  *
- * 一列分两层（2026-10-13 修订）：
- *   · 上层「平台功能」（约 35% 高）：智能体 / 知识库 / MCP / 任务 / 我的凭据 / 会话产物 六个直达入口；
- *     末尾「管理 ▸」点击**就地展开**其余入口（用量统计 / 用户管理 / 模型池）；
- *   · 下层「会话」（约 65% 高）：**跨智能体**会话历史（分组：今天 / 更早；组标题可点击**收缩**；
- *     每条 = 状态灯 + 标题 + 智能体徽标 + 相对时间；行内 hover 浮出 [重命名][删除]）；
- *   · 顶部与底部固定：品牌字标 + 「＋ 新对话」（经 `AgentPicker` 选智能体 ⇒ `/new/:agentId`）；
- *     用户菜单 / 配色 / 服务灯。
+ * 一列分两层（2026-10-26 修订）：
+ *   · 上层「平台功能」（**按内容固定高度、不出现滑块**）：智能体 / 知识库 / MCP / 任务 / 会话产物
+ *     五个直达入口；末尾「管理 ▸」**向右展开**一枚浮层（用量统计 / 我的凭据 / 用户管理 / 模型池 /
+ *     出网策略 / 沙箱实例）；
+ *   · 下层「会话」：**跨智能体**会话历史（分组：今天 / 更早；组标题可点击**收缩**）；
+ *     顶部一行小标题「会话历史」右侧有一枚**卡片样式切换**按钮（完整 / 省略，见 `stores/ui.ts`）：
+ *     完整 = 状态灯 + 标题 + 状态文案 + 智能体徽标 + 相对时间；省略 = 只留标题 + 状态色点、行更矮，
+ *     标题比分组标题更轻，避免"脚重头轻"。
+ *   · 顶部与底部固定：品牌字标 + 「＋ 新对话」（经 `AgentPicker` 选智能体 ⇒ `/new/:agentId`）、
+ *     服务灯 + 当前用户（配色 / 语言切换已收进头像菜单，见 `app/UserMenu.tsx`）。
+ *   · ⚠️ 会话历史的滑块**只在鼠标指向该区域时才显形**（`.convrail__convos` hover，见 app.css）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 三条"不新造口径"（与 `ConversationSidebar` 同源，见 `conversationList.ts`）
@@ -21,8 +25,8 @@
  * 都要导航到同两条路径 —— 与其把这几次导航层层透传到 `ChatPage`，不如让导航住在"它本就属于谁"。
  */
 
-import { DownOutlined, MenuOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
-import { Button, Input, Tag, Tooltip } from 'antd'
+import { CompressOutlined, ExpandAltOutlined, MenuOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
+import { Button, Input, Popover, Tag, Tooltip } from 'antd'
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { CONVERSATION_TOPIC_MAX_CHARS, type ConversationItem, type RemoveConversationResult } from '@doubulea/shared'
@@ -30,6 +34,7 @@ import { CONVERSATION_TOPIC_MAX_CHARS, type ConversationItem, type RemoveConvers
 import { useCurrentUser } from '../../api/auth.js'
 import { MY_CONVERSATIONS_PAGE_LIMIT_MAX, useMyConversations, useRenameConversation } from '../../api/conversations.js'
 import { useFeedback } from '../../app/feedback.js'
+import { useT, type Translate } from '../../app/i18n.js'
 import { matchNavItem, visibleNavItems, type NavItem } from '../../app/nav.js'
 import { ICON_BY_CODE, NAV_FALLBACK_ICON } from '../../app/navIcons.js'
 import { HOME_PATH, conversationPath, newConversationPath } from '../../app/paths.js'
@@ -37,7 +42,8 @@ import { ServiceLed } from '../../app/ServiceLed.js'
 import { UserMenu } from '../../app/UserMenu.js'
 import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
 import { streamingIdsOf, useChatStreamStore } from '../../stores/chatStream.js'
-import { useUiStore } from '../../stores/ui.js'
+import { useLocaleStore } from '../../stores/locale.js'
+import { useUiStore, type RailCardMode } from '../../stores/ui.js'
 import { useWorkspaceStore } from '../../stores/workspace.js'
 import { AgentPicker } from './AgentPicker.js'
 import { DeleteConversationModal } from './DeleteConversationModal.js'
@@ -52,10 +58,10 @@ import { useMinuteTick } from './useMinuteTick.js'
 
 /**
  * 上层「平台功能」的直达入口（按 `NavItem.code`）；顺序即产品口径的展示顺序
- * （智能体 / 知识库 / MCP / 任务 / 我的凭据 / 会话产物），**不跟 `NAV_ITEMS` 的排列**。
- * 其余导航项归「管理 ▸」展开后的「剩余部分」（用量统计 / 用户管理 / 模型池）。
+ * （智能体 / 知识库 / MCP / 任务 / 会话产物），**不跟 `NAV_ITEMS` 的排列**。
+ * 「我的凭据」按用户 2026-10-26 口径**收进「管理 ▸」**（它属个人设置族，不再是平台一级入口）。
  */
-const PLATFORM_NAV_CODES: readonly string[] = ['AG', 'KB', 'MC', 'TK', 'CR', 'AH']
+const PLATFORM_NAV_CODES: readonly string[] = ['AG', 'KB', 'MC', 'TK', 'AH']
 
 export interface ConvRailProps {
   /** 路由里的当前会话 id；`undefined` = 新会话态 / 聊天主页空态 */
@@ -93,25 +99,38 @@ export function ConvRail({ conversationId }: ConvRailProps) {
    * 会拿到**同一个视图对象**，于是下面的 `ConvGroup` / `ConvRow` 的 `memo` 才真的命中。
    * 60s tick 与流式帧（`streamingIds` 重算）在本会话之外就**不再引起任何重渲染**。
    */
+  /** P1-23：当前语言 —— 分组/行读数（`groupConversationViews`）与 `useMemo` 依赖都要它 */
+  const locale = useLocaleStore((state) => state.locale)
+
   const groupsRef = useRef<readonly ConversationGroup[]>([])
   const groups = useMemo(() => {
-    const next = groupConversationViews(items ?? [], now, streamingIds, groupsRef.current)
+    const next = groupConversationViews(items ?? [], now, streamingIds, locale, groupsRef.current)
     groupsRef.current = next
     return next
-  }, [items, now, streamingIds])
+    // ⚠️ `locale` 必须在依赖里：语言一变，分组标题与行文案（"生成中"/时间读数）都要重算。
+    //    漏了它 → 切语言后会话栏文字不跟着变（不报错，静默失效）。
+  }, [items, now, streamingIds, locale])
 
   /** 行内重命名：同时只能有一条在编辑（判据在 `normalizeTopicDraft`） */
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   /** 待确认删除的那一条 */
   const [pendingDelete, setPendingDelete] = useState<ConversationItem | null>(null)
-  /** 「管理 ▸」是否就地展开（展开后露出「其余入口」：用量统计 / 用户管理 / 模型池） */
-  const [manageExpanded, setManageExpanded] = useState(false)
+  /**
+   * 「管理 ▸」浮层是否展开（2026-10-26 用户口径：**向右**弹出，不再就地手风琴）。
+   *
+   * ⚠️ 为什么是**受控**的：`Popover` 默认只在"点击浮层之外"时才收起，而点击浮层里的 `Link`
+   * 是在浮层**内部** ⇒ 不受控时点完一条导航后浮层**会留在原地**（症状：已经换了页面，右侧还挂着
+   * 那枚旧浮层）。故这里自己持有开关，并在每条 `Link` 的 `onClick` 里收起。
+   */
+  const [manageOpen, setManageOpen] = useState(false)
   /** 已收缩的会话分组标题（"更早"这类长列表可点标题收起；默认全部展开） */
   const [collapsedGroups, setCollapsedGroups] = useState<readonly string[]>([])
 
-  const themeMode = useUiStore((state) => state.themeMode)
-  const toggleThemeMode = useUiStore((state) => state.toggleThemeMode)
+  /** 会话栏卡片样式（完整 / 省略）—— 纯客户端偏好，存 localStorage（`stores/ui.ts`） */
+  const railCardMode = useUiStore((state) => state.railCardMode)
+  const toggleRailCardMode = useUiStore((state) => state.toggleRailCardMode)
+  const { t } = useT()
 
   /** 当前命中的导航项 —— 平台功能列表据此高亮（与顶栏面包屑同一判据，见 `nav.ts`） */
   const currentNav = matchNavItem(useLocation().pathname)
@@ -140,8 +159,8 @@ export function ConvRail({ conversationId }: ConvRailProps) {
     rename.mutate(
       { id: item.id, topic: parsed.topic },
       {
-        onSuccess: (updated) => feedback.ok(`已重命名为「${updated.topic ?? parsed.topic}」`),
-        onError: (error) => feedback.fail(error, '重命名失败'),
+        onSuccess: (updated) => feedback.ok(t('rail.renameOk', { topic: updated.topic ?? parsed.topic })),
+        onError: (error) => feedback.fail(error, t('rail.renameFailed')),
       },
     )
   }
@@ -155,8 +174,8 @@ export function ConvRail({ conversationId }: ConvRailProps) {
 
   if (user === undefined || user === null) return null
   const navItems = visibleNavItems(user.role)
-  // 上层「平台功能」= 用户点名的六个直达入口（顺序按产品口径，不随 `NAV_ITEMS` 排）；
-  // 其余（用量统计 / 用户管理 / 模型池）= 「管理 ▸」展开后的「剩余部分」。
+  // 上层「平台功能」= 五个直达入口（顺序按产品口径，不随 `NAV_ITEMS` 排）；
+  // 其余（用量统计 / 我的凭据 / 用户管理 / 模型池 / 出网策略 / 沙箱实例）= 「管理 ▸」向右展开的浮层。
   const platformItems = PLATFORM_NAV_CODES.map((code) => navItems.find((item) => item.code === code)).filter(
     (item): item is NavItem => item !== undefined,
   )
@@ -190,8 +209,35 @@ export function ConvRail({ conversationId }: ConvRailProps) {
     return map
   }, [items])
 
+  /**
+   * 「管理 ▸」的浮层：用户 2026-10-26 口径是**点击 / hover 后向右展开**（不再就地手风琴）。
+   *
+   * ⚠️ 用 `Popover` 而不是 `Dropdown`：AntD 5 的 `Dropdown` 的 `placement` **只支持上/下四向**
+   * （`bottomLeft` … `topRight`），给 `rightTop` 会直接报类型错（`tsc` 拦下）；而这里要的正是
+   * "从本栏右侧弹出"。`Popover` 的 `placement` 支持 `rightTop`，且内容仍是我们自己的一组 `Link`。
+   * 每条 `Link` 点击即导航（`popover` 在点击后由 AntD 自行收起）。
+   */
+  const manageMenu = (
+    <nav className="convrail__manage-menu" aria-label={t('rail.manage')}>
+      {manageItems.map((item) => (
+        <Link
+          key={item.path}
+          to={item.path}
+          className="convrail__nav-item"
+          data-current={currentNav?.path === item.path}
+          onClick={() => setManageOpen(false)}
+        >
+          <span className="convrail__nav-icon" aria-hidden="true">
+            {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
+          </span>
+          <span className="convrail__nav-label">{t(item.labelKey)}</span>
+        </Link>
+      ))}
+    </nav>
+  )
+
   return (
-    <aside className="convrail" aria-label="平台功能与会话历史">
+    <aside className="convrail" aria-label={t('rail.ariaLabel')}>
       <div className="convrail__head">
         <span className="convrail__mark" aria-hidden="true">
           A
@@ -204,17 +250,17 @@ export function ConvRail({ conversationId }: ConvRailProps) {
           trigger={
             <>
               <PlusOutlined />
-              <span className="convrail__new-label">新对话</span>
+              <span className="convrail__new-label">{t('rail.newConversation')}</span>
             </>
           }
           triggerClassName="convrail__new-btn"
-          triggerTitle="新建对话（选择智能体）"
+          triggerTitle={t('rail.newConversationTitle')}
           onPick={(agentId) => navigate(newConversationPath(agentId))}
         />
       </div>
 
-      {/* 上层：平台功能（约 35% 高）。直达入口 + 就地展开的「管理」。 */}
-      <nav className="convrail__nav" aria-label="平台功能">
+      {/* 上层：平台功能。直达入口 + 「管理 ▸」向右展开的浮层（**固定高度、不出滑块**）。 */}
+      <nav className="convrail__nav" aria-label={t('rail.platformNavAria')}>
         <ul className="convrail__nav-list">
           {platformItems.map((item) => (
             <li key={item.path}>
@@ -226,92 +272,105 @@ export function ConvRail({ conversationId }: ConvRailProps) {
                 <span className="convrail__nav-icon" aria-hidden="true">
                   {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
                 </span>
-                <span className="convrail__nav-label">{item.label}</span>
+                <span className="convrail__nav-label">{t(item.labelKey)}</span>
               </Link>
             </li>
           ))}
+          {/* 「管理」：点击 / hover（鼠标移上去即展开）⇒ **向右**弹出浮层，不挤占本栏高度。
+              当前命中的管理页（用量 / 用户 / 模型池 / 出网 / 沙箱实例 / 我的凭据）也高亮这一枚按钮，
+              否则从平台功能点进管理页后本栏会"看起来哪都没选中"。 */}
           <li>
-            <button
-              type="button"
-              className="convrail__nav-item convrail__nav-toggle"
-              aria-expanded={manageExpanded}
-              title={manageExpanded ? '收起管理入口' : '展开管理入口'}
-              onClick={() => {
-                setManageExpanded((value) => !value)
-              }}
+            <Popover
+              content={manageMenu}
+              open={manageOpen}
+              onOpenChange={setManageOpen}
+              trigger={['click', 'hover']}
+              placement="rightTop"
+              overlayClassName="convrail__manage-overlay"
+              arrow={false}
             >
-              <span className="convrail__nav-icon" aria-hidden="true">
-                <MenuOutlined />
-              </span>
-              <span className="convrail__nav-label">管理</span>
-              <DownOutlined className="convrail__nav-caret" data-open={manageExpanded} />
-            </button>
+              <button
+                type="button"
+                className="convrail__nav-item"
+                data-current={currentNav !== undefined && !PLATFORM_NAV_CODES.includes(currentNav.code)}
+                title={t('rail.manageExpand')}
+                aria-haspopup="menu"
+              >
+                <span className="convrail__nav-icon" aria-hidden="true">
+                  <MenuOutlined />
+                </span>
+                <span className="convrail__nav-label">{t('rail.manage')}</span>
+                <RightOutlined className="convrail__nav-caret" />
+              </button>
+            </Popover>
           </li>
-          {manageExpanded
-            ? manageItems.map((item) => (
-                <li key={item.path}>
-                  <Link
-                    to={item.path}
-                    className="convrail__nav-item convrail__nav-item--sub"
-                    data-current={currentNav?.path === item.path}
-                  >
-                    <span className="convrail__nav-icon" aria-hidden="true">
-                      {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
-                    </span>
-                    <span className="convrail__nav-label">{item.label}</span>
-                  </Link>
-                </li>
-              ))
-            : null}
         </ul>
       </nav>
 
-      {/* 下层：会话（约 65% 高）。 */}
-      <section className="convrail__convos" aria-label="会话历史">
-        {listQuery.isPending ? (
-          <p className="convrail__hint">正在读取会话…</p>
-        ) : listQuery.isError ? (
-          <div className="convrail__empty">
-            <p className="convrail__hint">会话列表没有读出来。</p>
-            <Button
-              size="small"
-              loading={listQuery.isFetching}
-              onClick={() => {
-                void listQuery.refetch()
-              }}
+      {/* 下层：会话（自身可滚；滑块只在 hover 时显形，见 app.css）。 */}
+      <section className="convrail__convos" aria-label={t('rail.conversationsAria')}>
+        <div className="convrail__convos-head">
+          <span className="convrail__convos-title">{t('rail.conversationsTitle')}</span>
+          {/* 卡片样式切换（2026-10-26）：完整 ⇄ 省略。纯客户端偏好，刷新后保持。 */}
+          <Tooltip
+            title={railCardMode === 'compact' ? t('rail.cardFull') : t('rail.cardCompact')}
+          >
+            <button
+              type="button"
+              className="convrail__card-toggle"
+              data-mode={railCardMode}
+              aria-label={railCardMode === 'compact' ? t('rail.cardFull') : t('rail.cardCompact')}
+              onClick={toggleRailCardMode}
             >
-              重试
-            </Button>
-          </div>
-        ) : groups.length === 0 ? (
-          <p className="convrail__hint">还没有会话。点上方「新对话」选一个智能体开始。</p>
-        ) : (
-          <ul className="convrail__list">
-            {groups.map((group) => (
-              <ConvGroup
-                key={group.label}
-                group={group}
-                collapsed={collapsedGroups.includes(group.label)}
-                onToggle={toggleGroup}
-                itemById={itemById}
-                conversationId={conversationId}
-                editingId={editingId}
-                draft={draft}
-                handlers={rowHandlers}
-              />
-            ))}
-          </ul>
-        )}
+              {railCardMode === 'compact' ? <ExpandAltOutlined /> : <CompressOutlined />}
+            </button>
+          </Tooltip>
+        </div>
+        {/* 可滚体（**只有这一层滚动**，滚滑块默认隐藏、hover 才显形；见 app.css） */}
+        <div className="convrail__convos-body">
+          {listQuery.isPending ? (
+            <p className="convrail__hint">{t('rail.conversationsLoading')}</p>
+          ) : listQuery.isError ? (
+            <div className="convrail__empty">
+              <p className="convrail__hint">{t('rail.conversationsError')}</p>
+              <Button
+                size="small"
+                loading={listQuery.isFetching}
+                onClick={() => {
+                  void listQuery.refetch()
+                }}
+              >
+                {t('common.retry')}
+              </Button>
+            </div>
+          ) : groups.length === 0 ? (
+            <p className="convrail__hint">{t('rail.conversationsEmpty')}</p>
+          ) : (
+            <ul className="convrail__list">
+              {groups.map((group) => (
+                <ConvGroup
+                  key={group.label}
+                  group={group}
+                  collapsed={collapsedGroups.includes(group.label)}
+                  onToggle={toggleGroup}
+                  itemById={itemById}
+                  conversationId={conversationId}
+                  editingId={editingId}
+                  draft={draft}
+                  cardMode={railCardMode}
+                  handlers={rowHandlers}
+                  t={t}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
       </section>
 
       <div className="convrail__foot">
-        <div className="convrail__user">
-          <Button size="small" type="text" onClick={toggleThemeMode} title="切换配色（浅色为交付主态）">
-            {themeMode === 'dark' ? '暗色' : '浅色'}
-          </Button>
-          <ServiceLed />
-          <UserMenu user={user} />
-        </div>
+        <ServiceLed />
+        {/* 账号信息：只展示当前用户；配色 / 语言切换已收进头像菜单（`app/UserMenu.tsx`）。 */}
+        <UserMenu user={user} />
       </div>
 
       <DeleteConversationModal
@@ -363,7 +422,9 @@ const ConvGroup = memo(function ConvGroup({
   conversationId,
   editingId,
   draft,
+  cardMode,
   handlers,
+  t,
 }: {
   group: ConversationGroup
   collapsed: boolean
@@ -372,7 +433,11 @@ const ConvGroup = memo(function ConvGroup({
   conversationId: string | undefined
   editingId: string | null
   draft: string
+  cardMode: RailCardMode
   handlers: RowHandlers
+  // ⚠️ `t` 是本组件**唯一**会因为"语言变化"而变的外部依赖 —— 它变则整组重渲染，正是期望行为。
+  // 分组标题（`group.label`）来自服务端/纯函数的分类读数（今天 / 更早），本批不动（属后续批次）。
+  t: Translate
 }) {
   return (
     <li>
@@ -380,7 +445,7 @@ const ConvGroup = memo(function ConvGroup({
         type="button"
         className="convrail__group"
         aria-expanded={!collapsed}
-        title={collapsed ? `展开「${group.label}」` : `收缩「${group.label}」`}
+        title={collapsed ? t('rail.groupExpand', { label: group.label }) : t('rail.groupCollapse', { label: group.label })}
         onClick={() => onToggle(group.label)}
       >
         <RightOutlined className="convrail__group-caret" data-open={!collapsed} />
@@ -400,7 +465,9 @@ const ConvGroup = memo(function ConvGroup({
                 current={item.id === conversationId}
                 editing={editingId === item.id}
                 draft={draft}
+                cardMode={cardMode}
                 handlers={handlers}
+                t={t}
               />
             )
           })}
@@ -410,29 +477,34 @@ const ConvGroup = memo(function ConvGroup({
   )
 })
 
-/** 一行会话（`memo`：视图对象 / 当前态 / 编辑态都没变时整行跳过） */
+/** 一行会话（`memo`：视图对象 / 当前态 / 编辑态 / 卡片样式都没变时整行跳过） */
 const ConvRow = memo(function ConvRow({
   view,
   item,
   current,
   editing,
   draft,
+  cardMode,
   handlers,
+  t,
 }: {
   view: ConversationListItemView
   item: ConversationItem
   current: boolean
   editing: boolean
   draft: string
+  cardMode: RailCardMode
   handlers: RowHandlers
+  t: Translate
 }) {
+  const compact = cardMode === 'compact'
   return (
-    <li className="conv" data-current={current}>
+    <li className="conv" data-current={current} data-mode={cardMode}>
       {editing ? (
         <div className="conv__edit">
           <Input
             size="small"
-            aria-label="会话名称"
+            aria-label={t('rail.conversationNameAria')}
             value={draft}
             maxLength={CONVERSATION_TOPIC_MAX_CHARS}
             autoFocus
@@ -454,10 +526,10 @@ const ConvRow = memo(function ConvRow({
               disabled={normalizeTopicDraft(draft, item.topic) === null}
               onClick={() => handlers.onSubmitRename(item)}
             >
-              保存
+              {t('common.save')}
             </Button>
             <Button size="small" onClick={handlers.onCancelRename}>
-              取消
+              {t('common.cancel')}
             </Button>
           </div>
         </div>
@@ -471,34 +543,40 @@ const ConvRow = memo(function ConvRow({
           }}
         >
           <span className="conv__title">{view.title}</span>
-          <span className="conv__meta">
-            <span className={`led led--${view.led}`} aria-hidden="true" />
-            <span>{view.state}</span>
-            {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
-            <Tag className="conv__agent" title={view.agentName}>
-              {AGENT_TYPE_LABEL[view.agentType]}
-            </Tag>
-            <span aria-hidden="true">·</span>
-            <span className="num">{view.time}</span>
-          </span>
+          {/* 省略模式：**只留状态色点** —— 状态文案 / 智能体徽标 / 时间全部不画（不占位）。
+              状态灯本身路上仍是"色"这一格（`led--run|warn|idle`），满足"状态只展示颜色即可"。 */}
+          {compact ? (
+            <span className={`led led--${view.led}`} role="img" aria-label={view.state} title={view.state} />
+          ) : (
+            <span className="conv__meta">
+              <span className={`led led--${view.led}`} aria-hidden="true" />
+              <span>{view.state}</span>
+              {/* 智能体徽标（跨智能体列表的关键：一屏分清"这条是谁的"） */}
+              <Tag className="conv__agent" title={view.agentName}>
+                {AGENT_TYPE_LABEL[view.agentType]}
+              </Tag>
+              <span aria-hidden="true">·</span>
+              <span className="num">{view.time}</span>
+            </span>
+          )}
         </button>
       )}
 
       {editing ? null : (
         <span className="conv__ops">
-          <Tooltip title="重命名">
+          <Tooltip title={t('rail.rename')}>
             <button
               type="button"
-              aria-label={`重命名会话「${view.title}」`}
+              aria-label={t('rail.renameAria', { title: view.title })}
               onClick={() => handlers.onStartRename(item)}
             >
               ✎
             </button>
           </Tooltip>
-          <Tooltip title="删除">
+          <Tooltip title={t('rail.delete')}>
             <button
               type="button"
-              aria-label={`删除会话「${view.title}」`}
+              aria-label={t('rail.deleteAria', { title: view.title })}
               onClick={() => handlers.onRequestDelete(item)}
             >
               ✕

@@ -44,7 +44,7 @@
 
 import type { Readable } from 'node:stream'
 
-import {
+import { appMsg,
   AppError,
   artifactIdParamsSchema,
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
@@ -99,7 +99,7 @@ async function readStreamCapped(stream: Readable, maxBytes: number): Promise<Buf
   for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
     total += buffer.length
-    if (total > maxBytes) throw AppError.validation('文件较大，无法在线渲染预览，请下载查看')
+    if (total > maxBytes) throw AppError.validation(appMsg('app.m019'))
     chunks.push(buffer)
   }
   return Buffer.concat(chunks)
@@ -292,10 +292,10 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
       })
       const kind = previewKindOf(source.mime)
       if (kind !== 'docx' && kind !== 'xlsx') {
-        throw AppError.validation('该类型的产物没有在线渲染预览')
+        throw AppError.validation(appMsg('app.m090'))
       }
       if (source.contentLength > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) {
-        throw AppError.validation('文件较大，无法在线渲染预览，请下载查看')
+        throw AppError.validation(appMsg('app.m019'))
       }
 
       const bytes = await readStreamCapped(source.body, ARTIFACT_PREVIEW_MAX_INLINE_BYTES)
@@ -310,7 +310,7 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
         // 而不是笼统一句"渲染失败"（与 `pipeline/parse/docx.ts` 的文案口径一致）。
         if (error instanceof AppError) throw error
         getLogger().warn({ err: error, artifactId: source.artifactId, kind }, 'OOXML 渲染失败')
-        throw AppError.validation('无法解析该 Office 文档（可能已损坏，或被改名的其它格式），请下载后用本地工具打开')
+        throw AppError.validation(appMsg('app.m091'))
       }
 
       return reply

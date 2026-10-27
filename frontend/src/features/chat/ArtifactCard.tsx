@@ -41,6 +41,7 @@ import { Button, Checkbox, Popconfirm } from 'antd'
 import { memo, useState } from 'react'
 
 import { formatBytes } from '../../app/format.js'
+import { useT } from '../../app/i18n.js'
 import { useArtifactDownload } from '../../components/ArtifactPreview/useArtifactDownload.js'
 import { previewAvailability } from '../../components/ArtifactPreview/artifactPreview.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
@@ -89,6 +90,7 @@ export const ArtifactCard = memo(function ArtifactCard({
   selected = false,
   onSelectedChange,
 }: ArtifactCardProps) {
+  const { t } = useT()
   const openPreview = useArtifactPreviewStore((state) => state.openPreview)
   const { downloading, download } = useArtifactDownload()
   const [deleting, setDeleting] = useState(false)
@@ -107,7 +109,7 @@ export const ArtifactCard = memo(function ArtifactCard({
           onChange={(event) => {
             onSelectedChange(event.target.checked)
           }}
-          aria-label={`选择 ${artifact.fileName}`}
+          aria-label={t('artifact.selectAria', { name: artifact.fileName })}
         />
       ) : null}
       <span className="artifact__kind" aria-hidden="true">
@@ -127,7 +129,7 @@ export const ArtifactCard = memo(function ArtifactCard({
               openPreview(artifact)
             }}
           >
-            预览
+            {t('artifact.preview')}
           </Button>
         ) : null}
         <Button
@@ -137,14 +139,14 @@ export const ArtifactCard = memo(function ArtifactCard({
             download({ artifactId: artifact.artifactId, fileName: artifact.fileName })
           }}
         >
-          下载
+          {t('artifact.download')}
         </Button>
         {onDelete ? (
           <Popconfirm
-            title="删除这个产物？"
-            description="删除后不可恢复：文件与记录都会一并移除。"
-            okText="删除"
-            cancelText="取消"
+            title={t('artifact.deleteTitle')}
+            description={t('artifact.deleteDescription')}
+            okText={t('common.delete')}
+            cancelText={t('common.cancel')}
             okButtonProps={{ danger: true }}
             onConfirm={async () => {
               setDeleting(true)
@@ -158,7 +160,7 @@ export const ArtifactCard = memo(function ArtifactCard({
             }}
           >
             <Button size="small" danger loading={deleting}>
-              删除
+              {t('common.delete')}
             </Button>
           </Popconfirm>
         ) : null}

@@ -28,7 +28,7 @@
 
 import { randomUUID } from 'node:crypto'
 
-import {
+import { appMsg,
   AppError,
   attachmentItemSchema,
   MIME_BY_CHAT_ATTACHMENT_EXTENSION,
@@ -140,7 +140,7 @@ export async function uploadChatFile(input: {
     await s3.putObject(config.s3.bucket, fileKey, input.bytes, input.bytes.length)
   } catch (error) {
     getLogger().error({ err: error, fileKey }, '附件写入 S3 失败，已中止上传（未建行）')
-    throw AppError.upstreamError('附件写入对象存储失败，请稍后重试')
+    throw AppError.upstreamError(appMsg('app.m152'))
   }
 
   const row = await getPrisma().file.create({
@@ -192,7 +192,7 @@ export async function resolveChatAttachments(
     select: { id: true, fileKey: true, name: true, size: true, mime: true, kind: true },
   })
   if (rows.length !== fileIds.length) {
-    throw AppError.notFound('有附件不存在或不属于你（请重新上传后再发送）')
+    throw AppError.notFound(appMsg('app.m024'))
   }
   const byId = new Map(rows.map((row) => [row.id, row]))
   const s3 = getS3Client()
@@ -200,7 +200,7 @@ export async function resolveChatAttachments(
 
   for (const fileId of fileIds) {
     const row = byId.get(fileId)
-    if (row === undefined) throw AppError.notFound('有附件不存在或不属于你（请重新上传后再发送）')
+    if (row === undefined) throw AppError.notFound(appMsg('app.m024'))
     let bytes: Buffer
     try {
       const stat = await s3.statObject(config.s3.bucket, row.fileKey)
@@ -209,10 +209,10 @@ export async function resolveChatAttachments(
       void stat
     } catch (error) {
       if (isS3NoSuchKey(error)) {
-        throw AppError.notFound(`附件「${row.name}」已不在存储中，请重新上传`)
+        throw AppError.notFound(appMsg('app.m153', { p0: row.name }))
       }
       getLogger().error({ err: error, fileId, fileKey: row.fileKey }, '读取附件对象失败')
-      throw AppError.upstreamError('读取附件失败，请稍后重试')
+      throw AppError.upstreamError(appMsg('app.m025'))
     }
 
     if (row.kind === 'IMAGE') {
@@ -233,12 +233,12 @@ export async function resolveChatAttachments(
       // json / csv：无结构解析，原文即内容（上传时的三道校验已挡掉二进制改名）
       rawText = bytes.toString('utf8')
       if (rawText.trim() === '') {
-        throw AppError.validation(`附件「${row.name}」是空文件，没有可读取的内容`)
+        throw AppError.validation(appMsg('app.m154', { p0: row.name }))
       }
     } else {
       const parsed = await parseDocument(format as ParseFormat, bytes, DEFAULT_PARSE_OPTIONS)
       if (parsed.meta.charCount === 0) {
-        throw AppError.validation(`附件「${row.name}」里没有可读取的文字内容（可能是扫描件或空文件）`)
+        throw AppError.validation(appMsg('app.m155', { p0: row.name }))
       }
       rawText = parsed.text
     }
@@ -284,7 +284,7 @@ export async function openFileSource(params: { fileId: string; uploaderId: strin
     where: { id: params.fileId, uploaderId: params.uploaderId },
     select: { fileKey: true, name: true, mime: true },
   })
-  if (row === null) throw AppError.notFound('附件不存在')
+  if (row === null) throw AppError.notFound(appMsg('app.m156'))
 
   const s3 = getS3Client()
   let size: number
@@ -292,9 +292,9 @@ export async function openFileSource(params: { fileId: string; uploaderId: strin
     const stat = await s3.statObject(config.s3.bucket, row.fileKey)
     size = stat.size
   } catch (error) {
-    if (isS3NoSuchKey(error)) throw AppError.notFound('附件文件已不在存储中，请重新上传')
+    if (isS3NoSuchKey(error)) throw AppError.notFound(appMsg('app.m157'))
     getLogger().error({ err: error, fileId: params.fileId, fileKey: row.fileKey }, '读取附件元数据失败')
-    throw AppError.upstreamError('读取附件失败，请稍后重试')
+    throw AppError.upstreamError(appMsg('app.m025'))
   }
 
   const body = await s3.getObject(config.s3.bucket, row.fileKey)
@@ -356,7 +356,7 @@ export async function openFileSourceForConversation(params: {
 }): Promise<FileSource> {
   const items = await listConversationAttachments(params.conversationId)
   if (!items.some((item) => item.fileId === params.fileId)) {
-    throw AppError.notFound('附件不存在或不属于这个会话')
+    throw AppError.notFound(appMsg('app.m158'))
   }
   return openFileSource({ fileId: params.fileId, uploaderId: params.uploaderId })
 }

@@ -19,7 +19,7 @@
  * 「每批手改一次」的标识在 `src/index.ts` 的启动信封 `step`，别忘了同步。
  */
 
-import { AppError, attachmentItemSchema, fileIdParamsSchema, ok, UPLOAD_FILE_FIELD } from '@doubulea/shared'
+import { appMsg, AppError, attachmentItemSchema, fileIdParamsSchema, ok, UPLOAD_FILE_FIELD } from '@doubulea/shared'
 import type { FastifyInstance } from 'fastify'
 
 import { config } from '../config.js'
@@ -56,15 +56,15 @@ export function registerFileRoutes(app: FastifyInstance): void {
         const bytes = await part.toBuffer()
         if (part.file.truncated) throw fileTooLarge(part.filename)
         if (file !== undefined) {
-          throw AppError.validation(`一次只能上传一个文件：请只保留一个待上传文件，字段名为 ${UPLOAD_FILE_FIELD}`)
+          throw AppError.validation(appMsg('app.m101', { p0: UPLOAD_FILE_FIELD }))
         }
         file = { fileName: part.filename, declaredMime: part.mimetype, bytes }
       }
       if (file === undefined) {
-        throw AppError.validation(`没有收到文件：请用 multipart/form-data 上传，文件字段名为 ${UPLOAD_FILE_FIELD}`)
+        throw AppError.validation(appMsg('app.m020', { p0: UPLOAD_FILE_FIELD }))
       }
       if (file.bytes.length === 0) {
-        throw AppError.validation(`上传的文件是空的（0 字节）：${file.fileName || '未命名文件'}`)
+        throw AppError.validation(appMsg('app.m010', { p0: file.fileName || '未命名文件' }))
       }
       const item = await uploadChatFile({ uploaderId: viewer.user.id, ...file })
       // 响应体在本路由**再校验一次**（与其余路由"响应也过 schema"的口径一致）

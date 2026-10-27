@@ -22,12 +22,19 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import {
-  SANDBOX_INSTANCE_STATE_LABELS,
-  drainActionView,
+  sandboxInstanceStateLabel,
+  drainActionView as drainActionViewRaw,
   loadAgeText,
   sandboxInstanceState,
-  slotRatioText,
+  slotRatioText as slotRatioTextRaw,
 } from '../src/pages/admin/sandboxInstanceModel.ts'
+import { translate } from '@doubulea/shared'
+
+// P1-23 第十批：这两个纯函数多收 `locale`（译文搬去 `shared/src/i18n`）。本档统一按 zh 断言。
+const ZH = 'zh'
+const tr = (key, params) => translate(ZH, key, params)
+const drainActionView = (item) => drainActionViewRaw(item, ZH)
+const slotRatioText = (item) => slotRatioTextRaw(item, ZH)
 import {
   activeStepKey,
   jobProgressStatus,
@@ -98,7 +105,7 @@ it('A1 心跳新鲜 + 负载新鲜 ⇒ 在线', () => {
 it('A2 在线但负载超过新鲜度 ⇒ load-stale（不是「死了」）', () => {
   const view = sandboxInstanceState(item({ load: load(NOW - 90_000) }), { now: NOW, loadStaleMs: 60_000 })
   eq(view.state, 'load-stale', '状态')
-  eq(SANDBOX_INSTANCE_STATE_LABELS[view.state], '负载过期', '文案')
+  eq(sandboxInstanceStateLabel(view.state, ZH), '负载过期', '文案')
 })
 
 it('★ A3 心跳超过 TTL ⇒ stale（优先级高于负载过期）', () => {
@@ -107,7 +114,7 @@ it('★ A3 心跳超过 TTL ⇒ stale（优先级高于负载过期）', () => {
     loadStaleMs: 60_000,
   })
   eq(view.state, 'stale', '状态')
-  eq(SANDBOX_INSTANCE_STATE_LABELS[view.state], '心跳超时', '文案')
+  eq(sandboxInstanceStateLabel(view.state, ZH), '心跳超时', '文案')
 })
 
 it('A4 没有负载 ⇒ age / ratio 为 null，不算「0% 空闲」', () => {
@@ -155,13 +162,21 @@ it('★ A8 注册 TTL 可显式给（缺省 = 1.5 × loadStaleMs = 3× 心跳）
 console.log('')
 console.log(`── 形态（页面接线）──`)
 const page = readFileSync(fileURLToPath(new URL('../src/pages/admin/SandboxInstancesPage.tsx', import.meta.url)), 'utf8')
+/**
+ * P1-23 第十批：页面里的文案已全部搬进 `shared/src/i18n`，源码只剩 key ⇒
+ * 「页面写明了某句语义」的判据从"页面源码里有这句中文"改成"页面用了承载这句话的 key，
+ * 且该 key 的 zh 译文里有这句话"。断言强度不变（换 key 或改译文都会红）。
+ */
+const pageUses = (key) => page.includes(`t('${key}'`) || page.includes(`t(\`${key}\``)
+const pageSays = (key, phrase) => pageUses(key) && tr(key).includes(phrase)
 it('B1 页面消费同一组纯函数（不自己算状态）', () => {
   assert(page.includes('sandboxInstanceState('), '应调用 sandboxInstanceState')
   assert(page.includes('slotRatioText('), '应调用 slotRatioText')
 })
 it('★ B2 读失败显示错误条，而不是渲染成空表', () => {
   assert(page.includes('data?.error != null'), '应有 error 分支')
-  assert(page.includes('不是「零台实例」'), '错误条文案应点明不是零台')
+  assert(pageUses('sandboxInst.readFailed'), '错误条应使用一条专门的文案 key（不是复用通用失败）')
+  assert(pageSays('sandboxInst.readFailed', '不是「零台实例」'), '错误条文案应点明不是零台')
 })
 it('★ B3 写操作清单收敛：只有「一键初始化」与「摘流」，且都走封装好的 hook', () => {
   // 2026-10-21：摘流是**新**的写操作（用户反馈"页面上没有按钮"）。但它不允许页面自己拼 URL、
@@ -175,9 +190,14 @@ it('★ B6 摘流按钮：有确认框、文案与纯函数同源、不把「摘
   assert(page.includes('Modal.confirm'), '摘流是静默生效的运维动作，必须有确认框')
   assert(page.includes('drainActionView('), '按钮文案与确认框文案应共用 drainActionView')
   assert(page.includes('data-testid={`drain-${item.instanceId}`}'), '按钮应有稳定 testid')
-  for (const word of ['已摘流', '不等于下线', '仍会继续服务']) {
-    assert(page.includes(word), `页面应写明「${word}」的语义边界`)
-  }
+  // P1-23：语义边界的判据落到承载它们的 key（页面用到了 + 译文里确实这么说）
+  assert(pageSays('sandboxInst.drainedTag', '已摘流'), '页面应写明「已摘流」的语义边界')
+  assert(pageSays('sandboxInst.leadStrong2', '不等于下线'), '页面应写明「不等于下线」的语义边界')
+  assert(
+    pageSays('sandboxInst.aboutDrainStrong3', '仍会继续服务') ||
+      pageSays('sandboxInst.drainedTooltip', '仍会继续服务'),
+    '页面应写明「仍会继续服务」的语义边界',
+  )
 })
 it('★ B7 摘流纯函数：未摘流 ⇒ 按钮是「摘流」；已摘流 ⇒ 按钮是「恢复接收」（且文案说清新会话/已有会话的区别）', () => {
   const off = drainActionView(item({ drained: false }))
