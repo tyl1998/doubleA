@@ -31,6 +31,7 @@ import { appMsg,
   isWorkspaceTextMime,
   normalizeWorkspacePath,
   ok,
+  workspaceArtifactBodySchema,
   workspaceCreateFileBodySchema,
   workspaceChangesQuerySchema,
   workspaceEventsQuerySchema,
@@ -40,6 +41,7 @@ import { appMsg,
   workspaceRevertBodySchema,
   workspaceWriteFileBodySchema,
   type ConversationIdParams,
+  type WorkspaceArtifactBody,
   type WorkspaceChangesQuery,
   type WorkspaceCreateFileBody,
   type WorkspaceEventsQuery,
@@ -56,20 +58,24 @@ import { requireAuthContext } from '../plugins/session.js'
 import { buildContentDisposition } from '../services/document.service.js'
 import { workspaceRawHeadersFor } from '../services/previewHeaders.js'
 import { SSE_RESPONSE_HEADERS } from '../orchestrator/sse.js'
+import { registerWorkspaceArtifact } from '../sandbox/index.js'
 import {
   assertWorkspaceOwner,
   assertWorkspaceWriteRate,
   createWorkspaceFile,
   deleteWorkspaceDirectory,
   deleteWorkspaceFile,
+  ensureWorkspace,
   getWorkspaceFileDiff,
   listWorkspaceChanges,
   listWorkspaceEventsAfter,
   listWorkspaceFiles,
   moveWorkspaceFile,
   openWorkspaceFileSource,
+  readWorkspaceDirectoryZip,
   readWorkspaceFile,
   readWorkspaceGitRepos,
+  readWorkspaceRetention,
   revertWorkspaceRound,
   serializeWorkspaceSseEvent,
   subscribeWorkspaceEvents,
@@ -121,8 +127,35 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
   )
 
   /**
+   * 工作区**保留期与到期保护提示**（`GET /api/conversations/:id/workspace/retention`，2026-10-28）。
+   *
+   * ★ 2026-10-28（用户反馈「NGPOS 星礼包会话生成的 docx 没了」）：清理原来是**静默真删**，
+   *   用户删完才发现。这条端点让面板能**提前**说清"这个工作区还有几天清理、有没有被保护"。
+   *
+   * 只读判据（与 `workspace/reaper` 的 `retentionGuard` 同一套）：
+   *   · `expiresAt` = `workspaces.updated_at + retentionDays`（工作区**内容**最后一次变动的时刻起算）；
+   *   · `protected` = 有未过期产物 / 有保护期内的用户手写 ⇒ 到期也**不会**被清；
+   *   · `artifactCount` = 该会话仍在保留期内的产物数（交付物，不随工作区回收消失）。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/workspace/retention',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      return ok(await readWorkspaceRetention(request.params.id))
+    },
+  )
+
+  /**
    * 轮末**变更集**（`GET /api/conversations/:id/workspace/changes?since=<iso>`，P4）。
    * 回 `[since, now]` 窗口内动过的路径各一条（最新状态），按时间倒序。`since` 缺省 = 全量。
+   *
+   * ★ P1-24 / 2026-10-28（用户定案「git 拉下来的不算」）：
+   *   "clone / pull 的初始填充"由 **`listWorkspaceChanges` 在数据层**剔除
+   *   （`excludeRepositoryImports: true`，判据 = `sandbox/gitArtifacts#filterGitCleanPaths`，
+   *   与产物收集同源）。这里只做**转发**，不再自己跑一遍 git —— 两处各写一份迟早会分叉，
+   *   而且原来那条 try/catch 一旦 git 失败就整份退回几千条，等于过滤没生效。
    */
   app.get<{ Params: ConversationIdParams; Querystring: WorkspaceChangesQuery }>(
     '/api/conversations/:id/workspace/changes',
@@ -133,7 +166,11 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
     async (request) => {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
-      return ok(await listWorkspaceChanges(request.params.id, request.query.since))
+      return ok(
+        await listWorkspaceChanges(request.params.id, request.query.since, {
+          excludeRepositoryImports: true,
+        }),
+      )
     },
   )
 
@@ -152,18 +189,27 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
     async (request) => {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
-      const { path, baseVersion, stats } = request.query
-      return ok(await getWorkspaceFileDiff(request.params.id, path, baseVersion, stats === 1))
+      const { path, baseVersion, stats, roundBase, toVersion } = request.query
+      return ok(
+        await getWorkspaceFileDiff(
+          request.params.id,
+          path,
+          baseVersion,
+          stats === 1,
+          roundBase === 1,
+          toVersion,
+        ),
+      )
     },
   )
 
   /**
-   * 「撤销本轮」（`POST /api/conversations/:id/workspace/revert`，P4 · R2）。
+   * 「撤销本轮」（`POST /api/conversations/:id/workspace/revert`，P4 · R2；2026-10-28 重做）。
    *
-   * 把**本轮**（缺省 = TaskAgent 上一轮的起止窗口；或显式 `since`/`until`）内 agent/人的写入，
-   * 按各路径轮初版本**走同一套 CAS 回写**：轮初不存在 ⇒ 删除，有版本 ⇒ 从历史字节还原。
-   * 此后有人又动过的路径**不静默覆盖**（记 `conflict`）；二进制 / 改名记 `unsupported`。
-   * `dryRun=true` = 只算不写（预演）。
+   * 把**这一段**（与「最近变更」同一段划分）内 agent 的写入按回滚点 CAS 回写。
+   * **范围** `scope`：`AGENT_ONLY`（默认，只撤 agent 覆盖过的）/ `ALL`（含用户手写）/
+   * `SELECTED`（逐条勾选 `paths`）。用户手写收尾的路径在默认范围下**故意不动**。
+   * `dryRun=true` = 只算不写，并回 `preview`（会还原 / 会删除 / 会跳过 三栏）。
    */
   app.post<{ Params: ConversationIdParams; Body: WorkspaceRevertBody }>(
     '/api/conversations/:id/workspace/revert',
@@ -174,12 +220,14 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
     async (request) => {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
-      const { since, until, dryRun } = request.body
+      const { since, until, dryRun, scope, paths } = request.body
       return ok(
         await revertWorkspaceRound(request.params.id, {
           ...(since === undefined ? {} : { since }),
           ...(until === undefined ? {} : { until }),
           ...(dryRun === undefined ? {} : { dryRun }),
+          ...(scope === undefined ? {} : { scope }),
+          ...(paths === undefined ? {} : { paths }),
         }),
       )
     },
@@ -216,6 +264,30 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
         .header('cache-control', 'private, no-store')
       if (headers.csp !== null) reply.header('content-security-policy', headers.csp)
       return reply.send(source.body)
+    },
+  )
+
+  /**
+   * 「按目录下载为 zip」（`GET .../workspace/dir/zip?path=`，2026-10-29）。
+   *
+   * 目录行右键用它：把该目录（含子孙）下的**已索引文件**打成 zip 一次下载。只读；依赖目录 /
+   * 隐藏目录本就不在索引里，天然不进包。文件数超 `WORKSPACE_ZIP_MAX_FILES` ⇒ 413（`app.m284`）。
+   * ⚠️ 与 `/file/raw` 同族：**不套信封**（成功 = 字节流；失败 = 标准 JSON 信封）。
+   */
+  app.get<{ Params: ConversationIdParams; Querystring: WorkspacePathQuery }>(
+    '/api/conversations/:id/workspace/dir/zip',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema, querystring: workspacePathQuerySchema } },
+    async (request, reply) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      const zip = await readWorkspaceDirectoryZip(request.params.id, request.query.path)
+      reply
+        .header('content-type', 'application/zip')
+        .header('content-length', String(zip.body.byteLength))
+        .header('content-disposition', buildContentDisposition(zip.fileName, { disposition: 'attachment' }))
+        .header('x-content-type-options', 'nosniff')
+        .header('cache-control', 'private, no-store')
+      return reply.send(zip.body)
     },
   )
 
@@ -303,6 +375,42 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
       const target = normalizeWorkspacePath(dir === '' ? baseName : `${dir}/${baseName}`)
       if (target === null) throw AppError.validation(appMsg('app.m112'), { path: dir })
       return ok(await uploadWorkspaceFile(request.params.id, target, uploaded.bytes, userAuthor(userId)))
+    },
+  )
+
+  /**
+   * 「上传至平台」—— 把一个**工作区文件**登记成产物（`POST .../workspace/artifact`，2026-10-29）。
+   *
+   * ★ 为什么有这个端点：Code 模式下**不再自动收产物**（`taskAgent.ts` ⑦ 前面的产物块：
+   *   agent 动过的文件已经由工作区面板完整呈现，"哪些算产物"在那边不好定义）。要让某个文件进
+   *   产物面板 / 会话产物 / 可下载清单，得由人**显式**点一次（文件树右键）—— 那是唯一的口径。
+   *
+   * 只传路径：字节从**工作区**读（同一台实例、同一份 canonical 字节），不经浏览器重传一遍；
+   * 若文件已被删 / 超过单文件上限 ⇒ 409 / 413 由服务层给出（见 `registerWorkspaceArtifact`）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: WorkspaceArtifactBody }>(
+    '/api/conversations/:id/workspace/artifact',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: workspaceArtifactBodySchema },
+    },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      const conversationId = request.params.id
+      const { path } = request.body
+      // 产物是**会话归属**的：`user_id` 直接取会话 owner（与 `collectRoundArtifacts` 同源）
+      const handle = await ensureWorkspace(conversationId)
+      const item = await registerWorkspaceArtifact({
+        conversationId,
+        userId,
+        rootPath: handle.rootPath,
+        path,
+      })
+      if (item === null) {
+        throw AppError.validation(appMsg('app.m113', { p0: path }))
+      }
+      return ok(item)
     },
   )
 

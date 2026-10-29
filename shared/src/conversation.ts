@@ -765,12 +765,68 @@ export type ListMyArtifactsQuery = ListArtifactsQuery
 export const artifactListItemSchema = artifactItemSchema.extend({
   /** ISO 8601（JS 侧显式写入的 `created_at`，见 `artifacts.ts` 的时区注释） */
   createdAt: z.string(),
+  /**
+   * 预计被清理的时刻（ISO 8601）。2026-10-28 引入；**2026-10-29 起可为 `null`**。
+   *
+   * ★ 用户原话：「会话产物我们能加一个剩余多少天的提示吗？」—— 产物是**会过期的**，
+   *   而界面此前只说"什么时候产出的"，不说"什么时候会没"。这里把到期的绝对时刻交给前端，
+   *   剩余天数由前端按本地时钟算（与工作区保留期提示同一口径，见 `retentionDaysLeft`）。
+   *
+   * 建行时 = `createdAt + ARTIFACT_RETENTION_DAYS`（默认 7 天）；用户可「延期几天 / 延期到某日 /
+   * 永久保存」（见 {@link artifactExtendBodySchema}）。
+   * **`null` = 永久保存**（清理器不扫它）。
+   *
+   * 由服务端给：保留期是 env（`ARTIFACT_RETENTION_DAYS`），前端不得猜一个数。
+   */
+  expiresAt: z.string().nullable(),
 })
 export type ArtifactListItem = z.infer<typeof artifactListItemSchema>
 
 /** 产物列表响应 = `{ items, total, offset, limit }`（`shared/src/envelope.ts#offsetPageOf`） */
 export const artifactListResultSchema = offsetPageOf(artifactListItemSchema)
 export type ArtifactListResult = z.infer<typeof artifactListResultSchema>
+
+/**
+ * 产物延期（`POST /api/artifacts/:id/extend`，2026-10-29）。
+ *
+ * 三种口径（用户定案「延期几天 / 延期到某日 / 永久保存」）：
+ *   · `DAYS`：在**当前到期时刻与现在中较晚的那个**上再加 N 天（1 ~ 365）；
+ *   · `UNTIL`：延到某个**绝对时刻**（ISO 8601，带时区）。前端把用户选的日期按**本地时区**
+ *     折算成当天 23:59:59.999 再 `toISOString()` —— 服务端不猜时区（"延到 12 月 1 日"的
+ *     意思是"12 月 1 日这一整天都还在"）。
+ *   · `FOREVER`：永久保存（`expires_at = NULL`，清理器不再碰它）。
+ *
+ * ⚠️ 延期**只能往后推**：目标早于当前到期时刻、或对已永久保存的产物延期 ⇒ 422（理由由服务层给）。
+ */
+export const ARTIFACT_EXTEND_MODES = ['DAYS', 'UNTIL', 'FOREVER'] as const
+export type ArtifactExtendMode = (typeof ARTIFACT_EXTEND_MODES)[number]
+
+export const artifactExtendBodySchema = z
+  .discriminatedUnion('mode', [
+    z.object({
+      mode: z.literal('DAYS'),
+      days: z
+        .number({
+          required_error: validationMessage('validation.artifact.extendDaysRequired'),
+          invalid_type_error: validationMessage('validation.artifact.extendDaysInvalid'),
+        })
+        .int(validationMessage('validation.artifact.extendDaysInvalid'))
+        .min(1, validationMessage('validation.artifact.extendDaysRange'))
+        .max(365, validationMessage('validation.artifact.extendDaysRange')),
+    }),
+    z.object({
+      mode: z.literal('UNTIL'),
+      until: z
+        .string({ required_error: validationMessage('validation.artifact.extendUntilRequired') })
+        .datetime({ offset: true, message: validationMessage('validation.artifact.extendUntilInvalid') }),
+    }),
+    z.object({ mode: z.literal('FOREVER') }),
+  ])
+export type ArtifactExtendBody = z.infer<typeof artifactExtendBodySchema>
+
+/** 延期结果 = 更新后的那一条（前端据此就地刷新到期读数） */
+export const artifactExtendResultSchema = artifactListItemSchema
+export type ArtifactExtendResult = z.infer<typeof artifactExtendResultSchema>
 
 /** 路径参数（`/api/artifacts/:id/...` 的 `:id` = `artifacts` 行主键，`uuid(7)`） */
 export const artifactIdParamsSchema = z.object({
@@ -973,7 +1029,10 @@ export type FileIdParams = z.infer<typeof fileIdParamsSchema>
  * `roundToViews` 的顺序一致 —— 同一轮"我说了什么、它答了什么、我中途补了什么"可读）。
  *
  * · `id` = 服务端入队时生成的稳定标识（与 `steer` 事件帧、取消端点同源）；
- * · `message` = 插话正文原文；`at` = 入队时刻（ISO 8601）。
+ * · `message` = 插话正文原文；`at` = 入队时刻（ISO 8601）；
+ * · `textOffset`（2026-10-29 可空）= **投递时**助手正文已经写到第几个字符 —— 渲染时插话气泡
+ *   插在这里，「agent 在插话之后回复的内容」自然排在它下面（见前端 `interjectionViews`）。
+ *   省键 = 投递时正文还没开始（或旧数据）⇒ 气泡排在助手消息之后。
  *
  * ⚠️ 只落**真的投递过**的插话（被撤回且未投递的不在此列）；"是否已被模型读走"不落库
  * （历史视图不显示投递状态 —— 那一轮已经结束，状态没有意义）。
@@ -982,6 +1041,7 @@ export const steerRecordSchema = z.object({
   id: z.string().min(1),
   message: z.string(),
   at: z.string(),
+  textOffset: z.number().int().nonnegative().optional(),
 })
 export type SteerRecord = z.infer<typeof steerRecordSchema>
 

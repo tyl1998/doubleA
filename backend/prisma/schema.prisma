@@ -1160,6 +1160,10 @@ model Artifact {
   /// （`createdAt < now - N 天`）正是 JS 侧边界比较 —— 写偏了保留期就整体偏一个时区。
   /// 默认值只是兜底（同 `Sandbox.createdAt` 的口径）。
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// 过期时刻（2026-10-29 用户定案：产物可「延期几天 / 延期到某日 / 永久保存」）。
+  /// **`NULL` = 永不过期**（永久保存；清理器只扫非空且 `<= now` 的行）。
+  /// 建行时按 `ARTIFACT_RETENTION_DAYS` 写入（默认 7 天）；延期 = 把这一列往后推。
+  expiresAt      DateTime? @map("expires_at") @db.Timestamptz(3)
 
   /// ⚠️ `SetNull` 而不是 `Cascade`：删除会话**保留产物行**（历史产物，见上方的方案链接）。
   /// 行保留后由 `userId` 归回给用户 —— 这是 `delete 会话 → 产物还能查到` 的落点
@@ -1168,8 +1172,8 @@ model Artifact {
 
   /// P0-3-9 的产物列表（`GET /:id/artifacts`）扫描键
   @@index([conversationId, createdAt(sort: Desc)])
-  /// 保留期清理器的扫描键（`createdAt < now - ARTIFACT_RETENTION_DAYS`）
-  @@index([createdAt])
+  /// 保留期清理器的扫描键（`expiresAt` 非空且 `<= now`；`NULL` = 永久，不扫）
+  @@index([expiresAt])
   /// 历史产物列表（`GET /api/artifacts/history`：`userId = me AND conversationId = null`）扫描键
   @@index([userId, conversationId, createdAt(sort: Desc)])
   @@map("artifacts")

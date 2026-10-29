@@ -51,6 +51,7 @@ import {
   type MessageModelSegment,
   type SteerRecord,
 } from '@doubulea/shared'
+import { interjectionViews } from './roundReducer.js'
 import type {
   ChatFinishReason,
   SseArtifactPayload,
@@ -402,26 +403,24 @@ function pickSteers(source: Record<string, unknown>): SteerRecord[] {
 }
 
 /**
- * 插话段 → 视图（排在助手消息**之后**，与流式侧 `roundToViews` 同一顺序）。
+ * 插话段 → 视图（2026-10-29 起**按投递位置切开助手气泡**，与流式侧 `roundToViews` 同一规则）。
+ *
+ * 位置来自落库的 `textOffset`（投递那一刻正文写到第几个字符，见 `shared#steerRecordSchema`）；
+ * 旧数据没有这个键 ⇒ 插话仍排在助手气泡之后。
  *
  * ⚠️ 历史侧不显示投递状态（`steerState` 缺省）：「这一轮已经结束」之后，"是否被模型读到"
  * 对用户没有意义，显示一个永远停在「已投递」的角标只会增加噪音。
  */
-function steerViewsOf(item: MessageItem, steers: readonly SteerRecord[]): ChatMessageView[] {
-  return steers.map((steer) => ({
-    key: `${item.id}:steer:${steer.id}`,
-    role: 'USER' as const,
-    text: steer.message,
-    thinkingSegments: [],
-    citations: null,
-    tools: [],
-    artifacts: [],
-    attachments: [],
-    createdAt: steer.at,
-    status: 'complete' as const,
-    steer: true as const,
-    steerId: steer.id,
-  }))
+function steerViewsOf(assistant: ChatMessageView, steers: readonly SteerRecord[]): ChatMessageView[] {
+  return interjectionViews(
+    assistant,
+    steers.map((steer) => ({
+      id: steer.id,
+      text: steer.message,
+      at: steer.at,
+      textOffset: steer.textOffset ?? null,
+    })),
+  )
 }
 
 /**
@@ -556,9 +555,9 @@ export function isAssistantEmpty(view: ChatMessageView): boolean {
 /**
  * 历史列表 → 视图列表（保持服务端给的时间正序，见 `messagePageResultSchema` 的注释）。
  *
- * ⚠️ 助手消息的 `content.steers` 会**再展开出几条 USER 视图**（排在它之后）—— 插话在
- * 界面上的位置与流式侧一致（本轮末尾），而它挂在助手消息上是为了"一轮一起落库"
- * （见 `shared#steerRecordSchema`）。
+ * ⚠️ 助手消息的 `content.steers` 会**再展开出几条 USER 视图**——插话按落库的 `textOffset`
+ * （投递那一刻正文写到哪）插进助手气泡内部，与流式侧同一规则（见 {@link steerViewsOf}）；
+ * 它挂在助手消息上是为了"一轮一起落库"（见 `shared#steerRecordSchema`）。
  */
 export function messagesToViews(items: readonly MessageItem[]): ChatMessageView[] {
   const views: ChatMessageView[] = []
@@ -571,7 +570,7 @@ export function messagesToViews(items: readonly MessageItem[]): ChatMessageView[
         ? (raw as Record<string, unknown>)
         : {}
     const steers = pickSteers(content)
-    if (steers.length > 0) views.push(...steerViewsOf(item, steers))
+    if (steers.length > 0) views.push(...steerViewsOf(views[views.length - 1]!, steers))
   }
   return views
 }

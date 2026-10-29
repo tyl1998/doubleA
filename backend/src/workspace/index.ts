@@ -28,6 +28,7 @@ export {
   listWorkspaceFiles,
   moveWorkspaceFile,
   openWorkspaceFileSource,
+  readWorkspaceDirectoryZip,
   readWorkspaceFile,
   revertWorkspaceRound,
   sha256,
@@ -53,7 +54,13 @@ export {
 
 // git 概况（`GET .../workspace/git` 用）：只读 `<gitdir>/HEAD`，不调 git 二进制。
 // 纯解析两枚 + 收根目录参数的扫描一枚一并导出 —— 回归里逐条喂字面量 / 造临时目录核对，不必依赖配置。
-export { parseGitDirFile, parseGitHead, readWorkspaceGitRepos, scanGitReposUnder } from './git.js'
+export {
+  parseGitDirFile,
+  parseGitHead,
+  readWorkspaceGitRepos,
+  readWorkspaceRetention,
+  scanGitReposUnder,
+} from './git.js'
 
 // 字节层（宿主 FS）
 export {
@@ -165,6 +172,10 @@ export {
   recordWorkspaceRoundStart,
   type WorkspaceRoundWindow,
 } from './round.js'
+
+// zip 编码（2026-10-29，「按目录下载」）：stored 条目、零依赖；纯函数可逐字节核对
+// ｜ 工作区服务（`readWorkspaceDirectoryZip`）与路由层消费
+export { buildZip, crc32, zipEntryName, ZIP_MAX_BYTES, type ZipEntry } from './zip.js'
 
 // 历史字节（P4 · R2）：内容寻址的本地 blob 存储（撤销本轮据此还原）
 export {

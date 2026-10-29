@@ -17,6 +17,7 @@ import {
   type SetConversationCodeModeResult,
   type SetConversationInstanceResult,
   type SetConversationRuntimeResult,
+  type ArtifactItem,
   type WorkspaceChangesResult,
   type WorkspaceDeleteDirResult,
   type WorkspaceFileDiff,
@@ -24,6 +25,8 @@ import {
   type WorkspaceFileRead,
   type WorkspaceGitResult,
   type WorkspaceRevertResult,
+  type WorkspaceRevertScope,
+  type WorkspaceRetentionInfo,
   type WorkspaceTreeResult,
 } from '@doubulea/shared'
 
@@ -62,6 +65,10 @@ export function fetchWorkspaceGit(conversationId: string): Promise<WorkspaceGitR
  * 分支只在"有人动了工作区"时才可能变（`git checkout` 会写 `.git/HEAD` ⇒ 工作区事件）⇒
  * {@link WorkspacePanel} 在工作区事件到达时与文件树**一并失效**它，这里只给一个不刷屏的
  * `staleTime`（免得每次挂载都打一次这个"锦上添花"的端点）。
+ *
+ * ★ P1-24（2026-10-27）：`repos[].cloning`（`index.lock` / `shallow.lock` 还在）时**每 1.5s 再问一次**
+ *   —— `clone --depth` 中途工作区会一口气长出几千个文件，面板要把"已就绪"推后（见
+ *   `WorkspacePanel` 的 `workspaceReady`），直到 git 自己把锁文件删掉。
  */
 export function useWorkspaceGit(
   conversationId: string | undefined,
@@ -72,7 +79,25 @@ export function useWorkspaceGit(
     queryFn: () => fetchWorkspaceGit(conversationId ?? ''),
     enabled: enabled && conversationId !== undefined,
     staleTime: 10_000,
+    refetchInterval: (q) => ((q.state.data?.repos ?? []).some((repo) => repo.cloning) ? 1500 : false),
   })
+}
+
+/**
+ * 工作区**保留期提示**（2026-10-28）：还有几天清理、到期会不会被保护（有产物 / 有我的手写）。
+ *
+ * ★ 2026-10-28（用户反馈「agent 生成的 docx 被静默清掉」）：清理必须让用户**提前**看见，
+ *   而不是删完才发现。面板据此在「最近变更」上方显示一条可关闭的提示。
+ */
+export function fetchWorkspaceRetention(conversationId: string): Promise<WorkspaceRetentionInfo> {
+  return request<WorkspaceRetentionInfo>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/workspace/retention`,
+  )
+}
+
+/** 保留期提示的 react-query key */
+export function workspaceRetentionQueryKey(conversationId: string): readonly [string, string] {
+  return ['workspace-retention', conversationId]
 }
 
 /** 轮末变更集（`?since=<iso>` 只看该时刻后；缺省 = 全量），按时间倒序、各路径一条（P4） */
@@ -83,14 +108,13 @@ export function fetchWorkspaceChanges(conversationId: string, since?: string): P
   )
 }
 
-/** 文件差异的 react-query key（按会话 + 路径 + 基线版本；`0` = 缺省基线） */
-export function workspaceFileDiffQueryKey(
-  conversationId: string,
-  path: string,
-  baseVersion?: number,
-): readonly [string, string, string, number] {
-  return ['workspace-diff', conversationId, path, baseVersion ?? 0]
-}
+/**
+ * 文件差异的 react-query key —— **实现在纯函数模块** `features/chat/workspaceModel.ts`。
+ *
+ * 放那儿是为了能被 `verify:workspace-ui`（零依赖、不加载 `import.meta.env`）直接断言；
+ * 这里只做转出，调用点照旧从 `api/` 取。
+ */
+export { workspaceFileDiffQueryKey } from '../features/chat/workspaceModel.js'
 
 /**
  * 文件**行级差异**（旧版本 → 当前；P1-9 · 验收标记）。
@@ -99,11 +123,15 @@ export function workspaceFileDiffQueryKey(
 export function fetchWorkspaceFileDiff(
   conversationId: string,
   path: string,
-  options: { baseVersion?: number; stats?: boolean } = {},
+  options: { baseVersion?: number; toVersion?: number; stats?: boolean; roundBase?: boolean } = {},
 ): Promise<WorkspaceFileDiff> {
   const params = new URLSearchParams({ path })
   if (options.baseVersion !== undefined) params.set('baseVersion', String(options.baseVersion))
+  // ★ 2026-10-28：「更早」那条要比到**那一段的末版本**为止（不一路比到此刻盘上的内容）
+  if (options.toVersion !== undefined) params.set('toVersion', String(options.toVersion))
   if (options.stats === true) params.set('stats', '1')
+  // ★ 2026-10-28：让**服务端**按本轮窗口算基线（前端不必传 `beforeVersion`，合并丢字段也不漂移）
+  if (options.roundBase === true) params.set('roundBase', '1')
   return request<WorkspaceFileDiff>(
     `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/diff?${params.toString()}`,
   )
@@ -187,6 +215,19 @@ export function uploadWorkspaceFile(conversationId: string, dir: string, file: F
   )
 }
 
+/**
+ * 「上传至平台」（2026-10-29）：把**工作区里的一个文件**登记成产物。
+ *
+ * 只传路径 —— 字节由服务端从工作区读（同一台实例、同一份 canonical 字节）。
+ * 回 `ArtifactItem`（= 产物面板 / 消息 `artifact` 卡同一形状）。
+ */
+export function uploadWorkspaceArtifact(conversationId: string, path: string): Promise<ArtifactItem> {
+  return request<ArtifactItem>(`/api/conversations/${encodeURIComponent(conversationId)}/workspace/artifact`, {
+    method: 'POST',
+    body: { path },
+  })
+}
+
 /** 删除文件（软删 + 墓碑） */
 export function deleteWorkspaceFile(conversationId: string, path: string): Promise<{ path: string }> {
   const query = new URLSearchParams({ path }).toString()
@@ -217,13 +258,20 @@ export function moveWorkspaceFile(conversationId: string, from: string, to: stri
 }
 
 /**
- * 「撤销本轮」（`POST .../workspace/revert`，P1-9 · P4 · R2）。
+ * 「撤销本轮」（`POST .../workspace/revert`，P1-9 · P4 · R2；2026-10-28 加范围）。
  *
- * 不传 `since`/`until` = 由服务端读**本轮标记**（TaskAgent 上一轮的起止窗口）；`dryRun=true` = 只算不写。
+ * 不传 `since`/`until` = 由服务端按**与「最近变更」同一段划分**定窗口；`dryRun=true` = 只算不写
+ * （回 `preview` 三栏）。`scope` 缺省 = `AGENT_ONLY`（只撤 agent，手写收尾的路径故意不动）。
  */
 export function revertWorkspaceRound(
   conversationId: string,
-  options: { since?: string; until?: string; dryRun?: boolean } = {},
+  options: {
+    since?: string
+    until?: string
+    dryRun?: boolean
+    scope?: WorkspaceRevertScope
+    paths?: readonly string[]
+  } = {},
 ): Promise<WorkspaceRevertResult> {
   return request<WorkspaceRevertResult>(
     `/api/conversations/${encodeURIComponent(conversationId)}/workspace/revert`,
@@ -237,6 +285,17 @@ export function revertWorkspaceRound(
 export function workspaceRawUrl(conversationId: string, path: string): string {
   const query = new URLSearchParams({ path }).toString()
   return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/raw?${query}`
+}
+
+/**
+ * 目录下载为 zip 的 URL（`GET .../workspace/dir/zip?path=`，2026-10-29）。
+ *
+ * 返回 URL 而不是 Promise：调用方用 `<a download>` 直接触发（与单文件下载同款）——
+ * 打包可能要几秒，浏览器自己会转圈，前端不必把整包字节读进内存再造 blob。
+ */
+export function workspaceDirZipUrl(conversationId: string, path: string): string {
+  const query = new URLSearchParams({ path }).toString()
+  return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/dir/zip?${query}`
 }
 
 /** 读工作区文件的**原始字节**（下载 / 图片预览用；非 UTF-8 文本由调用方判） */
@@ -390,4 +449,20 @@ function parseWorkspaceFrame(frame: string): WorkspaceEventItem | null {
   } catch {
     return null
   }
+}
+/**
+ * 保留期提示（2026-10-28）：`staleTime` 5 分钟 —— 这是"天级"信息，没必要频繁问。
+ * `enabled` 跟工作区面板一致（非 Code 模式不拉）。
+ */
+export function useWorkspaceRetention(
+  conversationId: string | undefined,
+  enabled: boolean,
+): UseQueryResult<WorkspaceRetentionInfo> {
+  return useQuery({
+    queryKey: workspaceRetentionQueryKey(conversationId ?? ''),
+    queryFn: () => fetchWorkspaceRetention(conversationId ?? ''),
+    enabled: enabled && conversationId !== undefined,
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
 }

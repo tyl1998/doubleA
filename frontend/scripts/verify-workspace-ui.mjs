@@ -63,6 +63,7 @@ const {
   joinWorkspacePath,
   workspaceNewFolderPlaceholderPath,
   workspaceMoveTargetPath,
+  workspaceResolvePromptPath,
   WORKSPACE_FOLDER_PLACEHOLDER,
   mergeWorkspaceChanges,
   workspaceAncestorDirs,
@@ -75,6 +76,14 @@ const {
   workspaceCopyValue,
   workspaceGitChipLabel,
   workspaceGitChipTitle,
+  isGitInternalPath,
+  workspaceFileDiffQueryKey,
+  workspaceDiffScope,
+  groupWorkspaceChangesByRound,
+  WORKSPACE_RECENT_MAX_PER_GROUP,
+  workspaceChangeGrouping,
+  retentionDaysLeft,
+  WORKSPACE_RETENTION_NOTICE_DAYS,
 } = await import('../src/features/chat/workspaceModel.ts')
 
 // P1-23：读数改为"多收 locale 的纯函数"（译文在 `shared/src/i18n`）。本档统一用 zh 断言，
@@ -286,6 +295,15 @@ it('W26 workspaceMoveTargetPath：拖到目录后目标路径（名字不变）'
   eq(workspaceMoveTargetPath('a/b/c.ts', 'x/y'), 'x/y/c.ts', '移到别的目录')
   eq(workspaceMoveTargetPath('c.ts', ''), 'c.ts', '移到根目录保持原名')
 })
+it('W26b workspaceResolvePromptPath：预填 a/ 后再敲 a/x.py 不叠成 a/a/x.py', () => {
+  // ★ 2026-10-29 用户实测：右键目录 a 新建，框里预填 `a/`，输入 `a/x.py` ⇒ 实际建出 `a/a/x.py`
+  eq(workspaceResolvePromptPath('a', 'a/x.py'), 'x.py', '★ 连前缀一起敲 ⇒ 只留 x.py（最终 a/x.py）')
+  eq(workspaceResolvePromptPath('a', 'x.py'), 'x.py', '正常从预填处接着敲')
+  eq(workspaceResolvePromptPath('a', 'b/x.py'), 'b/x.py', '改成别的子目录 ⇒ 按用户写的走（a/b/x.py）')
+  eq(workspaceResolvePromptPath('a', 'a'), '', '只敲目录本身 ⇒ 空名，调用方不创建')
+  eq(workspaceResolvePromptPath('', 'a/x.py'), 'a/x.py', '根目录不预填前缀')
+  eq(workspaceResolvePromptPath('a', ' a/x.py '), 'x.py', '两端空白不影响判定')
+})
 
 console.log('── W12 最近变更 / 自动展开 / 撤销报告（P1-20 问题 1）──')
 it('W27 mergeWorkspaceChanges：服务端基线 ∪ 实时事件，按路径折叠、只认内容事件、时间倒序', () => {
@@ -302,8 +320,11 @@ it('W27 mergeWorkspaceChanges：服务端基线 ∪ 实时事件，按路径折�
     { id: 'e3', path: 'b.ts', type: 'claim', version: 1, actor: 'AGENT', actorId: null, at: '2026-10-15T03:00:00.000Z' },
   ]
   const merged = mergeWorkspaceChanges(server, live)
-  eq(merged.map((item) => item.path).join(','), 'c.ts,a.ts,b.ts', '按时间倒序、去掉 claim')
-  eq(merged.find((item) => item.path === 'a.ts')?.type, 'deleted', '同路径取更晚的实时事件')
+  // ★ 2026-10-28（「按次」口径）：实时事件顶掉的那条**降级为更早**保留 ⇒ a.ts 出现两次
+  //   （本轮 + 更早）。这正是"编辑第二次也看得见第一次"的要求，不是重复项。
+  eq(merged.map((item) => item.path).join(','), 'c.ts,a.ts,a.ts,b.ts', '按时间倒序、去掉 claim、被顶掉的降级为更早')
+  eq(merged.filter((item) => item.path === 'a.ts' && item.segment === 'current')[0]?.type, 'deleted', '本轮取更晚的实时事件')
+  eq(merged.filter((item) => item.path === 'a.ts' && item.segment === 'earlier')[0]?.version, 2, '更早保留上一次（服务端那条 v2）')
   eq(merged.find((item) => item.path === 'b.ts')?.type, 'created', 'claim 不顶掉内容事件')
 })
 it('W28 mergeWorkspaceChanges：只有服务端基线（刷新/刚进会话）也能出列表', () => {
@@ -360,6 +381,161 @@ it('W35 workspaceGitChipLabel / Title：分支直显、detached 标出来、读�
     'qatt-platform-qa · detached@9f1c0d2（detached HEAD，不在任何分支上）',
     '子目录仓库 + detached 的 title',
   )
+})
+
+it('W36 isGitInternalPath：只认 `.git` 那一段，「最近变更」不显示 git 自己的中间产物', () => {
+  eq(isGitInternalPath('repo/.git/objects/pack/tmp_pack_EDixtn'), true, 'clone 中途的临时 pack')
+  eq(isGitInternalPath('repo/.git/index.lock'), true, 'index.lock')
+  eq(isGitInternalPath('repo/.git'), true, '`--separate-git-dir` 那种 `.git` 文件本身')
+  eq(isGitInternalPath('.git/HEAD'), true, '根就是仓库')
+  eq(isGitInternalPath('repo/Demo/test_case/test_demo1.py'), false, '普通文件')
+  eq(isGitInternalPath('.doubulea/memory.md'), false, '隐藏目录不等于 .git（记忆文档不算 git 内部）')
+  eq(isGitInternalPath('repo/.github/workflows/ci.yml'), false, '`.github` 是正常目录，不是 `.git`')
+})
+
+it('W37 workspaceFileDiffQueryKey：`stats` 必须进 key（否则徽标与弹窗共享缓存 ⇒ 有 +N −M 却点开为空）', () => {
+  const badge = workspaceFileDiffQueryKey('c1', 'a.txt', 8, true)
+  const modal = workspaceFileDiffQueryKey('c1', 'a.txt', 8, false)
+  eq(badge.join('/'), 'workspace-diff/c1/a.txt/8/true/0', '计数查询的 key 带 stats=true、无 toVersion')
+  eq(modal.join('/'), 'workspace-diff/c1/a.txt/8/false/0', '全文查询的 key 带 stats=false、无 toVersion')
+  assert(badge.join('/') !== modal.join('/'), '两者**不能**同 key —— 同 key 会让弹窗读到只有计数的缓存（lines 缺失）')
+  // ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条）：`toVersion` 也必须进 key。
+  //   两条路径相同、基线也可能相同，只有"比到哪个版本"不同 ⇒ 少这一段就会读到同一份缓存，
+  //   于是「更早」那条点开显示的是「本轮」的差异。
+  const earlier = workspaceFileDiffQueryKey('c1', 'a.txt', 8, true, 5)
+  eq(earlier.join('/'), 'workspace-diff/c1/a.txt/8/true/5', '「更早」那条带 toVersion')
+  assert(earlier.join('/') !== badge.join('/'), '不同 toVersion **不能**同 key —— 否则两条变更共享同一份差异')
+})
+
+it('W38 groupWorkspaceChangesByRound：按轮分组（本轮 / 更早），边界取 >=', () => {
+  const c = (path, at) => ({ path, type: 'updated', version: 2, actor: 'USER', actorId: null, at })
+  const changes = [
+    c('a', '2026-10-28T10:05:00.000Z'),
+    c('b', '2026-10-28T10:00:00.000Z'),
+    c('c', '2026-10-28T09:00:00.000Z'),
+  ]
+  const g = groupWorkspaceChangesByRound(changes, { start: '2026-10-28T10:00:00.000Z', end: '2026-10-28T10:10:00.000Z' })
+  eq(g.current.map((x) => x.path).join(','), 'a,b', '起点那一刻（>=）算本轮；顺序保持不变')
+  eq(g.earlier.map((x) => x.path).join(','), 'c', '更早的归「更早」')
+  const noRound = groupWorkspaceChangesByRound(changes, undefined)
+  eq(noRound.current.length, 0, '没有轮次 ⇒ 不编造空的「本轮」')
+  eq(noRound.earlier.length, 3, '没有轮次 ⇒ 全部算「更早」')
+  const badStart = groupWorkspaceChangesByRound(changes, { start: 'not-a-date' })
+  eq(badStart.earlier.length, 3, '起点解析不了 ⇒ 退化为全部「更早」（不把旧的冒充本轮）')
+})
+
+it('W40 mergeWorkspaceChanges：实时保存占「本轮」，被顶掉的那跳降级为「更早」', () => {
+  const server = [
+    { path: 'f.py', type: 'updated', version: 25, actor: 'USER', actorId: null, at: '2026-10-27T18:31:18.000Z', segment: 'current', beforeVersion: 24 },
+  ]
+  const live = [{ id: 'e1', type: 'updated', path: 'f.py', version: 26, actor: 'USER', actorId: null, at: '2026-10-28T02:45:00.000Z' }]
+  const merged = mergeWorkspaceChanges(server, live)
+  // ★ 2026-10-28（用户定案「按次：每次保存各算一轮」）：实时事件 = 最近一次保存 ⇒ 本轮；
+  //   原来那条并不是被"覆盖消失"，而是**降级为更早** —— 否则"编辑第二次"就丢了第一次。
+  eq(merged.length, 2, '本轮一条 + 更早一条（前一次保存不能凭空消失）')
+  eq(merged[0].version, 26, '本轮 = 最近一次保存')
+  eq(merged[1].version, 25, '更早 = 上一次保存')
+  eq(merged[1].segment, 'earlier', '被顶掉的那条降级为更早')
+})
+
+it('W41 同一路径两段各一条（segment 区分），实时事件只更新「本轮」那条', () => {
+  const server = [
+    // 服务端按轮分段后的两条（同一文件：更早改过、本轮又改过）
+    { path: 'f.py', type: 'updated', version: 2, actor: 'AGENT', actorId: null, at: '2026-10-27T10:00:00.000Z', segment: 'earlier', beforeVersion: 1 },
+    { path: 'f.py', type: 'updated', version: 5, actor: 'USER', actorId: null, at: '2026-10-28T10:00:00.000Z', segment: 'current', beforeVersion: 3 },
+  ]
+  const merged = mergeWorkspaceChanges(server, [])
+  eq(merged.length, 2, '同一路径两段各一条 —— 不能按路径折叠成一条')
+  eq(merged.map((x) => x.segment).join(','), 'current,earlier', '按时间倒序（本轮在前）')
+  eq(merged[0].version, 5, '本轮那条的末版本')
+  eq(merged[1].version, 2, '更早那条的末版本（不是被本轮覆盖成 5）')
+
+  const live = [{ id: 'e1', type: 'updated', path: 'f.py', version: 6, actor: 'USER', actorId: null, at: '2026-10-28T11:00:00.000Z' }]
+  const after = mergeWorkspaceChanges(server, live)
+  eq(after.length, 2, '实时事件不新增第三条（仍是本轮一条 + 更早一条）')
+  eq(after.filter((x) => x.segment === 'current')[0].version, 6, '实时事件成为新的「本轮」')
+  // ★ 「按次」口径：被顶掉的那条（v5）降级并入「更早」，而更早压成一条 ⇒ 取较新那一跳（v5）
+  eq(after.filter((x) => x.segment === 'earlier')[0].version, 5, '更早 = 轮前那段的末版本（v5）')
+  eq(
+    after.filter((x) => x.segment === 'earlier')[0].beforeVersion,
+    1,
+    '更早的基线仍沿用原更早那条（轮前段起点 v1），不被降级那跳的基线顶掉',
+  )
+
+  // 分组以 segment 为准（服务端标的段就是真相，不再按时间猜）
+  const g = groupWorkspaceChangesByRound(after, { start: '2026-10-28T09:00:00.000Z' })
+  eq(g.current.length, 1, '本轮一条')
+  eq(g.earlier.length, 1, '更早一条')
+  const noRound = groupWorkspaceChangesByRound(after, undefined)
+  eq(noRound.earlier.length, 2, '没有轮次信息时两段都退回「更早」（不编造本轮）')
+})
+
+it('W42 mergeWorkspaceChanges：一条实时事件只产生一条，且一定归「本轮」', () => {
+  // ★ 2026-10-28（用户定案「按次：每次保存各算一轮」）：实时事件**就是**最近一次保存 ⇒ 天然本轮。
+  //   原来按 `round.start`（最后一条用户消息）判段，在按次口径下会把刚保存的错判成「更早」。
+  const live = [{ id: 'e1', type: 'updated', path: 'a.py', version: 7, actor: 'USER', actorId: null, at: '2026-10-28T08:00:00.000Z' }]
+  const merged = mergeWorkspaceChanges([], live)
+  eq(merged.length, 1, '一条实时事件只产生一条（不额外造更早条目）')
+  eq(merged[0].segment, 'current', '实时保存 ⇒ current')
+  const g = groupWorkspaceChangesByRound(merged, { start: '2026-10-28T10:00:00.000Z' })
+  eq(g.current.length, 1, '按 segment 分组：仍在「本轮」')
+})
+
+it('W43 workspaceDiffScope：两条（本轮 / 更早）各自的范围，徽标与弹窗同一判据', () => {
+  // ★ 2026-10-28（用户定案「按次：每次保存各算一轮」）：**两段用同一判据** ——
+  //   基线都是这条变更自己的 `beforeVersion`（这一跳之前那一版）。
+  //   本轮**不再**请求 `roundBase`（那是"本轮窗口整体"口径，会把多次保存合并成一条）。
+  const earlier = workspaceDiffScope({ version: 3, beforeVersion: 1, segment: 'earlier' })
+  eq(earlier.roundBase, false, '更早：不请求本轮基线')
+  eq(earlier.baseVersion, 1, '更早：基线 = 该段起点')
+  eq(earlier.toVersion, 3, '更早：到版本 = 该段末版本（不是当前内容）')
+
+  const current = workspaceDiffScope({ version: 9, beforeVersion: 7, segment: 'current' })
+  eq(current.roundBase, false, '★ 本轮：用自己这一跳的基线，不请求"本轮窗口整体"')
+  eq(current.baseVersion, 7, '★ 本轮：基线 = 这一跳之前那一版（v7→v9，不是轮初）')
+  eq(current.toVersion, undefined, '本轮：比到当前内容')
+
+  // 段缺省（旧响应）⇒ 按「本轮」口径（它就是"此刻"）
+  eq(workspaceDiffScope({ version: 4, beforeVersion: 3 }).baseVersion, 3, '段缺省仍用这条自身的基线')
+
+  // 「更早」新建（那一段开始时文件不存在）
+  const earlierNew = workspaceDiffScope({ version: 2, beforeVersion: null, segment: 'earlier' })
+  eq(earlierNew.baseVersion, 0, '更早新建：明确传 0（基线不存在），不是退回前一版')
+  eq(earlierNew.toVersion, 2, '更早新建：到 v2')
+
+  // 拿不到基线信息时才回退到服务端的本轮窗口口径
+  eq(workspaceDiffScope({ version: 5, segment: 'earlier' }).baseVersion, 4, '没有 beforeVersion ⇒ 前一版')
+  eq(workspaceDiffScope({ version: 5, segment: 'current' }).roundBase, true, '没有 beforeVersion 的本轮 ⇒ 请求服务端本轮基线')
+  // 已删除的条目（version=null）不带 toVersion
+  eq(
+    workspaceDiffScope({ version: null, segment: 'earlier' }).toVersion,
+    undefined,
+    '末版本未知（已删除）⇒ 不比到某个版本',
+  )
+})
+
+it('W39 WORKSPACE_RECENT_MAX_PER_GROUP：每段截断可见（不再静默 8 条）', () => {
+  eq(typeof WORKSPACE_RECENT_MAX_PER_GROUP, 'number', '上限是显式常量')
+  assert(WORKSPACE_RECENT_MAX_PER_GROUP > 8, '比原来的静默 8 条更宽松（分组后各段独立计数）')
+})
+
+it('W44 workspaceChangeGrouping：只有 USER 才算「变更历史」', () => {
+  // 2026-10-28 实测修正：真跑过的会话事件常是 SYSTEM（对账 / clone / 引擎写），AGENT 一条都没有 ——
+  // 按"有 AGENT 才 rounds"会把它们误判成「变更历史」。
+  eq(workspaceChangeGrouping([{ actor: 'USER' }]), 'history', '纯手写 ⇒ 平铺历史')
+  eq(workspaceChangeGrouping([{ actor: 'USER' }, { actor: 'SYSTEM' }]), 'rounds', '有 SYSTEM ⇒ 分本轮/更早')
+  eq(workspaceChangeGrouping([{ actor: 'USER' }, { actor: 'AGENT' }]), 'rounds', '有 agent ⇒ 分本轮/更早')
+  eq(workspaceChangeGrouping([]), 'history', '空清单 ⇒ history')
+})
+
+it('W45 retentionDaysLeft：向上取整、过期归零，与 expiresAt 同口径', () => {
+  const now = Date.parse('2026-10-28T00:00:00.000Z')
+  eq(retentionDaysLeft('2026-10-30T00:00:00.000Z', now), 2, '整 2 天')
+  eq(retentionDaysLeft('2026-10-30T01:00:00.000Z', now), 3, '不满 3 天 ⇒ 向上取整为 3（提前一天提醒）')
+  eq(retentionDaysLeft('2026-10-28T00:00:00.000Z', now), 0, '正好到期 ⇒ 0')
+  eq(retentionDaysLeft('2026-10-01T00:00:00.000Z', now), 0, '已过期 ⇒ 0（不给负数）')
+  eq(retentionDaysLeft('not-a-date', now), 0, '解析不了 ⇒ 0（不编造）')
+  assert(WORKSPACE_RETENTION_NOTICE_DAYS >= 1, '提示阈值至少提前 1 天')
 })
 
 console.log('')

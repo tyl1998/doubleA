@@ -42,21 +42,29 @@ import {
   FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
+  QuestionCircleOutlined,
   ReloadOutlined,
   RightOutlined,
   SaveOutlined,
+  CloudUploadOutlined,
   UndoOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
-import { Alert, App, Button, Dropdown, Empty, Input, Modal, Popconfirm, Space, Spin, Switch, Tag, Tooltip, Typography } from 'antd'
+import { Alert, App, Button, Dropdown, Empty, Input, Modal, Space, Spin, Switch, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import {
   WORKSPACE_ACTOR_KEY,
+  isWorkspaceHiddenPath,
+  isWorkspaceTextMime,
   type WorkspaceChangeEntry,
   type WorkspaceDiffLine,
   type WorkspaceEventItem,
+  type WorkspaceRevertResult,
+  type WorkspaceRevertScope,
+  type WorkspaceRevertSkipReason,
+  type WorkspaceRetentionInfo,
 } from '@doubulea/shared'
 
 import { ApiError } from '../../api/client.js'
@@ -72,15 +80,19 @@ import {
   revertWorkspaceRound,
   saveWorkspaceFile,
   streamWorkspaceEvents,
+  uploadWorkspaceArtifact,
   uploadWorkspaceFile,
   useWorkspaceGit,
   useWorkspaceTree,
+  workspaceDirZipUrl,
   workspaceFileDiffQueryKey,
   workspaceFileQueryKey,
   workspaceGitQueryKey,
+  useWorkspaceRetention,
   workspaceRawUrl,
   workspaceTreeQueryKey,
 } from '../../api/workspace.js'
+import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
 import { useWorkspaceExpandedDirs, useWorkspaceStore, useWorkspaceTabs } from '../../stores/workspace.js'
@@ -96,14 +108,22 @@ import {
   formatBytes,
   isContentEvent,
   isEditableRead,
+  isGitInternalPath,
   isImageMime,
   isWorkspacePathInDir,
+  WORKSPACE_RECENT_MAX_PER_GROUP,
+  WORKSPACE_RETENTION_NOTICE_DAYS,
+  groupWorkspaceChangesByRound,
   mergeWorkspaceChanges,
   revertActionLabel,
   revertSummaryText,
+  toggleExpandedDir,
   workspaceAncestorDirs,
   workspaceBaseName,
+  workspaceChangeGrouping,
+  retentionDaysLeft,
   workspaceCopyValue,
+  workspaceDiffScope,
   workspaceEditorLanguage,
   workspaceGitChipLabel,
   workspaceGitChipTitle,
@@ -111,12 +131,17 @@ import {
   workspaceMoveTargetPath,
   workspaceNewFolderPlaceholderPath,
   workspaceParentDir,
+  workspaceResolvePromptPath,
+  joinWorkspacePath,
   workspaceCopyItems,
   WORKSPACE_COPY_ITEM_KEYS,
   type WorkspaceCopyKind,
   type WorkspaceFileIconKind,
   type WorkspaceTreeNode,
 } from './workspaceModel.js'
+
+/** 空目录集合（"全部折叠"的展开状态；`resetKey` 非 0 且用户还没点过目录时用它） */
+const EMPTY_DIRS: readonly string[] = []
 
 /** 会话头 Code 模式开关（新会话态也能开 —— 先把意图记在本地，建出会话后落地；见 `ChatPage`） */
 export function CodeModeSwitch(props: {
@@ -177,6 +202,10 @@ interface TreeActions {
   remove: (path: string) => void
   removeDir: (dir: string) => void
   download: (path: string) => void
+  /** 「下载为 zip」：把这个目录（含子孙）打包下载（2026-10-29） */
+  downloadDir: (dir: string) => void
+  /** 「上传至平台」：把这个工作区文件登记成产物（2026-10-29；Code 模式不再自动收产物） */
+  uploadArtifact: (path: string) => void
   /** 复制三种口径之一（`relative` / `absolute`=容器 `/work/…` / `name`）；文件与目录同款 */
   copy: (kind: WorkspaceCopyKind, path: string) => void
   newFile: (dir: string) => void
@@ -251,8 +280,39 @@ export function WorkspacePanel({
 
   const [showHidden, setShowHidden] = useState(true)
   const [recentOpen, setRecentOpen] = useState(false)
-  /** 正在查看差异的文件路径（`null` = 差异弹窗关着） */
-  const [diffPath, setDiffPath] = useState<string | null>(null)
+  /**
+   * 从「最近变更」点开文件时带来的**版本范围**（`本轮` / `更早` 各一条，同路径出现两次时靠它区分）。
+   *
+   * ★ 2026-10-28（用户定案）：「同一路径出现两次，需要标明各自版本范围（**点击文件后展示**，
+   *   在文件列表里展示会把文件名都盖住）」。所以这里只在**打开该文件之后**、编辑器工具栏上
+   *   显示 `本轮 · v3 → v5` 这样的胶囊；列表行里不写版本范围。
+   *   换文件 / 从文件树打开 / 关标签时清掉（范围属于那条变更，不属于文件本身）。
+   */
+  const [openedRange, setOpenedRange] = useState<{
+    path: string
+    segment: 'current' | 'earlier'
+    from: number | null
+    to: number
+  } | null>(null)
+  /**
+   * 正在查看差异的文件 + 它的版本（`null` = 弹窗关着）。
+   *
+   * ★ 2026-10-27：以前只存 path，弹窗的 query key 里**没有版本** ⇒ 同一文件再看一次时
+   *   key 不变，react-query 直接回旧缓存（文件已经又改过），显示的还是上一次的 diff。
+   *   把版本一起带上，key 才真正代表"这一条变更"。
+   */
+  const [diffTarget, setDiffTarget] = useState<{
+    path: string
+    version: number | null
+    beforeVersion?: number | null
+    /**
+     * 这条属于哪一段（`current` = 本轮 / `earlier` = 更早）。
+     *
+     * ★ 2026-10-28（用户定案）：同一路径两段都动过时列表里是**两条**，点开必须看到**各自那一段**
+     *   的版本范围，而不是同一个"很久以前 → 现在"。段决定基线怎么取、比到哪个版本。
+     */
+    segment?: 'current' | 'earlier'
+  } | null>(null)
   /** 路径输入弹窗（新建文件 / 新建文件夹 / 重命名·移动，同一套壳） */
   const [prompt, setPrompt] = useState<PromptState>(null)
   /** 右键"上传到此处"的目标目录（'' = 根）；配合隐藏的 `<input type="file">` */
@@ -267,6 +327,21 @@ export function WorkspacePanel({
   const gitQuery = useWorkspaceGit(conversationId, codeMode)
   /** 有 git 才渲染分支 chip（见头部那段注释：空数组与失败都不显示） */
   const gitRepos = gitQuery.data?.repos ?? []
+  // 2026-10-28: 保留期提示（还有几天清理、到期会不会被保护）—— 提前告知，避免静默真删。
+  const retentionQuery = useWorkspaceRetention(conversationId, codeMode)
+  const retention = retentionQuery.data
+  const [retentionDismissed, setRetentionDismissed] = useState(false)
+  /**
+   * 工作区**此刻是否已经"定型"**（P1-24，2026-10-27）—— 一次 `git clone` / `git pull` 还没跑完时
+   * 它是 `false`，面板据此按"原始根"展示：树**不自动展开**、也不实时拉文件树。
+   *
+   * 为什么要它（用户反馈：「git 拉取下来目录又是默认全部展开了」）：`clone --depth` 期间工作区
+   * 在几十秒里长出几千个文件，每一条 `created` 事件都会 `expandDirs(它的所有祖先目录)`
+   * ⇒ clone 一结束，「repo/」下面几十个目录全是展开的（实测该会话 308 个祖先目录全部进了
+   * `doubulea.ws-expanded`，且这份状态还持久化在 localStorage）。而用户要的是"clone 完看到 repo/，
+   * 里面自己展开"。所以：**克隆期间不接收"新文件到了"这个信号**，等 git 把锁文件删掉再正常一轮。
+   */
+  const workspaceReady = gitRepos.every((repo) => !repo.cloning)
   const treeNodes = useMemo(() => buildWorkspaceTree(treeQuery.data?.items ?? []), [treeQuery.data])
   const visibleNodes = useMemo(() => filterWorkspaceTree(treeNodes, showHidden), [treeNodes, showHidden])
   const fileCount = useMemo(() => treeQuery.data?.items.length ?? 0, [treeQuery.data])
@@ -284,6 +359,8 @@ export function WorkspacePanel({
   // ── 按路径的编辑态 ──
   const [docs, setDocs] = useState<Record<string, WorkspaceDoc>>({})
   const [savingPath, setSavingPath] = useState<string | null>(null)
+  /** 正在「上传至平台」的路径（按钮态；同一时刻只允许一个，避免重复点产生两份产物行） */
+  const [uploadingArtifact, setUploadingArtifact] = useState<string | null>(null)
   const [reverting, setReverting] = useState(false)
 
   /**
@@ -361,6 +438,35 @@ export function WorkspacePanel({
     void fileQuery.refetch()
   }
 
+  /**
+   * 本端改完工作区之后**统一刷新一次**（保存 / 新建 / 删除 / 改名 / 上传 / 删目录都走它）。
+   *
+   * ★ 2026-10-28（用户定案「本轮改动 = 当前保存改动的内容，文件保存列表要同步更新呀」）：
+   *   这些动作以前**只**刷了文件树 ——「最近变更」要等 SSE 事件或重新进会话才更新，于是刚保存完
+   *   列表还是旧的（看起来"保存没生效"）。三样一起刷：树、差异（版本变了，徽标要重算）、变更清单。
+   */
+  const refreshAfterWrite = (): void => {
+    void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+    void queryClient.invalidateQueries({ queryKey: ['workspace-diff', conversationId] })
+    reloadChangesRef.current()
+  }
+
+  /**
+   * 本端新建之后**让它看得见**（2026-10-29 用户实测"新建了 a/x.py，树里找不到"）。
+   *
+   * 两个坑叠在一起：
+   *   · 文件树默认**折叠**（展开状态按目录持久化）⇒ 新目录的祖先若收着，建完还是一片安静；
+   *   · 隐藏过滤（`.` 开头的段，含新建文件夹的 `.gitkeep` 占位）默认**开着** ⇒ 只含隐藏文件的
+   *     新目录会被 `filterWorkspaceTree` 整枝滤掉。
+   * 所以：①把这条路径的祖先目录（**含它自己**，目录才需要展开）全部展开；
+   *       ②这条路径会被隐藏过滤掉的话，临时打开"显示隐藏文件"——用户刚亲手建的，不能"创建成功却看不见"。
+   */
+  const revealCreated = (path: string, kind: 'file' | 'dir'): void => {
+    const dirs = kind === 'dir' ? [...workspaceAncestorDirs(path), path] : workspaceAncestorDirs(path)
+    if (dirs.length > 0) expandDirs(conversationId, dirs)
+    if (isWorkspaceHiddenPath(path)) setShowHidden(true)
+  }
+
   const save = async (path: string): Promise<void> => {
     const doc = docs[path]
     if (doc === undefined) return
@@ -372,7 +478,7 @@ export function WorkspacePanel({
         if (current === undefined) return prev
         return { ...prev, [path]: { ...current, baseText: current.text, version: entry.version, conflict: null } }
       })
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      refreshAfterWrite()
       feedback.ok(t('workspace.savedOk'))
     } catch (error) {
       if (error instanceof ApiError && error.code === 'CONFLICT') {
@@ -407,7 +513,7 @@ export function WorkspacePanel({
         delete next[path]
         return next
       })
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      refreshAfterWrite()
       feedback.ok(t('workspace.deletedOk'))
     } catch (error) {
       feedback.fail(error, t('workspace.deleteFailed'))
@@ -442,7 +548,7 @@ export function WorkspacePanel({
         }
         return next
       })
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      refreshAfterWrite()
       feedback.ok(
         result.deleted > 0
           ? t('workspace.deleteDirOk', { count: result.deleted })
@@ -465,12 +571,20 @@ export function WorkspacePanel({
     })
   }
 
-  /** 新建文件（`POST .../workspace/file`）：成功后刷新树并直接打开它 */
+  /**
+   * 新建文件（`POST .../workspace/file`）：成功后刷新树并直接打开它
+   *
+   * ★ 2026-10-29（实测）：`a/` 下新建后树里看不到 —— 除 `.gitkeep` 外没有任何文件的分支（以及
+   *   `.` 开头目录，如 `a/.b/x.py`）默认被 `filterWorkspaceTree` 隐藏；而且**折叠状态不回退**：
+   *   新目录的祖先若在折叠集合里，建完仍是收起的。所以建完要 ①展开目标目录（已有祖先也展开）
+   *   ②本次新建路径若被隐藏过滤掉，就临时打开"显示隐藏文件"（否则"创建成功却看不见"）。
+   */
   const createFile = async (path: string): Promise<void> => {
     setPrompt(null)
     try {
       await createWorkspaceFile(conversationId, path)
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      revealCreated(path, 'file')
+      refreshAfterWrite()
       openFile(conversationId, path)
       feedback.ok(t('workspace.createdOk'))
     } catch (error) {
@@ -482,13 +596,18 @@ export function WorkspacePanel({
   /**
    * 新建文件夹：工作区模型里**空目录不算内容**（树由文件路径派生），故落一个隐藏占位文件
    * （`.gitkeep`）让目录可见 —— 与 git 保留空目录同一手法。
+   *
+   * ★ 2026-10-29：`dir` 是**已解析好的最终目录**（调用方已按右键目标去掉重复前缀），
+   *   所以这里只负责在它下面落占位，不再自己拼父目录；建完同样要展开 + 必要时显示隐藏文件，
+   *   否则"新建了文件夹却没出现"（`.gitkeep` 是隐藏文件，默认被过滤）。
    */
   const createFolder = async (dir: string): Promise<void> => {
     setPrompt(null)
     const placeholder = workspaceNewFolderPlaceholderPath(workspaceParentDir(dir), workspaceBaseName(dir))
     try {
       await createWorkspaceFile(conversationId, placeholder)
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      revealCreated(dir, 'dir')
+      refreshAfterWrite()
       feedback.ok(t('workspace.folderCreatedOk'))
     } catch (error) {
       if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, t('workspace.sameNameFolder'))
@@ -510,7 +629,9 @@ export function WorkspacePanel({
         return next
       })
       renameFile(conversationId, from, to)
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      // ★ 2026-10-29：移到收起的目录 / 隐藏目录后同样会"改名成功却找不到"（同 `revealCreated`）
+      revealCreated(to, 'file')
+      refreshAfterWrite()
       feedback.ok(t('workspace.renamedOk'))
     } catch (error) {
       if (error instanceof ApiError && error.code === 'CONFLICT') feedback.fail(error, t('workspace.targetExists'))
@@ -544,13 +665,38 @@ export function WorkspacePanel({
       try {
         await uploadWorkspaceFile(conversationId, dir, file)
         okCount += 1
+        // ★ 2026-10-29：上传到收起的目录 / 隐藏目录也要立刻看得见（同 `revealCreated`）
+        revealCreated(joinWorkspacePath(dir, file.name.split(/[\\/]/u).pop() ?? file.name), 'file')
       } catch (error) {
         feedback.fail(error, t('workspace.uploadFailed', { name: file.name }))
       }
     }
     if (okCount > 0) {
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+      refreshAfterWrite()
       feedback.ok(t('workspace.uploadedOk', { count: okCount }))
+    }
+  }
+
+  /**
+   * 右键「上传至平台」（2026-10-29）：把这个工作区文件登记成**产物**。
+   *
+   * 为什么是显式动作：Code 模式下 agent 改过的文件由工作区面板完整呈现，"哪些算产物"在那里无法
+   * 可靠判定（clone 的整棵树 / build 目录 / 下载的压缩包都会混进来）⇒ 服务端不再自动收；
+   * 要让文件进产物面板（可预览 / 可下载 / 会话产物清单），由人点这一下。
+   * 成功后刷新产物列表（`conversationArtifactsQueryKey`）—— 面板不在 Code 模式下也预取好。
+   */
+  const uploadArtifact = async (path: string): Promise<void> => {
+    // 同一时刻只跑一个：连点两次会建两条产物行（服务端不去重，字节相同但行不同）
+    if (uploadingArtifact !== null) return
+    setUploadingArtifact(path)
+    try {
+      await uploadWorkspaceArtifact(conversationId, path)
+      feedback.ok(t('workspace.artifactUploadedOk', { name: workspaceBaseName(path) }))
+      void queryClient.invalidateQueries({ queryKey: conversationArtifactsQueryKey(conversationId) })
+    } catch (error) {
+      feedback.fail(error, t('workspace.artifactUploadFailed', { name: workspaceBaseName(path) }))
+    } finally {
+      setUploadingArtifact(null)
     }
   }
 
@@ -565,48 +711,97 @@ export function WorkspacePanel({
   }
 
   /**
-   * 「撤销本轮」（P1-9 · P4 · R2）：把上一轮 agent/人的写入回退到轮初。
+   * 目录行右键「下载为 zip」（2026-10-29）：把该目录（含子孙）打包一次下载。
    *
-   * ★ 结果**逐条列出**（用户反馈："点「撤销本轮」时没有展示撤销了什么"）：汇总一句 + 每个落点
-   *   一行（路径 / 动作 / 说明）。冲突 / 缺历史 / 不支持都如实展示，而不是只弹一句"还原 N"。
+   * 用 `<a download>` 直接打服务端字节出口（`GET .../workspace/dir/zip`）—— 打包在服务端做，
+   * 前端不必把整包读进内存；文件数超上限时服务端回信封（浏览器会显示下载失败），
+   * 这是可接受的：真要在前端重做一次才能给出友好提示，而那种情况很少见。
    */
-  const revert = async (): Promise<void> => {
-    setReverting(true)
-    try {
-      const result = await revertWorkspaceRound(conversationId)
-      modal.info({
-        title: t('workspace.revertDoneTitle'),
-        width: 560,
-        okText: t('workspace.revertAck'),
-        content: (
-          <div data-testid="revert-report">
-            <p className="ws__revert-summary">{revertSummaryText(result, locale)}</p>
-            {result.items.length > 0 && (
-              <ul className="ws__revert-list">
-                {result.items.map((item) => (
-                  <li key={`${item.action}:${item.path}`} className="ws__revert-item">
-                    <span className={`ws__revert-action ws__revert-action--${item.action}`}>
-                      {revertActionLabel(item.action, locale)}
-                    </span>
-                    <span className="ws__revert-path">{item.path}</span>
-                    {item.message !== undefined && item.message !== '' && (
-                      <span className="ws__revert-message">{item.message}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        ),
-      })
-      void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-      // 打开的文件全量重读：干净的重铺，有草稿的进冲突（不静默覆盖）
-      void queryClient.invalidateQueries({ queryKey: ['workspace-file', conversationId] })
-    } catch (error) {
-      feedback.fail(error, t('workspace.revertFailed'))
-    } finally {
-      setReverting(false)
-    }
+  const downloadDir = (dir: string): void => {
+    const link = document.createElement('a')
+    link.href = workspaceDirZipUrl(conversationId, dir)
+    link.download = `${workspaceBaseName(dir) || 'workspace'}.zip`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  }
+
+  /**
+   * 「撤销本轮」（P1-9 · P4 · R2；2026-10-28 重做**范围选择**）。
+   *
+   * ★ 2026-10-28 用户定案（「撤销怎么选」）：不再一点就撤。顺序是
+   *   ① **先预演**（`dryRun`）拿三栏：会还原 / 会删除 / 会跳过（含"故意不动你的手写"）；
+   *   ② 让用户选范围：**默认只撤 agent**，可显式切「包含我的修改」或**逐条勾选**；
+   *   ③ 再真正落盘，并把结果逐条列出。
+   *   为什么必须预演：以前是盲撤 —— 用户看不到范围，点下去才知道撤了什么。
+   */
+  const revert = (): void => {
+    void (async () => {
+      setReverting(true)
+      try {
+        const preview = await revertWorkspaceRound(conversationId, { dryRun: true })
+        const current = grouped.current
+        modal.confirm({
+          title: t('workspace.revertChooseTitle'),
+          width: 620,
+          okText: t('workspace.revertOk'),
+          cancelText: t('workspace.revertCancel'),
+          content: (
+            <RevertScopeDialog
+              preview={preview}
+              currentPaths={current.map((change) => change.path)}
+              defaultSelected={current.filter((change) => change.actor !== 'USER').map((change) => change.path)}
+            />
+          ),
+          onOk: async () => {
+            // 弹窗里选了什么由 `RevertScopeDialog` 写到 DOM 上（AntD confirm 无受控 state）
+            const picked = readRevertScopeChoice()
+            const result = await revertWorkspaceRound(conversationId, {
+              scope: picked.scope,
+              ...(picked.scope === 'SELECTED' ? { paths: picked.paths } : {}),
+            })
+            modal.info({
+              title: t('workspace.revertDoneTitle'),
+              width: 560,
+              okText: t('workspace.revertAck'),
+              content: (
+                <div data-testid="revert-report">
+                  <p className="ws__revert-summary">{revertSummaryText(result, locale)}</p>
+                  {result.items.length > 0 && (
+                    <ul className="ws__revert-list">
+                      {result.items.map((item) => (
+                        <li key={`${item.action}:${item.path}`} className="ws__revert-item">
+                          <span className={`ws__revert-action ws__revert-action--${item.action}`}>
+                            {revertActionLabel(item.action, locale)}
+                          </span>
+                          <span className="ws__revert-path">{item.path}</span>
+                          {item.message !== undefined && item.message !== '' && (
+                            <span className="ws__revert-message">{item.message}</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ),
+            })
+            void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+            // 打开的文件全量重读：干净的重铺，有草稿的进冲突（不静默覆盖）
+            void queryClient.invalidateQueries({ queryKey: ['workspace-file', conversationId] })
+            // ★ 2026-10-27（用户反馈「点撤销本轮也没有恢复」）：撤销**改了盘上的字节**，所以清单里的
+            //   版本号、`+N −M` 徽标、差异弹窗全都作废了。以前只刷了树和正文缓存，这三样还留旧值 ——
+            //   文件其实已经回滚，界面却仍显示"改过 v9"，看起来就是「没恢复」。
+            void queryClient.invalidateQueries({ queryKey: ['workspace-diff', conversationId] })
+            reloadChangesRef.current()
+          },
+          onCancel: () => undefined,
+        })
+      } catch (error) {
+        feedback.fail(error, t('workspace.revertFailed'))
+      } finally {
+        setReverting(false)
+      }
+    })()
   }
 
   // ── 事件流：内容事件 ⇒ 刷新树 + 自动展开所在目录；命中当前文件 ⇒ 重载；`deleted` 命中打开的文件 ⇒ 关标签 ──
@@ -618,16 +813,34 @@ export function WorkspacePanel({
    *    （用户反馈："「最近变更」你也看不到"）。这份基线补上那一段，实时事件再叠在它上面。
    */
   const [serverChanges, setServerChanges] = useState<WorkspaceChangeEntry[]>([])
+  /** 本轮窗口（服务端随变更集一起回；`undefined` = 该会话还没派过活） */
+  const [serverRound, setServerRound] = useState<{ start: string; end?: string } | undefined>(undefined)
+  /**
+   * 重取上面那份基线（**给"保存 / 撤销本轮"用**）。
+   *
+   * ★ 2026-10-27（用户反馈「撤销本轮也没有恢复」「变更信息不是最新的」）：这份基线原来只在
+   *   **进会话时取一次**，之后再不刷新 —— 于是文件改回去 / 被撤销之后，`serverChanges` 里那条
+   *   `updated vN` 还在，`mergeWorkspaceChanges` 又按 `at` 取最新，列表**永远显示旧的**。
+   *   撤销完文件明明已经回到原样，界面却还说"改过"，看起来就是「没恢复」。
+   */
+  const reloadChangesRef = useRef<() => void>(() => undefined)
   useEffect(() => {
     if (!codeMode) return
     let cancelled = false
-    void fetchWorkspaceChanges(conversationId)
-      .then((result) => {
-        if (!cancelled) setServerChanges(result.items)
-      })
-      .catch(() => undefined)
+    const load = (): void => {
+      void fetchWorkspaceChanges(conversationId)
+        .then((result) => {
+          if (cancelled) return
+          setServerChanges(result.items)
+          setServerRound(result.round)
+        })
+        .catch(() => undefined)
+    }
+    reloadChangesRef.current = load
+    load()
     return () => {
       cancelled = true
+      reloadChangesRef.current = () => undefined
     }
   }, [conversationId, codeMode])
   /**
@@ -644,6 +857,8 @@ export function WorkspacePanel({
     // ⚠️ 先清掉**上一个会话**留下的那一份（effect 重跑时闭包里拿到的仍是旧 `conversationId`，
     //    这正是我们要清的那一份）；本次会话那份由**下一次**重跑 / 卸载负责。
     setDocs({})
+    // 「最近变更」点开文件带来的版本范围只属于上一个会话的某条变更 ⇒ 一并清掉
+    setOpenedRange(null)
     queryClient.removeQueries({ queryKey: ['workspace-file', conversationId] })
     queryClient.removeQueries({ queryKey: ['workspace-diff', conversationId] })
     return () => {
@@ -655,6 +870,12 @@ export function WorkspacePanel({
 
   const activePathRef = useRef<string | null>(activePath)
   activePathRef.current = activePath
+  /**
+   * 事件回调里读"此刻是否已定型"（P1-24）。用 ref 而不是把 `workspaceReady` 放进依赖 ——
+   * 放进依赖会让 SSE 在"clone 开始 / 结束"各重连一次，断开那一下正好会丢事件。
+   */
+  const readyRef = useRef(true)
+  readyRef.current = workspaceReady
   useEffect(() => {
     if (!codeMode) return
     const controller = new AbortController()
@@ -663,13 +884,30 @@ export function WorkspacePanel({
       onEvent: (event) => {
         setRecentEvents((prev) => [...prev.slice(-199), event])
         if (!isContentEvent(event)) return
-        // agent 改了某个文件 ⇒ 自动展开它所在的目录：文件树**默认全折叠**（`WorkspaceTree`），
-        // 不展开就看不见深处的新文件（用户反馈："agent 新增/编辑过的文件没有展示"）。
-        const dirs = workspaceAncestorDirs(event.path)
-        if (dirs.length > 0) expandDirs(conversationId, dirs)
+        // ★ clone / pull 进行中**不接收**"新文件到了"这个信号（P1-24）：
+        //   否则几千条 `created` 各自展开祖先目录，clone 一结束整棵树就是全展开的（用户反馈）。
+        //   锁文件一消失 `readyRef` 就变回 true，之后的改动照旧自动展开。
+        if (readyRef.current) {
+          // agent 改了某个文件 ⇒ 自动展开它所在的目录：文件树**默认全折叠**（`WorkspaceTree`），
+          // 不展开就看不见深处的新文件（用户反馈："agent 新增/编辑过的文件没有展示"）。
+          const dirs = workspaceAncestorDirs(event.path)
+          if (dirs.length > 0) expandDirs(conversationId, dirs)
+          // ★ 2026-10-27（用户反馈「编辑后再改，变更里展示的 diff 不是最新的」）：
+          //   `['workspace-diff', …]` 以前**从没被失效过** —— 只有「切会话」才 removeQueries。
+          //   于是 `RecentChangeRow` 的 `+N −M` 徽标与差异弹窗一直吃旧缓存（徽标还带 staleTime: 30s），
+          //   文件内容变了、条目版本也变了，数字却停在第一次算出来的那一份。
+          //   按**路径前缀**失效：只动这个文件的那几条（版本号是 key 的第 4 段）不影响别的文件。
+          void queryClient.invalidateQueries({ queryKey: ['workspace-diff', conversationId, event.path] })
+          // 服务端那份「最近变更」基线也要跟着重取：否则文件被改回去/撤销后，列表还挂旧条目。
+          // ⚠️ 放在 `readyRef` 里面：clone 期间几千条事件，逐条重取会把面板打爆（那时列表本就是空的）。
+          reloadChangesRef.current()
+        }
         void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
-        // 分支可能刚被换成别的（`git checkout` 会写 `.git/HEAD` ⇒ 也是工作区事件）⇒ 一并失效
+        // 分支可能刚被换成别的（`git checkout` 会写 `.git/HEAD` ⇒ 也是工作区事件）⇒ 一并失效；
+        // ⚠️ 连 clone 的锁状态一起刷（`readyRef` 的输入就是它，不刷就永远等不到"结束"）。
         void queryClient.invalidateQueries({ queryKey: workspaceGitQueryKey(conversationId) })
+        // ⚠️ 这里**不要**再重复失效 diff / 重取变更：上面 `readyRef.current` 分支里已经做过，
+        //   重复一遍会在 clone 期间把「最近变更」的请求量翻倍（2026-10-29 review 修正）。
         if (event.type === 'deleted' && (useWorkspaceStore.getState().tabsByConversation[conversationId]?.openPaths ?? []).includes(event.path)) {
           closeFile(conversationId, event.path)
           return
@@ -679,7 +917,7 @@ export function WorkspacePanel({
       onIssue: () => undefined,
     }).catch(() => undefined)
     return () => controller.abort()
-    // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` / `expandDirs` 通过 ref 与稳定引用）
+    // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` / `expandDirs` / `readyRef` 通过 ref 与稳定引用）
   }, [conversationId, codeMode, queryClient, closeFile, expandDirs])
 
   // ── ⌘S / Ctrl+S：编辑器聚焦时由 CodeMirror 拦截；焦点在别处（文件树 / 标签）时由这里兜底保存 ──
@@ -717,7 +955,41 @@ export function WorkspacePanel({
 
   // 「最近变更」= 服务端基线（刷新/刚进会话时那份）∪ 实时事件，按路径折叠、只认内容事件、按时间倒序。
   // ⚠️ 不能只 `foldWorkspaceEvents(recentEvents)`：那样刷新后 / 刚进会话时列表是空的。
-  const changes = useMemo(() => mergeWorkspaceChanges(serverChanges, recentEvents).slice(0, 8), [serverChanges, recentEvents])
+  //
+  // ★ P1-24（2026-10-27，用户反馈「git 都没变更，为什么拉取下来那些算变更」）：
+  //   `git clone` / `git pull` 会在工作区里**新建**（或改写）每一个文件 —— 对工作区来说它们
+  //   确实是 `created`/`updated` 事件，于是整棵仓库都进了这份清单。但那不是"谁改了代码"，
+  //   是"仓库只是被拉下来了"。所以：**clone/pull 进行中产生的变更不进「最近变更」**
+  //   （`workspaceReady` 为 false 的那段窗口；判据见 `useWorkspaceGit` 的 `cloning`）。
+  //   拉完之后 agent 真正改的文件照常显示。
+  // ★ 2026-10-28（用户反馈「clone 期间列表突然空了又满了」）：
+  //   **不再**在 clone 期间把整份列表清空。clone 只是"新内容正在进来"，用户已有的改动
+  //   （尤其手写的）没有任何理由消失。改用 `syncing` 标记：列表照常显示，只是标题旁提示"同步中"。
+  //   ⚠️ 多仓库时按仓库各自判就绪 ⇒ 一个仓库在 clone 不影响另一个仓库的条目。
+  const grouped = useMemo(() => {
+    const merged = mergeWorkspaceChanges(serverChanges, recentEvents).filter(
+      // `.git/**` 是 git 自己的中间产物（对象 / 索引 / 锁文件），不是"谁改了代码"。
+      // ⚠️ 别把 `.doubulea/**` 也剔掉：记忆文档是**真实写入**，属工作区改动（2026-10-28 用户指正）。
+      (change) => !isGitInternalPath(change.path),
+    )
+    const all = groupWorkspaceChangesByRound(merged, serverRound)
+    return {
+      current: all.current.slice(0, WORKSPACE_RECENT_MAX_PER_GROUP),
+      earlier: all.earlier.slice(0, WORKSPACE_RECENT_MAX_PER_GROUP),
+      /** 本轮 / 更早的**真实**条数（截断前；标题用真实数字，截断才看得见） */
+      currentTotal: all.current.length,
+      earlierTotal: all.earlier.length,
+      /**
+       * 展示口径（`workspaceChangeGrouping`，纯函数）：
+       * `history` = 本会话从没出现过 agent 改动 ⇒ 这是**你的编辑历史**，不切成「本轮 / 更早」。
+       */
+      grouping: workspaceChangeGrouping(merged),
+    }
+  }, [serverChanges, recentEvents, serverRound])
+  const changes = useMemo(
+    () => [...grouped.current, ...grouped.earlier],
+    [grouped],
+  )
 
   /**
    * 右键「复制」：三种口径见 `workspaceModel#workspaceCopyValue`（相对路径 / 容器内 `/work/…` / 名称）。
@@ -735,11 +1007,17 @@ export function WorkspacePanel({
 
   /** 文件树右键 / 拖拽要用的动作集合（下传给 `WorkspaceTree`） */
   const treeActions: TreeActions = {
-    open: (path) => openFile(conversationId, path),
+    open: (path) => {
+      // 从文件树打开 = 只是看文件，不带"某条变更的版本范围"（那条范围属于「最近变更」里的那一条）
+      setOpenedRange(null)
+      openFile(conversationId, path)
+    },
     rename: (path) => setPrompt({ mode: 'rename', path }),
     remove: confirmRemove,
     removeDir: confirmRemoveDir,
     download: downloadPath,
+    downloadDir,
+    uploadArtifact: (path) => void uploadArtifact(path),
     copy: copyPath,
     newFile: (dir) => setPrompt({ mode: 'createFile', dir }),
     newFolder: (dir) => setPrompt({ mode: 'createFolder', dir }),
@@ -757,6 +1035,26 @@ export function WorkspacePanel({
   const promptInitial =
     prompt === null ? '' : prompt.mode === 'rename' ? prompt.path : prompt.dir === '' ? '' : `${prompt.dir}/`
 
+  /**
+   * ★ 2026-10-29（用户反馈"新目录 a 里建的文件看不到"）：`WorkspacePathPrompt` 的 `initialValue`
+   *   是**字符串 prop**，`useState(props.initialValue)` 只在首次挂载取值。输入框原本常驻挂载，
+   *   上一次弹窗的值就成了下一次的初值 —— 右键 `b` 新建时框里还是上一次的 `a/`，
+   *   看一眼"没预填"就补输入，于是又落到旧目录里。
+   *   与 `WorkspaceDiffModal` 同款处理：目标为空就整块不挂载（`destroyOnClose` 只是卸载内部 DOM，
+   *   组件自己的 `useState` 不会跟着重置）。
+   */
+  const promptOpen = prompt !== null
+
+  /**
+   * 版本范围胶囊（「最近变更」点开文件后展示）。
+   *
+   * ★ 2026-10-28（用户定案）：同一路径两段都动过时列表里是两条，各自的版本范围**点击文件后**展示
+   *   ——放在列表里会把文件名遮住。所以挂在编辑器工具栏的路径后面，且只在"当前打开的就是那条
+   *   变更的路径"时出现；换文件 / 从文件树打开 / 关标签都会清掉。
+   */
+  const visibleRange =
+    openedRange !== null && openedRange.path === activePath ? openedRange : null
+
   return (
     <div className="ws" data-testid="workspace-panel">
       <header className="ws__head">
@@ -773,19 +1071,36 @@ export function WorkspacePanel({
             preferredInstance={runtimeControls.preferredInstance ?? null}
             onPreferredInstanceChange={runtimeControls.onPreferredInstanceChange}
           />
-          <Popconfirm
-            title={t('workspace.revertConfirmTitle')}
-            description={t('workspace.revertConfirmDescription')}
-            okText={t('workspace.revertOk')}
-            cancelText={t('common.cancel')}
-            onConfirm={() => void revert()}
+          {/*
+            ★ 2026-10-28（浏览器实测发现）：这里原来套着 `Popconfirm`（"撤销本轮？…"），
+            一确认就直接落盘 —— 我新加的「范围选择 + 预演」弹窗根本没机会出现。
+            现在**去掉确认气泡**，按钮直接进入 `revert()`：先 `dryRun` 预演，再让用户选范围。
+            旧气泡文案（`revertConfirmTitle`/`revertConfirmDescription`）已无人使用。
+          */}
+          <Button
+            size="small"
+            icon={<UndoOutlined />}
+            loading={reverting}
+            data-testid="workspace-revert"
+            onClick={() => revert()}
           >
-            <Button size="small" icon={<UndoOutlined />} loading={reverting} data-testid="workspace-revert">
-              {t('workspace.revertButton')}
-            </Button>
-          </Popconfirm>
+            {t('workspace.revertButton')}
+          </Button>
         </div>
       </header>
+
+      {/*
+        ★ 2026-10-29（用户反馈「点击上传至平台后提示成功，但刷新后看不到」）：
+        「上传至平台」是**一次真实的 S3 上传 + 建行**，大文件 / 网络慢时会持续几秒到几十秒；
+        以前只弹一个成功 toast，用户以为已经存好了，刷新（或看产物面板）却是空的。
+        现在给出**持续可见**的进行中提示（文件名 + 转圈），完成才换成成功 toast。
+      */}
+      {uploadingArtifact === null ? null : (
+        <div className="ws__upload-notice" data-testid="workspace-artifact-uploading">
+          <Spin size="small" />
+          <span>{t('workspace.artifactUploading', { name: workspaceBaseName(uploadingArtifact) })}</span>
+        </div>
+      )}
 
       <div className="ws__body">
         {/* 资源管理器：**常驻整宽**（不再折叠成 44px 图标条 —— 折叠态形态别扭，用户反馈去掉）；
@@ -824,27 +1139,176 @@ export function WorkspacePanel({
               nodes={visibleNodes}
               selectedPath={activePath}
               actions={treeActions}
+              // P1-24：clone / pull 还没跑完 ⇒ 一律按"原始根"展示（不读本会话的展开状态）
+              resetKey={workspaceReady ? 0 : 1}
+              uploadingArtifact={uploadingArtifact !== null}
             />
           )}
 
+            {/* 2026-10-28: 保留期提示 —— 只在「快到清理时间且不会被保护」时出现，可关闭。 */}
+            {retention !== undefined && !retentionDismissed && retention.expiresAt !== null && (
+              <RetentionNotice
+                info={retention}
+                daysLeft={retentionDaysLeft(retention.expiresAt, Date.now())}
+                onDismiss={() => setRetentionDismissed(true)}
+              />
+            )}
+
             {changes.length > 0 && (
               <div className={`ws__recent${recentOpen ? ' is-open' : ''}`}>
-                <button type="button" className="ws__recent-head" onClick={() => setRecentOpen((open) => !open)}>
-                  <RightOutlined className="ws__chevron" rotate={recentOpen ? 90 : 0} />{' '}
-                  {t('workspace.recentChanges', { count: changes.length })}
-                </button>
+                {/*
+                  ★ 2026-10-28（用户定案）：按轮分组 —— 「本轮」= `at >= 轮起点`，其余归「更早」。
+                  两段各自最多 `WORKSPACE_RECENT_MAX_PER_GROUP` 条，标题直接给**真实条数**，
+                  所以"被截断"这件事是看得见的（不再是一个看不出所以然的 `最近变更 8`）。
+                */}
+                {/*
+                  ★ 2026-10-28（用户要求）：「最近变更」的口径说明不再占一行正文，改成标题右侧的
+                  **? 图标**，悬浮/聚焦时用 Tooltip 展示完整说明。正文只在展开时保留一句极短的
+                  分组提示（避免长句把列表挤下去）。
+                */}
+                <div className="ws__recent-head-row">
+                  <button
+                    type="button"
+                    className="ws__recent-head"
+                    aria-label={
+                      grouped.grouping === 'history'
+                        ? t('workspace.changeHistory', { count: changes.length })
+                        : t('workspace.recentChanges', { count: changes.length })
+                    }
+                    onClick={() => setRecentOpen((open) => !open)}
+                  >
+                    <RightOutlined className="ws__chevron" rotate={recentOpen ? 90 : 0} />{' '}
+                    {/* ★ 2026-10-28：纯手写会话叫「变更历史」，不编造「本轮」 */}
+                    {grouped.grouping === 'history'
+                      ? t('workspace.changeHistory', { count: changes.length })
+                      : t('workspace.recentChanges', { count: changes.length })}
+                    {grouped.grouping !== 'history' && grouped.current.length > 0 && (
+                      <span className="ws__recent-badge">
+                        {t('workspace.recentCurrentCount', { count: grouped.currentTotal })}
+                      </span>
+                    )}
+                  </button>
+                  <Tooltip
+                    title={
+                      grouped.grouping === 'history'
+                        ? t('workspace.changeHistoryHint')
+                        : t('workspace.recentChangesHint')
+                    }
+                    placement="left"
+                  >
+                    <button
+                      type="button"
+                      className="ws__recent-help"
+                      aria-label={t('workspace.recentChangesHint')}
+                      data-testid="recent-changes-help"
+                      onClick={(e) => e.preventDefault()}
+                    >
+                      <QuestionCircleOutlined />
+                    </button>
+                  </Tooltip>
+                </div>
+                {!workspaceReady && (
+                  <p className="ws__recent-syncing" data-testid="recent-syncing">
+                    {t('workspace.recentSyncing')}
+                  </p>
+                )}
                 {recentOpen && (
-                  <ul className="ws__recent-list">
-                    {changes.map((change) => (
-                      <RecentChangeRow
-                        key={`${change.path}-${change.at}`}
-                        conversationId={conversationId}
-                        change={change}
-                        onOpenFile={() => openFile(conversationId, change.path)}
-                        onOpenDiff={() => setDiffPath(change.path)}
-                      />
-                    ))}
-                  </ul>
+                  <>
+                    {grouped.grouping === 'history' && (
+                      <>
+                        <p className="ws__recent-group" data-testid="recent-group-history">
+                          {t('workspace.changeHistory', { count: grouped.earlierTotal })}
+                        </p>
+                        <ul className="ws__recent-list">
+                          {grouped.earlier.map((change) => (
+                            <RecentChangeRow
+                              key={`history-${change.path}-${change.at}`}
+                              conversationId={conversationId}
+                              change={change}
+                              onOpenFile={() => {
+                                setOpenedRange(null)
+                                openFile(conversationId, change.path)
+                              }}
+                              onOpenDiff={() =>
+                                setDiffTarget({
+                                  path: change.path,
+                                  version: change.version,
+                                  beforeVersion: change.beforeVersion,
+                                  segment: change.segment,
+                                })
+                              }
+                            />
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                    {grouped.grouping === 'rounds' && grouped.current.length > 0 && (
+                      <>
+                        <p className="ws__recent-group" data-testid="recent-group-current">
+                          {t('workspace.recentGroupCurrent', { count: grouped.currentTotal })}
+                        </p>
+                        <ul className="ws__recent-list">
+                          {grouped.current.map((change) => (
+                            <RecentChangeRow
+                              key={`current-${change.path}-${change.at}`}
+                              conversationId={conversationId}
+                              change={change}
+                              onOpenFile={() => {
+                                openFile(conversationId, change.path)
+                                setOpenedRange({
+                                  path: change.path,
+                                  segment: 'current',
+                                  from: change.beforeVersion ?? null,
+                                  to: change.version ?? 0,
+                                })
+                              }}
+                              onOpenDiff={() =>
+                                setDiffTarget({
+                                  path: change.path,
+                                  version: change.version,
+                                  beforeVersion: change.beforeVersion,
+                                  segment: 'current',
+                                })
+                              }
+                            />
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                    {grouped.grouping === 'rounds' && grouped.earlier.length > 0 && (
+                      <>
+                        <p className="ws__recent-group" data-testid="recent-group-earlier">
+                          {t('workspace.recentGroupEarlier', { count: grouped.earlierTotal })}
+                        </p>
+                        <ul className="ws__recent-list">
+                          {grouped.earlier.map((change) => (
+                            <RecentChangeRow
+                              key={`earlier-${change.path}-${change.at}`}
+                              conversationId={conversationId}
+                              change={change}
+                              onOpenFile={() => {
+                                openFile(conversationId, change.path)
+                                setOpenedRange({
+                                  path: change.path,
+                                  segment: 'earlier',
+                                  from: change.beforeVersion ?? null,
+                                  to: change.version ?? 0,
+                                })
+                              }}
+                              onOpenDiff={() =>
+                                setDiffTarget({
+                                  path: change.path,
+                                  version: change.version,
+                                  beforeVersion: change.beforeVersion,
+                                  segment: 'earlier',
+                                })
+                              }
+                            />
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -883,7 +1347,11 @@ export function WorkspacePanel({
                     aria-selected={isActive}
                     className={`ws__tab${isActive ? ' is-active' : ''}`}
                   >
-                    <button type="button" className="ws__tab-name" title={path} onClick={() => activateFile(conversationId, path)}>
+                    <button type="button" className="ws__tab-name" title={path} onClick={() => {
+                        // 切到别的标签 ⇒ 那条变更的版本范围不再适用（范围属于"某一条变更"，不属于文件）
+                        setOpenedRange(null)
+                        activateFile(conversationId, path)
+                      }}>
                       <FileGlyph path={path} />
                       <span className="ws__tab-label">{workspaceBaseName(path)}</span>
                       {tabDirty && <span className="ws__tab-dot" aria-label={t('workspace.unsaved')} />}
@@ -894,6 +1362,8 @@ export function WorkspacePanel({
                       title={t('workspace.tabClose')}
                       onClick={(event) => {
                         event.stopPropagation()
+                        // 关掉这条变更对应的文件 ⇒ 它的版本范围不再有意义
+                        if (openedRange?.path === path) setOpenedRange(null)
                         closeFile(conversationId, path)
                       }}
                     >
@@ -926,6 +1396,28 @@ export function WorkspacePanel({
                 <span className="ws__crumb" title={activePath}>
                   {activePath}
                 </span>
+                {/*
+                  ★ 2026-10-28（用户定案）：点「最近变更」里的文件后，在这里标明**这条是哪一段、
+                  版本范围是多少**（同路径两条时这是唯一能分清它们的地方；放列表里会遮挡文件名）。
+                */}
+                {visibleRange !== null && (
+                  <span className="ws__range-chip" data-testid="workspace-range-chip">
+                    <span className="ws__range-segment">
+                      {t(
+                        visibleRange.segment === 'current'
+                          ? 'workspace.recentGroupCurrentShort'
+                          : 'workspace.recentGroupEarlierShort',
+                      )}
+                    </span>
+                    <span className="ws__range-version">
+                      {visibleRange.to === 0
+                        ? t('workspace.diffRangeDeletedShort', { from: visibleRange.from ?? 0 })
+                        : visibleRange.from === null
+                          ? t('workspace.diffRangeNewShort', { to: visibleRange.to })
+                          : t('workspace.diffRange', { from: visibleRange.from, to: visibleRange.to })}
+                    </span>
+                  </span>
+                )}
                 <Space size="small" className="u-right">
                   <Tooltip title={t('workspace.reloadTooltip')}>
                     <Button size="small" type="text" icon={<ReloadOutlined />} onClick={reloadActive} />
@@ -993,7 +1485,14 @@ export function WorkspacePanel({
                     ) : (
                       <div className="ws__placeholder">
                         <Typography.Text type="secondary">
-                          {t('workspace.notText', { mime: fileQuery.data?.mime ?? '' })}
+                          {/*
+                            ★ 2026-10-28（用户反馈「txt 文件也需要支持展示」）：文本类**但没内联正文**只有
+                            两种原因 —— 太大（超过内联上限）或内容其实是二进制（改名而来的假 txt）。
+                            套 `notText`（"该文件不是文本（text/plain）"）对前者是自相矛盾的。
+                          */}
+                          {isWorkspaceTextMime(fileQuery.data?.mime ?? null)
+                            ? t('workspace.textTooLarge')
+                            : t('workspace.notText', { mime: fileQuery.data?.mime ?? '' })}
                         </Typography.Text>
                       </div>
                     )}
@@ -1021,24 +1520,30 @@ export function WorkspacePanel({
         </div>
       </div>
 
-      <WorkspacePathPrompt
-        open={prompt !== null}
-        mode={prompt?.mode ?? 'createFile'}
-        initialValue={promptInitial}
-        onCancel={() => setPrompt(null)}
-        onSubmit={(path) => {
-          if (prompt === null) return
-          if (prompt.mode === 'rename') void doRename(prompt.path, path)
-          else if (prompt.mode === 'createFolder') void createFolder(path)
-          else void createFile(path)
-        }}
-      />
+      {promptOpen && (
+        <WorkspacePathPrompt
+          open={promptOpen}
+          mode={prompt?.mode ?? 'createFile'}
+          initialValue={promptInitial}
+          onCancel={() => setPrompt(null)}
+          onSubmit={(path) => {
+            if (prompt === null) return
+            if (prompt.mode === 'rename') void doRename(prompt.path, path)
+            else {
+              // ★ 2026-10-29：框里预填了 `a/`，用户连前缀一起敲（`a/x.py`）不再叠成 `a/a/x.py`
+              const resolved = workspaceResolvePromptPath(prompt.dir, path)
+              if (resolved === '') return
+              void (prompt.mode === 'createFolder' ? createFolder(resolved) : createFile(resolved))
+            }
+          }}
+        />
+      )}
 
       {/* 行级差异（验收标记）：点「最近变更」某条的「差异」打开 */}
       <WorkspaceDiffModal
         conversationId={conversationId}
-        path={diffPath}
-        onClose={() => setDiffPath(null)}
+        target={diffTarget}
+        onClose={() => setDiffTarget(null)}
       />
 
       {/* 上传入口：右键菜单触发选择器，多选逐个 multipart 上传（同一时刻只有一个在传） */}
@@ -1051,6 +1556,197 @@ export function WorkspacePanel({
       />
     </div>
   )
+}
+
+/**
+ * 保留期提示（2026-10-28）—— 面板上的一条可关闭提示。
+ *
+ * 只在**快到清理时间**（`WORKSPACE_RETENTION_NOTICE_DAYS` 天内）或**已被保护**时出现；
+ * 被保护的话要说清"到点也不会清"，否则用户会以为马上要丢东西。
+ */
+function RetentionNotice(props: {
+  info: WorkspaceRetentionInfo
+  daysLeft: number
+  onDismiss: () => void
+}): React.JSX.Element | null {
+  const { t } = useT()
+  const { info, daysLeft, onDismiss } = props
+  const expired = daysLeft <= 0
+  // ★ 2026-10-28 浏览器实测修正（三条）：
+  //   ① **没到期就别因为"有保护"弹出来** —— 原判据 `!protected && daysLeft > N` 会让
+  //      "未到期 + 有保护"也弹，且文案写"已到期"（实测：updated_at 是今天，7 天后才到期）。
+  //   ② 第二行原来无条件拼 `count`，于是出现"因为这里还有 0 个产物，或你近期手写过文件"——
+  //      应按**实际命中**的保护原因分别说。
+  //   ③ "已到期"只在真的过期时才出现。
+  if (daysLeft > WORKSPACE_RETENTION_NOTICE_DAYS) return null
+  const hasArtifact = info.protectedReasons.includes('ARTIFACT_PRESENT')
+  const hasUserEdit = info.protectedReasons.includes('USER_EDIT_PROTECTED')
+  const why =
+    hasArtifact && hasUserEdit
+      ? t('workspace.retentionWhyBoth', { count: info.artifactCount })
+      : hasArtifact
+        ? t('workspace.retentionWhyArtifact', { count: info.artifactCount })
+        : hasUserEdit
+          ? t('workspace.retentionWhyUserEdit', { days: info.protectUserEditDays })
+          : ''
+  const message = expired
+    ? info.protected
+      ? t('workspace.retentionExpiredProtected')
+      : t('workspace.retentionExpiredWillClean', { total: info.retentionDays })
+    : t('workspace.retentionSoon', { days: daysLeft, total: info.retentionDays })
+  return (
+    <div className="ws__retention-notice" data-testid="workspace-retention-notice">
+      <Alert
+        type={expired ? (info.protected ? 'info' : 'warning') : 'info'}
+        showIcon
+        closable
+        onClose={onDismiss}
+        message={message}
+        description={
+          <>
+            {why !== '' && <div>{why}</div>}
+            <div>{t('workspace.retentionWhereStored', { days: info.retentionDays })}</div>
+          </>
+        }
+      />
+    </div>
+  )
+}
+
+/**
+ * 「撤销本轮」的范围选择弹窗（2026-10-28 用户定案「撤销怎么选」）。
+ *
+ * 三档范围（**默认最安全**）：
+ *   · 只撤 agent —— 这一段**以你的手写收尾**的文件**故意不动**（预演里已标出来）；
+ *   · 包含我的修改 —— 显式选择才生效；
+ *   · 逐条勾选 —— 默认勾选状态 = "只撤 agent" 的口径。
+ *
+ * ⚠️ AntD 的 `modal.confirm` 内容不受控，这里用 `data-*` 把选择写回 DOM，
+ *   由 {@link readRevertScopeChoice} 在 `onOk` 时读回 —— 避免为了一个弹窗引入受控状态树。
+ */
+function RevertScopeDialog(props: {
+  preview: WorkspaceRevertResult
+  currentPaths: readonly string[]
+  defaultSelected: readonly string[]
+}): React.JSX.Element {
+  const { t } = useT()
+  const { preview, currentPaths, defaultSelected } = props
+  const [scope, setScope] = useState<'AGENT_ONLY' | 'ALL' | 'SELECTED'>('AGENT_ONLY')
+  const [picked, setPicked] = useState<string[]>([...defaultSelected])
+  /**
+   * ★ 2026-10-29（用户定案「选哪一个哪一个就要回退」）：逐条勾选时三栏必须**跟着勾选变**。
+   *   以前三栏固定是"默认范围"的预演 ⇒ 勾上手写收尾的文件后仍写着"跳过"，与勾了以后实际会撤对不上。
+   *
+   * 实现上**不再发请求**：`preview.items` 是同一份候选逐条算出来的（含每条的落点），
+   * 这里按"勾选 + `shouldRevertPath` 同款规则"本地重算即可 —— 没有网络往返，
+   * 也就不存在"用户点确定时预演还落后于勾选"的竞态。
+   */
+  const shown = useMemo(() => previewByScope(preview, scope, picked), [preview, scope, picked])
+  // 把当前选择同步到 DOM（`onOk` 读回，不依赖回调闭包里的旧值）
+  revertScopeChoiceRef.current = { scope, paths: picked }
+  const skipped = shown.skip
+  return (
+    <div className="ws__revert-scope" data-testid="revert-scope-dialog">
+      <p className="ws__revert-scope-hint">{t('workspace.revertScopeHint')}</p>
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <label className="ws__revert-scope-option">
+          <input type="radio" name="ws-revert-scope" checked={scope === 'AGENT_ONLY'} onChange={() => setScope('AGENT_ONLY')} />
+          {t('workspace.revertScopeAgentOnly')}
+        </label>
+        <label className="ws__revert-scope-option">
+          <input type="radio" name="ws-revert-scope" checked={scope === 'ALL'} onChange={() => setScope('ALL')} />
+          {t('workspace.revertScopeAll')}
+        </label>
+        <label className="ws__revert-scope-option">
+          <input type="radio" name="ws-revert-scope" checked={scope === 'SELECTED'} onChange={() => setScope('SELECTED')} />
+          {t('workspace.revertScopeSelected')}
+        </label>
+        {scope === 'SELECTED' && <p className="ws__revert-scope-hint">{t('workspace.revertScopeSelectedHint')}</p>}
+      </Space>
+      <ul className="ws__revert-preview">
+        <li>{t('workspace.revertPreviewRestore', { count: shown.restore.length })}</li>
+        <li>{t('workspace.revertPreviewRemove', { count: shown.remove.length })}</li>
+        <li data-testid="revert-preview-skip">{t('workspace.revertPreviewSkip', { count: skipped.length })}</li>
+      </ul>
+      {skipped.length > 0 && (
+        <ul className="ws__revert-preview-skip">
+          {skipped.map((entry) => (
+            <li key={`${entry.reason}:${entry.path}`}>
+              <span className="ws__revert-path">{entry.path}</span>
+              <span className="ws__revert-message">{t(`workspace.revertSkipReason.${entry.reason}`)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {scope === 'SELECTED' && (
+        <ul className="ws__revert-pick">
+          {currentPaths.map((path) => (
+            <li key={path}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={picked.includes(path)}
+                  onChange={(event) =>
+                    setPicked((prev) => (event.target.checked ? [...prev, path] : prev.filter((item) => item !== path)))
+                  }
+                />
+                {path}
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 按当前选择**本地重算**预演三栏（纯函数，`RevertScopeDialog` 用）。
+ *
+ * 判据与后端 `buildWorkspaceRevertPreview` 对齐（2026-10-29）：跳过 = 不在范围内 / 不可撤销 /
+ * 已经无可撤；删除 = 那一条的落点就是"不存在"（`action === 'deleted'`），其余算还原。
+ * `dryRun` 的 `items` 已经带好每条落点，所以这里只做分类，不再猜版本号。
+ */
+function previewByScope(
+  result: WorkspaceRevertResult,
+  scope: WorkspaceRevertScope,
+  selected: readonly string[],
+): { restore: string[]; remove: string[]; skip: { path: string; reason: WorkspaceRevertSkipReason }[] } {
+  const out: { restore: string[]; remove: string[]; skip: { path: string; reason: WorkspaceRevertSkipReason }[] } = {
+    restore: [],
+    remove: [],
+    skip: [],
+  }
+  for (const item of result.items) {
+    // 范围：默认只撤"不是自己最后一次写入"的；ALL 全撤；SELECTED 只撤勾上的
+    const inScope =
+      scope === 'SELECTED' ? selected.includes(item.path) : scope === 'ALL' ? true : item.defaultSelected === true
+    if (item.action === 'unsupported') {
+      out.skip.push({ path: item.path, reason: 'UNSUPPORTED' })
+      continue
+    }
+    if (!inScope) {
+      out.skip.push({ path: item.path, reason: item.defaultSelected === false ? 'USER_EDIT_EXCLUDED' : 'CONFLICT' })
+      continue
+    }
+    if (item.action === 'skipped') {
+      out.skip.push({ path: item.path, reason: 'NET_ZERO' })
+      continue
+    }
+    if (item.action === 'deleted') out.remove.push(item.path)
+    else if (item.action === 'restored') out.restore.push(item.path)
+    else out.skip.push({ path: item.path, reason: item.action === 'conflict' ? 'CONFLICT' : 'UNAVAILABLE' })
+  }
+  return out
+}
+
+/** 撤销弹窗里选了什么（`modal.confirm` 的 `onOk` 读回；见 {@link RevertScopeDialog}） */
+const revertScopeChoiceRef: { current: { scope: WorkspaceRevertScope; paths: string[] } } = {
+  current: { scope: 'AGENT_ONLY', paths: [] },
+}
+
+function readRevertScopeChoice(): { scope: WorkspaceRevertScope; paths: string[] } {
+  return revertScopeChoiceRef.current
 }
 
 /**
@@ -1068,9 +1764,27 @@ function RecentChangeRow(props: {
   const { conversationId, change, onOpenFile, onOpenDiff } = props
   const { t, locale } = useT()
   // 逐行差异的**计数**（只回 `+N −M`，不带逐行内容）：每行一个轻量查询，点开才取全文
+  //
+  // ★ 2026-10-28（用户反馈「编辑 4 行只显示 1 行，刷新后才 +4 −3」）：基线以**服务端**为准。
+  //
+  //   历史教训：基线先后取过 `version - 1`（只有最后一跳）和 `change.beforeVersion`
+  //   （清单里带的字段）—— 后者会因**实时 SSE 事件合并**丢字段而悄悄退回最后一跳，
+  //   于是"改完立刻看"和"刷新后看"两个数字不一样。
+  //   现在对本轮内的条目直接发 `roundBase=1`，由服务端按**本轮窗口**算（与「撤销本轮」同一判据）：
+  //   前端不再需要 `beforeVersion`，合并怎么变都不会漂移。
+  //   本轮之外的条目（更早）仍用清单里的 `beforeVersion` / 前一版（那些没有"本轮基线"可言）。
+  //
+  // ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条）：每条**只比自己那一段**。
+  //   判据在 `workspaceDiffScope`（纯函数，徽标与弹窗共用同一份）——「更早」那条到版本是它自己的
+  //   `version`，不是"此刻盘上的内容"；否则点开两条会看到同一个"很久以前 → 现在"的差异。
+  const scope = workspaceDiffScope(change)
   const stats = useQuery({
-    queryKey: workspaceFileDiffQueryKey(conversationId, change.path, change.version ?? undefined),
-    queryFn: () => fetchWorkspaceFileDiff(conversationId, change.path, { stats: true }),
+    queryKey: workspaceFileDiffQueryKey(conversationId, change.path, scope.baseVersion, true, scope.toVersion),
+    queryFn: () =>
+      fetchWorkspaceFileDiff(conversationId, change.path, {
+        ...scope,
+        stats: true,
+      }),
     enabled: change.version !== null,
     staleTime: 30_000,
   })
@@ -1115,12 +1829,32 @@ function RecentChangeRow(props: {
  * 文件**行级差异**弹窗（验收标记）：旧行号 / 新行号 / `+/−` 号 / 文本；
  * 未变长段由后端折成「⋯ N 行未变⋯」一条（`gap`）。
  */
-function WorkspaceDiffModal(props: { conversationId: string; path: string | null; onClose: () => void }) {
-  const { conversationId, path, onClose } = props
+function WorkspaceDiffModal(props: {
+  conversationId: string
+  target: {
+    path: string
+    version: number | null
+    beforeVersion?: number | null
+    segment?: 'current' | 'earlier'
+  } | null
+  onClose: () => void
+}) {
+  const { conversationId, target, onClose } = props
   const { t } = useT()
+  const path = target?.path ?? null
+  // 与「最近变更」那一行的徽标同源：本轮基线 → 当前。**和徽标必须同一基线**，
+  // 否则会出现"徽标 +2 −1、点开只有 +1 −0"这种自相矛盾（2026-10-28 用户反馈）。
+  //
+  // ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条）：弹窗也必须**只比那一段**，
+  //   且与列表徽标用**同一个** `workspaceDiffScope`（否则徽标与弹窗数字会打架）。
+  const scope = workspaceDiffScope({
+    version: target?.version ?? null,
+    ...(target?.beforeVersion === undefined ? {} : { beforeVersion: target.beforeVersion }),
+    ...(target?.segment === undefined ? {} : { segment: target.segment }),
+  })
   const query = useQuery({
-    queryKey: workspaceFileDiffQueryKey(conversationId, path ?? ''),
-    queryFn: () => fetchWorkspaceFileDiff(conversationId, path ?? ''),
+    queryKey: workspaceFileDiffQueryKey(conversationId, path ?? '', scope.baseVersion, false, scope.toVersion),
+    queryFn: () => fetchWorkspaceFileDiff(conversationId, path ?? '', scope),
     enabled: path !== null,
   })
   const diff = query.data
@@ -1134,12 +1868,35 @@ function WorkspaceDiffModal(props: { conversationId: string; path: string | null
       title={
         <span className="ws__diff-title">
           {t('workspace.diffTitle')}
-          <span className="ws__diff-title-path">{path}</span>
-          {diff !== undefined && diff.available ? (
-            <span className="ws__diff-title-stat">
-              <span className="ws__diff-added">+{diff.added}</span>{' '}
-              <span className="ws__diff-removed">−{diff.removed}</span>
+          {/*
+            ★ 2026-10-28（用户定案）：同一路径两段都动过时列表里是两条，弹窗要说明**这条是哪一段**，
+            否则两条的标题长得一模一样、只有版本号不同。（文件名本身在列表里不重复标注 —— 那样会把
+            文件名遮住；段与版本范围在这里展示。）
+          */}
+          {target?.segment !== undefined && (
+            <span className="ws__diff-title-segment">
+              {t(target.segment === 'current' ? 'workspace.recentGroupCurrentShort' : 'workspace.recentGroupEarlierShort')}
             </span>
+          )}
+          <span className="ws__diff-title-path">{path}</span>
+          {/*
+            ★ 2026-10-28：把"跟哪个版本比"写出来。用户要知道的是**这一段**改了什么，
+            而不是"最后一跳"；`diff.baseVersion → diff.currentVersion` 就是这次比较的两端。
+          */}
+          {diff !== undefined && diff.available ? (
+            <>
+              <span className="ws__diff-title-range">
+                {diff.currentVersion === null
+                  ? t('workspace.diffRangeDeleted', { from: diff.baseVersion ?? 0 })
+                  : diff.baseVersion === null
+                    ? t('workspace.diffRangeNew', { to: diff.currentVersion })
+                    : t('workspace.diffRange', { from: diff.baseVersion, to: diff.currentVersion })}
+              </span>
+              <span className="ws__diff-title-stat">
+                <span className="ws__diff-added">+{diff.added}</span>{' '}
+                <span className="ws__diff-removed">−{diff.removed}</span>
+              </span>
+            </>
           ) : null}
         </span>
       }
@@ -1324,19 +2081,30 @@ const TREE_INDENT = 12
  * "哪些目录**被展开**"（初始空集），而不是"哪些被折叠" —— 前者天然是"默认折叠"，后者要反着写。
  * 这份状态**按会话持久化**在 `stores/workspace.ts#expandedByConversation`（落 localStorage）：
  * 重进会话 / 刷新页面都记得住（与"标签是本次会话的临时选择"不同，浏览位置该被记住）。
+ *
+ * ⚠️ `resetKey` 变了就**忽略**这份持久化（P1-24）：一次 `git clone` / `git pull` 没跑完时，
+ * 面板按"原始根"展示 —— 用户此刻点开的目录既不进 store，也不被翻出来用，clone 一结束再正常一轮。
  */
 function WorkspaceTree(props: {
   conversationId: string
   nodes: readonly WorkspaceTreeNode[]
   selectedPath: string | null
   actions: TreeActions
+  /** 0 = 正常（读持久化的展开状态）；非 0 = 忽略持久化，一律按"全部折叠"展示 */
+  resetKey: number
+  /** 正在「上传至平台」的文件（非空 ⇒ 菜单里那一项禁用，避免连点建出两条产物行） */
+  uploadingArtifact: boolean
 }) {
   const { t, locale } = useT()
   const scrollRef = useRef<HTMLDivElement | null>(null)
   /** 被**展开**的目录（持久化在 store；初始为空 = 全部折叠，只看到顶层） */
-  const expandedDirs = useWorkspaceExpandedDirs(props.conversationId)
+  const stored = useWorkspaceExpandedDirs(props.conversationId)
+  const expandedDirs = props.resetKey === 0 ? stored : EMPTY_DIRS
   const toggleExpanded = useWorkspaceStore((state) => state.toggleExpanded)
-  const expanded = useMemo(() => new Set(expandedDirs), [expandedDirs])
+  /** 忽略持久化期间，点开/收起的目录仅本组件内有效（clone 结束后交给 store 那一份） */
+  const [transient, setTransient] = useState<readonly string[]>(EMPTY_DIRS)
+  const shownDirs = props.resetKey === 0 ? expandedDirs : transient
+  const expanded = useMemo(() => new Set(shownDirs), [shownDirs])
   /** 当前被拖到其上的目录（高亮落点） */
   const [dropDir, setDropDir] = useState<string | null>(null)
   const [rootDropActive, setRootDropActive] = useState(false)
@@ -1365,7 +2133,14 @@ function WorkspaceTree(props: {
     }
   }, [])
 
-  const toggle = (path: string): void => toggleExpanded(props.conversationId, path)
+  const toggle = (path: string): void => {
+    if (props.resetKey === 0) {
+      toggleExpanded(props.conversationId, path)
+      return
+    }
+    // 忽略持久化期间：只动本组件那一份，别把 clone 中途的临时浏览写进 localStorage
+    setTransient((prev) => toggleExpandedDir(prev, path))
+  }
 
   /**
    * 「复制」子菜单（**文件与目录同款**）。三个子项直接取自 `WORKSPACE_COPY_ITEMS`
@@ -1391,6 +2166,13 @@ function WorkspaceTree(props: {
       { key: 'open', label: t('workspace.menuOpen') },
       { key: 'rename', icon: <EditOutlined />, label: t('workspace.menuRename') },
       { key: 'download', icon: <DownloadOutlined />, label: t('workspace.menuDownload') },
+      {
+        key: 'uploadArtifact',
+        icon: <CloudUploadOutlined />,
+        label: t('workspace.menuUploadArtifact'),
+        // 上传进行中禁掉入口（同一时刻只跑一个；连点会建两条产物行）
+        disabled: props.uploadingArtifact,
+      },
       { type: 'divider' },
       copySubmenu(),
       { type: 'divider' },
@@ -1401,6 +2183,7 @@ function WorkspaceTree(props: {
       if (key === 'open') props.actions.open(path)
       else if (key === 'rename') props.actions.rename(path)
       else if (key === 'download') props.actions.download(path)
+      else if (key === 'uploadArtifact') props.actions.uploadArtifact(path)
       else if (key === 'delete') props.actions.remove(path)
     },
   })
@@ -1410,6 +2193,7 @@ function WorkspaceTree(props: {
       { key: 'newFile', icon: <FileAddOutlined />, label: t('workspace.newFile') },
       { key: 'newFolder', icon: <FolderAddOutlined />, label: t('workspace.newFolder') },
       { key: 'upload', icon: <UploadOutlined />, label: t('workspace.menuUploadHere') },
+      { key: 'downloadDir', icon: <DownloadOutlined />, label: t('workspace.menuDownloadDir') },
       { type: 'divider' },
       copySubmenu(),
       { type: 'divider' },
@@ -1420,6 +2204,7 @@ function WorkspaceTree(props: {
       if (key === 'newFile') props.actions.newFile(dir)
       else if (key === 'newFolder') props.actions.newFolder(dir)
       else if (key === 'upload') props.actions.upload(dir)
+      else if (key === 'downloadDir') props.actions.downloadDir(dir)
       else if (key === 'delete') props.actions.removeDir(dir)
     },
   })

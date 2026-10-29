@@ -313,6 +313,21 @@ pi 的 `bash` 能绕过工具中介直接写文件：
 
 > ✅ **已落地（2026-10-14，#3 · git 感知产物过滤）**：R4 的"工作区变更集"不认识 git ⇒ 轮内 `git clone` / `git pull` 会把整棵树当成本轮新增（实测命中单轮 200 上限、全进产物面板）。新增 `backend/src/sandbox/gitArtifacts.ts#filterGitCleanPaths`：用**宿主 git** 判"git 仓库里**干净的 tracked 文件**"（`git ls-files` ∩ `git status --porcelain` 无输出）并从候选里剔除 —— clone/pull 拉下来、没再动过的**不算产物**；被 agent 改过 / 新建的照常收。判据在 `collectRoundArtifacts` 里排在**截断之前**（否则 clone 的 200 个文件会先占满上限）。⚠️ **保守失败**：git 不可用 / 命令报错 ⇒ 不剔除（退回现状）。自证 `pnpm workspace:regression`（L4/L5）。忽略规则扩容（`dist/ build/ target/ *.lock`）仍**未做**。
 
+> ✅ **口径变更（2026-10-29，用户定案）：Code 模式下不再自动收产物。**
+>
+> 判据从"agent 改了什么"彻底改为"**人认了哪个**"：Code 模式的 TaskAgent 在轮末**不调**
+> `collectRoundArtifacts`（`taskAgent.ts` 产物块判 `codeMode === false` 才收），所以
+> `git clone` 的整棵树、`npm run build` 的 `build/`、`curl` 下来的压缩包都不会再自动进产物面板 ——
+> 这些文件本来就在**工作区面板**里（文件树 + 「最近变更」+ 单文件下载 `/workspace/file/raw`）。
+>
+> 要让某个文件成为产物（进产物面板 / 会话产物 / 批量下载清单），由人**显式**操作：
+> 文件树右键「上传至平台（存为产物）」⇒ `POST /api/conversations/:id/workspace/artifact`（body `{path}`）⇒
+> 服务端从**工作区字节**读取并走 `sandbox/artifacts.ts#registerWorkspaceArtifact`（与批量收集同一个
+> 实现：大小闸门 → 传对象 → 建行 → 建行失败补偿删对象）。契约 `shared#workspaceArtifactBodySchema`。
+>
+> 因此本节上面那套"变更集 + git 过滤 + 目录名单"的判据**只剩非 Code 的 TaskAgent 在用**；
+> 它们继续保留（那条链路没有工作区面板可看）。后续若要补"批量勾选上传"，复用同一个端点即可。
+
 ### 7. git 凭据：平台配置 + 容器内注入（2026-10-12 新增）
 
 > 背景：§十三 已决 7 把 git 定为「**agent 的普通工具**」（clone/commit/branch 都由 agent 在 `bash` 里跑，后端不做 git-aware 端点）。但"**agent 拿什么身份 clone 私有仓库**"是那条定案**没回答**的问题 —— 本节补上：凭据从哪来、放哪、怎么消失。

@@ -124,6 +124,24 @@ export function isWorkspaceHiddenPath(path: string): boolean {
   return path.split('/').some((segment) => segment.startsWith('.') && segment !== '.')
 }
 
+/**
+ * 这段路径是不是 **git 自己的内部文件**（`<repo>/.git/…`，或 `--separate-git-dir` 那种 `.git`
+ * 文件本身）—— **纯函数**，前后端共用一处判据。
+ *
+ * ★ 为什么要单独判（2026-10-27，用户反馈「git 都没变更，为什么拉取下来那些算变更」）：
+ *   `.git/` 里的对象 / 索引 / 锁文件在工作区里也是普通文件，`clone --depth` 中途会被
+ *   `reconcileWorkspaceOnce` 一条条记成 `created`/`updated`/`deleted`（实测某会话 12 秒里
+ *   1988 条事件，其中就有 `repo/.git/objects/pack/tmp_pack_*`、`repo/.git/index.lock`）。
+ *   它们已经是工作区索引的一部分（`.git` 属工作区内容、进冷备），但**不该出现在「最近变更」**：
+ *   那份清单要回答"谁动了哪些代码"，不是 git 的中间产物。
+ *
+ * 与 {@link isWorkspaceHiddenPath} 的区别：那个是"任一段以 `.` 开头"（会连 `.doubulea/memory.md`
+ * 一起算），这里**只认 `.git` 这一段**（`.github/` 是正常目录，不算）。
+ */
+export function isGitInternalPath(path: string): boolean {
+  return path.split('/').some((segment) => segment === '.git')
+}
+
 // ═════════════════════════════ 前端闸门常量（与后端 config 默认值同源） ═════════════════════════════
 
 /**
@@ -200,6 +218,14 @@ export const workspaceGitRepoSchema = z.object({
   branch: z.string().nullable(),
   /** 是否处于 detached HEAD（`branch` 那一栏装的是短 SHA） */
   detached: z.boolean(),
+  /**
+   * 这个仓库**此刻是否还在 clone / pull 中途**（P1-24，2026-10-27）：`index.lock` / `shallow.lock` 还在。
+   *
+   * 为什么要给前端：`clone --depth 1` 会在工作区里一口气长出几千个文件、`.git` 也在反复重写；
+   * 面板据此把「已就绪」推后（树先按原始根展示、不自动展开、也不拉文件树），避免 clone 中途的
+   * 半棵树被当成"新文件到了"而层层展开。
+   */
+  cloning: z.boolean().default(false),
 })
 export type WorkspaceGitRepo = z.infer<typeof workspaceGitRepoSchema>
 
@@ -243,6 +269,18 @@ export const workspaceWriteFileBodySchema = z.object({
     .default(0),
 })
 export type WorkspaceWriteFileBody = z.infer<typeof workspaceWriteFileBodySchema>
+
+/**
+ * 「上传至平台」（`POST /api/conversations/:id/workspace/artifact`，2026-10-29）。
+ *
+ * Code 模式下**不再自动收产物**（用户定案：agent 动过的文件由工作区面板呈现即可）。
+ * 要让某个文件进"产物面板 / 会话产物 / 可下载清单"，由人在文件树上**显式**点一次上传。
+ * `path` = 工作区相对路径（文件必须已存在，服务端从**工作区字节**读取，不经浏览器重新上传）。
+ */
+export const workspaceArtifactBodySchema = z.object({
+  path: workspacePathSchema,
+})
+export type WorkspaceArtifactBody = z.infer<typeof workspaceArtifactBodySchema>
 
 /** 新建文件请求体（`POST /api/conversations/:id/workspace/file`）—— `path` 在 body 里（无查询参数） */
 export const workspaceCreateFileBodySchema = z.object({
@@ -319,6 +357,16 @@ export type WorkspaceEventsQuery = z.infer<typeof workspaceEventsQuerySchema>
  * 依据：`docs/子方案/Code模式工作区.md` §六 3（轮末变更集 = "本轮这个工作区动过哪些文件"）。
  * 折叠口径见 {@link foldWorkspaceEvents}。
  */
+export const WORKSPACE_CHANGE_SEGMENTS = ['current', 'earlier'] as const
+/**
+ * 这条变更属于**哪一段**：`current` = 本轮（最后一次 agent 派活窗口 + 其后的编辑），
+ * `earlier` = 更早的轮次 / 更早的改动。
+ *
+ * ★ 2026-10-28（用户定案）：同一路径若**两段都动过**，清单里给**两条**（各带自己的版本范围），
+ *   这样"更早改过、本轮又改过"是看得出来的。以前按路径折叠成一条，本轮那条会把更早那次盖掉。
+ */
+export type WorkspaceChangeSegment = (typeof WORKSPACE_CHANGE_SEGMENTS)[number]
+
 export const workspaceChangeEntrySchema = z.object({
   path: z.string(),
   /** 这条路径**最后**一次事件的类型 */
@@ -328,12 +376,49 @@ export const workspaceChangeEntrySchema = z.object({
   actor: z.enum(WORKSPACE_ACTORS),
   actorId: z.string().nullable(),
   at: z.string(),
+  /**
+   * **该段的基线版本**（这条路径在**这一段**第一次被改之前的版本）。
+   *
+   * ★ 2026-10-28（用户反馈「实际编辑了 2 行，本轮只展示 1 行」）：徽标/差异弹窗原来按
+   *   `version - 1` 取基线，那是**最后一跳**（v24→v25），不是**这一段整体**（v23→v25）。
+   *   同一轮里连改两次，就只看到最后一次改动，看起来像"改动丢了"。
+   *   这里给出与「撤销本轮」**同一个判据**（`planWorkspaceRevert#beforeVersion`）算出的基线，
+   *   差异一律按 `该段基线 → 该段末版本` 展示，与撤销回滚的落点完全一致。
+   *
+   * `null` = 该段开始时该路径**不存在**（新建）或无从判定（如 `deleted` 的边界）；
+   * 缺省（`undefined`）= 这条清单没有窗口信息（全量口径），调用方退回"前一版"。
+   */
+  beforeVersion: z.number().int().min(1).nullable().optional(),
+  /**
+   * 这条属于哪一段（见 {@link WorkspaceChangeSegment}）。缺省 = `current`（实时事件天然是"此刻"）。
+   *
+   * 同一路径在两段都动过时，服务端会回**两条**（`current` + `earlier`），各自的
+   * `beforeVersion → version` 就是那一段的版本范围。
+   */
+  segment: z.enum(WORKSPACE_CHANGE_SEGMENTS).optional(),
 })
 export type WorkspaceChangeEntry = z.infer<typeof workspaceChangeEntrySchema>
 
-/** 变更集响应 = `{ items }`（按 `at` 倒序；只含 `[since, now]` 窗口内动过的路径各一条） */
+/**
+ * 变更集响应 = `{ items, round }`（按 `at` 倒序；只含 `[since, now]` 窗口内动过的路径各一条）。
+ *
+ * ★ 2026-10-28（用户定案：「最近变更」按轮分组显示 本轮 / 更早）：把**本轮窗口**一并回给前端，
+ *   让它能把同一份清单切成两段，而不必再发一次请求、也不必在前端猜"本轮从哪开始"。
+ *
+ * `round` 缺省（`undefined`）= 这个会话还没有过任何一轮（新会话 / 从没派过活）⇒ 全部算「更早」。
+ * ⚠️ `start` 是本轮**起点**（`workspace.round.start`），不是"最近 24 小时"之类的近似。
+ */
 export const workspaceChangesResultSchema = z.object({
   items: z.array(workspaceChangeEntrySchema),
+  /** 本轮窗口（Redis 轮次标记）；没有过轮次时缺省 */
+  round: z
+    .object({
+      /** 本轮起点（ISO 8601）；`at >= start` 的条目算「本轮」 */
+      start: z.string(),
+      /** 本轮终点（ISO 8601）；轮还没收尾时缺省 */
+      end: z.string().optional(),
+    })
+    .optional(),
 })
 export type WorkspaceChangesResult = z.infer<typeof workspaceChangesResultSchema>
 
@@ -343,6 +428,36 @@ export const workspaceChangesQuerySchema = z.object({
   since: z.string().datetime({ offset: true }).optional(),
 })
 export type WorkspaceChangesQuery = z.infer<typeof workspaceChangesQuerySchema>
+
+// ═════════════════════════════ 工作区保留期提示（2026-10-28） ═════════════════════════════
+
+/**
+ * 到期保护原因：命中任一 ⇒ 即使到了保留期，reaper 也**不会**清这个工作区。
+ *
+ * 依据 2026-10-28 用户反馈（agent 生成的 docx 被静默清掉）：到期清理必须让用户**提前**看见，
+ * 且"工作区里装着交付物 / 我手写过"这两种情况不能真删。
+ */
+export const WORKSPACE_RETENTION_PROTECTIONS = ['ARTIFACT_PRESENT', 'USER_EDIT_PROTECTED'] as const
+export type WorkspaceRetentionProtection = (typeof WORKSPACE_RETENTION_PROTECTIONS)[number]
+
+/** 工作区保留期提示（`GET /api/conversations/:id/workspace/retention`） */
+export const workspaceRetentionInfoSchema = z.object({
+  /** 工作区保留期（天） */
+  retentionDays: z.number().int(),
+  /** 工作区**内容**最后一次变动（`workspaces.updated_at`）；`null` = 还没建过工作区 */
+  updatedAt: z.string().nullable(),
+  /** 预计清理时刻（ISO）；`null` = 还没建过 */
+  expiresAt: z.string().nullable(),
+  /** 该会话仍在保留期内的产物数（交付物） */
+  artifactCount: z.number().int(),
+  /** 用户手写的额外保护期（天；`0` = 关闭） */
+  protectUserEditDays: z.number().int(),
+  /** 命中的保护原因（空 = 到点会真删） */
+  protectedReasons: z.array(z.enum(WORKSPACE_RETENTION_PROTECTIONS)),
+  /** 等价于 `protectedReasons.length > 0`（前端直接读这一位） */
+  protected: z.boolean(),
+})
+export type WorkspaceRetentionInfo = z.infer<typeof workspaceRetentionInfoSchema>
 
 // ═════════════════════════════ 文件差异（P1-9 · 验收标记） ═════════════════════════════
 
@@ -397,10 +512,33 @@ export type WorkspaceFileDiff = z.infer<typeof workspaceFileDiffSchema>
 /** 文件差异查询（`GET .../workspace/file/diff?path=…&baseVersion=…&stats=1`） */
 export const workspaceFileDiffQuerySchema = z.object({
   path: z.string().min(1),
-  /** 显式指定基线版本；缺省 = 当前版本的前一版（新建时为 `null`） */
-  baseVersion: z.coerce.number().int().min(1).optional(),
+  /**
+   * 显式指定基线版本；缺省 = 当前版本的前一版（新建时为 `null`）。
+   *
+   * ★ 2026-10-28：`0` = **明确"基线不存在"**（该段里这个文件是新建的）。缺省（不传）仍然是
+   *   "用默认基线"。两者必须能区分 —— 「更早」那一段里"新建 → v2"与"v1 → v2"是两个不同的故事，
+   *   而 `min(1)` 会把前者悄悄退化成后者。
+   */
+  baseVersion: z.coerce.number().int().min(0).optional(),
+  /**
+   * 差异的**到哪个版本**为止（缺省 = 当前盘上内容）。
+   *
+   * ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条，各自标明版本范围）：点「更早」那条时，
+   *   要比的是**那一段**（`该段基线 → 该段末版本`），而不是一路比到此刻的文件内容 ——
+   *   否则两行会给出同一个"从很久以前到现在"的差异，等于没分开。
+   */
+  toVersion: z.coerce.number().int().min(1).optional(),
   /** `1` = 只回计数（徽标用），不返回逐行差异 */
   stats: z.coerce.number().int().optional(),
+  /**
+   * `1` = 基线取**本轮基线**（这条路径在本轮第一次被改之前的版本），由服务端自己算。
+   *
+   * ★ 2026-10-28（用户反馈「编辑 4 行只显示 1 行，刷新后才变 +4 −3」）：`baseVersion` 由前端
+   *   从清单里带过来，而清单会因为实时事件合并、`beforeVersion` 偶发缺失而退回"前一版"，
+   *   于是**即时视图和刷新后不一致**。让服务端按同一窗口自己算基线，前端不必再传、
+   *   也不会因合并丢字段而漂移。`baseVersion` 显式给了仍然优先（高级用法）。
+   */
+  roundBase: z.coerce.number().int().optional(),
 })
 export type WorkspaceFileDiffQuery = z.infer<typeof workspaceFileDiffQuerySchema>
 
@@ -487,6 +625,46 @@ export function foldWorkspaceEvents(events: readonly WorkspaceEventItem[]): Work
 export const WORKSPACE_REVERT_ACTIONS = ['restored', 'deleted', 'skipped', 'conflict', 'unavailable', 'unsupported'] as const
 export type WorkspaceRevertAction = (typeof WORKSPACE_REVERT_ACTIONS)[number]
 
+/**
+ * 撤销**范围**（2026-10-28 用户定案：「撤销怎么选」）。
+ *
+ * 默认是 `AGENT_ONLY`（最安全）：用户手写是不可再生的，不许被一个"撤销本轮"顺手冲掉；
+ * 想连手写一起撤，必须显式换成 `ALL` 或逐条勾选（`SELECTED`）。
+ */
+export const WORKSPACE_REVERT_SCOPES = ['AGENT_ONLY', 'ALL', 'SELECTED'] as const
+export type WorkspaceRevertScope = (typeof WORKSPACE_REVERT_SCOPES)[number]
+
+/** 撤销**跳过**的原因（预演三栏里"不会动"那一栏；前端按 key 取文案） */
+export const WORKSPACE_REVERT_SKIP_REASONS = [
+  /** 这一段以用户手写收尾 —— 默认范围下**故意不动**（不是漏了） */
+  'USER_EDIT_EXCLUDED',
+  /** 本轮末之后又被改过（不静默覆盖） */
+  'CONFLICT',
+  /** 历史字节缺失，无从还原 */
+  'UNAVAILABLE',
+  /** 改名/移动、二进制等本版不支持 */
+  'UNSUPPORTED',
+  /** 建了又删，净变化为零 */
+  'NET_ZERO',
+] as const
+export type WorkspaceRevertSkipReason = (typeof WORKSPACE_REVERT_SKIP_REASONS)[number]
+
+/**
+ * 撤销**预演**（`dryRun=true` 时随结果一并回）：点之前就能看见"会还原什么 / 会删除什么 / 会跳过什么"。
+ *
+ * `skip` 里带原因 —— 尤其 `USER_EDIT_EXCLUDED` 必须**单独灰显并注明**，
+ * 让用户知道"系统不是漏了，是故意没动你的手写"。
+ */
+export const workspaceRevertPreviewSchema = z.object({
+  /** 会改写成某历史版本的路径 */
+  restore: z.array(z.string()),
+  /** 这一段新建的 ⇒ 撤销 = 删除 */
+  remove: z.array(z.string()),
+  /** 不会动，附原因 */
+  skip: z.array(z.object({ path: z.string(), reason: z.enum(WORKSPACE_REVERT_SKIP_REASONS) })),
+})
+export type WorkspaceRevertPreview = z.infer<typeof workspaceRevertPreviewSchema>
+
 /** 撤销结果里的一行（每路径一条） */
 export const workspaceRevertEntrySchema = z.object({
   path: z.string(),
@@ -499,6 +677,16 @@ export const workspaceRevertEntrySchema = z.object({
   toVersion: z.number().int().min(1).nullable(),
   /** 失败/跳过的原因（给人看；`restored`/`deleted` 时缺省） */
   message: z.string().optional(),
+  /**
+   * 回滚点是怎么定的。
+   *
+   * ★ 2026-10-29 起「撤销本轮」= 文件级**退一步**（回到本段最后一跳之前那一版），
+   *   所以现在固定回 `segment-start`（历史值，语义已变成"退一步"）；
+   *   `after-user-edit` 只为兼容旧响应保留，新响应不再产生。
+   */
+  rollbackFrom: z.enum(['segment-start', 'after-user-edit']).optional(),
+  /** 这一条在**默认范围**下是否会被勾选（用户手写收尾的为 `false`） */
+  defaultSelected: z.boolean().optional(),
 })
 export type WorkspaceRevertEntry = z.infer<typeof workspaceRevertEntrySchema>
 
@@ -509,6 +697,10 @@ export const workspaceRevertResultSchema = z.object({
   /** 只预演不落盘（`dryRun`）：`items` 的动作是"将会怎样" */
   dryRun: z.boolean(),
   items: z.array(workspaceRevertEntrySchema),
+  /** 本次实际生效的撤销范围（回显，便于前端把预演与结果对齐） */
+  scope: z.enum(WORKSPACE_REVERT_SCOPES).optional(),
+  /** 预演三栏：会还原 / 会删除 / 会跳过（缺省 = 没算，`dryRun=true` 时一定有） */
+  preview: workspaceRevertPreviewSchema.optional(),
 })
 export type WorkspaceRevertResult = z.infer<typeof workspaceRevertResultSchema>
 
@@ -522,6 +714,15 @@ export const workspaceRevertBodySchema = z.object({
   since: z.string().datetime({ offset: true }).optional(),
   until: z.string().datetime({ offset: true }).optional(),
   dryRun: z.boolean().optional(),
+  /**
+   * 撤销范围（2026-10-28 用户定案，见 `子方案`「撤销怎么选」）：
+   *   · `AGENT_ONLY`（**缺省**）：只撤 agent 覆盖过的文件 —— 这一段**最后一次写入是 agent** 的路径；
+   *   · `ALL`：这一段里出现过就撤（**含用户手写**，显式选择才生效）；
+   *   · `SELECTED`：只撤 `paths` 里列出的路径（逐条勾选）。
+   */
+  scope: z.enum(WORKSPACE_REVERT_SCOPES).optional(),
+  /** `scope=SELECTED` 时勾选的路径（其它范围忽略） */
+  paths: z.array(z.string().min(1)).max(5000).optional(),
 })
 export type WorkspaceRevertBody = z.infer<typeof workspaceRevertBodySchema>
 

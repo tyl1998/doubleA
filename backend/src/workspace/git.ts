@@ -24,9 +24,14 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 
-import type { WorkspaceGitRepo } from '@doubulea/shared'
+import type {
+  WorkspaceGitRepo,
+  WorkspaceRetentionInfo,
+  WorkspaceRetentionProtection,
+} from '@doubulea/shared'
 
 import { config } from '../config.js'
+import { getPrisma } from '../infra/prisma.js'
 import { workspaceDirOf } from './paths.js'
 
 /** 一层子目录里**最多**看多少个目录（防异常宽的工作区把一次探测拖慢；正常远到不了） */
@@ -34,6 +39,12 @@ const GIT_SCAN_MAX_DIRS = 200
 
 /** 一层子目录里跳过的名字：依赖目录（隐藏目录另有 `startsWith('.')` 判据） */
 const GIT_SCAN_SKIP_DIRS: ReadonlySet<string> = new Set(['node_modules'])
+
+/**
+ * clone / pull **进行中**的标记文件（相对 git 目录）。git 自己也是靠这两个锁判"上一次没跑完"。
+ * 见 {@link gitOperationInProgress}。
+ */
+const GIT_IN_PROGRESS_MARKERS = ['index.lock', 'shallow.lock'] as const
 
 /**
  * `.git/HEAD` 的内容 → 分支 / detached（**纯函数**）。
@@ -64,8 +75,34 @@ export function parseGitDirFile(raw: string, repoDir: string): string | null {
   return isAbsolute(target) ? target : resolve(repoDir, target)
 }
 
-/** 判一个目录是不是仓库根；是 ⇒ 回它的分支信息（`null` = 不是仓库 / 读不到） */
-async function probeGitRepo(repoDir: string): Promise<{ branch: string | null; detached: boolean } | null> {
+/**
+ * 这个 git 目录是不是**一次 clone / pull 还没落定**（P1-24，2026-10-27）。
+ *
+ * 判据是 git 自己的两个锁文件（`fsck` 之前 git 就是这么判的）：
+ *   · `index.lock` —— 正在写索引（checkout / reset 中途）；
+ *   · `shallow.lock` —— 浅克隆（`--depth`，agent 的常用形态）正在写边界文件。
+ *
+ * ★ 为什么要单独判：clone 期间工作区里**同时**在长大几千个文件，而两端（`index` 与
+ *   `shallow`）都会被 git 删掉重写。面板据此把"git 已就绪"推后 —— 否则用户在 clone 中途看到的
+ *   树是"半棵树 + 已展开的目录"，等 clone 收尾又跳一次（用户反馈："拉取下来目录又是默认全部展开了"）。
+ * ⚠️ 读不到（目录不存在 / 权限）一律当**不是**进行中：这只是个提示，不该让面板卡在"克隆中"。
+ */
+async function gitOperationInProgress(gitDir: string): Promise<boolean> {
+  for (const name of GIT_IN_PROGRESS_MARKERS) {
+    try {
+      await stat(join(gitDir, name))
+      return true
+    } catch {
+      // 不存在 ⇒ 看下一个
+    }
+  }
+  return false
+}
+
+/** 判一个目录是不是仓库根；是 ⇒ 回它的分支信息与"是否正在 clone/pull"（`null` = 不是仓库 / 读不到） */
+async function probeGitRepo(
+  repoDir: string,
+): Promise<{ branch: string | null; detached: boolean; cloning: boolean } | null> {
   const dotGit = join(repoDir, '.git')
   let kind: 'dir' | 'file' | null
   try {
@@ -76,7 +113,7 @@ async function probeGitRepo(repoDir: string): Promise<{ branch: string | null; d
   }
   if (kind === null) return null
 
-  let headPath = join(dotGit, 'HEAD')
+  let gitDir = dotGit
   if (kind === 'file') {
     let content: string
     try {
@@ -84,15 +121,19 @@ async function probeGitRepo(repoDir: string): Promise<{ branch: string | null; d
     } catch {
       return null
     }
-    const gitDir = parseGitDirFile(content, repoDir)
-    if (gitDir === null) return null
-    headPath = join(gitDir, 'HEAD')
+    const parsed = parseGitDirFile(content, repoDir)
+    if (parsed === null) return null
+    gitDir = parsed
   }
 
+  // ★ 顺序要紧：先看锁、再读 HEAD —— clone 前半段 `.git/HEAD` 都还不存在，两个判断互不干扰，
+  //   但"锁还在"时的 HEAD 可能是中间态，不如让调用方等下一轮。
+  const cloning = await gitOperationInProgress(gitDir)
   try {
-    return parseGitHead(await readFile(headPath, 'utf8'))
+    return { ...parseGitHead(await readFile(join(gitDir, 'HEAD'), 'utf8')), cloning }
   } catch {
-    return null
+    // HEAD 读不到：clone 刚建完 `.git/` 还没写 HEAD ⇒ 也算"进行中"，否则这一瞬间会被当成"不是仓库"
+    return cloning ? { branch: null, detached: false, cloning: true } : null
   }
 }
 
@@ -127,7 +168,7 @@ export async function scanGitReposUnder(rootDir: string): Promise<WorkspaceGitRe
   const repos: WorkspaceGitRepo[] = []
   for (const candidate of candidates) {
     const head = await probeGitRepo(candidate.dir)
-    if (head !== null) repos.push({ path: candidate.path, branch: head.branch, detached: head.detached })
+    if (head !== null) repos.push({ path: candidate.path, branch: head.branch, detached: head.detached, cloning: head.cloning })
   }
   return repos
 }
@@ -139,4 +180,52 @@ export async function scanGitReposUnder(rootDir: string): Promise<WorkspaceGitRe
  */
 export async function readWorkspaceGitRepos(conversationId: string): Promise<WorkspaceGitRepo[]> {
   return scanGitReposUnder(workspaceDirOf(config.workspace.root, conversationId))
+}
+
+/**
+ * 工作区**保留期提示**（2026-10-28）—— 让面板能提前说清"还有几天清理、会不会被保护"。
+ *
+ * 判据与 `workspace/reaper#retentionGuard` **同一套**（那边是"到期删不删"，这里是"到期会发生什么"），
+ * 两处若各写一份就会出现"面板说 3 天后清理、实际有产物所以不清"这种自相矛盾。
+ *
+ * @returns `expiresAt` = `workspaces.updated_at` + 保留期；`protected` = 到期也**不会**被清。
+ */
+export async function readWorkspaceRetention(conversationId: string): Promise<WorkspaceRetentionInfo> {
+  const row = await getPrisma().workspace.findUnique({
+    where: { conversationId },
+    select: { updatedAt: true },
+  })
+  const retentionDays = config.workspace.retentionDays
+  const updatedAt = row?.updatedAt ?? null
+  const expiresAt =
+    updatedAt === null ? null : new Date(updatedAt.getTime() + retentionDays * 24 * 60 * 60 * 1000).toISOString()
+
+  const artifactCount = await getPrisma().artifact.count({ where: { conversationId } })
+  const protectDays = config.workspace.retentionProtectUserEditDays
+  const userEditProtected =
+    protectDays > 0 &&
+    (await getPrisma().workspaceFile.findFirst({
+      where: {
+        conversationId,
+        updatedBy: 'USER',
+        deletedAt: null,
+        updatedAt: { gte: new Date(Date.now() - protectDays * 24 * 60 * 60 * 1000) },
+      },
+      select: { path: true },
+    })) !== null
+
+  /** 到期也**不会**被清的原因（空 = 到点会真删） */
+  const protectedReasons: WorkspaceRetentionProtection[] = []
+  if (artifactCount > 0) protectedReasons.push('ARTIFACT_PRESENT')
+  if (userEditProtected) protectedReasons.push('USER_EDIT_PROTECTED')
+
+  return {
+    retentionDays,
+    updatedAt: updatedAt === null ? null : updatedAt.toISOString(),
+    expiresAt,
+    artifactCount,
+    protectUserEditDays: protectDays,
+    protectedReasons,
+    protected: protectedReasons.length > 0,
+  }
 }

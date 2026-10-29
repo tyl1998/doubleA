@@ -36,10 +36,21 @@ export const WORKSPACE_BINARY_SAMPLE_BYTES = 8192
  *   · 文本文件（含 UTF-8 中文）几乎不会含 NUL ⇒ 不会误判；
  *   · 真正的二进制（PNG / PDF / 可执行…）头几个字节里就有 NUL ⇒ 稳定判出。
  *
+ * ★ 2026-10-28（用户反馈「txt 文件在 Code 模式下打不开 / 不能展示」）：
+ *   **带 BOM 的 UTF-16 文本**是纯文本，但它的 ASCII 字符后面**每两个字节就有一个 NUL**
+ *   （`a\0l\0l\0…`）⇒ 只按 NUL 判会被误判成二进制，于是编辑器只给下载、不给展示。
+ *   BOM 是文件自己的编码声明（`parse/txt.ts#decodeTextBuffer` 同款判据）⇒ **先认 BOM**：
+ *   `FF FE` / `FE FF` 一律当文本，跳过 NUL 判据。无 BOM 的 UTF-16 仍是二进制（无从判定，保守）。
+ *
  * 只看前 {@link WORKSPACE_BINARY_SAMPLE_BYTES} 字节：避免为一个 10MB 文件做整份扫描，
  * 且真实二进制几乎都在头部暴露 NUL。
  */
 export function looksBinaryWorkspaceContent(data: Uint8Array): boolean {
+  if (data.byteLength >= 2) {
+    const [b0, b1] = [data[0], data[1]]
+    // UTF-16LE BOM / UTF-16BE BOM（UTF-8 BOM `EF BB BF` 不含 NUL，不必特判）
+    if ((b0 === 0xff && b1 === 0xfe) || (b0 === 0xfe && b1 === 0xff)) return false
+  }
   const end = Math.min(data.byteLength, WORKSPACE_BINARY_SAMPLE_BYTES)
   for (let index = 0; index < end; index += 1) {
     if (data[index] === 0) return true

@@ -47,7 +47,6 @@ import {
   type ChatMessageView,
   type ToolCallView,
 } from './messageModel.js'
-
 /** 事件来源（决定"没有收口就该报断线"的文案与处置，P0-1-33 用） */
 export type RoundStatus = 'streaming' | 'stopped' | 'complete' | 'error'
 
@@ -184,11 +183,21 @@ export interface StreamRound {
    * 但聊天界面看不到这条插话（像丢消息）"。每条插话在消息流里渲染成一条用户气泡
    * （见 `roundToViews`），于是"我插了这句话"与 agent 的后续回答对得上。
    *
-   * `state`（2026-10-21）：`queued` = 还在引擎插话队列里（前端显示「待接收」+「取回编辑」）；
-   * `delivered` = 不在 `steer_queue` 快照里了（模型读走 / ChatBot 注入完毕）⇒ 状态翻成「已投递」、
-   * 收起「取回编辑」（引擎不支持回滚已投递的消息）。
-   */
-  interjections: { id: string; text: string; at: string; state: 'queued' | 'delivered' }[]
+    * `state`（2026-10-21）：`queued` = 还在引擎插话队列里（前端显示「待接收」+「取回编辑」）；
+    * `delivered` = 不在 `steer_queue` 快照里了（模型读走 / ChatBot 注入完毕）⇒ 状态翻成「已投递」、
+    * 收起「取回编辑」（引擎不支持回滚已投递的消息）。
+    *
+    * `textOffset`（2026-10-29）：投递这一刻正文已经写到第几个字符 —— 渲染时插话气泡**就插在这里**，
+    * 于是"插话 → agent 对它之后的回答"按发生顺序排（见 `interjectionViews`）。`null` = 还没投递
+    * / 旧数据 ⇒ 排在正文末尾。
+    */
+  interjections: {
+    id: string
+    text: string
+    at: string
+    state: 'queued' | 'delivered'
+    textOffset: number | null
+  }[]
 }
 
 /** 开一轮（用户按下发送、且流已经成功建立时调用） */
@@ -246,7 +255,15 @@ export function withInterjection(
   }
   return {
     ...round,
-    interjections: [...round.interjections, { ...item, state: round.status === 'streaming' ? 'queued' : 'delivered' }],
+    interjections: [
+      ...round.interjections,
+      {
+        ...item,
+        state: round.status === 'streaming' ? 'queued' : 'delivered',
+        // 投递位置在**翻转状态那一刻**才定（见 `withSteerQueue`）；此刻还是"待接收"，没有位置
+        textOffset: null,
+      },
+    ],
   }
 }
 
@@ -256,6 +273,10 @@ export function withInterjection(
  * 判据只有一条：**不在队列里 = 已被模型读走**（`delivered`）。
  * ⚠️ 只做单向翻转（queued → delivered）：引擎不会把已投递的再放回队列；
  * 反过来写会让状态在两次快照之间来回跳。
+ *
+ * ⚠️ 翻转的同一刻记下**正文当前长度**（`textOffset`）—— 模型正是从这一刻起才看得到这句话，
+ * 它之后的正文都是"对插话的回应" ⇒ 气泡插在该偏移处，"插话 → 后续回答"天然读得通。
+ * ChatBot 在投递前就发出快照（`chatBot.ts` 的 `steer_queue{messages: []}`），偏移同样取在这一刻。
  */
 export function withSteerQueue(round: StreamRound, queued: readonly string[]): StreamRound {
   if (isSettled(round)) return round
@@ -266,7 +287,7 @@ export function withSteerQueue(round: StreamRound, queued: readonly string[]): S
     if (entry.state === 'delivered') return entry
     if (pending.has(entry.text)) return entry
     changed = true
-    return { ...entry, state: 'delivered' as const }
+    return { ...entry, state: 'delivered' as const, textOffset: round.assistant.text.length }
   })
   return changed ? { ...round, interjections: next } : round
 }
@@ -499,8 +520,123 @@ export function reduceRound(round: StreamRound, event: SseEvent, locale: Locale)
   }
 }
 
+/** 插话在视图层的最小形状（流式取 `round.interjections`，历史取 `content.steers[]`） */
+export interface SteerItem {
+  id: string
+  text: string
+  at: string
+  /** 投递时正文写到第几个字符；`null` = 没有位置（还没投递 / 旧数据） */
+  textOffset: number | null
+}
+
+/**
+ * 一条插话气泡（`steer`）—— 流式与历史两侧共用的唯一构造点（2026-10-29）。
+ *
+ * 放在这里（而不是两侧各写一份）是因为 `messageModel` 已经从本文件取 {@link interjectionViews}，
+ * 反向依赖不存在，两侧共用同一形状才不会出现"流里标了插话、历史里没标"的漂移。
+ */
+export function steerView(
+  item: { id: string; text: string; at: string },
+  keyPrefix: string,
+  steerState?: 'queued' | 'delivered',
+): ChatMessageView {
+  return {
+    key: `${keyPrefix}:steer:${item.id}`,
+    role: 'USER',
+    text: item.text,
+    thinkingSegments: [],
+    citations: null,
+    tools: [],
+    artifacts: [],
+    attachments: [],
+    createdAt: item.at,
+    status: 'complete',
+    steer: true,
+    steerId: item.id,
+    ...(steerState === undefined ? {} : { steerState }),
+  }
+}
+
+/**
+ * 把一条助手气泡按**插话投递位置**切开，并在切口处插进插话气泡（2026-10-29）。
+ *
+ * 用户要的阅读顺序："插话投递成功后，agent 再回复的内容应该在插话下面"。插话的投递时刻
+ * 已经记在 `textOffset`（见 {@link withSteerQueue}）上，于是同一条助手气泡被切成
+ * `[0, 4)` / `[4, …)` 两截，插话夹在中间；每一截都是独立的一条助手气泡（渲染组件不变，
+ * 只是 key 加后缀）。
+ *
+ * 判据：`role === 'ASSISTANT'`、`textOffset` 落在 `(0, text.length)` 之内、且不是流式
+ * （流式时正文还在长，切开会让气泡在一次 delta 里重挂 ⇒ 抖动；收口后再切）。同一偏移的多条
+ * 插话按数组顺序依次插入（第二条落到切口的下一截里）。
+ *
+ * ⚠️ 偏移落在正文**末尾**（或没有位置）⇒ 整条不切，插话排在它之后（与 2026-10-21 的行为一致）。
+ * ⚠️ 内联条目（思考段 / 工具卡）的 `textOffset` 是**全文偏移**，而切开后每一截都按自己的
+ * 起点重新渲染 Markdown ⇒ 后一截的条目偏移要减去切口（否则卡片会被推到该截末尾）。
+ */
+export function interjectionViews(
+  assistant: ChatMessageView,
+  interjections: readonly SteerItem[],
+  steerState?: (item: SteerItem) => 'queued' | 'delivered',
+): ChatMessageView[] {
+  const at = (item: SteerItem): ChatMessageView =>
+    steerView(item, assistant.key, steerState === undefined ? undefined : steerState(item))
+  const placeable =
+    assistant.role === 'ASSISTANT' && assistant.status !== 'streaming'
+      ? [...interjections]
+          .filter(
+            (item) =>
+              item.textOffset !== null && item.textOffset > 0 && item.textOffset < assistant.text.length,
+          )
+          .sort((a, b) => (a.textOffset ?? 0) - (b.textOffset ?? 0))
+      : []
+  const placed = new Set(placeable.map((item) => item.id))
+  const tail = interjections.filter((item) => !placed.has(item.id))
+  const piece = (from: number, to: number, index: number | null): ChatMessageView => ({
+    ...assistant,
+    ...(index === null ? {} : { key: `${assistant.key}:part:${index}` }),
+    text: assistant.text.slice(from, to),
+    thinkingSegments: assistant.thinkingSegments.map((segment) => ({
+      ...segment,
+      ...(segment.textOffset === undefined ? {} : { textOffset: segment.textOffset - from }),
+    })),
+    tools: assistant.tools.map((tool) => ({
+      ...tool,
+      ...(tool.textOffset === undefined ? {} : { textOffset: tool.textOffset - from }),
+    })),
+  })
+  const out: ChatMessageView[] = []
+  let from = 0
+  placeable.forEach((item, index) => {
+    const offset = item.textOffset ?? 0
+    out.push(piece(from, offset, index))
+    out.push(at(item))
+    from = offset
+  })
+  out.push(piece(from, assistant.text.length, placeable.length === 0 ? null : placeable.length))
+  for (const item of tail) out.push(at(item))
+  return out
+}
+
 /** 一轮对话 → 消息列表（**用户 + 助手 + 本轮插话**），顺序与用户在界面上期待的阅读顺序一致 */
 export function roundToViews(round: StreamRound): ChatMessageView[] {
+  const assistant: ChatMessageView = {
+    key: 'stream:assistant',
+    role: 'ASSISTANT',
+    text: round.assistant.text,
+    thinkingSegments: round.assistant.thinkingSegments,
+    citations: round.assistant.citations,
+    tools: round.assistant.tools,
+    artifacts: round.assistant.artifacts,
+    attachments: [],
+    createdAt: null,
+    startedAt: round.startedAt,
+    status: round.status,
+    ...(round.statusText === null ? {} : { statusText: round.statusText }),
+    ...(round.finishReason === null ? {} : { finishReason: round.finishReason }),
+    ...(round.usage === null ? {} : { usage: round.usage }),
+    ...(round.error === null ? {} : { error: round.error }),
+    persisted: round.persisted,
+  }
   return [
     {
       key: 'stream:user',
@@ -514,45 +650,14 @@ export function roundToViews(round: StreamRound): ChatMessageView[] {
       createdAt: null,
       status: 'complete',
     },
-    {
-      key: 'stream:assistant',
-      role: 'ASSISTANT',
-      text: round.assistant.text,
-      thinkingSegments: round.assistant.thinkingSegments,
-      citations: round.assistant.citations,
-      tools: round.assistant.tools,
-      artifacts: round.assistant.artifacts,
-      attachments: [],
-      createdAt: null,
-      startedAt: round.startedAt,
-      status: round.status,
-      ...(round.statusText === null ? {} : { statusText: round.statusText }),
-      ...(round.finishReason === null ? {} : { finishReason: round.finishReason }),
-      ...(round.usage === null ? {} : { usage: round.usage }),
-      ...(round.error === null ? {} : { error: round.error }),
-      persisted: round.persisted,
-    },
-    // 中途插话（P1-20；**2026-10-21 起改放本轮末尾**）：每条渲染成一条用户气泡 ⇒
-    // 用户看得见"我插了这句话"（不再像丢消息）。
-    // ⚠️ 为什么在助手消息**之后**：插话的语义是"边跑边补一句"，它属于**本轮尾部**——
-    //    用户原话："插话发起后应该是直接在本轮末尾添加的，而不是放到本轮的回复前"。
-    //    助手正文在这里是一坨整篇（`round.assistant.text`）⇒ 无法按时刻插进它内部；
-    //    放在末尾是"这一轮完整回答 + 我中途补的话"的可读近似（历史侧同一顺序，见 `messageModel`）。
-    ...round.interjections.map((item) => ({
-      key: `stream:steer:${item.id}`,
-      role: 'USER' as const,
-      text: item.text,
-      thinkingSegments: [],
-      citations: null,
-      tools: [],
-      artifacts: [],
-      attachments: [],
-      createdAt: item.at,
-      status: 'complete' as const,
-      steer: true as const,
-      steerId: item.id,
-      steerState: item.state,
-    })),
+    // 中途插话（P1-20；**2026-10-29 起按投递位置切开助手气泡**）：
+    // 插话在**投递那一刻**之后的正文都算 agent 的回应 ⇒ 气泡插在那段正文**之前**，
+    // 用户读到的是"我说了什么 → 它接着答了什么"（早先一律贴在轮末，回答后半段反而在插话上面）。
+    // 位置判据与切分规则在 `interjectionViews`；还没投递（`queued`）或投递时已到正文末尾 ⇒ 仍在轮末。
+    ...interjectionViews(assistant, round.interjections, (item) => {
+      const state = round.interjections.find((entry) => entry.id === item.id)?.state
+      return state === 'queued' ? 'queued' : 'delivered'
+    }),
   ]
 }
 

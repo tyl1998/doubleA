@@ -69,6 +69,8 @@ export interface WorkspaceRetentionReport {
   skippedActive: number
   /** 因"工作区钉在别的实例名下"而跳过的工作区数（P1-14 §十六 D：不跨机清理） */
   skippedForeign: number
+  /** 因"有产物 / 有用户手写保护"而跳过的工作区数（2026-10-28） */
+  skippedProtected: number
   /** 清理失败、留待下一轮的工作区数 */
   failed: number
 }
@@ -79,27 +81,34 @@ export interface WorkspaceRetentionReport {
 /**
  * **彻底清掉**一个会话的工作区：本地目录 + 本地历史字节 + S3 冷备 + DB 行。幂等。
  *
- * 顺序是正确性的一部分：
- *   ① **先删 S3 冷备** —— 失败则**原样返回 `false`（什么都没动）**，下一轮再试（不留暗账）；
- *   ② 停 watcher + 丢弃去抖窗口里的冷备上行（否则目录会被对账重建、对象会被补传回来）；
- *   ③ 删本地目录 + 本地历史字节目录；
+ * 顺序是正确性的一部分（★ 2026-10-28 调整）：
+ *   ① 停 watcher + 丢弃去抖窗口里的冷备上行（否则目录会被对账重建、对象会被补传回来）；
+ *   ② **先删本地**（目录 + 历史字节）：本地删失败 ⇒ 原样返回 `false`、什么都不再动，
+ *      冷备**完好无损**（以前是"先删 S3"，本地删失败时冷备已经没了 ⇒ 永久丢数据）；
+ *   ③ 再删 S3 冷备：失败同样返回 `false`（本地已空，下一轮重试仍安全，因为 `rm -f` 幂等）；
  *   ④ 删 DB 行（`workspaces` 级联 `files`/`versions`/`events`/`claims`）。
  *
- * @returns `true` = 已清干净；`false` = S3 删除失败、本轮放弃（下一轮重试）
+ * @returns `true` = 已清干净；`false` = 本地或 S3 删除失败、本轮放弃（下一轮重试）
  */
 async function purgeWorkspace(conversationId: string): Promise<boolean> {
   const root = config.workspace.root
-  // ① 先收 S3：失败就不动本地、不删行（"对象删成功才删行"，下一轮再试）
-  const cold = await deleteWorkspaceColdBlobs(conversationId)
-  if (cold.failed) return false
 
-  // ② 停这个会话的 watcher（否则它下一秒对账会把目录重建回来、行也 upsert 回来）+ 丢弃去抖上行
+  // ① 停这个会话的 watcher（否则它下一秒对账会把目录重建回来、行也 upsert 回来）+ 丢弃去抖上行
   stopWorkspaceWatcher(conversationId)
   dropPendingWorkspaceBackups(conversationId)
 
-  // ③ 本地两处：工作区目录 + 历史字节目录（都在工作区根下，不在容器 `/work` / 产物 / 树里）
-  await rm(join(root, conversationId), { recursive: true, force: true })
-  await rm(workspaceBlobDirOf(root, conversationId), { recursive: true, force: true })
+  // ② 先删本地两处（工作区目录 + 历史字节目录）：失败就收手，冷备还能保住一份
+  try {
+    await rm(join(root, conversationId), { recursive: true, force: true })
+    await rm(workspaceBlobDirOf(root, conversationId), { recursive: true, force: true })
+  } catch (error) {
+    getLogger().warn({ err: error, conversationId }, '清理工作区：删本地目录失败（冷备保留，下一轮再试）')
+    return false
+  }
+
+  // ③ 本地已空 ⇒ 再收 S3（失败保留行，下一轮重试；本地删除是幂等的）
+  const cold = await deleteWorkspaceColdBlobs(conversationId)
+  if (cold.failed) return false
 
   // ④ DB 侧（删会话已级联删这些行；这里兜一手"目录还在、行却因异常残留"）
   await getPrisma().workspace.deleteMany({ where: { conversationId } })
@@ -198,6 +207,7 @@ export async function reapExpiredWorkspaceDirs(
     removed: 0,
     skippedActive: 0,
     skippedForeign: 0,
+    skippedProtected: 0,
     failed: 0,
   }
   const logger = getLogger()
@@ -224,6 +234,16 @@ export async function reapExpiredWorkspaceDirs(
       }
       if (await hasActiveSandbox(conversationId)) {
         report.skippedActive += 1
+        continue
+      }
+      // ★ 2026-10-28（用户反馈「NGPOS 星礼包会话生成的 docx 没了」）：
+      //   到期**不等于**可以删。两条保护，任一命中就跳过这一轮：
+      //   ① 该会话还有**未过期的产物**（`artifacts` 行）—— 产物是交付物，清掉工作区会让它读不到内容；
+      //   ② 该会话有**用户手写过**的文件、且最近一次在保护期内 —— 手打的东西不该和中间产物同命。
+      const guard = await retentionGuard(conversationId, now)
+      if (guard !== undefined) {
+        report.skippedProtected += 1
+        logger.info({ conversationId, reason: guard }, '工作区 reaper：到保留期但有保护，跳过（下轮再判）')
         continue
       }
       if (await purgeWorkspace(conversationId)) {
@@ -313,6 +333,41 @@ function runReapTick(): void {
 async function conversationExists(conversationId: string): Promise<boolean> {
   const row = await getPrisma().conversation.findUnique({ where: { id: conversationId }, select: { id: true } })
   return row !== null
+}
+
+/**
+ * 到期清理前的**保护判据**（2026-10-28）—— 返回 `undefined` = 可以删；否则是"为什么不删"。
+ *
+ * 两条保护针对的是同一件事：**工作区里可能装着用户当交付物的东西**。
+ *   · `ARTIFACT_PRESENT`：该会话还有未过期的产物行（产物字节从宿主工作区 FS 读，
+ *     工作区没了 ⇒ 产物就成了一条指向空处的记录）；
+ *   · `USER_EDIT_PROTECTED`：有用户显式保存过的文件，且最近一次写入在
+ *     `WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS` 以内（`0` = 关闭这条保护）。
+ *
+ * ⚠️ 跳过不是"永不回收"：产物到期后 `reapExpiredArtifacts` 会删行，保护自然解除；
+ *   用户手写保护期也是滑动窗口。两者都不会让清理器停摆。
+ */
+async function retentionGuard(conversationId: string, now: Date): Promise<'ARTIFACT_PRESENT' | 'USER_EDIT_PROTECTED' | undefined> {
+  const artifact = await getPrisma().artifact.findFirst({
+    where: { conversationId },
+    select: { id: true },
+  })
+  if (artifact !== null) return 'ARTIFACT_PRESENT'
+
+  const protectDays = config.workspace.retentionProtectUserEditDays
+  if (protectDays <= 0) return undefined
+  const userCutoff = new Date(now.getTime() - protectDays * 24 * 60 * 60 * 1000)
+  const userEdit = await getPrisma().workspaceFile.findFirst({
+    where: {
+      conversationId,
+      // `updated_by` 是**最近一次**写入者；用户保存过、且没被后来者覆盖的才算
+      updatedBy: 'USER',
+      deletedAt: null,
+      updatedAt: { gte: userCutoff },
+    },
+    select: { path: true },
+  })
+  return userEdit === null ? undefined : 'USER_EDIT_PROTECTED'
 }
 
 /**

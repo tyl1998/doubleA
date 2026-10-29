@@ -1291,6 +1291,61 @@
   color: var(--muted);
 }
 .ws__recent-head:hover { color: var(--ink); }
+.ws__diff-title-range {
+  margin-inline-start: 8px;
+  padding: 0 6px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ws__recent-head-row { display: flex; align-items: center; gap: 2px; }
+.ws__recent-head-row .ws__recent-head { flex: 1 1 auto; }
+.ws__recent-help {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-inline-end: var(--sp-2);
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: help;
+  font-size: var(--fs-2xs);
+}
+.ws__recent-help:hover, .ws__recent-help:focus-visible { color: var(--ink); background: var(--rule); }
+.ws__recent-badge {
+  margin-inline-start: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(29, 63, 168, 0.1);
+  color: var(--ink-2);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.ws__recent-group {
+  margin: 0;
+  padding: var(--sp-1) var(--sp-3) 2px;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  color: var(--muted);
+  border-top: 1px dashed var(--rule);
+}
+.ws__recent-group:first-of-type { border-top: 0; }
+.ws__recent-hint {
+  margin: 0;
+  padding: 0 var(--sp-3) var(--sp-2);
+  font-size: var(--fs-2xs);
+  line-height: 1.5;
+  color: var(--muted);
+}
 .ws__recent-list { list-style: none; margin: 0; padding: 0 0 var(--sp-2); }
 .ws__recent-list li { display: flex; align-items: center; gap: 6px; padding: 2px var(--sp-3); font-size: var(--fs-2xs); }
 .ws__recent-path {
@@ -1355,6 +1410,15 @@
 .ws__diff-removed { color: var(--danger); }
 
 .ws__diff-title { display: inline-flex; gap: 6px; align-items: baseline; }
+/* 段标（本轮 / 更早）：同一路径两段都动过时，弹窗标题里要能分清这是哪一段 */
+.ws__diff-title-segment {
+  padding: 0 6px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
 .ws__diff-title-path { color: var(--muted); font-size: var(--fs-xs); overflow-wrap: anywhere; }
 .ws__diff-title-stat { font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
 
@@ -1441,6 +1505,22 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 版本范围胶囊（「最近变更」点开文件后展示）：同路径两条变更时，点开后才知道自己看的是哪一段。
+   刻意不放进列表行 —— 那里会把文件名遮住（2026-10-28 用户定案）。 */
+.ws__range-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ws__range-segment { font-weight: 600; color: var(--accent-ink); }
+.ws__range-version { font-variant-numeric: tabular-nums; }
 .ws__banner { flex: 0 0 auto; padding: var(--sp-2) var(--sp-3); }
 .ws__editor-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
@@ -1990,6 +2070,15 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 产物剩余保留期（2026-10-28）：比 meta 更弱，避免和"什么时候产出的"抢注意力 */
+.artifact__expires {
+  margin: 0;
+  font-size: var(--fs-2xs);
+  color: var(--warning-ink, var(--muted));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .artifact__ops { margin-left: auto; flex: none; display: flex; align-items: center; gap: var(--sp-2); }
 
 /* ── 产物预览（P0-3-10；`子方案④` §七）─────────────────────────────────────
@@ -2384,3 +2473,47 @@
 @media (prefers-reduced-motion: reduce) {
   .node-step__detail-text.is-running { animation: none; color: var(--muted); background: none; }
 }
+
+/* ── 撤销范围弹窗（2026-10-28：「撤销怎么选」） ───────────────────────────── */
+.ws__revert-scope { display: flex; flex-direction: column; gap: var(--sp-2); }
+.ws__revert-scope-hint { margin: 0; font-size: var(--fs-2xs); color: var(--muted); }
+.ws__revert-scope-option { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); cursor: pointer; }
+.ws__revert-preview { margin: 0; padding-left: var(--sp-4); font-size: var(--fs-2xs); color: var(--muted); }
+.ws__revert-preview-skip, .ws__revert-pick {
+  margin: 0;
+  padding: var(--sp-1) var(--sp-2);
+  max-height: 180px;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-2xs);
+}
+.ws__revert-preview-skip li, .ws__revert-pick li { display: flex; gap: var(--sp-2); align-items: baseline; padding: 2px 0; }
+.ws__revert-preview-skip .ws__revert-message { color: var(--muted); }
+/* clone/pull 进行中的"同步中"弱提示（列表**不清空**，只提示有新内容正在进来） */
+.ws__recent-syncing {
+  margin: 0;
+  padding: 0 var(--sp-3) var(--sp-1);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  font-style: italic;
+}
+/* 「上传至平台」进行中（2026-10-29）：一次真实 S3 上传 + 建行，可能持续数秒 ⇒ 常驻可见，
+   而不是只闪一个成功 toast（用户反馈"提示成功、刷新后看不到"） */
+.ws__upload-notice {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: var(--sp-2) var(--sp-3) 0;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+/* 保留期提示（2026-10-28）：放在「最近变更」上方，到期前提前告知 */
+.ws__retention-notice { padding: var(--sp-2) var(--sp-3) var(--sp-1); }
+.ws__retention-notice .ant-alert { padding: var(--sp-1) var(--sp-2); }
+.ws__retention-notice .ant-alert-message { font-size: var(--fs-2xs); font-weight: 600; }
+.ws__retention-notice .ant-alert-description { font-size: var(--fs-2xs); }

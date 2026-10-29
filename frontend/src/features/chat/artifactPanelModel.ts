@@ -138,6 +138,39 @@ export function mergeArtifactPanelItems(
  *   · `null`（流式、还没落库）⇒ 「刚生成」；
  *   · 解析不出时刻 ⇒ 「时间未知」（那一格是给用户看的，填"还没有消息"是句假话）。
  */
+/**
+ * 产物**剩余保留期**读数（2026-10-28）—— 「还剩 5 天」/「今天到期」。
+ *
+ * ★ 用户原话：「会话产物我们能加一个剩余多少天的提示吗？」
+ *   产物的到期时刻由**服务端**给（`expiresAt` = `createdAt + ARTIFACT_RETENTION_DAYS`），
+ *   这里只做"毫秒差 → 人话"，不猜保留期（env 改了界面跟着变）。
+ *
+ * ★ 2026-10-29（用户指正）：**没有「已过期」这一档** —— 过期产物由
+ *   `reapExpiredArtifacts` 直接删行 + 删对象（`sandbox/artifacts.ts`），reaper 每 60 秒跑一次，
+ *   列表里根本查不到"已过期"的产物。为它留一段文案只会让人以为存在一个"已过期但还在"的状态。
+ *   已过期（`diff <= 0`）如实归到「今天到期」：对用户来说结论一样 —— 马上就要没了。
+ *
+ * 分档与工作区保留期提示同一口径（`workspaceModel#retentionDaysLeft`：向上取整、过期归零）：
+ *   · 当天内到期 / 已过期 ⇒ 「今天到期」；
+ *   · 其余 ⇒ 「还剩 N 天」。
+ *
+ * ★ 2026-10-29（产物可延期 / 永久保存）：
+ *   · `null` = **永久保存** ⇒ 显示「永久保存」（不是"不显示"—— 用户刚点了延期/永久，界面必须确认它生效了）；
+ *   · `undefined`（这个调用点没有这个字段，如对话页面板）⇒ 仍返回 `null`（这一格不显示）。
+ *
+ * @param expiresAt 服务端给的 ISO 时刻 / `null`（永久）/ `undefined`（本处不显示）
+ */
+export function artifactExpiresText(expiresAt: string | null | undefined, now: Date, locale: Locale): string | null {
+  if (expiresAt === undefined) return null
+  if (expiresAt === null) return translate(locale, 'artifact.expiresForever')
+  const at = Date.parse(expiresAt)
+  if (Number.isNaN(at)) return null
+  const days = Math.ceil((at - now.getTime()) / (24 * 60 * 60 * 1000))
+  // `days <= 1` 同时覆盖"今天到期"与"已过期"（后者理论上查不到，只兜一个瞬时窗口）
+  if (days <= 1) return translate(locale, 'artifact.expiresToday')
+  return translate(locale, 'artifact.expiresInDays', { days })
+}
+
 export function artifactTimeText(createdAt: string | null, now: Date, locale: Locale): string {
   if (createdAt === null) return translate(locale, ARTIFACT_TIME_JUST)
   const at = new Date(createdAt)

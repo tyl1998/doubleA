@@ -897,7 +897,7 @@ await it('D12 `roundToViews` 产出"用户 + 助手"两条，顺序与角色正�
   assertEqual(views[1].persisted, true, '持久化判据带出')
 })
 
-await it('D13 `steer` ⇒ 追加用户插话，且渲染在**本轮末尾**（P1-20；2026-10-21 改位置）', () => {
+await it('D13 `steer` ⇒ 追加用户插话；投递后按正文位置切开助手气泡（2026-10-29）', () => {
   let round = beginRound('问', STARTED_AT)
   round = reduceRound(round, eventOf('delta', { text: '答' }))
   round = reduceRound(round, eventOf('steer', { id: 's-1', message: '再补一句', at: '2026-09-23T10:00:05.000Z' }))
@@ -908,7 +908,7 @@ await it('D13 `steer` ⇒ 追加用户插话，且渲染在**本轮末尾**（P1
   assertEqual(
     views.map((view) => view.role).join(','),
     'USER,ASSISTANT,USER,USER',
-    '插话排在助手回答**之后**（用户原话：应该直接在本轮末尾添加，而不是放到回复前）',
+    '还没投递 / 没有位置 ⇒ 插话排在助手回答**之后**（与 2026-10-21 一致）',
   )
   assertEqual(views[2].text, '再补一句', '插话正文')
   assertEqual(views[2].createdAt, '2026-09-23T10:00:05.000Z', '插话时间')
@@ -916,6 +916,26 @@ await it('D13 `steer` ⇒ 追加用户插话，且渲染在**本轮末尾**（P1
   assertEqual(views[2].steerId, 's-1', '插话 id 带出（取回编辑靠它定位）')
   assertEqual(views[2].steerState, 'queued', '流式中默认待接收')
   assertEqual(views[1].text, '答', '助手正文')
+})
+
+await it('D13b 投递后：插话**插在投递位置**，agent 之后的回复排在插话下面', () => {
+  let round = beginRound('问', STARTED_AT)
+  round = reduceRound(round, eventOf('delta', { text: '前半段' }))
+  round = reduceRound(round, eventOf('steer', { id: 's-1', message: '补一句', at: '2026-09-23T10:00:05.000Z' }))
+  round = reduceRound(round, eventOf('steer_queue', { messages: [] }))
+  assertEqual(round.interjections[0].state, 'delivered', '已投递')
+  assertEqual(round.interjections[0].textOffset, 3, '投递位置 = 当时的正文长度')
+  round = reduceRound(round, eventOf('delta', { text: '后半段' }))
+  round = reduceRound(round, eventOf('done', { messageId: 'm', finishReason: 'COMPLETE', usage: null }))
+  const views = roundToViews(round)
+  assertEqual(
+    views.map((view) => `${view.role}:${view.text}`).join('|'),
+    'USER:问|ASSISTANT:前半段|USER:补一句|ASSISTANT:后半段',
+    '插话夹在两截正文之间（后半段 = 对插话的回应）',
+  )
+  assertEqual(views[3].status, 'complete', '后一截沿用助手状态')
+  assertEqual(views[3].key !== views[1].key, true, '两截各自独立的 key')
+  assertEqual(views[2].steer, true, '中间那条是插话')
 })
 
 await it('D14 `withInterjection`：乐观插入 + 出口层回帧**按 id** 去重（同文不同 id 不吞）', () => {

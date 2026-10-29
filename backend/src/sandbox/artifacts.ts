@@ -64,6 +64,7 @@ import { ensureBucket, getS3Client } from '../infra/s3.js'
 import { resolveWorkspacePath } from '../workspace/paths.js'
 import { ensureWorkspace } from '../workspace/service.js'
 import { readWorkspaceBytes, workspaceFileSize } from '../workspace/store.js'
+import { defaultArtifactExpiresAt } from '../services/artifactExpiryModel.js'
 import { ARTIFACT_EXCLUDED_DIRS, artifactChangePaths } from './artifactChanges.js'
 import { filterGitCleanPaths } from './gitArtifacts.js'
 
@@ -122,6 +123,107 @@ function safeKeySegment(fileName: string): string {
 }
 
 /**
+ * 把**工作区里的一个文件**登记成产物（传对象 → 建行），返回建好的行；跳过 / 失败 ⇒ `null`。
+ *
+ * 两条调用路径共用这一个实现（顺序与补偿逻辑只写一次）：
+ *   · `collectRoundArtifacts`（**非 Code** 的 TaskAgent，轮末按变更集批量）；
+ *   · 「上传至平台」端点（Code 模式下**用户显式**选中的文件，见
+ *     `routes/workspace.ts` 的 `POST .../workspace/artifact`，2026-10-29）。
+ *
+ * ⚠️ 顺序仍是"先传对象、再建行"（§十一 3），建行失败时**补偿删对象** —— 否则列表里会有
+ *   一条点开 404 的记录。单文件超 `ARTIFACT_MAX_FILE_MB` 跳过并 warn（不静默丢）。
+ */
+export async function registerWorkspaceArtifact(input: {
+  conversationId: string
+  /** 归属用户（从会话行取；`Artifact.userId` 是删会话后"谁的产物"的唯一判据） */
+  userId: string
+  /** 工作区宿主根（`ensureWorkspace().rootPath`） */
+  rootPath: string
+  /** 工作区相对路径 */
+  path: string
+}): Promise<ArtifactItem | null> {
+  const { conversationId, userId, rootPath, path } = input
+  const logger = getLogger()
+  try {
+    const { absolute } = resolveWorkspacePath(rootPath, path)
+    // ⓪ 大小上限放行前判一次（先 `stat`，避免把超大文件整个读进内存）
+    const size = await workspaceFileSize(absolute)
+    if (size === undefined) {
+      logger.warn({ conversationId, path }, '产物登记时工作区文件已不在盘上（被删/改名），已跳过')
+      return null
+    }
+    const maxFileBytes = config.limits.artifactMaxFileMb * 1024 * 1024
+    if (size > maxFileBytes) {
+      logger.warn(
+        { conversationId, path, sizeMb: Math.round(size / (1024 * 1024)) },
+        '文件超过产物单文件上限，已跳过（文件仍在工作区里，只是不收进产物面板）',
+      )
+      return null
+    }
+
+    const bytes = await readWorkspaceBytes(absolute)
+    if (bytes.length !== size) {
+      logger.warn(
+        { conversationId, path, statSize: size, actualSize: bytes.length },
+        '产物大小在统计与读出之间不一致（文件在两步之间被改动），按实际读到的字节继续',
+      )
+    }
+    if (bytes.length > maxFileBytes) {
+      logger.warn(
+        { conversationId, path, sizeMb: Math.round(bytes.length / (1024 * 1024)) },
+        '文件实际读出的字节超过产物单文件上限，已跳过',
+      )
+      return null
+    }
+
+    const bucket = config.s3.bucket
+    const createdAt = new Date()
+    const mime = artifactMimeOf(path)
+    const fileKey = `${ARTIFACT_KEY_PREFIX}/${conversationId}/${randomUUID()}/${safeKeySegment(path)}`
+    await ensureBucket(bucket)
+    // ⚠️ 对象的 ContentType 刻意不写 mime：产物响应头的唯一来源是 `artifacts.mime`
+    // （子方案④ §四），S3 元数据写一份就多一个分叉点
+    await getS3Client().putObject(bucket, fileKey, bytes, bytes.length, {
+      'Content-Type': 'application/octet-stream',
+    })
+
+    try {
+      const row = await getPrisma().artifact.create({
+        data: {
+          conversationId,
+          // 归属用户（删除会话后"我的会话产物"的唯一判据，见 schema.prisma#Artifact.userId）
+          userId,
+          fileKey,
+          fileName: path,
+          size: bytes.length,
+          mime,
+          // ⚠️ 由 JS 侧显式写入（PG 会话时区非 UTC 时 @default(now()) 会偏一个时区，
+          // 而保留期清理正是 JS 侧边界比较 —— 见 schema.prisma 该列的注释）
+          createdAt: createdAt,
+          // 默认到期时刻 = 建行时刻 + 当时的保留期（`null` = 永久，见 `artifactExpiryModel.ts`）。
+          // 之后用户可「延期几天 / 延期到某日 / 永久保存」—— 延期只改这一列。
+          expiresAt: defaultArtifactExpiresAt(createdAt, config.limits.artifactRetentionDays),
+        },
+        select: { id: true, fileName: true, size: true, mime: true },
+      })
+      return { artifactId: row.id, fileName: row.fileName, size: row.size, mime: row.mime }
+    } catch (rowError) {
+      // 补偿：刚传上去的对象没有行认领了 ⇒ 删掉（删不掉也只 warn，与 document.service 同款）
+      try {
+        await getS3Client().removeObject(bucket, fileKey)
+      } catch (removeError) {
+        logger.error({ err: removeError, bucket, fileKey }, '产物行创建失败后的对象补偿删除也失败了（将成孤儿，保留期清理器不会认识它）')
+      }
+      logger.warn({ err: rowError, conversationId, path }, '产物行创建失败，已跳过该文件（对象已补偿删除）')
+      return null
+    }
+  } catch (error) {
+    logger.warn({ err: error, conversationId, path }, '产物登记失败，已跳过')
+    return null
+  }
+}
+
+/**
  * 收一轮产物：**本轮工作区变更集 → 过滤 → 逐个「读字节 → 传对象 → 建行」**（P1-9 · R4）。
  *
  * **尽力而为**：单个文件失败只 warn 并跳过（继续传其余），整体抛错由调用方决定是否吞掉
@@ -145,6 +247,8 @@ export async function collectRoundArtifacts(input: {
 
   // 建行要写 `user_id`（`TaskAgent记忆与产物` 块 3：删除会话后产物行靠它归回给用户）。
   // 从会话行查一次（不信任任何传入值 —— 归属**只能**来自会话的 owner 列）。
+  // ⚠️ 单文件的处置（大小闸门 / 传对象 / 建行 / 补偿）在 {@link registerWorkspaceArtifact}，
+  //    与「上传至平台」端点共用同一份实现。
   // ⚠️ 查不到 = 会话已经被删：产物无处归属，这一轮**整轮跳过**。
   const owner = await getPrisma().conversation.findFirst({
     where: { id: conversationId },
@@ -192,81 +296,16 @@ export async function collectRoundArtifacts(input: {
     )
   }
   if (changed.length === 0) return []
-  const bucket = config.s3.bucket
-  const maxFileBytes = config.limits.artifactMaxFileMb * 1024 * 1024
   const items: ArtifactItem[] = []
 
   for (const path of changed) {
-    try {
-      const { absolute } = resolveWorkspacePath(handle.rootPath, path)
-      // ⓪ 大小上限放行前判一次（先 `stat`，避免把超大文件整个读进内存）
-      const size = await workspaceFileSize(absolute)
-      if (size === undefined) {
-        logger.warn({ conversationId, path }, '产物收集时工作区文件已不在盘上（本轮内被删/改名），已跳过')
-        continue
-      }
-      if (size > maxFileBytes) {
-        logger.warn(
-          { conversationId, path, sizeMb: Math.round(size / (1024 * 1024)) },
-          '产物超过单文件上限，已跳过（文件仍在工作区里，只是不收进产物面板）',
-        )
-        continue
-      }
-
-      const bytes = await readWorkspaceBytes(absolute)
-      if (bytes.length !== size) {
-        logger.warn(
-          { conversationId, path, statSize: size, actualSize: bytes.length },
-          '产物大小在统计与读出之间不一致（文件在两步之间被改动），按实际读到的字节继续',
-        )
-      }
-      if (bytes.length > maxFileBytes) {
-        logger.warn(
-          { conversationId, path, sizeMb: Math.round(bytes.length / (1024 * 1024)) },
-          '产物实际读出的字节超过单文件上限，已跳过',
-        )
-        continue
-      }
-
-      const mime = artifactMimeOf(path)
-      const fileKey = `${ARTIFACT_KEY_PREFIX}/${conversationId}/${randomUUID()}/${safeKeySegment(path)}`
-      await ensureBucket(bucket)
-      // ⚠️ 对象的 ContentType 刻意不写 mime：产物响应头的唯一来源是 `artifacts.mime`
-      // （子方案④ §四），S3 元数据写一份就多一个分叉点
-      await getS3Client().putObject(bucket, fileKey, bytes, bytes.length, {
-        'Content-Type': 'application/octet-stream',
-      })
-
-      const createdAt = new Date()
-      try {
-        const row = await getPrisma().artifact.create({
-          data: {
-            conversationId,
-            // 归属用户（删除会话后"我的会话产物"的唯一判据，见 schema.prisma#Artifact.userId）
-            userId: owner.userId,
-            fileKey,
-            fileName: path,
-            size: bytes.length,
-            mime,
-            // ⚠️ 由 JS 侧显式写入（PG 会话时区非 UTC 时 @default(now()) 会偏一个时区，
-            // 而保留期清理正是 JS 侧边界比较 —— 见 schema.prisma 该列的注释）
-            createdAt,
-          },
-          select: { id: true, fileName: true, size: true, mime: true },
-        })
-        items.push({ artifactId: row.id, fileName: row.fileName, size: row.size, mime: row.mime })
-      } catch (rowError) {
-        // 补偿：刚传上去的对象没有行认领了 ⇒ 删掉（删不掉也只 warn，与 document.service 同款）
-        try {
-          await getS3Client().removeObject(bucket, fileKey)
-        } catch (removeError) {
-          logger.error({ err: removeError, bucket, fileKey }, '产物行创建失败后的对象补偿删除也失败了（将成孤儿，保留期清理器不会认识它）')
-        }
-        logger.warn({ err: rowError, conversationId, path }, '产物行创建失败，已跳过该文件（对象已补偿删除）')
-      }
-    } catch (error) {
-      logger.warn({ err: error, conversationId, path }, '产物收集单文件失败，已跳过（其余文件继续）')
-    }
+    const item = await registerWorkspaceArtifact({
+      conversationId,
+      userId: owner.userId,
+      rootPath: handle.rootPath,
+      path,
+    })
+    if (item !== null) items.push(item)
   }
 
   if (items.length > 0) {
@@ -289,12 +328,17 @@ export async function collectRoundArtifacts(input: {
  */
 export async function reapExpiredArtifacts(): Promise<number> {
   const logger = getLogger()
-  const retentionDays = config.limits.artifactRetentionDays
-  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+  const now = new Date()
   const prisma = getPrisma()
 
+  /**
+   * ★ 2026-10-29 口径变更：判据从"`createdAt < now - 保留期`"改成"**这一列到期了**"
+   *   （`expiresAt != null AND expiresAt <= now`）。原因：产物现在可「延期几天 / 延期到某日 /
+   *   永久保存」（`services/artifactExpiryModel.ts`），延期只改这一列；`NULL` = 永久，永不扫到。
+   *   ⇒ 改 `ARTIFACT_RETENTION_DAYS` 不再回头影响已有产物的寿命（只影响此后新建的那些）。
+   */
   const stale = await prisma.artifact.findMany({
-    where: { createdAt: { lt: cutoff } },
+    where: { expiresAt: { not: null, lte: now } },
     select: { id: true, fileKey: true },
     take: 500,
   })
@@ -318,6 +362,6 @@ export async function reapExpiredArtifacts(): Promise<number> {
       logger.warn({ err: error, artifactId: row.id }, '保留期清理：对象已删但行删除失败（行将成为“对象已不在”的 404，由下载端点兜底）')
     }
   }
-  logger.info({ candidates: stale.length, removed, retentionDays }, '产物保留期清理完成')
+  logger.info({ candidates: stale.length, removed }, '产物保留期清理完成')
   return removed
 }

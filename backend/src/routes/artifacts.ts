@@ -46,6 +46,7 @@ import type { Readable } from 'node:stream'
 
 import { appMsg,
   AppError,
+  artifactExtendBodySchema,
   artifactIdParamsSchema,
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   batchDeleteArtifactsBodySchema,
@@ -54,6 +55,7 @@ import { appMsg,
   listMyArtifactsQuerySchema,
   ok,
   previewKindOf,
+  type ArtifactExtendBody,
   type ArtifactIdParams,
   type BatchDeleteArtifactsBody,
   type ConversationIdParams,
@@ -67,6 +69,7 @@ import {
   artifactDownloadContentType,
   deleteArtifact,
   deleteArtifacts,
+  extendArtifact,
   listArtifacts,
   listMyArtifacts,
   openArtifactSource,
@@ -160,6 +163,30 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
       await deleteArtifact({ artifactId: request.params.id, userId: userIdOf(request) })
       return ok(null)
     },
+  )
+
+  /**
+   * 产物延期（`POST /api/artifacts/:id/extend`，2026-10-29）。
+   *
+   * body 三选一（`shared#artifactExtendBodySchema` 的判别联合）：
+   * `{mode:'DAYS', days}` / `{mode:'UNTIL', until}` / `{mode:'FOREVER'}`。
+   * 只能往后推；对已永久保存的产物再延期 ⇒ 422（理由由服务层给）。
+   * 回**更新后的那一条**（前端就地刷新到期读数，不必整页重取）。
+   */
+  app.post<{ Params: ArtifactIdParams; Body: ArtifactExtendBody }>(
+    '/api/artifacts/:id/extend',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: artifactIdParamsSchema, body: artifactExtendBodySchema },
+    },
+    async (request) =>
+      ok(
+        await extendArtifact({
+          artifactId: request.params.id,
+          userId: userIdOf(request),
+          extend: request.body,
+        }),
+      ),
   )
 
   /**

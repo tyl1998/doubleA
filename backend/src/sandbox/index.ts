@@ -15,7 +15,7 @@
  * | P0-3-7 的编排层（P1-9 · R4 起判据 = 工作区变更集） | `collectRoundArtifacts`（本轮变更集 → 传对象 → 建行，返回值即 `artifact` 事件 payload） |
  * | ✅ P0-3-9b 的编排层（`taskAgent.ts`） | `ensureSandboxMcpCatalog`（预热工具清单，反查 `serverId` 的唯一依据）+ `resolveSandboxMcpTool`（引擎工具名 → 这个工具是谁）+ `type SandboxMcpCatalog` |
  * | ✅ P0-3-9b 的 listener（`listener.ts`，**它直接 `import './proxy.js'`** —— 那条链要碰 SSE/Prisma，不该被人人都在 import 的本桶拖上） | `registerSandboxProxyRoutes` |
- * | ✅ P0-3-8 的停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（先拆连接）/ `recycleSandbox`（再杀容器与具名卷） |
+ * | ✅ 停止路径（`taskAgent.ts` 收尾调用） | `closeSandboxRpc`（只拆连接；**容器保留**，2026-10-29 口径变更 —— 用户停止不再回收，下一轮复用同一容器） |
  * | P0-3-5 的引擎桥 | `SANDBOX_PI_PROVIDER_ID` + `SANDBOX_LLM_ENV` / `piRpcArgv`（拼容器命令行）、`SANDBOX_WORK_DIR` |
  * | 日志 / 将来的 `GET /api/tasks` | `getSandboxStats` / `getSandboxReaperStats` / `getSandboxListenerStats` / `getSandboxRpcStats` / `sandboxQueueDepth` |
  * | 诊断 / 纯函数核对 | `piApiForProtocol` / `piBaseUrlFor` / `sandboxLlmEnv`（LLM 目标的拼装，P0-3-4）、`piRpcArgv` 与 `createJsonlDecoder`（P0-3-5）、`readEngineUsage` / `isKnownEngineEventType` / **`engineTurnBoundaryOf`**（事件映射与用量归集，P0-3-6 / P0-3-12） |
@@ -92,11 +92,13 @@ export {
 // 产物收集（P0-3-7 建；P1-9 · R4 判据改为「产物 = 工作区变更集视图」）：
 // 本轮工作区变更集 → 过滤 → 读宿主工作区字节 → 对象存储 → `artifacts` 行
 // ｜ P0-3-6 的编排层 | `collectRoundArtifacts`（收尾：传对象 + 建行，返回值即 `artifact` 事件 payload）
+// ｜ 「上传至平台」端点（`routes/workspace.ts`，2026-10-29） | `registerWorkspaceArtifact`（单个工作区文件 → 产物行）
 // ｜ 进程入口（reaper 的那一轮） | `reapExpiredArtifacts`（保留期清理，挂在对账器 tick 里）
 // 纯函数 `artifactMimeOf`（产物 MIME 名单）也导出，可**不连 S3** 地逐条核对。
 export {
   artifactMimeOf,
   collectRoundArtifacts,
+  registerWorkspaceArtifact,
   reapExpiredArtifacts,
   ARTIFACT_EXEC_TIMEOUT_MS,
 } from './artifacts.js'

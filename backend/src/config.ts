@@ -681,6 +681,29 @@ const envSchema = z
      * bind mount 进容器 `/work`（§四 1）。多机形态下指向本机本地盘（路线 A，§十六），不共享。
      */
     WORKSPACE_ROOT: defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/workspaces'),
+    /**
+     * 工作区（agent 的**临时草稿台**）保留期（天）。
+     *
+     * ★ 2026-10-28（用户反馈「NGPOS 星礼包会话生成的 docx 没了」）：
+     *   原来它与 `ARTIFACT_RETENTION_DAYS` 共用同一个值（已决 4 的"同口径"），结果是
+     *   **工作区跟着产物一起 7 天到期被整份清掉**（本地目录 + 历史字节 + S3 冷备 + DB 行），
+     *   用户明确要的交付物（如 agent 生成的 docx）也随之消失且不可恢复。
+     *   两者是**不同生命周期**的东西 ⇒ 拆成独立变量（默认仍是 7 天，行为不变，
+     *   但可以单独调大；且下面 {@link WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS} 与
+     *   "有交付物就跳过"两条保护会拦住真正危险的清理）。
+     */
+    WORKSPACE_RETENTION_DAYS: intVar('WORKSPACE_RETENTION_DAYS', 7, { min: 1, max: 3650 }),
+    /**
+     * **用户手写过的文件**额外保护（天）：工作区到期时，只要该会话存在"用户显式保存过"的文件
+     * 且其最近一次写入在这么多天以内，就**跳过整份清理**（下轮再判）。
+     *
+     * ★ 2026-10-28：用户手打的东西不该和 agent 的中间产物同命。默认 30 天 ⇒
+     *   只要 30 天内亲手改过这个工作区，它就不会被自动回收。
+     */
+    WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS: intVar('WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS', 30, {
+      min: 0,
+      max: 3650,
+    }),
     /** 单文件上限（MB）。编辑器只内联打开这以下；超限只读/下载（§九 配额） */
     WORKSPACE_MAX_FILE_MB: intVar('WORKSPACE_MAX_FILE_MB', 10, { min: 1, max: 4096 }),
     /**
@@ -716,6 +739,15 @@ const envSchema = z
      * ⚠️ 必须 ≤ `WORKSPACE_MAX_FILE_MB`（下面的 superRefine 守着）。
      */
     WORKSPACE_TEXT_INLINE_MAX_MB: intVar('WORKSPACE_TEXT_INLINE_MAX_MB', 2, { min: 1, max: 1024 }),
+    /**
+     * 「按目录下载为 zip」的**单包文件数**上限（2026-10-29）。
+     *
+     * 为什么是代码常量级的 env：整包大小已有硬上限（`ZIP_MAX_BYTES` 4GiB，32 位字段），而文件数
+     * 才是"把实例拖住"的真实来源（几千个小文件各自一次读盘 + 一次 CRC）。默认 2000 = 工作区
+     * 活文件上限（`WORKSPACE_MAX_FILES`）的 1/10，够"下载一个源码目录"，又不至于让一次点击
+     * 打满事件循环。超限 ⇒ 413（`app.m284`），让用户按子目录再下。
+     */
+    WORKSPACE_ZIP_MAX_FILES: intVar('WORKSPACE_ZIP_MAX_FILES', 2000, { min: 1, max: 100_000 }),
 
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
@@ -1205,12 +1237,21 @@ export interface AppConfig {
     /** 文件级软锁存活期（秒，见 `WORKSPACE_CLAIM_TTL_SEC`） */
     claimTtlSec: number
     /**
-     * 工作区保留期（天）。⚠️ **与 `limits.artifactRetentionDays` 同值**（已决 4）：
-     * 两者由同一个 env（`ARTIFACT_RETENTION_DAYS`）驱动，此处只做别名，不新开一个来源。
+     * 工作区保留期（天，见 `WORKSPACE_RETENTION_DAYS`）。
+     *
+     * ★ 2026-10-28：**不再是** `ARTIFACT_RETENTION_DAYS` 的别名 —— 工作区是临时草稿台，
+     *   产物是交付物，两者生命周期不同（详见该 env 的注释）。
      */
     retentionDays: number
+    /**
+     * 用户手写文件的额外保护期（天，见 `WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS`）。
+     * `0` = 关闭这条保护。
+     */
+    retentionProtectUserEditDays: number
     /** 读接口内联文本上限（MB，见 `WORKSPACE_TEXT_INLINE_MAX_MB`） */
     textInlineMaxMb: number
+    /** 「按目录下载为 zip」的单包文件数上限（见 `WORKSPACE_ZIP_MAX_FILES`） */
+    zipMaxFiles: number
   }
 
   /**
@@ -1490,9 +1531,11 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxTotalMb: vars.WORKSPACE_MAX_TOTAL_MB,
       writePerMin: vars.WORKSPACE_WRITE_PER_MIN,
       claimTtlSec: vars.WORKSPACE_CLAIM_TTL_SEC,
-      // ⚠️ **别名**，不是独立来源（已决 4：工作区与产物共用保留期）
-      retentionDays: vars.ARTIFACT_RETENTION_DAYS,
+      // ★ 2026-10-28：不再复用 `ARTIFACT_RETENTION_DAYS`（见 WORKSPACE_RETENTION_DAYS 注释）
+      retentionDays: vars.WORKSPACE_RETENTION_DAYS,
+      retentionProtectUserEditDays: vars.WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS,
       textInlineMaxMb: vars.WORKSPACE_TEXT_INLINE_MAX_MB,
+      zipMaxFiles: vars.WORKSPACE_ZIP_MAX_FILES,
     },
 
     gitCredential: {

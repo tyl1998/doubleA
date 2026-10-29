@@ -38,6 +38,15 @@ const GIT_MAX_BUFFER = 32 * 1024 * 1024
 export interface GitCleanFilterResult {
   kept: string[]
   excluded: string[]
+  /**
+   * 这些候选里**被 git 跟踪**的路径（工作区相对路径）。
+   *
+   * ★ 2026-10-28（用户反馈「拉取代码这个会话最近变更对不上」）：只按"路径此刻脏不脏"剔，
+   *   会把**clone 检出那一刻**的 `created v1` 留在清单里 —— 比如 `repo/conftest.py`：
+   *   它是仓库自带文件（`created v1` 来自 checkout），后来被改脏了，于是路径判据放行，
+   *   结果「更早」里凭空多出一条"新建"。调用方拿这份集合就能把"检出产生的创建"也剔掉。
+   */
+  tracked: string[]
 }
 
 /**
@@ -86,6 +95,7 @@ export async function filterGitCleanPaths(
 ): Promise<GitCleanFilterResult> {
   const kept: string[] = []
   const excluded: string[] = []
+  const trackedPaths: string[] = []
   /** 仓库根 → 该仓库下的候选（`rel` = 相对仓库根的路径，供 `git ls-files` 的 pathspec 用） */
   const byRepo = new Map<string, { path: string; rel: string }[]>()
 
@@ -114,10 +124,12 @@ export async function filterGitCleanPaths(
       continue
     }
     for (const entry of entries) {
+      // 被 git 跟踪 ⇒ 这个路径的内容来自仓库（checkout / pull），不是"谁新建的"
+      if (tracked.has(entry.rel)) trackedPaths.push(entry.path)
       if (tracked.has(entry.rel) && !dirty.has(entry.rel)) excluded.push(entry.path)
       else kept.push(entry.path)
     }
   }
 
-  return { kept, excluded }
+  return { kept, excluded, tracked: trackedPaths }
 }

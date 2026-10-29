@@ -576,7 +576,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
         if (steerInbox.length > 0) {
           for (const entry of steerInbox.splice(0)) {
             messages.push({ role: 'user', content: entry.message })
-            steers.push({ id: entry.id, message: entry.message, at: entry.at })
+            // `textOffset` = 注入这一刻正文的长度 ⇒ 之后的正文都是"对插话的回应"，
+            // 历史渲染时插话气泡插在这里（见 `shared#steerRecordSchema`）
+            steers.push({
+              id: entry.id,
+              message: entry.message,
+              at: entry.at,
+              textOffset: assistantText.length,
+            })
           }
           enqueue({ name: 'steer_queue', data: { messages: [] } })
         }

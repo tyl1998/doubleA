@@ -114,6 +114,7 @@ const {
   showArtifactPanel,
   mergeArtifactPanelItems,
   artifactTimeText,
+  artifactExpiresText,
   artifactPanelOverflowNote,
 } = await import('../src/features/chat/artifactPanelModel.ts')
 
@@ -329,6 +330,23 @@ console.log(`  · "一轮结束后那条从『刚生成』变成时刻读数"的
 
 console.log('')
 if (failed === 0) {
+// ── 产物剩余保留期读数（2026-10-28）──
+groupStart('D', '`artifactExpiresText(expiresAt, now)`：还剩 N 天 / 今天到期', '保留期由服务端给，这里只做毫秒差 → 人话')
+{
+  const now = new Date('2026-10-28T10:00:00.000Z')
+  // 2026-10-29（产物可延期 / 永久保存）：`null` 现在是**永久保存**这一个真实口径，
+  // 必须显示出来（用户刚点了「永久保存」，界面要确认它生效）；"本处不显示"只由 `undefined` 表达。
+  assertEqual(artifactExpiresText(null, now, ZH), '永久保存', 'null ⇒ 永久保存')
+  assertEqual(artifactExpiresText(undefined, now, ZH), null, 'undefined ⇒ 不显示')
+  assertEqual(artifactExpiresText('not-a-date', now, ZH), null, '解析不出 ⇒ 不显示')
+  assertEqual(artifactExpiresText('2026-11-02T10:00:00.000Z', now, ZH), '还剩 5 天，逾期自动清理', '整 5 天')
+  assertEqual(artifactExpiresText('2026-11-02T23:00:00.000Z', now, ZH), '还剩 6 天，逾期自动清理', '不满 6 天向上取整')
+  assertEqual(artifactExpiresText('2026-10-28T20:00:00.000Z', now, ZH), '今天到期，逾期自动清理', '当天内到期')
+  // 2026-10-29 用户指正：过期产物会被 reaper 直接删掉（行 + 对象），列表里查不到 ⇒
+  // 不设「已过期」这一档；万一撞上"刚过期、还没跑到删"的那一分钟，按「今天到期」说。
+  assertEqual(artifactExpiresText('2026-10-27T10:00:00.000Z', now, ZH), '今天到期，逾期自动清理', '已过期 ⇒ 归到「今天到期」，不引入第三档')
+}
+
   console.log(`${c.g}${c.b}✅ 产物面板前端纯逻辑验收通过（P0-3-11）：${passed} 项全通过${c.x}`)
   process.exit(0)
 } else {

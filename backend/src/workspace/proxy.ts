@@ -35,6 +35,9 @@ import { AppError, isWorkspaceTextMime } from '@doubulea/shared'
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+// ★ 2026-10-28：引擎侧读/编辑也要按**真实编码**解码（UTF-16 / GBK 的 txt 按 UTF-8 解是乱码，
+//   局部编辑更会拿乱码去匹配 `oldText` ⇒ 永远找不到）。解码器全仓只有 `decodeTextBuffer` 一份。
+import { decodeTextBuffer } from '../pipeline/parse/txt.js'
 import {
   authenticateSandboxProxy,
   sandboxTokenFromHeader,
@@ -144,7 +147,7 @@ export function registerWorkspaceProxyRoutes(app: FastifyInstance): void {
         version: source.version,
         mime: source.mime,
         size: source.size,
-        content: source.body.toString('utf8'),
+        content: decodeTextBuffer(source.body).text,
       } satisfies WorkspaceProxyResult)
     } catch (error) {
       if (error instanceof AppError) return reply.send(toFailure(error))
@@ -217,10 +220,11 @@ export function registerWorkspaceProxyRoutes(app: FastifyInstance): void {
         } satisfies WorkspaceProxyResult)
       }
       // 首选 `edits[]`（与 pin 0.87.1 内置 edit 同形，R8）；旧的单处形态（含 replaceAll）走兼容分支
+      const currentText = decodeTextBuffer(source.body).text
       const applied =
         edits !== undefined
-          ? applyWorkspaceEdits(source.body.toString('utf8'), edits)
-          : applyWorkspaceEdit(source.body.toString('utf8'), oldString ?? '', newString ?? '', replaceAll)
+          ? applyWorkspaceEdits(currentText, edits)
+          : applyWorkspaceEdit(currentText, oldString ?? '', newString ?? '', replaceAll)
       if (!applied.ok) {
         return reply.send({ ok: false, code: 'VALIDATION', message: applied.reason } satisfies WorkspaceProxyResult)
       }

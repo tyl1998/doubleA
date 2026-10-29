@@ -671,6 +671,11 @@ export const zh = {
   'validation.conversation.instanceIdTooLong': 'instanceId 过长',
   'validation.conversation.artifactLimitMax': 'limit 最多 {max}',
   'validation.conversation.artifactIdNotUuid': '产物 ID 不是合法 UUID',
+  'validation.artifact.extendDaysRequired': '请输入延期天数',
+  'validation.artifact.extendDaysInvalid': '延期天数必须是整数',
+  'validation.artifact.extendDaysRange': '延期天数需在 1 ~ 365 之间',
+  'validation.artifact.extendUntilRequired': '请选择延期到的日期',
+  'validation.artifact.extendUntilInvalid': '延期日期格式不合法',
   'validation.conversation.artifactsRequired': '至少选择一个产物',
   'validation.conversation.artifactBatchMax': '一次最多删除 {max} 个产物',
   'validation.conversation.fileIdNotUuid': '附件 ID 不是合法 UUID',
@@ -886,6 +891,19 @@ export const zh = {
   'artifact.panelNote': '产物保存在沙箱工作目录，空闲回收后仍可从对象存储下载。',
   'artifact.panelLatestFirst': '最新产出在最上面',
   'artifact.panelOverflow': '仅显示最近 {shown} 个（共 {total} 个）',
+  // 2026-10-28：产物保留期读数（产物会过期，卡片上直接给剩余天数）
+  'artifact.expiresInDays': '还剩 {days} 天，逾期自动清理',
+  'artifact.expiresToday': '今天到期，逾期自动清理',
+  'artifact.expiresForever': '永久保存',
+  'artifact.extend': '延期',
+  'artifact.extendTitle': '延期保存：{name}',
+  'artifact.extendDays': '延期几天',
+  'artifact.extendUntil': '延期到某日',
+  'artifact.extendForever': '永久保存',
+  'artifact.extendHint': '延期只能往后推；「永久保存」之后不再自动清理（想立刻清掉请用「删除」）。',
+  'artifact.extendConfirm': '确认延期',
+  'artifact.extendedOk': '已延期保存',
+  'artifact.extendFailed': '延期失败',
   'artifact.listFailedTitle': '产物列表没读出来',
   'artifact.listFailedDescription': '本轮刚产出的那些仍然在下面。点重试读一次完整列表；刷新页面也会重读。',
   'artifact.timeJust': '刚生成',
@@ -2846,11 +2864,55 @@ export const zh = {
   'workspace.revertSummaryNone': '本轮无工作区改动',
   'workspace.revertSummaryDryRunPrefix': '[预演] {body}',
   'workspace.revertSummarySeparator': '，',
+  // ★ 2026-10-28（用户定案「撤销怎么选」）：撤销前先预演 + 选范围，默认只撤 agent。
+  'workspace.revertChooseTitle': '选择撤销范围',
+  'workspace.revertScopeHint':
+    '撤销 = 每个文件退回它的前一版（只会退一步，不会删掉你手写过的文件）。默认只撤销 agent 最后一次写入的文件。',
+  'workspace.revertScopeAgentOnly': '只撤销 agent 的改动（推荐）',
+  'workspace.revertScopeAll': '撤销本轮全部（含我的修改）',
+  'workspace.revertScopeSelected': '逐条勾选',
+  'workspace.revertScopeSelectedHint': '勾了谁就回退谁，各自退回它自己的前一版。',
+  'workspace.revertPreviewRestore': '会还原：{count} 个文件',
+  'workspace.revertPreviewRemove': '会删除：{count} 个文件（最后一次写入就是新建）',
+  'workspace.revertPreviewSkip': '会跳过：{count} 个文件',
+  'workspace.revertSkipReason.USER_EDIT_EXCLUDED': '这段以你的手写收尾，默认不撤销',
+  'workspace.revertSkipReason.CONFLICT': '本轮之后又被改过，不会自动覆盖',
+  'workspace.revertSkipReason.UNAVAILABLE': '历史内容缺失，无法还原',
+  'workspace.revertSkipReason.UNSUPPORTED': '该类型暂不支持撤销',
+  'workspace.revertSkipReason.NET_ZERO': '本段内建了又删，净变化为零',
+  'workspace.revertCancel': '取消',
+  // ★ 2026-10-28：纯手写会话（从没派过活）不显示「本轮 / 更早」，标题改成「变更历史」。
+  'workspace.changeHistory': '变更历史 {count}',
+  'workspace.changeHistoryHint':
+    '本会话没有 agent 的改动，这里是你的编辑历史（按时间倒序）。所有条目都仍是你当前的编辑结果。',
+  // ★ 2026-10-28：clone/pull 进行中**不清空**列表，只提示"正在同步"（列表里的旧条目照样可看）。
+  'workspace.recentSyncing': '正在同步仓库…（下方是已知的改动，新内容稍后自动补上）',
+  // 2026-10-28: 保留期提示（到期前提前告知，避免"删完才发现"）。
+  // 2026-10-28 重写：原文案把"未到期但被保护"说成"已到期"，还无条件拼"0 个产物"。
+  'workspace.retentionSoon': '工作区将在 {days} 天后清理（保留 {total} 天）。需要保留的文件请及时下载。',
+  'workspace.retentionExpiredProtected': '工作区已过 {retentionDays} 天保留期，但因为下面的原因，暂时不会清理。',
+  'workspace.retentionExpiredWillClean': '工作区已过 {total} 天保留期，下次清理时会删除。需要保留的文件请立刻下载。',
+  'workspace.retentionWhyArtifact': '这里还有 {count} 个会话产物（agent 生成的交付文件），所以跳过清理。',
+  'workspace.retentionWhyUserEdit': '你最近 {days} 天内亲手改过这里的文件，所以跳过清理。',
+  'workspace.retentionWhyBoth': '这里有 {count} 个会话产物，且你近期亲手改过文件，所以跳过清理。',
+  'workspace.retentionWhereStored':
+    '文件保存在本机会话工作区（不是云端长期存储）。超过保留期会被自动清理，清理后无法恢复；删除会话时也会一起删除。要长期保留请下载到本地。',
   'workspace.newFile': '新建文件',
   'workspace.newFolder': '新建文件夹',
   'workspace.hideDotFiles': '隐藏点文件（.git 等）',
   'workspace.showDotFiles': '显示点文件（.git 等）',
   'workspace.recentChanges': '最近变更 {count}',
+  // ★ 2026-10-27（用户反馈「会让人误以为是本轮/上一轮」）：说清口径 —— 这份清单是**本会话工作区**
+  //   历来的改动（不含 git 自己的 .git、不含 clone 整棵仓库的初始填充），按路径折叠后只显示最近 8 条。
+  //   它**不是**"这一轮的变更"（那种语义只在「撤销本轮」里）。
+  'workspace.recentGroupCurrent': '本轮 · {count}',
+  'workspace.recentGroupEarlier': '更早 · {count}',
+  // 差异弹窗标题里的段标（短形态）：同一路径两段都动过时，列表里是两条，弹窗要说明这条是哪一段
+  'workspace.recentGroupCurrentShort': '本轮',
+  'workspace.recentGroupEarlierShort': '更早',
+  'workspace.recentCurrentCount': '本轮 {count}',
+  'workspace.recentChangesHint':
+    '本会话工作区的改动，按次划分：本轮 = 最近一次保存（每次保存各算一轮）；更早 = 在此之前的那段改动，同一文件压成一条（显示轮前整体范围）。本轮的条目当前仍生效（改回去的不算）；更早是历史，发生过就保留。同一文件两段都动过会各出现一条，各自的版本范围（如 v1→v3）点开该条差异即可看到。每段最多显示最近 20 条；不含 .git 内部文件与 git 拉取下来的内容。点 +N −M 看该条变更的行级差异。',
   'workspace.emptyTree': '（空工作区；右键可新建文件 / 文件夹，或上传文件）',
   'workspace.menuOpen': '打开',
   'workspace.menuRename': '重命名 / 移动',
@@ -2859,6 +2921,8 @@ export const zh = {
   'workspace.menuDelete': '删除',
   'workspace.menuDeleteDir': '删除文件夹',
   'workspace.menuUploadHere': '上传文件到此目录',
+  'workspace.menuUploadArtifact': '上传至平台（存为产物）',
+  'workspace.menuDownloadDir': '下载为 zip',
   'workspace.menuUpload': '上传文件',
   'workspace.copyRelative': '相对路径',
   'workspace.copyAbsolute': '绝对路径（{root}）',
@@ -2890,7 +2954,19 @@ export const zh = {
   'workspace.fileLoading': '正在读取文件…',
   'workspace.fileUnreadablePeriod': '文件读不到（可能已被删除，或没有权限）。',
   'workspace.notText': '该文件不是文本（{mime}），只能下载 / 预览。',
+  // ★ 2026-10-28（用户反馈「txt 不能展示」）：文本类文件**只在超过内联体积上限**时才没有正文。
+  //   那时不能套 `notText`（会显示成"text/plain 不是文本"，自相矛盾），要如实说是太大。
+  'workspace.textTooLarge': '文件较大，未在编辑器中内联打开；请下载后查看。',
   'workspace.diffTitle': '差异',
+  // ★ 2026-10-28：把"跟哪个版本比"写明。用户关心的是**本轮整体**改了什么，
+  // 不是"最后一跳" —— v3 → v9 / 新建 / 已删除 三种都给出确定文案。
+  'workspace.diffRange': 'v{from} → v{to}',
+  'workspace.diffRangeNew': '新建 → v{to}',
+  'workspace.diffRangeDeleted': 'v{from} → 已删除',
+  // 编辑器工具栏上的范围胶囊用**短形态**（同路径两条变更时，点开文件后才展示范围；列表里不写，
+  // 避免遮住文件名 —— 2026-10-28 用户定案）
+  'workspace.diffRangeNewShort': '新建 → v{to}',
+  'workspace.diffRangeDeletedShort': 'v{from} → 已删除',
   'workspace.diffReadFailed': '差异读取失败。',
   'workspace.diffNotComparable': '该文件无法逐行比较',
   'workspace.diffNoChange': '内容没有变化',
@@ -2933,6 +3009,9 @@ export const zh = {
   'workspace.renameFailed': '重命名失败',
   'workspace.uploadFailed': '上传失败：{name}',
   'workspace.uploadedOk': '已上传 {count} 个文件',
+  'workspace.artifactUploading': '正在上传至平台：{name}（完成后会出现在产物面板）',
+  'workspace.artifactUploadedOk': '已上传至平台：{name}',
+  'workspace.artifactUploadFailed': '上传至平台失败：{name}',
   'workspace.copiedOk': '已复制：{value}',
   'workspace.copyFailed': '复制失败',
 
@@ -3331,6 +3410,8 @@ export const zh = {
 
   'app.m281': '当前没有在线实例',
   'app.m282': '没有在线实例具备「{0}」且能构建它 —— 请先在有构建上下文的实例上构建该环境',
+  'app.m283': '文件「{0}」没有登记为产物：它可能已不存在、超过单文件上限，或读不出来（文件仍在工作区里）',
+  'app.m284': '这个目录里的文件太多（超过 {0} 个），不能一次打包下载。请按子目录分别下载',
   // 失败通知里错误码的呈现（`app/feedback.ts#withCode`）：zh 用全角括号，en 用半角
   'common.withCode': '{text}（{code}）',
   // 同一行里多条信息的分隔符（`feedback.ts` 的 description 拼接）

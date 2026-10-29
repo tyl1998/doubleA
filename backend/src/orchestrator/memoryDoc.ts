@@ -365,6 +365,22 @@ export function renderMemoryDoc(input: {
       '（凭据按需拉取，失败不会打印原因，只会是一个笼统的认证错误）。',
   )
   lines.push('')
+  // ★ 2026-10-27：SSH 的**出网**与**DNS** 都经 ProxyCommand 隧道，`getent hosts` / `ping` 必然失败
+  //   —— 只有 `ssh` / `git` 自己会走代理。面里不写这一条，模型会拿 `getent`/`ssh` 的解析失败当
+  //   "没有网络出口"并让用户上传压缩包（真机日志里就是这么绕远的）。
+  lines.push(
+    '**容器没有 DNS、也没有直连出口**：`getent hosts <host>` / `ping` / `ssh <host>`（不经 git）一律' +
+      '`Temporary failure in name resolution`，这不代表没网 —— 出网只经平台代理，' +
+      '`git clone` / `git pull` 已由平台自动接上隧道（`GIT_SSH_COMMAND`），**直接跑 git 即可**，' +
+      '不要自己查 DNS、不要自己写 ProxyCommand。',
+  )
+  lines.push('')
+  lines.push('本地还没有仓库时 `pull` 会失败（没有 `.git`）：先 `git clone <地址> <目录>`（如 `git clone <地址> repo`）。')
+  lines.push(
+    '⚠️ 把代码 clone 到 **`/work` 下**（不要 clone 到 `/tmp`）：`/tmp` 只有 64MB tmpfs，' +
+      '真实仓库会 `fatal: unable to checkout working tree`。',
+  )
+  lines.push('')
 
   return lines.join('\n')
 }

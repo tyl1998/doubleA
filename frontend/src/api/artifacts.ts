@@ -28,7 +28,12 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 
-import type { ArtifactListResult, BatchDeleteArtifactsResult } from '@doubulea/shared'
+import type {
+  ArtifactExtendBody,
+  ArtifactListItem,
+  ArtifactListResult,
+  BatchDeleteArtifactsResult,
+} from '@doubulea/shared'
 
 import { request, requestBlob } from './client.js'
 import {
@@ -157,6 +162,40 @@ export function deleteArtifacts(artifactIds: string[]): Promise<BatchDeleteArtif
     method: 'POST',
     body: { ids: artifactIds },
   })
+}
+
+/**
+ * 产物延期（`POST /api/artifacts/:id/extend`，2026-10-29）。
+ *
+ * 三种口径（`shared#artifactExtendBodySchema`）：`{mode:'DAYS',days}` / `{mode:'UNTIL',until}` /
+ * `{mode:'FOREVER'}`。回**更新后的那一条**（调用方据此就地刷新到期读数）。
+ *
+ * 「延期到某日」由调用方把用户选的日期折成绝对时刻（见 {@link artifactExtendUntil}）——
+ * 服务端不猜时区。
+ */
+export function extendArtifact(artifactId: string, body: ArtifactExtendBody): Promise<ArtifactListItem> {
+  return request<ArtifactListItem>(`/api/artifacts/${encodeURIComponent(artifactId)}/extend`, {
+    method: 'POST',
+    body,
+  })
+}
+
+/**
+ * "延到某一天" → 请求体里的 `until`（**本机时区的当天 23:59:59.999**，ISO 串）。
+ *
+ * 为什么在前端折：用户点的是"12 月 1 日"，他期待的是**自己时区的**那一整天都还在；
+ * 服务端若按自己的时区或 UTC 解析纯日期，边界会差一天（东八区的用户会看到"少了一天"）。
+ * 这里用 `Date(y, m, d, 23, 59, 59, 999)` 构造本地时刻，再 `toISOString()` 交给服务端。
+ *
+ * @param day `YYYY-MM-DD`（AntD `DatePicker` 的字符串形态）
+ */
+export function artifactExtendUntil(day: string): string {
+  const matched = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(day.trim())
+  if (matched === null) throw new Error(`非法日期：${day}`)
+  const year = Number(matched[1])
+  const month = Number(matched[2])
+  const date = Number(matched[3])
+  return new Date(year, month - 1, date, 23, 59, 59, 999).toISOString()
 }
 
 /**

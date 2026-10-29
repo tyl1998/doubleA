@@ -67,6 +67,7 @@ import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
 import { getS3Client, isS3NoSuchKey } from '../infra/s3.js'
 import type { ConversationViewer } from './conversation.service.js'
+import { defaultArtifactExpiresAt, resolveArtifactExpiry, type ArtifactExtendInput } from './artifactExpiryModel.js'
 
 /**
  * 列表的查询字段（`02` §三 的列集合；**刻意不带 `fileKey` 与 `previewReady`** ——
@@ -78,6 +79,7 @@ const ARTIFACT_SELECT = {
   size: true,
   mime: true,
   createdAt: true,
+  expiresAt: true,
 } as const
 
 /**
@@ -89,12 +91,20 @@ const ARTIFACT_SELECT = {
  */
 const ARTIFACT_CHRONO_ORDER = [{ createdAt: 'desc' }, { id: 'desc' }] as const
 
+/**
+ * 行 → 对外一条（`expiresAt` = 列里的真实值；**`null` = 永久保存**，2026-10-29）。
+ *
+ * ★ 保留期只有**一处真源**（`config.limits.artifactRetentionDays`，即 `ARTIFACT_RETENTION_DAYS`），
+ *   与 `reapExpiredArtifacts` 用的是同一个值 —— 前端据此显示"还剩 N 天"，
+ *   不能自己写死 7，否则改了 env 界面就开始说谎。
+ */
 function toListItem(row: {
   id: string
   fileName: string
   size: number
   mime: string
   createdAt: Date
+  expiresAt: Date | null
 }): ArtifactListItem {
   return {
     artifactId: row.id,
@@ -102,7 +112,24 @@ function toListItem(row: {
     size: row.size,
     mime: row.mime,
     createdAt: row.createdAt.toISOString(),
+    // `null` = 永久保存（2026-10-29 起；前端据此不再显示"还剩 N 天"）
+    expiresAt: row.expiresAt === null ? null : row.expiresAt.toISOString(),
   }
+}
+
+/**
+ * 建行时的**默认**到期时刻（2026-10-29 起只用于**写入**，不再用于读取）。
+ *
+ * ★ 口径变更：此前是"读列表时现算 `createdAt + 保留期`"，于是"延期"没有地方落 ——
+ *   现在到期时刻是**一列真实数据**（`artifacts.expires_at`），建行时按当时的保留期写死；
+ *   延期只是把这一列往后推（见 `resolveArtifactExpiry`），清理器也只看这一列。
+ *   ⇒ **改 `ARTIFACT_RETENTION_DAYS` 只影响此后新建的产物**，不会让已有产物的"还剩 N 天"跳变
+ *   （旧行为会在改 env 后让所有历史产物的读数一起变，那才是意外）。
+ *
+ * @returns `null` = 永久保存（保留期配成 0 时）
+ */
+export function artifactExpiresAtOf(createdAt: Date): Date | null {
+  return defaultArtifactExpiresAt(createdAt, config.limits.artifactRetentionDays)
 }
 
 /**
@@ -346,6 +373,52 @@ export async function deleteArtifact(params: { artifactId: string; userId: strin
 
   await db.artifact.delete({ where: { id: row.id } })
   getLogger().info({ artifactId: row.id, userId: params.userId }, '用户删除了产物（对象与行一并移除）')
+}
+
+/**
+ * 产物延期（`POST /api/artifacts/:id/extend`，2026-10-29）。
+ *
+ * 三种口径见 `shared#artifactExtendBodySchema`：延期几天 / 延期到某日 / 永久保存。
+ * 判据（**只能往后推**、已永久的不再延期、天数范围）全在纯函数 {@link resolveArtifactExpiry} 里；
+ * 本函数只做"查归属 → 算 → 写 → 回新行"。
+ *
+ * ⚠️ **归属判据落在 `where`**：别人的产物与不存在一样是 404（与会话族同一条纪律）。
+ * ⚠️ 并发的两次延期：后写的赢（`UPDATE` 覆盖）—— 延期是幂等方向上的操作，不需要 CAS：
+ *    两条并发请求的语义都是"往后推"，最终停在哪个时刻都能用，不会丢数据。
+ *
+ * @throws {AppError} `NOT_FOUND`(404) 不是我的；`VALIDATION`(422) 目标时刻不合法（理由由纯函数给）
+ */
+export async function extendArtifact(params: {
+  artifactId: string
+  userId: string
+  extend: ArtifactExtendInput
+}): Promise<ArtifactListItem> {
+  const db = getPrisma()
+  const row = await db.artifact.findFirst({
+    where: { id: params.artifactId, userId: params.userId },
+    select: { id: true, expiresAt: true },
+  })
+  if (row === null) throw AppError.notFound(appMsg('app.m130'))
+
+  const resolved = resolveArtifactExpiry(row.expiresAt, params.extend, new Date())
+  if (!resolved.ok) throw AppError.validation(resolved.message)
+
+  const updated = await db.artifact.update({
+    where: { id: row.id },
+    data: { expiresAt: resolved.expiresAt },
+    select: ARTIFACT_SELECT,
+  })
+  getLogger().info(
+    {
+      artifactId: row.id,
+      userId: params.userId,
+      mode: params.extend.mode,
+      was: row.expiresAt?.toISOString() ?? null,
+      now: resolved.expiresAt?.toISOString() ?? null,
+    },
+    '产物延期（2026-10-29）',
+  )
+  return toListItem(updated)
 }
 
 /**

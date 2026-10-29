@@ -32,14 +32,21 @@ import { Button, Checkbox, Pagination, Popconfirm } from 'antd'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { ARTIFACTS_PAGE_LIMIT, deleteArtifact, deleteArtifacts, useMyArtifacts } from '../../api/artifacts.js'
+import {
+  ARTIFACTS_PAGE_LIMIT,
+  artifactExtendUntil,
+  deleteArtifact,
+  deleteArtifacts,
+  extendArtifact,
+  useMyArtifacts,
+} from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
 import { AGENTS_PATH } from '../../app/paths.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
-import { ArtifactCard } from '../../features/chat/ArtifactCard.js'
-import { artifactTimeText } from '../../features/chat/artifactPanelModel.js'
+import { ArtifactCard, type ArtifactExtendChoice } from '../../features/chat/ArtifactCard.js'
+import { artifactExpiresText, artifactTimeText } from '../../features/chat/artifactPanelModel.js'
 import { useMinuteTick } from '../../features/chat/useMinuteTick.js'
 import { useArtifactPreviewStore } from '../../stores/artifactPreview.js'
 
@@ -83,6 +90,35 @@ export function ArtifactCollectionPage() {
     onSettled: () => {
       // 删掉当页最后一条时回退一页：否则会停在一个空页上，看着像"产物全没了"。
       if (items.length === 1 && offset > 0) setOffset(Math.max(0, offset - limit))
+      void queryClient.invalidateQueries({ queryKey: ['artifacts', 'collection'] })
+    },
+  })
+
+  /**
+   * 延期（2026-10-29）：卡片弹窗把用户选的口径原样交回来 —— 这里只做"日期折算 + 调接口 +
+   * 提示 + 失效列表"。三种口径：
+   *   · `DAYS` / `FOREVER` 直接透传；
+   *   · `UNTIL` 的 `day`（`YYYY-MM-DD`）折成**本地时区当天 23:59:59.999** 的绝对时刻
+   *     （`artifactExtendUntil`）—— 服务端不猜时区。
+   * 失败抛出去让 `ArtifactCard` 结束 loading 并保持弹窗（用户可改后再试）。
+   */
+  const extend = useMutation({
+    mutationFn: ({ artifactId, choice }: { artifactId: string; choice: ArtifactExtendChoice }) =>
+      extendArtifact(
+        artifactId,
+        choice.mode === 'UNTIL'
+          ? { mode: 'UNTIL', until: artifactExtendUntil(choice.day) }
+          : choice.mode === 'DAYS'
+            ? { mode: 'DAYS', days: choice.days }
+            : { mode: 'FOREVER' },
+      ),
+    onSuccess: () => {
+      feedback.ok(t('artifact.extendedOk'))
+    },
+    onError: (error) => {
+      feedback.fail(error, t('artifact.extendFailed'))
+    },
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ['artifacts', 'collection'] })
     },
   })
@@ -194,12 +230,17 @@ export function ArtifactCollectionPage() {
                 key={item.artifactId}
                 artifact={item}
                 timeText={artifactTimeText(item.createdAt, now, locale)}
+                // 2026-10-28：产物会过期 —— 卡片上直接给"还剩 N 天"，不用点开才知道
+                expiresText={artifactExpiresText(item.expiresAt, now, locale)}
                 selected={selectedIds.has(item.artifactId)}
                 onSelectedChange={(checked) => {
                   toggleOne(item.artifactId, checked)
                 }}
                 onDelete={async () => {
                   await remove.mutateAsync(item.artifactId)
+                }}
+                onExtend={async (choice) => {
+                  await extend.mutateAsync({ artifactId: item.artifactId, choice })
                 }}
               />
             ))}

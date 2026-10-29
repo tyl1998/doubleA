@@ -66,3 +66,4 @@ infra/router/*.tar
 
 # 本机单机形态的运行脚本与日志（容器化前的过渡态，不入库）
 .run-logs/
+.playwright-cli/

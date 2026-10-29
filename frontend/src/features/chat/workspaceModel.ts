@@ -11,6 +11,7 @@
 
 import {
   WORKSPACE_CONTENT_EVENT_TYPES,
+  isGitInternalPath as sharedIsGitInternalPath,
   isWorkspaceTextMime,
   isWorkspaceHiddenPath,
   translate,
@@ -240,6 +241,96 @@ export function unionExpandedDirs(existing: readonly string[], paths: readonly s
   return out
 }
 
+/**
+ * 这条路径是不是 **git 自己的内部文件**（`<repo>/.git/…`，或 `--separate-git-dir` 那种
+ * `.git` 文件本身）。
+ *
+ * 判据本体在 `shared#isGitInternalPath`（前后端**同一处**）——这里只是按本模块的既有习惯
+ * 转出一次，免得 `WorkspacePanel` 直接从 `shared` 取（本模块其它判据也都从这里取）。
+ *
+ * ★ 为什么要单独判（2026-10-27，用户反馈「git 都没变更，为什么拉取下来那些算变更」）：
+ *   `.git/` 里的对象 / 索引 / 锁文件在工作区里也是普通文件，`clone --depth` 中途会被
+ *   `reconcileWorkspaceOnce` 一条条记成 `created`/`updated`/`deleted`（实测该会话 12 秒里
+ *   1988 条事件，其中就有 `repo/.git/objects/pack/tmp_pack_*`、`repo/.git/index.lock`）。
+ *   它们已经算工作区内容（进索引、进冷备），但**不该出现在「最近变更」**：用户看那份清单要的是
+ *   "谁动了哪些代码"，不是 git 的中间产物。
+ */
+export const isGitInternalPath = sharedIsGitInternalPath
+
+/**
+ * 「最近变更」**每段**最多渲染多少条（本轮 / 更早各算一份）。
+ *
+ * ★ 2026-10-28：原来是整份清单 `slice(0, 8)`，那是**静默截断** —— 标题里的 count 也是截断后的
+ *   数字，容易让人以为"这一轮只改了 8 个文件"。改成按轮分组后各段独立截断，配合标题上的真实
+ *   条数（`本轮 · 12` 而不是 8），截断这件事才看得见。
+ */
+export const WORKSPACE_RECENT_MAX_PER_GROUP = 20
+
+/**
+ * 文件差异的 react-query key（会话 + 路径 + 基线版本 + 到版本 + **是否只取计数**）。
+ *
+ * ★ 2026-10-27（用户反馈「徽标显示 +1 −1，点进去却没有内容改动」）：`stats` 必须进 key。
+ *   徽标请求 `{ stats: true }` 只回 `added/removed`、**不带 `lines`**；差异弹窗要的是 `lines`。
+ *   两者以前用同一个 key ⇒ 点徽标命中"只有计数"的那份缓存，弹窗拿到 `lines = []`，
+ *   于是"有 +1 −1、点开却空"。key 里带上 `stats` 才是两个不同的查询。
+ *
+ * ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条，各自版本范围）：`toVersion` 也必须进 key。
+ *   两条路径相同、基线也可能相同，只有"比到哪个版本"不一样 —— 少这一段，两行会读到同一份缓存，
+ *   于是「更早」那条点开显示的是「本轮」的差异。`0` = 不指定（比到当前）。
+ *
+ * 放在这个**纯函数**模块里（而不是 `api/workspace.ts`）是为了能被零依赖的
+ * `verify:workspace-ui` 直接断言 —— 那边不能加载 `import.meta.env`。
+ */
+export function workspaceFileDiffQueryKey(
+  conversationId: string,
+  path: string,
+  baseVersion?: number,
+  stats?: boolean,
+  toVersion?: number,
+): readonly [string, string, string, number, boolean, number] {
+  return ['workspace-diff', conversationId, path, baseVersion ?? 0, stats === true, toVersion ?? 0]
+}
+
+/**
+ * 一条变更**该跟哪个版本比**（徽标与差异弹窗共用，纯函数）。
+ *
+ * ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各一条，各自标明版本范围）：两条的差别**只**在
+ *   版本范围里 —— 基线是那一段起点、到版本是那一段末尾。判据写在这里，调用点（列表徽标 /
+ *   差异弹窗）才不会各自推一遍而给出"徽标 +2 −1、点开只有 +1 −0"（2026-10-28 用户反馈过）。
+ *
+ *   · `current` ：「本轮」= 最后一次 agent 派活窗口（或轮末之后的编辑）。
+ *     基线优先用服务端给的本轮基线（`beforeVersion`），**并让服务端按本轮窗口复核**（`roundBase`）；
+ *     到版本 = 当前盘上内容（不传 `toVersion`）。这样"这一轮整体改了什么"与「撤销本轮」一致。
+ *   · `earlier`：「更早」= 本轮起点之前。基线 = 那一段的 `beforeVersion`，
+ *     到版本 = 那一段的末版本（`version`）—— 不一路比到此刻，否则两条会显示同一个差异。
+ *
+ * `baseVersion === undefined` ⇒ 不显式指定，由服务端按默认（前一版）取。
+ */
+export function workspaceDiffScope(change: {
+  version: number | null
+  beforeVersion?: number | null
+  segment?: 'current' | 'earlier'
+}): { roundBase: boolean; baseVersion?: number; toVersion?: number } {
+  // ★ 2026-10-28（用户定案「按次：每次保存各算一轮」）：**两段用同一判据** ——
+  //   基线就是这条变更自己的 `beforeVersion`（= 这一跳之前那一版）。
+  //   ① 本级那条不再请求 `roundBase`（那是"本轮窗口整体"口径，会把多次保存合并）；
+  //   ② 「更早」那一条的到版本 = 它自己的末版本（`toVersion`），不一路比到此刻，
+  //      否则同一文件两条会显示同一个"从很久以前到现在"的差异。
+  //   `beforeVersion === null` = 那一段开始时文件不存在（新建）⇒ 明确传 0（基线不存在）。
+  const baseVersion =
+    change.beforeVersion === null
+      ? 0
+      : (change.beforeVersion ??
+        (change.version !== null && change.version > 1 ? change.version - 1 : undefined))
+  const hasBaseline = change.beforeVersion === undefined ? false : true
+  return {
+    // 保留 `roundBase` 字段（后端仍支持），但只有在**拿不到**这条自己的基线时才回退到它
+    roundBase: !hasBaseline,
+    ...(baseVersion === undefined ? {} : { baseVersion }),
+    ...(change.segment === 'earlier' && change.version !== null ? { toVersion: change.version } : {}),
+  }
+}
+
 /** 文件树里按名字取末段（标签文字用） */
 export function workspaceBaseName(path: string): string {
   const segments = path.split('/')
@@ -345,6 +436,27 @@ export const WORKSPACE_FOLDER_PLACEHOLDER = '.gitkeep'
 /** 「新建文件夹」实际要创建的文件路径（`dir/name` 目录下的占位文件） */
 export function workspaceNewFolderPlaceholderPath(dir: string, name: string): string {
   return joinWorkspacePath(joinWorkspacePath(dir, name), WORKSPACE_FOLDER_PLACEHOLDER)
+}
+
+/**
+ * 输入框里那串最终落到哪个路径（纯函数）—— 右键目标目录会**预填**在框里（`a/`），
+ * 用户很容易连前缀一起再敲一遍（`a/x.py`）。
+ *
+ * ★ 2026-10-29 用户实测：在 `a` 上右键新建、输入 `a/x.py` ⇒ 实际建出 `a/a/x.py`。
+ *   口径：预填就是"这个目录下"，用户从**预填值**接着敲（`a/x.py`）时不再叠前缀；
+ *   而用户主动改成别的目录（`b/x.py`）则按用户写的走 —— 判据是"是否以预填值开头"，
+ *   不是"有没有出现过斜杠"。
+ *
+ * @param dir   右键的目标目录（根 = `''`）
+ * @param input 输入框里的原文
+ */
+export function workspaceResolvePromptPath(dir: string, input: string): string {
+  const value = input.trim().replace(/\\/gu, '/')
+  if (dir === '') return value
+  const prefix = `${dir}/`
+  if (value.startsWith(prefix)) return value.slice(prefix.length)
+  // 用户只敲了目录本身（`a`）⇒ 等价于"在 a 下"，名字留空由调用方拦（空名不该创建）
+  return value === dir ? '' : value
 }
 
 /** 拖拽移动的目标路径：把 `from` 移到 `dir` 目录下，名字不变 */
@@ -554,11 +666,64 @@ export function workspaceAncestorDirs(path: string): string[] {
 }
 
 /**
- * 把**服务端变更集**（刷新 / 初次进入会话时拉的那份，已是"按路径折叠后的最新状态"）与
+ * 保留期提示的**提示阈值**（天）：剩余天数 ≤ 这个值才在面板上提醒。
+ *
+ * 2026-10-28：这是"该备份了"的提前量，不是保留期本身 —— 保留期在服务端 env 里。
+ */
+export const WORKSPACE_RETENTION_NOTICE_DAYS = 2
+
+/**
+ * 距到期还有几天（向上取整，纯函数）—— 已过期返回 `0`，绝不返回负数。
+ *
+ * ★ 2026-10-28（用户反馈"docx 被静默删掉"）：提示文案要能说"还有 N 天"，
+ *   这个数字必须与 `expiresAt` 同一口径（JS 侧毫秒差），不能拿服务端天数减本地日期猜。
+ */
+export function retentionDaysLeft(expiresAt: string, nowMs: number): number {
+  const at = Date.parse(expiresAt)
+  if (Number.isNaN(at)) return 0
+  const diff = at - nowMs
+  if (diff <= 0) return 0
+  return Math.ceil(diff / (24 * 60 * 60 * 1000))
+}
+
+/**
+ * 一份变更清单该按哪种口径展示（纯函数；与后端 `changesModel#workspaceChangeGrouping` 同一判据）。
+ *
+ * ★ 2026-10-28（用户定案「手写是一等公民」）：**从没派过活、只有手写的会话**不该出现
+ *   「本轮 / 更早」两段 —— 那是"二手数据"的视觉，用户会以为自己看到的是残缺状态。
+ *   判据只用清单**自身**已有的数据：
+ *   · 清单里有 `AGENT` 写入 ⇒ `rounds`（分「本轮 / 更早」）；
+ *   · 全是 `USER` / `SYSTEM` ⇒ `history`（标题叫「变更历史」，一条平铺清单）。
+ *
+ * ⚠️ 不拿 `round.start` 是否存在来判：那个字段按「最后一条用户消息」算，纯手写会话也可能有。
+ */
+export function workspaceChangeGrouping(
+  items: readonly Pick<WorkspaceChangeEntry, 'actor'>[],
+): 'rounds' | 'history' {
+  // ★ 2026-10-28 实测修正：不是"有 AGENT 才算 rounds"，而是"全是 USER 才算 history" ——
+  //   真跑过 agent 的会话，事件往往是 `SYSTEM`（对账 / clone / 引擎写），`AGENT` 一条都没有。
+  if (items.length === 0) return 'history'
+  return items.every((item) => item.actor === 'USER') ? 'history' : 'rounds'
+}
+
+/**
+ * 「最近变更」里一条的**去重键**：段 + 路径。
+ *
+ * ★ 2026-10-28（用户定案：同一文件「本轮 / 更早」各留一条）：服务端会为"两段都动过"的路径回
+ *   **两条**，各自带那一段的版本范围。所以合并键**不能只有路径** —— 否则后一条会把前一条顶掉，
+ *   又退回"一条盖住另一段"。实时事件永远算「本轮」，只更新本轮那条，不碰更早那条。
+ */
+function changeMergeKey(change: Pick<WorkspaceChangeEntry, 'path' | 'segment'>): string {
+  return `${change.segment ?? 'current'}\u0000${change.path}`
+}
+
+/**
+ * 把**服务端变更集**（刷新 / 初次进入会话时拉的那份，已是"按段按路径折叠后的最新状态"）与
  * **实时 SSE 事件**合并成展示用的「最近变更」清单（**纯函数**，前后端同用 `foldWorkspaceEvents` 的口径）。
  *
  * 口径：
- *   · 同一路径只留**最后一条**（`at` 最大；`at` 相同以实时事件胜）；
+ *   · **同一段、同一路径**只留**最后一条**（`at` 最大；`at` 相同以实时事件胜）；
+ *     同一路径的两段（本轮 / 更早）各自保留一条（见 {@link changeMergeKey}）；
  *   · **只认内容事件**（`created`/`updated`/`deleted`/`renamed`）—— `claim`/`release` 不改变字节，
  *     混进来会把真正的改动顶掉（看起来像"改的是锁、不是文件"）；
  *   · 结果按 `at` 倒序（最近动的在前）。
@@ -570,26 +735,95 @@ export function mergeWorkspaceChanges(
   serverChanges: readonly WorkspaceChangeEntry[],
   liveEvents: readonly WorkspaceEventItem[],
 ): WorkspaceChangeEntry[] {
-  const byPath = new Map<string, WorkspaceChangeEntry>()
+  const byKey = new Map<string, WorkspaceChangeEntry>()
   for (const change of serverChanges) {
     if (!isContentEvent(change)) continue
-    byPath.set(change.path, change)
+    byKey.set(changeMergeKey(change), change)
   }
+  // ★ 2026-10-28（用户定案：**每个文件各自最近一次保存**进「本轮」）：
+  //   实时事件就是该文件的最近一次保存 ⇒ 它进「本轮」。别的文件的条目**不受影响**
+  //   （key 含 path ⇒ A、B、C 各自一条；不会出现"最后只展示 C"）。
+  //
+  //   ⚠️ 同一文件原来那条「本轮」不能被悄悄覆盖掉（否则"编辑第二次"就看不出前后两次了）：
+  //   它要**降级成「更早」**留下，与服务端重新拉取后的划分一致（`S4` 用例锁住这个口径）。
   for (const event of liveEvents) {
     if (!isContentEvent(event)) continue
-    const current = byPath.get(event.path)
+    const key = changeMergeKey({ path: event.path, segment: 'current' })
+    const replaced = byKey.get(key)
+    if (replaced !== undefined && replaced.at < event.at) {
+      // 被这次保存顶掉的那一条 ⇒ 降级为更早（同一路径可能已有更早条目，保留较新的一条）
+      const earlierKey = changeMergeKey({ path: replaced.path, segment: 'earlier' })
+      const existingEarlier = byKey.get(earlierKey)
+      if (existingEarlier === undefined || existingEarlier.at < replaced.at) {
+        // 「更早」压成一条 ⇒ 取**较新**那一跳的末版本，但基线沿用原更早那条（= 轮前段起点），
+        // 否则基线会退化成"上一跳之前"，把更早那段的开头丢掉。
+        byKey.set(earlierKey, {
+          ...replaced,
+          segment: 'earlier',
+          ...(existingEarlier?.beforeVersion === undefined
+            ? {}
+            : { beforeVersion: existingEarlier.beforeVersion }),
+        })
+      }
+    }
+    const current = byKey.get(key)
     if (current === undefined || event.at >= current.at) {
-      byPath.set(event.path, {
+      byKey.set(key, {
         path: event.path,
         type: event.type,
         version: event.version,
         actor: event.actor,
         actorId: event.actorId,
         at: event.at,
+        segment: 'current',
+        // ★ 2026-10-28：基线必须跟着**这一跳**走。本轮 = 该文件最近一次保存 ⇒ 基线 = 前一版
+        //   （`version - 1`，与服务端 `beforeOf` 同口径）。不能沿用被顶掉那条的基线 ——
+        //   那会把"33→44 这次"显示成"轮初→44"，正是用户指出的问题。
+        ...(event.version === null || event.version <= 1 ? {} : { beforeVersion: event.version - 1 }),
       })
     }
   }
-  return [...byPath.values()].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+  return [...byKey.values()].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+}
+
+/**
+ * 把「最近变更」清单按**轮次**切成两段：`本轮`（`at >= 轮起点`）与 `更早`。
+ *
+ * ★ 2026-10-28（用户定案）：面板原来是一条扁平列表，标题叫「最近变更」，很容易被误读成
+ *   "这一轮改了什么"；实际它是**本会话工作区历来的改动**（见 `listWorkspaceChanges` 的全量口径）。
+ *   这里按后端回的**本轮窗口**（`round.start`）分组，让"本轮"与"更早"一眼分开。
+ *
+ * ★ 2026-10-28 追加（用户定案）：同一路径两段都动过时**各留一条**。服务端已经把每条的 `segment`
+ *   标好了（`current`/`earlier`），这里**以标记为准**；只有标记缺省时（旧响应 / 实时事件）
+ *   才退回时间比较。两条各自带自己那一段的版本范围，才是"能看出两段都动过这个文件"。
+ *
+ * 纯函数（不碰时间以外的东西），`verify:workspace-ui` 可直接断言：
+ *   · `round === undefined`（从没派过活 / 新会话）⇒ 全部算「更早」，不编造一个空「本轮」；
+ *   · 边界取 `>=`（起点那一刻的写入算**本轮**，与 `listWorkspaceChanges(since)` 同口径）；
+ *   · 两段各自保持入参顺序（调用方已按 `at` 倒序），不重排。
+ */
+export function groupWorkspaceChangesByRound(
+  changes: readonly WorkspaceChangeEntry[],
+  round: { start: string; end?: string } | undefined,
+): { current: WorkspaceChangeEntry[]; earlier: WorkspaceChangeEntry[] } {
+  if (round === undefined) return { current: [], earlier: [...changes] }
+  const startMs = Date.parse(round.start)
+  if (Number.isNaN(startMs)) return { current: [], earlier: [...changes] }
+  const current: WorkspaceChangeEntry[] = []
+  const earlier: WorkspaceChangeEntry[] = []
+  for (const change of changes) {
+    if (change.segment !== undefined) {
+      // 服务端标的段优先（它就是"按轮分段、同路径两条"的真相）
+      if (change.segment === 'current') current.push(change)
+      else earlier.push(change)
+      continue
+    }
+    const at = Date.parse(change.at)
+    // 兜底：`at` 解析不了 ⇒ 算「更早」（宁可少标本轮，也不把旧的冒充成本轮）
+    if (!Number.isNaN(at) && at >= startMs) current.push(change)
+    else earlier.push(change)
+  }
+  return { current, earlier }
 }
 
 /** 撤销落点动作 → 人读文案（「撤销本轮」报告用；纯展示） */
