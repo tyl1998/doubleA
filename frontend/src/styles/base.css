@@ -10,12 +10,23 @@
   box-sizing: border-box;
 }
 
+/* 视口级裁切（2026-10-29 用户反馈「hover `?` 时屏幕闪一下、中间列变窄、右边冒出整体滚动条」）：
+   `.app-shell` 是 `height: 100vh` 的单屏外壳，文档本身**不该滚**。但左侧会话栏的列表
+   （`.convrail__list`，可能高达 1600px+）是 `overflow: visible`、伸到视口外，只靠
+   `.convrail__convos-body` 裁住；一旦有任何浮层（AntD Tooltip 的 `.ant-tooltip`）在 hover 时
+   让文档高度多出 1~2px，`html` 就会渲染**纵向滚动条**，它吞掉 11px 宽度 ⇒ 文档宽度
+   `1600 → 1589`、中间列被挤窄 ⇒ 看起来就是「闪一下 + 变宽」。
+   在根上裁掉两个方向：纵向溢出不再产生滚动条（仍是单屏外壳，没有需要整页滚动的页面），
+   横向同理（各个滚动容器自己管）。⚠️ `html` 与 `body` 都要写：`body` 的 `overflow` 会传播到
+   视口，只写一边时另一边的旧值仍可能生效。 */
 html {
   -webkit-text-size-adjust: 100%;
+  overflow: hidden;
 }
 
 body {
   margin: 0;
+  overflow: hidden;
   background-color: var(--paper);
   color: var(--ink);
   font-family: var(--font-body);

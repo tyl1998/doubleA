@@ -156,6 +156,8 @@ export const AssistantMessage = memo(function AssistantMessage({
               text={view.text}
               tools={view.tools}
               thinkingSegments={view.thinkingSegments}
+              // 2026-10-29：Mermaid 图流式期间不渲染（半截语法 / 每帧重排），结束后再渲染
+              streaming={view.status === 'streaming'}
               {...(view.status === 'streaming'
                 ? { streamingThinkingIndex: view.thinkingSegments.length - 1 }
                 : {})}

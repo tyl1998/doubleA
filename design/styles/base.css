@@ -10,10 +10,13 @@
 
 html {
   -webkit-text-size-adjust: 100%;
+  /* 单屏外壳：根上裁掉溢出，浮层让文档高 1~2px 时不会再冒出纵向滚动条把整页挤窄 */
+  overflow: hidden;
 }
 
 body {
   margin: 0;
+  overflow: hidden;
   background-color: var(--paper);
   color: var(--ink);
   font-family: var(--font-body);

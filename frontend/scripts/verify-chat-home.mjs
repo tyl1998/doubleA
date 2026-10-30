@@ -437,6 +437,70 @@ it('G5 会话历史：卡片样式切换 + 滑块仅 hover 显形', () => {
   includes(css, ".conv[data-mode='compact']", '省略模式样式存在')
 })
 
+it('G6 根上裁掉溢出：浮层让文档高 1~2px 时不再冒纵向滚动条把整页挤窄', () => {
+  // 2026-10-29 用户反馈「hover ? 时屏幕闪一下、中间列变窄、右边出现整体滚动条」。
+  // 实测（1600×950）：hover 前 doc 1600 / 高 950；hover 后 doc 1589 / 高 952 ⇒ 纵向滚动条吞掉 11px。
+  // 单屏外壳（`.app-shell` 是 100vh）本来就不该整页滚 ⇒ `html` 与 `body` 都裁掉。
+  const base = read('../src/styles/base.css')
+  const htmlRule = base.slice(base.indexOf('html {'), base.indexOf('html {') + 200)
+  const bodyRule = base.slice(base.indexOf('body {'), base.indexOf('body {') + 200)
+  includes(htmlRule, 'overflow: hidden;', 'html 裁掉溢出')
+  includes(bodyRule, 'overflow: hidden;', 'body 裁掉溢出（body 的 overflow 会传播到视口）')
+  // 视觉真相来源同步（`base.css` 头注释要求两边逐字对齐）
+  const designBase = read('../../design/styles/base.css')
+  includes(designBase, 'overflow: hidden;', 'design/styles/base.css 同步')
+})
+
+it('G7 Mermaid 图表：正文围栏渲染 + 缩放 + 原文，且流式期间只显示源码', () => {
+  // 2026-10-29 用户需求：「返回了流程图，能渲染吗（支持放大缩小原文查看）」
+  const markdown = read('../src/features/chat/AssistantMarkdown.tsx')
+  includes(markdown, "import { MermaidBlock } from './MermaidBlock.js'", '接回点：AssistantMarkdown')
+  includes(markdown, "language !== 'mermaid'", '只拦 mermaid 围栏，其它语言原样是 code')
+  includes(markdown, 'streaming?: boolean', '有流式标记（流式期间不渲染图表）')
+  const message = read('../src/features/chat/AssistantMessage.tsx')
+  includes(message, "streaming={view.status === 'streaming'}", 'AssistantMessage 把流式状态传下去')
+
+  const block = read('../src/features/chat/MermaidBlock.tsx')
+  // 按需加载：mermaid 必须走动态 import，否则首屏白背几百 KB
+  includes(block, "import('mermaid')", 'mermaid 动态 import（独立 chunk）')
+  notIncludes(block, "from 'mermaid'", '不得静态 import mermaid')
+  includes(block, "securityLevel: 'strict'", '外部输入 ⇒ strict')
+  includes(block, 'svgLooksSafe', 'SVG 再过一道自有安全闸')
+  // 三件能力：缩放、原文、失败回落
+  includes(block, 'MIN_SCALE', '缩放下限')
+  includes(block, 'MAX_SCALE', '缩放上限')
+  includes(block, 'mermaidSource', '「原文」切换')
+  includes(block, 'mermaid-block__source', '源码区')
+  includes(block, 'mermaidFailed', '解析失败回落源码并说明')
+  // 流式期间不渲染
+  includes(block, 'if (streaming || source.trim() ===', '流式 / 空内容不渲染')
+  // 样式与 i18n
+  const css = read('../src/styles/app.css')
+  includes(css, '.mermaid-block__canvas', '画布样式')
+  const zh = read('../../shared/src/i18n/messages.zh.ts')
+  includes(zh, "'assistant.mermaidZoomIn'", '中文文案')
+})
+
+it('G8 围栏代码块可一键复制（Mermaid 块除外，它自带复制源码）', () => {
+  // 2026-10-30 用户需求：「聊天窗口渲染的代码块现在可以复制吗」⇒ 加块级复制按钮
+  const markdown = read('../src/features/chat/AssistantMarkdown.tsx')
+  includes(markdown, 'pre: components?.pre ?? CodeBlock', 'pre 覆盖接进唯一渲染路径')
+  const block = read('../src/features/chat/CodeBlock.tsx')
+  // 必须从渲染后的 DOM 取文本：`String(children)` 只会得到 [object Object]
+  includes(block, 'preRef.current?.textContent', '复制的是 DOM 上的纯文本')
+  // ⚠️ 只针对 CodeBlock：AssistantMarkdown 里的 `String(children)` 是给 Mermaid 取围栏源码的，不受此限
+  notIncludes(block, 'writeText(String(', '不得从 children 重建字符串')
+  includes(block, "querySelector('.mermaid-block')", 'Mermaid 块跳过（避免两个复制按钮）')
+  includes(block, 'codeCopyFailed', '复制失败不静默')
+  includes(block, 'data-testid="code-copy"', '按钮有稳定 testid')
+  const css = read('../src/styles/app.css')
+  // 按钮必须在滚动容器外面：装进 `pre` 会跟着横向滚动跑掉
+  includes(css, '.md__codeblock { position: relative; }', '相对定位的壳')
+  includes(css, '.md__codeblock:hover .md__codecopy', 'hover 才显形')
+  const zh = read('../../shared/src/i18n/messages.zh.ts')
+  includes(zh, "'assistant.codeCopy'", '中文文案')
+})
+
 // ───────────────────────────── H 新建对话模型 Key 预检（2026-10-16） ─────────────────────────────
 
 const { missingModelKeyProviders, partitionPoolModels, isConversationBlocked, pickUsableModelId } =

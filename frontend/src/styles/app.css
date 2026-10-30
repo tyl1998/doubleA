@@ -2529,3 +2529,96 @@
 .ws__retention-notice .ant-alert { padding: var(--sp-1) var(--sp-2); }
 .ws__retention-notice .ant-alert-message { font-size: var(--fs-2xs); font-weight: 600; }
 .ws__retention-notice .ant-alert-description { font-size: var(--fs-2xs); }
+
+/* ── Mermaid 图表块（2026-10-29：助手正文里的 ```mermaid 围栏）──────────────────
+   形态：工具栏（图表/原文切换 + 缩放 + 下载 + 复制）+ 画布（可缩放、可滚动）+ 源码兜底。
+   ⚠️ 画布用 `overflow: auto` 而不是 `hidden`：放大到 400% 后要能拖着看局部。 */
+.mermaid-block {
+  margin: 0;
+  padding: var(--sp-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.mermaid-block__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding-bottom: var(--sp-2);
+}
+.mermaid-block__label {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.mermaid-block__ops { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; }
+.mermaid-block__scale {
+  min-width: 40px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.mermaid-block__loading { display: flex; align-items: center; justify-content: center; padding: var(--sp-4); }
+.mermaid-block__canvas {
+  max-height: 60vh;
+  overflow: auto;
+  padding: var(--sp-2);
+  background: var(--surface-2);
+  border-radius: var(--r-sm);
+}
+/* 缩放轴在左上角（图表从左上开始放大，右侧 / 下方出现滚动条） */
+.mermaid-block__stage { transform-origin: 0 0; }
+.mermaid-block__stage svg { max-width: 100%; height: auto; }
+.mermaid-block__source {
+  margin: 0;
+  padding: var(--sp-2);
+  max-height: 40vh;
+  overflow: auto;
+  background: var(--surface-2);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.55;
+}
+.mermaid-block__source code { padding: 0; border: 0; background: none; }
+.mermaid-block__error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: var(--fs-2xs);
+  color: var(--danger);
+}
+
+/* ── 围栏代码块 + 复制按钮（2026-10-30）──────────────────────────────────────
+   壳是相对定位的容器：`pre` 自己横向滚动，按钮必须钉在可视区右上角（放进 `pre` 会跟着滚走）。 */
+.md__codeblock { position: relative; }
+.md__codeblock .md__codecopy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur-micro) ease-out, color var(--dur-micro) ease-out;
+}
+/* 默认隐身、hover 代码块或键盘聚焦时出现（与「复制全文」同款节奏；不占额外高度） */
+.md__codeblock:hover .md__codecopy,
+.md__codecopy:focus-visible { opacity: 1; }
+.md__codecopy:hover { color: var(--ink); border-color: var(--rule-strong); }
+.md__codecopy.is-copied { opacity: 1; color: var(--ok); border-color: var(--ok); }

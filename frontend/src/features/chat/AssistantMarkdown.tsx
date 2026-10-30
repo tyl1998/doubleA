@@ -33,12 +33,14 @@
  *         不影响任何契约、服务端或数据。所以"暂缓"是可逆的 —— 这也是能安心定案的前提。
  */
 
-import { useMemo, useRef } from 'react'
+import { useMemo, useRef, type ReactNode } from 'react'
 import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { PhrasingContent, Root, RootContent } from 'mdast'
 import type { Plugin } from 'unified'
 
+import { CodeBlock } from './CodeBlock.js'
+import { MermaidBlock } from './MermaidBlock.js'
 import { ThinkingBlock } from './ThinkingBlock.js'
 import { ToolCard } from './ToolCard.js'
 import type { ThinkingSegmentView, ToolCallView } from './messageModel.js'
@@ -248,6 +250,14 @@ export interface AssistantMarkdownProps {
   /** 思考段里**仍在生成**的那一段（其余段落已完成、默认折叠）；不传 = 都当已完成 */
   streamingThinkingIndex?: number
   /**
+   * 正文是否还在流式生成（2026-10-29，给 Mermaid 用）。
+   *
+   * 图表**流式期间不渲染**：围栏内容每帧都在变，每帧都跑一遍 mermaid 会让长回答卡住，
+   * 而且此刻多半是半截语法。流式时显示源码，结束后再渲染。
+   * 不传 = 已结束（历史消息 / 产物预览都是这个情形）。
+   */
+  streaming?: boolean
+  /**
    * 渲染器覆盖（**P0-3-10 新增，默认不给**）。
    *
    * 唯一的消费者是**产物预览里的 MD**（`components/ArtifactPreview/MarkdownPreview`）：
@@ -280,6 +290,7 @@ export function AssistantMarkdown({
   tools,
   thinkingSegments,
   streamingThinkingIndex,
+  streaming = false,
   components,
 }: AssistantMarkdownProps) {
   const hasTools = tools !== undefined && tools.length > 0
@@ -294,10 +305,41 @@ export function AssistantMarkdown({
   const streamingThinkingRef = useRef<number | undefined>(undefined)
   streamingThinkingRef.current = streamingThinkingIndex
 
+  /**
+   * Mermaid 围栏的渲染器（2026-10-29）。
+   *
+   * ⚠️ **无依赖的 useMemo**（type 必须稳定）：`components.code` 的函数引用就是元素 type，
+   * 每次渲染新建闭包会让整棵 `<pre>` 子树卸载重挂（与上面 `div` 那条注释同一个坑）。
+   * `streaming` 经 ref 读最新值 ⇒ 依赖数组可以留空。
+   */
+  const streamingRef = useRef(false)
+  streamingRef.current = streaming
+  const mermaidCodeRenderer = useMemo(
+    () =>
+      function MermaidCode({ className, children, ...props }: { className?: string; children?: ReactNode }) {
+        const language = /language-([\w-]+)/.exec(className ?? '')?.[1]?.toLowerCase()
+        if (language !== 'mermaid') {
+          return (
+            <code className={className} {...props}>
+              {children}
+            </code>
+          )
+        }
+        return <MermaidBlock source={String(children).replace(/\n$/, '')} streaming={streamingRef.current} />
+      },
+    [],
+  )
+
   const renderers = useMemo<Components | undefined>(() => {
-    if (!hasInline) return components
-    return {
+    const base: Components = {
       ...components,
+      // 2026-10-30：围栏代码块加「复制」按钮（Mermaid 块自带，`CodeBlock` 内部会跳过）
+      pre: components?.pre ?? CodeBlock,
+      code: mermaidCodeRenderer as Components['code'],
+    }
+    if (!hasInline) return base
+    return {
+      ...base,
       div: ({ node, ...props }) => {
         const toolId = node?.properties?.['dataToolId']
         if (toolId !== undefined) {
@@ -315,7 +357,7 @@ export function AssistantMarkdown({
         return <div {...props} />
       },
     }
-  }, [components, hasInline])
+  }, [components, hasInline, mermaidCodeRenderer])
 
   // 插件数组本身不参与元素 type 判定（同步版 Markdown 每帧都会重跑解析），
   // 但它决定"条目插在哪" ⇒ 只在清单变化时重建（正文增量不重建）。

@@ -60,6 +60,96 @@ const MARKDOWN_PACKAGES = new Set([
 const STATE_PACKAGES = new Set(['@tanstack/react-query', 'zustand', 'use-sync-external-store'])
 
 /**
+ * Mermaid 图表（2026-10-29）：**必须独立成块**。
+ *
+ * 它由 `MermaidBlock.tsx` 的 `import('mermaid')` **动态**引入 —— 只有出现 ```mermaid 围栏时才下载。
+ * 但 `manualChunks` 里遇到不认识的包会落到 `vendor`，而 `vendor` 是**首屏同步加载**的
+ * ⇒ 按需加载会**静默失效**：构建照样成功、代码也没错，只是每个访客都白下几 MB
+ * （实测并进 vendor 后那块从 162 kB 涨到 5.9 MB）。
+ * 这里显式点名它（连它的依赖一起），让 rollup 把它切成独立 chunk、只在用到的页面拉取。
+ */
+const MERMAID_PACKAGES = new Set(['mermaid'])
+
+/**
+ * Mermaid 的渲染依赖（同样是它专属的巨型包）。
+ *
+ * ⚠️ **只列 mermaid 独占的**：`dayjs` / `lodash-es` 之类既被它用、也被别处用的**不列**，
+ * 否则会把公共包从 `vendor` 拽进 mermaid 块 ⇒ 不用图表的人反而要多下一个 chunk
+ * （那种分叉不会报错，只是首屏变慢）。
+ */
+const MERMAID_SUPPORT_PACKAGES = new Set([
+  'd3',
+  'd3-array',
+  'd3-axis',
+  'd3-brush',
+  'd3-chord',
+  'd3-color',
+  'd3-contour',
+  'd3-delaunay',
+  'd3-dispatch',
+  'd3-drag',
+  'd3-dsv',
+  'd3-ease',
+  'd3-fetch',
+  'd3-force',
+  'd3-format',
+  'd3-geo',
+  'd3-hierarchy',
+  'd3-interpolate',
+  'd3-path',
+  'd3-polygon',
+  'd3-quadtree',
+  'd3-random',
+  'd3-scale',
+  'd3-scale-chromatic',
+  'd3-selection',
+  'd3-shape',
+  'd3-time',
+  'd3-time-format',
+  'd3-timer',
+  'd3-transition',
+  'd3-zoom',
+  'dagre-d3-es',
+  'cytoscape',
+  'cytoscape-cose-bilkent',
+  'cytoscape-fcose',
+  'elkjs',
+  'katex',
+  'dompurify',
+  'roughjs',
+  'stylis',
+  // mermaid 12 的解析器与图标依赖（同为它独占；实测不列这些会让 vendor 从 162 kB 涨到 1.8 MB）
+  'langium',
+  'chevrotain',
+  'chevrotain-allstar',
+  'vscode-languageserver',
+  'vscode-languageserver-types',
+  'vscode-jsonrpc',
+  'vscode-languageserver-textdocument',
+  'vscode-uri',
+  'marked',
+  'uuid',
+  'ts-dedent',
+  '@braintree/sanitize-url',
+  '@iconify/utils',
+  '@iconify/types',
+  '@mermaid-js/parser',
+  'd3-sankey',
+  'es-toolkit',
+  'khroma',
+  '@upsetjs/venn.js',
+  // 上面那些包的下级依赖（同样只被 mermaid 用；漏一个就会把整串拖进 vendor）
+  'cose-base',
+  'layout-base',
+  'cytoscape-cose-bilkent',
+  'internmap',
+  'lodash-es',
+  '@chevrotain/gast',
+  '@chevrotain/regexp-to-ast',
+  '@chevrotain/utils',
+])
+
+/**
  * 前端构建配置
  *
  * 关键约定（docs/06 §二·补「构建与部署分离约定」）：
@@ -179,6 +269,8 @@ export default defineConfig({
           if (REACT_PACKAGES.has(pkg)) return 'react'
           if (MARKDOWN_PACKAGES.has(pkg) || pkg.startsWith('micromark') || pkg.startsWith('mdast-')) return 'markdown'
           if (STATE_PACKAGES.has(pkg)) return 'state'
+          // Mermaid 及其依赖（d3 / dagre / cytoscape / elk / katex 等）单独成块，保住按需加载
+          if (MERMAID_PACKAGES.has(pkg) || MERMAID_SUPPORT_PACKAGES.has(pkg)) return 'mermaid'
           if (ANTD_PACKAGES.has(pkg)) return 'antd'
           // `@ant-design/*` 与 `rc-*` **必须同块**：`@ant-design/cssinjs-utils` 依赖 `rc-util`，
           // 分开两块会立刻得到 `Circular chunk: antd -> vendor -> antd`（实测）
