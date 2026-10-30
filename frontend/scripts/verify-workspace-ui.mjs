@@ -55,6 +55,7 @@ const {
   flattenWorkspaceTree,
   fileIconKind,
   isImageMime,
+  workspacePreviewKindOf,
   workspaceLanguageLabel,
   clampWorkspacePanelWidth,
   WORKSPACE_PANEL_MIN_W,
@@ -265,6 +266,25 @@ it('W20 isImageMime：image/* 才是图片', () => {
   eq(isImageMime('IMAGE/JPEG'), true, '大小写不敏感')
   eq(isImageMime('application/pdf'), false, 'pdf 不是')
   eq(isImageMime(null), false, '空安全')
+})
+it('W20b workspacePreviewKindOf：只读文件该用哪个渲染器（2026-10-30）', () => {
+  eq(workspacePreviewKindOf('image/png'), 'image', 'png → <img>')
+  eq(workspacePreviewKindOf('application/pdf'), 'pdf', 'pdf → iframe（不加 sandbox）')
+  eq(workspacePreviewKindOf('image/svg+xml'), 'html', 'SVG 归 html 一族，不放进 <img>')
+  eq(workspacePreviewKindOf('text/html'), 'html', 'html → 沙箱 iframe')
+  eq(
+    workspacePreviewKindOf('application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+    'docx',
+    'docx → 服务端渲染出口',
+  )
+  eq(
+    workspacePreviewKindOf('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+    'xlsx',
+    'xlsx → 服务端渲染出口',
+  )
+  eq(workspacePreviewKindOf('text/plain'), null, '文本走编辑器，不走预览')
+  eq(workspacePreviewKindOf('application/octet-stream'), null, '未知类型只能下载')
+  eq(workspacePreviewKindOf(null), null, '空安全')
 })
 it('W21 workspaceLanguageLabel：语言 id → 人读文案', () => {
   eq(workspaceLanguageLabel('typescript', ZH), 'TypeScript', 'ts')

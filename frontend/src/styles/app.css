@@ -1558,6 +1558,18 @@
 }
 .ws__image img { max-width: 100%; max-height: 100%; object-fit: contain; }
 
+/*
+ * 只读文件的 iframe 预览（PDF / HTML·SVG / docx·xlsx 渲染出口）—— 与 `.preview__frame` 不同，
+ * 它要**撑满编辑器区域**（不在弹层里，没有 220px 的壳）。
+ */
+.ws__frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: var(--surface);
+}
+
 .ws__status {
   flex: 0 0 auto;
   display: flex;

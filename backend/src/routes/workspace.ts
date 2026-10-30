@@ -28,7 +28,9 @@
 import { appMsg,
   AppError,
   conversationIdParamsSchema,
+  ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   isWorkspaceTextMime,
+  previewKindOf,
   normalizeWorkspacePath,
   ok,
   workspaceArtifactBodySchema,
@@ -54,9 +56,12 @@ import { appMsg,
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import { config } from '../config.js'
+import { getLogger } from '../infra/logger.js'
 import { requireAuthContext } from '../plugins/session.js'
 import { buildContentDisposition } from '../services/document.service.js'
-import { workspaceRawHeadersFor } from '../services/previewHeaders.js'
+import { renderDocxToHtml } from '../services/docxPreview.js'
+import { HTML_PREVIEW_CSP, workspaceRawHeadersFor } from '../services/previewHeaders.js'
+import { parseXlsx, renderXlsxToHtml } from '../services/xlsxPreview.js'
 import { SSE_RESPONSE_HEADERS } from '../orchestrator/sse.js'
 import { registerWorkspaceArtifact } from '../sandbox/index.js'
 import {
@@ -264,6 +269,58 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
         .header('cache-control', 'private, no-store')
       if (headers.csp !== null) reply.header('content-security-policy', headers.csp)
       return reply.send(source.body)
+    },
+  )
+
+  /**
+   * 渲染预览（`GET .../workspace/file/render?path=`，2026-10-30）—— **OOXML 专用**（DOCX / XLSX）。
+   *
+   * ★ 与产物那条 `GET /api/artifacts/:id/render` 是同一件事、同一套转换器
+   * （`renderDocxToHtml` / `renderXlsxToHtml`），只是取字节的来源不同：产物在 S3、工作区在宿主盘。
+   *
+   * ★ **为什么必须另开一条出口，而不是让 `/file/raw` 直接回 HTML**：`/raw` 是**字节代理**，
+   * `Content-Type` 的唯一来源是索引里的 `mime`（二进制 OOXML）⇒ 把它当 `text/html` 直出不安全。
+   * "取原始字节"与"渲染成 HTML"是两件事，必须是两条 URL（同产物预览那条的纪律）。
+   *
+   * ★ 前端只对 `previewKindOf(mime) ∈ {docx, xlsx}` 打这个端点，但 URL 可以手敲 ⇒ 按 mime
+   * **自己再判一次**，不是这两种形态一律 400。体积闸门同样复用 `ARTIFACT_PREVIEW_MAX_INLINE_BYTES`
+   * （与前端同一个常量，前后端同源）；`/raw` 没有这条闸门（它是流式的），这里必须先拦。
+   */
+  app.get<{ Params: ConversationIdParams; Querystring: WorkspacePathQuery }>(
+    '/api/conversations/:id/workspace/file/render',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema, querystring: workspacePathQuerySchema } },
+    async (request, reply) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      const source = await openWorkspaceFileSource(request.params.id, request.query.path)
+      const kind = previewKindOf(source.mime)
+      if (kind !== 'docx' && kind !== 'xlsx') {
+        throw AppError.validation(appMsg('app.m090'))
+      }
+      if (source.size > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) {
+        throw AppError.validation(appMsg('app.m019'))
+      }
+
+      let html: string
+      try {
+        html =
+          kind === 'xlsx'
+            ? renderXlsxToHtml(parseXlsx(source.body), source.path)
+            : await renderDocxToHtml(source.body, source.path)
+      } catch (error) {
+        // 走到这里基本是"不是合法 OOXML"（损坏 / 改名 / 截断）—— 与产物那条同口径。
+        if (error instanceof AppError) throw error
+        getLogger().warn({ err: error, path: source.path, kind }, '工作区 OOXML 渲染失败')
+        throw AppError.validation(appMsg('app.m091'))
+      }
+
+      return reply
+        .header('content-type', 'text/html; charset=utf-8')
+        .header('content-security-policy', HTML_PREVIEW_CSP)
+        .header('content-disposition', buildContentDisposition(source.path, { disposition: 'inline' }))
+        .header('x-content-type-options', 'nosniff')
+        .header('cache-control', 'private, no-store')
+        .send(html)
     },
   )
 

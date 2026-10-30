@@ -283,11 +283,44 @@ export async function openWorkspaceFileSource(conversationId: string, rawPath: u
   return {
     path: row.path,
     size: body.byteLength,
-    mime: row.mime,
+    mime: (await refreshUnknownMime(conversationId, row)) ?? row.mime,
     version: row.version,
     body,
     binary: workspaceContentIsBinary(body),
   }
+}
+
+/**
+ * 索引里的 `mime` 是 `application/octet-stream` 时**按路径重算一次**（2026-10-30）。
+ *
+ * ★ 为什么要有：`mime` 在**写入索引那一刻**按扩展名定死（`workspaceMimeOf`），而扩展名表是会长的。
+ * 2026-10-30 给工作区表补了 `.docx` / `.xlsx` 等 —— 但**旧会话的索引行早就是 `octet-stream`**，
+ * 不重算的话，那些会话里已有的 docx / xlsx 永远只能下载（文件没变，索引不会自己更新）。
+ *
+ * 口径（窄到不会误伤）：
+ *   · **只**在"库里是 `octet-stream` 且按路径现在能认出具体 mime"时改 —— 认不出的仍原样（不嗅探）；
+ *   · 只回填 `workspace_files` 的**当前态**（历史版本行不动：它的 mime 是当时的结论）；
+ *   · 写失败**不影响本次读**（回退到原来的值）—— 这只是让预览能用，不该让读文件失败。
+ *
+ * @returns 重算后的 mime；不需要改 / 改失败时为 `null`（调用方沿用 `row.mime`）
+ */
+async function refreshUnknownMime(
+  conversationId: string,
+  row: { path: string; mime: string },
+): Promise<string | null> {
+  if (row.mime !== 'application/octet-stream') return null
+  const derived = workspaceMimeOf(row.path)
+  if (derived === 'application/octet-stream') return null
+  try {
+    await getPrisma().workspaceFile.updateMany({
+      where: { conversationId, path: row.path, mime: 'application/octet-stream' },
+      data: { mime: derived },
+    })
+  } catch (error) {
+    getLogger().warn({ err: error, path: row.path }, '回填 workspace_files.mime 失败（沿用旧值）')
+    return null
+  }
+  return derived
 }
 
 /**

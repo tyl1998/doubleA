@@ -14,9 +14,11 @@ import {
   isGitInternalPath as sharedIsGitInternalPath,
   isWorkspaceTextMime,
   isWorkspaceHiddenPath,
+  previewKindOf,
   translate,
   type Locale,
   type MessageKey,
+  type PreviewKind,
   type WorkspaceChangeEntry,
   type WorkspaceEventItem,
   type WorkspaceFileEntry,
@@ -578,6 +580,25 @@ export function fileIconKind(path: string): WorkspaceFileIconKind {
 export function isImageMime(mime: string | null | undefined): boolean {
   if (typeof mime !== 'string') return false
   return mime.trim().toLowerCase().startsWith('image/')
+}
+
+/**
+ * 只读文件的**预览形态**（`previewKindOf` 的工作区口径）。
+ *
+ * ⚠️ 与 {@link isImageMime} 的分工：后者是"能不能塞进 `<img>`"，前者是"该用哪个渲染器"。
+ * SVG 是 `image/*` 却**不是**图片那一支 —— 它是能带 `<script>` 的文档，走沙箱 iframe
+ * （与产物预览同一条纪律，见 `shared#previewKindOf` 判据 ②）；把它放进 `<img>` 只会空白。
+ *
+ * 只在**不可编辑**时被调用（可编辑的一律是 CodeMirror），所以这里只回答"剩下的怎么展示"：
+ *   · `image` → `<img>`（raw 出口）
+ *   · `html` / `pdf` → 沙箱 iframe / 浏览器 viewer（raw 出口）
+ *   · `docx` / `xlsx` → 服务端渲染出口（`.../workspace/file/render`）
+ *   · 其余 → `null`（"只能下载"的占位文案）
+ */
+export function workspacePreviewKindOf(mime: string | null | undefined): PreviewKind | null {
+  const kind = previewKindOf(mime)
+  if (kind === 'none' || kind === 'text') return null
+  return kind
 }
 
 /** 编辑器语言 id → 状态栏人读文案（纯展示） */

@@ -32,6 +32,7 @@
 
 import { z } from 'zod'
 
+import { DOCX_MIME, XLSX_MIME } from './conversation.js'
 import { validationMessage } from './i18n/validation.js'
 
 import type { MessageKey } from './i18n/index.js'
@@ -815,7 +816,18 @@ export const WORKSPACE_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   gif: 'image/gif',
   webp: 'image/webp',
   bmp: 'image/bmp',
+  ico: 'image/x-icon',
   pdf: 'application/pdf',
+  // OOXML / 老式 Office：**只定"是什么"**（能不能在线预览由 `previewKindOf` 决定 —— docx/xlsx
+  // 走服务端渲染出口，其余仍是"只能下载"）。漏掉它们会让 agent 生成的 docx 落进
+  // `application/octet-stream`，连"这是什么文件"都说不出来（2026-10-30 用户反馈）。
+  docx: DOCX_MIME,
+  xlsx: XLSX_MIME,
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  doc: 'application/msword',
+  xls: 'application/vnd.ms-excel',
+  ppt: 'application/vnd.ms-powerpoint',
+  zip: 'application/zip',
   py: 'text/x-python',
   js: 'text/javascript',
   mjs: 'text/javascript',

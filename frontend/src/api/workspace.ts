@@ -288,6 +288,18 @@ export function workspaceRawUrl(conversationId: string, path: string): string {
 }
 
 /**
+ * 文件的**渲染出口 URL**（`GET .../workspace/file/render?path=`，docx / xlsx 专用）。
+ *
+ * ⚠️ 与 {@link workspaceRawUrl} 是**两条出口**，不是一个端点加参数：raw 回原始字节
+ * （OOXML 是二进制，只能 `octet-stream` + `attachment`），render 回服务端转好的 HTML
+ * （`text/html` + CSP `sandbox`）。跟产物那边的 `/content` 与 `/render` 是同一条纪律。
+ */
+export function workspaceRenderUrl(conversationId: string, path: string): string {
+  const query = new URLSearchParams({ path }).toString()
+  return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/render?${query}`
+}
+
+/**
  * 目录下载为 zip 的 URL（`GET .../workspace/dir/zip?path=`，2026-10-29）。
  *
  * 返回 URL 而不是 Promise：调用方用 `<a download>` 直接触发（与单文件下载同款）——

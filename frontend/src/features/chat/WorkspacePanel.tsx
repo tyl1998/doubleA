@@ -65,6 +65,7 @@ import {
   type WorkspaceRevertScope,
   type WorkspaceRevertSkipReason,
   type WorkspaceRetentionInfo,
+  type PreviewKind,
 } from '@doubulea/shared'
 
 import { ApiError } from '../../api/client.js'
@@ -90,6 +91,7 @@ import {
   workspaceGitQueryKey,
   useWorkspaceRetention,
   workspaceRawUrl,
+  workspaceRenderUrl,
   workspaceTreeQueryKey,
 } from '../../api/workspace.js'
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
@@ -109,7 +111,6 @@ import {
   isContentEvent,
   isEditableRead,
   isGitInternalPath,
-  isImageMime,
   isWorkspacePathInDir,
   WORKSPACE_RECENT_MAX_PER_GROUP,
   WORKSPACE_RETENTION_NOTICE_DAYS,
@@ -118,6 +119,7 @@ import {
   revertActionLabel,
   revertSummaryText,
   toggleExpandedDir,
+  workspacePreviewKindOf,
   workspaceAncestorDirs,
   workspaceBaseName,
   workspaceChangeGrouping,
@@ -407,6 +409,11 @@ export function WorkspacePanel({
 
   const activeDoc = activePath === null ? undefined : docs[activePath]
   const editable = fileQuery.data !== undefined && isEditableRead(fileQuery.data)
+  /**
+   * 只读文件的预览形态（`null` = 没有在线预览，只给下载占位）。
+   * ⚠️ 可编辑的一律走 CodeMirror，不经过它（判据只在 `workspacePreviewKindOf` 一处）。
+   */
+  const previewKind = editable || fileQuery.data === undefined ? null : workspacePreviewKindOf(fileQuery.data.mime)
   const dirty = activeDoc !== undefined && activeDoc.text !== activeDoc.baseText
 
   const editText = (path: string, text: string): void => {
@@ -1477,10 +1484,18 @@ export function WorkspacePanel({
                           if (dirty && savingPath === null) void save(activePath)
                         }}
                       />
-                    ) : isImageMime(fileQuery.data?.mime) ? (
-                      <WorkspaceImagePreview
-                        url={workspaceRawUrl(conversationId, activePath)}
-                        alt={activePath}
+                    ) : previewKind !== null ? (
+                      /*
+                        ★ 2026-10-30（用户反馈「Code 模式下图片 / docx 不能预览」）：只读文件不再一律
+                        落到"只能下载"占位 —— 按 `previewKindOf` 分派（与产物预览**同一个判据**）：
+                        image → `<img>`；html / pdf → 沙箱 iframe；docx / xlsx → 服务端渲染出口。
+                        ⚠️ SVG 是 `image/*` 但归 html 一族（能带脚本），绝不能丢进 `<img>`。
+                      */
+                      <WorkspaceFilePreview
+                        kind={previewKind}
+                        rawUrl={workspaceRawUrl(conversationId, activePath)}
+                        renderUrl={workspaceRenderUrl(conversationId, activePath)}
+                        name={activePath}
                       />
                     ) : (
                       <div className="ws__placeholder">
@@ -2037,6 +2052,38 @@ const FILE_ICON_NODES: Record<WorkspaceFileIconKind, ReactNode> = {
   shell: <CodeOutlined />,
   yaml: <FileOutlined />,
   text: <FileOutlined />,
+}
+
+/**
+ * 只读文件的**在线预览**（2026-10-30）—— 按 `previewKindOf` 分派，与产物预览同一套判据。
+ *
+ *   · `image` → `<img>`（raw 出口）。失败给因由，同 `ArtifactPreview/ImagePreview` 的纪律；
+ *   · `html`（含 SVG）→ **沙箱 iframe** 打 raw 出口：脚本不给、同源不给 —— 隔离头由后端
+ *     `HTML_PREVIEW_CSP` 上（响应头才是第一道，`sandbox=""` 只是第二道，同 `HtmlPreview`）；
+ *   · `pdf` → iframe 打 raw 出口，**刻意不加 `sandbox`**（加了浏览器内置 viewer 渲染不出来）；
+ *   · `docx` / `xlsx` → iframe 打**渲染出口**（服务端 mammoth / xlsx 读取器转成 HTML），
+ *     与 html 那一路同款沙箱。
+ *
+ * ⚠️ SVG 会不会落到 `image`？不会 —— `previewKindOf` 把它归 `html`（见那里的判据 ②）。
+ */
+function WorkspaceFilePreview(props: {
+  kind: PreviewKind
+  rawUrl: string
+  renderUrl: string
+  name: string
+}) {
+  if (props.kind === 'image') return <WorkspaceImagePreview url={props.rawUrl} alt={props.name} />
+  const sandboxed = props.kind !== 'pdf'
+  return (
+    <iframe
+      className="ws__frame"
+      src={props.kind === 'docx' || props.kind === 'xlsx' ? props.renderUrl : props.rawUrl}
+      /* HTML/SVG/渲染出来的 OOXML：空串 = 最严格（不含 allow-scripts / allow-same-origin） */
+      {...(sandboxed ? { sandbox: '' } : {})}
+      referrerPolicy="no-referrer"
+      title={props.name}
+    />
+  )
 }
 
 /** 只读图片预览（内联；失败给因由，同 `ArtifactPreview/ImagePreview` 的纪律） */
