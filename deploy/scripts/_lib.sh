@@ -120,7 +120,7 @@ detect_platform() {
 # 宿主 docker.sock 的 gid。
 #
 # ⚠️ **必须按"容器内看到的属主"取**，不能只看宿主 stat（2026-10-20 实测）：
-#   OrbStack 上宿主是 `srw-rw---- atan:staff`（gid=1，= macOS 的 daemon 组），
+#   OrbStack 上宿主是 `srw-rw---- <user>:staff`（gid=1，= macOS 的 daemon 组），
 #   但挂进 Linux 容器后是 `srw-rw---- root:root`（gid=0）。
 #   照宿主取值 ⇒ `--group-add 1` 加了个容器里无关的组 ⇒ 后端访问 socket 报
 #   `permission denied`，实例自检 docker 项红，沙箱完全起不来。

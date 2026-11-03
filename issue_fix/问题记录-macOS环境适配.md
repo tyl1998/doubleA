@@ -59,7 +59,7 @@ npm 会先把 `--` 原样带进 argv，故 `infra.mjs` 里要 `.filter(a => a !=
 
 ```
 $ lsof -nP -iTCP:5432 -sTCP:LISTEN
-OrbStack  30519 atan  206u  IPv4 ... TCP *:5432 (LISTEN)
+OrbStack  30519 <user>  206u  IPv4 ... TCP *:5432 (LISTEN)
 ```
 
 四个端口全被 `OrbStack` 代理监听 —— 实为**另一个项目**（`apitest-server`）的
