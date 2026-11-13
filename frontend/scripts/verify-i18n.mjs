@@ -405,6 +405,11 @@ const COVERED = [
   'src/features/chat/chatStream.ts',
   'src/features/chat/sseParser.ts',
   'src/app/locale.ts',
+  // ── P1-24a-2：Skill 管理面（列表 / 详情 / Agent 表单 Skill 区）──
+  'src/pages/skills/SkillListPage.tsx',
+  'src/pages/skills/SkillDetailPage.tsx',
+  'src/pages/skills/skillModel.tsx',
+  'src/api/skills.ts',
 ]
 
 for (const file of COVERED) {

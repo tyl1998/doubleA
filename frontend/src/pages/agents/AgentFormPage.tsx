@@ -76,9 +76,11 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { useAgent, useCreateAgent, useReplaceAgentComponents, useUpdateAgent } from '../../api/agents.js'
 import { describeError } from '../../api/client.js'
+import { useCurrentUser } from '../../api/auth.js'
 import { useMyConversationCount } from '../../api/conversations.js'
 import { useKnowledgeBases } from '../../api/knowledgeBases.js'
 import { useMcpServers, useMcpServerTools, useMyCredentials } from '../../api/mcp.js'
+import { useSkills } from '../../api/skills.js'
 import { useAvailableChatModels } from '../../api/models.js'
 import { useFeedback } from '../../app/feedback.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
@@ -107,12 +109,16 @@ import {
   sameComponentSet,
   sectionOrdinal,
   sectionsOfUpdateBody,
+  skillIdsOf,
+  skillSelectionOf,
+  skillVersionsOf,
   submittableComponents,
   valuesFromAgent,
   type AgentFormValues,
   type AgentPageSectionKey,
   type AgentSectionKey,
 } from './agentModel.js'
+import { SkillBadge, skillBindability, visibleSkillsFor } from '../skills/skillModel.js'
 
 /**
  * 受众字段的 AntD 适配层（P1-18）：把 `Form.Item name="audience"` 的 `{ value, onChange }`
@@ -264,6 +270,15 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
   const [pinnedMcpTools, setPinnedMcpTools] = useState<Record<string, string[]>>(
     pinnedMcpToolsOf(initialComponents),
   )
+  /**
+   * 已勾选的 Skill（P1-24a-2）：`id → 固定版本`（`undefined` = 跟随最新版）。
+   *
+   * ⚠️ **值里必须带固定版本**：`PUT …/components` 是整体替换，提交时丢掉 `skillVersion`
+   * 等于把"固定 v3"悄悄改回"跟随最新"（`agentModel#skillSelectionOf` 的注释）。
+   */
+  const [selectedSkillVersions, setSelectedSkillVersions] = useState<Record<string, number | undefined>>(
+    skillVersionsOf(initialComponents),
+  )
   const [deleteOpen, setDeleteOpen] = useState(false)
 
   const item = initialItem ?? created
@@ -280,14 +295,33 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
    */
   const mcpQuery = useMcpServers()
   const credQuery = useMyCredentials()
+  /**
+   * Skill 清单（P1-24a-2）：数据源是 `GET /api/skills`（按"对我可见"过滤）。
+   * 只取第一页上限（200）—— 与知识库 / MCP 同款；超过时把条数如实写在块尾。
+   */
+  const skillQuery = useSkills({ limit: 200 })
+  /**
+   * 当前用户（判"他人的 sandbox Skill"用）：`skillBindability` 需要 `viewerId` / 是否 ADMIN，
+   * 与后端 `assertComponentRefsBindable` 的 403 判据同口径。未读到时不假装知道 —— 一律按"不是我的"。
+   */
+  const viewerQuery = useCurrentUser()
   const kbItems = kbQuery.data?.items ?? []
   const mcpItems = mcpQuery.data?.items ?? []
   const modelOptions = modelQuery.data?.items ?? []
 
-  const selectedComponents = [
+  const selectedComponents: AgentComponentInput[] = [
     ...knowledgeSelectionOf(selectedKbIds),
     ...mcpSelectionOf(selectedMcpIds, pinnedMcpTools),
+    ...skillSelectionOf(selectedSkillVersions),
   ]
+
+  /** Skill 列表（按 Agent 类型过滤：ChatBot 只列 INLINE，见 `skillModel#visibleSkillsFor`） */
+  const skillItems = visibleSkillsFor(skillQuery.data?.items ?? [], values.type)
+  const selectedSkillIds = skillIdsOf(selectedComponents)
+  /** 已勾选、但不在 Skill 清单里的 id（被删 / 对我不可见）——理由与知识库那条完全相同 */
+  const missingSkillIds =
+    skillQuery.data === undefined ? [] : selectedSkillIds.filter((id) => !skillItems.some((item) => item.id === id))
+  const viewerIsAdmin = viewerQuery.data?.role === 'ADMIN'
 
   /**
    * 已勾选、但**不在知识库列表里**的 id（列表重拉后消失的那些）。
@@ -322,9 +356,12 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
    * 脏区块 = 文本/模型字段的差异 ∪ 组件绑定的集合差异。
    *
    * ⚠️ 组件那一路比较的是 `submittableComponents(snapshot.components)` —— **P0-2-11 起它含
-   * `KNOWLEDGE` 与 `MCP` 两类**（`agentModel#submittableComponents` 是唯一的"哪些绑定会被提交"
-   * 判据）。少算一类 ⇒ 每次保存都白发一个 `PUT` 且永远显示"未保存"；多算一类 ⇒ 把不该动的
-   * 绑定一起交上去。两条都是没有编译期错误的错。
+   * `KNOWLEDGE` 与 `MCP` 两类，P1-24a-1 起再加 `SKILL`**（`agentModel#submittableComponents`
+   * 是唯一的"哪些绑定会被提交"判据）。少算一类 ⇒ 每次保存都白发一个 `PUT` 且永远显示"未保存"；
+   * 多算一类 ⇒ 把不该动的绑定一起交上去。两条都是没有编译期错误的错。
+   *
+   * ✅ **P1-24a-2 起 `SKILL` 也进 `selectedComponents`**（`skillSelectionOf`，值里带固定版本）——
+   *    a-1 时期那条"整体替换会解绑已绑定的 Skill"的边界到此关闭。
    */
   const componentsDirty = !sameComponentSet(submittableComponents(snapshot.components), selectedComponents)
   const dirtySections = orderSections([
@@ -437,7 +474,12 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
             body: { components: selectedComponents },
           })
           nextSnapshot.components = componentsFromAgent(updated)
+          // 固定版本以服务端回读为准（"整体替换"把库里真实存下的 config 带回来）
+          setSelectedSkillVersions(skillVersionsOf(componentsFromAgent(updated)))
         } catch (error) {
+          // ⚠️ Skill 的两条门禁（409 `SKILL_RUNTIME_NOT_ALLOWED` / 403 `SKILL_SANDBOX_FOREIGN_DENIED`）
+          //    在这里**原样端到 components 区块**（`toFailures` 直接展示 `ApiError.message`），
+          //    不静默回退、也不偷偷把那个 Skill 从勾选里去掉（`子方案` §5.2 第 4 条）。
           problems.push(...toFailures(['components'], error))
         }
       }
@@ -525,6 +567,16 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
         return next
       })
     }
+  }
+
+  /** Skill 多选的勾选/取消（与其他两类同款：最后勾的排在后面；取消即整条移除，含固定版本） */
+  const toggleSkill = (skillId: string, checked: boolean) => {
+    setSelectedSkillVersions((current) => {
+      const next = { ...current }
+      if (checked) next[skillId] = current[skillId]
+      else delete next[skillId]
+      return next
+    })
   }
 
   /** 设置某台 server 的常驻工具（P1-19）；空数组 = 清掉常驻 */
@@ -877,6 +929,85 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                 </div>
 
                 <div>
+                  <p className="block-label">{t('agentForm.skill')}</p>
+                  {skillQuery.isPending ? (
+                    <p className="ratio">{t('agentForm.skillLoading')}</p>
+                  ) : skillQuery.isError ? (
+                    <Alert
+                      type="error"
+                      showIcon
+                      message={t('agentForm.skillLoadFailed')}
+                      description={describeError(skillQuery.error).message}
+                      action={
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            void skillQuery.refetch()
+                          }}
+                        >
+                          {t('common.retry')}
+                        </Button>
+                      }
+                    />
+                  ) : skillItems.length === 0 ? (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message={values.type === 'CHATBOT' ? t('agentForm.noSkillChatbot') : t('agentForm.noSkill')}
+                    />
+                  ) : (
+                    <div className="stack stack--tight">
+                      {skillItems.map((skill) => {
+                        const verdict = skillBindability(skill, {
+                          agentType: values.type,
+                          viewerId: viewerQuery.data?.id,
+                          viewerIsAdmin,
+                        })
+                        return (
+                          <Checkbox
+                            className="pick"
+                            key={skill.id}
+                            checked={selectedSkillIds.includes(skill.id)}
+                            // 不可绑定的选项**置灰而不是隐藏**：藏起来会让"列表里有、表单里没有"变成要猜的事
+                            disabled={!verdict.selectable && !selectedSkillIds.includes(skill.id)}
+                            onChange={(event) => toggleSkill(skill.id, event.target.checked)}
+                          >
+                            <span className="pick__title">
+                              {skill.name}
+                              {skill.runtime === 'SANDBOX' && <SkillBadge runtime={skill.runtime} />}
+                            </span>
+                            <span className="pick__meta">
+                              {skill.description}
+                              {selectedSkillVersions[skill.id] !== undefined && (
+                                <> · {t('agentForm.skillPinned', { version: selectedSkillVersions[skill.id] ?? 0 })}</>
+                              )}
+                              {!verdict.selectable && (
+                                <> · <span className="ratio">{t(verdict.reasonKey)}</span></>
+                              )}
+                            </span>
+                          </Checkbox>
+                        )
+                      })}
+                      <span className="ratio">{t('agentForm.skillListNote', { count: skillItems.length })}</span>
+                    </div>
+                  )}
+
+                  {/* 已勾选但已不在清单里（被删 / 转私有）——理由与知识库那条同款：必须能取消勾选 */}
+                  {missingSkillIds.length > 0 && (
+                    <div className="stack stack--tight" style={{ marginTop: 'var(--sp-3)' }}>
+                      {missingSkillIds.map((skillId) => (
+                        <Checkbox key={skillId} className="pick" checked onChange={() => toggleSkill(skillId, false)}>
+                          <span className="pick__title">
+                            {t('agentForm.staleSkill')} <Tag className="tag--danger">{t('agentForm.unbindTag')}</Tag>
+                          </span>
+                          <span className="pick__meta">{t('agentForm.staleSkillMeta', { id: skillId })}</span>
+                        </Checkbox>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div>
                   <p className="block-label">{t('agentForm.mcpTools')}</p>
 
                   {mcpQuery.isPending ? (
@@ -1054,6 +1185,7 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
               />
               <SummaryRow label={t('agentForm.summaryKb')} value={t('agentForm.summaryKbCount', { count: selectedKbIds.length })} />
               <SummaryRow label={t('agentForm.summaryMcp')} value={t('agentForm.summaryMcpCount', { count: selectedMcpIds.length })} />
+              <SummaryRow label={t('agentForm.summarySkill')} value={t('agentForm.summarySkillCount', { count: selectedSkillIds.length })} />
 
               <SummaryRow
                 label={t('agentForm.summaryConversations')}

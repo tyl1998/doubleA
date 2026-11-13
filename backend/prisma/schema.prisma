@@ -101,10 +101,12 @@ enum AgentType {
   @@map("agent_type")
 }
 
-/// Agent 可绑定的组件类型（`01` 决策 7：仅知识库 + MCP 两种）
+/// Agent 可绑定的组件类型（`01` 决策 7 → 决策 39 修订：知识库 + MCP + **Skill** 三种）
 enum ComponentType {
   KNOWLEDGE
   MCP
+  /// P1-24a-1：Skill（`SKILL.md` + references/assets + 可选 scripts），见 `Skill` 模型
+  SKILL
 
   @@map("component_type")
 }
@@ -361,6 +363,10 @@ model User {
   userGroupMembers        UserGroupMember[]
   /// P1-18：本用户的 **per-user Provider 凭据**（各自 Key；见 `ProviderUserCredential`）
   providerUserCredentials ProviderUserCredential[]
+  /// P1-24a-1：本用户名下的 Skill（`skills.created_by` = 所属人）
+  skills                  Skill[]
+  /// P1-24a-2：本用户写下的 Skill 变更记录（`skill_changes.created_by`）
+  skillChanges            SkillChange[]           @relation("SkillChangeCreator")
 
   @@map("users")
 }
@@ -1631,4 +1637,165 @@ model TitleModelConfig {
   model Model? @relation("TitleModelConfigModel", fields: [modelId], references: [id], onDelete: SetNull)
 
   @@map("title_model_config")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Skill（P1-24a-1；`docs/子方案/Skill能力.md` §三）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Skill 的运行时要求（`SKILL.md` frontmatter 的 `requires.runtime`，DB 字段是**真相源**）
+///
+/// · `INLINE`  —— 只要说明 / 参考资料 ⇒ ChatBot 与 TaskAgent 都能绑；
+/// · `SANDBOX` —— 需要容器与脚本 ⇒ **只允许 TaskAgent**（ChatBot 绑定期 409 `SKILL_RUNTIME_NOT_ALLOWED`）。
+enum SkillRuntime {
+  INLINE
+  SANDBOX
+
+  @@map("skill_runtime")
+}
+
+/// Skill 的来源（"我的 Skills"里的来源徽标与审计；**不参与任何授权判定**）
+enum SkillSourceType {
+  /// 管理面手工创建
+  MANUAL
+  /// zip 导入
+  IMPORT
+  /// 从会话沉淀（P1-24c）
+  CONVERSATION
+
+  @@map("skill_source_type")
+}
+
+/// skills —— Skill 资产（"说明 + 参考资料 + 可选脚本"的可复用包；`子方案/Skill能力.md` §3.1）
+///
+/// 五条口径（每一条错了都只会在运行期才暴露）：
+///   · **`slug` 与 `(created_by, name)` 只在"未删除范围"内唯一** ⇒ 迁移里手写两条**部分唯一索引**
+///     （`WHERE deleted_at IS NULL`），Prisma 表达不了。刻意**不用** `@unique`：否则软删一条后
+///     它的 slug / name 永远占位、同名的再也建不出来。⇒ 服务层按 slug 查必须
+///     `findFirst({ where: { slug, deletedAt: null } })`，**不能**用 `findUnique`。
+///   · **`version` 是"整版快照号"**：改任何一个文件都 `version + 1`，并把当前全部文件以新版本号
+///     重新写一遍 `skill_files`（`skill_files.version` ≡ `skills.version`，没有单文件版本）。
+///   · **可见性只支持 `PRIVATE` / `PUBLIC`**（列复用 `AssetVisibility`，但服务层拒绝 `SHARED` ——
+///     Skill 没有受众表，声明 `SHARED` 会退化成"只有 owner / ADMIN 可见"）；判据见 `shared#canViewAsset`。
+///   · `storageKey` 是**当前版本**的 S3 前缀（`skills/{id}/v{version}/`）；旧版本按前缀回收**对象**，
+///     但 `skill_files` 行保留（历史审计到"版本 + 路径 + sha256"，见 `SkillFile`）。
+///   · `parentSkillId` 是 fork 来源，**逻辑引用、不建 FK**（上游删除后 fork 必须还能活）。
+model Skill {
+  id                   String          @id @default(uuid(7)) @db.Uuid
+  name                 String          @db.VarChar(128)
+  /// 未删除范围内全局唯一；部分唯一索引 `(slug) WHERE deleted_at IS NULL`（Prisma 不表达）
+  slug                 String          @db.VarChar(128)
+  /// 模型选择 Skill 的**唯一依据**（写"什么时候用"，不是功能介绍）
+  description          String          @db.Text
+  runtime              SkillRuntime    @default(INLINE)
+  /// `requires.bins`（脚本依赖的解释器 / 命令；只用于绑定期提示与 TaskAgent 预检，不阻断派活）
+  requiresBins         Json            @default("[]") @map("requires_bins") @db.JsonB
+  /// **整版快照号**（见上方口径）；指针语义 —— 当前版本
+  version              Int             @default(1)
+  /// `SKILL.md` frontmatter 原样（回显与后续扩展用；**读取时以 DB 字段为准**）
+  manifest             Json            @default("{}") @db.JsonB
+  sourceType           SkillSourceType @default(MANUAL) @map("source_type")
+  /// 来源会话（**不建 FK**：会话删除后仍要保留来源快照标识）
+  sourceConversationId String?         @map("source_conversation_id") @db.Uuid
+  sourceMessageIds     Json?           @map("source_message_ids") @db.JsonB
+  /// 当前版本的 S3 前缀 `skills/{id}/v{version}/`
+  storageKey           String          @map("storage_key") @db.VarChar(512)
+  /// fork 来源（逻辑引用、无 FK；见上方口径）
+  parentSkillId        String?         @map("parent_skill_id") @db.Uuid
+  parentVersion        Int?            @map("parent_version")
+  /// 所属人（P1-13 语义：`created_by` = 所属人）
+  createdBy            String          @map("created_by") @db.Uuid
+  /// DB 用三值枚举；服务层按 `SKILL_VISIBILITIES` 只允许 `PRIVATE` / `PUBLIC`
+  visibility           AssetVisibility @default(PRIVATE)
+  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt            DateTime?       @map("deleted_at") @db.Timestamptz(3)
+
+  creator User         @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  files   SkillFile[]
+  changes SkillChange[]
+
+  @@index([deletedAt, updatedAt(sort: Desc)])
+  @@index([createdBy, name])
+  @@index([visibility])
+  @@index([parentSkillId])
+  @@map("skills")
+}
+
+/// skill_files —— 某个版本的**文件索引**（`子方案/Skill能力.md` §3.1）
+///
+/// ⚠️ **`version` ≡ `skills.version`（整版快照号），不是"该文件自己的版本号"**。
+/// 一次发布 = 一整份文件集合的快照：`@@unique([skillId, version, path])` 才因此成立，
+/// 清理也才能"按版本号整份回收"而不需要引用计数。
+///
+/// ⚠️ **保留期后只回收 S3 对象、保留本行**（`storageKey` 置空 = 正文已归档）：
+/// `tool_calls` 里的 `skillSlug + skillVersion + path` 永久留在历史消息里，连行都删掉之后
+/// "那一版有哪些文件"就再也定位不到。所以承诺是：保留期内可回读正文，之后仍可看
+/// "用了哪个版本、哪些路径与 sha256"，但读不到正文。
+model SkillFile {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  skillId    String   @map("skill_id") @db.Uuid
+  /// 整版快照号（见上）
+  version    Int
+  /// Skill 内相对路径（`SKILL.md` / `references/api.md` / `scripts/export.py`…）
+  path       String   @db.VarChar(1024)
+  size       Int
+  mime       String   @db.VarChar(255)
+  sha256     String   @db.VarChar(64)
+  /// 对象键 `skills/{skillId}/v{version}/{path}`；**空串 = 该版本正文已归档**
+  storageKey String   @map("storage_key") @db.VarChar(512)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  skill Skill @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([skillId, version, path])
+  @@index([skillId, version])
+  @@map("skill_files")
+}
+
+/// 变更记录的来源（与管理面 `shared#SKILL_CHANGE_SOURCES` 逐字一致）
+///
+/// · `MANUAL` —— 管理面重新导入 zip（P1-24a-2 唯一的生产者）；
+/// · `CONVERSATION_CORRECTION` —— 会话里纠正后保存（P1-24c-4）；
+/// · `PROPOSAL` —— 他人提案被接受（P1-24c-6）。
+enum SkillChangeSource {
+  MANUAL
+  CONVERSATION_CORRECTION
+  PROPOSAL
+
+  @@map("skill_change_source")
+}
+
+/// skill_changes —— 一次发布的**变更记录**（`子方案/会话生成Skill.md` §10.7）
+///
+/// ⚠️ **不存正文**：正文在 `skill_files` 的版本行里。本表只回答"vN → vN+1 是谁、为什么、什么时候"，
+/// `diff` 是给版本历史页回看用的**结构化摘要**（不是可执行 patch）。
+///
+/// ⚠️ **随 P1-24a-2 落地**（原计划 c-1）：管理面的"重新导入"本身就是一次版本切换，
+/// 没有这张表就没有版本历史可读（`GET /api/skills/:id/changes`）。表跟功能走 —— 与
+/// `conversation_skill_overrides` 随 c-4b 落地同一条纪律。
+model SkillChange {
+  id          String            @id @default(uuid(7)) @db.Uuid
+  skillId     String            @map("skill_id") @db.Uuid
+  fromVersion Int               @map("from_version")
+  toVersion   Int               @map("to_version")
+  changeSummary String          @map("change_summary") @db.Text
+  /// 结构化摘要（本批不写：管理面只有"重新导入"，摘要由版本号与文件数表达）
+  diff        Json?             @db.JsonB
+  source      SkillChangeSource @default(MANUAL)
+  /// 来源会话（**不建 FK**：会话删除后仍保留审计来源）
+  sourceConversationId String?  @map("source_conversation_id") @db.Uuid
+  sourceMessageIds     Json?    @map("source_message_ids") @db.JsonB
+  /// PROPOSAL 时记录提案人；其余为空
+  proposedBy  String?           @map("proposed_by") @db.Uuid
+  createdBy   String            @map("created_by") @db.Uuid
+  createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  skill Skill @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  /// 写这次变更的人（管理面 = 所属人或 ADMIN）
+  creator User @relation("SkillChangeCreator", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@unique([skillId, toVersion])
+  @@index([skillId, createdAt(sort: Desc)])
+  @@map("skill_changes")
 }

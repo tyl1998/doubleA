@@ -16,7 +16,13 @@
 
 import type { MessageKey, UserRole } from '@doubulea/shared'
 
-import { ADMIN_EGRESS_PATH, ADMIN_SANDBOX_INSTANCES_PATH, AGENTS_PATH, HOME_PATH } from './paths.js'
+import {
+  ADMIN_EGRESS_PATH,
+  ADMIN_SANDBOX_INSTANCES_PATH,
+  AGENTS_PATH,
+  HOME_PATH,
+  SKILLS_PATH,
+} from './paths.js'
 
 export interface NavItem {
   /** 导航项的稳定标识（本仓用它映射图标；原型里是左侧栏上的等宽字形） */
@@ -61,6 +67,9 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { code: 'AG', labelKey: 'nav.agents', path: AGENTS_PATH, serial: 'S-02 · 智能体' },
   // 已落地 ⇒ 不带 `batch`（P0-1-35 把知识库列表与详情换成真实页面）
   { code: 'KB', labelKey: 'nav.knowledge', path: '/knowledge', serial: 'S-05 · 知识库' },
+  // 已落地 ⇒ 不带 `batch`（P1-24a-2 把 Skill 管理页换成真实页面：列表 / 导入 / 详情 / 版本历史）。
+  // 排在知识库之后、MCP 之前：三者都是"可绑定资产"，而 Skill 是最后纳入组件范围的一类。
+  { code: 'SK', labelKey: 'nav.skills', path: SKILLS_PATH, serial: 'S-05b · Skill' },
   // 已落地 ⇒ 不带 `batch`（P0-2-11 把 MCP 管理页换成真实页面）
   { code: 'MC', labelKey: 'nav.mcp', path: '/mcp', serial: 'S-06 · MCP' },
   // 已落地 ⇒ 不带 `batch`（P1-6 把任务中心占位页换成真页面：**定时任务**管理）

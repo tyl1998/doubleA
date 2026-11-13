@@ -76,6 +76,16 @@ export interface ToolCallView {
    * （slug 刻意不唯一 ⇒ 会指到别的 server 上）。
    */
   serverId?: string
+  /**
+   * **Skill 审计字段**（P1-24a-4 起上屏；P1-24a-3 起落库 + 入事件）：这次调用读的是哪一版 Skill。
+   *
+   * 为什么放视图里：`tool_calls` 是**永久**的，历史卡永远显示**当时**的版本（v1），
+   * 新轮次的卡显示 v2 —— 用户据此核对"我升级后模型读的确实是新版"。
+   * 只有 Skill 工具（`serverName === 'Skill'`）且**真的读了文件**时才有这三个键；失败帧没有。
+   */
+  skillSlug?: string
+  skillVersion?: number
+  skillPath?: string
   kind: ToolCallKind
   status: ToolCallStatus
   inputSummary: string
@@ -288,6 +298,10 @@ export function toolViewFromEvent(payload: SseToolCallPayload): ToolCallView {
     ...(payload.seq === undefined ? {} : { seq: payload.seq }),
     ...(payload.output === undefined ? {} : { output: payload.output }),
     ...(payload.errorCode === undefined ? {} : { errorCode: payload.errorCode }),
+    // Skill 审计字段（P1-24a-4）：与 `serverId` 同款"有才带上"的三态写法
+    ...(payload.skillSlug === undefined ? {} : { skillSlug: payload.skillSlug }),
+    ...(payload.skillVersion === undefined ? {} : { skillVersion: payload.skillVersion }),
+    ...(payload.skillPath === undefined ? {} : { skillPath: payload.skillPath }),
   }
 }
 
@@ -367,6 +381,10 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
       ...(record.seq === undefined ? {} : { seq: record.seq }),
       ...(record.output === undefined ? {} : { output: record.output }),
       ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
+      // Skill 审计字段（P1-24a-4）：历史卡按**落库那一份**回放，显示的就是当时读的版本
+      ...(record.skillSlug === undefined ? {} : { skillSlug: record.skillSlug }),
+      ...(record.skillVersion === undefined ? {} : { skillVersion: record.skillVersion }),
+      ...(record.skillPath === undefined ? {} : { skillPath: record.skillPath }),
     })
   }
   return [...byCallId.values()]

@@ -85,6 +85,7 @@ $PgUser        = Cfg 'POSTGRES_USER' 'doubulea'
 $PgDb          = Cfg 'POSTGRES_DB' 'doubulea'
 $S3Key         = Cfg 'S3_KEY' 'doubulea'
 $Tz            = Cfg 'TZ' 'Asia/Shanghai'
+$PgTz          = Cfg 'POSTGRES_TZ' 'UTC'
 $PgPort        = Cfg 'POSTGRES_PORT' '15432'
 $RedisPort     = Cfg 'REDIS_PORT' '16379'
 $MinioApiPort  = Cfg 'MINIO_API_PORT' '19000'
@@ -119,7 +120,8 @@ $redisHost = Cfg 'REMOTE_REDIS_HOST' '127.0.0.1'
 $redisPortV= Cfg 'REMOTE_REDIS_PORT' $RedisPort
 $s3Host    = Cfg 'REMOTE_S3_HOST' '127.0.0.1'
 $s3PortV   = Cfg 'REMOTE_S3_PORT' $MinioApiPort
-$dbUrl     = "postgresql://${PgUser}:${PgPassword}@${pgHost}:${pgPortV}/${PgDb}?schema=public"
+# ⚠️ options=-c TimeZone=UTC 不可删（Prisma 按会话时区序列化 JS Date，见 docs/02 §三 已知问题）
+$dbUrl     = "postgresql://${PgUser}:${PgPassword}@${pgHost}:${pgPortV}/${PgDb}?schema=public&options=-c%20TimeZone%3DUTC"
 $redisUrl  = "redis://${redisHost}:${redisPortV}"
 $s3Endp    = "http://${s3Host}:${s3PortV}"
 $workspace = Cfg 'WORKSPACE_ROOT' (Join-Path $env:USERPROFILE 'doubulea\workspaces')
@@ -199,7 +201,7 @@ if ($ManageInfra -eq '1') {
     if (-not ((Running 'doubulea-postgres') -and -not $Force)) {
         Drop 'doubulea-postgres'
         & docker run -d --name doubulea-postgres --restart unless-stopped `
-            -e POSTGRES_USER=$PgUser -e POSTGRES_PASSWORD=$PgPassword -e POSTGRES_DB=$PgDb -e TZ=$Tz `
+            -e POSTGRES_USER=$PgUser -e POSTGRES_PASSWORD=$PgPassword -e POSTGRES_DB=$PgDb -e TZ=$PgTz `
             -e 'POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C.UTF-8' `
             -p "${PgPort}:5432" -v doubulea-deploy-pgdata:/var/lib/postgresql/data `
             --health-cmd "pg_isready -U $PgUser -d $PgDb -q" --health-interval 5s --health-timeout 5s --health-retries 30 --health-start-period 30s `

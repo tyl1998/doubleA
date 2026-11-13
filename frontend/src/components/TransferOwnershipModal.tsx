@@ -23,13 +23,14 @@ import { translate, type MessageKey } from '@doubulea/shared'
 import { useTransferAgent } from '../api/agents.js'
 import { useTransferKnowledgeBase } from '../api/knowledgeBases.js'
 import { useTransferMcpServer } from '../api/mcp.js'
+import { useTransferSkill } from '../api/skills.js'
 import { useTransferModelProvider } from '../api/modelPool.js'
 import { useFeedback } from '../app/feedback.js'
 import { useT } from '../app/i18n.js'
 import { AssetUserPicker } from './AssetUserPicker.js'
 
 /** 四类可转移资产 */
-export type TransferableAssetKind = 'AGENT' | 'KNOWLEDGE' | 'MCP' | 'PROVIDER'
+export type TransferableAssetKind = 'AGENT' | 'KNOWLEDGE' | 'MCP' | 'PROVIDER' | 'SKILL'
 
 /** 资产种类 → i18n key（弹窗标题与成功提示里都要说"转的是哪种东西"） */
 const ASSET_KIND_KEY: Readonly<Record<TransferableAssetKind, MessageKey>> = {
@@ -37,6 +38,7 @@ const ASSET_KIND_KEY: Readonly<Record<TransferableAssetKind, MessageKey>> = {
   KNOWLEDGE: 'label.assetKind.KNOWLEDGE',
   MCP: 'label.assetKind.MCP',
   PROVIDER: 'label.assetKind.PROVIDER',
+  SKILL: 'label.assetKind.SKILL',
 }
 
 export interface TransferOwnershipModalProps {
@@ -68,6 +70,7 @@ export function TransferOwnershipModal({
   const transferKnowledgeBase = useTransferKnowledgeBase()
   const transferMcpServer = useTransferMcpServer()
   const transferModelProvider = useTransferModelProvider()
+  const transferSkill = useTransferSkill()
 
   const [toUserId, setToUserId] = useState('')
 
@@ -80,7 +83,8 @@ export function TransferOwnershipModal({
     transferAgent.isPending ||
     transferKnowledgeBase.isPending ||
     transferMcpServer.isPending ||
-    transferModelProvider.isPending
+    transferModelProvider.isPending ||
+    transferSkill.isPending
 
   const kindLabel = translate(locale, ASSET_KIND_KEY[assetKind])
   const canSubmit = toUserId.trim() !== '' && !pending
@@ -97,7 +101,8 @@ export function TransferOwnershipModal({
     if (assetKind === 'AGENT') transferAgent.mutate(payload, { onSuccess, onError })
     else if (assetKind === 'KNOWLEDGE') transferKnowledgeBase.mutate(payload, { onSuccess, onError })
     else if (assetKind === 'MCP') transferMcpServer.mutate(payload, { onSuccess, onError })
-    else transferModelProvider.mutate(payload, { onSuccess, onError })
+    else if (assetKind === 'PROVIDER') transferModelProvider.mutate(payload, { onSuccess, onError })
+    else transferSkill.mutate(payload, { onSuccess, onError })
   }
 
   return (

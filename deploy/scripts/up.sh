@@ -101,7 +101,8 @@ if [ "$MANAGE_INFRA" = '1' ]; then
 
   up_if_needed "$C_PG" run -d --name "$C_PG" --restart unless-stopped \
     -e POSTGRES_USER="$POSTGRES_USER" -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" -e POSTGRES_DB="$POSTGRES_DB" \
-    -e TZ="$TZ" -e POSTGRES_INITDB_ARGS='--encoding=UTF8 --locale=C.UTF-8' \
+    # ★ PG 容器时区固定 UTC（新装环境；会话时区另由 DATABASE_URL 的 options 钉死）
+    -e TZ="${POSTGRES_TZ:-UTC}" -e POSTGRES_INITDB_ARGS='--encoding=UTF8 --locale=C.UTF-8' \
     -p "${POSTGRES_PORT}:5432" -v doubulea-deploy-pgdata:/var/lib/postgresql/data \
     --health-cmd "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -q" --health-interval 5s --health-timeout 5s \
     --health-retries 30 --health-start-period 30s \

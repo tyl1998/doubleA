@@ -21,13 +21,16 @@ import { useT } from '../../app/i18n.js'
 import { artifactContentUrl } from './artifactPreview.js'
 
 export interface ImagePreviewProps {
-  artifactId: string
+  artifactId?: string
   fileName: string
+  /** 直接给预览 URL（Skill 文件树等非产物来源）；缺省 = 产物内容出口 */
+  src?: string
 }
 
-export function ImagePreview({ artifactId, fileName }: ImagePreviewProps) {
+export function ImagePreview({ artifactId, fileName, src }: ImagePreviewProps) {
   const { t } = useT()
   const [failed, setFailed] = useState(false)
+  const url = src ?? (artifactId === undefined ? '' : artifactContentUrl(artifactId))
 
   if (failed) {
     return (
@@ -43,7 +46,7 @@ export function ImagePreview({ artifactId, fileName }: ImagePreviewProps) {
   return (
     <div className="preview preview--image">
       <img
-        src={artifactContentUrl(artifactId)}
+        src={url}
         alt={fileName}
         loading="lazy"
         // 内存优化 P1（`docs/子方案/前端长会话内存优化.md`）：解码不阻塞渲染。

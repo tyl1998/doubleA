@@ -18,15 +18,18 @@
 import { artifactContentUrl } from './artifactPreview.js'
 
 export interface PdfPreviewProps {
-  artifactId: string
+  artifactId?: string
   fileName: string
+  /** 直接给预览 URL（Skill 文件树等非产物来源）；缺省 = 产物内容出口 */
+  src?: string
 }
 
-export function PdfPreview({ artifactId, fileName }: PdfPreviewProps) {
+export function PdfPreview({ artifactId, fileName, src }: PdfPreviewProps) {
+  const url = src ?? (artifactId === undefined ? '' : artifactContentUrl(artifactId))
   return (
     <iframe
       className="preview__frame"
-      src={artifactContentUrl(artifactId)}
+      src={url}
       // ⚠️ **没有** `sandbox` 属性 —— 见文件头（加了 PDF 就渲染不出来）
       referrerPolicy="no-referrer"
       title={fileName}

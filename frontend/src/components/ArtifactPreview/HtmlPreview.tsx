@@ -30,7 +30,8 @@
 import { artifactContentUrl } from './artifactPreview.js'
 
 export interface HtmlPreviewProps {
-  artifactId: string
+  /** 产物来源（与 `src` 二选一） */
+  artifactId?: string
   /** 用于 iframe 的无障碍标题（文件名） */
   fileName: string
   /**
@@ -42,10 +43,11 @@ export interface HtmlPreviewProps {
 }
 
 export function HtmlPreview({ artifactId, fileName, src }: HtmlPreviewProps) {
+  const url = src ?? (artifactId === undefined ? '' : artifactContentUrl(artifactId))
   return (
     <iframe
       className="preview__frame"
-      src={src ?? artifactContentUrl(artifactId)}
+      src={url}
       // 空串 = 最严格：**不含 `allow-scripts`、不含 `allow-same-origin`**
       sandbox=""
       referrerPolicy="no-referrer"

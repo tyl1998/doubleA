@@ -85,6 +85,12 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
       >
         <span className="tool__name">{tool.toolName}</span>
         {tool.serverName === '' ? null : <span className="ratio">{tool.serverName}</span>}
+        {/* P1-24a-4：读的是哪一版 Skill（历史卡永远显示**当时**的版本 —— 审计字段落库，回放不重算） */}
+        {tool.skillVersion === undefined ? null : (
+          <span className="ratio" data-testid="tool-card-skill-version">
+            {t('toolCard.skillVersion', { version: tool.skillVersion })}
+          </span>
+        )}
         <span className="tool__arg">{tool.inputSummary}</span>
         <span className="tool__head-right">
           {tool.status === 'RUNNING' ? (
@@ -123,6 +129,13 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
         <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
           {t('toolCard.inputSummary', { summary: tool.inputSummary })}
         </p>
+        {/* P1-24a-4：Skill 读取的文件路径（`SKILL.md` 也记）—— 审计三元组的另外两列在标题行 */}
+        {tool.skillPath === undefined ? null : (
+          <p className="ratio" style={{ marginTop: 'var(--sp-1)' }}>
+            {tool.skillSlug === undefined ? null : `${tool.skillSlug} · `}
+            {tool.skillPath}
+          </p>
+        )}
         {hasDetail ? (
           <div className="code-block" style={{ marginTop: 'var(--sp-3)' }}>
             {detail}

@@ -51,6 +51,7 @@ import { registerSandboxInstanceRoutes } from './routes/sandboxInstances.js'
 import { registerNodeRoutes } from './routes/node.js'
 import { registerNodeInternalRoutes } from './routes/nodeInternal.js'
 import { registerTitleModelRoutes } from './routes/titleModel.js'
+import { registerSkillRoutes } from './routes/skills.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -265,6 +266,12 @@ export function buildApp(): FastifyInstance {
    * 两者都**不要 Key**（公开的契约），且路径在 `/open/v1` 下 ⇒ 网关侧是轮询路由（无状态）。
    */
   registerOpenApiDocRoutes(app)
+
+  // ㉕ Skill 资产（P1-24a-2）：`/api/skills` 列表 / 详情 / 新建（zip）/ 重新导入 / 改元数据 /
+  //    软删 / 转移 / 单文件预览与下载。权限与 `registerAgentRoutes` 同族 —— 全部只挂 `requireAuth`，
+  //    **改 / 删 / 导入 / 转移的行级判定在服务层**（所属人或 ADMIN），路由里一个 `requireAdmin` 都没有。
+  //    ⚠️ 本批**不注册任何模型工具、不改 ChatBot / TaskAgent 运行时**（那是 a-3 / b 批）。
+  registerSkillRoutes(app)
 
   return app
 }

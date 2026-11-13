@@ -16,6 +16,7 @@ import {
   KeyOutlined,
   RobotOutlined,
   ScheduleOutlined,
+  ThunderboltOutlined,
   TeamOutlined,
 } from '@ant-design/icons'
 import type { ReactNode } from 'react'
@@ -24,6 +25,7 @@ import type { ReactNode } from 'react'
 export const ICON_BY_CODE: Record<string, ReactNode> = {
   AG: <RobotOutlined />,
   KB: <BookOutlined />,
+  SK: <ThunderboltOutlined />,
   MC: <ApiOutlined />,
   AH: <HistoryOutlined />,
   TK: <ScheduleOutlined />,

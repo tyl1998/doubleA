@@ -230,13 +230,17 @@ export function sameComponentSet(
   b: readonly AgentComponentInput[],
 ): boolean {
   if (a.length !== b.length) return false
-  const left = new Map(a.map((item) => [componentKey(item), new Set(item.pinnedToolNames ?? [])]))
+  const left = new Map(a.map((item) => [componentKey(item), item]))
   return b.every((item) => {
     const existing = left.get(componentKey(item))
     if (existing === undefined) return false
+    // P1-24a-1：固定版本一起判等 —— 否则"只改了 skillVersion"会被判成"绑定未变化"而不发 PUT，
+    // 症状是"设了固定版本但没生效"（与后端 `agent.service#sameComponentSet` 同一条口径）
+    if ((existing.skillVersion ?? undefined) !== (item.skillVersion ?? undefined)) return false
+    const before = new Set(existing.pinnedToolNames ?? [])
     const next = new Set(item.pinnedToolNames ?? [])
-    if (existing.size !== next.size) return false
-    for (const name of existing) if (!next.has(name)) return false
+    if (before.size !== next.size) return false
+    for (const name of before) if (!next.has(name)) return false
     return true
   })
 }
@@ -249,6 +253,7 @@ export function componentsFromAgent(item: AgentItem): AgentComponentInput[] {
     ...(component.pinnedToolNames === undefined || component.pinnedToolNames.length === 0
       ? {}
       : { pinnedToolNames: [...component.pinnedToolNames] }),
+    ...(component.skillVersion === undefined ? {} : { skillVersion: component.skillVersion }),
   }))
 }
 
@@ -268,13 +273,20 @@ export function submittableComponents(
   components: readonly AgentComponentInput[],
 ): AgentComponentInput[] {
   return components
-    .filter((component) => component.componentType === 'KNOWLEDGE' || component.componentType === 'MCP')
+    .filter(
+      (component) =>
+        component.componentType === 'KNOWLEDGE' ||
+        component.componentType === 'MCP' ||
+        component.componentType === 'SKILL',
+    )
     .map((component) => ({
-      componentType: component.componentType as 'KNOWLEDGE' | 'MCP',
+      componentType: component.componentType as 'KNOWLEDGE' | 'MCP' | 'SKILL',
       refId: component.refId,
       ...(component.pinnedToolNames === undefined || component.pinnedToolNames.length === 0
         ? {}
         : { pinnedToolNames: [...component.pinnedToolNames] }),
+      // P1-24a-1：SKILL 的固定版本同样必须随绑定一起提交 —— 整体替换不带它就等于"改回跟随最新"
+      ...(component.skillVersion === undefined ? {} : { skillVersion: component.skillVersion }),
     }))
 }
 
@@ -319,6 +331,39 @@ export function pinnedMcpToolsOf(
 /** 从绑定集合里取出知识库 id 列表（供多选框的 `value`） */
 export function knowledgeIdsOf(components: readonly { componentType: string; refId: string }[]): string[] {
   return components.filter((c) => c.componentType === 'KNOWLEDGE').map((c) => c.refId)
+}
+
+/**
+ * 从绑定集合里取出 SKILL 引用（P1-24a-2）：`id → skillVersion（缺省 = 跟随最新）`。
+ *
+ * ⚠️ **必须带版本来回**：`PUT …/components` 是**整体替换**，提交时丢掉 `skillVersion`
+ * 等于把"固定 v3"悄悄改回"跟随最新"—— 而没有编译期错误。
+ */
+export function skillSelectionOf(
+  versions: Readonly<Record<string, number | undefined>>,
+): AgentComponentInput[] {
+  return Object.entries(versions).map(([refId, skillVersion]) => ({
+    componentType: 'SKILL' as const,
+    refId,
+    ...(skillVersion === undefined ? {} : { skillVersion }),
+  }))
+}
+
+/** 从绑定集合里取出 SKILL 的固定版本表（供表单状态初始化；未固定 ⇒ `undefined`） */
+export function skillVersionsOf(
+  components: readonly AgentComponentInput[],
+): Record<string, number | undefined> {
+  const out: Record<string, number | undefined> = {}
+  for (const component of components) {
+    if (component.componentType !== 'SKILL') continue
+    out[component.refId] = component.skillVersion
+  }
+  return out
+}
+
+/** 已勾选的 Skill id 列表（顺序 = 最后勾的在后，与知识库 / MCP 同款） */
+export function skillIdsOf(components: readonly { componentType: string; refId: string }[]): string[] {
+  return components.filter((c) => c.componentType === 'SKILL').map((c) => c.refId)
 }
 
 /** 从绑定集合里取出 MCP server id 列表（供多选框的 `value`） */

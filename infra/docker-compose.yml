@@ -34,8 +34,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-doubulea}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必填，见 infra/.env.example}
       POSTGRES_DB: ${POSTGRES_DB:-doubulea}
-      # 与宿主同区，便于日志时间与排查对齐
-      TZ: ${TZ:-Asia/Shanghai}
+      # ★ PG 会话时区固定 UTC（新装环境）：Prisma 适配器按**会话时区**序列化 JS Date，
+      #   非 UTC 时 JS 侧的 timestamptz 会整体偏一个时区偏移（见 docs/02 §三 已知问题）。
+      #   已有部署**不必**重建：后端 DATABASE_URL 的 `options=-c TimeZone=UTC` 已把会话时区钉死。
+      #   宿主/其它服务的 TZ 仍走 ${TZ}（便于日志与排查对齐），两者刻意分开。
+      TZ: ${POSTGRES_TZ:-UTC}
       # 中文排序/大小写（initdb 时决定，之后不可改）
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
     ports:

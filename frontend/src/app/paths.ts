@@ -40,6 +40,13 @@ export const AGENTS_NEW_PATH = '/agents/new'
 /** 知识库列表（`03` §二：`/knowledge`，登录即可 —— 与模型池相反，**不是** ADMIN） */
 export const KNOWLEDGE_PATH = '/knowledge'
 
+/**
+ * Skill 管理（`03` §二：`/skills`，登录即可 —— P1-24a-2）。
+ *
+ * 可见性两档（私有 / 公开）：私有 Skill 对他人**列表不可见、详情 404**（判据在服务端）。
+ */
+export const SKILLS_PATH = '/skills'
+
 /** MCP server 管理（`03` §二：`/mcp`，登录即可） */
 export const MCP_PATH = '/mcp'
 
@@ -112,6 +119,15 @@ export const TASKS_PATH = '/tasks'
  */
 export function knowledgeDetailPath(kbId: string): string {
   return `/knowledge/${encodeURIComponent(kbId)}`
+}
+
+/**
+ * Skill 详情（`03` §二 的 `/skills/:id`：文件树 + Markdown 预览 + 版本历史）。
+ *
+ * `encodeURIComponent` 的理由与 {@link knowledgeDetailPath} 相同。
+ */
+export function skillDetailPath(skillId: string): string {
+  return `/skills/${encodeURIComponent(skillId)}`
 }
 
 /**

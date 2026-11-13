@@ -165,6 +165,9 @@ prepare() {
   POSTGRES_DB="${POSTGRES_DB:-doubulea}"
   S3_KEY="${S3_KEY:-doubulea}"
   TZ="${TZ:-Asia/Shanghai}"
+  # PG 容器时区（只对新装环境生效）：会话时区由连接串的 `options=-c TimeZone=UTC` 钉死，
+  # 已有部署不必重建 PG。两者刻意分开：TZ 供后端/cron/日志，POSTGRES_TZ 只给 PG 容器。
+  POSTGRES_TZ="${POSTGRES_TZ:-UTC}"
   IMAGE_TAG="${IMAGE_TAG:-2}"
   IMAGE_SOURCE="${IMAGE_SOURCE:-local}"
   IMAGE_PREFIX=''
@@ -190,7 +193,11 @@ prepare() {
   PG_HOST="${REMOTE_PG_HOST:-127.0.0.1}"; PG_PORT="${REMOTE_PG_PORT:-$POSTGRES_PORT}"
   REDIS_HOST="${REMOTE_REDIS_HOST:-127.0.0.1}"; REDIS_PORT_V="${REMOTE_REDIS_PORT:-$REDIS_PORT}"
   S3_HOST="${REMOTE_S3_HOST:-127.0.0.1}"; S3_PORT_V="${REMOTE_S3_PORT:-$MINIO_API_PORT}"
-  DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${PG_HOST}:${PG_PORT}/${POSTGRES_DB}?schema=public"
+  # ⚠️ `options=-c TimeZone=UTC` **不可删**：Prisma（@prisma/adapter-pg）按**会话时区**序列化
+  #    JS Date；会话时区非 UTC 时，写进 timestamptz 的值会比真实 UTC 早一个时区偏移
+  #    （读回又抵消 ⇒ 往返恒等、平时看不出来）⇒ 凡「JS 侧时间」与 DB `now()` 进同一比较处整体偏 8 小时。
+  #    验证：`SHOW TimeZone` = UTC（`pnpm timezone:regression`）。见 docs/02 §三「已知问题」。
+  DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${PG_HOST}:${PG_PORT}/${POSTGRES_DB}?schema=public&options=-c%20TimeZone%3DUTC"
   REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT_V}"
   S3_ENDPOINT="http://${S3_HOST}:${S3_PORT_V}"
 
@@ -403,5 +410,6 @@ SANDBOX_APT_MIN_BPS=$(_two SANDBOX_APT_MIN_BPS)
 SANDBOX_NODE_DIST_MIRROR=$(_two SANDBOX_NODE_DIST_MIRROR)
 SANDBOX_RUST_DIST_MIRROR=$(_two SANDBOX_RUST_DIST_MIRROR)
 TZ=$(_two TZ Asia/Shanghai)
+POSTGRES_TZ=$(_two POSTGRES_TZ UTC)
 EOF
 }

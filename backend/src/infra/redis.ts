@@ -353,6 +353,83 @@ export function chatSteerKey(conversationId: string): string {
  */
 export const CHAT_STEER_TTL_SEC = 60
 
+// ═════════════════════════════ Skill 会话版本（P1-24a-4）═════════════════════════════
+//
+// `skill:last-loaded:{conversationId}` → 哈希 `{skillId: version}`（`子方案/Skill能力.md` §4.2 / §5.9）。
+//
+// 它回答的**只有一个**问题："本会话上一次成功读到某个 Skill 时，它是哪一版"。
+// Turn 开始时拿本轮 `skillSnapshot` 与它比较，只有"真的加载过且版本变了"才注入一句
+// "Skill 已更新，请重新 load"（**不落库**，见 `orchestrator/skillVersionNotice.ts`）。
+//
+// 四条口径（每条错了都会造出一种"看起来在正常工作"的错误提示）：
+//   · **只在成功读取后写**（`load_skill` / `read_skill_file` 拿到正文）：失败不写 ——
+//     "没读到"不该被记成"读过 v2"，否则下一次成功读到 v2 时就**不会**提示；
+//   · **写的是上游版本**：会话级覆写（c-4b）生效期间**不写这个哈希**（覆写不是上游版本）；
+//   · **读失败视为"没有上次版本"**：`undefined` ⇒ 一律不提示（宁可漏一次提示，不可把首次使用
+//     说成"更新了"）。所以读用 `try/catch` 吞掉、只 warn，写同样只 warn；
+//   · **TTL 与会话保留期一致**：会话行多久没人动就多久后自然过期（后端没有"删会话"的统一入口，
+//     主机制是 TTL 而不是显式删键 —— 与 `chat.autoapprove` 的"主机制显式清除"刻意不同）。
+
+/** `skill:last-loaded:{conversationId}` 键名 */
+export function skillLastLoadedKey(conversationId: string): string {
+  return `skill:last-loaded:${conversationId}`
+}
+
+/**
+ * 读一个会话的"上次加载版本"（`skillId → version`）。
+ *
+ * **恒不抛**：Redis 故障 / 值被人工改坏 ⇒ `undefined`（调用方据此完全不提示）。
+ * 坏字段逐条丢弃（不整张表作废）：一个字段坏了不该让同一会话的其它 Skill 也失去提示。
+ */
+export async function readSkillLastLoaded(conversationId: string): Promise<Record<string, number> | undefined> {
+  try {
+    const redis = await ensureRedisConnected()
+    const raw = await redis.hgetall(skillLastLoadedKey(conversationId))
+    if (raw === null || Object.keys(raw).length === 0) return undefined
+    const out: Record<string, number> = {}
+    for (const [skillId, value] of Object.entries(raw)) {
+      const version = Number.parseInt(value, 10)
+      if (!Number.isInteger(version) || version < 1) continue
+      out[skillId] = version
+    }
+    return Object.keys(out).length === 0 ? undefined : out
+  } catch (error) {
+    // 只 warn：版本提示是**锦上添花**的能力，Redis 抖动不该让整轮对话变慢或失败
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), conversationId }, '读取 Skill 上次加载版本失败（本轮不提示版本变化）')
+    return undefined
+  }
+}
+
+/**
+ * 记一条"这个会话读过某个 Skill 的某一版"（成功读取后调用）。
+ *
+ * **恒不抛**（同 {@link readSkillLastLoaded}）：写失败最多导致下一轮**漏一次**版本提示，
+ * 不值得让一次已经成功的工具调用变成错误。
+ *
+ * `ttlSeconds` 传会话保留期（天 × 86400）—— 每个字段各自带 TTL 是不必要的：整张哈希一个过期间
+ * 就够（活跃会话每轮都会续上）。
+ */
+export async function writeSkillLastLoaded(
+  conversationId: string,
+  update: Readonly<Record<string, number>>,
+  ttlSeconds: number,
+): Promise<void> {
+  const entries = Object.entries(update)
+  if (entries.length === 0) return
+  try {
+    const redis = await ensureRedisConnected()
+    const key = skillLastLoadedKey(conversationId)
+    const flat = entries.flatMap(([skillId, version]) => [skillId, String(version)])
+    await redis.hset(key, ...flat)
+    await redis.expire(key, Math.max(1, Math.trunc(ttlSeconds)))
+  } catch (error) {
+    getLogger().warn(
+      { err: describeRedisFailure(getRedis(), error), conversationId, skillCount: entries.length },
+      '写入 Skill 上次加载版本失败（下一轮可能漏一次版本提示）',
+    )
+  }
+}
+
 // ═════════════════════════════ 开放平台（P1-22）═════════════════════════════
 
 /**

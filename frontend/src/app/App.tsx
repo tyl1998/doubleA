@@ -48,6 +48,8 @@ import { KnowledgeListPage } from '../pages/knowledge/KnowledgeListPage.js'
 import { LoginPage } from '../pages/login/LoginPage.js'
 import { McpCredentialsPage } from '../pages/mcp/McpCredentialsPage.js'
 import { McpServersPage } from '../pages/mcp/McpServersPage.js'
+import { SkillDetailPage } from '../pages/skills/SkillDetailPage.js'
+import { SkillListPage } from '../pages/skills/SkillListPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 import { TasksPage } from '../pages/tasks/TasksPage.js'
 
@@ -86,6 +88,9 @@ export function App() {
           {/* S-05 · 知识库：列表与详情**都是登录即可**（知识库没有 owner 列，是全员共享资源） */}
           <Route path="/knowledge" element={<KnowledgeListPage />} />
           <Route path="/knowledge/:id" element={<KnowledgeDetailPage />} />
+          {/* S-05b · Skill（P1-24a-2）：列表与详情都是登录即可，私有 Skill 对他人 404 */}
+          <Route path="/skills" element={<SkillListPage />} />
+          <Route path="/skills/:id" element={<SkillDetailPage />} />
           {/* S-06 · MCP：登录即可（`mcp_servers` 没有 owner 列） */}
           <Route path="/mcp" element={<McpServersPage />} />
           {/* S-08b · 我的凭据（个人设置族，与 MCP 解耦；Git 凭据内嵌为区块） */}

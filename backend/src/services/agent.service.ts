@@ -75,6 +75,8 @@ import { appMsg,
   normalizeGuideQuestions,
   normalizeAudienceInput,
   pinnedMcpToolNamesFromConfig,
+  skillVersionFromConfig,
+  SKILL_ERROR_CODES,
   type AgentAudience,
   type AgentComponentInput,
   type AgentComponentRef,
@@ -322,7 +324,8 @@ async function componentsOf(agentId: string): Promise<AgentComponentRef[]> {
 }
 
 /**
- * 组件行 → 读侧投影（P1-19：把 `config.pinnedMcpTools` 摊成 `pinnedToolNames`）。
+ * 组件行 → 读侧投影（P1-19：把 `config.pinnedMcpTools` 摊成 `pinnedToolNames`；
+ * P1-24a-1：把 `config.skillVersion` 摊成 `skillVersion`）。
  * 抽取成一处，免得"列表一次查、详情单条查"两条路径各拼一次而漂移。
  */
 function toComponentRef(row: {
@@ -330,14 +333,24 @@ function toComponentRef(row: {
   refId: string
   config: unknown
 }): AgentComponentRef {
-  // 常驻工具只对 MCP 有意义；KNOWLEDGE 行即使 config 里有键也忽略
-  if (row.componentType !== 'MCP') return { componentType: row.componentType, refId: row.refId }
-  const pinned = pinnedMcpToolNamesFromConfig(row.config)
-  return {
-    componentType: row.componentType,
-    refId: row.refId,
-    ...(pinned.length === 0 ? {} : { pinnedToolNames: pinned }),
+  // 两个键都只对自己的类型有意义：MCP 行即使 config 里有 `skillVersion` 也忽略，反之亦然
+  if (row.componentType === 'MCP') {
+    const pinned = pinnedMcpToolNamesFromConfig(row.config)
+    return {
+      componentType: row.componentType,
+      refId: row.refId,
+      ...(pinned.length === 0 ? {} : { pinnedToolNames: pinned }),
+    }
   }
+  if (row.componentType === 'SKILL') {
+    const skillVersion = skillVersionFromConfig(row.config)
+    return {
+      componentType: row.componentType,
+      refId: row.refId,
+      ...(skillVersion === undefined ? {} : { skillVersion }),
+    }
+  }
+  return { componentType: row.componentType, refId: row.refId }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -719,7 +732,7 @@ export async function copyAgent(id: string, viewer: AgentViewer): Promise<AgentI
           agentId: agent.id,
           componentType: ref.componentType,
           refId: ref.refId,
-          config: componentConfigOf(ref.pinnedToolNames),
+          config: componentConfigOf(ref),
         })),
       })
     }
@@ -1025,14 +1038,24 @@ function compareComponents(
   return 0
 }
 
-/** 两个绑定集合是否**完全相同**（与顺序无关；条数相同且逐条能对上，**含常驻工具集合**） */
+/**
+ * 两个绑定集合是否**完全相同**（与顺序无关；条数相同且逐条能对上）。
+ *
+ * ⚠️ **P1-24a-1：`skillVersion` 必须一起判**。判等只比"集合键 + 常驻工具"的话，
+ * "只把固定版本从 v2 改成 v3"会被判成"绑定未变化"而直接跳过写库 —— 症状是
+ * **设了固定版本但没生效**（而日志里还理直气壮地写着"未变化，不写库"）。
+ * 与 `pinnedMcpTools` 是同一类 bug 的两个面（`02` §4.4 契约增量点名的三处落点之一）。
+ */
 function sameComponentSet(a: AgentComponentRef[], b: AgentComponentInput[]): boolean {
   if (a.length !== b.length) return false
-  const byKey = new Map(a.map((item) => [componentKey(item), toNameSet(item.pinnedToolNames)]))
+  const byKey = new Map(a.map((item) => [componentKey(item), item]))
   return b.every((item) => {
     const existing = byKey.get(componentKey(item))
     if (existing === undefined) return false
-    return sameNameSet(existing, toNameSet(item.pinnedToolNames))
+    return (
+      sameNameSet(toNameSet(existing.pinnedToolNames), toNameSet(item.pinnedToolNames)) &&
+      (existing.skillVersion ?? undefined) === (item.skillVersion ?? undefined)
+    )
   })
 }
 
@@ -1049,15 +1072,35 @@ function sameNameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
 }
 
 /**
- * 组件绑定的 `config`（P1-19：只装常驻工具）。**空 ⇒ `undefined`**（不写该列，保持 NULL）——
- * 与 `guideQuestions` 用 `[]` 表达清空不同：这里的"没有常驻"就是"没有 config"。
+ * 组件绑定的 `config`（`agent_components` 那一列 jsonb）。**空 ⇒ `undefined`**（不写该列，保持 NULL）——
+ * 与 `guideQuestions` 用 `[]` 表达清空不同：这里的"没有配置"就是"没有 config"。
+ *
+ * ⚠️ **按 `componentType` 合并生成，两种 shape 共用这一列**（P1-24a-1，`02` §4.4 契约增量）：
+ *   · `MCP`   ⇒ `{ pinnedMcpTools: [...] }`（P1-19 的常驻工具）；
+ *   · `SKILL` ⇒ `{ skillVersion: 3 }`（P1-24a-1 的固定版本；缺省 = 跟随最新）；
+ *   · 其它    ⇒ 无 config。
+ *
+ * 为什么不能"写 SKILL 时整列换成 `{ skillVersion }`"：`PUT …/components` 是整体替换、一行只存
+ * 一种组件，看似不会互相覆盖 —— 但 `config` 的**读侧**是共用的（{@link toComponentRef}），
+ * 一旦有人写成"整列替换"且在同一行里同时维护两种键（P1-19 之后确实有过这种设想），
+ * 抹掉 `pinnedMcpTools` 的 bug 就会以"常驻工具莫名其妙没了"的形式出现。按类型合并生成是
+ * 唯一不会漂移的写法，也让未来第三、第四种 shape 有地方落。
+ *
+ * ⚠️ 签名**不再**接受"纯 `pinnedToolNames` 数组"：那就逼着调用方自己拼对象，两个调用点各拼一次。
  */
-function componentConfigOf(
-  pinnedToolNames: readonly string[] | undefined,
-): { pinnedMcpTools: string[] } | undefined {
-  return pinnedToolNames === undefined || pinnedToolNames.length === 0
-    ? undefined
-    : { pinnedMcpTools: [...pinnedToolNames] }
+function componentConfigOf(item: {
+  componentType: AgentComponentRef['componentType']
+  pinnedToolNames?: readonly string[]
+  skillVersion?: number
+}): { pinnedMcpTools: string[] } | { skillVersion: number } | undefined {
+  if (item.componentType === 'MCP') {
+    const pinned = item.pinnedToolNames
+    return pinned === undefined || pinned.length === 0 ? undefined : { pinnedMcpTools: [...pinned] }
+  }
+  if (item.componentType === 'SKILL') {
+    return item.skillVersion === undefined ? undefined : { skillVersion: item.skillVersion }
+  }
+  return undefined
 }
 
 /**
@@ -1090,6 +1133,7 @@ function componentConfigOf(
 async function assertComponentRefsBindable(
   components: AgentComponentInput[],
   viewer: AgentViewer,
+  agentType: AgentItem['type'],
 ): Promise<void> {
   // 去重后再查：同一批里"同一个目标"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
   const refIdsOf = (type: AgentComponentInput['componentType']): string[] => [
@@ -1097,11 +1141,12 @@ async function assertComponentRefsBindable(
   ]
   const knowledgeIds = refIdsOf('KNOWLEDGE')
   const mcpIds = refIdsOf('MCP')
-  if (knowledgeIds.length === 0 && mcpIds.length === 0) return
+  const skillIds = refIdsOf('SKILL')
+  if (knowledgeIds.length === 0 && mcpIds.length === 0 && skillIds.length === 0) return
 
   const db = getPrisma()
   const viewerGroupIds = await resolveViewerGroupIds(viewer)
-  const [kbRows, mcpRows] = await Promise.all([
+  const [kbRows, mcpRows, skillRows] = await Promise.all([
     knowledgeIds.length === 0
       ? Promise.resolve([])
       : db.knowledgeBase.findMany({
@@ -1114,6 +1159,21 @@ async function assertComponentRefsBindable(
           where: { id: { in: mcpIds } },
           select: { id: true, name: true, createdBy: true, visibility: true },
         }),
+    skillIds.length === 0
+      ? Promise.resolve([])
+      : db.skill.findMany({
+          where: { id: { in: skillIds } },
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            version: true,
+            runtime: true,
+            createdBy: true,
+            visibility: true,
+            deletedAt: true,
+          },
+        }),
   ])
 
   const missingKb = knowledgeIds.filter((refId) => !kbRows.some((row) => row.id === refId))
@@ -1123,6 +1183,12 @@ async function assertComponentRefsBindable(
   const missingMcp = mcpIds.filter((refId) => !mcpRows.some((row) => row.id === refId))
   if (missingMcp.length > 0) {
     throw AppError.notFound(appMsg('app.m126', { p0: missingMcp.join('、') }))
+  }
+  // ⚠️ Skill 的"不存在"与"对我不可见"**回同一个 404**（不泄漏存在性，见 `子方案` §3.1 第 2 条）
+  // 不存在与不可见**回同一句 404**（不泄漏存在性）—— 文案与知识库那条同源（`app.m125`）
+  const missingSkill = skillIds.filter((refId) => !skillRows.some((row) => row.id === refId))
+  if (missingSkill.length > 0) {
+    throw AppError.notFound(appMsg('app.m125', { p0: missingSkill.join('、') }))
   }
 
   // P1-18：**取消可见性闭包** —— 不再要求"公开 Agent 只能引用公开组件"。
@@ -1141,8 +1207,47 @@ async function assertComponentRefsBindable(
       notVisible.push(`MCP server《${mcp.name}》`)
     }
   }
+  // Skill：软删 / 私有且非本人 ⇒ 一律按"不可见"处理（`canViewAsset` 已经把软删算进去）
+  const visibleSkills = new Map<string, (typeof skillRows)[number]>()
+  for (const skill of skillRows) {
+    if (canViewAsset({ ownerId: skill.createdBy, visibility: skill.visibility, deletedAt: skill.deletedAt }, viewerForAsset)) {
+      visibleSkills.set(skill.id, skill)
+    } else {
+      notVisible.push(`Skill《${skill.name}》`)
+    }
+  }
   if (notVisible.length > 0) {
     throw AppError.notFound(appMsg('app.m127', { p0: notVisible.join('、') }))
+  }
+
+  // ── P1-24a-1：Skill 的两条门禁（都在**绑定期**，不做执行期放行）──
+  //  ① ChatBot + SANDBOX ⇒ 409 CONFLICT + data.code=SKILL_RUNTIME_NOT_ALLOWED（脚本只在容器里跑）；
+  //  ② 他人的 SANDBOX Skill（非 ADMIN）⇒ 403 FORBIDDEN + data.code=SKILL_SANDBOX_FOREIGN_DENIED
+  //     —— 理由：`bash` 面前无法可靠区分"执行的是哪个 Skill 的脚本"，所以执行期确认不成立，
+  //     只能在这里一次拦死；出路是 fork 成自己的 Skill（`子方案` §6.3）。
+  //  ③ 固定版本越界 / 指向已归档版本 ⇒ 409（`SKILL_VERSION_PURGED`），不静默回退最新版。
+  const seenSkill = new Set<string>()
+  for (const item of components) {
+    if (item.componentType !== 'SKILL' || seenSkill.has(item.refId)) continue
+    seenSkill.add(item.refId)
+    const skill = visibleSkills.get(item.refId)
+    if (skill === undefined) continue
+
+    if (skill.runtime === 'SANDBOX' && agentType === 'CHATBOT') {
+      throw AppError.conflict(appMsg('app.m285', { p0: skill.name }), {
+        code: SKILL_ERROR_CODES.RUNTIME_NOT_ALLOWED,
+      })
+    }
+    if (skill.runtime === 'SANDBOX' && skill.createdBy !== viewer.id && viewer.role !== 'ADMIN') {
+      throw AppError.forbidden(appMsg('app.m286', { p0: skill.name }), {
+        code: SKILL_ERROR_CODES.SANDBOX_FOREIGN_DENIED,
+      })
+    }
+    if (item.skillVersion !== undefined && item.skillVersion > skill.version) {
+      throw AppError.conflict(appMsg('app.m289', { p0: `Skill《${skill.name}》没有 v${item.skillVersion}` }), {
+        code: SKILL_ERROR_CODES.VERSION_PURGED,
+      })
+    }
   }
 }
 
@@ -1200,7 +1305,9 @@ export async function replaceAgentComponents(
   const desired = [...input.components].sort(compareComponents)
 
   // ③ 校验在写之前（P1-18：绑定时只允许选"对我可见"的组件；**不再**有公开/私有两类分支的闭包校验）
-  await assertComponentRefsBindable(desired, viewer)
+  // P1-24a-1：绑定校验需要 Agent 类型 —— ChatBot 不能绑 sandbox Skill（409）。
+  // 传 `target.type` 而不是请求体：`type` 创建后不可改（`PATCH` 改类型直接 409），库里那份就是真相。
+  await assertComponentRefsBindable(desired, viewer, target.type)
 
   const current = await componentsOf(id)
   if (!sameComponentSet(current, desired)) {
@@ -1212,7 +1319,7 @@ export async function replaceAgentComponents(
             agentId: id,
             componentType: item.componentType,
             refId: item.refId,
-            config: componentConfigOf(item.pinnedToolNames),
+            config: componentConfigOf(item),
           })),
           skipDuplicates: true,
         })

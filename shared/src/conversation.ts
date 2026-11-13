@@ -664,6 +664,26 @@ export const toolCallRecordSchema = z.object({
    * ——`output` 是一句人话，前端从里面认不出"这是缺凭据"，只能靠一个**结构化**的信号。
    */
   errorCode: z.enum(ERROR_CODES).optional(),
+  /**
+   * **Skill 审计字段**（P1-24a-3 写入，P1-24a-1 先定形状）：命中的 Skill 的 slug。
+   *
+   * 为什么审计要落到这里而不是只放日志：历史消息是**永久**的（`messages.content` 的 jsonb
+   * 天然不过期），而"这一轮模型到底读了哪一版 Skill 的哪个文件"是事后**唯一**能复盘的线索
+   * （`子方案/Skill能力.md` §5.9）。三个字段一起出现、一起缺省（非 Skill 工具没有它们）。
+   */
+  skillSlug: z.string().optional(),
+  /** 命中 Skill 的版本（命中会话级覆写时 = `basedOnVersion`） */
+  skillVersion: z.number().int().min(1).optional(),
+  /** `load_skill` / `read_skill_file` 读的是哪个文件（`SKILL.md` 也记） */
+  skillPath: z.string().optional(),
+  /**
+   * 会话级覆写的递增号（P1-24c-4b 写入；**a-1 只占位**）。
+   *
+   * ⚠️ **"没有这个键" ≠ "用了覆写 r0"**（与 `output` / `errorCode` 同款口径）：
+   * 没有键 = 用的是上游版本；有键 = 用的是该会话的第 n 版覆写。
+   * 只有它才能区分"用的是上游 v3"与"用的是我基于 v3 改的第 2 版覆写"。
+   */
+  overrideRevision: z.number().int().min(1).optional(),
   /** 模型给出的参数 **JSON 原样**（含不合法 JSON 的原样）；卡片不显示，留档排查用 */
   arguments: z.string().optional(),
 })

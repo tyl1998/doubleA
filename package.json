@@ -58,6 +58,7 @@
     "gateway:regression": "pnpm --filter @doubulea/backend gateway:regression",
     "tool-text-offset:regression": "pnpm --filter @doubulea/backend tool-text-offset:regression",
     "xlsx:regression": "pnpm --filter @doubulea/backend xlsx:regression",
+    "timezone:regression": "pnpm --filter @doubulea/backend timezone:regression",
     "router:start": "pnpm --filter @doubulea/backend router:start",
     "router:dev": "pnpm --filter @doubulea/backend router:dev",
     "verify:workspace-ui": "pnpm --filter @doubulea/frontend verify:workspace-ui",

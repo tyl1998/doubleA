@@ -1606,7 +1606,7 @@ function RetentionNotice(props: {
           : ''
   const message = expired
     ? info.protected
-      ? t('workspace.retentionExpiredProtected')
+      ? t('workspace.retentionExpiredProtected', { retentionDays: info.retentionDays })
       : t('workspace.retentionExpiredWillClean', { total: info.retentionDays })
     : t('workspace.retentionSoon', { days: daysLeft, total: info.retentionDays })
   return (

@@ -73,12 +73,15 @@ export const AGENT_TYPES = ['CHATBOT', 'TASK_AGENT'] as const
 export type AgentType = (typeof AGENT_TYPES)[number]
 
 /**
- * 可绑定的组件类型（`schema.prisma` 的 `enum ComponentType`；`01` 决策 7：只有知识库 + MCP）。
+ * 可绑定的组件类型（`schema.prisma` 的 `enum ComponentType`；`01` 决策 7 → **决策 39 修订**）。
+ *
+ * P0-1 起只有 `KNOWLEDGE` / `MCP`；**P1-24a-1** 增第三类 `SKILL`（`子方案/Skill能力.md`）：
+ * `refId` 指向 `skills.id`，`config.skillVersion` 可固定版本（缺省 = 跟随最新）。
  *
  * 放在这里而不是留给 P0-1-23 自己定义：**读侧（详情回显）在本批就要落地**，
  * 而写侧（PUT 整体替换）在 P0-1-23 —— 两批共用一个枚举，否则就是两处 enum 各自漂移。
  */
-export const COMPONENT_TYPES = ['KNOWLEDGE', 'MCP'] as const
+export const COMPONENT_TYPES = ['KNOWLEDGE', 'MCP', 'SKILL'] as const
 export type ComponentType = (typeof COMPONENT_TYPES)[number]
 
 // ───────────────────────────── 权限判据（唯一实现） ─────────────────────────────
@@ -264,10 +267,16 @@ export function normalizeGuideQuestions(raw: unknown): string[] {
  */
 export const agentComponentRefSchema = z.object({
   componentType: z.enum(COMPONENT_TYPES),
-  /** `KNOWLEDGE` → `knowledge_bases.id`；`MCP` → `mcp_servers.id`（多态，无外键，`02` §3.1） */
+  /** `KNOWLEDGE` → `knowledge_bases.id`；`MCP` → `mcp_servers.id`；`SKILL` → `skills.id`（多态，无外键，`02` §3.1） */
   refId: z.string(),
   /** 常驻的 MCP 工具原始名（仅 `MCP`；缺省 = 无常驻，工具多时全走网关） */
   pinnedToolNames: z.array(z.string()).optional(),
+  /**
+   * 固定版本（仅 `SKILL`，P1-24a-1）。缺省 = **跟随最新**（`skills.version`）；
+   * 给了就把该 Agent 钉在那一版，平台更新不影响它，直到用户显式"更新到 vN"。
+   * 与 `pinnedToolNames` **共用 `agent_components.config` 这一列**（合并写，见 {@link componentConfigOf}）。
+   */
+  skillVersion: z.number().int().min(1).optional(),
 })
 export type AgentComponentRef = z.infer<typeof agentComponentRefSchema>
 
@@ -296,6 +305,20 @@ export function pinnedMcpToolNamesFromConfig(config: unknown): string[] {
     if (out.length >= MCP_PINNED_TOOL_NAMES_MAX) break
   }
   return out
+}
+
+/**
+ * 从 `agent_components.config`（jsonb）里读出**Skill 的固定版本**（P1-24a-1）。**永不抛错**。
+ *
+ * 形状是 `{ skillVersion: 3 }`（与 `{ pinnedMcpTools: [...] }` 共用同一列）。读侧唯一的入口，
+ * 与 {@link pinnedMcpToolNamesFromConfig} 同一套"脏值静默丢弃"的口径：
+ * 非正整数 / 缺键 ⇒ `undefined`（= 跟随最新），不因为一条脏行让整个详情接口 500。
+ */
+export function skillVersionFromConfig(config: unknown): number | undefined {
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) return undefined
+  const raw = (config as { skillVersion?: unknown }).skillVersion
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) return undefined
+  return raw
 }
 
 /**
@@ -415,6 +438,19 @@ export const agentComponentInputSchema = z.object({
       MCP_PINNED_TOOL_NAMES_MAX,
       validationMessage('validation.agent.pinnedToolNamesTooMany', { max: MCP_PINNED_TOOL_NAMES_MAX }),
     )
+    .optional(),
+  /**
+   * 固定版本（仅 `SKILL`；P1-24a-1）。省略 = 跟随最新。
+   *
+   * ⚠️ 与 `pinnedToolNames` **并列**而不是"按类型二选一"：`PUT …/components` 是整体替换、
+   * 一行只存一种组件，所以同一行里两者本来就不会同时出现；把它们放成两个可省字段，
+   * 是为了让服务层能**按 `componentType` 合并生成** `config`（见 `agent.service#componentConfigOf`），
+   * 而不是"写 SKILL 时把整列换成 `{ skillVersion }`" —— 后者会把 MCP 的常驻工具抹掉。
+   */
+  skillVersion: z
+    .number({ invalid_type_error: validationMessage('validation.agent.skillVersionNotNumber') })
+    .int(validationMessage('validation.agent.skillVersionNotInteger'))
+    .min(1, validationMessage('validation.agent.skillVersionMin'))
     .optional(),
 })
 export type AgentComponentInput = z.infer<typeof agentComponentInputSchema>

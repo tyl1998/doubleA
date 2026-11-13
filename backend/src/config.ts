@@ -215,7 +215,11 @@ const corsOriginsVar = z.preprocess(
     .optional(),
 )
 
-/** 必填连接串 + 协议白名单（避免把 redis:// 填进 DATABASE_URL 这类低级错） */
+/** 必填连接串 + 协议白名单（避免把 redis:// 填进 DATABASE_URL 这类低级错）。
+ *
+ * ⚠️ 只校验 scheme，**不重写**连接串 ⇒ query 参数（如 `options=-c%20TimeZone%3DUTC`）
+ *    原样保留、原样交给 `@prisma/adapter-pg`。不要在这里做 URL 归一化/裁剪。
+ */
 const requiredUrl = (label: string, schemes: readonly string[]) => {
   const allowed = schemes.map((scheme) => `${scheme}://`).join(' 或 ')
   return requiredText(label).refine(
@@ -749,6 +753,34 @@ const envSchema = z
      */
     WORKSPACE_ZIP_MAX_FILES: intVar('WORKSPACE_ZIP_MAX_FILES', 2000, { min: 1, max: 100_000 }),
 
+    // ── Skill 资产（P1-24a-1；`子方案/Skill能力.md` §2.2 / §6.1）──
+    /**
+     * Skill 导入（zip 解包）的**硬上限**。四个数字都必须在导入阶段就拦住 ——
+     * 一个 50 层深的目录 / 一次解出 20 万个小文件 / 1KB 压成 500MB 的 zip bomb，
+     * 只要放进 S3、等到运行时才炸，症状就是"某个 Skill 一加载就 OOM"，而**没有任何报错**。
+     * 超限一律 `VALIDATION` 400 + `data.code=SKILL_IMPORT_INVALID` + `data.reasons[]` 逐条说明。
+     */
+    /** 单个 Skill 的文件数上限（`SKILL.md` + references + assets + scripts 合计） */
+    SKILL_MAX_FILES: intVar('SKILL_MAX_FILES', 200, { min: 1, max: 5000 }),
+    /** 单文件解压后的字节上限 */
+    SKILL_MAX_FILE_BYTES: intVar('SKILL_MAX_FILE_BYTES', 5 * 1024 * 1024, { min: 1024, max: 200 * 1024 * 1024 }),
+    /** 整个 Skill 解压后的总字节上限 */
+    SKILL_MAX_TOTAL_BYTES: intVar('SKILL_MAX_TOTAL_BYTES', 30 * 1024 * 1024, { min: 1024, max: 1024 * 1024 * 1024 }),
+    /** 路径深度上限（`a/b/c` = 3） */
+    SKILL_MAX_PATH_DEPTH: intVar('SKILL_MAX_PATH_DEPTH', 8, { min: 1, max: 64 }),
+    /**
+     * 压缩比上限（解压后总字节 ÷ zip 字节）。超过 ⇒ 按 zip bomb 直接拒绝。
+     * 100 倍对"大量重复文本"的 Skill 已经很宽松（正常 Markdown + 模板远低于 20）。
+     */
+    SKILL_MAX_COMPRESSION_RATIO: intVar('SKILL_MAX_COMPRESSION_RATIO', 100, { min: 1, max: 10_000 }),
+    /**
+     * 宿主 Skill 运行时根目录（P1-24b-1 起用于 TaskAgent 的只读挂载）。
+     *
+     * ⚠️ a-1 只把配置位占好（与 `WORKSPACE_ROOT` 同族、同写法，进 `infra/.env.example`）：
+     * 本批不建目录、不 chown、不挂载 —— 那些属 b-1（含"目录属主必须是 10001"那条实测坑）。
+     */
+    SKILL_RUNTIME_ROOT: defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/skills'),
+
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
      * 「到响应头」的上限（连接 + TTFT）。流式路径**收到头就撤**（之后交给 LLM_STREAM_IDLE_TIMEOUT_MS），
@@ -1255,6 +1287,25 @@ export interface AppConfig {
   }
 
   /**
+   * Skill 导入与宿主目录（P1-24a-1）。消费方 = `services/skillZip.ts`（解包校验）
+   * 与 `services/skill.service.ts`；b-1 起再有 `sandbox/manager.ts`（只读挂载）。
+   */
+  skill: {
+    /** 文件数上限（见 `SKILL_MAX_FILES`） */
+    maxFiles: number
+    /** 单文件解压后字节上限（见 `SKILL_MAX_FILE_BYTES`） */
+    maxFileBytes: number
+    /** 解压后总字节上限（见 `SKILL_MAX_TOTAL_BYTES`） */
+    maxTotalBytes: number
+    /** 路径深度上限（见 `SKILL_MAX_PATH_DEPTH`） */
+    maxPathDepth: number
+    /** 压缩比上限（见 `SKILL_MAX_COMPRESSION_RATIO`） */
+    maxCompressionRatio: number
+    /** 宿主运行时根目录（见 `SKILL_RUNTIME_ROOT`；b-1 起使用） */
+    runtimeRoot: string
+  }
+
+  /**
    * git 凭据（P1-9 · R11）。消费方 = `services/gitCredential.service.ts`（建凭据时的条数闸门）
    * 与 `sandbox/manager.ts`（派活时按用户解密注入容器 tmpfs/env）。
    */
@@ -1289,7 +1340,7 @@ export class ConfigError extends Error {
 /** 变量 → 「去哪儿找答案」提示（只给必填项，避免报告变成噪声） */
 const ENV_VAR_HINTS: Readonly<Record<string, string>> = {
   DATABASE_URL:
-    'PostgreSQL 连接串，示例 postgresql://doubulea:<pwd>@127.0.0.1:<POSTGRES_PORT>/doubulea?schema=public（宿主端口见 infra/.env）',
+    'PostgreSQL 连接串，示例 postgresql://doubulea:<pwd>@127.0.0.1:<POSTGRES_PORT>/doubulea?schema=public&options=-c%20TimeZone%3DUTC（⚠️ options 不可删，见 docs/02 §三 已知问题；宿主端口见 infra/.env）',
   REDIS_URL: 'Redis 连接串，示例 redis://127.0.0.1:<REDIS_PORT>',
   S3_ENDPOINT: '对象存储端点，示例 http://127.0.0.1:<MINIO_API_PORT>',
   S3_KEY: 'MinIO/S3 访问密钥（= .env 的 MINIO_ROOT_USER）',
@@ -1536,6 +1587,15 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retentionProtectUserEditDays: vars.WORKSPACE_RETENTION_PROTECT_USER_EDIT_DAYS,
       textInlineMaxMb: vars.WORKSPACE_TEXT_INLINE_MAX_MB,
       zipMaxFiles: vars.WORKSPACE_ZIP_MAX_FILES,
+    },
+
+    skill: {
+      maxFiles: vars.SKILL_MAX_FILES,
+      maxFileBytes: vars.SKILL_MAX_FILE_BYTES,
+      maxTotalBytes: vars.SKILL_MAX_TOTAL_BYTES,
+      maxPathDepth: vars.SKILL_MAX_PATH_DEPTH,
+      maxCompressionRatio: vars.SKILL_MAX_COMPRESSION_RATIO,
+      runtimeRoot: vars.SKILL_RUNTIME_ROOT,
     },
 
     gitCredential: {

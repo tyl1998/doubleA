@@ -83,7 +83,10 @@ import { appMsg,
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
+  SKILL_TOOL_SERVER_NAME,
+  buildSkillOpenAiTools,
   pinnedMcpToolNamesFromConfig,
+  skillVersionFromConfig,
   type CitationItem,
   type ErrorCode,
   type RetrievalHit,
@@ -97,6 +100,7 @@ import { appMsg,
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import { readSkillLastLoaded, writeSkillLastLoaded } from '../infra/redis.js'
 import {
   LlmAbortError,
   chatStream,
@@ -144,6 +148,17 @@ import {
 } from './chatContext.js'
 import { executeKnowledgeTool, isKnowledgeToolName, loadKnowledgeCatalog } from './knowledgeTools.js'
 import {
+  availableSkillEntries,
+  executeSkillTool,
+  isSkillTool,
+  loadSkillSnapshot,
+} from './skillTools.js'
+import {
+  detectSkillVersionChanges,
+  formatSkillVersionNotice,
+  skillLastLoadedUpdate,
+} from './skillVersionNotice.js'
+import {
   MCP_GATEWAY_TOOL_SERVER_NAME,
   callMcpToolTool,
   executeListMcpTools,
@@ -185,6 +200,17 @@ import {
  *   （⚠️ 知识库检索自 2026-09-30 起在工具循环内完成，它的失败**不会**从这里抛出，见文件头 ②）
  * @throws {LlmAbortError} 只有"没接住的中断"才会漏出去（正常路径下中断被本函数接住并转成 `STOPPED`）
  */
+/**
+ * `skill:last-loaded` 的 TTL（秒）—— **与会话有效期同口径**（`子方案` §4.2："TTL 与会话保留期一致"）。
+ *
+ * 仓库里没有"会话保留期"这个配置（会话行不自动删除）；离它最近的是**会话有效期**
+ * （`SESSION_TTL_HOURS`，默认 12h）：一个连登录态都过期了的会话，它的"上次加载版本"也没有意义了。
+ * 活跃会话每写一次就续一次期，所以真实寿命由"用户最后一次读到 Skill 的时间"决定。
+ */
+function skillLastLoadedTtlSec(): number {
+  return config.session.ttlSeconds
+}
+
 export const chatBotProducer: ChatProducer = async (input) => {
   const logger = getLogger()
   const { conversationId, agentId, content, signal } = input
@@ -307,6 +333,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
     const mcpServerIdsRaw = agent.components
       .filter((component) => component.componentType === 'MCP')
       .map((component) => component.refId)
+    /**
+     * P1-24a-3：绑定的 Skill（`componentType = 'SKILL'`，`config.skillVersion` 可固定版本）。
+     *
+     * ⚠️ ChatBot **不可能**绑到 `SANDBOX` Skill（绑定期 409，`agent.service.ts` 已拦），所以这里
+     * 不需要再按 runtime 过滤 —— 但**读侧也不假设**：快照项带着 runtime，执行体只做只读加载，
+     * 与 runtime 无关（脚本执行只在 TaskAgent 容器里，本批不实现）。
+     */
+    const skillBindings = agent.components.filter((component) => component.componentType === 'SKILL')
 
     // ── ②·bis P1-18：**不再按可见范围过滤组件** ──
     // 组件通过 Agent 被使用时，授权来自 **Agent 的受众**（"谁能用这个 Agent 就能用它的组件"）；
@@ -342,6 +376,47 @@ export const chatBotProducer: ChatProducer = async (input) => {
      */
     // ⚠️ 执行体与"目录读取"同源：`knowledgeTools.ts`（TaskAgent 的沙箱代理路径也用它）
     const knowledgeCatalog = await loadKnowledgeCatalog(kbIds, KNOWLEDGE_CATALOG_MAX_DOCS_PER_KB)
+
+    /**
+     * P1-24a-3：本轮 **skillSnapshot**（元数据查询；**不读正文、不碰 S3**，见 `skillTools.ts`）。
+     *
+     * ⚠️ 在**进入工具循环前**解析一次、整轮复用：`load_skill` 与随后的 `read_skill_file` 必须落在
+     * 同一个版本上（§5.9）—— 每调一次工具就重查一次版本，就会造出"v1 的说明 + v2 的文件"。
+     * `availableSkills` 同时也是 system prompt 目录段的来源（顺序 `slug asc`，逐字稳定）。
+     */
+    const skillSnapshot = await loadSkillSnapshot(
+      skillBindings.map((component) => ({ refId: component.refId, skillVersion: skillVersionFromConfig(component.config) ?? null })),
+    )
+    const availableSkills = availableSkillEntries(skillSnapshot)
+    /**
+     * P1-24a-4：**版本变化提示**（不落库）。
+     *
+     * 只在**绑了可用的 Skill** 时才读 `skill:last-loaded:{conversationId}`（没绑 Skill 的 Agent
+     * 连这一次 Redis 读取都不做，与 a-3 之前的路径逐字一致），再逐条比较版本：
+     * 只有**本会话真的加载过**且版本变了的 Skill 才提示（`skillVersionNotice.ts` 的三条判据）。
+     * 首次使用 / Redis 丢失 ⇒ 读到 `undefined` ⇒ 不提示。
+     *
+     * ⚠️ **不做"目录指纹相同就跳过"的优化**：哈希里只有 `skillId → version`（§4.2 的形态），
+     *    没有指纹可比；而一次 `HGETALL` 本来就只有一次往返。指纹是 b-1 的 manifest 判据
+     *    （`skillCatalogFingerprintOf`），本批不把它塞进这个哈希 —— 那会让"上次加载版本"这个
+     *    语义多出一个与版本无关的键，c-4b 的覆写判据（"覆写生效期间不写"）会跟着变复杂。
+     * ⚠️ 读失败 = 不提示（`readSkillLastLoaded` 恒不抛）；绝不让版本提示拖垮一轮对话。
+     */
+    let skillVersionNotice = ''
+    if (skillSnapshot.hasUsable) {
+      const lastLoaded = await readSkillLastLoaded(conversationId)
+      skillVersionNotice = formatSkillVersionNotice(
+        detectSkillVersionChanges(
+          availableSkills.map((entry) => ({
+            skillId: entry.skillId,
+            slug: entry.slug,
+            name: entry.name,
+            version: entry.version,
+          })),
+          lastLoaded,
+        ),
+      )
+    }
 
     /**
      * 命中累积：**只来自模型的主动检索**（内置「知识库检索」工具，2026-09-30）。
@@ -388,6 +463,14 @@ export const chatBotProducer: ChatProducer = async (input) => {
      */
     const builtinTools = kbIds.length === 0 ? [] : [knowledgeListTool(), knowledgeSearchTool(), readDocumentTool()]
     /**
+     * P1-24a-3：Skill 三个工具（`list_skills` / `load_skill` / `read_skill_file`），**绑了可用的 Skill 才下发**。
+     *
+     * 与知识库一族同款：与 MCP 工具同表下发，执行时按名字分流（`skillTools.ts#isSkillTool`）。
+     * 定义来自 `shared#buildSkillOpenAiTools`（**与 manifest 共用同一份参数 schema**，不在编排层手写第二份）。
+     * 排在知识库工具**之后、网关之前**：目录（system prompt）里已经给了 Skill 清单，工具是第二步。
+     */
+    if (skillSnapshot.hasUsable) builtinTools.push(...buildSkillOpenAiTools())
+    /**
      * 工具网关（P1-19）：**只在工具多、走了网关时**下发（`catalog.gatewayActive`）。
      * 走网关时 `catalog.tools` 里只有常驻工具，其余工具需要模型用 `mcp_list_tools` 发现、
      * 再 `mcp_call_tool` 调用；工具少时（全量下发）不加，行为与旧版逐字一致。
@@ -422,9 +505,18 @@ export const chatBotProducer: ChatProducer = async (input) => {
           userProfileBlock: userProfile.block,
           memoryTocBlock: memoryToc.block,
           memoryRules: memorySettings.enabled,
+          skills: availableSkills,
         }),
       },
       ...selectHistoryMessages(historyRows as HistoryRow[], rounds),
+      /**
+       * P1-24a-4：**版本变化提示**（不落库）—— 位置在本轮用户消息**之前**：
+       * 模型读到用户这次的要求时，已经知道"上下文里的 Skill 正文是旧版"。
+       * 空串时**一个字节都不多**（没版本变化 / 没绑 Skill 的轮次与 a-3 之前逐字一致）。
+       * ⚠️ 它只对**出现它的这一轮**成立：下一轮重建 `messages` 时这整份数组会被重新组装，
+       *    提示自然不再出现（`persist.ts` 落库的是 `toolRecords` 与正文，不含这条 user 消息）。
+       */
+      ...(skillVersionNotice === '' ? [] : [{ role: 'user' as const, content: skillVersionNotice }]),
       // 本轮用户消息 + 附件（P1-4）：图片→多模态 part、文本类→拼进正文（见 `buildUserChatMessage`）
       buildUserChatMessage(content, input.attachments),
     ]
@@ -858,6 +950,70 @@ export const chatBotProducer: ChatProducer = async (input) => {
             outcomes.push({ callId: call.id, text: output, isError })
             continue
           }
+
+          // ── 内置 Skill 工具（P1-24a-3）：目录 / 正文 / 资源，与知识库同属内置族，按名字分流 ──
+          //
+          // 只有绑了**可用的** Skill 才会下发这三个工具（`skillSnapshot.hasUsable`），但执行侧仍校验
+          // —— 模型可能在上一次绑定里见过这些名字，解绑后还继续调（那就该回一句"没有绑定 Skill"）。
+          // 版本来自本轮 `skillSnapshot`（**不在这里重新解析**，见 `skillTools.ts`）。
+          const isBuiltinSkillTool = skillSnapshot.hasUsable && isSkillTool(call.name)
+          if (isBuiltinSkillTool) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: SKILL_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+
+            // ★ 执行体在 `orchestrator/skillTools.ts`（唯一实现）：发卡与审计字段在这里，读取逻辑在那里
+            const outcome = await executeSkillTool({
+              snapshot: skillSnapshot,
+              name: call.name,
+              arguments: call.arguments,
+              log: { conversationId, agentId },
+            })
+            const status: ToolCallStatus = outcome.isError ? 'ERROR' : 'SUCCESS'
+            const finished = {
+              ...base,
+              status,
+              inputSummary,
+              output: outcome.output,
+              // 审计字段（§5.9）：只有**真的读了**某个 Skill 的某个文件才写；失败不写"读了"
+              ...(outcome.audit === undefined
+                ? {}
+                : {
+                    skillSlug: outcome.audit.skillSlug,
+                    skillVersion: outcome.audit.skillVersion,
+                    skillPath: outcome.audit.skillPath,
+                  }),
+            }
+            /**
+             * P1-24a-4：成功读到一个 Skill ⇒ 记进 `skill:last-loaded:{conversationId}`（`skillId → 版本`）。
+             *
+             * ⚠️ 三条口径（见 `infra/redis.ts` 那一节）：
+             *   · **只在成功时写**（`outcome.audit === undefined` 就不写）—— 失败不该被记成"读过"；
+             *   · **写上游版本**：C-4b 的会话级覆写生效期间**不写**（那版不是上游版本）；
+             *   · **写失败只 warn**（`writeSkillLastLoaded` 恒不抛）—— 最多让下一轮漏一次提示。
+             */
+            if (outcome.audit !== undefined) {
+              await writeSkillLastLoaded(
+                conversationId,
+                skillLastLoadedUpdate(outcome.audit),
+                skillLastLoadedTtlSec(),
+              )
+            }
+            emitToolCard(finished)
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
+            continue
+          }
+
 
           // ── 内置「发送通知」工具（P1-6，场景 1）：与知识库同属内置族，按名字分流 ──
           if (call.name === SEND_NOTIFICATION_TOOL_NAME && getNotifyTarget(conversationId) !== undefined) {
