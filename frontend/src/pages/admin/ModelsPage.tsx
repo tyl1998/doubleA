@@ -62,7 +62,7 @@ import { DeleteProviderModal } from './DeleteProviderModal.js'
 import { ModelFormModal } from './ModelFormModal.js'
 import { ProviderFormModal } from './ProviderFormModal.js'
 import { RemoteModelsDrawer } from './RemoteModelsDrawer.js'
-import { SystemModelSection } from './SystemModelSection.js'
+import { SkillExtractModelSection, SystemModelSection } from './SystemModelSection.js'
 import {
   describeProviderKey,
   maxContextText,
@@ -551,6 +551,7 @@ export function ModelsPage() {
       {/* ───────────────────── 系统模型（仅 ADMIN）─────────────────────
           平台级"会话标题生成用哪个模型"；与模型池同主题、共用 CHAT 模型下拉，故并入本页而非单开一页。 */}
       {isAdmin && <SystemModelSection />}
+      {isAdmin && <SkillExtractModelSection />}
 
       {/* ───────────────────── Provider ───────────────────── */}
       <section className="admin-section">

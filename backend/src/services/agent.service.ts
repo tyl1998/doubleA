@@ -94,6 +94,7 @@ import { appMsg,
 import { getLogger } from '../infra/logger.js'
 import { broadcastAgentMcpCatalogChange } from '../sandbox/catalogSync.js'
 import { getPrisma } from '../infra/prisma.js'
+import { skillHasScriptsMap } from './skill.service.js'
 
 /**
  * 调用者（`AuthContext['user']` 的**结构子集**）。
@@ -1134,6 +1135,7 @@ async function assertComponentRefsBindable(
   components: AgentComponentInput[],
   viewer: AgentViewer,
   agentType: AgentItem['type'],
+  agentId: string,
 ): Promise<void> {
   // 去重后再查：同一批里"同一个目标"最多查一次（payload 内的重复项已由 schema 拦掉，这里只防重复查询）
   const refIdsOf = (type: AgentComponentInput['componentType']): string[] => [
@@ -1220,12 +1222,21 @@ async function assertComponentRefsBindable(
     throw AppError.notFound(appMsg('app.m127', { p0: notVisible.join('、') }))
   }
 
-  // ── P1-24a-1：Skill 的两条门禁（都在**绑定期**，不做执行期放行）──
+  // ── P1-24a-1：Skill 的绑定门禁（都在**绑定期**，不做执行期放行）──
   //  ① ChatBot + SANDBOX ⇒ 409 CONFLICT + data.code=SKILL_RUNTIME_NOT_ALLOWED（脚本只在容器里跑）；
+  //  ①′ ChatBot + **任何可执行脚本**（跨目录识别）⇒ 409；**已绑定的旧组合放行**（不改历史绑定）。
   //  ② 他人的 SANDBOX Skill（非 ADMIN）⇒ 403 FORBIDDEN + data.code=SKILL_SANDBOX_FOREIGN_DENIED
   //     —— 理由：`bash` 面前无法可靠区分"执行的是哪个 Skill 的脚本"，所以执行期确认不成立，
   //     只能在这里一次拦死；出路是 fork 成自己的 Skill（`子方案` §6.3）。
   //  ③ 固定版本越界 / 指向已归档版本 ⇒ 409（`SKILL_VERSION_PURGED`），不静默回退最新版。
+  const [scriptFlags, existingSkillRows] = await Promise.all([
+    skillHasScriptsMap(skillRows.map((skill) => ({ id: skill.id, version: skill.version }))),
+    db.agentComponent.findMany({
+      where: { agentId, componentType: 'SKILL' },
+      select: { refId: true },
+    }),
+  ])
+  const alreadyBoundSkillIds = new Set(existingSkillRows.map((row) => row.refId))
   const seenSkill = new Set<string>()
   for (const item of components) {
     if (item.componentType !== 'SKILL' || seenSkill.has(item.refId)) continue
@@ -1235,6 +1246,11 @@ async function assertComponentRefsBindable(
 
     if (skill.runtime === 'SANDBOX' && agentType === 'CHATBOT') {
       throw AppError.conflict(appMsg('app.m285', { p0: skill.name }), {
+        code: SKILL_ERROR_CODES.RUNTIME_NOT_ALLOWED,
+      })
+    }
+    if (agentType === 'CHATBOT' && scriptFlags.get(skill.id) === true && !alreadyBoundSkillIds.has(skill.id)) {
+      throw AppError.conflict(appMsg('app.m330', { p0: skill.name }), {
         code: SKILL_ERROR_CODES.RUNTIME_NOT_ALLOWED,
       })
     }
@@ -1307,7 +1323,7 @@ export async function replaceAgentComponents(
   // ③ 校验在写之前（P1-18：绑定时只允许选"对我可见"的组件；**不再**有公开/私有两类分支的闭包校验）
   // P1-24a-1：绑定校验需要 Agent 类型 —— ChatBot 不能绑 sandbox Skill（409）。
   // 传 `target.type` 而不是请求体：`type` 创建后不可改（`PATCH` 改类型直接 409），库里那份就是真相。
-  await assertComponentRefsBindable(desired, viewer, target.type)
+  await assertComponentRefsBindable(desired, viewer, target.type, id)
 
   const current = await componentsOf(id)
   if (!sameComponentSet(current, desired)) {

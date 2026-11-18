@@ -974,7 +974,9 @@ function AgentForm({ initialItem }: { initialItem?: AgentItem }) {
                           >
                             <span className="pick__title">
                               {skill.name}
-                              {skill.runtime === 'SANDBOX' && <SkillBadge runtime={skill.runtime} />}
+                              {(skill.runtime === 'SANDBOX' || skill.hasScripts) && (
+                                <SkillBadge runtime={skill.runtime} hasScripts={skill.hasScripts} />
+                              )}
                             </span>
                             <span className="pick__meta">
                               {skill.description}

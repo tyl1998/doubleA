@@ -89,6 +89,9 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
         {tool.skillVersion === undefined ? null : (
           <span className="ratio" data-testid="tool-card-skill-version">
             {t('toolCard.skillVersion', { version: tool.skillVersion })}
+            {tool.overrideRevision === undefined
+              ? ''
+              : ` · ${t('toolCard.overrideRevision', { revision: tool.overrideRevision })}`}
           </span>
         )}
         <span className="tool__arg">{tool.inputSummary}</span>

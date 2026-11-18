@@ -33,12 +33,16 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type {
+  ForkSkillBody,
   ImportSkillResult,
   RemoveSkillResult,
   SkillDetail,
   SkillFilePreview,
   SkillItem,
   SkillListResult,
+  SkillUpstreamDiff,
+  SyncSkillUpstreamBody,
+  SyncSkillUpstreamResult,
   TransferAssetBody,
   UpdateSkillBody,
 } from '@doubulea/shared'
@@ -84,8 +88,12 @@ export function fetchSkill(id: string): Promise<SkillDetail> {
 }
 
 /** 详情（404 = 不存在或对我不可见，页面据此渲染错误态 + 回列表入口） */
-export function useSkill(id: string) {
-  return useQuery({ queryKey: skillQueryKey(id), queryFn: () => fetchSkill(id) })
+export function useSkill(id: string, options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: skillQueryKey(id),
+    queryFn: () => fetchSkill(id),
+    enabled: id !== '' && options.enabled !== false,
+  })
 }
 
 /** 组表单：zip 是必填，其余字段只在给了值时才进 `FormData` */
@@ -144,6 +152,62 @@ export function useRemoveSkill() {
   return useMutation({
     mutationFn: (id: string) =>
       request<RemoveSkillResult>(`/api/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY })
+    },
+  })
+}
+
+/**
+ * 复制为我的 Skill（P1-24c-5；界面不叫 Fork）。
+ *
+ * 成功后新副本出现在「我的 Skills」；调用方负责跳转到副本详情。
+ */
+export function useForkSkill() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body?: ForkSkillBody }) =>
+      request<SkillItem>(`/api/skills/${encodeURIComponent(id)}/fork`, {
+        method: 'POST',
+        body: body ?? {},
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY })
+    },
+  })
+}
+
+/** 副本的上游差异（只读；`fromVersion` 缺省 = 副本的 `parentVersion`） */
+export function fetchSkillUpstreamDiff(
+  id: string,
+  params: { fromVersion?: number } = {},
+): Promise<SkillUpstreamDiff> {
+  const search = new URLSearchParams()
+  if (params.fromVersion !== undefined) search.set('fromVersion', String(params.fromVersion))
+  const query = search.toString()
+  return request<SkillUpstreamDiff>(
+    `/api/skills/${encodeURIComponent(id)}/upstream-diff${query === '' ? '' : `?${query}`}`,
+  )
+}
+
+export function useSkillUpstreamDiff(id: string, enabled = true) {
+  return useQuery({
+    queryKey: [...skillQueryKey(id), 'upstream-diff'] as const,
+    queryFn: () => fetchSkillUpstreamDiff(id),
+    enabled: enabled && id !== '',
+    retry: false,
+  })
+}
+
+/** 同步上游（仅 fast-forward；有本地改动时服务端 409，不覆盖） */
+export function useSyncSkillUpstream() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: SyncSkillUpstreamBody }) =>
+      request<SyncSkillUpstreamResult>(`/api/skills/${encodeURIComponent(id)}/sync-upstream`, {
+        method: 'POST',
+        body,
+      }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY })
     },

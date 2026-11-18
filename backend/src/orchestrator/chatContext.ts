@@ -28,6 +28,9 @@
 import {
   SKILL_LOAD_TOOL_NAME,
   SKILL_READ_FILE_TOOL_NAME,
+  SKILL_REQUEST_DRAFT_TOOL_NAME,
+  SKILL_REQUEST_REVISION_TOOL_NAME,
+  SKILL_REVISE_DRAFT_TOOL_NAME,
   formatSkillCatalogBlock,
   toolCallRecordSchema,
   type ArtifactItem,
@@ -407,6 +410,20 @@ export const SKILL_USAGE_RULES = [
 ].join('\n')
 
 /** 可用 Skill 目录的标题（与 `KNOWLEDGE_CATALOG_TITLE` 同款：标题本身是"这段有没有进去"的可观测点） */
+/**
+ * 草稿入口的**发现性**说明（P1-24c-4c）。
+ *
+ * 这不是自动触发：系统只告诉模型"用户明确要求时可以调哪个工具"，纠正本身不触发。
+ * 没有这段，用户不知道该在对话里怎么表达"把这段流程存成 Skill"，工具也就永远不被调用。
+ */
+export const SKILL_REQUEST_RULES = [
+  `- 用户**明确要求**「把这段流程存成 Skill / 另存为 Skill」时，调用 \`${SKILL_REQUEST_DRAFT_TOOL_NAME}\`；`,
+  `- 用户**明确要求**「把这个 Skill 按刚才的纠正更新一下」时，调用 \`${SKILL_REQUEST_REVISION_TOOL_NAME}\`；`,
+  `- 审核阶段用户要求「按这个意见修改草稿」时，调用 \`${SKILL_REVISE_DRAFT_TOOL_NAME}\`（只改草稿，不保存）；`,
+  '- 工具只产草稿或权限结果，**不保存、不绑定**；工具返回 FOREIGN / TARGET_NOT_FOUND 时按 reason 向用户解释，不要重复调用；',
+  '- **不要在用户没有明确要求时自动调用**（纠正本身不触发"保存为 Skill"）。',
+].join('\n')
+
 export const SKILL_CATALOG_TITLE = '可用 Skill（slug / 名称 / 版本 / 用途）'
 
 /**
@@ -450,7 +467,7 @@ export function buildSystemPrompt(
     ? DEFAULT_SYSTEM_PROMPT
     : agentPrompt
   const catalogBlock = formatKnowledgeCatalog(catalog)
-  const parts = [persona]
+  const parts = [persona, SKILL_REQUEST_RULES]
   if (options.userProfileBlock !== undefined && options.userProfileBlock !== '') {
     parts.push(options.userProfileBlock)
   }

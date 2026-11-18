@@ -45,6 +45,7 @@ import {
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   SKILL_ENTRY_PATH,
   SKILL_ERROR_CODES,
+  isLikelyScriptPath,
   isPreviewableSkillMime,
   isSafeSkillPath,
   previewKindOf,
@@ -81,6 +82,7 @@ import {
   findSkillConflict,
   isPurgedSkillFile,
   normalizeSkillVisibility,
+  skillHasScriptsMap,
   skillSlugOf,
   skillVisibilityWhere,
   uniqueSkillSlug,
@@ -103,8 +105,37 @@ const SKILL_CHANGES_PAGE_LIMIT = 50
 // 投影
 // ═════════════════════════════════════════════════════════════════════
 
-/** 行 → 列表 / 详情共用的元数据（`02` §4.4 的 `canEdit` / `creatorName` 口径，与知识库同款） */
-function toItem(row: SkillRow, viewer: SkillViewer): SkillItem {
+/**
+ * 上游（fork 来源）的展示信息（P1-24c-5）。
+ *
+ * `deleted` 与 `available` 是两件事：软删的上游行还在（名字还能显示），但**不可用**；
+ * 行已不存在时名字取不到（`name=null`），界面只说「来源 Skill 已删除」。
+ */
+export interface SkillParentInfo {
+  name: string | null
+  available: boolean
+  deleted: boolean
+  latestVersion: number | null
+}
+
+const NO_SKILL_PARENT: SkillParentInfo = { name: null, available: false, deleted: false, latestVersion: null }
+
+/**
+ * 行 → 列表 / 详情共用的元数据（`02` §4.4 的 `canEdit` / `creatorName` 口径，与知识库同款）。
+ *
+ * @param availableSource 可选的"来源会话仍然存在"集合（P1-24c-2）：列表 / 详情**批量**查一次后传进来，
+ *   不给 ⇒ 一律按"不可用"投影（`sourceAvailable=false`）—— 展示层据此显示"来源会话已删除"。
+ * @param parent 副本的上游展示信息（P1-24c-5；非副本不用传）
+ */
+export function toItem(
+  row: SkillRow,
+  viewer: SkillViewer,
+  availableSource?: ReadonlySet<string>,
+  parent?: SkillParentInfo,
+  hasScripts = false,
+  pendingProposalCount = 0,
+): SkillItem {
+  const parentInfo = parent ?? NO_SKILL_PARENT
   return {
     id: row.id,
     name: row.name,
@@ -116,14 +147,86 @@ function toItem(row: SkillRow, viewer: SkillViewer): SkillItem {
     visibility: row.visibility === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE',
     sourceType: row.sourceType,
     requiresBins: requiresBinsOf(row.requiresBins),
+    hasScripts,
     createdBy: row.createdBy,
     creatorName: row.creator.nickname ?? row.creator.username,
     canEdit: canEditSkill(row, viewer),
+    pendingProposalCount: canEditSkill(row, viewer) ? pendingProposalCount : 0,
     parentSkillId: row.parentSkillId,
     parentVersion: row.parentVersion,
+    parentName: row.parentSkillId === null ? null : parentInfo.name,
+    parentAvailable: row.parentSkillId === null ? false : parentInfo.available,
+    parentDeleted: row.parentSkillId === null ? false : parentInfo.deleted,
+    parentLatestVersion: row.parentSkillId === null ? null : parentInfo.latestVersion,
+    sourceConversationId: row.sourceConversationId,
+    sourceMessageIds: stringArrayOf(row.sourceMessageIds),
+    sourceAvailable:
+      row.sourceConversationId !== null && (availableSource?.has(row.sourceConversationId) ?? false),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }
+}
+
+/**
+ * 取一批副本的上游展示信息（**一次查询**；`parentSkillId` 去重）。
+ *
+ * 不按 `deletedAt` 过滤：软删的上游还要显示名字（「来源：X · 已删除」）——
+ * 这与 `findSkillRow` 的"软删即不存在"是不同的问题（那是读正文 / 判权）。
+ */
+export async function loadParentInfo(
+  rows: readonly Pick<SkillRow, 'parentSkillId'>[],
+  viewer: SkillViewer,
+): Promise<Map<string, SkillParentInfo>> {
+  const ids = [...new Set(rows.map((row) => row.parentSkillId).filter((id): id is string => id !== null))]
+  if (ids.length === 0) return new Map()
+  const parents = await getPrisma().skill.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, name: true, version: true, createdBy: true, visibility: true, deletedAt: true },
+  })
+  const map = new Map<string, SkillParentInfo>()
+  for (const parent of parents) {
+    const visible = parent.deletedAt === null && canViewSkill(parent, viewer)
+    map.set(parent.id, {
+      name: parent.name,
+      available: visible,
+      deleted: parent.deletedAt !== null,
+      latestVersion: visible ? parent.version : null,
+    })
+  }
+  // 行已不存在（上游硬删）⇒ 名字取不到，但「已删除」这个结论必须成立
+  for (const id of ids) {
+    if (!map.has(id)) map.set(id, { name: null, available: false, deleted: true, latestVersion: null })
+  }
+  return map
+}
+
+/** 单个副本的上游展示信息（列表以外的单行投影用） */
+export async function parentInfoOf(row: SkillRow, viewer: SkillViewer): Promise<SkillParentInfo> {
+  if (row.parentSkillId === null) return NO_SKILL_PARENT
+  const map = await loadParentInfo([row], viewer)
+  return map.get(row.parentSkillId) ?? { name: null, available: false, deleted: true, latestVersion: null }
+}
+
+/** jsonb → `string[]`（脏值一律当空数组；同 `requiresBinsOf` 的纪律） */
+function stringArrayOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+/**
+ * 批量取"来源会话仍然属于这些人"的集合（P1-24c-2）。
+ *
+ * 只查**有来源**那几行用到的会话 id（一个页面通常"没有来源"占多数）；**不建 FK** 是刻意的，
+ * 所以"会话已删"只能靠这一次查询表达成 `sourceAvailable=false`，而不是靠 join。
+ */
+async function loadAvailableSources(rows: readonly SkillRow[]): Promise<ReadonlySet<string>> {
+  const ids = [...new Set(rows.map((row) => row.sourceConversationId).filter((id): id is string => id !== null))]
+  if (ids.length === 0) return new Set()
+  const found = await getPrisma().conversation.findMany({
+    where: { id: { in: ids } },
+    select: { id: true },
+  })
+  return new Set(found.map((row) => row.id))
 }
 
 /** `requires_bins`（jsonb）→ `string[]`；脏值一律当空数组（列表不该因一行脏数据 500） */
@@ -155,7 +258,7 @@ function toFileEntry(row: {
  *
  * @throws {AppError} `NOT_FOUND`(404)
  */
-async function findSkillRow(id: string): Promise<SkillRow> {
+export async function findSkillRow(id: string): Promise<SkillRow> {
   const row = await getPrisma().skill.findFirst({ where: { id, deletedAt: null }, select: SKILL_SELECT })
   if (row === null) throw AppError.notFound(appMsg('app.m288', { p0: id }))
   return row
@@ -166,7 +269,7 @@ async function findSkillRow(id: string): Promise<SkillRow> {
  *
  * @param mode `'view'` = 可见即可；`'edit'` = 所属人 / ADMIN
  */
-async function requireSkill(
+export async function requireSkill(
   id: string,
   viewer: SkillViewer,
   mode: 'view' | 'edit',
@@ -216,7 +319,39 @@ export async function listSkills(query: ListSkillsQuery, viewer: SkillViewer): P
     }),
     db.skill.count({ where }),
   ])
-  return { items: rows.map((row) => toItem(row, viewer)), total, offset: query.offset, limit: query.limit }
+  const editableIds = rows.filter((row) => canEditSkill(row, viewer)).map((row) => row.id)
+  const [available, parents, scriptFlags, pendingCounts] = await Promise.all([
+    loadAvailableSources(rows),
+    loadParentInfo(rows, viewer),
+    skillHasScriptsMap(rows),
+    editableIds.length === 0
+      ? Promise.resolve(new Map<string, number>())
+      : db.skillProposal
+          .groupBy({
+            by: ['targetSkillId'],
+            where: { targetSkillId: { in: editableIds }, status: 'PENDING' },
+            _count: { _all: true },
+          })
+          .then(
+            (groups) =>
+              new Map(groups.map((group) => [group.targetSkillId, group._count._all] as const)),
+          ),
+  ])
+  return {
+    items: rows.map((row) =>
+      toItem(
+        row,
+        viewer,
+        available,
+        row.parentSkillId === null ? undefined : parents.get(row.parentSkillId),
+        scriptFlags.get(row.id) ?? false,
+        pendingCounts.get(row.id) ?? 0,
+      ),
+    ),
+    total,
+    offset: query.offset,
+    limit: query.limit,
+  }
 }
 
 /**
@@ -254,8 +389,9 @@ export async function getSkill(id: string, viewer: SkillViewer): Promise<SkillDe
     db.agentComponent.count({ where: { componentType: 'SKILL', refId: id } }),
   ])
 
+  const hasScripts = fileRows.some((file) => isLikelyScriptPath(file.path))
   return {
-    ...toItem(row, viewer),
+    ...toItem(row, viewer, await loadAvailableSources([row]), await parentInfoOf(row, viewer), hasScripts),
     files: fileRows.map(toFileEntry),
     versions: await listSkillVersions(id),
     changes: changes.map(
@@ -318,12 +454,15 @@ export interface ImportSkillInput {
 }
 
 /** S3 对象键（`skillStoragePrefix` 是全仓唯一拼法） */
-function objectKeyOf(skillId: string, version: number, path: string): string {
+export function skillObjectKey(skillId: string, version: number, path: string): string {
   return `${skillStoragePrefix(skillId, version)}${path}`
 }
 
+/** 兼容本文件内部的旧调用名（`objectKeyOf` 是同一拼法，不新增第二套前缀） */
+const objectKeyOf = skillObjectKey
+
 /** 确保桶存在（与文档上传同款：桶是按需创建的） */
-async function ensureBucket(): Promise<string> {
+export async function ensureBucket(): Promise<string> {
   const bucket = config.s3.bucket
   const s3 = getS3Client()
   if (!(await s3.bucketExists(bucket))) await s3.makeBucket(bucket)
@@ -331,7 +470,7 @@ async function ensureBucket(): Promise<string> {
 }
 
 /** 尽力删除一批键（失败只告警：孤儿对象是"泄漏一点存储"，比 500 好） */
-async function removeObjectsQuietly(keys: readonly string[]): Promise<void> {
+export async function removeObjectsQuietly(keys: readonly string[]): Promise<void> {
   if (keys.length === 0) return
   const bucket = config.s3.bucket
   try {
@@ -550,7 +689,13 @@ export async function importSkillPackage(
     existing === null ? '已创建 Skill' : '已重新导入 Skill（新版本）',
   )
   return {
-    skill: toItem(saved, viewer),
+    skill: toItem(
+      saved,
+      viewer,
+      undefined,
+      await parentInfoOf(saved, viewer),
+      files.some((file) => isLikelyScriptPath(file.path)),
+    ),
     version: nextVersion,
     fileCount: files.length,
     created: existing === null,
@@ -607,7 +752,13 @@ export async function updateSkill(
     select: SKILL_SELECT,
   })
   getLogger().info({ skillId: id, changed: Object.keys(input) }, '已更新 Skill 元数据')
-  return toItem(updated, viewer)
+  return toItem(
+    updated,
+    viewer,
+    undefined,
+    await parentInfoOf(updated, viewer),
+    (await skillHasScriptsMap([updated])).get(updated.id) ?? false,
+  )
 }
 
 /**
@@ -646,7 +797,13 @@ export async function transferSkill(id: string, toUserId: string, viewer: SkillV
   if (newOwner === null || newOwner.status !== 'ACTIVE') throw AppError.validation(appMsg('app.m011'))
   const updated = await db.skill.update({ where: { id }, data: { createdBy: toUserId }, select: SKILL_SELECT })
   getLogger().info({ skillId: id, from: row.createdBy, to: toUserId }, '已转移 Skill 所属人')
-  return toItem(updated, viewer)
+  return toItem(
+    updated,
+    viewer,
+    undefined,
+    await parentInfoOf(updated, viewer),
+    (await skillHasScriptsMap([updated])).get(updated.id) ?? false,
+  )
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -689,7 +846,7 @@ async function readSkillFileObject(
   row: { path: string; storageKey: string },
   targetVersion: number,
 ): Promise<Buffer> {
-  const bytes = await readObject(row.storageKey, objectKeyOf(skill.id, targetVersion, row.path), row.path)
+  const bytes = await readSkillObjectBytes(row.storageKey, objectKeyOf(skill.id, targetVersion, row.path), row.path)
   if (!isSkillEntryPath(row.path)) return bytes
   return Buffer.from(skillMarkdownOf(bytes, skill), 'utf8')
 }
@@ -765,7 +922,7 @@ function extraFrontmatterOf(value: unknown): Readonly<Record<string, unknown>> |
  * 一旦那一版过了保留期被回收（对象删了、行留着），"这一版明明还在保留期内"却读不到。
  * 先按行里的键读，失败再按本版号拼一次，两次都失败才判归档（见 {@link asPurged}）。
  */
-async function readObject(key: string, fallbackKey: string, path: string): Promise<Buffer> {
+export async function readSkillObjectBytes(key: string, fallbackKey: string, path: string): Promise<Buffer> {
   const bucket = config.s3.bucket
   try {
     return await readObjectOnce(bucket, key)

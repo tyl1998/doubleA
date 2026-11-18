@@ -21,16 +21,18 @@ import {
   ASSET_VISIBILITY_KEY,
   previewKindOf,
   translate,
+  type MessageKey,
   type PreviewKind,
   type SkillChange,
   type SkillDetail,
+  type SkillProposalStatus,
   type SkillFileEntry,
   type SkillVersion,
   type UpdateSkillBody,
 } from '@doubulea/shared'
 import { Alert, Button, Col, Descriptions, Empty, Input, Modal, Row, Tag } from 'antd'
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 
 import { ApiError, describeError } from '../../api/client.js'
 import {
@@ -39,13 +41,22 @@ import {
   saveDownloadedFile,
   skillFileRawUrl,
   skillFileRenderUrl,
+  useForkSkill,
   useSkill,
   useUpdateSkill,
 } from '../../api/skills.js'
+import {
+  useCreateSkillProposalDraft,
+  useMySkillProposals,
+  useSkillProposalsForTarget,
+} from '../../api/skillProposals.js'
+import { SkillProposalReviewModal } from '../../features/skills/SkillProposalReviewModal.js'
+import { UpstreamDiffModal } from '../../features/skills/UpstreamDiffModal.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
 import { formatUpdatedAt } from '../../app/format.js'
+import { skillDetailPath, skillDraftPath } from '../../app/paths.js'
 import { CsvPreview } from '../../components/ArtifactPreview/CsvPreview.js'
 import { HtmlPreview } from '../../components/ArtifactPreview/HtmlPreview.js'
 import { ImagePreview } from '../../components/ArtifactPreview/ImagePreview.js'
@@ -62,11 +73,20 @@ import { ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { VisibilityBadge } from '../../components/VisibilityBadge.js'
 import { SkillBadge } from './skillModel.js'
+import { SkillFileTree } from './SkillFileTree.js'
 
 interface SkillDraft {
   name: string
   description: string
   visibility: 'PRIVATE' | 'PUBLIC'
+}
+
+const PROPOSAL_STATUS_KEY: Readonly<Record<SkillProposalStatus, MessageKey>> = {
+  PENDING: 'skillProposal.statusPENDING',
+  ACCEPTED: 'skillProposal.statusACCEPTED',
+  REJECTED: 'skillProposal.statusREJECTED',
+  NEEDS_REBASE: 'skillProposal.statusNEEDS_REBASE',
+  CLOSED: 'skillProposal.statusCLOSED',
 }
 
 type TextPreviewState =
@@ -80,13 +100,19 @@ export function SkillDetailPage() {
   const { id = '' } = useParams<{ id: string }>()
   const { t, locale } = useT()
   const feedback = useFeedback()
+  const navigate = useNavigate()
 
   const skillQuery = useSkill(id)
   const updateSkill = useUpdateSkill()
+  const forkSkill = useForkSkill()
+  const createProposalDraft = useCreateSkillProposalDraft()
 
   const [draft, setDraft] = useState<SkillDraft | null>(null)
   const [transferOpen, setTransferOpen] = useState(false)
   const [versionOpen, setVersionOpen] = useState(false)
+  const [upstreamOpen, setUpstreamOpen] = useState(false)
+  const [proposalReviewId, setProposalReviewId] = useState('')
+  const [proposalReviewMode, setProposalReviewMode] = useState<'review' | 'mine'>('review')
   const [downloading, setDownloading] = useState(false)
 
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
@@ -94,6 +120,16 @@ export function SkillDetailPage() {
   const [textState, setTextState] = useState<TextPreviewState>({ phase: 'idle' })
 
   const detail = skillQuery.data
+  const isFork = detail?.parentSkillId != null
+  const targetProposals = useSkillProposalsForTarget(
+    detail?.id ?? '',
+    'PENDING',
+    detail?.canEdit === true && detail?.parentSkillId == null,
+  )
+  const myProposals = useMySkillProposals(undefined, isFork && detail?.canEdit === true)
+  const myProposalsForParent = (myProposals.data?.items ?? []).filter(
+    (proposal) => proposal.targetSkillId === detail?.parentSkillId,
+  )
   usePageCrumb(detail?.name ?? t('skillDetail.crumbFallback'))
 
   useEffect(() => {
@@ -224,6 +260,31 @@ export function SkillDetailPage() {
   const files = skill.files
   const entry = selectedEntry
 
+  function startProposal(): void {
+    if (detail === undefined) return
+    createProposalDraft.mutate(
+      { id: detail.id },
+      {
+        onSuccess: (proposalDraft) => navigate(skillDraftPath(proposalDraft.id)),
+        onError: (error) => feedback.fail(error, t('skillProposal.createFailed')),
+      },
+    )
+  }
+
+  function copyAsMine(): void {
+    if (detail === undefined) return
+    forkSkill.mutate(
+      { id: detail.id },
+      {
+        onSuccess: (copy) => {
+          feedback.ok(t('skillFork.copyOk', { name: copy.name }))
+          navigate(skillDetailPath(copy.id))
+        },
+        onError: (error) => feedback.fail(error, t('skillFork.copyFailed')),
+      },
+    )
+  }
+
   async function downloadArchive(): Promise<void> {
     setDownloading(true)
     try {
@@ -336,6 +397,22 @@ export function SkillDetailPage() {
           </p>
         </div>
         <div className="page__head-actions">
+          {!skill.canEdit && skill.visibility === 'PUBLIC' ? (
+            <Button type="primary" loading={forkSkill.isPending} onClick={copyAsMine}>
+              {t('skillFork.copy')}
+            </Button>
+          ) : null}
+          {skill.parentSkillId !== null ? (
+            <Button onClick={() => setUpstreamOpen(true)}>{t('skillFork.viewUpstream')}</Button>
+          ) : null}
+          {skill.parentSkillId !== null &&
+          skill.canEdit &&
+          skill.parentAvailable &&
+          !skill.parentDeleted ? (
+            <Button loading={createProposalDraft.isPending} onClick={startProposal}>
+              {t('skillProposal.submit')}
+            </Button>
+          ) : null}
           {dirty && <Tag className="tag--warn">{t('skillDetail.unsaved')}</Tag>}
           {skill.canEdit && (
             <Button type="primary" loading={updateSkill.isPending} disabled={!canSave} onClick={save}>
@@ -354,7 +431,11 @@ export function SkillDetailPage() {
           size="small"
           column={{ xs: 1, md: 2 }}
           items={[
-            { key: 'runtime', label: t('skillDetail.runtime'), children: <SkillBadge runtime={skill.runtime} /> },
+            {
+              key: 'runtime',
+              label: t('skillDetail.runtime'),
+              children: <SkillBadge runtime={skill.runtime} hasScripts={skill.hasScripts} />,
+            },
             { key: 'visibility', label: t('skillDetail.visibility'), children: <VisibilityBadge visibility={skill.visibility} /> },
             {
               key: 'owner',
@@ -413,6 +494,99 @@ export function SkillDetailPage() {
         )}
       </div>
 
+      {skill.parentSkillId !== null ? (
+        <div className="card card--pad" style={{ marginBottom: 'var(--sp-5)' }}>
+          <p className="block-label">{t('skillFork.sourceTitle')}</p>
+          <p style={{ marginTop: 0 }}>
+            {t('skillFork.sourceLine', {
+              name: skill.parentName ?? t('skillFork.sourceDeletedName'),
+              basedOn: skill.parentVersion ?? '—',
+            })}{' '}
+            <Tag color={skill.parentDeleted || !skill.parentAvailable ? 'default' : 'blue'}>
+              {skill.parentDeleted
+                ? t('skillFork.sourceDeleted')
+                : !skill.parentAvailable
+                  ? t('skillFork.statusUnavailable')
+                  : skill.parentLatestVersion !== null &&
+                      skill.parentVersion !== null &&
+                      skill.parentLatestVersion > skill.parentVersion
+                    ? t('skillFork.statusUpstream', { version: skill.parentLatestVersion })
+                    : t('skillFork.statusSynced', {
+                        version: skill.parentLatestVersion ?? skill.parentVersion ?? '—',
+                      })}
+            </Tag>
+          </p>
+        </div>
+      ) : null}
+
+      {skill.canEdit && skill.parentSkillId === null ? (
+        <div className="card card--pad" style={{ marginBottom: 'var(--sp-5)' }}>
+          <p className="block-label">
+            {t('skillProposal.ownerTitle')}
+            {(targetProposals.data?.pendingCount ?? 0) > 0 && (
+              <Tag color="orange" style={{ marginLeft: 8 }}>
+                {t('skillProposal.pendingCount', { count: targetProposals.data?.pendingCount ?? 0 })}
+              </Tag>
+            )}
+          </p>
+          {(targetProposals.data?.items.length ?? 0) === 0 ? (
+            <p className="ratio">{t('skillProposal.ownerEmpty')}</p>
+          ) : (
+            <div className="stack stack--tight">
+              {(targetProposals.data?.items ?? []).map((proposal) => (
+                <div key={proposal.id} className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+                  <Tag>{t(PROPOSAL_STATUS_KEY[proposal.status])}</Tag>
+                  <span>{t('skillProposal.fromProposer', { name: proposal.proposerName })}</span>
+                  <span className="ratio">{t('skillProposal.basedOn', { version: proposal.baseVersion })}</span>
+                  <span>{proposal.changeSummary}</span>
+                  <Button
+                    type="link"
+                    size="small"
+                    style={{ padding: 0 }}
+                    onClick={() => {
+                      setProposalReviewMode('review')
+                      setProposalReviewId(proposal.id)
+                    }}
+                  >
+                    {t('skillProposal.review')}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : null}
+
+      {skill.parentSkillId !== null && myProposalsForParent.length > 0 ? (
+        <div className="card card--pad" style={{ marginBottom: 'var(--sp-5)' }}>
+          <p className="block-label">{t('skillProposal.mineTitle')}</p>
+          <div className="stack stack--tight">
+            {myProposalsForParent.map((proposal) => (
+              <div key={proposal.id} className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+                <Tag>{t(PROPOSAL_STATUS_KEY[proposal.status])}</Tag>
+                <span className="ratio">{t('skillProposal.basedOn', { version: proposal.baseVersion })}</span>
+                <span>{proposal.changeSummary}</span>
+                {proposal.acceptedVersion !== null && (
+                  <Tag color="green">{t('skillProposal.mergedInto', { version: proposal.acceptedVersion })}</Tag>
+                )}
+                {proposal.reviewNote !== null && <span className="ratio">{proposal.reviewNote}</span>}
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ padding: 0 }}
+                  onClick={() => {
+                    setProposalReviewMode('mine')
+                    setProposalReviewId(proposal.id)
+                  }}
+                >
+                  {t('skillProposal.viewMine')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       {skill.agentCount > 0 && (
         <Alert
           type="info"
@@ -427,28 +601,14 @@ export function SkillDetailPage() {
         <Col xs={24} lg={7}>
           <div className="card card--pad">
             <p className="block-label">{t('skillDetail.filesTitle')}</p>
-            <div className="stack stack--tight">
-              {files.map((file) => (
-                <button
-                  key={file.path}
-                  type="button"
-                  className={`pick${selectedPath === file.path ? ' pick--active' : ''}`}
-                  style={{ width: '100%', textAlign: 'left' }}
-                  onClick={() => {
-                    setSelectedPath(file.path)
-                    setTextState({ phase: 'idle' })
-                  }}
-                >
-                  <span className="pick__title">{file.path}</span>
-                  <span className="pick__meta num">
-                    {formatBytes(file.size)}
-                    {!file.previewable && ` · ${t('skillDetail.binaryHint')}`}
-                    {file.purged && ` · ${t('skillDetail.purgedTag')}`}
-                  </span>
-                </button>
-              ))}
-              {files.length === 0 && <p className="ratio">{t('skillDetail.noFiles')}</p>}
-            </div>
+            <SkillFileTree
+              files={files}
+              selectedPath={selectedPath}
+              onSelect={(path) => {
+                setSelectedPath(path)
+                setTextState({ phase: 'idle' })
+              }}
+            />
           </div>
         </Col>
         <Col xs={24} lg={17}>
@@ -472,6 +632,24 @@ export function SkillDetailPage() {
         assetName={skill.name}
         currentOwnerName={skill.creatorName}
         onClose={() => setTransferOpen(false)}
+      />
+
+      <UpstreamDiffModal
+        open={upstreamOpen}
+        skillId={skill.id}
+        skillName={skill.name}
+        onClose={() => setUpstreamOpen(false)}
+      />
+
+      <SkillProposalReviewModal
+        open={proposalReviewId !== ''}
+        proposalId={proposalReviewId}
+        mode={proposalReviewMode}
+        onClose={() => setProposalReviewId('')}
+        onAccepted={() => {
+          void skillQuery.refetch()
+          void targetProposals.refetch()
+        }}
       />
 
       <Modal

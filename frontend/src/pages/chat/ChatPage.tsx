@@ -92,7 +92,7 @@ import { confirmConversation } from '../../api/mcp.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
-import { AGENTS_PATH, agentEditPath, conversationPath, newConversationPath } from '../../app/paths.js'
+import { AGENTS_PATH, agentEditPath, conversationPath, newConversationPath, skillDetailPath } from '../../app/paths.js'
 import { ArtifactPreviewDrawer } from '../../components/ArtifactPreview/ArtifactPreviewDrawer.js'
 import { EmptyState, TableSkeleton } from '../../components/ListStates.js'
 import { AGENT_TYPE_LABEL } from '../../pages/agents/agentModel.js'
@@ -104,6 +104,10 @@ import { confirmAnsweredText, confirmIgnoredNote } from '../../features/chat/con
 import { ConversationSettings, type CodeFocus } from '../../features/chat/ConversationSettings.js'
 import { DisconnectBanner } from '../../features/chat/DisconnectBanner.js'
 import { MemoryNoticeStack } from '../../features/chat/MemoryControls.js'
+import { SkillDraftNoticeStack } from '../../features/chat/SkillDraftNoticeStack.js'
+import { useExtractSkillOverride } from '../../api/skillOverrides.js'
+import { useForkSkill } from '../../api/skills.js'
+import { SkillDraftReviewDrawer } from '../../features/skills/SkillDraftReviewDrawer.js'
 import { WorkspacePanel, WorkspacePanelPlaceholder } from '../../features/chat/WorkspacePanel.js'
 import { useWorkspacePanelResize } from '../../features/chat/useWorkspacePanelResize.js'
 import { MessageList } from '../../features/chat/MessageList.js'
@@ -237,6 +241,9 @@ export function ChatPage({
   // `agentId` 为空串时不查（`useAgent` 的 `enabled` 判据是"不是 undefined"，空串会打出一个 400）
   const agentQuery = useAgent(agentId === '' ? undefined : agentId)
   const messagesQuery = useConversationMessages(conversationId)
+  // P1-24c-4b：提示卡「只改本会话」⇒ 生成 SESSION_OVERRIDE 草稿（同一个抽取端点，intent=OVERRIDE）
+  const extractOverride = useExtractSkillOverride(conversationId ?? '')
+  const forkSkill = useForkSkill()
   // 新建对话前的模型 Key 预检要用它（`ModelOption` 带 `providerCredentialMode` / `providerUserHasKey`）。
   // 与智能体编辑页共用同一个查询键（见 `api/models.ts`），不额外打请求。
   const availableModelsQuery = useAvailableChatModels()
@@ -352,6 +359,21 @@ export function ChatPage({
   const serverRunStartedAt = conversationId === undefined ? null : (serverRun[conversationId] ?? null)
 
   const [draft, setDraft] = useState('')
+  /** P1-24c-4c：提示卡「审核草稿」打开的宽版弹层（`null` = 关闭；深链仍保留） */
+  const [reviewDraftId, setReviewDraftId] = useState<string | null>(null)
+  /**
+   * 审核弹层属于**打开它的那个会话**。切会话时只靠 effect 把 `reviewDraftId` 置空，
+   * 新会话的第一帧仍可能看到上一会话的弹层（effect 在 paint 之后）—— 这里记住打开时的会话，
+   * 渲染时先判一次，避免"别处会话短暂顶着审核内容"。
+   */
+  const reviewDraftConversationRef = useRef<string | undefined>(undefined)
+  const openReviewDraft = useCallback(
+    (draftId: string): void => {
+      reviewDraftConversationRef.current = conversationId
+      setReviewDraftId(draftId)
+    },
+    [conversationId],
+  )
   const [aligning, setAligning] = useState(false)
   /**
    * 本轮**已上传好**的附件（P1-4）：先上传拿 `fileId`，发送时只带 id（后端按归属解析）。
@@ -375,7 +397,7 @@ export function ChatPage({
   const [selectedModelId, setSelectedModelId] = useState<string | undefined>(undefined)
   /** 渲染窗口的"展开"（内存优化 P5a）：`true` = 用户点过"显示更早的消息"，本次会话内不再设上限 */
   const [historyExpanded, setHistoryExpanded] = useState(false)
-  useEffect(() => {
+useEffect(() => {
     if (preserveSelectionRef.current) {
       preserveSelectionRef.current = false
       return
@@ -386,6 +408,16 @@ export function ChatPage({
     // 渲染窗口的"展开"（内存优化 P5a）同样是"这一屏的选择"：切会话要收回默认窗口，
     // 否则下一条会话会莫名其妙地把几千条历史全画出来。
     setHistoryExpanded(false)
+  }, [conversationId])
+
+  /**
+   * 审核弹层是**会话上下文里**的界面（提示卡 / 覆写面板都在本会话里打开）。
+   * 切到另一个会话时它必须一起关掉 —— 否则 B 会话会顶着 A 会话的审核弹层，
+   * 甚至还能把 A 的草稿保存掉（草稿本身按用户判权，但界面语境是错的）。
+   */
+  useEffect(() => {
+    setReviewDraftId(null)
+    reviewDraftConversationRef.current = undefined
   }, [conversationId])
 
   /** 确认应答在飞（防连点：两个按钮同时禁用，见 `ConfirmCard` 文件头 ③） */
@@ -1456,7 +1488,9 @@ export function ChatPage({
               </Tag>
             ) : null}
 
-            {/* 标题栏右侧只留一枚**设置图标**（R4 / 用户反馈：直接进编辑智能体） */}
+            {/* 标题栏右侧：一枚**设置图标**（R4 / 用户反馈：直接进编辑智能体）。
+                ⚠️ Skill 生成/更新入口已改为 Agent 工具 + 提示卡（P1-24c-4c）——
+                这里不再有固定按钮。 */}
             <div className="chat__head-right">
               {agent === undefined ? null : (
                 <Tooltip title={t('chat.editAgent')}>
@@ -1478,6 +1512,44 @@ export function ChatPage({
           {/* 长期记忆提示（P1-8，toast 晚一拍）：自动写入可撤销 / 偏好建议可记住。
               只在有提示时渲染；由 `MemoryNoticeStack` 自己按会话/聚焦/每轮拉取。 */}
           <MemoryNoticeStack conversationId={conversationId} refreshKey={memoryRefreshKey} />
+
+          {/* Skill 草稿提示卡（P1-24c-4c）：与记忆提示同族，本轮结束/聚焦/重连时拉取。 */}
+          <SkillDraftNoticeStack
+            key={conversationId ?? 'none'}
+            conversationId={conversationId}
+            refreshKey={memoryRefreshKey}
+            onReview={openReviewDraft}
+            onLetAgentRevise={(draftId, instruction) => {
+              setDraft(t('skillNotice.reviseRequest', { draftId, instruction }))
+            }}
+            onEditInSession={(notice) => {
+              if (conversationId === undefined || notice.targetSkillId === null || notice.fromVersion === null) return
+              extractOverride.mutate(
+                {
+                  targetSkillId: notice.targetSkillId,
+                  baseVersion: notice.fromVersion,
+                  scope: 'CORRECTION',
+                },
+                {
+                  onSuccess: (result) => openReviewDraft(result.draftId),
+                  onError: (error) => feedback.fail(error, t('skillOverride.extractFailed')),
+                },
+              )
+            }}
+            onFork={(notice) => {
+              if (notice.targetSkillId === null) return
+              forkSkill.mutate(
+                { id: notice.targetSkillId },
+                {
+                  onSuccess: (copy) => {
+                    feedback.ok(t('skillFork.copyOk', { name: copy.name }))
+                    navigate(skillDetailPath(copy.id))
+                  },
+                  onError: (error) => feedback.fail(error, t('skillFork.copyFailed')),
+                },
+              )
+            }}
+          />
 
           {/* 排队提示（`queued` 事件）：沙箱并发满时的位次。**P0 阶段恒不出现**
               （产生方是沙箱并发闸，属 P0-3）。 */}
@@ -1646,6 +1718,7 @@ export function ChatPage({
                   onTogglePanel={setPanelOpen}
                   codeFocus={codeFocus}
                   onChangeCodeFocus={setCodeFocus}
+                  onReviewDraft={openReviewDraft}
                 />
               }
             />
@@ -1726,6 +1799,17 @@ export function ChatPage({
 
       {/* 撤回 / 修改重发最新一轮（产品优化 2026-09-29）。`conversationId ?? ''` 是类型兜底：
           弹窗只在 `recallTarget` 非空时发请求，而那时 `conversationId` 必然存在（见 `recallable` 的判据） */}
+      {/* P1-24c-4c：宽版审核弹层（复用 SkillDraftReview：文件树 + 对比 / 内容 / 编辑）；深链 `/skills/drafts/:draftId` 仍保留 */}
+      <SkillDraftReviewDrawer
+        draftId={reviewDraftConversationRef.current === conversationId ? reviewDraftId : null}
+        onClose={() => {
+          setReviewDraftId(null)
+          reviewDraftConversationRef.current = undefined
+          // 保存 / 丢弃都会消耗草稿：关闭后重新拉一次提示卡，让已失效的那张自然消失
+          setMemoryRefreshKey((key) => key + 1)
+        }}
+      />
+
       <RecallConversationModal
         agentId={agentId}
         conversationId={conversationId ?? ''}

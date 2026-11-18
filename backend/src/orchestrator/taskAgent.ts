@@ -119,8 +119,13 @@ import { appMsg,
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
+  SKILL_ERROR_CODES,
+  SKILL_TOOL_SERVER_NAME,
+  isSkillRequestToolName,
+  isSkillToolName,
   type ArtifactItem,
   type ConversationActiveSnapshot,
+  type SkillManifest,
   type SseEvent,
   type ToolCallRecord,
 } from '@doubulea/shared'
@@ -131,11 +136,14 @@ import { sumUsages, type ChatUsage } from '../llm/protocol.js'
 import {
   buildSandboxMcpCatalogPreview,
   closeSandboxRpc,
+  formatSkillCatalogPromptBlock,
+  syncConversationSkills,
   collectRoundArtifacts,
   ensureSandbox,
   ensureSandboxMcpCatalog,
   republishSandboxMcpCatalog,
   getSandboxRpc,
+  recycleSandbox,
   resolveSandboxMcpTool,
   type SandboxAcquireFailure,
   type SandboxHandle,
@@ -146,7 +154,11 @@ import {
   type TurnOutcome,
 } from '../sandbox/index.js'
 import { catalogFingerprint } from '../sandbox/catalogSync.js'
-import { sandboxMcpRefreshPromptLine } from '../sandbox/spec.js'
+import { execInSandbox } from '../sandbox/docker.js'
+import { needsSkillsRefresh, skillsMountHealthy, skillsRefreshPromptLine, skillToolSetOf } from '../sandbox/skillContainer.js'
+import { binsProbeCommand, declaredBinsOf, formatSkillBinsWarningBlock, parseBinsProbe } from '../sandbox/skillScript.js'
+import { readConversationSkillManifest } from '../sandbox/skillSync.js'
+import { SANDBOX_SKILLS_DIR, sandboxMcpRefreshPromptLine } from '../sandbox/spec.js'
 import {
   createEngineEventMapper,
   engineTurnBoundaryOf,
@@ -162,6 +174,7 @@ import {
   ATTACHMENT_CONTEXT_NOTE,
   MEMORY_TOOL_RULES,
   RETRIEVAL_RULES,
+  SKILL_REQUEST_RULES,
   attachmentItemsOf,
   formatKnowledgeCatalog,
 } from './chatContext.js'
@@ -239,7 +252,39 @@ function builtinToolServerName(toolName: string): string {
     return MEMORY_TOOL_SERVER_NAME
   }
   if (toolName === SEND_NOTIFICATION_TOOL_NAME) return NOTIFY_TOOL_SERVER_NAME
+  if (isSkillToolName(toolName) || isSkillRequestToolName(toolName)) return SKILL_TOOL_SERVER_NAME
   return '内置工具'
+}
+
+/**
+ * ★ P1-24b-3：`requires.bins` 的**运行时预检**（§4.3 第 7 条：只提示、不阻断）。
+ *
+ * 判据链：manifest 里有没有 Skill 声明 bins（没有 ⇒ **一次 exec 都不付**）→ 一次 `sh -c command -v`
+ * 探完所有 bin（名字先过白名单，见 `skillScript.ts#binsProbeCommand`）→ 缺失的非空才拼成提示块。
+ *
+ * ⚠️ **恒不抛**：预检失败（docker 抖动 / 容器刚退出）只 warn 返回空串 —— 它是提示不是闸门，
+ *    绝不能因为"探测不到 python3"把这一轮打掉（派活本身与 Skill 正文读取都不受影响）。
+ */
+async function skillBinsWarningBlock(containerId: string, manifest: SkillManifest): Promise<string> {
+  const declared = declaredBinsOf(manifest)
+  if (declared.length === 0) return ''
+  const command = binsProbeCommand(declared)
+  if (command === null) return ''
+  try {
+    const probe = await execInSandbox(containerId, command, { timeoutMs: 10_000 })
+    const parsed = parseBinsProbe(probe.stdout.toString('utf8'), declared)
+    const block = formatSkillBinsWarningBlock(manifest, parsed)
+    if (block !== '') {
+      getLogger().info(
+        { containerId, missing: parsed.missing, unsupported: parsed.unsupported },
+        'Skill 脚本依赖预检：当前运行时缺少部分 bin（只提示，不阻断派活）',
+      )
+    }
+    return block
+  } catch (error) {
+    getLogger().warn({ err: error, containerId }, 'Skill 脚本依赖预检失败（按"不缺"继续；不影响派活）')
+    return ''
+  }
 }
 
 export const taskAgentProducer: ChatProducer = async (input) => {
@@ -509,6 +554,76 @@ export const taskAgentProducer: ChatProducer = async (input) => {
     // 这些事件不落库、不进 `/active` 快照（`shared#sseStatusPayloadSchema` 文件头写明）。
     enqueue([{ name: 'status', data: { text: '沙箱已就绪，正在启动引擎…' } }])
 
+    /**
+     * ★ P1-24b-1：**先把技能目录补齐，再建桥派活**。
+     *
+     * 顺序是正确性的一部分：
+     *   · 容器创建时就把 `{SKILL_RUNTIME_ROOT}/{conversationId}` 只读挂进 `$HOME/.skills`
+     *     （`spec.ts`），所以"这一轮要用的 Skill 文件"必须在**派活之前**落盘；
+     *   · 同步失败 ⇒ 抛 `SKILL_SYNC_FAILED`（本轮明确失败），**不重建容器**（重建解决不了 S3 故障）；
+     *   · 复用容器时同样要同步（宿主目录可能被 reaper 清过 / 换机）—— 判据是目录内容与 manifest，
+     *     不是"mount 在不在"（§3.2 末尾那条 ⚠️）。
+     * ⚠️ 失败时容器与本轮既有状态都保留，下一轮重试即可。
+     */
+    let skillManifest: SkillManifest
+    /** 这一轮容器里**该有**的 Skill 工具（manifest `tools[]`；扩展按它注册） */
+    let skillTools: string[]
+    try {
+      const synced = await syncConversationSkills({ conversationId, agentId })
+      skillManifest = synced.manifest
+      skillTools = skillToolSetOf(synced.manifest)
+      logger.info(
+        {
+          conversationId,
+          agentId,
+          changed: synced.changed,
+          rehydrated: synced.rehydrated,
+          skills: synced.manifest.skills.map((entry) => `${entry.slug}@v${String(entry.version)}`),
+        },
+        '本轮 Skill 宿主副本已就绪',
+      )
+    } catch (error) {
+      logger.warn({ err: error, conversationId, agentId }, 'Skill 宿主副本同步失败 ⇒ 本轮明确失败（不重建容器）')
+      throw error
+    }
+
+    /**
+     * ★ P1-24b-2：**挂载健康探针**（§4.16「容器没有 Skill mount ⇒ 重建」）。
+     *
+     * 宿主目录刚刚同步好，容器里看到的应当就是它（只读 bind）。两条判据：`$HOME/.skills` 是目录、
+     * 且里面能读到**本会话**的 `manifest.json`（内容与 mount 同一个源 ⇒ 宿主读得到容器就读得到）。
+     *   · 失效 ⇒ `recycleSandbox` 后**直接失败本轮**（用户重发即可；不静默用一个看不到 Skill 的容器跑，
+     *     那会让模型"目录里有 Skill、工具却一个都没有"，而日志里一条错都没有）；
+     *   · 探针**本身**失败（docker 抖动 / 容器刚退出）⇒ 只 warn 继续 —— 那与 mount 健康无关，
+     *     且 `ensureSandbox` 下一轮会按容器状态自行重建（不能因为一次 inspect 失败把这一轮打掉）。
+     * ⚠️ 成本：每个**新容器**一轮 `exec`（复用容器跳过 —— 它们的挂载建时已验过）。
+     */
+    if (!handle.reused) {
+      try {
+        const manifest = await readConversationSkillManifest(conversationId)
+        const probe = await execInSandbox(
+          handle.containerId,
+          ['sh', '-c', `test -d ${SANDBOX_SKILLS_DIR} && echo DIR || echo MISSING`],
+          { timeoutMs: 10_000 },
+        )
+        const isDirectory = probe.stdout.toString('utf8').includes('DIR')
+        if (!skillsMountHealthy({ isDirectory, manifest }, conversationId)) {
+          logger.warn(
+            { conversationId, containerId: handle.containerId, isDirectory, hasManifest: manifest !== null },
+            '容器内 $HOME/.skills 挂载不可用 ⇒ 回收容器并让本轮明确失败（下一轮重建时挂回）',
+          )
+          await recycleSandbox(conversationId, 'skill-mount-missing')
+          throw AppError.internal(appMsg('app.m303'), { code: SKILL_ERROR_CODES.SYNC_FAILED })
+        }
+      } catch (error) {
+        if (error instanceof AppError) throw error
+        logger.warn(
+          { err: error, conversationId, containerId: handle.containerId },
+          'Skill 挂载探针失败（按挂载正常继续；容器状态由下一轮 ensureSandbox 复核）',
+        )
+      }
+    }
+
     try {
       // ═════════════════════════════════════════════════════════════
       // ② 引擎桥（一个会话一条、与容器同寿命；容器换了它会自己重attach）
@@ -618,6 +733,23 @@ export const taskAgentProducer: ChatProducer = async (input) => {
         )
       }
 
+      // ★ P1-24c-4c：草稿入口的发现性说明（只在用户明确要求时调；不自动学习）。
+      engineContent = `${SKILL_REQUEST_RULES}\n\n${engineContent}`
+
+      // ★ P1-24b-1：Skill 目录段（`slug / version / path / currentPath`）—— 与 ChatBot 的
+      //   "只给目录、正文按需 load"同一条口径（§4.2.1 / §4.14 第 5 步）。TaskAgent 的正文读取
+      //   由容器内 `skills` 扩展完成（b-2），所以这里只告诉模型"有哪些、各自在哪"，不注入正文。
+      // ★ P1-24b-3：同一段里还有脚本口径（`$SKILL_DIR/scripts/...`、cwd=/work、产物写 /work），
+      //   以及 `requires.bins` 的**预检提示**（缺失只提示、不阻断 —— 见下方那段）。
+      //   ⚠️ 只改 `engineContent`（落库仍是用户原文，与知识库 / 记忆注入同款）。
+      {
+        const block = formatSkillCatalogPromptBlock(skillManifest)
+        if (block !== '') {
+          const warning = await skillBinsWarningBlock(handle.containerId, skillManifest)
+          engineContent = warning === '' ? `${block}\n\n${engineContent}` : `${block}\n\n${warning}\n\n${engineContent}`
+        }
+      }
+
       // ★ 长期记忆工具说明 + 反幻觉（P1-8a）：启用记忆时把 remember/recall_memory 的用法与
       //   "未命中不得编造"拼进发给引擎的 prompt。⚠️ 只改 engineContent（落库仍是用户原文）。
       try {
@@ -697,6 +829,20 @@ export const taskAgentProducer: ChatProducer = async (input) => {
           { err: error, conversationId, agentId },
           '沙箱 MCP 工具清单预热失败（本轮 MCP 工具卡将不带 serverId；工具本身不受影响）',
         )
+      }
+      // ★ P1-24b-2：**首次绑定 / 全部解绑**才注入 `/doubulea:skills-refresh`（§4.15）。
+      //   工具集合没变（绝大多数轮次：0→0 或 N→N）⇒ 一个字节都不注入。
+      //   `needsSkillsRefresh(null, 0)` 为 false ⇒ 没绑 Skill 的新容器也不刷（它本来就没东西可注册）；
+      //   反过来"从没绑过 → 这轮绑了"必然注入（`registered = null` 且 desired 非空）。
+      //   ⚠️ **仅版本变化不刷**：扩展每次调用都按 manifest 的 `path` 读，manifest 已由同步器换过。
+      //   ⚠️ 容器内的"已注册集合"后端看不到，按 `null`（不知道）判 —— 代价只是多一条命令，不会漏刷。
+      //      `registeredNames` 在扩展里跨会话保留，重复 refresh 是幂等的（同名只覆盖定义）。
+      {
+        const needs = needsSkillsRefresh(null, skillTools)
+        if (needs) {
+          engineContent = `${skillsRefreshPromptLine()}\n\n${engineContent}`
+          logger.info({ conversationId, agentId, tools: skillTools }, '本轮注入 Skill 工具刷新命令（首次绑定 / 解绑）')
+        }
       }
       // ⚠️ 过一次 `const`：`let` 变量在闭包里 TS 不会保留窄化 ⇒ 直接闭合 `mcpCatalog` 会报"可能为 null"
       const resolverCatalog: SandboxMcpCatalog | null = mcpCatalog
@@ -1204,6 +1350,7 @@ function toEngineUsage(total: ChatUsage | null): EngineUsage | null {
  * | `MODEL_NOT_AVAILABLE` | `CONFLICT` 409 | 目标（模型/Provider）不可用 —— 与 `resolveChatTarget` 的"模型已停用 409"同族；文案已指向"去改智能体的模型" |
  * | `CONVERSATION_NOT_FOUND` | `CONFLICT` 409 | 撞到的是"会话已结束（只读）"这个**状态**问题（真不存在的情况路由层已经 404 挡过），与 `assertConversationSendable` 的只读 409 口径一致 |
  * | `CREATE_FAILED` | `INTERNAL` 500 | 建容器失败（镜像缺失 / 卷建不出来 / Docker 不可达）：基础设施故障 |
+ * | `OUTBOUND_UNAVAILABLE` | `INTERNAL` 500 | 出口①/② 的 egress / relay 容器没在跑：容器建了也通讯不了（C 端无解，管理员 `pnpm egress:up` / `pnpm relay:up`） |
  * | `STARTING` | `BUSY` 429 | 实例刚重启、启动对账未完成：**可自愈**，等几十秒重发（不是配置错） |
  * | `ABORTED` | `BUSY` 429 | ⚠️ **理论上不可达**：取消一定经 `signal` ⇒ 调用方在 `!acquired.ok` 那一支已经先按"用户已停止"处理。真到了这里说明有人绕过了信号，按"暂时不可用"报（比编一个"已取消"更像事实） |
  *
@@ -1221,6 +1368,9 @@ export function sandboxAcquireError(code: SandboxAcquireFailure, message: string
     case 'CONVERSATION_NOT_FOUND':
       return AppError.conflict(message)
     case 'CREATE_FAILED':
+      return AppError.internal(message)
+    // ★ 出口基础设施（egress / relay 容器）没在跑：管理员动作，用户重发无解
+    case 'OUTBOUND_UNAVAILABLE':
       return AppError.internal(message)
     // ★ 实例刚重启、对账还没跑完：可自愈（等几十秒重发），与 QUEUE_TIMEOUT 同族（429 BUSY）
     case 'STARTING':

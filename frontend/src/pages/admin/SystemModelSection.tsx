@@ -27,6 +27,7 @@ import { Alert, Button, Select, Spin, Switch, Tag } from 'antd'
 import { useEffect, useState } from 'react'
 
 import { useAvailableChatModels } from '../../api/models.js'
+import { useSkillExtractModel, useUpdateSkillExtractModel } from '../../api/skillExtract.js'
 import { useTitleModel, useUpdateTitleModel } from '../../api/titleModel.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
@@ -141,6 +142,127 @@ export function SystemModelSection() {
                   style={{ width: '100%' }}
                   allowClear
                   placeholder={t('systemModel.titleModelPlaceholder')}
+                  value={form.modelId === '' ? undefined : form.modelId}
+                  loading={models.isLoading}
+                  options={options}
+                  onChange={(value: string | undefined) => setForm({ ...form, modelId: value ?? '' })}
+                />
+              </div>
+
+              <div className="row" style={{ gap: 'var(--sp-3)' }}>
+                <Button type="primary" loading={save.isPending} onClick={submit}>
+                  {t('common.save')}
+                </Button>
+                {query.data !== undefined && (
+                  <span className="ratio">
+                    {t('systemModel.lastUpdated', { time: new Date(query.data.updatedAt).toLocaleString(localeTag(locale)) })}
+                  </span>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+/**
+ * 「从会话生成 Skill」的抽取模型（P1-24c-2，同一区块的第二张小卡）。
+ *
+ * 与标题模型的三处不同（写在这里，免得后来的人以为可以直接照抄上面那张）：
+ *   · **不可用不降级**：标题模型不可用时回落原文截断；抽取不可用 ⇒ 抽取入口 502 明说
+ *     （草稿会直接进用户的 Skill，用错模型比报错更糟）；
+ *   · **没配就回落标题模型**（配置层面的回落，不是降级）；两者都没有才报错；
+ *   · 默认**开**（用户显式点的动作）。
+ */
+export function SkillExtractModelSection() {
+  const feedback = useFeedback()
+  const { t, locale } = useT()
+  const query = useSkillExtractModel()
+  const models = useAvailableChatModels()
+  const save = useUpdateSkillExtractModel()
+
+  const [form, setForm] = useState<{ enabled: boolean; modelId: string } | null>(null)
+
+  useEffect(() => {
+    if (query.data !== undefined && form === null) {
+      setForm({ enabled: query.data.enabled, modelId: query.data.modelId ?? '' })
+    }
+  }, [query.data, form])
+
+  const submit = (): void => {
+    if (form === null) return
+    save.mutate(
+      { enabled: form.enabled, modelId: form.modelId === '' ? null : form.modelId },
+      {
+        onSuccess: () => feedback.ok(t('skillExtractModel.saved')),
+        onError: (error) => feedback.fail(error, t('skillExtractModel.saveFailed')),
+      },
+    )
+  }
+
+  const options = (models.data?.items ?? []).map((model) => ({
+    value: model.id,
+    label: `${model.label}（${model.providerName} · ${model.modelName}）`,
+  }))
+
+  const statusTag = () => {
+    if (query.data === undefined) return null
+    if (!query.data.enabled) return <Tag style={{ marginInlineStart: 6 }}>{t('skillExtractModel.offTag')}</Tag>
+    if (query.data.fallbackToTitleModel) {
+      return (
+        <Tag color="gold" style={{ marginInlineStart: 6 }}>
+          {t('skillExtractModel.fallbackTag')}
+        </Tag>
+      )
+    }
+    if (query.data.modelId !== null) {
+      return (
+        <Tag color="green" style={{ marginInlineStart: 6 }}>
+          {query.data.modelLabel ?? query.data.modelId}
+        </Tag>
+      )
+    }
+    return null
+  }
+
+  return (
+    <section className="admin-section">
+      <div className="card">
+        <div className="card__head">
+          <h2 className="card__title">{t('skillExtractModel.title')}</h2>
+          <div className="card__head-right">
+            <span className="ratio">
+              {t('skillExtractModel.prefix')}
+              {statusTag()}
+            </span>
+          </div>
+        </div>
+
+        <div className="card__body stack">
+          <p className="ratio">{t('skillExtractModel.note')}</p>
+
+          {query.isLoading || form === null ? (
+            <Spin />
+          ) : (
+            <>
+              <div className="stack stack--tight" style={{ maxWidth: 560 }}>
+                <div className="row" style={{ gap: 'var(--sp-3)' }}>
+                  <Switch checked={form.enabled} onChange={(checked) => setForm({ ...form, enabled: checked })} />
+                  <span className="block-label" style={{ marginBottom: 0 }}>
+                    {t('skillExtractModel.enableLabel')}
+                  </span>
+                  <span className="ratio">{t('skillExtractModel.enableOff')}</span>
+                </div>
+
+                <label className="block-label" htmlFor="skill-extract-model">
+                  {t('skillExtractModel.modelLabel')}
+                </label>
+                <Select
+                  id="skill-extract-model"
+                  style={{ width: '100%' }}
+                  allowClear
+                  placeholder={t('skillExtractModel.modelPlaceholder')}
                   value={form.modelId === '' ? undefined : form.modelId}
                   loading={models.isLoading}
                   options={options}

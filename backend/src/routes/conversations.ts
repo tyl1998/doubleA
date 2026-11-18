@@ -37,6 +37,16 @@
 
 import { appMsg,
   chatRequestBodySchema,
+  skillDraftNoticeActionBodySchema,
+  skillDraftNoticeParamsSchema,
+  skillDraftNoticeActionResultSchema,
+  skillExtractRequestSchema,
+  createConversationSkillOverrideBodySchema,
+  replaceConversationSkillOverrideBodySchema,
+  rebaseConversationSkillOverrideBodySchema,
+  conversationSkillOverrideParamsSchema,
+  type SkillExtractBody,
+  type SkillRevisionExtractBody,
   confirmRequestBodySchema,
   conversationIdParamsSchema,
   createConversationBodySchema,
@@ -71,6 +81,10 @@ import { appMsg,
   type SteerCancelBody,
   type SteerConversationBody,
   type SseEvent,
+  type SkillDraftNoticeActionBody,
+  type CreateConversationSkillOverrideBody,
+  type ReplaceConversationSkillOverrideBody,
+  type RebaseConversationSkillOverrideBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
@@ -110,6 +124,19 @@ import {
   setConversationRuntime,
   type ConversationViewer,
 } from '../services/conversation.service.js'
+import { extractSkillFromConversation } from '../services/skillExtract.service.js'
+import { listSkillRevisionTargets } from '../services/skillRevision.service.js'
+import { consumeSkillDraftNotice, listSkillDraftNotices } from '../services/skillDraftNotice.service.js'
+import {
+  createConversationSkillOverride,
+  deleteConversationSkillOverride,
+  getConversationSkillOverride,
+  listConversationSkillOverrides,
+  rebaseConversationSkillOverride,
+  replaceConversationSkillOverride,
+} from '../services/skillOverride.service.js'
+import { promoteConversationSkillOverride } from '../services/skillFork.service.js'
+import { createProposalDraftFromOverride } from '../services/skillProposal.service.js'
 
 /** 在线实例的能力快照（读 `sandbox:instance:*`，与网关自动发现同一份判据） */
 interface OnlineInstance {
@@ -391,6 +418,215 @@ export function registerConversationRoutes(app: FastifyInstance): void {
       schema: { params: conversationIdParamsSchema, querystring: listMessagesQuerySchema },
     },
     async (request) => ok(await listMessages(request.params.id, request.query, viewerOf(request))),
+  )
+
+  /**
+   * 从会话抽取 Skill 草稿（`POST /api/conversations/:id/skills/extract`，P1-24c-2）。
+   *
+   * 判据全在服务层（`skillExtract.service.ts` 文件头 ①）：**只有会话所有者**能抽
+   * （`userId` 在 where 里 ⇒ ADMIN 也没有"导出他人会话"的口子）；不是你的 / 不存在 ⇒ 同一个 404。
+   * 本版只做 SUMMARY 管线；返回的是**草稿**，落库仍走 `POST /api/skills/from-draft`。
+   */
+  app.post<{ Params: ConversationIdParams; Body: SkillExtractBody | SkillRevisionExtractBody }>(
+    '/api/conversations/:id/skills/extract',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: skillExtractRequestSchema },
+    },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      // 抽取的归属判据只看 `userId`（`role` 不参与：ADMIN 也不能抽别人的会话）
+      return ok(await extractSkillFromConversation(request.params.id, request.body, { id: user.id, role: user.role }))
+    },
+  )
+
+  /**
+   * 「更新到哪个 Skill」的候选（`GET /api/conversations/:id/skill-targets`，P1-24c-4）。
+   *
+   * 判据与抽取**同一条**（只有会话所有者；不是你的 / 不存在 ⇒ 同一个 404）。响应给前端三件事：
+   * 最近加载优先的候选、每个候选的影响范围（跟随最新 / 固定版本的 Agent 数）、以及**我能不能直接更新**
+   * （`canUpdate=false` 的用户只能 fork 或只改本会话的 Skill —— 真正拒绝发生在发起 REVISION 抽取时）。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/skill-targets',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(await listSkillRevisionTargets(request.params.id, { id: user.id, role: user.role }))
+    },
+  )
+
+  /**
+   * Skill 草稿提示卡（P1-24c-4c）：`GET /api/conversations/:id/skill-notices` 拉取、
+   * `POST /:noticeId` 消费（`OPEN` / `DISMISS`）。
+   *
+   * 判据与抽取**同一条**（只有会话所有者；不是你的 / 不存在 ⇒ 同一个 404）。`GET` **不消费**
+   * —— 前端按 `id` 去重（打开页面 / 重连会重复拉到）；只有 `POST` 移除。
+   */
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/skill-notices',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok({ items: await listSkillDraftNotices(request.params.id, { id: user.id }) })
+    },
+  )
+
+  app.post<{ Params: { id: string; noticeId: string }; Body: SkillDraftNoticeActionBody }>(
+    '/api/conversations/:id/skill-notices/:noticeId',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillDraftNoticeParamsSchema, body: skillDraftNoticeActionBodySchema },
+    },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        skillDraftNoticeActionResultSchema.parse(
+          await consumeSkillDraftNotice({
+            conversationId: request.params.id,
+            noticeId: request.params.noticeId,
+            action: request.body.action,
+            viewer: { id: user.id },
+          }),
+        ),
+      )
+    },
+  )
+
+  /**
+   * 会话级 Skill 覆写（P1-24c-4b；`子方案/Skill能力.md` §5.16.7）。
+   *
+   * 全部端点只有**会话发起者**能访问（`conversation.userId === viewer.id`，ADMIN 也 404）；
+   * 目标 Skill 必须在本会话 Agent 的绑定集合内；`storageKey` 只由服务端生成。
+   *
+   * · `POST   /api/conversations/:id/skill-overrides`        —— 保存草稿（只收 `draftId`）
+   * · `GET    /api/conversations/:id/skill-overrides`        —— 列表（会话设置面板）
+   * · `GET    /api/conversations/:id/skill-overrides/:id`    —— 详情（含文件清单）
+   * · `PUT    /api/conversations/:id/skill-overrides/:id`    —— 替换（`expectedRevision` CAS）
+   * · `DELETE /api/conversations/:id/skill-overrides/:id`    —— 放弃（回退上游）
+   * · `POST   /api/conversations/:id/skill-overrides/:id/rebased` —— 按当前上游重建草稿
+ * · `POST   /api/conversations/:id/skill-overrides/:id/promote` —— 另存为我的 Skill（P1-24c-5）
+ * · `POST   /api/conversations/:id/skill-overrides/:id/proposal-draft` —— 直接提交更新建议（不 fork）
+   *
+   * ⚠️ `promote` 是覆写的**唯一出口**：服务端先 fork、再删覆写；删失败保留覆写（回 `overrideDeleted=false`），
+   *    不会出现"两边都没有"（`子方案/Skill能力.md` §5.16.7）。
+   */
+  app.post<{ Params: ConversationIdParams; Body: CreateConversationSkillOverrideBody }>(
+    '/api/conversations/:id/skill-overrides',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationIdParamsSchema, body: createConversationSkillOverrideBodySchema },
+    },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(await createConversationSkillOverride(request.params.id, request.body.draftId, { id: user.id, role: user.role }))
+    },
+  )
+
+  app.get<{ Params: ConversationIdParams }>(
+    '/api/conversations/:id/skill-overrides',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(await listConversationSkillOverrides(request.params.id, { id: user.id, role: user.role }))
+    },
+  )
+
+  app.get<{ Params: { id: string; overrideId: string } }>(
+    '/api/conversations/:id/skill-overrides/:overrideId',
+    { preHandler: app.requireAuth, schema: { params: conversationSkillOverrideParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        await getConversationSkillOverride(request.params.id, request.params.overrideId, { id: user.id, role: user.role }),
+      )
+    },
+  )
+
+  app.put<{ Params: { id: string; overrideId: string }; Body: ReplaceConversationSkillOverrideBody }>(
+    '/api/conversations/:id/skill-overrides/:overrideId',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationSkillOverrideParamsSchema, body: replaceConversationSkillOverrideBodySchema },
+    },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        await replaceConversationSkillOverride(
+          request.params.id,
+          request.params.overrideId,
+          { draftId: request.body.draftId, expectedRevision: request.body.expectedRevision },
+          { id: user.id, role: user.role },
+        ),
+      )
+    },
+  )
+
+  app.delete<{ Params: { id: string; overrideId: string } }>(
+    '/api/conversations/:id/skill-overrides/:overrideId',
+    { preHandler: app.requireAuth, schema: { params: conversationSkillOverrideParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(await deleteConversationSkillOverride(request.params.id, request.params.overrideId, { id: user.id, role: user.role }))
+    },
+  )
+
+  app.post<{ Params: { id: string; overrideId: string }; Body: RebaseConversationSkillOverrideBody }>(
+    '/api/conversations/:id/skill-overrides/:overrideId/rebased',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: conversationSkillOverrideParamsSchema, body: rebaseConversationSkillOverrideBodySchema },
+    },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        await rebaseConversationSkillOverride(
+          request.params.id,
+          request.params.overrideId,
+          { expectedRevision: request.body.expectedRevision },
+          { id: user.id, role: user.role },
+        ),
+      )
+    },
+  )
+
+  /**
+   * 另存为我的 Skill（`POST .../promote`，P1-24c-5）。
+   *
+   * 把当前覆写落成自己的独立 Skill（`parentSkillId` 指向上游、`parentVersion=basedOnVersion`），
+   * **先 fork 成功、再删覆写**；删除失败只回 `overrideDeleted=false`（覆写仍在，可稍后放弃）。
+   */
+  app.post<{ Params: { id: string; overrideId: string } }>(
+    '/api/conversations/:id/skill-overrides/:overrideId/promote',
+    { preHandler: app.requireAuth, schema: { params: conversationSkillOverrideParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        await promoteConversationSkillOverride(request.params.id, request.params.overrideId, {
+          id: user.id,
+          role: user.role,
+        }),
+      )
+    },
+  )
+
+  /**
+   * 从覆写直接建更新建议草稿（`POST .../proposal-draft`）。
+   *
+   * 非所属人不 fork 也能提建议：内容就是这条覆写（已确认过脱敏），`baseVersion = basedOnVersion`。
+   */
+  app.post<{ Params: { id: string; overrideId: string } }>(
+    '/api/conversations/:id/skill-overrides/:overrideId/proposal-draft',
+    { preHandler: app.requireAuth, schema: { params: conversationSkillOverrideParamsSchema } },
+    async (request) => {
+      const { user } = requireAuthContext(request)
+      return ok(
+        await createProposalDraftFromOverride(request.params.id, request.params.overrideId, {
+          id: user.id,
+          role: user.role,
+        }),
+      )
+    },
   )
 
   /**

@@ -236,6 +236,15 @@ export interface ChatOptions {
   /** 覆盖配置的"流内空闲"超时 */
   idleTimeoutMs?: number
   /**
+   * 覆盖"是否请求深度思考"（缺省 = 模型的 `supportsReasoning`）。
+   *
+   * 结构化抽取（Skill 抽取 / 修订）必须显式传 `false`：思考 token 与正文共享
+   * `max_tokens`，开了思考时 JSON 很容易被截断（2026-11-17 实测：`finish_reason=length`
+   * 且正文只有 0~2k 字符）。普通对话不传 = 按模型的 `supportsReasoning`；
+   * 对**默认开思考**的厂商还会显式下发 `thinking: disabled`（见 `vendorThinkingBody`）。
+   */
+  requestReasoning?: boolean
+  /**
    * 原样并入请求体的额外字段（`top_p` / 多模态 part 之类）。
    * **本层不校验它** —— 这是给 F 包留的逃生口：上游差异不该逼着改传输层。
    * ⚠️ 它在 `buildBody` 的最后被 `Object.assign` ⇒ **能覆盖**同名的协议字段（含 `tools`）。
@@ -296,6 +305,39 @@ function decodeContextOf(target: LlmTarget): ProtocolDecodeContext {
   return { providerName: target.providerName, subject: target.modelName, apiKey: target.apiKey }
 }
 
+/**
+ * 已知"**默认开启深度思考**"的 OpenAI 兼容模型的私有 `thinking` 开关。
+ *
+ * 背景（2026-11-17 实测）：平台的 `supportsReasoning` 缺省 `false`，原先的语义只是
+ * "**不主动请求**思考"，但小米 MiMo v2.5 / v2.6 与 DeepSeek v4.1 Flash 的**默认值就是
+ * `thinking.type=enabled`** ⇒ 平台以为没开、上游一直在思考：
+ *  · 普通问答的首个**正文** token 要等 10~27s（期间只有 `reasoning_content`），
+ *    原来的 30s「到响应头」预算很容易被顶穿（实测 4 次里 2 次 `UPSTREAM_TIMEOUT`；
+ *    默认现已调到 60s，见 `config.llm.requestTimeoutMs`）；
+ *  · 一次 Skill 更新草稿（非流式）要 36s；
+ *  · 多轮工具调用还要求回传历史 `reasoning_content`，我们并不存它。
+ *
+ * 所以这里把它们**显式**下发：管理员勾了「启用深度思考」⇒ `enabled`，否则 `disabled`。
+ * ⚠️ 只对已知支持 `thinking.type` 的（Provider 域名 × 型号）组合生效；其它一律返回 `null`，
+ *    不往请求体里塞未知字段（很多网关会直接 400）。
+ */
+function vendorThinkingBody(target: LlmTarget, requestReasoning: boolean): Record<string, unknown> | null {
+  if (target.protocol !== 'OPENAI_COMPAT') return null
+  let host: string
+  try {
+    host = new URL(target.baseUrl).hostname.toLowerCase()
+  } catch {
+    return null
+  }
+  const name = target.modelName.toLowerCase()
+  const known =
+    ((host === 'xiaomimimo.com' || host.endsWith('.xiaomimimo.com')) && /^mimo-v2\.[56]/.test(name)) ||
+    ((host === 'opencsg.com' || host.endsWith('.opencsg.com')) &&
+      (name.startsWith('deepseek-v4') || name === 'deepseek-flash'))
+  if (!known) return null
+  return { thinking: { type: requestReasoning ? 'enabled' : 'disabled' } }
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // chat()：非流式
 // ═════════════════════════════════════════════════════════════════════
@@ -320,6 +362,8 @@ export async function chat(
   const protocol = protocolOf(target.protocol)
   const endpoint = endpointOf(target)
 
+  const requestReasoning = options.requestReasoning ?? target.supportsReasoning
+  const vendorThinking = vendorThinkingBody(target, requestReasoning)
   // 报文形状（路径 / 字段名 / system 放哪 / 有没有必填项）全部由协议决定 —— 见 `./protocol.ts`
   const body = protocol.buildBody({
     model: target.modelName,
@@ -328,8 +372,9 @@ export async function chat(
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     tools: options.tools,
-    requestReasoning: target.supportsReasoning,
-    extraBody: options.extraBody,
+    // 已知默认开思考的模型用私有 `thinking` 对象控制（见 `vendorThinkingBody`），不再叠 `reasoning_effort`
+    requestReasoning: vendorThinking === null ? requestReasoning : undefined,
+    extraBody: { ...(vendorThinking ?? {}), ...(options.extraBody ?? {}) },
   })
 
   // 非流式的报文很小（一次问答的 JSON），所以一个计时器覆盖"到响应头 + 读 body"全程
@@ -419,6 +464,8 @@ export async function chatStream(
     }
   }
 
+  const requestReasoning = options.requestReasoning ?? target.supportsReasoning
+  const vendorThinking = vendorThinkingBody(target, requestReasoning)
   const body = protocol.buildBody({
     model: target.modelName,
     messages,
@@ -426,8 +473,9 @@ export async function chatStream(
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     tools: options.tools,
-    requestReasoning: target.supportsReasoning,
-    extraBody: options.extraBody,
+    // 已知默认开思考的模型用私有 `thinking` 对象控制（见 `vendorThinkingBody`），不再叠 `reasoning_effort`
+    requestReasoning: vendorThinking === null ? requestReasoning : undefined,
+    extraBody: { ...(vendorThinking ?? {}), ...(options.extraBody ?? {}) },
   })
   // ⚠️ 刻意不写 `stream_options`（见文件头 ②）：它是 400 的常见来源，而 usage 只是锦上添花
 

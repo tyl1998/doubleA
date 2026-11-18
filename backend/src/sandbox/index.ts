@@ -24,6 +24,7 @@
 // 生命周期（拿、收、刷活跃、观测）
 export {
   ensureSandbox,
+  ensureSkillRuntimeDir,
   getSandboxStats,
   recycleSandbox,
   touchSandbox,
@@ -178,6 +179,40 @@ export {
   type SandboxMcpToolRef,
 } from './mcpMap.js'
 
+// Skill 宿主副本与同步（P1-24b-1）：`{SKILL_RUNTIME_ROOT}/{conversationId}` → 容器 `$HOME/.skills`（只读）
+// ｜ 编排层（`taskAgent.ts`） | `syncConversationSkills`（派活前一次）/ `formatSkillCatalogPromptBlock`
+// ｜ 容器创建（`manager.ts`） | `ensureSkillRuntimeDir`（见 `manager.js` 导出）/ `skillRuntimeDirOf` / `skillSync.ts`
+// ｜ reaper（`skillRuntime/reaper.ts`） | `purgeSkillRuntimeDir`
+// ｜ 诊断 / 自证 | `buildSkillManifest` / `manifestMatches` / `skillRuntimeDirIsEmpty` / `skillManifestFingerprint`（shared）
+export {
+  buildSkillManifest,
+  expectedFingerprintOf,
+  formatSkillCatalogPromptBlock,
+  manifestMatches,
+  purgeSkillRuntimeDir,
+  resolveDesiredSkills,
+  skillCurrentPath,
+  skillRuntimeDirIsEmpty,
+  skillRuntimeDirOf,
+  skillVersionDir,
+  SKILL_MANIFEST_TOOL_NAMES,
+  syncConversationSkills,
+  type SkillDesiredEntry,
+  type SkillSyncResult,
+} from './skillSync.js'
+
+// Skill 宿主副本的独立 reaper（P1-24b-1）：跟随工作区保留期，判据 = `conversations.updated_at`
+// ｜ 进程入口（`index.ts`） | `reapOrphanSkillRuntimeDirs` / `reapExpiredSkillRuntimeDirs` / `startSkillReaper` / `stopSkillReaper`
+export {
+  reapExpiredSkillRuntimeDirs,
+  reapOrphanSkillRuntimeDirs,
+  startSkillReaper,
+  stopSkillReaper,
+  SKILL_REAP_INTERVAL_MS,
+  SKILL_REAP_MAX_PER_TICK,
+  type SkillReapReport,
+} from './skillRuntime/reaper.js'
+
 // 排队（位次可观测；编排层把位次变成 `queued` 事件）
 export { sandboxQueueDepth, sandboxQueueKey, sandboxQueuePosition } from './queue.js'
 
@@ -215,6 +250,8 @@ export {
 
 // 名字与标签契约（纯函数；"哪些容器是我们的"**只**由它们回答）
 export {
+  SANDBOX_AGENT_HOME,
+  SANDBOX_SKILLS_DIR,
   SANDBOX_LABEL_CONVERSATION,
   SANDBOX_LABEL_MODEL,
   SANDBOX_LABEL_ROLE,

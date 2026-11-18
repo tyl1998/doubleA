@@ -83,6 +83,7 @@ import { appMsg,
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
+  SKILL_REQUEST_TOOL_NAMES,
   SKILL_TOOL_SERVER_NAME,
   buildSkillOpenAiTools,
   pinnedMcpToolNamesFromConfig,
@@ -153,6 +154,7 @@ import {
   isSkillTool,
   loadSkillSnapshot,
 } from './skillTools.js'
+import { executeSkillDraftTool, isSkillRequestTool } from './skillDraftTools.js'
 import {
   detectSkillVersionChanges,
   formatSkillVersionNotice,
@@ -386,6 +388,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
      */
     const skillSnapshot = await loadSkillSnapshot(
       skillBindings.map((component) => ({ refId: component.refId, skillVersion: skillVersionFromConfig(component.config) ?? null })),
+      conversationId,
     )
     const availableSkills = availableSkillEntries(skillSnapshot)
     /**
@@ -407,12 +410,15 @@ export const chatBotProducer: ChatProducer = async (input) => {
       const lastLoaded = await readSkillLastLoaded(conversationId)
       skillVersionNotice = formatSkillVersionNotice(
         detectSkillVersionChanges(
-          availableSkills.map((entry) => ({
-            skillId: entry.skillId,
-            slug: entry.slug,
-            name: entry.name,
-            version: entry.version,
-          })),
+          availableSkills
+            // 覆写生效期间不参与"上游版本变化提示"（§5.16.8）：它记录的是上游版本，不是覆写
+            .filter((entry) => entry.overrideRevision === null)
+            .map((entry) => ({
+              skillId: entry.skillId,
+              slug: entry.slug,
+              name: entry.name,
+              version: entry.version,
+            })),
           lastLoaded,
         ),
       )
@@ -470,6 +476,11 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * 排在知识库工具**之后、网关之前**：目录（system prompt）里已经给了 Skill 清单，工具是第二步。
      */
     if (skillSnapshot.hasUsable) builtinTools.push(...buildSkillOpenAiTools())
+    /**
+     * P1-24c-4c：草稿入口三工具（**始终下发** —— 没绑 Skill 也能"把这段流程存成 Skill"）。
+     * 与只读工具同一份定义源；执行体在 `orchestrator/skillDraftTools.ts`（只产草稿或权限结果）。
+     */
+    builtinTools.push(...buildSkillOpenAiTools([...SKILL_REQUEST_TOOL_NAMES]))
     /**
      * 工具网关（P1-19）：**只在工具多、走了网关时**下发（`catalog.gatewayActive`）。
      * 走网关时 `catalog.tools` 里只有常驻工具，其余工具需要模型用 `mcp_list_tools` 发现、
@@ -951,6 +962,44 @@ export const chatBotProducer: ChatProducer = async (input) => {
             continue
           }
 
+          // ── 内置 Skill 草稿入口工具（P1-24c-4c）：只产草稿或权限结果，不保存 ──
+          //
+          // 与只读工具分开一条分支：它们的执行体要调抽取 / 修订模型（见 `skillDraftTools.ts`），
+          // 成败都以结构化结果回给模型（工具本身不抛整轮错误）。
+          if (isSkillRequestTool(call.name)) {
+            const parsed = parseToolArguments(call.arguments)
+            const inputSummary = parsed.ok
+              ? summarizeToolInput(parsed.value)
+              : summarizeToolInput({ raw: call.arguments })
+            const base = {
+              callId: call.id,
+              toolName: call.name,
+              serverName: SKILL_TOOL_SERVER_NAME,
+              kind: 'BUILTIN' as const,
+            }
+            emitToolCard({ ...base, status: 'RUNNING', inputSummary })
+            await input.updateSnapshot({ currentTool: call.name })
+            const outcome = await executeSkillDraftTool({
+              conversationId,
+              agentId,
+              name: call.name,
+              arguments: call.arguments,
+              viewer: { id: conversationRow.userId, role: conversationRow.user.role },
+              chatTarget: input.target,
+              log: { conversationId, agentId },
+            })
+            const finished = {
+              ...base,
+              status: outcome.isError ? ('ERROR' as const) : ('SUCCESS' as const),
+              inputSummary,
+              output: outcome.output,
+            }
+            emitToolCard(finished)
+            toolRecords.push({ ...withToolTextOffset(finished), arguments: call.arguments })
+            outcomes.push({ callId: call.id, text: outcome.output, isError: outcome.isError })
+            continue
+          }
+
           // ── 内置 Skill 工具（P1-24a-3）：目录 / 正文 / 资源，与知识库同属内置族，按名字分流 ──
           //
           // 只有绑了**可用的** Skill 才会下发这三个工具（`skillSnapshot.hasUsable`），但执行侧仍校验
@@ -991,6 +1040,9 @@ export const chatBotProducer: ChatProducer = async (input) => {
                     skillSlug: outcome.audit.skillSlug,
                     skillVersion: outcome.audit.skillVersion,
                     skillPath: outcome.audit.skillPath,
+                    ...(outcome.audit.overrideRevision === undefined
+                      ? {}
+                      : { overrideRevision: outcome.audit.overrideRevision }),
                   }),
             }
             /**
@@ -1001,7 +1053,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
              *   · **写上游版本**：C-4b 的会话级覆写生效期间**不写**（那版不是上游版本）；
              *   · **写失败只 warn**（`writeSkillLastLoaded` 恒不抛）—— 最多让下一轮漏一次提示。
              */
-            if (outcome.audit !== undefined) {
+            if (outcome.audit !== undefined && outcome.audit.overrideRevision === undefined) {
               await writeSkillLastLoaded(
                 conversationId,
                 skillLastLoadedUpdate(outcome.audit),

@@ -27,7 +27,6 @@
 import {
   BranchesOutlined,
   CloseOutlined,
-  CodeOutlined,
   CopyOutlined,
   DeleteOutlined,
   DownOutlined,
@@ -36,9 +35,6 @@ import {
   EyeInvisibleOutlined,
   EyeOutlined,
   FileAddOutlined,
-  FileImageOutlined,
-  FileMarkdownOutlined,
-  FileOutlined,
   FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
@@ -53,7 +49,7 @@ import {
 import { Alert, App, Button, Dropdown, Empty, Input, Modal, Space, Spin, Switch, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import {
   WORKSPACE_ACTOR_KEY,
   isWorkspaceHiddenPath,
@@ -97,6 +93,7 @@ import {
 import { conversationArtifactsQueryKey } from '../../api/artifacts.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
+import { FileTypeGlyph } from '../../components/FileTypeGlyph.js'
 import { useWorkspaceExpandedDirs, useWorkspaceStore, useWorkspaceTabs } from '../../stores/workspace.js'
 import { CodeMirrorEditor } from './CodeMirrorEditor.js'
 import {
@@ -104,7 +101,6 @@ import {
   changeTagColor,
   conflictText,
   eventTouchesPath,
-  fileIconKind,
   filterWorkspaceTree,
   flattenWorkspaceTree,
   formatBytes,
@@ -138,7 +134,6 @@ import {
   workspaceCopyItems,
   WORKSPACE_COPY_ITEM_KEYS,
   type WorkspaceCopyKind,
-  type WorkspaceFileIconKind,
   type WorkspaceTreeNode,
 } from './workspaceModel.js'
 
@@ -1359,7 +1354,7 @@ export function WorkspacePanel({
                         setOpenedRange(null)
                         activateFile(conversationId, path)
                       }}>
-                      <FileGlyph path={path} />
+                      <FileTypeGlyph path={path} />
                       <span className="ws__tab-label">{workspaceBaseName(path)}</span>
                       {tabDirty && <span className="ws__tab-dot" aria-label={t('workspace.unsaved')} />}
                     </button>
@@ -2019,41 +2014,6 @@ function WorkspacePathPrompt(props: {
   )
 }
 
-/** 文件图标（按 `fileIconKind` 挑图标 + 配色；纯展示，判据在纯函数里） */
-function FileGlyph({ path }: { path: string }) {
-  const kind = fileIconKind(path)
-  const color = FILE_ICON_COLORS[kind]
-  return <span className="ws__glyph" style={{ color }}>{FILE_ICON_NODES[kind]}</span>
-}
-
-const FILE_ICON_COLORS: Record<WorkspaceFileIconKind, string> = {
-  typescript: '#3178c6',
-  javascript: '#b8860b',
-  json: '#8a5a00',
-  markdown: '#3f6ea5',
-  html: '#c04a20',
-  css: '#6a4bbb',
-  python: '#3572a5',
-  image: '#1f6f4a',
-  shell: '#4a5568',
-  yaml: '#8a5a00',
-  text: '#666a73',
-}
-
-const FILE_ICON_NODES: Record<WorkspaceFileIconKind, ReactNode> = {
-  typescript: <CodeOutlined />,
-  javascript: <CodeOutlined />,
-  json: <CodeOutlined />,
-  markdown: <FileMarkdownOutlined />,
-  html: <CodeOutlined />,
-  css: <CodeOutlined />,
-  python: <CodeOutlined />,
-  image: <FileImageOutlined />,
-  shell: <CodeOutlined />,
-  yaml: <FileOutlined />,
-  text: <FileOutlined />,
-}
-
 /**
  * 只读文件的**在线预览**（2026-10-30）—— 按 `previewKindOf` 分派，与产物预览同一套判据。
  *
@@ -2382,7 +2342,7 @@ function WorkspaceTree(props: {
                       onClick={() => props.actions.open(row.node.path)}
                     >
                       <span className="ws__chevron" />
-                      <FileGlyph path={row.node.path} />
+                      <FileTypeGlyph path={row.node.path} />
                       <span className="ws__tree-name">{row.node.name}</span>
                       {/* 行内尺寸读数（P1-15）：与状态栏同一口径（`formatBytes`），浏览时一眼看到大小 */}
                       <span className="ws__tree-size num">{formatBytes(row.node.entry.size)}</span>

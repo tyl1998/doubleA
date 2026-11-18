@@ -325,8 +325,11 @@ export const createModelBodySchema = z.object({
    *
    * 它**不只是读数**：对话链路会据此决定是否向上游请求思考 —— 各协议的落点不同
    * （OpenAI 兼容 `reasoning_effort`、Responses `reasoning.effort`、Anthropic `thinking`），
-   * 见 `backend/src/llm/protocol.ts` 各 `buildBody`。关掉它 = 不向上游发任何思考参数
-   * （回到默认行为：上游若自发思考，`reasoning_content` 仍会被解析显示）。
+   * 见 `backend/src/llm/protocol.ts` 各 `buildBody`。
+   * ⚠️ **默认开思考**的已知模型（MiMo v2.5/2.6、OpenCSG 的 DeepSeek v4）不勾时还会显式下发
+   * `thinking: {type:'disabled'}`（见 `backend/src/llm/client.ts#vendorThinkingBody`）——
+   * 对这些模型"不发参数"≠"关闭思考"，上游会一直思考（首字 10~27s）。
+   * 勾上 ⇒ `thinking: {type:'enabled'}`，思考过程仍照常解析显示。
    */
   supportsReasoning: z.boolean().optional(),
   enabled: z.boolean().optional(),

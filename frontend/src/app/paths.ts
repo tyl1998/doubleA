@@ -47,6 +47,14 @@ export const KNOWLEDGE_PATH = '/knowledge'
  */
 export const SKILLS_PATH = '/skills'
 
+/**
+ * 我的 Skill 草稿列表（`/skills/drafts`）。
+ *
+ * 提示卡是一次性的（关闭 / 重新进会话后不再出现），草稿却还在 TTL 内 ⇒ 需要这个固定入口。
+ * 路由必须排在 `/skills/drafts/:draftId` 之前（列表页不是某一份草稿）。
+ */
+export const SKILL_DRAFTS_PATH = '/skills/drafts'
+
 /** MCP server 管理（`03` §二：`/mcp`，登录即可） */
 export const MCP_PATH = '/mcp'
 
@@ -128,6 +136,15 @@ export function knowledgeDetailPath(kbId: string): string {
  */
 export function skillDetailPath(skillId: string): string {
   return `/skills/${encodeURIComponent(skillId)}`
+}
+
+/**
+ * Skill 草稿审核页（`03` §二 的 `/skills/drafts/:draftId`：可编辑表单 + Markdown 预览 + 脱敏复核）。
+ *
+ * `encodeURIComponent` 的理由与 {@link skillDetailPath} 相同；草稿只对本人有效（服务端判 404）。
+ */
+export function skillDraftPath(draftId: string): string {
+  return `/skills/drafts/${encodeURIComponent(draftId)}`
 }
 
 /**

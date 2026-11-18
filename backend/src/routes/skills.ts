@@ -5,7 +5,7 @@
  *       `shared/src/skill.ts`（契约与投影）、`services/skillAsset.service.ts`（编排）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * 十一条端点（**全部只需登录**；改 / 删 / 导入 / 转移由服务层行级判定 = 所属人或 ADMIN）
+ * 十四条端点（**全部只需登录**；改 / 删 / 导入 / 转移 / fork / 同步由服务层行级判定 = 所属人或 ADMIN）
  * ─────────────────────────────────────────────────────────────────────
  *   GET    /api/skills                            列表（`offset/limit/query`）
  *   GET    /api/skills/:id                        详情（文件索引 + 版本 + 变更记录 + 引用数）
@@ -36,15 +36,31 @@ import { appMsg,
   AppError,
   listSkillsQuerySchema,
   ok,
+  createSkillProposalDraftBodySchema,
+  forkSkillBodySchema,
+  listSkillProposalsQuerySchema,
+  submitSkillProposalBodySchema,
   skillDownloadQuerySchema,
   skillFileQuerySchema,
   skillIdParamsSchema,
+  skillUpstreamDiffQuerySchema,
+  syncSkillUpstreamBodySchema,
+  saveSkillFromDraftBodySchema,
+  saveSkillRevisionFromDraftBodySchema,
   transferAssetBodySchema,
   updateSkillBodySchema,
+  type CreateSkillProposalDraftBody,
+  type ForkSkillBody,
+  type ListSkillProposalsQuery,
   type ListSkillsQuery,
+  type SubmitSkillProposalBody,
   type SkillDownloadQuery,
+  type SaveSkillFromDraftBody,
+  type SaveSkillRevisionFromDraftBody,
   type SkillFileQuery,
   type SkillIdParams,
+  type SkillUpstreamDiffQuery,
+  type SyncSkillUpstreamBody,
   type TransferAssetBody,
   type UpdateSkillBody,
 } from '@doubulea/shared'
@@ -69,6 +85,22 @@ import {
   updateSkill,
   type ImportSkillInput,
 } from '../services/skillAsset.service.js'
+import {
+  listSkillChangesForSkill,
+  listSkillVersionsForSkill,
+  saveSkillFromDraft,
+  saveSkillRevisionFromDraft,
+} from '../services/skillDraft.service.js'
+import {
+  forkSkill,
+  getSkillUpstreamDiff,
+  syncSkillUpstream,
+} from '../services/skillFork.service.js'
+import {
+  createProposalDraftFromFork,
+  listSkillProposalsForTarget,
+  submitSkillProposal,
+} from '../services/skillProposal.service.js'
 
 /** 取调用者（`id` + `role`）—— 服务层按行级 ACL 判权 */
 function viewerOf(request: FastifyRequest): SkillViewer {
@@ -155,6 +187,121 @@ export function registerSkillRoutes(app: FastifyInstance): void {
     '/api/skills',
     { preHandler: app.requireAuth, bodyLimit: config.limits.uploadBodyLimitBytes },
     async (request) => ok(await importSkillPackage(await readSkillUpload(request), viewerOf(request))),
+  )
+
+  /**
+   * 从草稿保存（`POST /api/skills/from-draft`，P1-24c-1）：**只收 `draftId` + 展示元数据**。
+   *
+   * `bindToAgentId` 是唯一的「顺带绑定」入口；绑定失败**不影响保存**（回 `bindError`）。
+   * 客户端传 `files` / `storageKey` / `markdown` 会被 schema 忽略（zod 默认剥未知键），
+   * 内容一律从服务端草稿读 —— 见 `shared/src/skill.ts` 草稿段口径 ①。
+   */
+  app.post<{ Body: SaveSkillFromDraftBody }>(
+    '/api/skills/from-draft',
+    { preHandler: app.requireAuth, schema: { body: saveSkillFromDraftBodySchema } },
+    async (request) => ok(await saveSkillFromDraft(request.body, viewerOf(request))),
+  )
+
+  /**
+   * 草稿落成新版本（`POST /api/skills/:id/revisions/from-draft`）。
+   *
+   * `fromVersion` 是 CAS：不等于当前版本 ⇒ 409 `SKILL_VERSION_CONFLICT`（不自动合并）。
+   * **P1-24c-4 保存选项 ②**：可带 `pinAgentId` 把那个 Agent 固定到 `vN+1`；固定失败只回 `pinError`
+   * （与 `bindError` 同一条纪律：版本已经写进去了，不该让用户以为没保存）。
+   */
+  app.post<{ Params: SkillIdParams; Body: SaveSkillRevisionFromDraftBody }>(
+    '/api/skills/:id/revisions/from-draft',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, body: saveSkillRevisionFromDraftBodySchema },
+    },
+    async (request) => ok(await saveSkillRevisionFromDraft(request.params.id, request.body, viewerOf(request))),
+  )
+
+  /**
+   * 复制为我的 Skill（`POST /api/skills/:id/fork`，P1-24c-5）。
+   *
+   * 源 Skill 必须对调用者可见（私有他人的 ⇒ 404）；复制出的新行 `PRIVATE` + `parentSkillId/parentVersion`。
+   * **不改上游**、不自动绑定；返回新副本的 `SkillItem`。
+   */
+  app.post<{ Params: SkillIdParams; Body: ForkSkillBody }>(
+    '/api/skills/:id/fork',
+    { preHandler: app.requireAuth, schema: { params: skillIdParamsSchema, body: forkSkillBodySchema } },
+    async (request) => ok(await forkSkill(request.params.id, request.body, viewerOf(request))),
+  )
+
+  /** 副本的上游差异（只读；`parentAvailable=false` 时不读上游正文） */
+  app.get<{ Params: SkillIdParams; Querystring: SkillUpstreamDiffQuery }>(
+    '/api/skills/:id/upstream-diff',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, querystring: skillUpstreamDiffQuerySchema },
+    },
+    async (request) => ok(await getSkillUpstreamDiff(request.params.id, request.query, viewerOf(request))),
+  )
+
+  /**
+   * 同步上游（`POST /api/skills/:id/sync-upstream`，P1-24c-5）：**只允许 `FAST_FORWARD`**。
+   *
+   * 有本地改动 / 基准或上游正文已归档 ⇒ 409，**绝不静默覆盖副本**。
+   * 三方合并（`THREE_WAY`）属 c-6；本批契约层只接受 `FAST_FORWARD`。
+   */
+  app.post<{ Params: SkillIdParams; Body: SyncSkillUpstreamBody }>(
+    '/api/skills/:id/sync-upstream',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, body: syncSkillUpstreamBodySchema },
+    },
+    async (request) => ok(await syncSkillUpstream(request.params.id, request.body, viewerOf(request))),
+  )
+
+  /**
+   * 从副本建更新建议草稿（`POST /api/skills/:id/proposal-draft`，P1-24c-6；`id` = 副本）。
+   *
+   * 内容来自**副本当前版本**（不是上游）；返回 `SkillDraft`，前端跳到 `/skills/drafts/:draftId`
+   * 用同一套审核组件补充说明 / 编辑，再由 `POST /api/skills/:id/proposals` 提交。
+   */
+  app.post<{ Params: SkillIdParams; Body: CreateSkillProposalDraftBody }>(
+    '/api/skills/:id/proposal-draft',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, body: createSkillProposalDraftBodySchema },
+    },
+    async (request) => ok(await createProposalDraftFromFork(request.params.id, request.body, viewerOf(request))),
+  )
+
+  /** 提交更新建议（`POST /api/skills/:id/proposals`；只收 `draftId` + 说明 + 审计位） */
+  app.post<{ Params: SkillIdParams; Body: SubmitSkillProposalBody }>(
+    '/api/skills/:id/proposals',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, body: submitSkillProposalBodySchema },
+    },
+    async (request) => ok(await submitSkillProposal(request.params.id, request.body, viewerOf(request))),
+  )
+
+  /** 所属人 / ADMIN 的「更新建议」列表（目标必须可编辑） */
+  app.get<{ Params: SkillIdParams; Querystring: ListSkillProposalsQuery }>(
+    '/api/skills/:id/proposals',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillIdParamsSchema, querystring: listSkillProposalsQuerySchema },
+    },
+    async (request) => ok(await listSkillProposalsForTarget(request.params.id, request.query, viewerOf(request))),
+  )
+
+  /** 版本历史（只读；可见即可） */
+  app.get<{ Params: SkillIdParams }>(
+    '/api/skills/:id/versions',
+    { preHandler: app.requireAuth, schema: { params: skillIdParamsSchema } },
+    async (request) => ok(await listSkillVersionsForSkill(request.params.id, viewerOf(request))),
+  )
+
+  /** 变更记录（只读；可见即可） */
+  app.get<{ Params: SkillIdParams }>(
+    '/api/skills/:id/changes',
+    { preHandler: app.requireAuth, schema: { params: skillIdParamsSchema } },
+    async (request) => ok(await listSkillChangesForSkill(request.params.id, viewerOf(request))),
   )
 
   /** 重新导入（生成新版本；不覆盖旧对象） */

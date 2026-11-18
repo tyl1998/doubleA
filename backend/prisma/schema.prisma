@@ -367,6 +367,12 @@ model User {
   skills                  Skill[]
   /// P1-24a-2：本用户写下的 Skill 变更记录（`skill_changes.created_by`）
   skillChanges            SkillChange[]           @relation("SkillChangeCreator")
+  /// P1-24c-4b：本用户创建的会话级 Skill 覆写（`conversation_skill_overrides.created_by`）
+  skillOverrides          ConversationSkillOverride[]
+  /// P1-24c-6：本用户提交的更新建议（`skill_proposals.proposed_by`）
+  skillProposals          SkillProposal[]         @relation("SkillProposalProposer")
+  /// P1-24c-6：本用户审核过的更新建议（`skill_proposals.reviewed_by`）
+  reviewedSkillProposals  SkillProposal[]         @relation("SkillProposalReviewer")
 
   @@map("users")
 }
@@ -482,6 +488,8 @@ model Model {
   captionKnowledgeBases KnowledgeBase[]    @relation("KnowledgeBaseCaptionModel")
   /// 把本模型用作"会话标题生成"的平台配置（`TitleModelConfig.modelId`）
   titleModelConfigs     TitleModelConfig[] @relation("TitleModelConfigModel")
+  /// 把本模型用作"从会话抽取 Skill"的平台配置（`SkillExtractModelConfig.modelId`，P1-24c-2）
+  skillExtractModelConfigs SkillExtractModelConfig[] @relation("SkillExtractModelConfigModel")
 
   @@unique([providerId, modelName, type])
   @@index([type, enabled])
@@ -710,6 +718,8 @@ model Conversation {
   /// workspace reaper 另行清理（与产物"行保留、对象由保留期收口"是两条不同的纪律：
   /// 工作区是会话的**派生计算目录**，会话没了它就没有归属，故行随会话走）
   workspace         Workspace?
+  /// 会话级 Skill 覆写（P1-24c-4b）：删会话级联删行（S3 前缀由清理器回收）
+  skillOverrides    ConversationSkillOverride[]
 
   @@index([userId, lastMessageAt(sort: Desc)])
   @@index([agentId, lastMessageAt(sort: Desc)])
@@ -1639,6 +1649,29 @@ model TitleModelConfig {
   @@map("title_model_config")
 }
 
+/// skill_extract_model_config —— 从会话抽取 Skill 用的模型（平台级；**单例行**，P1-24c-2）。
+///
+/// 依据：`docs/子方案/会话生成Skill.md` §4.3（"走平台模型池：默认独立抽取模型配置，标题模型只作 fallback"）。
+///   · **单行**（`id` 固定 `'default'`）—— 抽取是平台级动作，没有"每人一份"的维度；
+///   · `enabled` = 平台总开关；关 ⇒ 抽取端点直接 502 `EXTRACT_MODEL_UNAVAILABLE`（**不静默降级**：
+///     抽出来的东西要进用户的 Skill，用错模型比报错更糟）；
+///   · `modelId` = 选定的抽取模型（`models` 里 `type=CHAT`）；`null` = 未配置；
+///     为 `null` 时**回落到标题模型**（`TitleModelConfig`），两者都不可用 ⇒ 502；
+///   · ⚠️ 可空 + `onDelete: SetNull`：删模型时自动置空，抽取退回标题模型 / 明确报错，不 500。
+/// 消费方 = `services/skillExtractModel.service.ts`（解析目标）+ `services/skillExtract.service.ts`（编排）。
+model SkillExtractModelConfig {
+  id        String   @id @default("default") @db.VarChar(32)
+  /// 平台总开关（默认**开**：与标题不同，抽取是用户显式点出来的动作，配了就该能用）
+  enabled   Boolean  @default(true)
+  /// 选定的抽取模型（`models` 里 `type=CHAT`）；`null` = 未配置 ⇒ 回落标题模型
+  modelId   String?  @map("model_id") @db.Uuid
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  model Model? @relation("SkillExtractModelConfigModel", fields: [modelId], references: [id], onDelete: SetNull)
+
+  @@map("skill_extract_model_config")
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Skill（P1-24a-1；`docs/子方案/Skill能力.md` §三）
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1714,6 +1747,10 @@ model Skill {
   creator User         @relation(fields: [createdBy], references: [id], onDelete: Restrict)
   files   SkillFile[]
   changes SkillChange[]
+  /// 会话级 Skill 覆写（P1-24c-4b）：上游 Skill 删除 ⇒ 覆写随 FK 级联删除
+  overrides ConversationSkillOverride[]
+  /// 更新建议（P1-24c-6）：目标 Skill 删除 ⇒ 提案随 FK 级联删除
+  proposals SkillProposal[] @relation("SkillProposals")
 
   @@index([deletedAt, updatedAt(sort: Desc)])
   @@index([createdBy, name])
@@ -1798,4 +1835,93 @@ model SkillChange {
   @@unique([skillId, toVersion])
   @@index([skillId, createdAt(sort: Desc)])
   @@map("skill_changes")
+}
+
+/// 更新建议状态（P1-24c-6；与 `shared#SKILL_PROPOSAL_STATUSES` 逐字一致）
+///
+/// `PENDING → ACCEPTED / REJECTED / NEEDS_REBASE / CLOSED`。
+/// 目标 Skill 软删**不**级联（提案记录保留审计），需要显式 `CLOSED`。
+enum SkillProposalStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  NEEDS_REBASE
+  CLOSED
+
+  @@map("skill_proposal_status")
+}
+
+/// skill_proposals —— 公开 Skill 的更新建议（P1-24c-6；`子方案/会话生成Skill.md` §10.12 / §10.16）
+///
+/// · 非所属人**不能直接改**公开 Skill：只能 fork → 修改 → 提交提案 → 所属人审核；
+/// · `files` 是**已物化到 `skill-proposals/{proposalId}/` 的整版文件清单**（path/mime/size/sha256），
+///   草稿 1 小时过期后仍可审；
+/// · `diff` 由服务端从基准内容计算，只用于展示/审计，**不是可执行 patch**；
+/// · **不存会话原文**：`source_conversation_id / source_message_ids` 只是审计标识；
+/// · 接受时按提案完整内容（或显式 `THREE_WAY` 的合并结果）写上游 `vN+1`，并记 `SkillChange(source=PROPOSAL)`。
+model SkillProposal {
+  id                   String               @id @default(uuid(7)) @db.Uuid
+  targetSkillId        String               @map("target_skill_id") @db.Uuid
+  baseVersion          Int                  @map("base_version")
+  proposedBy           String               @map("proposed_by") @db.Uuid
+  status               SkillProposalStatus  @default(PENDING)
+  changeSummary        String               @map("change_summary") @db.Text
+  /// `skillDiffSchema`（只用于展示/审计）
+  diff                 Json?                @db.JsonB
+  /// 已物化文件清单（path/mime/size/sha256）+ 提案元数据（name/description/runtime/requiresBins）
+  files                Json?                @db.JsonB
+  sourceConversationId String?              @map("source_conversation_id") @db.Uuid
+  sourceMessageIds     Json?                @map("source_message_ids") @db.JsonB
+  reviewedBy           String?              @map("reviewed_by") @db.Uuid
+  reviewedAt           DateTime?            @map("reviewed_at") @db.Timestamptz(3)
+  reviewNote           String?              @map("review_note") @db.Text
+  /// 被接受时落成的上游版本（ACCEPTED 才有值；供「已合并到上游 vN」展示）
+  acceptedVersion      Int?                 @map("accepted_version")
+  createdAt            DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  target   Skill @relation("SkillProposals", fields: [targetSkillId], references: [id], onDelete: Cascade)
+  proposer User  @relation("SkillProposalProposer", fields: [proposedBy], references: [id], onDelete: Restrict)
+  reviewer User? @relation("SkillProposalReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+
+  @@index([targetSkillId, status, createdAt(sort: Desc)])
+  @@index([proposedBy, createdAt(sort: Desc)])
+  @@map("skill_proposals")
+}
+
+/// conversation_skill_overrides —— 会话级 Skill 覆写（P1-24c-4b；`子方案/Skill能力.md` §5.16）
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// 这张表是**会话覆写的唯一记录**，`revision` 是覆写自己的版本号（不是 `skills.version`）
+/// ─────────────────────────────────────────────────────────────────────
+/// · **不改上游**：不写 `skills` / `skill_files`、不递增 `skills.version`、不动 `skills/{id}/v{n}/`；
+/// · `@@unique([conversationId, skillId])` ⇒ 一个会话对一个 Skill 最多一份**生效**覆写；
+///   再改一次 `revision + 1` 并换 `storageKey` 前缀（旧前缀由下一轮的 S3 回收器处理）；
+/// · `files` 是**整版快照**（path / mime / size / sha256），口径同 `skill_files`；
+///   正文对象在 `skill-overrides/{conversationId}/{skillId}/r{revision}/...`；
+/// · **为什么值得加表而不是纯 Redis**：`tool_calls` 要能审计"这一轮用的是覆写"，
+///   而审计必须扛过 Redis 抖动；会话删除时的级联回收也要有确定判据。
+model ConversationSkillOverride {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  skillId        String   @map("skill_id") @db.Uuid
+  /// 建立覆写时所基于的上游版本（用于"上游已更新"提示与合并判断）
+  basedOnVersion Int      @map("based_on_version")
+  /// 覆写自身的递增号：同一会话同一 Skill 反复改时递增，用于 fingerprint 与缓存失效
+  revision       Int      @default(1)
+  /// 当前生效的那份的存储前缀：`skill-overrides/{conversationId}/{skillId}/r{revision}/`
+  storageKey     String   @map("storage_key") @db.VarChar(512)
+  /// 文件清单（path / mime / size / sha256），整版快照
+  files          Json?    @db.JsonB
+  changeSummary  String?  @map("change_summary") @db.Text
+  createdBy      String   @map("created_by") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  skill        Skill        @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  creator      User         @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+
+  @@unique([conversationId, skillId])
+  @@index([skillId])
+  @@map("conversation_skill_overrides")
 }

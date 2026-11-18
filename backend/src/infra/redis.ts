@@ -374,8 +374,16 @@ export const CHAT_STEER_TTL_SEC = 60
 export function skillLastLoadedKey(conversationId: string): string {
   return `skill:last-loaded:${conversationId}`
 }
-
 /**
+ * `skill:sync-lock:{conversationId}` 键名（P1-24b-1）—— 同一会话的 Skill 宿主副本同步短锁。
+ *
+ * 两个并发的"下一轮派活"不能交叉写 `manifest.json` / `current/<slug>`：交叉写的结果是
+ * manifest 与链接指向两个版本，而容器与模型都察觉不到（见 `sandbox/skillSync.ts`）。
+ * 寿命 = 一次同步（`PX` 30s 只是持有者崩溃时的兜底）。
+ */
+export function skillSyncLockKey(conversationId: string): string {
+  return `skill:sync-lock:${conversationId}`
+}/**
  * 读一个会话的"上次加载版本"（`skillId → version`）。
  *
  * **恒不抛**：Redis 故障 / 值被人工改坏 ⇒ `undefined`（调用方据此完全不提示）。
@@ -427,6 +435,125 @@ export async function writeSkillLastLoaded(
       { err: describeRedisFailure(getRedis(), error), conversationId, skillCount: entries.length },
       '写入 Skill 上次加载版本失败（下一轮可能漏一次版本提示）',
     )
+  }
+}
+
+// ═════════════════════════════ Skill 草稿（P1-24c-1）═════════════════════════════
+//
+// `skill-draft:{draftId}` → 整份草稿 JSON（`SkillDraftRecord`，见 `services/skillDraft.service.ts`）。
+//
+// 四条口径（每条错了都会造出一种"看起来能用"的错误行为）：
+//   · **TTL 即生命周期**：草稿不落库（§7.2 的 MVP 取舍），过期 = 不存在 ⇒ `GET/PUT` 一律 404
+//     `SKILL_DRAFT_NOT_FOUND`。`GET` / `PUT` / 上传文件都会**续期**（审核页每 60s 自动保存）；
+//   · **归属写在值里**（`userId`），键里只有 `draftId` —— 键名不进任何对外的列表，
+//     归属校验在服务层做（不是你的 / 不存在 / 过期 ⇒ 同一个 404，不泄漏存在性）；
+//   · **落库后用 `DEL` 消耗掉草稿**（同一个草稿不能被保存两次：第二次会 404）；
+//     文件对象（`skill-drafts/{userId}/{draftId}/...`）在落库成功后由服务层回收；
+//   · **读失败向上抛**（与 `readSkillLastLoaded` 的"恒不抛"刻意不同）：草稿是**用户正在编辑的东西**，
+//     悄悄当成"过期"会让用户以为辛苦编辑的内容丢了。
+
+/** `skill-draft:{draftId}` 键名 */
+export function skillDraftKey(draftId: string): string {
+  return `skill-draft:${draftId}`
+}
+
+/** 读一份草稿的原始 JSON；不存在 / 过期 ⇒ `undefined`（**不抛**：Redis 故障视为不存在，由调用方回 404） */
+export async function readSkillDraftRaw(draftId: string): Promise<string | undefined> {
+  try {
+    const redis = await ensureRedisConnected()
+    const raw = await redis.get(skillDraftKey(draftId))
+    return raw === null ? undefined : raw
+  } catch (error) {
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), draftId }, '读取 Skill 草稿失败（按不存在处理）')
+    return undefined
+  }
+}
+
+/**
+ * 写一份草稿（**带 TTL**；`ttlSec` 由调用方给，来自 `config.skill.draft.ttlSec`）。
+ *
+ * **失败向上抛**：保存不进去却回 200 会让审核页以为草稿还在（下一次 `GET` 就 404 了）。
+ */
+export async function writeSkillDraftRaw(draftId: string, json: string, ttlSec: number): Promise<void> {
+  try {
+    const redis = await ensureRedisConnected()
+    await redis.set(skillDraftKey(draftId), json, 'EX', Math.max(1, Math.trunc(ttlSec)))
+  } catch (error) {
+    throw describeRedisFailure(getRedis(), error)
+  }
+}
+
+/** 删一份草稿（落库成功 / 用户丢弃）。`DEL` 返回 0 也算成功（幂等） */
+export async function deleteSkillDraftRaw(draftId: string): Promise<void> {
+  try {
+    const redis = await ensureRedisConnected()
+    await redis.del(skillDraftKey(draftId))
+  } catch (error) {
+    // 删失败只告警：草稿带 TTL，最坏情况是一份没人能读的残留（归属校验仍然拦着别人）
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), draftId }, '删除 Skill 草稿失败（依赖 TTL 过期）')
+  }
+}
+
+/** 本人草稿索引（`skill-drafts:user:{userId}` → Set<draftId>） */
+export function skillDraftUserIndexKey(userId: string): string {
+  return `skill-drafts:user:${userId}`
+}
+
+/** 把草稿登记进本人索引（每次建 / 续期都调用；Set 的 TTL 与草稿同源） */
+export async function addSkillDraftToUserIndex(userId: string, draftId: string, ttlSec: number): Promise<void> {
+  try {
+    const redis = await ensureRedisConnected()
+    const key = skillDraftUserIndexKey(userId)
+    await redis.sadd(key, draftId)
+    await redis.expire(key, Math.max(1, Math.trunc(ttlSec)))
+  } catch (error) {
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), draftId }, '登记 Skill 草稿索引失败（列表可能少一条）')
+  }
+}
+
+/** 从本人索引移除（落库 / 丢弃） */
+export async function removeSkillDraftFromUserIndex(userId: string, draftId: string): Promise<void> {
+  try {
+    const redis = await ensureRedisConnected()
+    await redis.srem(skillDraftUserIndexKey(userId), draftId)
+  } catch (error) {
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error), draftId }, '移除 Skill 草稿索引失败（依赖 TTL 过期）')
+  }
+}
+
+/** 读本人索引里的草稿 id（**不续期**） */
+export async function readSkillDraftIdsForUser(userId: string): Promise<string[]> {
+  try {
+    const redis = await ensureRedisConnected()
+    return await redis.smembers(skillDraftUserIndexKey(userId))
+  } catch (error) {
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error) }, '读取 Skill 草稿索引失败（按空列表处理）')
+    return []
+  }
+}
+
+/**
+ * 扫描所有草稿 id（**只为兼容索引上线前建的草稿**；列表发现索引为空时兜一次）。
+ *
+ * `skill-draft-notice:*` 也匹配 `skill-draft:*`，这里按前缀显式剔除。
+ */
+export async function scanSkillDraftIds(): Promise<string[]> {
+  try {
+    const redis = await ensureRedisConnected()
+    const ids = new Set<string>()
+    let cursor = '0'
+    do {
+      const [next, keys] = await redis.scan(cursor, 'MATCH', 'skill-draft:*', 'COUNT', 200)
+      cursor = next
+      for (const key of keys) {
+        if (key.startsWith('skill-draft-notice:')) continue
+        ids.add(key.slice('skill-draft:'.length))
+      }
+    } while (cursor !== '0')
+    return [...ids]
+  } catch (error) {
+    getLogger().warn({ err: describeRedisFailure(getRedis(), error) }, '扫描 Skill 草稿失败（按空列表处理）')
+    return []
   }
 }
 

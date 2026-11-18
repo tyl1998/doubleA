@@ -110,8 +110,14 @@ export const RUNTIME_IMAGE_NAME = 'doubulea/sandbox-runtime'
  * （`registerCommand('doubulea:mcp-refresh')` + 运行期 `registerTool` 增删）。不重建的症状与
  * P1-9 R8 同款：后端一切正常、热更新命令注入了，而容器里的扩展**不认识这条命令**
  * ⇒ 模型看不到新绑的 MCP / 知识库（"必须重建会话"的老症状原样还在）。
+ *
+ * ⚠️ **P1-24b-2 起为 `8`**：只读层里多了 `extensions/skills/{index,contract}.ts`（Skill 的只读扩展：
+ * 读 `$HOME/.skills/manifest.json`、注册 `list_skills` / `load_skill` / `read_skill_file`、
+ * 认 `/doubulea:skills-refresh`）+ `Dockerfile` 第 5 节两条 `test -f` 断言。不 +1 的症状与
+ * P1-9 R8 / P1-21 同款：后端注入刷新命令、manifest 也同步好了，而镜像里的 pi **根本不加载这个扩展**
+ * ⇒ 模型一个 Skill 工具都看不到，后端日志里却没有一条错。
  */
-export const BASE_LAYER_VERSION = '7'
+export const BASE_LAYER_VERSION = '9'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -147,8 +153,11 @@ export const BASE_LAYER_VERSION = '7'
  *
  * ⚠️ **P1-21b 起为 `10`**：同"base 变了就换 tag"那条 —— base 升到 `7`（mcp-bridge 加了热更新），
  * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-6 的那一份。
+ *
+ * ⚠️ **P1-24b-2 起为 `11`**：同"base 变了就换 tag"那条 —— base 升到 `8`（多了 skills 扩展），
+ * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-7 的那一份（扩展不在里面）。
  */
-export const TOOLKIT_LAYER_VERSION = '10'
+export const TOOLKIT_LAYER_VERSION = '12'
 
 /**
  * 运行时层内容版本（P1-17a；加/换一个语言运行时、或改 runtime Dockerfile 时 +1）

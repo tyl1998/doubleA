@@ -30,11 +30,13 @@ import type { SkillItem } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
-import { useCreateSkill, useRemoveSkill, useSkills } from '../../api/skills.js'
+import { useCreateSkill, useForkSkill, useRemoveSkill, useSkills } from '../../api/skills.js'
+import { useCreateSkillProposalDraft } from '../../api/skillProposals.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
 import { formatUpdatedAt } from '../../app/format.js'
-import { skillDetailPath } from '../../app/paths.js'
+import { SKILL_DRAFTS_PATH, skillDetailPath, skillDraftPath } from '../../app/paths.js'
+import { UpstreamDiffModal } from '../../features/skills/UpstreamDiffModal.js'
 import { EmptyState, ErrorState, TableSkeleton } from '../../components/ListStates.js'
 import { TransferOwnershipModal } from '../../components/TransferOwnershipModal.js'
 import { VisibilityBadge } from '../../components/VisibilityBadge.js'
@@ -50,13 +52,20 @@ export function SkillListPage() {
   const [importOpen, setImportOpen] = useState(false)
   const [pickedFile, setPickedFile] = useState<File | null>(null)
   const [transferFor, setTransferFor] = useState<SkillItem | null>(null)
+  const [upstreamFor, setUpstreamFor] = useState<SkillItem | null>(null)
 
   const skillsQuery = useSkills({ limit: SKILLS_PAGE_LIMIT, query: keyword })
   const createSkill = useCreateSkill()
   const removeSkill = useRemoveSkill()
+  const forkSkill = useForkSkill()
+  const createProposalDraft = useCreateSkillProposalDraft()
 
   const items = skillsQuery.data?.items ?? []
   const total = skillsQuery.data?.total ?? 0
+  const pendingReviewTotal = items.reduce(
+    (sum, skill) => sum + (skill.canEdit ? skill.pendingProposalCount : 0),
+    0,
+  )
 
   function closeImport(): void {
     setImportOpen(false)
@@ -81,6 +90,29 @@ export function SkillListPage() {
     )
   }
 
+  function startProposal(skill: SkillItem): void {
+    createProposalDraft.mutate(
+      { id: skill.id },
+      {
+        onSuccess: (draft) => navigate(skillDraftPath(draft.id)),
+        onError: (error) => feedback.fail(error, t('skillProposal.createFailed')),
+      },
+    )
+  }
+
+  function copySkill(skill: SkillItem): void {
+    forkSkill.mutate(
+      { id: skill.id },
+      {
+        onSuccess: (copy) => {
+          feedback.ok(t('skillFork.copyOk', { name: copy.name }))
+          navigate(skillDetailPath(copy.id))
+        },
+        onError: (error) => feedback.fail(error, t('skillFork.copyFailed')),
+      },
+    )
+  }
+
   const columns: TableColumnsType<SkillItem> = [
     {
       title: t('skillList.colName'),
@@ -92,6 +124,46 @@ export function SkillListPage() {
             {skill.name}
           </Link>
           <span className="kb-cell__sub">{skill.description}</span>
+          {/* 待审核徽标（2026-11-18）：所属人在列表上就能看到有人提交了更新建议，不必先点进详情 */}
+          {skill.canEdit && skill.pendingProposalCount > 0 ? (
+            <span className="kb-cell__sub">
+              <Link to={skillDetailPath(skill.id)}>
+                <Tag color="orange">{t('skillProposal.pendingReviewBadge', { count: skill.pendingProposalCount })}</Tag>
+              </Link>
+            </span>
+          ) : null}
+          {/* 来源徽标（P1-24c-2）：从会话抽出来的 Skill 标出处；会话已删 ⇒ 明说，不给跳转 */}
+          {skill.sourceType === 'CONVERSATION' ? (
+            <span className="kb-cell__sub">
+              <Tag>{t('skillSource.conversation')}</Tag>
+              <span className="ratio">
+                {skill.sourceAvailable ? `${skill.sourceMessageIds.length}` : t('skillSource.conversationDeleted')}
+              </span>
+            </span>
+          ) : null}
+          {/* 副本徽标（P1-24c-5）：来源 + 基于版本 + 上游状态 */}
+          {skill.parentSkillId !== null ? (
+            <span className="kb-cell__sub">
+              <Tag>{t('skillFork.badge')}</Tag>
+              <span className="ratio">
+                {t('skillFork.rowLine', {
+                  name: skill.parentName ?? t('skillFork.sourceDeletedName'),
+                  basedOn: skill.parentVersion ?? '—',
+                  status: skill.parentDeleted
+                    ? t('skillFork.sourceDeleted')
+                    : !skill.parentAvailable
+                      ? t('skillFork.statusUnavailable')
+                      : skill.parentLatestVersion !== null &&
+                          skill.parentVersion !== null &&
+                          skill.parentLatestVersion > skill.parentVersion
+                        ? t('skillFork.statusUpstream', { version: skill.parentLatestVersion })
+                        : t('skillFork.statusSynced', {
+                            version: skill.parentLatestVersion ?? skill.parentVersion ?? '—',
+                          }),
+                })}
+              </span>
+            </span>
+          ) : null}
         </div>
       ),
     },
@@ -105,15 +177,25 @@ export function SkillListPage() {
       title: t('skillList.colRuntime'),
       dataIndex: 'runtime',
       width: 170,
-      render: (_, skill) =>
-        skill.runtime === 'SANDBOX' ? (
-          <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
-            <Tag className="tag--warn">{t('skillBadge.sandbox')}</Tag>
-            <span className="ratio">{t('skillBadge.sandboxHint')}</span>
-          </span>
-        ) : (
-          <Tag>{t('skillBadge.inline')}</Tag>
-        ),
+      render: (_, skill) => (
+        <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+          {skill.runtime === 'SANDBOX' ? (
+            <>
+              <Tag className="tag--warn">{t('skillBadge.sandbox')}</Tag>
+              <span className="ratio">{t('skillBadge.sandboxHint')}</span>
+            </>
+          ) : (
+            <Tag>{t('skillBadge.inline')}</Tag>
+          )}
+          {skill.hasScripts && <Tag color="orange">{t('skillBadge.hasScripts')}</Tag>}
+          {skill.runtime === 'INLINE' && !skill.hasScripts && (
+            <span className="ratio">{t('skillBadge.inlineBindable')}</span>
+          )}
+          {skill.runtime === 'INLINE' && skill.hasScripts && (
+            <span className="ratio">{t('skillBadge.scriptTaskAgentOnly')}</span>
+          )}
+        </span>
+      ),
     },
     {
       title: t('skillList.colVersion'),
@@ -155,6 +237,36 @@ export function SkillListPage() {
       render: (_, skill) => (
         <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-3)' }}>
           <Link to={skillDetailPath(skill.id)}>{t('skillList.open')}</Link>
+          {skill.parentSkillId !== null ? (
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setUpstreamFor(skill)}>
+              {t('skillFork.viewUpstream')}
+            </Button>
+          ) : null}
+          {skill.parentSkillId !== null &&
+          skill.canEdit &&
+          skill.parentAvailable &&
+          !skill.parentDeleted ? (
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0 }}
+              loading={createProposalDraft.isPending && createProposalDraft.variables?.id === skill.id}
+              onClick={() => startProposal(skill)}
+            >
+              {t('skillProposal.submit')}
+            </Button>
+          ) : null}
+          {!skill.canEdit && skill.visibility === 'PUBLIC' ? (
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0 }}
+              loading={forkSkill.isPending && forkSkill.variables?.id === skill.id}
+              onClick={() => copySkill(skill)}
+            >
+              {t('skillFork.copy')}
+            </Button>
+          ) : null}
           {skill.canEdit ? (
             <Button
               type="link"
@@ -198,6 +310,17 @@ export function SkillListPage() {
     },
   ]
 
+  /**
+   * 建一个 Skill 的三个入口（P1-24c 起：**没有**"空白标题 + 空正文"的手建入口）。
+   *
+   * · 导入 zip（本页主页按钮，内容自带 `SKILL.md`）；
+   * · 「另存为 Skill」（在会话头部，`SaveAsSkillButton`）⇒ 会话抽取 → 草稿（c-2）；
+   * · 更新既有 Skill（详情页的版本编辑 ⇒ `REVISION` 草稿，c-1 已落地）。
+   *
+   * ⚠️ c-2 起 `POST /api/skill-drafts` 不再接受 `CREATE`（来源与消息范围必须由服务端判定），
+   * 故原先那个"新建本地草稿"按钮在此移除 —— 它建出来的正是"只有元数据、没有正文"的空壳。
+   */
+
   const head = (
     <div className="page__head">
       <div>
@@ -207,6 +330,9 @@ export function SkillListPage() {
         </p>
       </div>
       <div className="page__head-actions">
+        <Link to={SKILL_DRAFTS_PATH}>
+          <Button>{t('skillDraftList.entry')}</Button>
+        </Link>
         <Button type="primary" onClick={() => setImportOpen(true)}>
           {t('skillList.import')}
         </Button>
@@ -225,6 +351,15 @@ export function SkillListPage() {
         message={t('skillList.introTitle')}
         description={t('skillList.introDesc')}
       />
+
+      {pendingReviewTotal > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 'var(--sp-5)' }}
+          message={t('skillProposal.pendingReviewBanner', { count: pendingReviewTotal })}
+        />
+      )}
 
       <div className="row row--wrap" style={{ marginBottom: 'var(--sp-5)' }}>
         <Input.Search
@@ -324,6 +459,13 @@ export function SkillListPage() {
         assetName={transferFor?.name ?? ''}
         currentOwnerName={transferFor?.creatorName ?? ''}
         onClose={() => setTransferFor(null)}
+      />
+
+      <UpstreamDiffModal
+        open={upstreamFor !== null}
+        skillId={upstreamFor?.id ?? ''}
+        skillName={upstreamFor?.name ?? ''}
+        onClose={() => setUpstreamFor(null)}
       />
     </>
   )

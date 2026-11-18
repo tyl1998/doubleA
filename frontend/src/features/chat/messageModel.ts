@@ -86,6 +86,8 @@ export interface ToolCallView {
   skillSlug?: string
   skillVersion?: number
   skillPath?: string
+  /** 命中会话级覆写时的 revision（P1-24c-4b；没有覆写缺省） */
+  overrideRevision?: number
   kind: ToolCallKind
   status: ToolCallStatus
   inputSummary: string
@@ -302,6 +304,7 @@ export function toolViewFromEvent(payload: SseToolCallPayload): ToolCallView {
     ...(payload.skillSlug === undefined ? {} : { skillSlug: payload.skillSlug }),
     ...(payload.skillVersion === undefined ? {} : { skillVersion: payload.skillVersion }),
     ...(payload.skillPath === undefined ? {} : { skillPath: payload.skillPath }),
+    ...(payload.overrideRevision === undefined ? {} : { overrideRevision: payload.overrideRevision }),
   }
 }
 
@@ -385,6 +388,7 @@ function pickToolCalls(source: Record<string, unknown>): ToolCallView[] {
       ...(record.skillSlug === undefined ? {} : { skillSlug: record.skillSlug }),
       ...(record.skillVersion === undefined ? {} : { skillVersion: record.skillVersion }),
       ...(record.skillPath === undefined ? {} : { skillPath: record.skillPath }),
+      ...(record.overrideRevision === undefined ? {} : { overrideRevision: record.overrideRevision }),
     })
   }
   return [...byCallId.values()]

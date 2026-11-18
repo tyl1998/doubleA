@@ -95,6 +95,18 @@ export const SANDBOX_WORK_DIR = '/work'
 export const SANDBOX_AGENT_HOME = '/home/agent'
 
 /**
+ * 容器内 Skill 目录的挂载点（P1-24b-1）—— `$HOME/.skills`，只读。
+ *
+ * ⚠️ **跨边界契约**：b-2 的容器 `skills` 扩展与 b-3 的脚本约定（`$SKILL_DIR/scripts/...`）
+ * 都逐字用它（`current/<slug>` → 那一版目录）。宿主侧对应 `{SKILL_RUNTIME_ROOT}/{conversationId}`。
+ * ⚠️ 它在 `$HOME` 之下：`$HOME` 已被 tmpfs 覆盖（见 `buildSandboxContainerSpec` 的 `Tmpfs`），
+ * 再叠一条 bind 进同一个目录是**允许的**（bind 挂在 tmpfs 之上），但**目录必须先由后端建好**
+ * （见 `manager.ts#ensureSkillRuntimeDir`），否则 Docker 静默建一个 root:root 的 0600 空目录，
+ * 容器内 agent 读不到且不报错。
+ */
+export const SANDBOX_SKILLS_DIR = `${SANDBOX_AGENT_HOME}/.skills`
+
+/**
  * 镜像内 `agent` 用户的 uid/gid。
  *
  * ⚠️ 这是**镜像与运行时之间的契约**（不是随手写的 magic number）：`infra/sandbox/base/Dockerfile`
@@ -229,6 +241,19 @@ export interface SandboxContainerSpecInput {
    * 由调用方（`manager.ts#createSandbox`）先 `ensureWorkspaceDir`。
    */
   workspacePath?: string
+  /**
+   * ★ P1-24b-1：Skill 宿主副本目录**绝对路径**（`{SKILL_RUNTIME_ROOT}/{conversationId}`）。
+   *
+   * 给了它就挂第二条第 bind（`{skillRootPath} → /home/agent/.skills`，**`ReadOnly: true`**）。
+   * 只读是刻意的：容器里 agent 不该能改技能目录（改了下一轮就被 rehydrate 覆盖，而"改了没用"
+   * 比"改不了"更让人困惑）；写侧只有宿主上的 `skillSync.ts`。
+   *
+   * ⚠️ 目录**必须已存在**（Docker bind 不建源目录、会静默挂出 0600 空目录）—— 由调用方
+   * （`manager.ts#ensureSkillRuntimeDir`）先建好并对齐属主（`SANDBOX_AGENT_UID`）。
+   * ⚠️ **只在容器创建时挂**：禁止 putArchive / 运行中追加 mount（只读 rootfs 下都做不到）；
+   * 首次绑定 Skill 只写目录内容 + manifest，不重建容器。
+   */
+  skillRootPath?: string
   startedAt: Date
   /**
    * 这一轮模型（`agents.model_id`，P0-3-4）⇒ 写进标签 {@link SANDBOX_LABEL_MODEL}。
@@ -304,6 +329,21 @@ export const SANDBOX_PROXY_TIMEOUT_ENV = 'SANDBOX_PROXY_TIMEOUT_MS'
  * ⚠️ 名字带 `doubulea:` 前缀 ⇒ 与用户自己的 prompt 模板不会撞名。
  */
 export const SANDBOX_MCP_REFRESH_COMMAND = 'doubulea:mcp-refresh'
+
+/**
+ * 容器内 Skill 挂载点的**环境变量名**（P1-24b-2）—— 跨边界契约：容器侧
+ * `infra/sandbox/base/pi-agent/extensions/skills/index.ts` 读它。
+ *
+ * ⚠️ 为什么还要 env：挂载点本可以写死在扩展里（它是 {@link SANDBOX_SKILLS_DIR} 这个常量），但那种
+ * "两份字面量"在任何一次调整挂载位置时都会静默分叉（扩展读一个空目录 ⇒ 模型看到 0 个 Skill、
+ * 日志里一条错都没有）。env 缺省时扩展仍回落到同一个默认值。
+ */
+export const SANDBOX_SKILLS_DIR_ENV = 'DOUBULEA_SKILLS_DIR'
+
+/** Skill 扩展要用的容器 env（**纯函数**）：把 mount 点告诉容器（见 {@link SANDBOX_SKILLS_DIR_ENV}） */
+export function sandboxSkillsEnv(skillsDir: string = SANDBOX_SKILLS_DIR): Record<string, string> {
+  return { [SANDBOX_SKILLS_DIR_ENV]: skillsDir }
+}
 
 /** 注入给引擎的那一行（前面加 `/` 才是命令；单独成行，后面空一行再接用户正文） */
 export function sandboxMcpRefreshPromptLine(): string {
@@ -657,6 +697,18 @@ export function buildSandboxContainerSpec(input: SandboxContainerSpecInput): Doc
               Target: SANDBOX_WORK_DIR,
               ReadOnly: false,
             },
+        // ★ P1-24b-1：第二条 —— Skill 宿主副本，**只读**挂到 `$HOME/.skills`（见 `skillRootPath`）。
+        // 与 `/work` 并列写进 `Mounts`（不是 `Config.Binds`）；`Source` 是 manager 传入的绝对路径。
+        ...(input.skillRootPath === undefined
+          ? []
+          : [
+              {
+                Type: 'bind' as const,
+                Source: input.skillRootPath,
+                Target: SANDBOX_SKILLS_DIR,
+                ReadOnly: true,
+              },
+            ]),
       ],
       // ⚠️ P0-3-3 刻意**没有** StorageOpt：理由见函数头上方那段（实测三条）。work 卷的体量
       //    改由「周期巡检 + 超限告警」看着，不假装有硬配额。

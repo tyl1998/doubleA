@@ -61,6 +61,7 @@ import {
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
+  isSkillRequestToolName,
   mcpCallToolArgsSchema,
   pinnedMcpToolNamesFromConfig,
 } from '@doubulea/shared'
@@ -81,6 +82,7 @@ import { toDescription } from '../mcp/toolSchema.js'
 import { executeSendNotification, getNotifyTarget, notifyBuiltinDescriptor } from '../notify/index.js'
 import { knowledgeListTool, knowledgeSearchTool, readDocumentTool, summarizeToolInput } from '../orchestrator/chatContext.js'
 import { executeMemoryTool, executeRecallMemoryTool, recallMemoryTool, rememberTool } from '../orchestrator/memoryTools.js'
+import { executeSkillDraftTool } from '../orchestrator/skillDraftTools.js'
 import {
   callMcpToolTool,
   executeListMcpTools,
@@ -612,6 +614,28 @@ export function registerSandboxProxyRoutes(app: FastifyInstance): void {
       )
     }
     const body = parsed.data
+
+    // ── Skill 草稿入口工具（P1-24c-4c）──
+    // 它们注册在容器 `skills` 扩展里（带会话令牌代理回本端点），不属于 MCP / 知识库内置工具，
+    // 因此**不受 catalog.builtins 的白名单约束**：执行体只产草稿或权限结果，且身份来自令牌解析。
+    if (isSkillRequestToolName(body.name)) {
+      const user = await getPrisma().user.findUnique({
+        where: { id: auth.record.userId },
+        select: { role: true },
+      })
+      if (user === null) {
+        return sendSandboxProxyError(reply, 401, 'UNAUTHORIZED', '会话发起者已不存在，无法执行该工具。')
+      }
+      const outcome = await executeSkillDraftTool({
+        conversationId: auth.record.conversationId,
+        agentId: auth.record.agentId,
+        name: body.name,
+        arguments: JSON.stringify(body.arguments),
+        viewer: { id: auth.record.userId, role: user.role === 'ADMIN' ? 'ADMIN' : 'MEMBER' },
+        log: { conversationId: auth.record.conversationId, agentId: auth.record.agentId },
+      })
+      return reply.send({ isError: outcome.isError, text: outcome.output })
+    }
 
     const isNotify = body.name === SEND_NOTIFICATION_TOOL_NAME
     const isMemory = body.name === REMEMBER_TOOL_NAME || body.name === RECALL_MEMORY_TOOL_NAME

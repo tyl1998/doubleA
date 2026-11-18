@@ -49,6 +49,8 @@ import { LoginPage } from '../pages/login/LoginPage.js'
 import { McpCredentialsPage } from '../pages/mcp/McpCredentialsPage.js'
 import { McpServersPage } from '../pages/mcp/McpServersPage.js'
 import { SkillDetailPage } from '../pages/skills/SkillDetailPage.js'
+import { SkillDraftPage } from '../pages/skills/SkillDraftPage.js'
+import { SkillDraftsPage } from '../pages/skills/SkillDraftsPage.js'
 import { SkillListPage } from '../pages/skills/SkillListPage.js'
 import { PasswordPage } from '../pages/settings/PasswordPage.js'
 import { TasksPage } from '../pages/tasks/TasksPage.js'
@@ -90,6 +92,10 @@ export function App() {
           <Route path="/knowledge/:id" element={<KnowledgeDetailPage />} />
           {/* S-05b · Skill（P1-24a-2）：列表与详情都是登录即可，私有 Skill 对他人 404 */}
           <Route path="/skills" element={<SkillListPage />} />
+          {/* 我的草稿列表：提示卡关闭后的固定入口；**必须排在 `/skills/:id` 前面** */}
+          <Route path="/skills/drafts" element={<SkillDraftsPage />} />
+          {/* S-05c · Skill 草稿审核页（P1-24c-1）：**必须排在 `/skills/:id` 前面**（`drafts` 会被当成 `:id`） */}
+          <Route path="/skills/drafts/:draftId" element={<SkillDraftPage />} />
           <Route path="/skills/:id" element={<SkillDetailPage />} />
           {/* S-06 · MCP：登录即可（`mcp_servers` 没有 owner 列） */}
           <Route path="/mcp" element={<McpServersPage />} />

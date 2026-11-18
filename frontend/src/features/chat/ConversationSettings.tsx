@@ -19,6 +19,7 @@
 import {
   BulbOutlined,
   CodeOutlined,
+  ExperimentOutlined,
   FolderOpenOutlined,
   LayoutOutlined,
   MessageOutlined,
@@ -30,6 +31,7 @@ import { useState, type ReactNode } from 'react'
 import type { AgentItem } from '@doubulea/shared'
 
 import { useT } from '../../app/i18n.js'
+import { SkillOverridePanel } from './SkillOverridePanel.js'
 
 export interface ConversationSettingsProps {
   agent: AgentItem | undefined
@@ -61,6 +63,8 @@ export interface ConversationSettingsProps {
   /** Code 模式的专注态（§七 3）：`none` / 专注工作区 / 专注对话 */
   codeFocus: CodeFocus
   onChangeCodeFocus: (focus: CodeFocus) => void
+  /** P1-24c-4b：会话设置里的「本会话的 Skill 覆写」；重建出的草稿交给父组件打开审核弹层 */
+  onReviewDraft: (draftId: string) => void
 }
 
 /** Code 模式专注态（纯展示枚举；真值在 `ChatPage`，见那里的 `.chat--focus-*`） */
@@ -109,6 +113,7 @@ function ControlButton(props: {
 export function ConversationSettings(props: ConversationSettingsProps) {
   const { t } = useT()
   const { agent } = props
+  const [overridesOpen, setOverridesOpen] = useState(false)
 
   // 池里有 2 个及以上模型才给选择器（否则只有默认模型、没有可选项；与改造前同判据）
   const modelPool = agent !== undefined && agent.modelId !== null && agent.models.length >= 2
@@ -166,6 +171,15 @@ export function ConversationSettings(props: ConversationSettingsProps) {
         onClick={() => props.onToggleAutoApprove(!props.autoApprove)}
       />
 
+      {props.conversationId === undefined ? null : (
+        <ControlButton
+          icon={<ExperimentOutlined />}
+          active={overridesOpen}
+          label={t('skillOverride.entry')}
+          onClick={() => setOverridesOpen(true)}
+        />
+      )}
+
       <ControlButton
         icon={<BulbOutlined />}
         active={!props.memoryExcluded}
@@ -201,6 +215,13 @@ export function ConversationSettings(props: ConversationSettingsProps) {
           onClick={() => props.onTogglePanel(!props.panelOpen)}
         />
       ) : null}
+
+      <SkillOverridePanel
+        conversationId={props.conversationId}
+        open={overridesOpen}
+        onClose={() => setOverridesOpen(false)}
+        onReviewDraft={props.onReviewDraft}
+      />
 
       {props.codeMode ? (
         <>

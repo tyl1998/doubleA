@@ -132,11 +132,13 @@ export function AgentsListPage() {
       render: (_, agent) => {
         const knowledge = agent.components.filter((c) => c.componentType === 'KNOWLEDGE').length
         const mcp = mcpRefsOf(agent.components).length
-        if (knowledge === 0 && mcp === 0) return <Tag>{t('agents.noBinding')}</Tag>
+        const skill = agent.components.filter((c) => c.componentType === 'SKILL').length
+        if (knowledge === 0 && mcp === 0 && skill === 0) return <Tag>{t('agents.noBinding')}</Tag>
         return (
           <span className="row" style={{ gap: 'var(--sp-2)' }}>
             {knowledge > 0 && <Tag>{t('agents.knowledgeCount', { count: knowledge })}</Tag>}
             {mcp > 0 && <Tag className="tag--warn">{t('agents.mcpCount', { count: mcp })}</Tag>}
+            {skill > 0 && <Tag>{t('agents.skillCount', { count: skill })}</Tag>}
           </span>
         )
       },

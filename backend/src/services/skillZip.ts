@@ -258,7 +258,7 @@ function mimeOf(path: string): string {
 // ───────────────────────────── frontmatter ─────────────────────────────
 
 /** 极简 YAML 子集解析：只认 Skill frontmatter 实际会用的 `key: value` 与一层 `嵌套:`（`requires`） */
-function parseSimpleYaml(text: string): Record<string, unknown> {
+export function parseSimpleYaml(text: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   let currentMap: Record<string, unknown> | null = null
   for (const rawLine of text.split(/\r?\n/u)) {

@@ -46,6 +46,7 @@ import { appMsg,
   SKILL_NAME_MAX_CHARS,
   SKILL_SLUG_MAX_CHARS,
   SKILL_VISIBILITIES,
+  isLikelyScriptPath,
   skillDescriptionWithinLimit,
   skillStoragePrefix,
   slugifyServerName,
@@ -74,6 +75,8 @@ const SKILL_SELECT = {
   visibility: true,
   // P1-24a-2：列表 / 详情 / 导入结果的投影需要这几列（版本、来源、依赖、fork 关系）
   sourceType: true,
+  sourceConversationId: true,
+  sourceMessageIds: true,
   requiresBins: true,
   manifest: true,
   parentSkillId: true,
@@ -95,6 +98,10 @@ export interface SkillRow {
   version: number
   visibility: AssetVisibility
   sourceType: SkillSourceType
+  /** 来源会话（`sourceType=CONVERSATION` 时有值；**不建 FK**） */
+  sourceConversationId: string | null
+  /** `source_message_ids`（jsonb；脏值按空数组投影） */
+  sourceMessageIds: unknown
   requiresBins: unknown
   /** `SKILL.md` 原始 frontmatter（非受控键在预览 / 下载时原样带回） */
   manifest: unknown
@@ -332,3 +339,27 @@ export function assertSkillMetadata(input: { name: string; description: string }
 }
 
 export { SKILL_SELECT }
+
+/**
+ * 批量判定"当前版本是否含脚本"（列表 / 绑定校验共用；一次查询，不在 JS 里读 S3）。
+ *
+ * 传进来的每项必须是**当前版本**；老版本的脚本不影响"现在这个 Skill 有没有脚本"。
+ * 判据是 {@link isLikelyScriptPath}（跨目录识别），不是只看 `scripts/**`。
+ */
+export async function skillHasScriptsMap(
+  skills: readonly { id: string; version: number }[],
+): Promise<Map<string, boolean>> {
+  const unique = [...new Map(skills.map((skill) => [skill.id, skill])).values()]
+  const result = new Map(unique.map((skill) => [skill.id, false]))
+  if (unique.length === 0) return result
+  const versionById = new Map(unique.map((skill) => [skill.id, skill.version]))
+  const rows = await getPrisma().skillFile.findMany({
+    where: { OR: unique.map((skill) => ({ skillId: skill.id, version: skill.version })) },
+    select: { skillId: true, version: true, path: true },
+  })
+  for (const row of rows) {
+    if (row.version !== versionById.get(row.skillId)) continue
+    if (isLikelyScriptPath(row.path)) result.set(row.skillId, true)
+  }
+  return result
+}

@@ -63,6 +63,7 @@ const sharedEnv = {
   BACKEND_IMAGE: 'doubulea-backend:2',
   SHARED_ENV_FILE: join(ROUTER_DIR, '.env.node.shared'),
   WORKSPACE_ROOT: '/var/lib/doubulea/workspaces',
+  SKILL_RUNTIME_ROOT: '/var/lib/doubulea/skills',
   EGRESS_IMAGE: 'node:22-bookworm-slim',
   EGRESS_DOCKER_BIN: '/usr/bin/docker',
   DOCKER_SOCKET_GID: '0',

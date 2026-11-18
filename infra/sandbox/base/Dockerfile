@@ -135,7 +135,9 @@ RUN set -eux; \
     find /opt/pi/agent -type f -exec chmod 0644 {} +; \
     test -f /opt/pi/agent/settings.json; \
     test -f /opt/pi/agent/extensions/mcp-bridge/index.ts; \
-    test -f /opt/pi/agent/extensions/workspace/index.ts
+    test -f /opt/pi/agent/extensions/workspace/index.ts; \
+    test -f /opt/pi/agent/extensions/skills/index.ts; \
+    test -f /opt/pi/agent/extensions/skills/contract.ts
 
 # entrypoint：播种（只读种子 → 可写 agent-dir）后 `exec pi "$@"`
 # 这里只做**语法**检查（`bash -n`）—— 播种的**行为**由 toolkit 的 selfcheck 真跑一次来验

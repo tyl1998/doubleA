@@ -51,7 +51,10 @@ import { registerSandboxInstanceRoutes } from './routes/sandboxInstances.js'
 import { registerNodeRoutes } from './routes/node.js'
 import { registerNodeInternalRoutes } from './routes/nodeInternal.js'
 import { registerTitleModelRoutes } from './routes/titleModel.js'
+import { registerSkillExtractModelRoutes } from './routes/skillExtractModel.js'
 import { registerSkillRoutes } from './routes/skills.js'
+import { registerSkillDraftRoutes } from './routes/skillDrafts.js'
+import { registerSkillProposalRoutes } from './routes/skillProposals.js'
 
 /**
  * 监听地址：容器/内网部署要能从他机访问（`02` §十二），故不锁 `127.0.0.1`。
@@ -251,6 +254,10 @@ export function buildApp(): FastifyInstance {
   //    一律回落 `persist.ts` 里那条确定性截断（`deriveConversationTopic`）。
   registerTitleModelRoutes(app)
 
+  // ㉓′ Skill 抽取模型（平台级单例，P1-24c-2）：`/api/admin/skill-extract-model` 两条（读 / 整替换）。
+  //    仅 ADMIN；未配置时回落标题模型，两者都不可用 ⇒ 抽取端点 502（不静默降级）。
+  registerSkillExtractModelRoutes(app)
+
   // ㉔ 开放平台（P1-22）：内部管理三条（Cookie + 行级权限）+ 对外 17 条（`/open/v1/**`，Key 鉴权）。
   //    内部三条与 `registerAgentRoutes` 同族（行级判定在服务层），**不是** `(A)`：受众也要能给自己签 Key。
   registerOpenApiKeyRoutes(app)
@@ -272,6 +279,11 @@ export function buildApp(): FastifyInstance {
   //    **改 / 删 / 导入 / 转移的行级判定在服务层**（所属人或 ADMIN），路由里一个 `requireAdmin` 都没有。
   //    ⚠️ 本批**不注册任何模型工具、不改 ChatBot / TaskAgent 运行时**（那是 a-3 / b 批）。
   registerSkillRoutes(app)
+  registerSkillDraftRoutes(app)
+  // ㉖ Skill 更新建议审核（P1-24c-6）：`/api/skill-proposals` 六条（我的建议 / 详情 / 接受 / 拒绝 /
+  //    要求重做 / 撤回）。权限在服务层：读 = 提交者或目标所属人；审核动作 = 目标所属人或 ADMIN
+  //    （**提交者不能自审自批**）。
+  registerSkillProposalRoutes(app)
 
   return app
 }

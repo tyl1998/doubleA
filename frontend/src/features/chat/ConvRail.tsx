@@ -33,6 +33,7 @@ import { CONVERSATION_TOPIC_MAX_CHARS, type ConversationItem, type RemoveConvers
 
 import { useCurrentUser } from '../../api/auth.js'
 import { MY_CONVERSATIONS_PAGE_LIMIT_MAX, useMyConversations, useRenameConversation } from '../../api/conversations.js'
+import { usePendingSkillReviewCount } from '../../api/skillProposals.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT, type Translate } from '../../app/i18n.js'
 import { matchNavItem, visibleNavItems, type NavItem } from '../../app/nav.js'
@@ -58,10 +59,13 @@ import { useMinuteTick } from './useMinuteTick.js'
 
 /**
  * 上层「平台功能」的直达入口（按 `NavItem.code`）；顺序即产品口径的展示顺序
- * （智能体 / 知识库 / MCP / 任务 / 会话产物），**不跟 `NAV_ITEMS` 的排列**。
+ * （智能体 / 知识库 / Skill / MCP / 任务 / 会话产物），**不跟 `NAV_ITEMS` 的排列**。
  * 「我的凭据」按用户 2026-10-26 口径**收进「管理 ▸」**（它属个人设置族，不再是平台一级入口）。
+ *
+ * ⚠️ 2026-11-18：`SK` 从「管理 ▸」提到直达入口 —— 待审核徽标要在**外部**一眼可见，
+ * 藏在二级浮层里等于没提醒。
  */
-const PLATFORM_NAV_CODES: readonly string[] = ['AG', 'KB', 'MC', 'TK', 'AH']
+const PLATFORM_NAV_CODES: readonly string[] = ['AG', 'KB', 'SK', 'MC', 'TK', 'AH']
 
 export interface ConvRailProps {
   /** 路由里的当前会话 id；`undefined` = 新会话态 / 聊天主页空态 */
@@ -86,6 +90,9 @@ export function ConvRail({ conversationId }: ConvRailProps) {
 
   const listQuery = useMyConversations({ offset: 0, limit: MY_CONVERSATIONS_PAGE_LIMIT_MAX })
   const items = listQuery.data?.items
+  /** 待我审核的 Skill 更新建议数（左侧导航的外部提醒） */
+  const pendingReviews = usePendingSkillReviewCount()
+  const pendingReviewCount = pendingReviews.data?.count ?? 0
 
   /**
    * 服务端侧活跃判据（2026-10-21）：本页画不出的那些轮次（切走后 / 刷新后进入 / 别的窗口发起）
@@ -273,6 +280,9 @@ export function ConvRail({ conversationId }: ConvRailProps) {
                   {ICON_BY_CODE[item.code] ?? NAV_FALLBACK_ICON}
                 </span>
                 <span className="convrail__nav-label">{t(item.labelKey)}</span>
+                {item.code === 'SK' && pendingReviewCount > 0 ? (
+                  <span className="convrail__nav-badge">{pendingReviewCount}</span>
+                ) : null}
               </Link>
             </li>
           ))}

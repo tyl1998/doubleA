@@ -245,7 +245,7 @@ skill-overrides/{conversationId}/{skillId}/r{revision}/...  # 会话级覆写（
 
 | 项 | 口径 |
 |---|---|
-| 配置 | 新增 `config.ts` 的 `SKILL_RUNTIME_ROOT`（`defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/skills')`），与 `WORKSPACE_ROOT`（`config.ts:687`）同族、同写法，并进 `infra/.env.example` |
+| 配置 | `config.ts` 的 `SKILL_RUNTIME_ROOT`（**留空 = 跟随 `WORKSPACE_ROOT` 的同级目录** `{WORKSPACE_ROOT}/../skills`），与 `WORKSPACE_ROOT`（`config.ts:687`）同族、进 `infra/.env.example`；⚠️ **不要**硬编码 `/var/lib/doubulea/skills` —— 非 root 进程建不了 `/var/lib/doubulea`（本地开发会 `EACCES: permission denied, mkdir '/var/lib/doubulea'`），而且只透传了 `WORKSPACE_ROOT` 的部署会静默指到一个不可写的根 |
 | 属主 | 目录必须 chown 到 `SANDBOX_AGENT_UID`（10001），复用 `sandbox/manager.ts` 的 `alignAgentOwnership` 判定；不 chown 时容器以 agent 跑会读不到（与 `$HOME` tmpfs 那条实测坑同源） |
 | 清理 | **跟随工作区保留期，但独立 reaper**：判据 `conversation.updatedAt < now - 保留期` → 停容器 → 删目录。**不要**塞进 `reapExpiredWorkspaceDirs`——那是 `workspaces` 表行驱动的，Skill 目录没有对应的表行，混在一起会让"没有工作区的会话"永远漏清 |
 | 多机 | 机器本地缓存，不是真相源；换机 / 重建容器时**以 S3 为准重建**（见 §4.12） |
@@ -783,11 +783,13 @@ DELETE /api/skill-drafts/:draftId       丢弃草稿
 
 ### 5.6 交互流程
 
-入口：
+入口（**2026-11-16 交互修订**）：
 
-- 会话头部「另存为 Skill」；
-- 消息选择态下「将选中内容存为 Skill」；
-- TaskAgent 产物/命令区域可选「连同产物一起保存」。
+- 主入口 = 用户在对话里明确要求（“把上面这个流程生成 Skill” / “更新 Skill《X》”），Agent 调用 `request_skill_draft` / `request_skill_revision`；
+- 工具只产草稿 / 权限结果，本轮结束后由 `SkillDraftNotice` 提示卡承接（与 `MemoryNoticeStack` 同族，可关闭）；
+- 审核在弹层（宽版 Drawer，复用草稿审核组件），也可走 `/skills/drafts/:draftId` 深链；
+- **不再使用 / 不新增会话头部的固定按钮**（`SaveAsSkillButton` / `UpdateSkillButton` 为过渡入口，随 P1-24c-4c 移除）；
+- 消息选择态 / TaskAgent 产物区不再单独挂固定入口，产物勾选并入 `request_skill_draft` 的参数。
 
 向导：
 
@@ -825,7 +827,7 @@ POST /api/skills/from-draft
 - `GET /api/skill-drafts/:draftId` / `DELETE` 与 `from-draft` 一样校验 `draft.userId === viewer.id`；ADMIN 也不能读他人草稿。
 - `from-draft` / `revisions/from-draft` / Proposal 接受按 `(draftId, kind)` 幂等；重复提交返回同一结果，不重复生成版本。S3 先写、DB 后切；DB 失败留下的新版本对象按前缀清理。
 - 只有会话所有者可以抽取；ADMIN 也不能把别人的会话导出为 Skill。
-- 抽取调用走平台模型池（默认独立抽取模型配置，标题模型只做 fallback；不可用时明确失败），不依赖会话 Agent 的模型是否仍可用。
+- 抽取调用走平台模型池：**显式配置的独立抽取模型优先**；没配时优先用**本会话当前模型**（工具调用 = 本轮实际模型；直连 API = 智能体默认模型），再回落标题模型；都不可用时明确失败（502 `EXTRACT_MODEL_UNAVAILABLE`），不静默降级。抽取是**非流式**调用，单独使用 `SKILL_EXTRACT_TIMEOUT_MS`（默认 120s），不能沿用聊天流的到响应头超时。
 - `Skill` 增加可选来源字段，便于“我的 Skills”显示来源与审计：
 
 ```prisma
@@ -1082,11 +1084,13 @@ model ConversationSkillOverride {
 
 #### 5.16.6 入口与交互
 
-**入口**（沿用 §五·补 的手法，但落点是会话而非资产）：
+**入口**（**2026-11-16 交互修订**，落点是会话而非资产）：
 
-1. 消息选择态 / 助手消息：「把本次纠正应用到本会话的 Skill」——目标是**当前会话已加载的那个 Skill**；
-2. Skill 工具卡：「在本会话中修改此 Skill」；
-3. 会话设置面板：「本会话的 Skill 覆写」列表（显示 skill 名、基于 vN、当前 rM、可放弃）。
+1. 用户在对话里要求更新某个 Skill，且 `canEditSkill=false` ⇒ Agent 调 `request_skill_revision` 得到 `FOREIGN` 结果 ⇒ `SkillDraftNotice` 提示卡出现「只改本会话」动作（c-4b 落地后可用）；**不是**在任何消息 / 工具卡上挂固定按钮；
+2. 用户主动说「只改本会话的 Skill」⇒ Agent 调同一工具（或 c-4b 的专用动作）走覆写分支；
+3. 会话设置面板：「本会话的 Skill 覆写」列表（显示 skill 名、基于 vN、当前 rM、可放弃）——这是**已存在覆写**的管理入口，不是新建入口。
+
+> 提示卡 / 审核弹层复用 `会话生成Skill.md` §8.1.1 / §8.1.2 的同一套 `SkillDraftNotice` 与宽版 Drawer；覆写保存仍走 §5.16.7 的端点。
 
 **流程**：选中目标 Skill → 进入与 `skill-drafts` **同一套审核页**（可编辑表单 + Markdown 预览 + 文件/脚本区 + 脱敏复核）→ 保存为覆写。**不新增第二种编辑器**。
 
@@ -1198,6 +1202,12 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 | 抽取模型不可用 | `UPSTREAM_ERROR` | 502 | `EXTRACT_MODEL_UNAVAILABLE` |
 | TaskAgent Skill 同步失败 | `INTERNAL` | 500 | `SKILL_SYNC_FAILED` |
 | 导入校验失败（路径穿越 / 脚本但 inline / zip bomb） | `VALIDATION` | 400 | `SKILL_IMPORT_INVALID`（`data.reasons[]` 给逐条原因） |
+| 抽取请求非法 / 抽取模型输出不可解析 | `VALIDATION` / `UPSTREAM_ERROR` | 400 / 502 | `SKILL_EXTRACT_INVALID` / `SKILL_EXTRACT_FAILED` |
+| 抽取并发已满（进程级信号量） | `BUSY` | 429 | —（`app.m313`；不排队） |
+| 非所属人尝试更新上游 Skill | `FORBIDDEN` | 403 | `SKILL_REVISION_FOREIGN_DENIED` |
+| 修订零改动（正文与文件都没变） | `CONFLICT` | 409 | `SKILL_REVISION_NO_CHANGE`（`app.m331`；工具状态 `NO_CHANGE`，不生成草稿） |
+| 会话覆写不存在 / 目标未绑定 / CAS 冲突 | `NOT_FOUND` / `VALIDATION` / `CONFLICT` | 404 / 400 / 409 | `SKILL_OVERRIDE_NOT_FOUND` / `SKILL_OVERRIDE_NOT_BOUND` / `SKILL_OVERRIDE_CONFLICT` |
+| fork 前置 / 上游不可用 / 有本地改动 | `VALIDATION` / `CONFLICT` | 400 / 409 | `SKILL_FORK_REQUIRED` / `SKILL_UPSTREAM_NOT_AVAILABLE` / `SKILL_UPSTREAM_LOCAL_CHANGES` |
 
 > ⚠️ 文档里凡写「409 `SKILL_X`」的，实现时一律是 **HTTP 409 + `code: 'CONFLICT'` + `data.code: 'SKILL_X'`**；**不要**往 `ERROR_CODES` 里加 `SKILL_*`——那会连带要求所有前端 i18n key 与 `HTTP_STATUS_BY_ERROR_CODE` 同步，且让 `error.<CODE>` 兜底层出现一堆只有 Skill 用一次的码。
 > 前端展示顺序：`data.code` 有对应文案就展示它，否则退回 `code` 的通用文案（与 P1-23 的 `error.<CODE>` 兜底一致）。
@@ -1307,7 +1317,7 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 > 8. **审计上屏**：`tool_calls` 仍只写 `skillSlug / skillVersion / skillPath`（`skillId` 是内部主键，只给 Redis 用）；前端工具卡标题行显示 `Skill v{n}`、正文区显示 `{slug} · {path}` ⇒ **历史卡永远显示当时那一版**，历史回放不重算。
 > 9. **指纹算法单一实现**：`shared#sha256Hex()` 是**纯 JS 标准 SHA-256** —— `shared` 会进浏览器图（不能 `node:crypto`），而 `crypto.subtle` 是异步的（指纹要在同步纯函数里算）。`skillCatalogFingerprintOf()` 本批**尚无运行期调用方**，服务的调用方是 **b-1** 的 manifest `fingerprint`；提前放在 `skillTools.ts` 是为了让"把快照摊成行"只有一份实现（否则容器不刷新的症状不报错）。
 
-### P1-24b-1 · TaskAgent 宿主副本与同步
+### P1-24b-1 · TaskAgent 宿主副本与同步 ✅ **已落地（2026-11-16）**
 
 范围：
 
@@ -1326,7 +1336,21 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 - S3 故障只让本轮失败，不误重建容器；
 - **覆写目录位先占好**：宿主副本结构里预留 `overrides/`（本批不写内容），manifest 的 `override` / `overrideRevision` 字段按"恒为 false/null"输出，`fingerprint` 计算已含 `overrideRevision`（值为 null 时不改变哈希）。
 
-### P1-24b-2 · 容器 skills 扩展（只读）与 refresh
+> **落地记录（2026-11-16）**
+> 1. **挂载**：`spec.ts#buildSandboxContainerSpec` 的第二条 `HostConfig.Mounts`（`Type: 'bind'`，`Target = ${SANDBOX_AGENT_HOME}/.skills`，**`ReadOnly: true`**）；`manager.ts#ensureSkillRuntimeDir` 在 `buildSandboxContainerSpec` 之前建目录 + `alignAgentOwnership`（root 跑时才 chown 到 10001），**失败直接抛**（不能只 warn —— 源目录缺失时 Docker 会静默建 root:root 0600 空目录）。
+> 2. **同步位置 = `taskAgent.ts` 拿到沙箱之后、建引擎桥之前**：容器创建时挂的就是这个目录，所以"这一轮要用的文件"必须在派活前落盘；复用容器的路径同样走一次（宿主目录可能被 reaper 清过 / 换机）。
+> 3. **判据 = manifest + 目录内容**（`manifestMatches` 四条：manifest 存在且可解析 / `fingerprint` 相同 / 每个 `v{n}/<slug>` 真的在 / `current/<slug>` 指向它）。**不看 mount 在不在**；不一致 ⇒ rehydrate（补齐 S3 → 切 current → 原子写 manifest）。一个字节都不用动时连 Redis 缓存键都不更新。
+> 4. **失败分流**：S3 读失败 / 文件行已归档 / manifest 写入失败 ⇒ `AppError.internal` + `data.code = SKILL_SYNC_FAILED`（文案 `app.m302`），这一轮明确失败；**不重建容器**（重建解决不了 S3 故障）。mount 缺失 / 容器扩展注册失败的重建判据属 b-2。
+> 5. **原子性**：版本目录先写进 `v{n}/.<slug>.tmp-*` 再 `rename`；`current/<slug>` 先建 `.<slug>.tmp-*` 链接再 `rename` 覆盖；`manifest.json` 用 `.tmp` + `rename`。三者顺序 = 目录 → current → manifest（写完 manifest 新集合才对读侧生效）。
+> 6. **同会话短锁**：Redis `SET NX PX 30000`（`skill:sync-lock:{conversationId}`），抢不到就 50ms × 60 次等；仍抢不到按"已是最新"继续（下一轮还会再对一次指纹），**不并发写**。释放用 Lua 比较后删。
+> 7. **在主机上 never 删除旧版本目录**：`v1/` 何时清由后续保留期策略定（本批只保证 manifest 不引用它）；但 `current/<slug>` 里 manifest 不认的链接会被摘掉 —— 否则 `$SKILL_DIR` 能进一个"manifest 说没有"的 Skill。
+> 8. **覆写位**：`overrides/` 目录建好但为空；manifest 的 `override` / `overrideRevision` 恒 `false` / `null`；`shared#skillManifestFingerprint` 的输入含 `overrideRevision`（`null` 时行内容不变 ⇒ a 批指纹逐字不变，`skill:regression` 80 项守着），`skillCatalogFingerprintLines` 在 `overrideRevision` 非空时追加 `r{n}`。
+> 9. **独立 reaper**（`sandbox/skillRuntime/reaper.ts`）：判据 `conversations.updated_at < now − WORKSPACE_RETENTION_DAYS`（与工作区**共用保留期值**，但**不共用清理器**），顺序 = 判活体容器 / 判实例归属 → 停容器（`recycleSandbox`）→ 删目录；另扫"会话已不存在"的孤儿目录。1h 一轮，启动先跑一次。
+> 10. **部署**：`infra/.env.example` 已有 `SKILL_RUNTIME_ROOT`；`docker-compose.host.yml` 必须**同路径**透传宿主目录（否则 bind 源在宿主 daemon 上不存在 ⇒ 空目录且不报错），`router-compose-check` 的最小 env 也补了这一项。
+> 11. **默认根不再硬编码**（2026-11-16 修）：`SKILL_RUNTIME_ROOT` 缺省 = `dirname(WORKSPACE_ROOT)/skills`。原方案给的 `/var/lib/doubulea/skills` 只在"部署也硬编码了 WORKSPACE_ROOT 默认值"时成立；本地（`WORKSPACE_ROOT=/Users/…/workspaces`）与任何只透传 `WORKSPACE_ROOT` 的部署都会在**第一轮派活同步文件时**报 `EACCES: permission denied, mkdir '/var/lib/doubulea'`。compose 的 bind 源用同一派生规则（`${SKILL_RUNTIME_ROOT:-${WORKSPACE_ROOT}/../skills}`），改 `WORKSPACE_ROOT` 即可整体搬家。
+> 12. **本批不做**：不注册容器工具（b-2）、不跑脚本（b-3）、不做会话级覆写（c-4b）、不在轮次中途同步（更新只在下一轮派活前生效）。自证 `pnpm --filter @doubulea/backend skill-sync:regression`（53 项）。
+
+### P1-24b-2 · 容器 skills 扩展（只读）与 refresh ✅ **已落地（2026-11-16）**
 
 范围：
 
@@ -1344,7 +1368,18 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 - 版本变化不重新注册工具，读到的正文是新版本；
 - 新镜像构建期 `test -f` 断言通过；容器 `docker inspect` 的 `doubulea.image` 标签与本轮 `.env` 一致。
 
-### P1-24b-3 · 脚本执行与预检
+> **落地记录（2026-11-16）**
+> 1. **扩展分两个文件**：`skills/contract.ts`（纯契约：常量、`skillPageOf`、`formatSkillPageText`、入参归一化、路径判据、manifest 解析与目录查找；**不 import 任何东西** ⇒ 后端回归能用 tsx 直接加载）+ `skills/index.ts`（pi 装配：`session_start` 与 `/doubulea:skills-refresh` 共用一份 `syncTools`，三个工具的执行体读本地文件）。
+> 2. **不重写 schema**：`registerTool.parameters` 直接转交 manifest 的 `inputSchema`（与 mcp-bridge 的 `parametersFor` 同一条理由 —— TypeBox 1.x 接受纯 JSON Schema）；`list_skills` / `load_skill` / `read_skill_file` 的名字与顺序都来自 manifest。
+> 3. **版本一轮内固定**：执行体用的 manifest 是**同步那一刻**存下来的那份；manifest 换了要等下一次 `/doubulea:skills-refresh` 或下一轮 `session_start`（容器 = 一次性会话，正常路径上就是下一轮派活）。
+> 4. **页文本与切片算法上移到 `shared`**（`formatSkillPageText` / `normalizeSkillPagingArgs`）：容器副本必须与后端逐字同形，`skill:regression` 用同一段 9000 码点正文比对两边。
+> 5. **refresh 判据**（`skillContainer.ts#needsSkillsRefresh`）：0→N / N→0 / 集合不同才注入；**仅版本变化不刷**（扩展按 `path` 读，manifest 已由同步器换过）。`needsSkillsRefresh(null, [])` 为 false —— 没绑 Skill 的会话**一个字节都不注入**。
+> 6. **挂载探针**（§4.16「容器没有 Skill mount ⇒ 重建」）：新容器一轮 `exec` 判 `$HOME/.skills` 是目录、且宿主能读到**本会话**的 `manifest.json`；不满足 ⇒ `recycleSandbox` + `app.m303`（`data.code = SKILL_SYNC_FAILED`），本轮明确失败、下一轮重建时挂回。探针**本身**失败只 warn（与挂载健康无关；容器状态由下一轮 `ensureSandbox` 复核）。
+> 7. **env 传挂载点**：`DOUBULEA_SKILLS_DIR`（`spec.ts#SANDBOX_SKILLS_DIR_ENV` 由 `manager.ts` 注入），扩展缺省回落到同一默认值 `/home/agent/.skills` —— 避免"两处字面量"在调整挂载位置时静默分叉。
+> 8. **镜像四项齐改**：`base/Dockerfile` 两条 `test -f`（`skills/index.ts` / `skills/contract.ts`）、`BASE_LAYER_VERSION 7→8`、`TOOLKIT_LAYER_VERSION 10→11`、`infra/.env` 的 `SANDBOX_IMAGE_BASE` / `SANDBOX_IMAGE`。
+> 9. **本批不做**：不跑脚本（b-3）；不做会话级覆写（c-4b，页文本与 manifest 的覆写位已预留）；端到端（只读 `EROFS` / 首次绑定 refresh / v1→v2 读到新正文）留给用户真跑。
+
+### P1-24b-3 · 脚本执行与预检 ✅ **已落地（2026-11-16）**
 
 范围：
 
@@ -1362,12 +1397,23 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 - **他人的 sandbox Skill 在绑定期就被 403 拒绝**（`SKILL_SANDBOX_FOREIGN_DENIED`），因此本批**不存在**"他人脚本已在容器里"的状态；fork 之后（自己拥有）可正常执行；
 - §6.3 的两条**已知边界**（脚本能读同会话其他 Skill 文件、能借 `SANDBOX_TOKEN` 调 MCP / 出网默认 `ALL`）用**正向**用例固化成断言，不写成期望失败。
 
+> **落地记录（2026-11-16）**
+> 1. **不新增工具**：脚本统一走容器既有 `bash`，`run_skill_script` 第一阶段不下发（manifest `tools[]` 仍只有三个）。回归断言 manifest 里没有它。
+> 2. **`$SKILL_DIR` 只有一份拼法**：`skillScript.ts#skillDirAbsoluteOf(slug)` = `${SANDBOX_SKILLS_DIR}/current/<slug>`，与 `shared#skillDirInContainer` 及 manifest 的 `currentPath` 在回归里逐字比对（改挂载位置时不会一半新一半旧）。
+> 3. **prompt 里的脚本口径是独立小节**（`SKILL_SCRIPT_RULES`，插在"可用 Skill"目录之前）：`$SKILL_DIR/scripts/...`、cwd 仍是 `/work`、产物写 `/work`（临时文件 `/tmp`）、`$SKILL_DIR` 只读不要往里写、不要写裸相对路径、bins 缺失只提示且**不得假装执行过**。没有 Skill 时整段不注入（prompt 逐字不变）。
+> 4. **预检只提示、不阻断**（§4.3 第 7 条）：`taskAgent.ts#skillBinsWarningBlock()` 在注入目录段后跑一次 `sh -c` + `command -v`（**所有 bin 一次探完**），缺失的按 Skill 列一句"需要 X：缺少 Y"，并明确"脚本跑不起来就换做法或告诉用户，不要假装跑过"。探针本身失败只 warn（与派活无关）。
+> 5. **探针防注入**：`requires.bins` 来自用户上传的 `SKILL.md`，而探针要把名字拼进 `sh -c` ⇒ 只探 `[A-Za-z0-9][A-Za-z0-9._+-]{0,63}`（`splitBinsForProbe`），其余**不执行**、只在提示里原样列为"未探测"。没有声明 bins（或全是非法名）⇒ **一次 exec 都不付**。
+> 6. **裸相对路径只发现不拦截**：`findBareScriptPathMentions()` 供回归/诊断用（识别 `scripts/export.py` 这类`行首/空白/引号`后的裸引用，`$SKILL_DIR/...` 与绝对路径不算）；不在导入时拒绝 —— 正文里可能本来就在讲"不要这么写"（本批的规则段自己就示范过一次，已改写成"例如只写 `脚本名.py`"）。生成器（c 批）才是"不产出裸路径"的责任方。
+> 7. **脚本不污染 `/work`**：Skill 挂在只读的 `$HOME/.skills`（不在 `/work` 下），`/work` 的索引/产物扫描天然看不到它；脚本与 Skill 文件都不进产物。回归 + 只读挂载（b-1/b-2）共同保证这一点，本批不新增扫 `$HOME` 的逻辑。
+> 8. **信任边界不新增判据**：公开 sandbox Skill 仍在**绑定期** 403（`SKILL_SANDBOX_FOREIGN_DENIED`），fork 之后（自己拥有）可正常执行；§6.3 的两条已知边界（脚本能读同会话其他 Skill 文件、能借 `SANDBOX_TOKEN` 调 MCP / 出网默认 `ALL`）保持**正向**口径，本批不加执行期拦截（`bash` 面前不成立）。
+> 9. **本批不做**：不新增 `run_skill_script`、不改镜像（复用 toolkit 层已有的 `python3` / `jq` / `git` / `rg`）、不做会话级覆写（c-4b）；端到端留给用户真跑。自证 `pnpm --filter @doubulea/backend skill-sync:regression`（116 项）。
+
 ### P1-24c-1 ~ P1-24c-7 · 从会话沉淀、纠正与 Fork/Proposal
 
 完整范围、验收与拆批见 `子方案/会话生成Skill.md` §十一：
 
-- `c-1` 草稿基础设施（`skill-drafts` + 审核页骨架 + 脱敏）；
-- `c-2` SUMMARY 抽取；
+- `c-1` 草稿基础设施（`skill-drafts` + 审核页骨架 + 脱敏）✅ 2026-11-16；
+- `c-2` SUMMARY 抽取 ✅ 2026-11-16；
 - `c-3` TRACE + TaskAgent 产物；
 - `c-4` Revision；
 - **`c-4b` 会话级覆写（Session Override，§5.16）**——依赖 c-1 的草稿基础设施，不依赖抽取；含 `scripts/**` 覆写与 TaskAgent 物化；**它同时要碰 a 批（解析优先级）与 b 批（`skillSync` 物化覆写目录），所以是唯一一个跨批的 c 项**；

@@ -410,6 +410,27 @@ const COVERED = [
   'src/pages/skills/SkillDetailPage.tsx',
   'src/pages/skills/skillModel.tsx',
   'src/api/skills.ts',
+  // ── P1-24c-1：Skill 草稿审核页 ──
+  'src/pages/skills/SkillDraftPage.tsx',
+  'src/pages/skills/SkillFileTree.tsx',
+  'src/api/skillDrafts.ts',
+  // ── P1-24c-1（2026-11-17 重做审核布局）：文件树 + 对比 / 内容 / 编辑 ──
+  'src/features/skills/SkillDraftReview.tsx',
+  'src/features/skills/skillDraftReviewModel.ts',
+  // ── P1-24c-2：会话抽取接口 + 管理面抽取模型卡（固定按钮已随 c-4c 移除）──
+  'src/api/skillExtract.ts',
+  // ── P1-24c-4c：Agent 工具 + 草稿提示卡 + 宽版审核弹层 ──
+  'src/features/chat/SkillDraftNoticeStack.tsx',
+  'src/features/skills/SkillDraftReviewDrawer.tsx',
+  'src/api/skillNotices.ts',
+  // ── P1-24c-4b：会话级覆写（列表 + 保存 / 重建 / 放弃）──
+  'src/features/chat/SkillOverridePanel.tsx',
+  'src/api/skillOverrides.ts',
+  // ── P1-24c-5：Fork + fast-forward（副本徽标 / 上游差异 / 同步 / promote）──
+  'src/features/skills/UpstreamDiffModal.tsx',
+  // ── P1-24c-6：更新建议（提交 / 我的建议 / 审核弹层 / 三方合并）──
+  'src/api/skillProposals.ts',
+  'src/features/skills/SkillProposalReviewModal.tsx',
 ]
 
 for (const file of COVERED) {

@@ -18,7 +18,7 @@
 
 import { existsSync } from 'node:fs'
 import { hostname } from 'node:os'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { z } from 'zod'
@@ -774,12 +774,45 @@ const envSchema = z
      */
     SKILL_MAX_COMPRESSION_RATIO: intVar('SKILL_MAX_COMPRESSION_RATIO', 100, { min: 1, max: 10_000 }),
     /**
-     * 宿主 Skill 运行时根目录（P1-24b-1 起用于 TaskAgent 的只读挂载）。
+     * 宿主 Skill 副本根目录（P1-24b-1；b-1 起真正建目录 / chown / 挂载）。
      *
-     * ⚠️ a-1 只把配置位占好（与 `WORKSPACE_ROOT` 同族、同写法，进 `infra/.env.example`）：
-     * 本批不建目录、不 chown、不挂载 —— 那些属 b-1（含"目录属主必须是 10001"那条实测坑）。
+     * ⚠️ **缺省是空串 = 跟随 `WORKSPACE_ROOT` 的同级目录**（`{WORKSPACE_ROOT}/../skills`，见下方
+     * `skill.runtimeRoot`）。为什么不再硬编码 `/var/lib/doubulea/skills`：
+     * `WORKSPACE_ROOT` 是**已经验证可写**的那个根（生产与本地都是宿主绝对路径），而一个独立的默认值
+     * 在"只透传了 `WORKSPACE_ROOT`"的部署里会悄悄指到 `/var/lib/doubulea` —— 非 root 进程下建不了它，
+     * 症状是 `EACCES: permission denied, mkdir '/var/lib/doubulea'`（本地开发必踩）。
+     * 显式配置时仍以本项为准（生产若把 Skill 放在另一块盘上，单独设它即可）。
      */
-    SKILL_RUNTIME_ROOT: defaultedVar(z.string().trim().min(1), '/var/lib/doubulea/skills'),
+    SKILL_RUNTIME_ROOT: defaultedVar(z.string().trim(), ''),
+    /**
+     * Skill 草稿的存活时长（秒，P1-24c-1）。Redis 草稿 TTL = 它；`GET/PUT` 每次续期。
+     *
+     * 审核页每 60s 自动 `PUT` 一次 ⇒ 默认 1 小时足够"编辑 + 脱敏复核 + 保存"。
+     * 过期后草稿（含 S3 临时前缀下的文件）一律 404 `SKILL_DRAFT_NOT_FOUND`：草稿是**临时**资源，
+     * 不落库、不跨设备恢复（`子方案/会话生成Skill.md` §7.2）。
+     */
+    SKILL_DRAFT_TTL_SEC: intVar('SKILL_DRAFT_TTL_SEC', 3600, { min: 60, max: 7 * 24 * 3600 }),
+    /** 单份草稿的文件数上限（含 `SKILL.md`；与导入的 `SKILL_MAX_FILES` 分开，草稿是手工编辑的面） */
+    SKILL_DRAFT_MAX_FILES: intVar('SKILL_DRAFT_MAX_FILES', 50, { min: 1, max: 500 }),
+    /** 草稿单文件字节上限（默认与导入同值 5MB） */
+    SKILL_DRAFT_MAX_FILE_BYTES: intVar('SKILL_DRAFT_MAX_FILE_BYTES', 5 * 1024 * 1024, {
+      min: 1024,
+      max: 200 * 1024 * 1024,
+    }),
+    /** 草稿 `SKILL.md` 正文的字符上限（码点；默认 20 万，约 800KB UTF-8） */
+    SKILL_DRAFT_MAX_MARKDOWN_CHARS: intVar('SKILL_DRAFT_MAX_MARKDOWN_CHARS', 200_000, { min: 1000, max: 5_000_000 }),
+    /**
+     * 流程抽取（P1-24c-2）的进程级并发上限：抽取是一次**非流式**上游调用（最长几十秒），
+     * 与 ChatBot 的对话闸门分开 —— 否则"有人在抽 Skill"会把"有人想聊天"挤掉。
+     * 满了立刻 429（`app.m313`），不排队：抽一次要用户点一下，重试成本很低。
+     */
+    SKILL_EXTRACT_CONCURRENCY: intVar('SKILL_EXTRACT_CONCURRENCY', 2, { min: 1, max: 64 }),
+    /**
+     * 单次抽取上游调用的超时（毫秒）。抽取是**非流式**调用：上游通常要生成完整正文才结束，
+     * 不能用聊天流的 `LLM_REQUEST_TIMEOUT_MS`（60s，覆盖到响应头）—— 实测大 Skill 会 60s 超时。
+     * 同时覆盖"发请求 + 读 body"全程（见 `callExtractModel` 的 `timeoutMs`）。
+     */
+    SKILL_EXTRACT_TIMEOUT_MS: intVar('SKILL_EXTRACT_TIMEOUT_MS', 120_000, { min: 5_000, max: 600_000 }),
 
     // ── LLM 调用（P0-1-12；`02` §六 + §十一）──
     /**
@@ -788,8 +821,12 @@ const envSchema = z
      *
      * 上限 10 分钟：再长就等于没有超时（F 包的 SSE 与网关的 `proxy_read_timeout` 都在分钟级，
      * 这里放任不管不会让任何一条链路变好，只会让"上游挂了"变成"界面一直转圈"）。
+     *
+     * 默认 60s（原 30s）：思考型模型即使已经显式关掉思考（见 `llm/client.ts#vendorThinkingBody`），
+     * 大 prompt / 工具轮次的响应头也可能超过 30s；30s 下实测 4 次里 2 次 504
+     * （`UPSTREAM_TIMEOUT · 首次响应（到响应头）`），60s 给一次正常的首包留够余量。
      */
-    LLM_REQUEST_TIMEOUT_MS: intVar('LLM_REQUEST_TIMEOUT_MS', 30_000, { min: 500, max: 600_000 }),
+    LLM_REQUEST_TIMEOUT_MS: intVar('LLM_REQUEST_TIMEOUT_MS', 60_000, { min: 500, max: 600_000 }),
     /**
      * 流式响应体传输期「两次数据之间的间隔」上限。每收到一块即重置。
      *
@@ -803,7 +840,7 @@ const envSchema = z
     /**
      * MCP 单次请求的上限（毫秒）：「到响应头」与 `tools/call` 的等待共用它。
      *
-     * 为什么比 `LLM_REQUEST_TIMEOUT_MS`(30s) 小：MCP 工具调用是**一问一答**的短事务
+     * 为什么比 `LLM_REQUEST_TIMEOUT_MS`(60s) 小：MCP 工具调用是**一问一答**的短事务
      * （拉列表、调工具），而对话是一整段流式生成。给 20s 是"够慢的服务端也别把界面吊住"。
      * ⚠️ 交付验收要靠**注入小值**来验超时分支（`06` P0-2-1 验收门槛 3），所以它必须是配置项。
      */
@@ -1303,6 +1340,24 @@ export interface AppConfig {
     maxCompressionRatio: number
     /** 宿主运行时根目录（见 `SKILL_RUNTIME_ROOT`；b-1 起使用） */
     runtimeRoot: string
+    /** 草稿（c-1） */
+    draft: {
+      /** 存活秒数（见 `SKILL_DRAFT_TTL_SEC`） */
+      ttlSec: number
+      /** 文件数上限（含 `SKILL.md`；见 `SKILL_DRAFT_MAX_FILES`） */
+      maxFiles: number
+      /** 单文件字节上限（见 `SKILL_DRAFT_MAX_FILE_BYTES`） */
+      maxFileBytes: number
+      /** `SKILL.md` 正文字符上限（见 `SKILL_DRAFT_MAX_MARKDOWN_CHARS`） */
+      maxMarkdownChars: number
+    }
+    /** 从会话抽取（c-2） */
+    extract: {
+      /** 进程级并发上限（见 `SKILL_EXTRACT_CONCURRENCY`） */
+      concurrency: number
+      /** 单次抽取上游调用上限（毫秒，见 `SKILL_EXTRACT_TIMEOUT_MS`） */
+      timeoutMs: number
+    }
   }
 
   /**
@@ -1595,7 +1650,27 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxTotalBytes: vars.SKILL_MAX_TOTAL_BYTES,
       maxPathDepth: vars.SKILL_MAX_PATH_DEPTH,
       maxCompressionRatio: vars.SKILL_MAX_COMPRESSION_RATIO,
-      runtimeRoot: vars.SKILL_RUNTIME_ROOT,
+      /**
+       * 宿主 Skill 副本根。**显式配置优先**；缺省 = `{WORKSPACE_ROOT}/../skills`（同一父目录下的兄弟）。
+       *
+       * 选"兄弟目录"而不是"`{WORKSPACE_ROOT}/.skills`"：后者会被工作区树 / 索引 / 冷备当成会话内容，
+       * 而这里装的是**平台生成、可再生的副本**（不该进工作区，也不该随工作区保留期活动刷新）。
+       * `dirname` 用 `node:path` 而不是字符串切分：`WORKSPACE_ROOT` 末尾带 `/` 时切出来会是空串。
+       */
+      runtimeRoot:
+        vars.SKILL_RUNTIME_ROOT === ''
+          ? join(dirname(vars.WORKSPACE_ROOT), 'skills')
+          : vars.SKILL_RUNTIME_ROOT,
+      draft: {
+        ttlSec: vars.SKILL_DRAFT_TTL_SEC,
+        maxFiles: vars.SKILL_DRAFT_MAX_FILES,
+        maxFileBytes: vars.SKILL_DRAFT_MAX_FILE_BYTES,
+        maxMarkdownChars: vars.SKILL_DRAFT_MAX_MARKDOWN_CHARS,
+      },
+      extract: {
+        concurrency: vars.SKILL_EXTRACT_CONCURRENCY,
+        timeoutMs: vars.SKILL_EXTRACT_TIMEOUT_MS,
+      },
     },
 
     gitCredential: {

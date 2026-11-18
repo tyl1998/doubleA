@@ -843,6 +843,20 @@
 .convrail__nav-icon { display: inline-flex; flex: 0 0 auto; color: var(--muted); }
 .convrail__nav-item[data-current='true'] .convrail__nav-icon { color: var(--accent-ink); }
 .convrail__nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 待审核数量徽标（Skill 更新建议）：贴在导航项尾部，不参与文案截断 */
+.convrail__nav-badge {
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink, #fff);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
 /* 「管理 ▸」尾部的箭头：静态指向右（点它向右弹浮层），不再有就地展开的旋转态 */
 .convrail__nav-caret {
   margin-left: auto;
@@ -1271,7 +1285,7 @@
 .ws__tree-row.is-active { background: var(--accent-wash); color: var(--accent-ink); }
 .ws__tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws__chevron { display: inline-flex; width: 12px; color: var(--muted-2); font-size: 10px; }
-.ws__glyph { display: inline-flex; }
+.file-glyph { display: inline-flex; }
 /* 拖拽移动的落点高亮：拖到目录（整块子树）/ 拖到根空白区 */
 .ws__tree-item.is-drop > .ws__tree-row { background: var(--accent-wash); box-shadow: inset 2px 0 0 var(--accent); }
 .ws__tree-scroll.is-drop { background: var(--accent-wash); box-shadow: inset 0 0 0 1px var(--accent-rule); }
@@ -2622,3 +2636,62 @@
 .md__codecopy:focus-visible { opacity: 1; }
 .md__codecopy:hover { color: var(--ink); border-color: var(--rule-strong); }
 .md__codecopy.is-copied { opacity: 1; color: var(--ok); border-color: var(--ok); }
+
+/* ── Skill 文件树（2026-11-17）──────────────────────────────────────────────
+   行样式复用 Code 模式的 `.ws__tree-*`；这里只加一个滚动上限，文件多时不把详情页撑高。 */
+.skill-tree-scroll { max-height: 520px; overflow: auto; }
+
+/* 更新建议审核弹层的正文对照（等宽、可滚动；只做展示，不做编辑器） */
+.skill-proposal-diff {
+  margin: 0;
+  max-height: 340px;
+  overflow: auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-2);
+  background: var(--surface-sunken, color-mix(in srgb, var(--rule) 24%, transparent));
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 审核弹层的改动标记：新增 / 修改 */
+.skill-status {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: var(--fs-2xs);
+  line-height: 18px;
+  border: 1px solid transparent;
+}
+.skill-status--added { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 32%, transparent); }
+.skill-status--modified { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
+
+/* ── Skill 审核（2026-11-17）：文件树 + 预览 / diff 两栏 ────────────────── */
+.skill-review { display: flex; flex-direction: column; gap: var(--sp-3); min-height: 0; }
+.skill-review__head { display: flex; align-items: flex-start; gap: var(--sp-3); flex-wrap: wrap; }
+.skill-review__head-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 320px; }
+.skill-review__head-main strong { font-size: var(--fs-lg); overflow: hidden; text-overflow: ellipsis; }
+.skill-review__actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-left: auto; }
+.skill-review__toggle { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.skill-review__body { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); gap: var(--sp-3); }
+.skill-review__tree { min-height: 0; overflow: auto; padding-right: var(--sp-1); }
+.skill-review__pane { min-height: 0; min-width: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--sp-3); }
+.skill-review__pane-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.skill-review__pane-head code { margin-right: auto; }
+.skill-review__editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-3); align-items: stretch; }
+.skill-review__editor-preview { max-height: 60vh; overflow: auto; border-left: 1px solid var(--rule); padding-left: var(--sp-3); }
+@media (max-width: 960px) {
+  .skill-review__body { grid-template-columns: 1fr; }
+  .skill-review__tree { max-height: 260px; }
+  .skill-review__editor { grid-template-columns: 1fr; }
+  .skill-review__editor-preview { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: var(--sp-3); }
+}
+
+/* 行级 diff（新增 / 删除行的底色；不是新组件，只给审核页用） */
+.skill-diff { margin: 0; padding: var(--sp-2) 0; }
+.skill-diff__line { display: block; padding: 0 var(--sp-2); white-space: pre-wrap; }
+.skill-diff__line--add { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ink); }
+.skill-diff__line--del { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--ink-2); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--danger) 45%, transparent); }

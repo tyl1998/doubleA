@@ -52,6 +52,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # ★ 工作区：宿主路径 → 容器内**同一路径**（容器里的 WORKSPACE_ROOT 值因此仍指向宿主盘）
       - ${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}:${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}
+      # ★ Skill 宿主副本（P1-24b-1）：同理必须**同路径**透传 —— 它会被再 bind 进沙箱容器的
+      #   `$HOME/.skills`（只读），源路径必须对**宿主** daemon 有效。缺了它 / 路径不一致时，
+      #   容器里看到的是一份空目录，而模型没有任何报错（"Skill 绑了但看不见"）。
+      #   ⚠️ 缺省派生规则与 `config.ts` 一致：`{WORKSPACE_ROOT}/../skills`（=.env 里不填就自动同源）。
+      #   ⚠️ `../skills` 依赖 `WORKSPACE_ROOT` **不带尾斜杠**（`.env` 里写的是绝对路径，正常不会带）。
+      - ${SKILL_RUNTIME_ROOT:-${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}/../skills}:${SKILL_RUNTIME_ROOT:-${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}/../skills}
       # ★ 运维脚本 / 构建上下文（2026-10-19 起**已打进镜像**，`/app/infra/{scripts,sandbox}`）⇒
       #   **默认不挂**。compose 没有条件挂载，因此这两条只在"热修脚本"时由可选 override 文件提供：
       #     docker compose -f docker-compose.host.yml -f docker-compose.host.dev.yml up -d backend
@@ -97,6 +103,8 @@ services:
       #   而容器内以 uid 10001 运行 ⇒ 建工作区时报 `EACCES: permission denied, mkdir '/var/lib/doubulea'`。
       #   它还必须与上面那条 bind mount 的源路径**逐字一致**（否则容器写的是容器自己的层）。
       WORKSPACE_ROOT: ${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}
+      # ★ Skill 宿主副本根：与上面那条 bind mount 的源路径**逐字一致**；缺省派生规则同 `config.ts`
+      SKILL_RUNTIME_ROOT: ${SKILL_RUNTIME_ROOT:-${WORKSPACE_ROOT:-/var/lib/doubulea/workspaces}/../skills}
       # ★ 按需构建上下文（见上面 volumes；推理不出时容器里落成 undefined ⇒ canBuild=false，会如实反映）
       SANDBOX_RUNTIME_BUILD_CONTEXT: /app/infra/sandbox/runtime
       # ★ 按需构建用的 docker CLI（由 `docker-cli` 侧车经 `volumes_from` 提供）

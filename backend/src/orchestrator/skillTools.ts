@@ -54,11 +54,12 @@ import {
   listSkillsArgsSchema,
   readSkillFileArgsSchema,
   formatSkillCatalogBlock,
+  formatSkillPageText as sharedFormatSkillPageText,
+  resolveSkillSnapshot,
   skillCatalogFingerprint,
   skillCatalogFingerprintLines,
   skillPageOf,
   skillStoragePrefix,
-  type SkillPage,
   type SkillRuntime,
 } from '@doubulea/shared'
 
@@ -69,7 +70,7 @@ import { getS3Client, isS3NoSuchKey } from '../infra/s3.js'
 import { parseToolArguments } from '../llm/client.js'
 import { composeSkillMarkdown, stripFrontmatter } from '../services/skillZip.js'
 import { truncateToolResult } from './chatContext.js'
-import { createSkillObjectCache, skillObjectCacheKey } from './skillObjectCache.js'
+import { createSkillObjectCache } from './skillObjectCache.js'
 
 // ═════════════════════════════════════════════════════════════════════
 // 绑定行与快照
@@ -98,6 +99,12 @@ export interface SkillBindingEntry {
   currentVersion: number
   /** 本轮解析出来的版本（`pinnedVersion ?? currentVersion`；失效时 = `pinnedVersion`） */
   version: number
+  /** 本轮是否命中会话级覆写（c-4b；命中时 `version` = `basedOnVersion`） */
+  overrideRevision: number | null
+  /** 读取正文 / 文件的唯一前缀（上游 `skills/{id}/v{n}/` 或覆写 `skill-overrides/.../r{n}/`） */
+  contentKey: string
+  /** 命中覆写时的文件索引（来自覆写行；否则 `null` = 读 `skill_files`） */
+  overrideFiles: { path: string; mime: string; size: number; sha256: string }[] | null
   bound: boolean
   /** 不可用原因（`bound = false` 时非空；直接进工具结果里给模型看） */
   unavailableReason: string | null
@@ -141,9 +148,44 @@ export function skillCatalogFingerprintOf(snapshot: SkillSnapshot): string {
 export function resolveSkillBindingEntry(input: {
   skill: { id: string; slug: string; name: string; description: string; runtime: SkillRuntime; version: number }
   pinnedVersion: number | null
+  /** 会话级覆写（c-4b）：命中时优先级高于固定版本与最新版 */
+  override?: { revision: number; basedOnVersion: number; files: { path: string; mime: string; size: number; sha256: string }[] } | null
+  conversationId?: string | null
 }): SkillBindingEntry {
   const { skill } = input
   const pinnedVersion = input.pinnedVersion
+  const override = input.override ?? null
+  if (override !== null) {
+    const snapshot = resolveSkillSnapshot({
+      skillId: skill.id,
+      slug: skill.slug,
+      runtime: skill.runtime,
+      currentVersion: skill.version,
+      pinnedVersion,
+      override: { basedOnVersion: override.basedOnVersion, revision: override.revision },
+      ...(input.conversationId === undefined || input.conversationId === null
+        ? {}
+        : { conversationId: input.conversationId }),
+    })
+    return {
+      skillId: skill.id,
+      slug: skill.slug,
+      name: skill.name,
+      description: skill.description,
+      runtime: skill.runtime,
+      pinnedVersion,
+      currentVersion: skill.version,
+      version: snapshot.version,
+      overrideRevision: snapshot.overrideRevision,
+      contentKey: snapshot.contentKey,
+      overrideFiles: override.files,
+      bound: skill.version >= override.basedOnVersion,
+      unavailableReason:
+        skill.version < override.basedOnVersion
+          ? `覆写基于 v${String(override.basedOnVersion)}，但 Skill 当前只有 v${String(skill.version)}（数据不一致，请让用户放弃覆写后重建）`
+          : null,
+    }
+  }
   if (pinnedVersion !== null && pinnedVersion > skill.version) {
     return {
       skillId: skill.id,
@@ -154,6 +196,9 @@ export function resolveSkillBindingEntry(input: {
       pinnedVersion,
       currentVersion: skill.version,
       version: pinnedVersion,
+      overrideRevision: null,
+      contentKey: skillStoragePrefix(skill.id, pinnedVersion),
+      overrideFiles: null,
       bound: false,
       unavailableReason: `该智能体固定使用的是 v${String(pinnedVersion)}，但当前最新版本是 v${String(
         skill.version,
@@ -170,6 +215,9 @@ export function resolveSkillBindingEntry(input: {
     pinnedVersion,
     currentVersion: skill.version,
     version,
+    overrideRevision: null,
+    contentKey: skillStoragePrefix(skill.id, version),
+    overrideFiles: null,
     bound: true,
     unavailableReason: null,
   }
@@ -204,6 +252,7 @@ export function availableSkillEntries(snapshot: SkillSnapshot): SkillBindingEntr
  */
 export async function loadSkillSnapshot(
   bindings: readonly { refId: string; skillVersion: number | null }[],
+  conversationId?: string,
 ): Promise<SkillSnapshot> {
   const ids = [...new Set(bindings.map((binding) => binding.refId))]
   if (ids.length === 0) return buildSkillSnapshot([])
@@ -212,6 +261,14 @@ export async function loadSkillSnapshot(
     select: { id: true, slug: true, name: true, description: true, runtime: true, version: true, deletedAt: true },
   })
   const rowById = new Map(rows.map((row) => [row.id, row]))
+  const overrides =
+    conversationId === undefined
+      ? []
+      : await getPrisma().conversationSkillOverride.findMany({
+          where: { conversationId, skillId: { in: ids } },
+          select: { skillId: true, revision: true, basedOnVersion: true, files: true },
+        })
+  const overrideBySkill = new Map(overrides.map((row) => [row.skillId, row]))
   const entries: SkillBindingEntry[] = []
   for (const binding of bindings) {
     const row = rowById.get(binding.refId)
@@ -230,14 +287,51 @@ export async function loadSkillSnapshot(
         pinnedVersion,
         currentVersion: row.version,
         version: pinnedVersion ?? row.version,
+        overrideRevision: null,
+        contentKey: skillStoragePrefix(row.id, pinnedVersion ?? row.version),
+        overrideFiles: null,
         bound: false,
         unavailableReason: '这个 Skill 已被删除（可在「Skills」页重新导入后再绑定）',
       })
       continue
     }
-    entries.push(resolveSkillBindingEntry({ skill: row, pinnedVersion }))
+    const override = overrideBySkill.get(row.id)
+    entries.push(
+      resolveSkillBindingEntry({
+        skill: row,
+        pinnedVersion,
+        ...(override === undefined
+          ? {}
+          : {
+              override: {
+                revision: override.revision,
+                basedOnVersion: override.basedOnVersion,
+                files: parseOverrideFiles(override.files),
+              },
+            }),
+        ...(conversationId === undefined ? {} : { conversationId }),
+      }),
+    )
   }
   return buildSkillSnapshot(entries)
+}
+
+/** 覆写行里的文件清单（jsonb 脏值按空数组投影） */
+function parseOverrideFiles(value: unknown): { path: string; mime: string; size: number; sha256: string }[] {
+  if (!Array.isArray(value)) return []
+  const out: { path: string; mime: string; size: number; sha256: string }[] = []
+  for (const item of value) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+    const record = item as Record<string, unknown>
+    if (typeof record.path !== 'string') continue
+    out.push({
+      path: record.path,
+      mime: typeof record.mime === 'string' ? record.mime : 'application/octet-stream',
+      size: typeof record.size === 'number' ? record.size : 0,
+      sha256: typeof record.sha256 === 'string' ? record.sha256 : '',
+    })
+  }
+  return out
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -270,6 +364,8 @@ export interface SkillAuditRecord {
   skillSlug: string
   skillVersion: number
   skillPath: string
+  /** 命中会话覆写时的 revision（没有覆写 ⇒ 缺省，不写这个键） */
+  overrideRevision?: number
 }
 
 /** 日志上下文（只用于 warn，不影响结果） */
@@ -295,37 +391,18 @@ export function isSkillTool(name: string): boolean {
  * "Skill 内容是操作说明、不是系统指令"的口径。
  */
 function skillLabel(entry: SkillBindingEntry): string {
-  return `Skill「${entry.name}」（${entry.slug}，v${String(entry.version)}）`
+  const override = entry.overrideRevision === null ? '' : ` · 本会话覆写 r${String(entry.overrideRevision)}`
+  return `Skill「${entry.name}」（${entry.slug}，v${String(entry.version)}${override}）`
 }
 
 /**
- * 一页正文 → 给模型的文本：标题 + 分页信息 + 正文（`skillPageOf` 切出来的一段）。
+ * 一页正文 → 给模型的文本（**唯一实现在 `shared#formatSkillPageText`**）。
  *
- * 页尾必须写清"还有多少、下次带什么 offset"：它把"读完"变成一个模型能自己推进的循环，
- * 否则模型会以为这一页就是全文（`子方案` §4.1 / `read_document` 同款教训）。
+ * 为什么搬去 shared（P1-24b-2）：容器里的 `skills` 扩展不能 import 后端，而"页头 + 翻页提示"必须
+ * 与 ChatBot **逐字同形**（模型换执行器时看到的提示不该变）。这里只保留一个转发，免得后端几十处
+ * 调用点跟着搬家；`skill:regression` 同时断言"后端转发 == shared 实现"。
  */
-export function formatSkillPageText(input: {
-  title: string
-  page: SkillPage
-  /** 下一页要调用的工具名（`load_skill` / `read_skill_file`） */
-  toolName: string
-  /** 继续翻页时要带的参数（已格式化好，如 `slug="x"` / `slug="x", path="references/a.md"`） */
-  nextArgs: string
-}): string {
-  const { title, page } = input
-  const head =
-    page.offset === 0
-      ? `${title}（共 ${String(page.totalChars)} 字符）`
-      : `${title}（共 ${String(page.totalChars)} 字符，从第 ${String(page.offset + 1)} 字符起）`
-  const body = page.truncated
-    ? `\n\n…（本页到此为止。后面还有内容，请再次调用 ${input.toolName}：${input.nextArgs}, offset=${
-        page.nextOffset ?? 0
-      } 继续读，直到返回里不再提示）`
-    : page.offset === 0
-      ? ''
-      : '\n\n（已读完全文）'
-  return `${head}\n${page.text}${body}`
-}
+export const formatSkillPageText = sharedFormatSkillPageText
 
 // ═════════════════════════════════════════════════════════════════════
 // 读对象
@@ -341,9 +418,12 @@ export function formatSkillPageText(input: {
  */
 const skillObjectCache = createSkillObjectCache()
 
-/** S3 对象键（`skills/{id}/v{n}/...`；前缀来自 `shared#skillStoragePrefix`，本文件不自己拼前缀） */
-function objectKeyOf(skillId: string, version: number, path: string): string {
-  return `${skillStoragePrefix(skillId, version)}${path}`
+/**
+ * S3 对象键（前缀来自 `contentKey`；命中覆写时是 `skill-overrides/{conversationId}/{skillId}/r{n}/`）。
+ * ⚠️ 本文件**不自己拼前缀**：上游与覆写的前缀都由 `shared#resolveSkillSnapshot()` 产出。
+ */
+function objectKeyOf(entry: { contentKey: string }, path: string): string {
+  return `${entry.contentKey}${path}`
 }
 
 /** 一次 `getObject` + 收流（对象上限由导入闸门保证） */
@@ -367,7 +447,7 @@ async function readObjectOnce(bucket: string, key: string): Promise<Buffer> {
  * @throws {AppError} `CONFLICT` + `data.code = SKILL_VERSION_PURGED`（对象已回收）
  */
 async function readSkillObject(
-  entry: { skillId: string; version: number },
+  entry: { skillId: string; version: number; contentKey: string },
   path: string,
   key: string,
   fallbackKey: string,
@@ -376,7 +456,7 @@ async function readSkillObject(
    * ① 先查进程内缓存（P1-24a-4）：key 含 `skillId + version + path` ⇒ 版本一变自动换键，
    *    永远不会把 v1 的正文当成 v2 的内容（见 `skillObjectCache.ts` 文件头）。
    */
-  const cacheKey = skillObjectCacheKey(entry.skillId, entry.version, path)
+  const cacheKey = `${entry.contentKey}${path}`
   const cached = skillObjectCache.get(cacheKey)
   if (cached !== undefined) return cached
 
@@ -418,6 +498,13 @@ function asPurged(error: unknown, path: string, key: string): AppError {
 async function loadFileIndex(
   entry: SkillBindingEntry,
 ): Promise<{ path: string; storageKey: string }[] | null> {
+  // 命中会话覆写：文件清单来自覆写行（**不读 `skill_files`**），对象在覆写前缀下
+  if (entry.overrideFiles !== null) {
+    if (entry.overrideFiles.length === 0) return null
+    return [...entry.overrideFiles]
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .map((file) => ({ path: file.path, storageKey: `${entry.contentKey}${file.path}` }))
+  }
   const rows = await getPrisma().skillFile.findMany({
     where: { skillId: entry.skillId, version: entry.version },
     select: { path: true, storageKey: true },
@@ -628,7 +715,7 @@ async function executeLoadSkill(
     entry,
     row.path,
     row.storageKey,
-    objectKeyOf(entry.skillId, entry.version, row.path),
+    objectKeyOf(entry, row.path),
   )
   const markdown = composeSkillMarkdown({
     name: entry.name,
@@ -650,7 +737,13 @@ async function executeLoadSkill(
         nextArgs: `slug="${entry.slug}"`,
       }),
     ),
-    audit: { skillId: entry.skillId, skillSlug: entry.slug, skillVersion: entry.version, skillPath: SKILL_ENTRY_PATH },
+    audit: {
+      skillId: entry.skillId,
+      skillSlug: entry.slug,
+      skillVersion: entry.version,
+      skillPath: SKILL_ENTRY_PATH,
+      ...(entry.overrideRevision === null ? {} : { overrideRevision: entry.overrideRevision }),
+    },
   }
 }
 
@@ -707,7 +800,7 @@ async function executeReadSkillFile(
     entry,
     row.path,
     row.storageKey,
-    objectKeyOf(entry.skillId, entry.version, row.path),
+    objectKeyOf(entry, row.path),
   )
   const page = skillPageOf(text, offset ?? 0, limit ?? SKILL_PAGE_DEFAULT_LIMIT)
   return {
@@ -720,6 +813,12 @@ async function executeReadSkillFile(
         nextArgs: `slug="${entry.slug}", path="${path}"`,
       }),
     ),
-    audit: { skillId: entry.skillId, skillSlug: entry.slug, skillVersion: entry.version, skillPath: path },
+    audit: {
+      skillId: entry.skillId,
+      skillSlug: entry.slug,
+      skillVersion: entry.version,
+      skillPath: path,
+      ...(entry.overrideRevision === null ? {} : { overrideRevision: entry.overrideRevision }),
+    },
   }
 }

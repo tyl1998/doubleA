@@ -63,7 +63,7 @@ const {
   formatSkillVersionNotice,
   skillLastLoadedUpdate,
 } = await import('../src/orchestrator/skillVersionNotice.ts')
-const { SKILL_USAGE_RULES, TOOL_RESULT_MAX_CHARS, buildSystemPrompt, truncateToolResult } = await import(
+const { SKILL_REQUEST_RULES, SKILL_USAGE_RULES, TOOL_RESULT_MAX_CHARS, buildSystemPrompt, truncateToolResult } = await import(
   '../src/orchestrator/chatContext.ts'
 )
 
@@ -264,7 +264,7 @@ function skillRow(
 // ═════════════════════════════════════════════════════════════════════
 {
   const baseline = buildSystemPrompt('你是助手', [])
-  check('没绑 Skill / 没绑库 ⇒ 只有人设（与 a-3 之前逐字相同）', baseline === '你是助手', baseline)
+  check('没绑 Skill / 没绑库 ⇒ 只有人设 + 草稿入口发现性说明（c-4c）', baseline === `你是助手\n\n${SKILL_REQUEST_RULES}`, baseline)
   check('空数组等价于缺省（不引入空段）', buildSystemPrompt('你是助手', [], { skills: [] }) === baseline)
 
   const withSkill = buildSystemPrompt('你是助手', [], {

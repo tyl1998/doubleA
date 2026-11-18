@@ -25,11 +25,13 @@ export const PageCrumbContext = createContext<SetCrumbDetail | null>(null)
  * 把一个**细节段**交给顶栏面包屑（`工作台 / 模块 / <label>`）。
  *
  * 必须在组件顶层调用（遵守 Hooks 规则）：页面每次渲染传入当前 label，卸载时自动清空。
+ *
+ * `undefined` = **本条不上报也不清空**（弹层复用页面组件时用：它不能把下面那页的细节段抹掉）。
  */
-export function usePageCrumb(label: string | null): void {
+export function usePageCrumb(label: string | null | undefined): void {
   const setDetail = useContext(PageCrumbContext)
   useEffect(() => {
-    if (setDetail === null) return
+    if (setDetail === null || label === undefined) return
     setDetail(label)
     return () => {
       setDetail(null)

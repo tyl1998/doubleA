@@ -1,7 +1,8 @@
 # 子方案 — 从会话生成 Skill（Conversation → Skill）
 
 > 上游基准：`01-整体需求与实施步骤.md`（决策 18/29/30/37；⚠️ **决策 7「技能不做」由本方案修订**，回写要求见 `Skill能力.md` §1.1）、`02-后端设计.md`（§三 数据模型、§六 编排、§九 安全）、`03-前端设计.md`（§二 路由、对话页 / 消息选择）、`05-P系列计划拆分.md`（P1-24c）、`子方案/Skill能力.md`（§五·补、§五·补二）。
-> 状态：**方案稿（2026-11-13，v3 评审修订），未开工**。本文只展开 P1-24c「从会话沉淀 Skill」；Skill 的基础模型、运行时、ChatBot/TaskAgent 装配与版本生效见 `子方案/Skill能力.md`。v3 订正：① 错误子码一律走 `data.code`（§六）；② `bindToAgentId` 的失败语义（§六）；③ 导入校验复用 P1-12 `.doc` 嗅探与新建 `skillZip.ts`（§六）；④ **新增第四种作用域「只改本会话的 Skill」与会话级覆写**（§10.1 / `SkillDraftKind` 增 `SESSION_OVERRIDE` / 新增批次 `c-4b`）。
+> 状态：**c-1 ~ c-6 已落地（2026-11-16 ~ 2026-11-17），c-7（增强，可选）未开工**。
+2026-11-17 另按实测反馈完成一轮收尾修复（审核弹窗重做、提示卡按会话隔离、抽取稳定性），见 §8.2 与 §十三。本文只展开 P1-24c「从会话沉淀 Skill」；Skill 的基础模型、运行时、ChatBot/TaskAgent 装配与版本生效见 `子方案/Skill能力.md`。v3 订正：① 错误子码一律走 `data.code`（§六）；② `bindToAgentId` 的失败语义（§六）；③ 导入校验复用 P1-12 `.doc` 嗅探与新建 `skillZip.ts`（§六）；④ **新增第四种作用域「只改本会话的 Skill」与会话级覆写**（§10.1 / `SkillDraftKind` 增 `SESSION_OVERRIDE` / 新增批次 `c-4b`）。
 > 一句话：**会话负责“把这次流程生成成 Skill 草稿”，用户审核后保存到“我的 Skills”；它不是会话级临时 Skill，也不会随会话继续变化而自动改写。**（例外是「只改本会话的 Skill」——那是**显式的会话级覆写**，见 `Skill能力.md` §5.16：用户主动要求、只影响本会话、不改上游、可随时放弃或 promote 成正式 Skill。）
 
 ---
@@ -31,11 +32,17 @@
 
 ## 二、用户路径
 
-### 2.1 入口
+### 2.1 入口（2026-11-16 交互修订）
 
-- 会话头部：「另存为 Skill」。
-- 消息选择态：「将选中内容存为 Skill」。
-- TaskAgent 产物/命令区域：「连同产物一起保存」（可选）。
+**不再以会话头部的固定按钮作为主入口**（`SaveAsSkillButton` / `UpdateSkillButton` 只保留为过渡，随 P1-24c-4c 移除）。主入口是**会话内 Agent 工具 + 提示卡**：
+
+- 新增：用户说「根据上面这个流程帮我生成一个 Skill」→ Agent 调 `request_skill_draft` → 服务端生成 `CREATE` 草稿 → 本轮结束后弹出 `SkillDraftNotice` 卡；
+- 更新：用户说「把 Skill《X》按这次纠正更新一下」→ Agent 调 `request_skill_revision` → 所属人直接生成 `REVISION` 草稿；非所属人**在抽取之前**就被拦住，提示「会话级覆盖 / 复制为我的 Skill」；
+- 审核：提示卡的「审核草稿」打开**弹层**（宽版 Drawer / Modal，复用 `/skills/drafts/:draftId` 的审核组件），不强制跳独立页；
+- Agent 修改：审核弹层里可直接改并保存；也可把修改意见发回给 Agent，由 `revise_skill_draft`（后续增量）改草稿后再审核；
+- 提示卡是**事件驱动、可关闭、只在有草稿或权限提示时出现**的（交互形态与 `MemoryNoticeStack` 同族），不是常驻按钮。
+
+> ⚠️ **工具不是自动学习入口**：系统提示词要求 Agent 只在用户**明确要求**「存成 Skill / 更新这个 Skill」时调用；纠正本身不触发，纠正后也不自动生成草稿。
 
 ### 2.2 向导
 
@@ -205,7 +212,7 @@
 
 模型调用：
 
-- 走平台模型池：**默认独立抽取模型配置**（`skill_extract_model`），标题模型只作 fallback；两者都不可用 / 被关闭时明确报 `UPSTREAM_ERROR` 502 + `data.code = EXTRACT_MODEL_UNAVAILABLE`，不要静默生成低质量草稿；
+- 走平台模型池：**默认独立抽取模型配置**（`skill_extract_model`）；没配时优先用**本会话当前模型**（工具调用 = 本轮实际模型；直连 API = 智能体默认模型），再回落标题模型；三者都不可用 / 被关闭时明确报 `UPSTREAM_ERROR` 502 + `data.code = EXTRACT_MODEL_UNAVAILABLE`，不要静默生成低质量草稿；
 - 不挂任何工具；
 - 不把 MCP / Provider / Git 凭据放进上下文；
 - 失败重试一次，仍失败则明确报错，不落半成品。
@@ -433,11 +440,78 @@ MVP 不建议新增 `skill_drafts` 表：
 
 ### 8.1 入口
 
-- `ChatPage` 会话头部：`SaveAsSkillButton`。
-- 消息选择态：工具栏「存为 Skill」。
-- TaskAgent 产物/命令区：可选「连同产物保存」。
-- 审核页路由：`/skills/drafts/:draftId`（可以是全屏 Modal，也可以是独立页；建议独立页，便于长表单编辑）；路由按 `draft.kind` 显示「另存为 / 更新版本 / 提交建议」文案。
+**主入口 = 会话内 Agent 工具 + 提示卡（2026-11-16 定案）**：
+
+- `request_skill_draft`（新增）与 `request_skill_revision`（更新）由 Agent 在用户明确要求时调用；工具只创建**草稿**，不保存、不绑定、不发布。
+- 工具执行成功后写一条 `SkillDraftNotice`；`ChatPage` 在每轮结束 / 窗口聚焦时拉取，用 `SkillDraftNoticeStack` 渲染（与 `MemoryNoticeStack` 同族的可关闭卡片）。
+- 提示卡动作：`审核草稿` / `让 Agent 修改` / `忽略`；非所属人更新时动作换成 `只改本会话（c-4b）` / `复制为我的 Skill（c-5）` / `取消`。
+- 审核入口默认打开**弹层**（宽版 Drawer），内部复用 `SkillDraftPage` 的表单 + Markdown 预览 + 改动对比 + 脱敏复核；保留 `/skills/drafts/:draftId` 深链作为兜底。
+- **移除会话头部的 `SaveAsSkillButton` / `UpdateSkillButton`**（现有实现属过渡入口，随 P1-24c-4c 一并移除）；消息选择态 / 工具卡等其他入口同样不再新增固定按钮。
+- Agent 的系统提示词增加一行能力说明（“用户要求保存/更新 Skill 时调用对应工具”），否则用户不知道该说什么；这只是**发现性提示**，不是自动触发。
 - 副本详情的 `SKILL.md` 编辑器也走同一个 `skill-drafts`（`kind=REVISION`），不直接 `PATCH` 文件。
+
+### 8.1.1 Agent 工具契约（P1-24c-4c）
+
+工具定义放 `shared/src/skill.ts` 单一来源（与 `list_skills` / `load_skill` / `read_skill_file` 同一份，ChatBot 与容器 manifest 共用）：
+
+```ts
+request_skill_draft({
+  scope?: 'LAST_TURN' | 'WHOLE',       // 默认 LAST_TURN；服务端按会话归属与上限切消息
+  includeToolOutputs?: boolean,        // 勾选即 TRACE；ChatBot 拒绝
+  includeArtifacts?: boolean,          // 仅 TaskAgent
+  titleHint?: string                   // 可选，给草稿名的提示，不参与权限
+})
+
+request_skill_revision({
+  targetSkillId?: string,              // 缺省 = 本会话最近 load 的那个
+  targetSlug?: string,                 // 与上二选一；两者都给以 id 为准
+  scope?: 'CORRECTION' | 'WHOLE',      // 默认 CORRECTION（只看纠正窗口）
+  includeToolOutputs?: boolean,
+  includeArtifacts?: boolean
+})
+
+revise_skill_draft({                   // “让 Agent 修改”：对同一份草稿按意见再改一次
+  draftId: string,
+  instruction: string,                // 用户的修改意见（自然语言）
+  scope?: 'MINIMAL' | 'WHOLE'         // 默认 MINIMAL：只动相关段落
+})
+```
+
+口径：
+
+- **不接受 `messageIds` / `turnRange` / `markdown` / `patch`**：消息范围与正文只能由服务端按会话与草稿状态判定（模型不能“替我选一段别人看不到的会话”）。
+- `targetSkillId` 必须在本会话候选内（`skill-targets` 同一判据：本会话加载过或本会话 Agent 绑定）；不在候选 ⇒ 工具回 `TARGET_NOT_FOUND` + 候选清单，不生成草稿。
+- 工具结果只回 `{ status, draftId?, targetName?, fromVersion?, toVersion?, changeSummary?, risks?, reason?, candidates? }`；**不回草稿正文**（正文只在审核弹层里看）。
+- 工具失败不抛整轮错误：结构化 `code`（`SKILL_REVISION_FOREIGN_DENIED` / `SKILL_VERSION_CONFLICT` / `SKILL_EXTRACT_*`）回给模型，由模型用自然语言解释；真正权限拒绝仍以服务端判据为准，不靠模型自觉。
+- `request_skill_revision` 在**非所属人**时不调用抽取模型（不白烧一次），直接回 `FOREIGN` 分支：`canOverride` / `canFork` 两个布尔 + 说明。c-4b 落地后 `canOverride=true` 并生成 `SESSION_OVERRIDE` 草稿；c-5 落地后 `canFork=true` 并走 fork。
+- `revise_skill_draft` 只改**草稿**（不是正式 Skill），服务端用当前草稿 + 用户意见调修订模型，仍走同一套脱敏 / 风险 / diff 现算；不保存、不发布。审核弹层里的「让 Agent 修改」把意见发回对话，Agent 调它之后提示卡/弹层刷新同一份草稿。
+- TaskAgent 容器内的 `skills` 扩展负责把 `request_skill_draft` / `request_skill_revision` / `revise_skill_draft` **代理回后端** `/api/sandbox/builtin/call`（抽取要读 DB / S3 / 模型，不能在容器里跑）；容器只消费 manifest 的 `tools[]`。
+
+### 8.1.2 提示卡（SkillDraftNotice）
+
+```ts
+SkillDraftNotice = {
+  id: string
+  conversationId: string
+  kind: 'CREATE' | 'REVISION' | 'FOREIGN' | 'SESSION_OVERRIDE' // 后两种随 c-4b
+  draftId: string | null          // FOREIGN 为 null
+  targetSkillId: string | null
+  targetName: string | null
+  fromVersion: number | null
+  toVersion: number | null
+  changeSummary: string
+  risks: string[]
+  reason: string | null           // 权限 / 冲突等人话
+  actions: Array<'REVIEW' | 'LET_AGENT_REVISE' | 'EDIT_IN_SESSION' | 'FORK' | 'DISMISS'>
+  createdAt: string
+  expiresAt: string
+}
+```
+
+- 存储：Redis 队列 `skill-draft-notice:{conversationId}`（TTL 与草稿同源，不新建表）；`GET /api/conversations/:id/skill-notices` 拉取，`POST /api/conversations/:id/skill-notices/:noticeId` 消费（`OPEN` / `DISMISS`）。
+- “晚一拍”：本轮结束（`done`）后才拉取，避免工具卡与提示卡在同一帧抢注意力；窗口聚焦 / 重连也拉一次。
+- 提示卡**幂等**：同一 `draftId` 只出现一条；草稿保存 / 丢弃后由服务端消费，不重复弹。
+- 不把 `warnings` 全文塞进卡片（长）；卡片只给摘要 + 风险标签，详情在审核弹层。
 
 ### 8.2 审核页布局
 
@@ -452,6 +526,15 @@ MVP 不建议新增 `skill_drafts` 表：
 - runtime 可改，但 ChatBot 只允许 `inline`；改成 `sandbox` 时禁用「同时绑定当前 Agent」；
 - 保存前必须完成脱敏确认；**凭据形状不允许“恢复”**，只能保持打码或删除；
 - 编辑每 60s 自动 `PUT /api/skill-drafts/:draftId` 续期；保存失败保留表单内容与本地副本，不丢草稿。
+
+> **2026-11-17 审核弹窗重做（已落地）**：原"左表单 / 右 Markdown 预览 / 底栏一堆控件"的信息密度实测不可用。现改为与 Skill 详情页一致的**文件视角**：
+>
+> - 新增 `features/skills/SkillDraftReview.tsx`（弹层与 `/skills/drafts/:draftId` 深链页**共用一份**）+ `skillDraftReviewModel.ts`（合并「基准版本文件 ∪ 草稿文件」的纯数据层）；
+> - 左：文件树（`SKILL.md` 用草稿正文虚拟成一条；草稿新增 / 替换文件覆盖同名基准；改动文件标「新增 / 修改」）；
+> - 右：选中文件的**对比 / 内容 / 编辑**三态 —— 改动文件默认行级 diff，未改动文件正常展示且**仍可替换 / 移除**，`SKILL.md` 可直接编辑正文；
+> - 元数据、脱敏复核、变更说明、影响范围收进**「设置」页签**，默认打开文件列表；未确认脱敏 / 缺变更说明时头部显示提示与「去设置」入口（不再出现"保存按钮灰着但不知道原因"）。
+>
+> 口径：审核 UI 只有这一份，深链页与弹层不得出现两套编辑器；自动保存（800ms 防抖 + 60s 心跳）、脱敏闸门、保存来源的语义**逐字沿用** c-1。
 
 ### 8.3 “我的 Skills”列表
 
@@ -519,12 +602,17 @@ MVP 不建议新增 `skill_drafts` 表：
 - 若没有加载过任何 Skill，不提供“更新 Skill”/“只改本会话的 Skill”，改为“从本次会话生成新 Skill”或“仅这一次”；
 - 若用户不是该 Skill 的所属人（例如使用的是公开 Skill），不直接改原 Skill；提供 **“复制为我的 Skill 并应用这次纠正”**（fork）。
 
+> **2026-11-16 交互修订**：上面的“四选一”不再由用户点固定按钮后在弹窗里选，而是用户在对话里表达意图，Agent 调工具后由服务端判定能力，再以 `SkillDraftNotice` 呈现可执行的那几档。四档的**语义不变**，只是入口从“按钮 + 四选一表单”变成“对话 + 提示卡动作”。
+
 ### 10.2 入口
 
-- 用户发出纠正、助手按纠正完成后，在该助手消息上出现「将本次纠正更新到 Skill」；
-- 已加载 Skill 的工具卡上提供「更新此 Skill」；
-- 若纠正后的流程明显成功，可显示一条非阻塞提示：“已按你的纠正完成。要保存到 Skill《X》吗？”；
-- 不自动弹出全屏向导；用户点入口才进入。
+- 用户发出纠正、助手按纠正完成后，**用户明确说**「把这个 Skill 按刚才的纠正更新一下」；
+- Agent 调 `request_skill_revision`（参数见 §8.1.1）；目标缺省 = 本会话最近 `load_skill` 的那个，多个时由工具回候选、Agent 追问；
+- 服务端先判 `canEditSkill`：
+  - 所属人 / ADMIN ⇒ 生成 `REVISION` 草稿，写一条 `SkillDraftNotice`（kind=REVISION，动作 `审核草稿 / 让 Agent 修改 / 忽略`）；
+  - 非所属人 ⇒ **不调抽取模型**，回 `FOREIGN` 结果，写一条 kind=FOREIGN 的提示卡：说明“不能直接改上游”，给出「只改本会话（c-4b，当前未上线则置灰）」/「复制为我的 Skill（c-5，当前未上线则置灰）」/「取消」；
+- 用户点提示卡的「审核草稿」打开审核弹层；点「让 Agent 修改」把意见发回对话（`revise_skill_draft` 属后续增量）；
+- 不自动弹出全屏向导，也不在每条助手消息 / 每张工具卡上各挂一个固定入口；提示卡只在有草稿或权限结果时出现，可关闭。
 
 ### 10.3 捕获范围
 
@@ -645,9 +733,11 @@ model SkillChange {
 
 ### 10.9 验收判据
 
-- ChatBot 加载 Skill v1 → 用户说“不要先导出，先校验” → 助手按纠正完成 →「将本次纠正更新到 Skill」→ diff 显示步骤调整 → 保存 v2 → 下一轮使用 v2 并提示重新 load；当前轮不受影响。
-- 同一会话加载了两个 Skill → 更新入口要求选择目标，默认最近加载的那个。
-- 非所属人使用公开 Skill → 只能“另存为我的 Skill”，不能直接改原 Skill。
+- 用户与 Agent 走完一段流程后说「根据上面这个流程生成一个 Skill」→ Agent 调 `request_skill_draft` → 本轮结束弹出 CREATE 提示卡 → 审核弹层可见草稿 → 保存为 `v1`。
+- ChatBot 加载 Skill v1 → 用户说“不要先导出，先校验” → 助手按纠正完成 → 用户说「把这个 Skill 按刚才的纠正更新一下」→ Agent 调 `request_skill_revision` → 弹出 REVISION 提示卡 → diff 显示步骤调整 → 保存 v2 → 下一轮使用 v2 并提示重新 load；当前轮不受影响。
+- 同一会话加载了两个 Skill → Agent 工具回候选，Agent 追问目标；默认最近加载的那个。
+- 非所属人使用公开 Skill 并要求更新 → Agent 调工具后回 `FOREIGN`，提示卡说明「不能直接改上游」，只给出会话级覆盖（c-4b）/ 复制为我的 Skill（c-5）；**不调用抽取模型**。
+- 用户没有明确要求 → 纠正后 Agent 不自动生成草稿（不自动学习）。
 - 更新草稿生成后，原 Skill 被其他人更新到 v3 → 保存返回 409，提示重新生成，不覆盖 v3。
 - 用户选择“仅这一次” → 零写入：不产生新版本、不写覆写、不修改 Agent。
 - 用户选择“只改本会话的 Skill” → 产生一条会话级覆写（`revision=1`），**上游 `skills.version` 不变**；下一轮本会话生效，其他使用者不受影响。
@@ -688,7 +778,10 @@ model SkillChange {
 入口：
 
 - fork 详情：「提交更新建议」；
-- 公开 Skill 详情（有 fork 时）：「基于我的 fork 提交建议」。
+- 公开 Skill 详情（有 fork 时）：「基于我的 fork 提交建议」；
+- **本会话「覆写」列表：「提交更新建议」（2026-11-18 扩展）** —— 直接拿这条覆写的整版内容建
+  `PROPOSAL` 草稿（`baseVersion = basedOnVersion`），**不需要先 fork**（避免副本越攒越多）；
+  服务端给草稿打 `redactionCarried=true`，审核页沿用覆写保存时那次脱敏确认，再次编辑才重新确认。
 
 内容：
 
@@ -960,7 +1053,9 @@ POST /api/skills/:id/sync-upstream
 
 ## 十一、分批实施
 
-### P1-24c-1 · 草稿基础设施（无抽取）
+### P1-24c-1 · 草稿基础设施（无抽取）✅ 2026-11-16 已落地
+
+> 落地口径与 c-1 原文的两处差异（均已回写 `06` 施工记录）：① 建草稿只收 JSON，文件走独立上传端点 `POST /api/skill-drafts/:draftId/files`（不再有 `multipart draft.json + 文件` 的混合形态）；② 保存入口额外允许带「脱敏确认后的正文」（`markdown`，审核页的「恢复」只活在这一次提交里），并对它**在落库前重扫** —— 凭据形状一律 400。
 
 范围：
 
@@ -979,11 +1074,18 @@ POST /api/skills/:id/sync-upstream
 - 客户端传 `storageKey/files/markdown` 到保存入口被忽略/400；
 - 本批**不接会话抽取**。
 
-### P1-24c-2 · SUMMARY 抽取
+### P1-24c-2 · SUMMARY 抽取 ✅ 2026-11-16 已落地
+
+> 落地口径与原文的四处差异（均已回写 `06` 施工记录）：① **c-2 起 `POST /api/skill-drafts` 只收 `REVISION`**
+> —— CREATE 草稿只能由抽取端点生成（来源与消息范围必须服务端判定），「我的 Skills」原「新建本地草稿」入口随之下线；
+> ② `TRACE` 对**任何** Agent 都 400（管线属 c-3，不静默降级成 SUMMARY）；`includeArtifacts` 只做矩阵放行
+> （ChatBot 带 ⇒ 400，TaskAgent 带本版不阻断、产物候选属 c-3）；③ 抽取模型配置**单列一张平台单例表**
+> （`skill_extract_model_config`），没配时优先用会话当前模型、再回落标题模型，都没有 ⇒ 502 `EXTRACT_MODEL_UNAVAILABLE`；
+> ④ 消息选择态（多选）UI 未做，入口只有「最近一轮 / 整个会话」两档（`messageIds` 契约已备好）。
 
 范围：
 
-- 会话头部 / 消息选择入口；
+- 会话头部 / 消息选择入口（**2026-11-16 起由 c-4c 的 Agent 工具 + 提示卡替代**）；
 - `POST /api/conversations/:id/skills/extract`（仅 SUMMARY）；
 - 消息 + 工具元数据读取、服务端脱敏、抽取 prompt、zod 校验；
 - `kind=CREATE` 草稿 + 审核页接入抽取结果；
@@ -997,7 +1099,16 @@ POST /api/skills/:id/sync-upstream
 - ChatBot 绑定 `sandbox` 草稿被拒；
 - 保存失败不丢草稿。
 
-### P1-24c-3 · TRACE 与 TaskAgent 产物
+### P1-24c-3 · TRACE 与 TaskAgent 产物 ✅ 2026-11-16 已落地
+
+> 落地口径（已回写 `06` 施工记录）：
+> ① **勾选即 TRACE**：`includeToolOutputs` / `includeArtifacts` 任一为真 ⇒ `mode=TRACE`；ChatBot 三项都不渲染（服务端仍 400）；
+> ② **SUMMARY prompt 逐字不变**，TRACE 才追加 `SKILL_EXTRACT_TRACE_RULES`（`$SKILL_DIR/scripts/...` / cwd `/work` / 只读 / 只生成稳定命令的脚本）；
+> ③ **产物**：文本类（`text/*`、json、xml、yaml、csv）→ `assets/<相对路径>`；二进制 → `references/<名字>.md` 说明（不进包）；
+>    读失败（对象过期 / 已清理）⇒ 整次 502 `app.m314`，**不静默少带**；上限按件数计并写 warning；
+> ④ **命令与工作区变更**：从工具卡 `arguments` 里的 `command` / `cmd` 取（按行拆），从 `content.workspace_changes[]` 取变更；都只是 prompt 的「数据块」段；
+> ⑤ **脚本**：模型 `files[]` 只收 `scripts/` 与 `references/`，裸 `scripts/...` ⇒ `$SKILL_DIR/scripts/...`；带脚本 ⇒ **强制 `runtime=sandbox`**；bins 取「声明 ∪ shebang 推断」；
+> ⑥ 草稿文件写入复用 `/:draftId/files` 同一条路径（先 S3 后 JSON）。
 
 范围：
 
@@ -1011,16 +1122,32 @@ POST /api/skills/:id/sync-upstream
 
 验收：
 
-- 一次含 `bash` 的 TaskAgent 会话 → 生成 `sandbox` Skill → 容器内脚本可执行；
+- 一次含 `bash` 的 TaskAgent 会话 → 生成 `sandbox` Skill → 容器内脚本可执行（端到端留给用户手动 E2E）；
 - 不稳定的命令不生成脚本，只留命令参考；
 - 产物只在用户勾选后进入 `assets/`；
 - ChatBot 无法绑定该 Skill。
 
-### P1-24c-4 · 从会话纠正更新既有 Skill
+### P1-24c-4 · 从会话纠正更新既有 Skill ✅ 2026-11-16 已落地
+
+> 落地口径与原文的四处差异（均已回写 `06` 施工记录）：
+> ① **目标候选单列一条端点** `GET /api/conversations/:id/skill-targets`（最近加载优先 + 影响范围 + `canUpdate`）——
+>    §10.1 的"判断辅助"需要一个"本会话有哪些可更新对象"的数据源，塞进抽取响应里会让向导先抽一次才知道目标；
+> ② **"只改本会话的 Skill"只置灰并说明属 c-4b**（契约 `SESSION_OVERRIDE` 建草稿仍 400）；
+>    "另存为新的 Skill（fork）"在 c-5 之前只有话术与 `canUpdate=false`，没有真正的复制入口；
+> ③ **`scope` 是捕获窗口而非四选一作用域**：四选一（仅这一次 / 覆写 / 更新 Skill / 更新 Agent 提示词）在**前端**，
+>    服务端只有"捕获多少会话"（`CORRECTION` 默认 / `WHOLE`）与"更新谁"（`targetSkillId`）；
+> ④ **保存选项 ② 落成 `pinAgentId`**（`revisions/from-draft`）—— 只改已有绑定行的 `config.skillVersion`，
+>    合并写、失败回 `pinError`（与 `bindError` 同一条纪律）；
+> ⑤ **入口收敛到会话头部一枚按钮**（与「另存为 Skill」并列），不在每条助手消息 / 每张 Skill 工具卡上各挂一个：
+>    §10.2 的三处入口做出来会让同一个动作出现三份，而工具卡是**无会话上下文的纯展示组件**（要传 `conversationId`
+>    就得把回调穿过 `MessageList`）；"更新哪个 Skill"由 `skill-targets` 清单兜住（**最近加载优先**，默认预选），
+>    与"从这条消息上点"得到的目标一致。§10.2 的"非阻塞提示"同批不做（属增强，见 c-7）。
+>
+> **2026-11-16 交互修订（用户定案，取代上一条）**：固定按钮不再是主入口。新增/更新都改为「用户在对话里明确要求 → Agent 调工具 → `SkillDraftNotice` 提示卡 → 审核弹层」，落地批为 **P1-24c-4c**；现有 `SaveAsSkillButton` / `UpdateSkillButton` 属过渡入口，届时移除。理由：固定按钮把“要不要沉淀”的判断从对话里拿走了，而用户的真实意图是“这段流程不错 / 这个 Skill 该改”，Agent 才是能听懂这句话的一方；提示卡则与记忆提示同族，事件驱动、可关闭、不占常驻位置。
 
 范围：
 
-- 助手消息 / Skill 工具卡上的「将本次纠正更新到 Skill」；
+- ~~助手消息 / Skill 工具卡上的「将本次纠正更新到 Skill」~~ ⇒ **2026-11-16 改为 Agent 工具 `request_skill_revision` + `SkillDraftNotice`（P1-24c-4c）**；
 - 四选一作用域：仅这一次（零写入） / 只改本会话的 Skill（会话级覆写） / 更新 Skill（仅所属人） / 更新 Agent 提示词；
 - 目标 Skill 选择（最近加载优先）与 fork 路径（非所属人）；
 - 纠正窗口捕获（纠正消息 + 后续成功步骤，可选工具/命令/产物）；
@@ -1065,7 +1192,11 @@ POST /api/skills/:id/sync-upstream
 - `promote` 成功后新 Skill 出现在"我的 Skills"且 `parentSkillId` 指向上游；promote 失败时覆写**仍在**（不出现"两边都没有"）；
 - 会话删除 / 上游 Skill 删除 ⇒ 覆写行与 S3 前缀一并回收。
 
-### P1-24c-5 · Fork 与 fast-forward 同步
+### P1-24c-5 · Fork 与 fast-forward 同步 ✅ 2026-11-17 已落地
+
+> 落地口径：三条端点 + 会话覆写 `promote` 同批注册；「无本地改动」用内容判据（`SKILL.md` 只比正文、其余比 path+sha256），
+> fast-forward 后副本版本号 +1 仍可继续同步；有本地改动 / 基准或上游正文归档 ⇒ 409，不覆盖。
+> `SkillItem` 增 `parentName/parentAvailable/parentDeleted/parentLatestVersion`；本批**仍不实现 Proposal / THREE_WAY**。
 
 范围：
 
@@ -1085,7 +1216,7 @@ POST /api/skills/:id/sync-upstream
 - 原 Skill 删除后副本保留并显示“来源 Skill 已删除”；
 - 本批**不实现 Proposal**。
 
-### P1-24c-6 · Proposal 与三方合并
+### P1-24c-6 · Proposal 与三方合并 ✅ 2026-11-17 已落地
 
 范围：
 
@@ -1132,6 +1263,9 @@ POST /api/skills/:id/sync-upstream
 - 从会话纠正更新：只改相关步骤、生成 `vN+1`、旧版本保留；diff 由服务端从草稿计算；`fromVersion` 冲突返回 409；非所属人只能 fork；固定版本的 Agent 不自动升级；选择“仅这一次”时零写入。
 - 会话级覆写：B 改 A 的 Skill（含 `scripts/**`）→ 上游字节不变 → B 的下一轮生效；上游再更新时下一轮提示"覆写基于 vN，上游已到 vM"，默认保留覆写（`Skill能力.md` §5.16.4）。
 - 公开 Skill 合并：非所属人 fork 后提交 Proposal；所属人/ADMIN 接受后上游生成 `vN+1`，提交者不能自审自批；默认 `REQUIRE_BASE`，`baseVersion` 冲突不自动合并；`THREE_WAY` 无重叠才合并；上游 → fork 的同步有本地改动时走三方对比，不静默覆盖；Proposal 文件在草稿过期后仍可审。
+- 审核弹层：左文件树能看到「基准版本文件 ∪ 草稿新增/替换文件」，改动文件标「新增 / 修改」并可看行级 diff；未改动文件可正常查看且仍可替换 / 移除；`SKILL.md` 可直接编辑正文；未确认脱敏或缺变更说明时头部给出「去设置」入口，深链页与弹层看到的是同一份组件与同一份数据。
+- 提示卡只属于当前会话：切换会话后旧提示卡立即消失，新会话不会出现上一会话的弹层或卡片。
+- 零改动修订：正文与文件都未变化时明确返回 `SKILL_REVISION_NO_CHANGE` / 工具 `NO_CHANGE`，界面提示"没有产生改动"，不出现空 diff 草稿或版本号递增。
 
 ---
 
@@ -1139,7 +1273,7 @@ POST /api/skills/:id/sync-upstream
 
 | # | 事项 | 当前建议 |
 |---|---|---|
-| 1 | 抽取模型用哪个 | 默认独立 `skill_extract_model`；标题模型只作 fallback，不可用时报错 |
+| 1 | 抽取模型用哪个 | 默认独立 `skill_extract_model`；没配时优先用会话当前模型（工具=本轮模型；直连 API=智能体默认模型），再回落标题模型；都不可用时报错 |
 | 2 | 草稿是否持久化 | MVP Redis + S3 临时；`GET/PUT` 续期；需要跨设备再加表 |
 | 3 | 是否允许从他人共享会话生成 | 不允许；只允许会话所有者 |
 | 4 | 是否自动绑定当前 Agent | 不自动；显式勾选 |
@@ -1147,6 +1281,13 @@ POST /api/skills/:id/sync-upstream
 | 6 | 是否支持“整段会话” | 支持，但限制 token / 消息数，超出提示用户缩小范围 |
 | 7 | 是否保留原始会话引用 | 是，存 `sourceConversationId/messageIds`，不写进 SKILL.md |
 | 8 | Proposal 冲突默认策略 | `REQUIRE_BASE`（409，不自动三方合并）；`THREE_WAY` 必须显式带 resolutions |
+
+> **2026-11-17 实测补充（抽取稳定性，已落地）**：
+> - **超时分开**：抽取 / 修订是**非流式**调用，单独用 `SKILL_EXTRACT_TIMEOUT_MS`（默认 **120s**，覆盖"发请求 + 读 body"）；聊天的 `LLM_REQUEST_TIMEOUT_MS`（默认 60s）只管到响应头，不能复用。
+> - **关闭深度思考**：抽取 / 修订显式 `requestReasoning: false`；`llm/client.ts` 对已知默认开思考的 MiMo v2.5/v2.6、OpenCSG DeepSeek v4/Flash 下发 `thinking.type=disabled`。思考 token 与 JSON 共享 `max_tokens`，开启时极易 `finish_reason=length`。
+> - **输出预算与重试**：修订 `max_tokens=8000`；首次 `length` 截断时翻倍到 `16000` 重试一次。**不对解析失败做同 prompt 盲目重试**（`temperature:0` 下大概率同样输出）。
+> - **可诊断**：失败只记输出形状（`rawFinishReason` / `modelId` / `outputChars` / 首尾字符），不写模型原文；用户可见 `reason` 带真实上游原因（截断 300 字）。
+> - **零改动 ≠ 成功**：修订正文与文件都无变化 ⇒ 409 `SKILL_REVISION_NO_CHANGE`（`app.m331`）+ 工具状态 `NO_CHANGE`，不创建空 diff 草稿、不递增版本。
 
 ---
 

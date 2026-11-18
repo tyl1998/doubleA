@@ -35,6 +35,8 @@
  * 下一批接的是"谁来调它"，不是"它长什么样"。
  */
 
+import { mkdir } from 'node:fs/promises'
+
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
@@ -51,6 +53,7 @@ import {
 } from './queue.js'
 import { createSlotRegistry } from './registry.js'
 import { ensureSandboxNetwork, type SandboxNetwork } from './network.js'
+import { checkSandboxOutbound } from './outbound.js'
 import {
   buildSandboxContainerSpec,
   isNonRootImageUser,
@@ -58,6 +61,7 @@ import {
   readSandboxLabels,
   sandboxEgressEnv,
   sandboxProxyEnv,
+  sandboxSkillsEnv,
   workVolumeName,
   workspaceMediationEnv,
 } from './spec.js'
@@ -68,6 +72,8 @@ import { bindSandboxToken, revokeSandboxToken } from './token.js'
 import { clearSandboxMcpMap } from './mcpMap.js'
 import { clearSandboxOwner, ensureWorkspaceOwner, isSandboxStartupReady, registerSandboxOwner } from './owner.js'
 import { ensureWorkspace } from '../workspace/service.js'
+import { alignAgentOwnership } from '../workspace/store.js'
+import { skillRuntimeDirOf } from './skillSync.js'
 import { startWorkspaceWatcher } from '../workspace/watcher.js'
 
 /**
@@ -102,6 +108,14 @@ export interface SandboxHandle {
 export type SandboxAcquireFailure =
   /** 没配 `SANDBOX_IMAGE`（镜像还没建，或 .env 没填） */
   | 'NOT_CONFIGURED'
+  /**
+   * 出口①/② 的**基础设施容器**没在跑（egress / relay 退出、或没接上沙箱网）。
+   *
+   * 为什么单独一个码：它不是"配置缺了"，而是**本机基础设施掉了** —— 容器建起来也通讯不了
+   * （MCP 工具一个都注册不上、模型调用必失败），修法是 `pnpm egress:up` / `pnpm relay:up`
+   * 或页面上的「一键初始化」。与 `NOT_CONFIGURED` 分开是为了让日志/指标一眼看出是哪一类事故。
+   */
+  | 'OUTBOUND_UNAVAILABLE'
   /** 会话不存在 / 已结束（只读） */
   | 'CONVERSATION_NOT_FOUND'
   /**
@@ -252,6 +266,20 @@ export async function ensureSandbox(
   //   ⚠️ 返回值含明文 Key ⇒ **只往下传给 `buildSandboxContainerSpec`**，不 log（见 `llm.ts` 文件头）。
   const llm = await resolveSandboxLlm(conversation.agent.modelId, conversation.userId)
   if (!llm.ok) return fail(llm.code, llm.message)
+
+  // ★ 2026-11-16：出口预检 —— **容器建得起来 ≠ 它通讯得了**。egress / relay 是独立容器，
+  //   它们 Exited 时沙箱本身照样能启动，症状只在容器里：`mcp-bridge` 拉不到工具清单、
+  //   模型调用 fetch failed（看起来像应用代码坏了）。位置在"动容器之前"（复用也算），
+  //   与上面几条校验同一纪律：**必然失败的派活不该付建容器的成本**，也不该让用户等到
+  //   容器里的第一轮才发现。放在会话/模型校验之后，是为了让"用户输入错"优先报出来。
+  const outbound = await checkSandboxOutbound({
+    egressProxyUrl: proxyUrl,
+    backendUrl: config.sandbox.backendUrl,
+  })
+  if (!outbound.ok) {
+    getLogger().warn({ conversationId, reason: outbound.message }, '沙箱出口预检未通过 ⇒ 本轮不启动容器')
+    return fail('OUTBOUND_UNAVAILABLE', outbound.message)
+  }
 
   // ① 复用：账本说有 RUNNING 行 **且容器还在跑**（账本会撒谎，Docker 不会）。
   //    ★ P0-3-8 收紧：判据从"容器存在"改成"容器**在跑**"—— pi 是容器主进程 ⇒ 引擎退出 =
@@ -554,6 +582,19 @@ async function createSandbox(
      *   （目录缺失/为空时从 S3 按最新版本重建）⇒ 换机 / 宿主重建后的首轮派活前自动 rehydrate。
      */
     const { rootPath: workspacePath } = await ensureWorkspace(conversationId)
+    /**
+     * ★ P1-24b-1：Skill 宿主副本目录（`{SKILL_RUNTIME_ROOT}/{conversationId}`）。
+     *
+     * 三件事与工作区同款、缺一不可：
+     *   ① 目录**必须在 `buildSandboxContainerSpec` 之前建好**：Docker bind 不会替我们建源目录，
+     *      源不存在时它**静默**建一个 0600 的空目录（属主 root）⇒ 容器内 agent 读不到且不报错；
+     *   ② 属主对齐到 `SANDBOX_AGENT_UID`（10001）：后端以 root 跑时默认 0700/root，
+     *      容器里（uid 10001）连列表都读不出来；
+     *   ③ **内容同步不在这里**：容器起来之后由 `taskAgent.ts` 在派活前调 `syncConversationSkills`
+     *      （复用容器的路径也要走那一步 —— 宿主目录可能被 reaper 清过）。
+     *      这里只保证"目录存在且可读"，于是"新容器 + 空目录"是一致状态，不是异常。
+     */
+    const skillRootPath = await ensureSkillRuntimeDir(conversationId)
     // ★ P1-9 · P3：本会话是否开了 Code 模式 ⇒ 决定是否给容器注入 `DOUBULEA_WORKSPACE_MEDIATION=1`
     //   （pi 的 read/write/edit 走版本中介）。持久列，派活时读一次即可（容器即会话）。
     const conversationRow = await prisma.conversation.findUnique({
@@ -601,6 +642,8 @@ async function createSandbox(
         volumeName,
         // ★ P1-9：Code 模式工作区 = 宿主 bind mount（人与 agent 同字节）；见上方注释
         workspacePath,
+        // ★ P1-24b-1：Skill 宿主副本 → `$HOME/.skills`（只读，见 `spec.ts#SANDBOX_SKILLS_DIR`）
+        skillRootPath,
         startedAt,
         // ★ 模型 id 进标签（P0-3-4）：**复用前比对的唯一判据**（`ensureSandbox` 里那一段）。
         //   为什么不用 `sandboxes` 表存：表里的行是"账本"，而模型变更是**容器属性**的问题 ——
@@ -624,6 +667,8 @@ async function createSandbox(
           ...sandboxEgressEnv({ proxyUrl: runtime.proxyUrl, backendUrl: runtime.backendUrl }),
           ...llm.env,
           ...sandboxProxyEnv({ token, proxyTimeoutSec: config.sandbox.proxyTimeoutSec }),
+          // ★ P1-24b-2：把 Skill 挂载点告诉容器扩展（与服务端常量同源，见 `spec.ts#sandboxSkillsEnv`）
+          ...sandboxSkillsEnv(),
           // ★ P1-9 · P3：Code 模式才注入（普通会话一个都不加，扩展默认关闭）
           ...workspaceMediationEnv(codeMode),
           // ★ P1-9 · R11 修订：git 凭据 helper env（**不含秘密**；凭据运行期按需回调取回）
@@ -862,6 +907,23 @@ export interface SandboxStats {
   image: string | undefined
   /** 空闲回收阈值（分钟） */
   idleTtlMin: number
+}
+
+/**
+ * 确保一个会话的 Skill 宿主副本目录存在、且属主对齐到容器内 agent（P1-24b-1）。
+ *
+ * @returns 宿主**绝对路径**（`{SKILL_RUNTIME_ROOT}/{conversationId}`），交给 `buildSandboxContainerSpec`
+ *          作为第二条 bind mount 的 `Source`。
+ *
+ * ⚠️ **失败必须抛**（不能像 `alignAgentOwnership` 那样只 warn）：源目录建不出来时容器照样能起来，
+ *    只是 `$HOME/.skills` 是一个 Docker 静默建的 root:root 空目录 —— 症状是"Skill 绑了但模型看不见"，
+ *    且没有任何一条错误。宁可在这里让建容器失败（文案清楚）。
+ */
+export async function ensureSkillRuntimeDir(conversationId: string): Promise<string> {
+  const root = skillRuntimeDirOf(conversationId)
+  await mkdir(root, { recursive: true, mode: 0o755 })
+  await alignAgentOwnership(root)
+  return root
 }
 
 /** 取名额册快照（**不发起任何 IO** —— 它能被日志与探活安全地反复调用） */

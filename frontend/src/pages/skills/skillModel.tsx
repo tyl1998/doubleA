@@ -20,13 +20,20 @@ const RUNTIME_KEY: Readonly<Record<SkillRuntime, MessageKey>> = {
   SANDBOX: 'skillBadge.sandbox',
 }
 
-/** `skill.runtime` 徽标（列表 / 详情 / Agent 表单共用一份文案） */
-export function SkillBadge({ runtime }: { runtime: SkillRuntime }) {
+/** `skill.runtime` 徽标 + 「含脚本」徽标（列表 / 详情 / Agent 表单共用一份文案） */
+export function SkillBadge({ runtime, hasScripts = false }: { runtime: SkillRuntime; hasScripts?: boolean }) {
   const { t } = useT()
   return (
     <span className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
       <Tag className={runtime === 'SANDBOX' ? 'tag--warn' : undefined}>{t(RUNTIME_KEY[runtime])}</Tag>
+      {hasScripts && <Tag color="orange">{t('skillBadge.hasScripts')}</Tag>}
       {runtime === 'SANDBOX' && <span className="ratio">{t('skillBadge.sandboxHint')}</span>}
+      {runtime === 'INLINE' && !hasScripts && (
+        <span className="ratio">{t('skillBadge.inlineBindable')}</span>
+      )}
+      {runtime === 'INLINE' && hasScripts && (
+        <span className="ratio">{t('skillBadge.scriptTaskAgentOnly')}</span>
+      )}
     </span>
   )
 }
@@ -42,11 +49,15 @@ export function SkillBadge({ runtime }: { runtime: SkillRuntime }) {
  * 变成一件必须猜的事；置灰 + 一行原因能直接说清"要换成 TaskAgent"。
  */
 export function skillBindability(
-  skill: { runtime: SkillRuntime; createdBy: string },
+  skill: { runtime: SkillRuntime; createdBy: string; hasScripts?: boolean },
   context: { agentType: 'CHATBOT' | 'TASK_AGENT'; viewerId: string | undefined; viewerIsAdmin: boolean },
 ): { selectable: true } | { selectable: false; reasonKey: MessageKey } {
   if (context.agentType === 'CHATBOT' && skill.runtime === 'SANDBOX') {
     return { selectable: false, reasonKey: 'agentForm.skillChatbotSandbox' }
+  }
+  // 旧包可能把 vision.js 放在根目录：跨目录识别到脚本后，**新绑定**也不允许进 ChatBot
+  if (context.agentType === 'CHATBOT' && skill.hasScripts === true) {
+    return { selectable: false, reasonKey: 'agentForm.skillChatbotScripts' }
   }
   const mine = context.viewerId !== undefined && skill.createdBy === context.viewerId
   if (skill.runtime === 'SANDBOX' && !mine && !context.viewerIsAdmin) {
