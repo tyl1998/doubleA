@@ -89,6 +89,7 @@ export {
 
 // 事件总线（实时订阅 + 落库）
 export {
+  deliverBroadcastWorkspaceEvent,
   emitWorkspaceEvent,
   publishWorkspaceEventItem,
   resetWorkspaceEventBus,
@@ -98,6 +99,15 @@ export {
   workspaceEventSubscriberCount,
   type WorkspaceEventInput,
 } from './events.js'
+
+// 事件总线的**跨进程广播**（多实例；进程退出时 `index.ts` 统一停）
+export {
+  broadcastWorkspaceEvent,
+  ensureWorkspaceEventBroadcast,
+  releaseWorkspaceEventBroadcast,
+  stopWorkspaceEventBroadcast,
+  workspaceBroadcastSubscriptionCount,
+} from './broadcast.js'
 
 // 主动感知（P1-9 · P4 · R1）：USER 写事件 → 给运行中 agent 的插话文案（纯函数）
 export { workspaceEditSteerMessage } from './steerMessage.js'

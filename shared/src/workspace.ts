@@ -199,6 +199,16 @@ export type WorkspaceFileEntry = z.infer<typeof workspaceFileEntrySchema>
  */
 export const workspaceTreeResultSchema = z.object({
   items: z.array(workspaceFileEntrySchema),
+  /**
+   * **服务这次请求的实例 id**（2026-11-20，多机诊断用）。
+   *
+   * 为什么要它：工作区字节在本机盘、事件流也是本机的（+ Redis 广播），"前端看到的是哪一份工作区"
+   * 取决于粘性路由把它送到了哪台。多实例下排查"文件树不刷新"时，第一件要知道的事就是
+   * "树和 SSE 是不是同一台"—— 前端据它判断实例是否漂移，漂移了就重连事件流并重取树。
+   *
+   * ⚠️ 可缺：单实例 / 老客户端不依赖它（缺省 = 不判断漂移）。
+   */
+  servingInstanceId: z.string().optional(),
 })
 export type WorkspaceTreeResult = z.infer<typeof workspaceTreeResultSchema>
 

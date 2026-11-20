@@ -663,6 +663,24 @@ export function workspaceWriteRateKey(conversationId: string, windowStartMs: num
 export const WORKSPACE_WRITE_RATE_TTL_SEC = 120
 
 /**
+ * `workspace.events.redis:{conversationId}` —— 工作区事件的**跨进程广播**频道（2026-11-20）。
+ *
+ * 为什么需要：watcher 与事件总线都是**进程内**的（`workspace/watcher.ts` 文件头）。多实例下
+ * `/workspace*` 与 `/workspace/events` 虽然按 `sandbox:owner` 粘性（`shared#classifyRoute`），
+ * 但**粘性键过期 / 换机 / 容器由别处持有**时，SSE 会连到 A、watcher 跑在 B —— 只靠进程内 `Map`
+ * 就永远收不到事件（用户看到"agent 写完了文件树不刷新"）。
+ *
+ * 口径（**只做实时转发，不做持久**）：
+ *   · 落库仍由 `workspace/events.ts#emitWorkspaceEvent` 负责（`workspace_events` 表 + `headVersion`），
+ *     那是断线补发的唯一真相，广播不替代它；
+ *   · 频道名带会话 id ⇒ 一个实例只订阅**自己有订阅者的会话**（见 `workspace/broadcast.ts`）；
+ *   · 消息体 = `{instanceId, event}`：`instanceId` 用来**丢弃自己发的回声**（本进程已经直接通知过了）。
+ */
+export function workspaceEventsChannel(conversationId: string): string {
+  return `workspace.events.redis:${conversationId}`
+}
+
+/**
  * 新建会话并返回 `sid`。
  *
  * `sid` **由本函数生成**（而不是由调用方传入）：会话 ID 是安全令牌，

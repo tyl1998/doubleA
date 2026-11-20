@@ -16,10 +16,30 @@
  *
  * ⚠️ 订阅者抛错**只 warn**：一个 SSE 连接写失败不能让"这一写已经成功"这件事回滚
  * （事件已经落库，重连会补发）。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 跨进程：两条通道，**先本地、后广播**（2026-11-20）
+ * ─────────────────────────────────────────────────────────────────────
+ * 本文件是**本进程**的事件总线（`listeners`）。多实例下 watcher 与 SSE 可能不在同一台
+ * （粘性键过期 / 换机 / 容器由别处持有），故 {@link publishWorkspaceEventItem} 同时把事件发到
+ * Redis 频道（{@link workspaceEventsChannel}）：
+ *   · **本地先发**（同步、零延迟）—— 单实例 / 粘性命中时的行为与引入前逐字一致；
+ *   · **再异步广播**（尽力而为，失败只 debug）—— 别的实例收到后由 `workspace/broadcast.ts`
+ *     调 {@link deliverBroadcastWorkspaceEvent} 投进自己的 `listeners`；
+ *   · **回声去重**用的不是"广播里有没有我"：`emitWorkspaceEvent` 只把事件落到**本进程**一次，
+ *     广播消息**不回投本地**（订阅方负责按 `instanceId` 丢弃自己的回声）。
+ *
+ * ⚠️ 广播**不负责持久**：断线补发仍只认 `workspace_events` 表 + `headVersion`（见文件头与
+ *    `listWorkspaceEventsAfter`）。广播丢了（Redis 抖动）最坏是"这次没实时刷到"，重连仍能补齐。
  */
 
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
+import {
+  broadcastWorkspaceEvent,
+  ensureWorkspaceEventBroadcast,
+  releaseWorkspaceEventBroadcast,
+} from './broadcast.js'
 import type { WorkspaceActor, WorkspaceEventItem, WorkspaceEventType } from '@doubulea/shared'
 
 /** 发一条事件的输入（`version` 对 `claim`/`release` 留空） */
@@ -47,11 +67,17 @@ export function subscribeWorkspaceEvents(conversationId: string, listener: Works
     listeners.set(conversationId, set)
   }
   set.add(listener)
+  // 第一个订阅者到达 ⇒ 让广播订阅跟上这个会话（最后一个订阅者离开时退订，见下）
+  ensureWorkspaceEventBroadcast(conversationId)
   return () => {
     const current = listeners.get(conversationId)
     if (current === undefined) return
     current.delete(listener)
-    if (current.size === 0) listeners.delete(conversationId)
+    if (current.size === 0) {
+      listeners.delete(conversationId)
+      // 本进程已没人听这个会话 ⇒ 停掉广播订阅（不让 Redis 连接订阅一场空会话）
+      releaseWorkspaceEventBroadcast(conversationId)
+    }
   }
 }
 
@@ -113,8 +139,24 @@ export function workspaceEventCreateData(input: WorkspaceEventInput): {
   }
 }
 
-/** 通知实时订阅者（供"在别处事务里已落库"的调用方在事务提交后调用） */
+/**
+ * 通知实时订阅者（供"在别处事务里已落库"的调用方在事务提交后调用）。
+ *
+ * 两条通道，顺序是**正确性的一部分**（见文件头）：本地同步投递先行（调用方紧跟其后的
+ * `reloadChanges()` 之类的后续动作看到的就是"事件已经到订阅者手里"），广播随后异步进行。
+ */
 export function publishWorkspaceEventItem(conversationId: string, item: WorkspaceEventItem): void {
+  publish(conversationId, item)
+  // 尽力而为：广播失败只是"别的实例这一拍没刷到"，重连仍会按 `headVersion` 补齐
+  broadcastWorkspaceEvent(conversationId, item)
+}
+
+/**
+ * 把**从别的实例广播过来**的事件投进本进程的订阅者（`workspace/broadcast.ts` 的订阅回调调用它）。
+ *
+ * ⚠️ 不落库、不回广播，只投递 —— 否则会形成"A 广播 → B 投递 → B 再广播"的回声循环。
+ */
+export function deliverBroadcastWorkspaceEvent(conversationId: string, item: WorkspaceEventItem): void {
   publish(conversationId, item)
 }
 

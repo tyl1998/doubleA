@@ -53,6 +53,7 @@ import {
   reapOrphanWorkspaceDirs,
   startWorkspaceReaper,
   stopAllWorkspaceWatchers,
+  stopWorkspaceEventBroadcast,
   stopWorkspaceReaper,
 } from './workspace/index.js'
 
@@ -168,6 +169,9 @@ async function shutdown(reason: string, exitCode: number): Promise<void> {
     await stopWorkspaceReaper()
     // ★ P1-9：停掉工作区 watcher（进程内定时器）。放在关依赖之前 —— 它会读 PG。
     stopAllWorkspaceWatchers()
+    // ★ 2026-11-20：断开工作区事件的跨进程广播连接（独立 Redis 连接，`closeRedis()` 管不到它）。
+    //   放在 `closeRedis()` 之前 —— 它是一条**自己收尾**的连接（见 `workspace/broadcast.ts` 文件头）。
+    await stopWorkspaceEventBroadcast()
     // ★ P1-9 · R3：退出前把还在去抖窗口里的**工作区冷备上行**排空（尽力，失败只 warn）——
     //   否则刚写完就重启会丢掉"最后一跳"的 S3 冷备。放在关依赖之前（它要用 S3/PG）。
     await flushWorkspaceColdBackups().catch((error: unknown) => {

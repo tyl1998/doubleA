@@ -214,6 +214,17 @@ export async function ensureWorkspace(conversationId: string): Promise<Workspace
   await ensureWorkspaceOwner(conversationId).catch((error: unknown) => {
     getLogger().warn({ err: error, conversationId }, '工作区钉机记录写入失败（多机下路由可能不粘性；单机无影响）')
   })
+  // ★ 2026-11-20（用户反馈「agent 生成的文件工作区没刷新」）：watcher 以前**只在建/复用容器时**启动
+  //   （`sandbox/manager.ts#ensureSandbox`）—— 若本进程不是建容器的那台（换机 / 多实例 / 容器由别处持有），
+  //   它永远不会起 watcher，于是 `bash`/宿主写出来的文件既不进索引、也不发事件，前端静默不刷新。
+  //   这里补成"**工作区首次被触达就在本进程起 watcher**"：`ensureWorkspace` 是树/读/写/SSE/冷备恢复的
+  //   公共入口 ⇒ 覆盖全部读路径。幂等（`startWorkspaceWatcher` 自带去重），失败只 warn。
+  //   ⚠️ 判据在 `watcher.ts`；用**动态 import** 是因为 `watcher.ts` 已静态依赖本文件（反向静态 import 会成环）。
+  void import('./watcher.js')
+    .then(({ startWorkspaceWatcher }) => startWorkspaceWatcher(conversationId))
+    .catch((error: unknown) => {
+      getLogger().warn({ err: error, conversationId }, '工作区 watcher 启动失败（未中介写不会被对账）')
+    })
   return { conversationId, rootPath }
 }
 

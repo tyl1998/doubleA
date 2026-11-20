@@ -15,6 +15,15 @@
  *
  * ⚠️ 多机下 watcher 是**进程内**的（只装在持有该工作区的那台）⇒ 工作区 SSE 路由必须粘性
  * （§十六 A）。本文件只负责"发现变化并落事件"，不负责推送。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * 谁负责启动（2026-11-20 修订）
+ * ─────────────────────────────────────────────────────────────────────
+ * 现在是**两处**：① `sandbox/manager.ts#ensureSandbox`（建/复用容器，老口径）；
+ * ② `workspace/service.ts#ensureWorkspace`（工作区首次被触达，**新的兜底口径**）。
+ * 只有 ① 是不够的：本进程若不是"建容器的那台"（换机 / 多实例 / 容器由别处持有），
+ * watcher 永远不起 ⇒ `bash` / 宿主写出来的文件不进索引、不发事件，前端静默不刷新。
+ * ② 覆盖树/读/写/SSE/冷备恢复全部读路径，与容器寿命无关。两处都是幂等的。
  */
 
 import { getLogger } from '../infra/logger.js'
@@ -97,8 +106,11 @@ export function workspaceWatcherCount(): number {
 }
 
 /**
- * 开始监听一个会话的工作区（幂等）。第一次触达工作区（查看/编辑/派活）时调用。
+ * 开始监听一个会话的工作区（幂等）。**任何一次工作区触达**都可能启动它（见文件头"谁负责启动"）。
  * 定时器 `unref()`：它不该拖着进程不退出（同 reaper 的纪律）。
+ *
+ * ★ 2026-11-20：注册时就**立刻对账一次**（不等到 1s 后的第一跳）—— 触达之前 agent/宿主写下的
+ *   文件本来就是"未被索引的存量"，等一拍只是白白延后用户看到它。
  */
 export function startWorkspaceWatcher(conversationId: string): void {
   if (timers.has(conversationId)) return
@@ -109,6 +121,9 @@ export function startWorkspaceWatcher(conversationId: string): void {
   }, WORKSPACE_WATCH_POLL_MS)
   timer.unref?.()
   timers.set(conversationId, timer)
+  void reconcileWorkspaceOnce(conversationId).catch((error: unknown) => {
+    getLogger().warn({ err: error, conversationId }, '工作区首次对账失败（下一轮重试）')
+  })
 }
 
 /** 停止监听一个会话（会话结束 / 进程收尾） */

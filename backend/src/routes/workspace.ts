@@ -104,14 +104,19 @@ function userAuthor(userId: string): { actor: 'USER'; actorId: string } {
 }
 
 export function registerWorkspaceRoutes(app: FastifyInstance): void {
-  /** 文件树（DB 索引查询） */
+  /**
+   * 文件树（DB 索引查询）。
+   *
+   * ★ 2026-11-20：响应带 `servingInstanceId`（服务本次请求的实例）—— 多实例下前端据此判断
+   *   "树与事件流是不是同一台"，漂移了就重连事件流 + 重取树（见 `shared#workspaceTreeResultSchema`）。
+   */
   app.get<{ Params: ConversationIdParams }>(
     '/api/conversations/:id/workspace',
     { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema } },
     async (request) => {
       const userId = userIdOf(request)
       await assertWorkspaceOwner(request.params.id, userId)
-      return ok(await listWorkspaceFiles(request.params.id))
+      return ok({ ...(await listWorkspaceFiles(request.params.id)), servingInstanceId: config.sandbox.instanceId })
     },
   )
 

@@ -879,6 +879,30 @@ export function WorkspacePanel({
    */
   const readyRef = useRef(true)
   readyRef.current = workspaceReady
+  /**
+   * **实例漂移**探测器（2026-11-20，多机）：文件树响应带回 `servingInstanceId`。
+   *
+   * 为什么要它：工作区字节在本机盘、事件流也是本机的（外加 Redis 广播），粘性键过期 / 换机后
+   * 树会由 B 服务、SSE 还挂在 A 上 —— 用户看到的是"agent 写完了，树不刷新"且**没有任何报错**。
+   * 这里把"上一次树是哪台给的"记下来，变了就让 SSE 重连（并重取树），让两者重新对齐到同一台。
+   *
+   * ⚠️ 计数型 `streamEpoch` 而不是把实例 id 放进 SSE effect 的依赖：那个 effect 的重连会**丢掉
+   *    断开那一下的实时事件**，所以只在真正漂移时才重连一次。
+   */
+  const servingInstanceId = treeQuery.data?.servingInstanceId
+  const lastServingInstanceRef = useRef<string | null>(null)
+  const [streamEpoch, setStreamEpoch] = useState(0)
+  useEffect(() => {
+    if (servingInstanceId === undefined) return
+    const previous = lastServingInstanceRef.current
+    lastServingInstanceRef.current = servingInstanceId
+    // 首次拿到 / 没变 ⇒ 不动（首次挂载时 SSE 本来就要连）
+    if (previous === null || previous === servingInstanceId) return
+    void queryClient.invalidateQueries({ queryKey: workspaceTreeQueryKey(conversationId) })
+    void queryClient.invalidateQueries({ queryKey: workspaceGitQueryKey(conversationId) })
+    reloadChangesRef.current()
+    setStreamEpoch((value) => value + 1)
+  }, [servingInstanceId, conversationId, queryClient])
   useEffect(() => {
     if (!codeMode) return
     const controller = new AbortController()
@@ -920,8 +944,8 @@ export function WorkspacePanel({
       onIssue: () => undefined,
     }).catch(() => undefined)
     return () => controller.abort()
-    // 只在会话 / 开关变化时重连（`fileQuery.refetch` / `closeFile` / `expandDirs` / `readyRef` 通过 ref 与稳定引用）
-  }, [conversationId, codeMode, queryClient, closeFile, expandDirs])
+    // 只在会话 / 开关 / **实例漂移**时重连（`fileQuery.refetch` / `closeFile` / `expandDirs` / `readyRef` 通过 ref 与稳定引用）
+  }, [conversationId, codeMode, queryClient, closeFile, expandDirs, streamEpoch])
 
   // ── ⌘S / Ctrl+S：编辑器聚焦时由 CodeMirror 拦截；焦点在别处（文件树 / 标签）时由这里兜底保存 ──
   const saveActiveRef = useRef<() => void>(() => undefined)
