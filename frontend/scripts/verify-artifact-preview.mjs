@@ -120,6 +120,8 @@ const {
   ARTIFACT_PREVIEW_CSV_CELL_CHARS,
   artifactContentUrl,
   artifactDownloadUrl,
+  artifactExtendUrl,
+  artifactOutlineUrl,
   artifactRenderUrl,
   csvDelimiterOf,
   decodeUtf8Text,
@@ -376,9 +378,12 @@ await it('E1 路径里带上 artifactId，且**没有** query', () => {
   assertEqual(artifactContentUrl('a1'), '/api/artifacts/a1/content', 'content')
   assertEqual(artifactDownloadUrl('a1'), '/api/artifacts/a1/download', 'download')
   assertEqual(artifactRenderUrl('a1'), '/api/artifacts/a1/render', 'render（DOCX 渲染出口）')
+  assertEqual(artifactOutlineUrl('a1'), '/api/artifacts/a1/outline', 'outline（XMIND 大纲出口）')
+  assertEqual(artifactExtendUrl('a1'), '/api/artifacts/a1/extend', 'extend（产物延期）')
   assert(!artifactContentUrl('a1').includes('?'), '预览 URL 不带 query')
   assert(!artifactDownloadUrl('a1').includes('?'), '下载 URL 不带 query')
   assert(!artifactRenderUrl('a1').includes('?'), '渲染 URL 不带 query')
+  assert(!artifactOutlineUrl('a1').includes('?'), '大纲 URL 不带 query')
 })
 
 await it('E2 id 走 `encodeURIComponent`（产物 id 是 uuid，但拼串那处不该信任输入形态）', () => {

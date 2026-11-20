@@ -42,6 +42,7 @@ import {
   artifactContentUrl,
   artifactDeleteUrl,
   artifactDownloadUrl,
+  artifactExtendUrl,
   artifactOutlineUrl,
   artifactsCollectionUrl,
   decodeUtf8Text,
@@ -176,7 +177,7 @@ export function deleteArtifacts(artifactIds: string[]): Promise<BatchDeleteArtif
  * 服务端不猜时区。
  */
 export function extendArtifact(artifactId: string, body: ArtifactExtendBody): Promise<ArtifactListItem> {
-  return request<ArtifactListItem>(`/api/artifacts/${encodeURIComponent(artifactId)}/extend`, {
+  return request<ArtifactListItem>(artifactExtendUrl(artifactId), {
     method: 'POST',
     body,
   })

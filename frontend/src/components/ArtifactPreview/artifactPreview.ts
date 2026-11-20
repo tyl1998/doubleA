@@ -95,6 +95,16 @@ export function artifactsCollectionUrl(offset: number, limit: number): string {
 }
 
 /**
+ * 产物延期（`POST /api/artifacts/:id/extend`，2026-10-29）。
+ *
+ * ⚠️ 与其它 URL Builder 同处本文件：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
+ * 只出现在**这一个文件**（否则就有第二处会各自演化）。
+ */
+export function artifactExtendUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}/extend`
+}
+
+/**
  * 删除产物（`DELETE /api/artifacts/:id`，**会话产物列表的删除动作**）。
  *
  * ⚠️ 与上面两个 URL 同处一个文件：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
