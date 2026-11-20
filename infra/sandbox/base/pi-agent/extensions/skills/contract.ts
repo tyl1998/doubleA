@@ -35,13 +35,16 @@ export const SKILL_READ_FILE_TOOL_NAME = 'read_skill_file'
 export const SKILL_REQUEST_DRAFT_TOOL_NAME = 'request_skill_draft'
 export const SKILL_REQUEST_REVISION_TOOL_NAME = 'request_skill_revision'
 export const SKILL_REVISE_DRAFT_TOOL_NAME = 'revise_skill_draft'
+/** TaskAgent 专用：从工作区目录 / zip 导入（`shared#SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME`） */
+export const SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME = 'request_skill_from_workspace'
 
 /** 草稿入口工具（需要代理回后端；只读工具在容器内本地读） */
 export function isSkillRequestToolName(name: string): boolean {
   return (
     name === SKILL_REQUEST_DRAFT_TOOL_NAME ||
     name === SKILL_REQUEST_REVISION_TOOL_NAME ||
-    name === SKILL_REVISE_DRAFT_TOOL_NAME
+    name === SKILL_REVISE_DRAFT_TOOL_NAME ||
+    name === SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME
   )
 }
 

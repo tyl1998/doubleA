@@ -1249,10 +1249,19 @@ function ReviewFilePane({
 
   const beforeText = isEntry ? (isTargeted ? baseMarkdown : '') : file.inBase ? (baseQuery.data ?? null) : ''
   const afterText = isEntry ? markdown : file.inDraft ? (draftQuery.data ?? null) : (baseQuery.data ?? null)
+  /**
+   * ⚠️ 只统计**真正启用的**那条查询：`useQuery({ enabled: false })` 在 React Query v5 里
+   * 仍是 `status: 'pending'`（`isPending` 为 `true`）。草稿里**新增**的文件（`inBase === false`）
+   * 根本不会发基准查询，若照旧 OR 上 `baseQuery.isPending`，"内容 / 对比"会永远停在
+   * 「读取文件…」—— 只有「编辑」栏能看到已取回的正文（用户反馈 2026-11-20：
+   * 草稿里 `references/*.md` 内容看不到，只有编辑可以）。
+   */
   const loading = isEntry
     ? baseLoading
-    : baseQuery.isPending || (file.inDraft && draftQuery.isPending)
-  const failed = isEntry ? baseFailed : baseQuery.isError || draftQuery.isError
+    : (file.inBase && baseQuery.isPending) || (file.inDraft && draftQuery.isPending)
+  const failed = isEntry
+    ? baseFailed
+    : (file.inBase && baseQuery.isError) || (file.inDraft && draftQuery.isError)
   const binary = !isEntry && (!file.previewable || file.purged)
   const afterEditableText = editableTextFile ? (textDraft ?? afterText ?? '') : ''
 

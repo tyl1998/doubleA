@@ -313,8 +313,23 @@ export function XmindOutlinePreview({ outline, error = null }: XmindOutlinePrevi
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
-          <Button size="small" type="text" onClick={() => setExpanded(tops)}>
-            {t('xmind.collapseAll')}
+          <Button
+            size="small"
+            type="text"
+            aria-label={expanded.length > tops.length ? t('xmind.collapseAll') : t('xmind.expandAll')}
+            onClick={() => {
+              const openAll = expanded.length > tops.length
+              setExpanded(openAll ? tops : Array.from(rows.keys()))
+              // 摊开后左栏会横向溢出（缩进 + 长标题）：把横向滚动复位到最左，
+              // 否则上一次的横向位移会让整列文字被推到右边、左侧留一片空白（2026-11-20 反馈）。
+              if (openAll) return
+              const treeBox = treeRef.current as unknown as {
+                scrollTo?: (config: { x?: number; y?: number }) => void
+              } | null
+              window.requestAnimationFrame(() => treeBox?.scrollTo?.({ x: 0 }))
+            }}
+          >
+            {expanded.length > tops.length ? t('xmind.collapseAll') : t('xmind.expandAll')}
           </Button>
         </div>
 

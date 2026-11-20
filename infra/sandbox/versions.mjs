@@ -122,8 +122,13 @@ export const RUNTIME_IMAGE_NAME = 'doubulea/sandbox-runtime'
  * `Cannot access 'skillsDir' before initialization`，pi 进程当场退出（症状是每次派活都以
  * `UPSTREAM_ERROR · 沙箱引擎已退出` 收尾，而容器本身建得好好的）。
  * 不 +1 的症状：宿主上是旧的 base:9 ⇒ 同样的报错原样复现。
+ *
+ * ⚠️ **2026-11-20 起为 `11`**：`extensions/skills/contract.ts` 新增
+ * `request_skill_from_workspace`（TaskAgent 从工作区目录 / zip 导入 CREATE 草稿）。
+ * 它是**代理回后端**的入口工具，容器侧 `isSkillRequestToolName` 必须认识它；不 +1 的症状：
+ * manifest 里下发了该工具，容器扩展却按"只读工具"去读本地文件 ⇒ 工具一调就报错。
  */
-export const BASE_LAYER_VERSION = '10'
+export const BASE_LAYER_VERSION = '11'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -165,8 +170,12 @@ export const BASE_LAYER_VERSION = '10'
  *
  * ⚠️ **2026-11-19 起为 `13`**：同"base 变了就换 tag"那条 —— base 升到 `10`（修 skills 扩展的
  * TDZ 启动失败），toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-9 的那一份。
+ *
+ * ⚠️ **2026-11-20 起为 `14`**：同"base 变了就换 tag"那条 —— base 升到 `11`（skills 扩展新增
+ * `request_skill_from_workspace` 代理入口），toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE`
+ * 仍指向基于 base-10 的那一份（工具不会被注册）。
  */
-export const TOOLKIT_LAYER_VERSION = '13'
+export const TOOLKIT_LAYER_VERSION = '14'
 
 /**
  * 运行时层内容版本（P1-17a；加/换一个语言运行时、或改 runtime Dockerfile 时 +1）

@@ -54,6 +54,7 @@ import {
   SKILL_LIST_TOOL_NAME,
   SKILL_LOAD_TOOL_NAME,
   SKILL_REQUEST_DRAFT_TOOL_NAME,
+  SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
   SKILL_REQUEST_REVISION_TOOL_NAME,
   SKILL_REVISE_DRAFT_TOOL_NAME,
   SKILL_MANIFEST_FILE,
@@ -320,6 +321,7 @@ function desired(
         SKILL_REQUEST_DRAFT_TOOL_NAME,
         SKILL_REQUEST_REVISION_TOOL_NAME,
         SKILL_REVISE_DRAFT_TOOL_NAME,
+        SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
       ]),
   )
   check('没有 manifest ⇒ 空集合', JSON.stringify(skillToolSetOf(null)) === '[]')
@@ -331,6 +333,7 @@ function desired(
     SKILL_REQUEST_DRAFT_TOOL_NAME,
     SKILL_REQUEST_REVISION_TOOL_NAME,
     SKILL_REVISE_DRAFT_TOOL_NAME,
+    SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
   ]
   check('0→N（首次绑定）⇒ 要刷新', needsSkillsRefresh(null, three))
   check('0→0（没绑 Skill）⇒ 不刷新（一个字节都不注入）', !needsSkillsRefresh(null, []))
@@ -463,6 +466,7 @@ const contractModule = (await import(`${extensionDir}/contract.ts`)) as {
         SKILL_REQUEST_DRAFT_TOOL_NAME,
         SKILL_REQUEST_REVISION_TOOL_NAME,
         SKILL_REVISE_DRAFT_TOOL_NAME,
+        SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
       ].join(','),
   )
 }

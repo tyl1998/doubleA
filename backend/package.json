@@ -34,6 +34,8 @@
     "skill-extract:regression": "node --import tsx scripts/skill-extract-regression.ts",
     "skill-revision:regression": "node --import tsx scripts/skill-revision-regression.ts",
     "skill-notice:regression": "node --import tsx scripts/skill-notice-regression.ts",
+    "skill-workspace:regression": "node --import tsx scripts/skill-workspace-regression.ts",
+    "node-bootstrap:regression": "node --import tsx scripts/node-bootstrap-regression.ts",
     "skill-override:regression": "node --import tsx scripts/skill-override-regression.ts",
     "skill-fork:regression": "node --import tsx scripts/skill-fork-regression.ts",
     "skill-proposal:regression": "node --import tsx scripts/skill-proposal-regression.ts",

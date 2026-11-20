@@ -29,6 +29,7 @@ import {
   SKILL_EXTRACT_MAX_MESSAGES,
   isSkillRequestToolName,
   requestSkillDraftArgsSchema,
+  requestSkillFromWorkspaceArgsSchema,
   requestSkillRevisionArgsSchema,
   reviseSkillDraftArgsSchema,
   skillCorrectionTurnRange,
@@ -52,6 +53,7 @@ import {
   listSkillRevisionTargets,
 } from '../services/skillRevision.service.js'
 import { pushSkillDraftNotice } from '../services/skillDraftNotice.service.js'
+import { createSkillDraftFromWorkspace } from '../services/skillWorkspaceDraft.service.js'
 import type { SkillViewer } from '../services/skill.service.js'
 
 /** 日志上下文（只用于 warn，不影响结果） */
@@ -403,6 +405,90 @@ async function runRequestSkillRevision(input: {
   }
 }
 
+/**
+ * 工作区导入的失败分类：路径 / 包 / 草稿形状问题都属于"模型可以换个 path 再试"，
+ * 回 `INVALID`；其余（DB / S3 / FS 异常）回 `FAILED`。
+ */
+function workspaceErrorStatusOf(error: unknown): 'INVALID' | 'FAILED' {
+  if (error instanceof AppError) {
+    const code = skillErrorCodeOf(error.data)
+    if (code === SKILL_ERROR_CODES.IMPORT_INVALID || code === SKILL_ERROR_CODES.DRAFT_INVALID) return 'INVALID'
+    if (error.code === 'VALIDATION' || error.code === 'NOT_FOUND' || error.code === 'FORBIDDEN') return 'INVALID'
+  }
+  return 'FAILED'
+}
+
+/** `request_skill_from_workspace`：TaskAgent 从工作区目录 / zip 生成 CREATE 草稿 */
+async function runRequestSkillFromWorkspace(input: {
+  conversationId: string
+  agentId: string
+  viewer: SkillViewer
+  arguments: string
+  log: SkillDraftToolLogContext
+}): Promise<SkillDraftToolResult> {
+  const parsed = parseToolArguments(input.arguments)
+  if (!parsed.ok) return resultOf({ status: 'INVALID', reason: `参数不是合法 JSON：${parsed.reason}` })
+  const args = requestSkillFromWorkspaceArgsSchema.safeParse(parsed.value)
+  if (!args.success) return resultOf({ status: 'INVALID', reason: issueOf(args.error) })
+
+  const agent = await getPrisma().agent.findUnique({
+    where: { id: input.agentId },
+    select: { type: true },
+  })
+  if (agent === null || agent.type !== 'TASK_AGENT') {
+    return resultOf({
+      status: 'INVALID',
+      kind: 'CREATE',
+      reason: 'request_skill_from_workspace 只支持任务型智能体（TaskAgent）；ChatBot 没有工作区，请用 request_skill_draft。',
+    })
+  }
+
+  try {
+    const created = await createSkillDraftFromWorkspace({
+      conversationId: input.conversationId,
+      path: args.data.path,
+      ...(args.data.titleHint === undefined ? {} : { titleHint: args.data.titleHint }),
+      viewer: input.viewer,
+    })
+    const changeSummary = `已从工作区 ${args.data.path} 生成草稿（${String(created.fileCount)} 个附加文件，运行时 ${created.runtime.toLowerCase()}）`
+    await noticeOfDraft({
+      conversationId: input.conversationId,
+      kind: 'CREATE',
+      draftId: created.draftId,
+      targetSkillId: null,
+      targetName: null,
+      fromVersion: null,
+      toVersion: null,
+      changeSummary,
+      risks: [],
+    })
+    getLogger().info(
+      {
+        conversationId: input.conversationId,
+        draftId: created.draftId,
+        path: args.data.path,
+        runtime: created.runtime,
+        fileCount: created.fileCount,
+      },
+      'Agent 工具已从工作区生成 Skill 新建草稿',
+    )
+    return resultOf({
+      status: 'DRAFT_CREATED',
+      kind: 'CREATE',
+      draftId: created.draftId,
+      changeSummary,
+      risks: [],
+    })
+  } catch (error) {
+    const status = workspaceErrorStatusOf(error)
+    getLogger().warn(
+      { err: error, conversationId: input.conversationId, agentId: input.agentId, path: args.data.path },
+      'request_skill_from_workspace 失败',
+    )
+    return resultOf({ status, kind: 'CREATE', reason: reasonOf(error) })
+  }
+}
+
 /** `revise_skill_draft`：按用户意见修改同一份草稿 */
 async function runReviseSkillDraft(input: {
   conversationId: string
@@ -460,6 +546,32 @@ async function runReviseSkillDraft(input: {
   }
 }
 
+/** 按工具名分流（新增入口工具时只改这一处） */
+async function runSkillDraftTool(
+  name: SkillRequestToolName,
+  input: {
+    conversationId: string
+    agentId: string
+    viewer: SkillViewer
+    arguments: string
+    log: SkillDraftToolLogContext
+    chatTarget?: LlmTarget
+  },
+): Promise<SkillDraftToolResult> {
+  switch (name) {
+    case 'request_skill_draft':
+      return await runRequestSkillDraft(input)
+    case 'request_skill_revision':
+      return await runRequestSkillRevision(input)
+    case 'request_skill_from_workspace':
+      return await runRequestSkillFromWorkspace(input)
+    case 'revise_skill_draft':
+      return await runReviseSkillDraft(input)
+    default:
+      return resultOf({ status: 'INVALID', reason: `不支持的 Skill 草稿工具：${name}` })
+  }
+}
+
 /**
  * 执行一次草稿入口工具（**恒不抛**：失败也是 `isError:true` + 结构化结果）。
  *
@@ -480,12 +592,7 @@ export async function executeSkillDraftTool(input: {
 }): Promise<SkillDraftToolOutcome> {
   const log = input.log ?? { conversationId: input.conversationId, agentId: input.agentId }
   try {
-    const result =
-      input.name === 'request_skill_draft'
-        ? await runRequestSkillDraft({ ...input, log })
-        : input.name === 'request_skill_revision'
-          ? await runRequestSkillRevision({ ...input, log })
-          : await runReviseSkillDraft({ ...input, log })
+    const result = await runSkillDraftTool(input.name, { ...input, log })
     return {
       // `FOREIGN` / `TARGET_NOT_FOUND` 是**工具正常给出的结论**（权限拒绝 / 目标不合法），
       // 不是调用失败。把它们算成 ERROR 会让同一轮的 `failedToolNamesOf` 冒出"本轮有工具调用

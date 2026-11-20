@@ -36,6 +36,29 @@ Without confirmation, do not: install new dependencies or global CLIs, add tempo
 - Do not proactively run full regressions / end-to-end tests (user decision: manual E2E).
 - Commit only when the user explicitly asks.
 
+## Sandbox layer version bump = `versions.mjs` + `infra/.env` in the same batch
+
+`infra/sandbox/versions.mjs` is the source of truth for the sandbox layer tags, but the running
+stack reads `SANDBOX_IMAGE` / `SANDBOX_IMAGE_BASE` from `infra/.env` **at startup**. Bumping
+`BASE_LAYER_VERSION` / `TOOLKIT_LAYER_VERSION` (or a runtime layer) is **not complete** until the
+pinned tags are updated too:
+
+1. Rebuild: `pnpm sandbox:build` (`--toolkit-only` when only toolkit changed; rebuild the
+   `--runtime` variants when their layer changed — old `*-v<n>` images are never auto-rebuilt).
+2. Update `infra/.env` to the two refs the build prints: `SANDBOX_IMAGE_BASE=...` and
+   `SANDBOX_IMAGE=...`. This file is gitignored, so it never shows up in `git diff` — check it
+   explicitly after every bump.
+3. Restart the backend afterwards; env is a startup snapshot, so until then it keeps using the old tag.
+4. Sweep remaining pins of the old tag (`rg 'sandbox-(base|toolkit):<old>'`): the image table in
+   `docs/README-工程手册.md`, `deploy/env/deploy.env.example`, and the fallback defaults in
+   `deploy/scripts/_lib.sh` / `deploy/scripts/up.sh`.
+
+Why this is mandatory: one-click init compares the `SANDBOX_IMAGE` tag with `versions.mjs`. On
+mismatch it prepares the expected image but still marks the `toolkitImage` step and the whole job
+`failed` — the drift branch in `backend/src/sandbox/nodeBootstrap.ts` always returns `ok:false`,
+because preparation alone does not make the configured (old) image ready. A successful build
+therefore looks like a failed init until env + restart are done.
+
 ## i18n — every new string is a key, never a literal (P1-23)
 
 The platform ships zh + en. **Any user-visible text added or changed by a batch must go through i18n in the same batch** — it is not a "later cleanup" step.

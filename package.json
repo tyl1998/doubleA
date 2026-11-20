@@ -61,6 +61,8 @@
     "skill-override:regression": "pnpm --filter @doubulea/backend skill-override:regression",
     "skill-fork:regression": "pnpm --filter @doubulea/backend skill-fork:regression",
     "skill-proposal:regression": "pnpm --filter @doubulea/backend skill-proposal:regression",
+    "skill-workspace:regression": "pnpm --filter @doubulea/backend skill-workspace:regression",
+    "node-bootstrap:regression": "pnpm --filter @doubulea/backend node-bootstrap:regression",
     "xlsx:regression": "pnpm --filter @doubulea/backend xlsx:regression",
     "timezone:regression": "pnpm --filter @doubulea/backend timezone:regression",
     "router:start": "pnpm --filter @doubulea/backend router:start",

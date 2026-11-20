@@ -6,7 +6,7 @@
  *      （⚠️ 改过 `shared/src` 要先 `pnpm build:shared`；本档 import 的是构建产物）
  *
  * 守的是这几条：
- *  ① 三个入口工具的参数只收"意图 / 目标 / 捕获范围"，**不收 messageIds / markdown / patch**；
+ *  ① 入口工具的参数只收"意图 / 目标 / 捕获范围 / 工作区路径"，**不收 messageIds / markdown / patch**；
  *  ② manifest / OpenAI 下发共用同一份工具名与参数表（含 `revise_skill_draft` 的 required）；
  *  ③ 提示卡契约：kind / actions / draftId 可空 / 能力位；`GET` 结果与 `POST` 动作形状；
  *  ④ 接线（源码断言）：ChatBot 下发入口工具、builtin/call 代理、会话路由两条、前端提示卡/弹层；
@@ -20,14 +20,17 @@ import { fileURLToPath } from 'node:url'
 
 import {
   SKILL_ANY_TOOL_NAMES,
+  SKILL_CHATBOT_REQUEST_TOOL_NAMES,
   SKILL_DRAFT_NOTICE_ACTIONS,
   SKILL_DRAFT_TOOL_STATUSES,
+  SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
   SKILL_REVISE_DRAFT_TOOL_NAME,
   SKILL_REQUEST_DRAFT_TOOL_NAME,
   SKILL_REQUEST_REVISION_TOOL_NAME,
   buildSkillManifestTools,
   buildSkillOpenAiTools,
   requestSkillDraftArgsSchema,
+  requestSkillFromWorkspaceArgsSchema,
   requestSkillRevisionArgsSchema,
   reviseSkillDraftArgsSchema,
   skillDraftNoticeActionBodySchema,
@@ -56,8 +59,15 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../..')
 
 console.log('\n① 工具参数契约')
 {
-  check('入口工具名单 = 3 个', SKILL_ANY_TOOL_NAMES.slice(-3).join(',') ===
+  check('ChatBot 入口工具名单 = 3 个（不含工作区导入）', SKILL_CHATBOT_REQUEST_TOOL_NAMES.join(',') ===
     [SKILL_REQUEST_DRAFT_TOOL_NAME, SKILL_REQUEST_REVISION_TOOL_NAME, SKILL_REVISE_DRAFT_TOOL_NAME].join(','))
+  check('容器 manifest 入口工具名单 = 4 个（多一个 TaskAgent 工作区导入）', SKILL_ANY_TOOL_NAMES.slice(-4).join(',') ===
+    [
+      SKILL_REQUEST_DRAFT_TOOL_NAME,
+      SKILL_REQUEST_REVISION_TOOL_NAME,
+      SKILL_REVISE_DRAFT_TOOL_NAME,
+      SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
+    ].join(','))
   const draft = requestSkillDraftArgsSchema.safeParse({ scope: 'LAST_TURN', includeToolOutputs: true, titleHint: '日报' })
   check('request_skill_draft 接受意图 / 范围 / 勾选', draft.success)
   check('request_skill_draft 默认 scope 由服务端补（schema 不强制）', requestSkillDraftArgsSchema.safeParse({}).success)
@@ -72,18 +82,35 @@ console.log('\n① 工具参数契约')
   check('revise_skill_draft 缺 instruction ⇒ 拒绝', !reviseSkillDraftArgsSchema.safeParse({ draftId: UUID(3) }).success)
   check('revise_skill_draft 缺 draftId ⇒ 拒绝', !reviseSkillDraftArgsSchema.safeParse({ instruction: 'x' }).success)
   check('revise_skill_draft 不接受 markdown / patch', !('markdown' in reviseSkillDraftArgsSchema.parse({ draftId: UUID(3), instruction: 'x', markdown: 'y' })))
+
+  check(
+    'request_skill_from_workspace 必须有 path',
+    requestSkillFromWorkspaceArgsSchema.safeParse({ path: 'skills/story' }).success &&
+      !requestSkillFromWorkspaceArgsSchema.safeParse({}).success,
+  )
+  check(
+    'request_skill_from_workspace 拒绝绝对路径 / .. / 反斜杠',
+    !requestSkillFromWorkspaceArgsSchema.safeParse({ path: '/work/story' }).success &&
+      !requestSkillFromWorkspaceArgsSchema.safeParse({ path: '../story' }).success &&
+      !requestSkillFromWorkspaceArgsSchema.safeParse({ path: 'skills\\story' }).success,
+  )
+  check(
+    'request_skill_from_workspace 不接受 markdown / files（内容只能来自工作区）',
+    !('markdown' in requestSkillFromWorkspaceArgsSchema.parse({ path: 'story', markdown: '# x' })) &&
+      !('files' in requestSkillFromWorkspaceArgsSchema.parse({ path: 'story', files: [] })),
+  )
 }
 
 console.log('\n② 工具定义单一生成源')
 {
   const manifest = buildSkillManifestTools([...SKILL_ANY_TOOL_NAMES])
   const openai = buildSkillOpenAiTools([...SKILL_ANY_TOOL_NAMES])
-  check('manifest / OpenAI 工具名逐字一致（6 个）', manifest.map((tool) => tool.name).join(',') === openai.map((tool) => tool.function.name).join(','))
+  check('manifest / OpenAI 工具名逐字一致（7 个）', manifest.map((tool) => tool.name).join(',') === openai.map((tool) => tool.function.name).join(','))
   const reviseManifest = manifest.find((tool) => tool.name === SKILL_REVISE_DRAFT_TOOL_NAME)
   const reviseOpenai = openai.find((tool) => tool.function.name === SKILL_REVISE_DRAFT_TOOL_NAME)
   check('revise_skill_draft 的 required = draftId,instruction', (reviseManifest?.inputSchema['required'] as string[] | undefined)?.join(',') === 'draftId,instruction')
   check('manifest 与 OpenAI 的 required 逐字一致', JSON.stringify(reviseManifest?.inputSchema['required']) === JSON.stringify(reviseOpenai?.function.parameters['required']))
-  check('三个入口工具都在 manifest 里（容器 skills 扩展才会注册）', SKILL_ANY_TOOL_NAMES.every((name) => manifest.some((tool) => tool.name === name)))
+  check('全部入口工具都在 manifest 里（容器 skills 扩展才会注册）', SKILL_ANY_TOOL_NAMES.every((name) => manifest.some((tool) => tool.name === name)))
 }
 
 console.log('\n③ 提示卡 / 结果契约')
@@ -130,9 +157,11 @@ console.log('\n④ 接线（源码断言）')
   const routes = readFileSync(join(repoRoot, 'backend/src/routes/conversations.ts'), 'utf8')
   const chatPage = readFileSync(join(repoRoot, 'frontend/src/pages/chat/ChatPage.tsx'), 'utf8')
   const extension = readFileSync(join(repoRoot, 'infra/sandbox/base/pi-agent/extensions/skills/index.ts'), 'utf8')
+  const contract = readFileSync(join(repoRoot, 'infra/sandbox/base/pi-agent/extensions/skills/contract.ts'), 'utf8')
+  const taskAgent = readFileSync(join(repoRoot, 'backend/src/orchestrator/taskAgent.ts'), 'utf8')
   const skillTools = readFileSync(join(repoRoot, 'backend/src/orchestrator/skillDraftTools.ts'), 'utf8')
 
-  check('ChatBot 下发草稿入口工具', chatBot.includes('SKILL_REQUEST_TOOL_NAMES') && chatBot.includes('executeSkillDraftTool'))
+  check('ChatBot 下发草稿入口工具', chatBot.includes('SKILL_CHATBOT_REQUEST_TOOL_NAMES') && chatBot.includes('executeSkillDraftTool'))
   check(
     '权限 / 目标类结论不算工具失败（不误触"本轮有工具没成功"）',
     skillTools.includes('SKILL_DRAFT_TOOL_OK_STATUSES') &&
@@ -143,6 +172,21 @@ console.log('\n④ 接线（源码断言）')
   check('会话路由有 skill-notices 拉取与消费', routes.includes("'/api/conversations/:id/skill-notices'") && routes.includes('/skill-notices/:noticeId'))
   check('ChatPage 接线提示卡与审核弹层', chatPage.includes('SkillDraftNoticeStack') && chatPage.includes('SkillDraftReviewDrawer'))
   check('容器 skills 扩展把入口工具代理回后端', extension.includes('BUILTIN_CALL_PATH') && extension.includes('callBuiltinTool'))
+  check(
+    '容器契约认识 request_skill_from_workspace（否则会按只读工具处理）',
+    contract.includes("SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME = 'request_skill_from_workspace'") &&
+      contract.includes('name === SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME'),
+  )
+  check(
+    'TaskAgent 注入工作区导入规则（ChatBot 不注入）',
+    taskAgent.includes('SKILL_WORKSPACE_REQUEST_RULES') && !chatBot.includes('SKILL_WORKSPACE_REQUEST_RULES'),
+  )
+  check(
+    '工作区导入工具执行体已接线',
+    skillTools.includes('request_skill_from_workspace') &&
+      skillTools.includes('createSkillDraftFromWorkspace') &&
+      skillTools.includes("agent.type !== 'TASK_AGENT'"),
+  )
   check(
     '固定按钮已移除（不再引用 SaveAsSkillButton / UpdateSkillButton）',
     !chatPage.includes('SaveAsSkillButton') &&

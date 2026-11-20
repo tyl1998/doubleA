@@ -29,6 +29,7 @@ import {
   SKILL_LOAD_TOOL_NAME,
   SKILL_READ_FILE_TOOL_NAME,
   SKILL_REQUEST_DRAFT_TOOL_NAME,
+  SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
   SKILL_REQUEST_REVISION_TOOL_NAME,
   SKILL_REVISE_DRAFT_TOOL_NAME,
   formatSkillCatalogBlock,
@@ -422,6 +423,17 @@ export const SKILL_REQUEST_RULES = [
   `- 审核阶段用户要求「按这个意见修改草稿」时，调用 \`${SKILL_REVISE_DRAFT_TOOL_NAME}\`（只改草稿，不保存）；`,
   '- 工具只产草稿或权限结果，**不保存、不绑定**；工具返回 FOREIGN / TARGET_NOT_FOUND 时按 reason 向用户解释，不要重复调用；',
   '- **不要在用户没有明确要求时自动调用**（纠正本身不触发"保存为 Skill"）。',
+].join('\n')
+
+/**
+ * TaskAgent 专用：把**工作区文件**做成 Skill（ChatBot 没有文件系统，所以这段不进 ChatBot 的 prompt）。
+ *
+ * `path` 是工作区相对路径（容器 `/work` 与宿主同一份挂载），不是绝对路径；一次调用只产一个 Skill。
+ */
+export const SKILL_WORKSPACE_REQUEST_RULES = [
+  `- 用户明确要求「把工作区里的这个目录 / zip 做成平台 Skill」时，调用 \`${SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME}\`；`,
+  '- `path` 必须指向含 `SKILL.md` 的目录或单 Skill 的 zip（工作区相对路径，如 `skills/story`）；一次只导入一个 Skill；',
+  '- 合集（多个子 Skill）请逐个目录调用；工具只产 CREATE 草稿，不直接保存。',
 ].join('\n')
 
 export const SKILL_CATALOG_TITLE = '可用 Skill（slug / 名称 / 版本 / 用途）'

@@ -175,6 +175,7 @@ import {
   MEMORY_TOOL_RULES,
   RETRIEVAL_RULES,
   SKILL_REQUEST_RULES,
+  SKILL_WORKSPACE_REQUEST_RULES,
   attachmentItemsOf,
   formatKnowledgeCatalog,
 } from './chatContext.js'
@@ -734,7 +735,8 @@ export const taskAgentProducer: ChatProducer = async (input) => {
       }
 
       // ★ P1-24c-4c：草稿入口的发现性说明（只在用户明确要求时调；不自动学习）。
-      engineContent = `${SKILL_REQUEST_RULES}\n\n${engineContent}`
+      // ★ 2026-11-20：TaskAgent 多一条"从工作区目录/zip 导入 CREATE 草稿"的规则（ChatBot 没有文件系统）。
+      engineContent = `${SKILL_REQUEST_RULES}\n\n${SKILL_WORKSPACE_REQUEST_RULES}\n\n${engineContent}`
 
       // ★ P1-24b-1：Skill 目录段（`slug / version / path / currentPath`）—— 与 ChatBot 的
       //   "只给目录、正文按需 load"同一条口径（§4.2.1 / §4.14 第 5 步）。TaskAgent 的正文读取

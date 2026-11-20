@@ -2,11 +2,20 @@
    只放 AntD 表达不了的版式：左右两栏、用例的"步骤 + 预期"配对块、默认展开的子树缩进。
    树控件、标签、按钮都用 AntD。 */
 
+/* 高度口径（2026-11-20 实测修正）：**不写死 `100vh - 260px`**。
+   · Code 模式工作区：父级 `.ws__editor-main` 是定高 flex 列，容器 `flex: 1; min-height: 0` 就铺满
+     （实测工作区面板只有 ~700px 宽，旧的 `100vh - 260px` 让预览比宿主矮 80px，下方露出空白）；
+   · 产物抽屉 / Skill 详情：宿主不是定高 flex 列，`max-height` 兜底 —— 不写死后只剩这
+     一条上限，猜错也只影响"最长能多高"，不会切断底部。
+   `height: 100%` 只是给非 flex 宿主的回退，flex 宿主里由 `flex` 决定。 */
 .xm-outline {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
-  height: calc(100vh - 260px);
-  min-height: 440px;
+  grid-template-columns: minmax(240px, 300px) minmax(300px, 1fr);
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  container-type: inline-size;
+  max-height: calc(100vh - 120px);
   border: 1px solid var(--rule);
   border-radius: var(--r-sm);
   overflow: hidden;
@@ -14,19 +23,32 @@
 }
 
 /* ── 左栏：索引树 ── */
+/* 两方向**都可滚**：摊开整棵树后 AntD 的缩进（最深 7 层）+ `showLine` 会让行宽超过栏宽，
+   横向滑动是唯一能看到深层节点尾巴的手段（2026-11-20 实测：`ant-tree` scrollWidth 418 / clientWidth 323）。
+   纵向 `min-height: 0` 才能让 flex 子项自己滚，而不是把整栏撑高把外层顶出滚动条。 */
 .xm-outline__tree {
   border-right: 1px solid var(--rule);
   overflow: auto;
+  min-height: 0;
   padding: var(--sp-2);
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
   background: var(--surface-2);
 }
-.xm-outline__tools { display: flex; align-items: center; gap: 4px; }
+.xm-outline__tree .ant-tree { min-width: 0; }
+/* 缩进列是 flex 项，`blockNode` 下内容列从缩进之后**继续向右排**，总宽超过行宽时不换行也不会收窄
+   —— 浅层短标题因此会多出 20~30px 的不可见溢出（2026-11-20 实测「入口与对接人」行 scrollWidth
+   244 / 宽 223）。让缩进可以压缩，短标题行就完全放得下，横向滚动只留给真正的长标题。 */
+.xm-outline__tree .ant-tree-indent { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.xm-outline__tools { display: flex; align-items: center; gap: 4px; flex: none; }
 .xm-outline__tools .ant-input-search { flex: 1; min-width: 0; }
 
-.xm-outline__row { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+/* 标题宽度**跟着栏宽走**，不再写死 200px：写死后 5 层缩进 + 箭头就占掉半行，剩下的宽度全变成
+   空白，横向滑到右边左侧只剩一片空（2026-11-20 实测 scrollWidth 426 / clientWidth 239，其中
+   187px 是纯空白）。现在用 `calc(100cqw - 90px)`：扣掉栏内内边距与一层缩进/箭头的余量，
+   超长标题依然省略号，横向滚动只在真正的深层长行上出现。 */
+.xm-outline__row { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
 .xm-outline__text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
 .xm-outline__badge {
   font-size: 11px;
@@ -201,7 +223,18 @@
 .xm-case--compact .xm-case__expect { display: none; }
 .xm-case--compact .xm-case__sec:not(:nth-of-type(2)) { display: none; }
 
+/* 标题上限跟着**左栏可用宽度**走（容器 = `.xm-outline`，`cqw` 是整块预览宽度）：
+   左栏占 240~300px，扣掉栏内内边距、缩进与箭头，「文字」这一列还剩下的宽度给标题。
+   这样浅层的标题不会因为写死 200px 而在右侧留白，深层缩进再靠横向滚动补。 */
+@container (min-width: 640px) {
+  .xm-outline__text { max-width: 240px; }
+}
 @media (max-width: 900px) {
   .xm-outline { grid-template-columns: minmax(0, 1fr); height: auto; }
   .xm-outline__tree { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--rule); }
 }
+
+/* 窄宿主（Code 模式工作区里编辑器区实测只有 220~520px）：固定的 320px 左栏会把阅读区压没，
+   改成「左栏上限 240px、阅读区至少 300px，放不下就整体横向滚动」。
+   ⚠️ 不能用 `@container (max-width)` 查 `.xm-outline` 自己 —— 它是被查询的容器，按规范自身
+   不能命中自己的容器查询（实测不生效），所以这里靠 `minmax(240px, 300px)` 的取值来兜。 */

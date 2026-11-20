@@ -446,6 +446,7 @@ sourceMessageIds     Json?           @map("source_message_ids") @db.JsonB
 **主入口 = 会话内 Agent 工具 + 提示卡（2026-11-16 定案）**：
 
 - `request_skill_draft`（新增）与 `request_skill_revision`（更新）由 Agent 在用户明确要求时调用；工具只创建**草稿**，不保存、不绑定、不发布。
+- TaskAgent 另有 `request_skill_from_workspace`：把工作区里的 Skill 目录 / zip 导入成 `CREATE` 草稿（ChatBot 不下发；合集逐个调用）。
 - 工具执行成功后写一条 `SkillDraftNotice`；`ChatPage` 在每轮结束 / 窗口聚焦时拉取，用 `SkillDraftNoticeStack` 渲染（与 `MemoryNoticeStack` 同族的可关闭卡片）。
 - 提示卡动作：`审核草稿` / `让 Agent 修改` / `忽略`；非所属人更新时动作换成 `只改本会话（c-4b）` / `复制为我的 Skill（c-5）` / `取消`。
 - 审核入口默认打开**弹层**（宽版 Drawer），内部复用 `SkillDraftPage` 的表单 + Markdown 预览 + 改动对比 + 脱敏复核；保留 `/skills/drafts/:draftId` 深链作为兜底。
@@ -478,6 +479,11 @@ revise_skill_draft({                   // “让 Agent 修改”：对同一份�
   instruction: string,                // 用户的修改意见（自然语言）
   scope?: 'MINIMAL' | 'WHOLE'         // 默认 MINIMAL：只动相关段落
 })
+
+request_skill_from_workspace({         // TaskAgent 专用（2026-11-20）：工作区目录 / zip → CREATE 草稿
+  path: string,                        // 工作区相对路径：含 SKILL.md 的目录，或单 Skill zip
+  titleHint?: string                   // 可选，包内没有 name 时的兜底
+})
 ```
 
 口径：
@@ -488,7 +494,8 @@ revise_skill_draft({                   // “让 Agent 修改”：对同一份�
 - 工具失败不抛整轮错误：结构化 `code`（`SKILL_REVISION_FOREIGN_DENIED` / `SKILL_VERSION_CONFLICT` / `SKILL_EXTRACT_*`）回给模型，由模型用自然语言解释；真正权限拒绝仍以服务端判据为准，不靠模型自觉。
 - `request_skill_revision` 在**非所属人**时不调用抽取模型（不白烧一次），直接回 `FOREIGN` 分支：`canOverride` / `canFork` 两个布尔 + 说明。c-4b 落地后 `canOverride=true` 并生成 `SESSION_OVERRIDE` 草稿；c-5 落地后 `canFork=true` 并走 fork。
 - `revise_skill_draft` 只改**草稿**（不是正式 Skill），服务端用当前草稿 + 用户意见调修订模型，仍走同一套脱敏 / 风险 / diff 现算；不保存、不发布。审核弹层里的「让 Agent 修改」把意见发回对话，Agent 调它之后提示卡/弹层刷新同一份草稿。
-- TaskAgent 容器内的 `skills` 扩展负责把 `request_skill_draft` / `request_skill_revision` / `revise_skill_draft` **代理回后端** `/api/sandbox/builtin/call`（抽取要读 DB / S3 / 模型，不能在容器里跑）；容器只消费 manifest 的 `tools[]`。
+- `request_skill_from_workspace` **只在 TaskAgent 下发**（ChatBot 没有文件系统）：`path` 是工作区相对路径（与容器 `/work` 同一份 bind mount），可指向含 `SKILL.md` 的目录或单 Skill zip；服务端用 `resolveWorkspacePath` 判逃逸，再复用 `parseSkillZip` 的同一套导入闸门（路径 / 大小 / 压缩比 / frontmatter / scripts→sandbox），最后走 `createSkillDraft(kind=CREATE)` + 逐文件上传草稿，**仍然只产草稿、不直接写 `skills`**。一次调用只导入一个 Skill；合集需逐个目录调用。
+- TaskAgent 容器内的 `skills` 扩展负责把 `request_skill_draft` / `request_skill_revision` / `revise_skill_draft` / `request_skill_from_workspace` **代理回后端** `/api/sandbox/builtin/call`（抽取 / 读库与工作区字节都不能在容器里跑）；容器只消费 manifest 的 `tools[]`。
 
 ### 8.1.2 提示卡（SkillDraftNotice）
 

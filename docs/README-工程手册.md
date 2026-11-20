@@ -250,6 +250,13 @@ curl -s -b cookies.txt -X POST -H 'content-type: application/json' \
 `docker pull ${SANDBOX_TOOLKIT_PULL_FROM}`（配置了才拉）、拉不到再用仓库脚本 `--toolkit-only` 构建
 ④ `egress` 未运行/未接沙箱网时重建（缺 `$EGRESS_IMAGE` 先拉）⑤ macOS/Windows 的 `relay` 未运行才拉起
 （缺 `$RELAY_IMAGE` 先拉；Linux 判定为"不需要"）。
+
+> **版本升级会被识别**（2026-11-20）：自检把 `SANDBOX_IMAGE` 的 **tag** 与仓库内
+> `infra/sandbox/versions.mjs` 的 `toolkitImageRef()` / `baseImageRef()` 对比；不一致时
+> `toolkitImage` 直接判未就绪（不再因为"旧 tag 还在本地"而显示已就绪）。一键初始化会先按期望版本
+> 构建（`--toolkit-only`，缺 base 会先补建），但仍需把 `infra/.env` 改成提示里的两行
+> `SANDBOX_IMAGE_BASE=...` / `SANDBOX_IMAGE=...` 并重启后端，再点一次；env 是启动期快照，
+> 后端无法替宿主改。旧的运行时镜像（`*-v3`）也不会被自动更新，需按变体重建。
 > 脚本本身刻意"离线可跑"（不拉镜像）；**拉取只发生在初始化**这一步，走宿主 Docker 网络。拉不到如实报
 > "请离线导入或配置内网镜像源"（`EGRESS_IMAGE` / `RELAY_IMAGE` / `DOCKER_CLI_IMAGE` 都可改指向内网）。
 > **四个命名卷**（`node-up.sh` 会建好）：`doubulea-docker-bin`（构建用 CLI）、`doubulea-docker-buildx`、
@@ -1790,6 +1797,7 @@ bash infra/scripts/egress-down.sh             # 收工（只删代理容器，�
 | `docs/子方案/文件预览.md` | MD/HTML/图片/CSV/PDF 五格式预览 + 安全处理（两条出口：下载 `attachment` / 预览 `inline`；**六条安全判据** + 逐格式落法） | ✅ 已完成（2026-09-26，P0-3-0b） |
 | `docs/子方案/Code模式工作区.md` | **Code 模式**：人机共享工作区（共享 FS + DB 版本索引 + S3 冷备）/ agent 文件 I/O 中介 / 四层并发防护（串行 · claim · CAS · 三方合并）/ CodeMirror 6 前端 | 📝 设计讨论稿（2026-10-08） |
 | `docs/子方案/沙箱多机部署.md` | **沙箱多机部署（路线 A）**：每机一实例 + 按会话路由（`SANDBOX_INSTANCE_ID` 实例身份 / `Sandbox.instanceId` 归属列 / 三处对账按本机过滤 / 队列键按实例隔离 / Redis 会话→实例目录 / 路由网关）；**R1 部署编排（后端/网关两个镜像 + 两套 compose）+ R2① 自动发现 + R3 负载感知 + R4 全局可观测 + R5 实例注册表已落地（2026-10-19）**，余网关多副本编排 / 负载感知 / 全局可观测 | 🚧 部分落地（核心 2026-10-12 · R1/R2① 2026-10-19） |
+| `docs/子方案/沙箱制品与部署解耦.md` | **制品与部署解耦（4 角色 + 制品中心 + sandbox-host）**：registry/build-once/pull-only；平台/沙箱/agent 独立版本与 digest；base→common→toolkit/runtime 重新分层；skills request 工具 builtin、read 工具走后端 S3；P0–P4 落地与变更影响矩阵 | 📝 设计讨论稿（2026-11-20） |
 
 ### 缺陷与踩坑归档
 

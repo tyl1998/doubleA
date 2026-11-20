@@ -146,9 +146,10 @@ export function isSkillToolName(name: string): name is SkillToolName {
  * 会话内 Skill 草稿入口工具（P1-24c-4c）。
  *
  * 与 {@link SKILL_TOOL_NAMES} 的差别是**它们不读 Skill**，只发起"生成 / 更新 / 修改草稿"：
- *   · `request_skill_draft`    —— 根据本会话生成一份新草稿（CREATE）；
- *   · `request_skill_revision` —— 按本会话的纠正生成既有 Skill 的更新草稿（REVISION）；
- *   · `revise_skill_draft`     —— 审核阶段按用户意见修改**同一份草稿**（不保存）。
+ *   · `request_skill_draft`         —— 根据本会话生成一份新草稿（CREATE）；
+ *   · `request_skill_revision`      —— 按本会话的纠正生成既有 Skill 的更新草稿（REVISION）；
+ *   · `revise_skill_draft`          —— 审核阶段按用户意见修改**同一份草稿**（不保存）；
+ *   · `request_skill_from_workspace` —— **TaskAgent 专用**：把工作区里的目录 / zip 导入成 CREATE 草稿。
  *
  * 参数只收"意图 + 目标 + 捕获范围"：**不收 `messageIds` / `markdown` / patch** ——
  * 消息范围与正文由服务端按会话归属与草稿状态判定（模型不能替用户选一段会话）。
@@ -156,10 +157,25 @@ export function isSkillToolName(name: string): name is SkillToolName {
 export const SKILL_REQUEST_DRAFT_TOOL_NAME = 'request_skill_draft'
 export const SKILL_REQUEST_REVISION_TOOL_NAME = 'request_skill_revision'
 export const SKILL_REVISE_DRAFT_TOOL_NAME = 'revise_skill_draft'
-export const SKILL_REQUEST_TOOL_NAMES = [
+/**
+ * TaskAgent 专用：把工作区里的 Skill 目录 / zip 变成一份 **CREATE 草稿**。
+ *
+ * ChatBot 没有文件系统 ⇒ **不下发**（{@link SKILL_CHATBOT_REQUEST_TOOL_NAMES}）；
+ * 容器侧把它和另外三个入口工具一样代理回后端 `/api/sandbox/builtin/call`。
+ */
+export const SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME = 'request_skill_from_workspace'
+
+/** ChatBot 下发的三个入口工具（不含工作区导入） */
+export const SKILL_CHATBOT_REQUEST_TOOL_NAMES = [
   SKILL_REQUEST_DRAFT_TOOL_NAME,
   SKILL_REQUEST_REVISION_TOOL_NAME,
   SKILL_REVISE_DRAFT_TOOL_NAME,
+] as const
+
+/** 全部草稿入口工具（容器 manifest 下发全集） */
+export const SKILL_REQUEST_TOOL_NAMES = [
+  ...SKILL_CHATBOT_REQUEST_TOOL_NAMES,
+  SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME,
 ] as const
 export type SkillRequestToolName = (typeof SKILL_REQUEST_TOOL_NAMES)[number]
 
@@ -319,6 +335,31 @@ export const reviseSkillDraftArgsSchema = z.object({
 })
 export type ReviseSkillDraftArgs = z.infer<typeof reviseSkillDraftArgsSchema>
 
+/**
+ * `request_skill_from_workspace` 参数（**TaskAgent 专用**）。
+ *
+ * `path` 只接受**工作区相对路径**（容器里看到的 `/work` 同源）：既可以是含 `SKILL.md` 的目录，
+ * 也可以是单 Skill 的 zip。服务端会再走一次 `resolveWorkspacePath`（绝对路径 / `..` / 符号链接
+ * 逃逸一律拒绝），因此这里只管形态。
+ *
+ * 仍然**不收 markdown / files**：内容必须来自工作区的真实字节，不能由模型在参数里塞一段正文。
+ */
+export const requestSkillFromWorkspaceArgsSchema = z.object({
+  path: z
+    .string({ required_error: validationMessage('validation.skill.pathRequired') })
+    .trim()
+    .min(1, validationMessage('validation.skill.pathRequired'))
+    .max(SKILL_PATH_MAX_CHARS, validationMessage('validation.skill.pathTooLong', { max: SKILL_PATH_MAX_CHARS }))
+    .regex(/^(?!.*(?:\\|\.\.|^\/|[A-Za-z]:))/u, validationMessage('validation.skill.pathUnsafe')),
+  /** 可选：包内没写 `name` 时的兜底名（不参与权限与路径判定） */
+  titleHint: z
+    .string()
+    .trim()
+    .max(SKILL_NAME_MAX_CHARS, validationMessage('validation.skill.nameTooLong', { max: SKILL_NAME_MAX_CHARS }))
+    .optional(),
+})
+export type RequestSkillFromWorkspaceArgs = z.infer<typeof requestSkillFromWorkspaceArgsSchema>
+
 /** OpenAI / manifest 下发的参数表（**与 zod schema 同源**：两边都从这里取） */
 const REQUEST_DRAFT_TOOL_PARAMETERS: Record<string, unknown> = {
   type: 'object',
@@ -385,11 +426,25 @@ const REVISE_DRAFT_TOOL_PARAMETERS: Record<string, unknown> = {
   required: ['draftId', 'instruction'],
 }
 
+const REQUEST_FROM_WORKSPACE_TOOL_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    path: {
+      type: 'string',
+      description:
+        '工作区相对路径：含 SKILL.md 的目录，或单 Skill 的 zip（例如 "skills/story" / "skills/story.zip"）；不是 /work 绝对路径',
+    },
+    titleHint: { type: 'string', description: '（可选）包内没写 name 时的兜底名，不参与权限与路径判定' },
+  },
+  required: ['path'],
+}
+
 /** 草稿入口工具的参数表（生成 manifest / OpenAI 定义时共用） */
 export const SKILL_REQUEST_TOOL_PARAMETERS: Readonly<Record<SkillRequestToolName, Record<string, unknown>>> = {
   [SKILL_REQUEST_DRAFT_TOOL_NAME]: REQUEST_DRAFT_TOOL_PARAMETERS,
   [SKILL_REQUEST_REVISION_TOOL_NAME]: REQUEST_REVISION_TOOL_PARAMETERS,
   [SKILL_REVISE_DRAFT_TOOL_NAME]: REVISE_DRAFT_TOOL_PARAMETERS,
+  [SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME]: REQUEST_FROM_WORKSPACE_TOOL_PARAMETERS,
 }
 
 // ───────────────────────────── 结果形状 ─────────────────────────────
@@ -914,6 +969,8 @@ const SKILL_TOOL_DESCRIPTIONS: Readonly<Record<SkillAnyToolName, string>> = {
     '按本会话的纠正更新一个既有 Skill，生成更新草稿。只在用户明确要求更新 Skill 时调用；非所属人不会生成草稿，只回权限结果。',
   [SKILL_REVISE_DRAFT_TOOL_NAME]:
     '按用户的修改意见修改**同一份** Skill 草稿（审核阶段用）。只改草稿，不保存、不发布。',
+  [SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME]:
+    '把工作区里的 Skill 目录（含 SKILL.md）或单 Skill zip 导入成一份 CREATE 草稿。只在用户明确要求把工作区文件做成 Skill 时调用；每次只能一个 Skill。',
 }
 
 /**
@@ -1008,6 +1065,8 @@ const SKILL_TOOL_PARAMETER_HINTS: Readonly<Record<SkillAnyToolName, string>> = {
     '非所属人不会生成草稿（只回权限结果），由提示卡给出路。',
   [SKILL_REVISE_DRAFT_TOOL_NAME]:
     '按用户的修改意见修改**同一份** Skill 草稿（审核阶段用）。只改草稿，不保存、不发布。',
+  [SKILL_REQUEST_FROM_WORKSPACE_TOOL_NAME]:
+    '把工作区里的 Skill 目录（含 SKILL.md）或单 Skill zip 导入成一份 CREATE 草稿（TaskAgent 专用）。',
 }
 
 /**

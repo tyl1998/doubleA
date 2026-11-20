@@ -29,12 +29,14 @@ import { readdir } from 'node:fs/promises'
 import { platform } from 'node:os'
 import { dirname as pathDirname, join as pathJoin } from 'node:path'
 import { promisify } from 'node:util'
+import { pathToFileURL } from 'node:url'
 
 import type { NodeBootstrapResult, NodeBootstrapStep, NodeCheckItem, NodeReport, NodeRoleName } from '@doubulea/shared'
 
 import { getLogger } from '../infra/logger.js'
 import { config, findWorkspaceRoot } from '../config.js'
 import { getDocker, listRuntimeImages, resolveDockerBin, withDockerEnv } from './docker.js'
+import { imageTagOf, sandboxImageDriftOf, sandboxImageUpgradeHint, type SandboxImageExpectation } from './imageExpectation.js'
 import { ensureSandboxNetwork } from './network.js'
 import { canBuildSandboxRuntime, interpretBuildLine } from './runtimeBuild.js'
 
@@ -96,6 +98,62 @@ function bootstrapCwd(): string {
 }
 
 /**
+ * `infra/sandbox/versions.mjs` 的定位（容器 `/app/infra/sandbox`，宿主 dev 仓库）。
+ *
+ * 与 {@link bootstrapScript} 同一套布局兼容；额外留一个 env 覆写，便于定制镜像把版本文件放到别处。
+ *
+ * @throws 不抛：找不到时返回候选路径，由调用方按"读不到 ⇒ 不判漂移"处理。
+ */
+function sandboxVersionsFile(): string {
+  const override = (process.env.DOUBULEA_SANDBOX_VERSIONS_FILE ?? '').trim()
+  if (override !== '') return override
+  const inImage = '/app/infra/sandbox/versions.mjs'
+  if (existsSync(inImage)) return inImage
+  const root = findWorkspaceRoot()
+  if (root !== undefined) {
+    const inRepo = pathJoin(root, 'infra', 'sandbox', 'versions.mjs')
+    if (existsSync(inRepo)) return inRepo
+  }
+  return inImage
+}
+
+/** `versions.mjs` 模块里本文件用到的两个 ref 生成函数（不引入其全部导出，避免把类型带进契约） */
+interface SandboxVersionsModule {
+  baseImageRef: () => string
+  toolkitImageRef: () => string
+}
+
+/**
+ * 当前代码期望的沙箱镜像 tag（`base` / `toolkit`）。
+ *
+ * ⚠️ 用**动态 import** 而不是静态 import：`backend/src` 与 `infra/` 是两个构建上下文，
+ *    `versions.mjs` 也不在 backend 的 tsconfig 里；动态 URL 在 dev（仓库）与镜像（`/app/infra`）
+ *    两种布局下都能加载同一份文件。
+ *
+ * 读不到 / 加载失败 ⇒ 返回 `null`（不判漂移，退回"只看镜像在不在"的旧行为），只 warn 不抛。
+ */
+let expectedImagesPromise: Promise<SandboxImageExpectation | null> | undefined
+
+async function expectedSandboxImages(): Promise<SandboxImageExpectation | null> {
+  if (expectedImagesPromise !== undefined) return await expectedImagesPromise
+  expectedImagesPromise = (async () => {
+    const file = sandboxVersionsFile()
+    if (!existsSync(file)) {
+      getLogger().warn({ file }, '读不到沙箱 versions.mjs ⇒ 一键初始化无法判断镜像版本漂移（退回只查镜像是否存在）')
+      return null
+    }
+    try {
+      const mod = (await import(pathToFileURL(file).href)) as SandboxVersionsModule
+      return { base: mod.baseImageRef(), toolkit: mod.toolkitImageRef() }
+    } catch (error) {
+      getLogger().warn({ err: error, file }, '加载沙箱 versions.mjs 失败 ⇒ 不判断镜像版本漂移')
+      return null
+    }
+  })()
+  return await expectedImagesPromise
+}
+
+/**
  * 补齐 toolkit（空环境）镜像：**先拉取、后构建**。
  *
  *   · 拉取：`SANDBOX_TOOLKIT_PULL_FROM`（如 `registry.local/doubulea/sandbox-toolkit:8`）存在时
@@ -106,6 +164,45 @@ function bootstrapCwd(): string {
 async function ensureToolkitImage(note?: (event: string) => void): Promise<{ ok: boolean; detail: string }> {
   const image = config.sandbox.image
   if (image === undefined) return { ok: false, detail: '未配置 SANDBOX_IMAGE（toolkit 镜像名）' }
+
+  const expected = await expectedSandboxImages()
+  if (expected !== null && sandboxImageDriftOf(image, expected)) {
+    // ★ 2026-11-20：平台升级后 env 还是旧 tag。**先按代码期望的版本把镜像准备好**，
+    //   再明确告诉运维"改 env + 重启" —— 不能只报"已就绪"跳过（旧镜像里没有新扩展）。
+    const hint = sandboxImageUpgradeHint(image, expected)
+    note?.(`检测到沙箱镜像版本漂移：${hint}`)
+    try {
+      await getDocker().getImage(expected.toolkit).inspect()
+      return { ok: false, detail: `本机已有 ${expected.toolkit}；${hint}` }
+    } catch {
+      // 期望版本不在本地：优先从分发源拉（多机部署只构建一次），拉不到再本地构建。
+      const pullFrom = (process.env.SANDBOX_TOOLKIT_PULL_FROM ?? '').trim()
+      if (pullFrom !== '' && imageTagOf(pullFrom) === imageTagOf(expected.toolkit)) {
+        try {
+          note?.(`本地没有 ${expected.toolkit}，开始 docker pull ${pullFrom}（可能较久）`)
+          await execFileAsync(resolveDockerBin(), ['pull', pullFrom], { timeout: 20 * 60_000 })
+          if (pullFrom !== expected.toolkit) {
+            note?.(`拉取完成，标记为 ${expected.toolkit}`)
+            await execFileAsync(resolveDockerBin(), ['tag', pullFrom, expected.toolkit], { timeout: 60_000 })
+          }
+          return { ok: false, detail: `已从 ${pullFrom} 拉取并标记为 ${expected.toolkit}；${hint}` }
+        } catch (error) {
+          const message = error instanceof Error ? error.message.split('\n')[0] : String(error)
+          note?.(`拉取 ${pullFrom} 失败（${message}），改为本地构建 ${expected.toolkit}`)
+        }
+      } else if (pullFrom !== '') {
+        note?.(
+          `SANDBOX_TOOLKIT_PULL_FROM 的 tag 与期望版本不一致（${pullFrom}），改为本地构建 ${expected.toolkit}`,
+        )
+      }
+      const built = await buildToolkit(expected.toolkit, '', note)
+      return {
+        ok: false,
+        detail: built.ok ? `${built.detail}；${hint}` : `镜像版本不匹配且构建失败：${built.detail}；${hint}`,
+      }
+    }
+  }
+
   note?.(`检查组沙箱镜像 ${image}`)
   try {
     await getDocker().getImage(image).inspect()
@@ -561,6 +658,11 @@ export async function inspectNode(options: { role: NodeRoleName; instanceId: str
   })
 
   // ⑦ toolkit 镜像（沙箱默认镜像；缺了连空环境都起不来）
+  //
+  // ★ 2026-11-20：不只查"镜像在不在"，还要对**当前代码期望的层版本**（`versions.mjs`）。
+  //   平台升级后 env 仍是旧 tag 时，旧镜像在本地存在 ⇒ 旧实现会误报"已就绪"并跳过初始化。
+  const expectedImages = await expectedSandboxImages()
+  const imageDrifted = sandboxImageDriftOf(config.sandbox.image, expectedImages)
   let toolkitOk = false
   if (dockerOk) {
     const image = config.sandbox.image
@@ -574,12 +676,18 @@ export async function inspectNode(options: { role: NodeRoleName; instanceId: str
       }
     }
   }
+  const toolkitDetail =
+    imageDrifted && expectedImages !== null
+      ? sandboxImageUpgradeHint(config.sandbox.image, expectedImages)
+      : toolkitOk
+        ? '已就绪（空环境可用）'
+        : '缺失 —— 需要导入或构建 toolkit 镜像'
   items.push({
     key: 'toolkitImage',
     label: `沙箱镜像 ${config.sandbox.image ?? '（未配置 SANDBOX_IMAGE）'}`,
     required: true,
-    ok: toolkitOk,
-    detail: toolkitOk ? '已就绪（空环境可用）' : '缺失 —— 需要导入或构建 toolkit 镜像',
+    ok: toolkitOk && !imageDrifted,
+    detail: toolkitDetail,
   })
 
   // ⑧ 运行时镜像（可选：没有就用 toolkit 回退，只是少了语言层）
@@ -597,7 +705,9 @@ export async function inspectNode(options: { role: NodeRoleName; instanceId: str
     ok: runtimeIds.length > 0,
     detail:
       runtimeIds.length > 0
-        ? `已就绪：${runtimeIds.join('、')}`
+        ? imageDrifted
+          ? `已就绪：${runtimeIds.join('、')}（⚠️ toolkit 已升级，这些镜像可能基于旧 toolkit，需要重建后才会带新扩展）`
+          : `已就绪：${runtimeIds.join('、')}`
         : '没有额外运行时（空环境照样可用；可在实例上按需构建）',
   })
 

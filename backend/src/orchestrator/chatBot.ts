@@ -83,7 +83,7 @@ import { appMsg,
   RECALL_MEMORY_TOOL_NAME,
   REMEMBER_TOOL_NAME,
   SEND_NOTIFICATION_TOOL_NAME,
-  SKILL_REQUEST_TOOL_NAMES,
+  SKILL_CHATBOT_REQUEST_TOOL_NAMES,
   SKILL_TOOL_SERVER_NAME,
   buildSkillOpenAiTools,
   pinnedMcpToolNamesFromConfig,
@@ -480,7 +480,7 @@ export const chatBotProducer: ChatProducer = async (input) => {
      * P1-24c-4c：草稿入口三工具（**始终下发** —— 没绑 Skill 也能"把这段流程存成 Skill"）。
      * 与只读工具同一份定义源；执行体在 `orchestrator/skillDraftTools.ts`（只产草稿或权限结果）。
      */
-    builtinTools.push(...buildSkillOpenAiTools([...SKILL_REQUEST_TOOL_NAMES]))
+    builtinTools.push(...buildSkillOpenAiTools([...SKILL_CHATBOT_REQUEST_TOOL_NAMES]))
     /**
      * 工具网关（P1-19）：**只在工具多、走了网关时**下发（`catalog.gatewayActive`）。
      * 走网关时 `catalog.tools` 里只有常驻工具，其余工具需要模型用 `mcp_list_tools` 发现、

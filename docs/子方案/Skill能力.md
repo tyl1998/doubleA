@@ -791,6 +791,7 @@ DELETE /api/skill-drafts/:draftId       丢弃草稿
 入口（**2026-11-16 交互修订**）：
 
 - 主入口 = 用户在对话里明确要求（“把上面这个流程生成 Skill” / “更新 Skill《X》”），Agent 调用 `request_skill_draft` / `request_skill_revision`；
+- TaskAgent 另有 `request_skill_from_workspace`（2026-11-20）：把工作区里的 Skill 目录 / zip 导入成 `CREATE` 草稿；`path` 是工作区相对路径，服务端复用 `parseSkillZip` 同一套导入闸门，仍然只产草稿、不直接写 `skills`；ChatBot 不下发该工具。
 - 工具只产草稿 / 权限结果，本轮结束后由 `SkillDraftNotice` 提示卡承接（与 `MemoryNoticeStack` 同族，可关闭）；
 - 审核在弹层（宽版 Drawer，复用草稿审核组件），也可走 `/skills/drafts/:draftId` 深链；
 - **不再使用 / 不新增会话头部的固定按钮**（`SaveAsSkillButton` / `UpdateSkillButton` 为过渡入口，随 P1-24c-4c 移除）；
