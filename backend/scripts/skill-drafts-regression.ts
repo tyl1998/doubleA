@@ -28,6 +28,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { Readable } from 'node:stream'
 
 import {
   APP_MESSAGES,
@@ -42,21 +43,25 @@ import {
   saveSkillFromDraftBodySchema,
   saveSkillRevisionFromDraftBodySchema,
   scanSkillSecrets,
+  skillDraftFileContentBodySchema,
+  skillDraftFileQuerySchema,
+  skillDraftRenameBodySchema,
   skillDraftSchema,
   updateSkillDraftBodySchema,
 } from '@doubulea/shared'
 
 const { normalizeSkillDraftContent } = await import('../src/sandbox/skillScript.ts')
+const { mergeFileEntries } = await import('../src/services/skillDraft.service.ts')
 
 let passed = 0
 let failed = 0
-function check(label: string, ok: boolean, detail = ''): void {
+function check(label: string, ok: boolean, detail: unknown = ''): void {
   if (ok) {
     passed += 1
     console.log(`  ✓ ${label}`)
   } else {
     failed += 1
-    console.error(`  ✗ ${label}${detail === '' ? '' : ` —— ${detail}`}`)
+    console.error(`  ✗ ${label}${detail === '' ? '' : ` —— ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`}`)
   }
 }
 
@@ -102,11 +107,19 @@ console.log('\n① 契约形状')
   )
   check('`files[]` 里多带 `draftKey` ⇒ 被剥掉（不透出服务端键）', withDraftKey.success && !('draftKey' in withDraftKey.data.files[0]!))
 
-  // c-2 起客户端**只能直接建 REVISION**（CREATE 草稿只能由会话抽取生成：来源与消息范围必须服务端判定）
-  check('客户端只能直接建 REVISION（c-2）', SKILL_DRAFT_KINDS_SUPPORTED.join(',') === 'REVISION')
+  // P1-24a-6：客户端可以建 CREATE（页面新建），但必须带非空正文；无来源 ⇒ MANUAL
+  check('客户端能建 CREATE + REVISION（a-6）', SKILL_DRAFT_KINDS_SUPPORTED.join(',') === 'CREATE,REVISION')
   check(
-    '直接建 CREATE 草稿 ⇒ 400（只能走会话抽取）',
+    'CREATE 带正文可建（a-6）',
+    createSkillDraftBodySchema.safeParse({ kind: 'CREATE', name: 'x', description: 'y', runtime: 'INLINE', markdown: '# x\n1.' }).success,
+  )
+  check(
+    'CREATE 缺正文 ⇒ 400（空壳闸门）',
     !createSkillDraftBodySchema.safeParse({ kind: 'CREATE', name: 'x', description: 'y', runtime: 'INLINE' }).success,
+  )
+  check(
+    'CREATE 正文只有空白 ⇒ 400',
+    !createSkillDraftBodySchema.safeParse({ kind: 'CREATE', name: 'x', description: 'y', runtime: 'INLINE', markdown: '   \n\t' }).success,
   )
   check('SESSION_OVERRIDE 建草稿 ⇒ 400', !createSkillDraftBodySchema.safeParse(draftFixture({ kind: 'SESSION_OVERRIDE' })).success)
   check('PROPOSAL 建草稿 ⇒ 400（属 c-6）', !createSkillDraftBodySchema.safeParse(draftFixture({ kind: 'PROPOSAL' })).success)
@@ -129,6 +142,7 @@ console.log('\n① 契约形状')
       name: 'x',
       description: 'y',
       runtime: 'INLINE',
+      markdown: '# x',
       targetSkillId: '00000000-0000-4000-8000-00000000d009',
     }).success,
   )
@@ -152,6 +166,14 @@ console.log('\n① 契约形状')
       fromVersion: 1,
     }).success,
   )
+  // P1-24a-5：详情页把可见范围与正文改动合并发布（只收 PRIVATE / PUBLIC）
+  const revisionVisibility = saveSkillRevisionFromDraftBodySchema.safeParse({
+    draftId: '00000000-0000-4000-8000-00000000d001',
+    fromVersion: 1,
+    changeSummary: '详情页编辑',
+    visibility: 'PUBLIC',
+  })
+  check('revisions 入口接受 `visibility`（与正文改动合并发布）', revisionVisibility.success)
   check('PUT 草稿不能改 `targetSkillId` / `baseVersion` / `kind`', [
     'targetSkillId',
     'baseVersion',
@@ -167,11 +189,39 @@ console.log('\n② 归属 / 过期 / 消耗')
   const source = stripComments(readFileSync(new URL('../src/services/skillDraft.service.ts', import.meta.url), 'utf8'))
   check('归属判据：`record.userId !== viewer.id` ⇒ 404', source.includes('record.userId !== viewer.id'))
   check('过期判据：`updatedAt + ttl` ⇒ 404', source.includes('isExpired(record)'))
-  check('落库成功后消耗草稿（DEL + 回收对象）', source.includes('async function consumeDraft') && source.includes('deleteSkillDraftRaw(record.id)'))
+  check(
+    '落库成功后消耗草稿（删 `skill_drafts` 行 + 回收对象）',
+    source.includes('async function consumeDraft') && source.includes('await dropDraftRecordQuietly(record)'),
+  )
+  check(
+    '草稿落表（`skill_drafts` 是唯一真相源，c-7a）',
+    source.includes('getPrisma().skillDraft.upsert') && source.includes('getPrisma().skillDraft.findMany'),
+  )
+  check(
+    '旧 Redis 草稿可迁移（DB 没有时读一次并写表）',
+    source.includes('async function readLegacyDraft') && source.includes('await writeDraftRow(record)'),
+  )
   check('草稿键里有 `userId`（`skill-drafts/{userId}/{draftId}/`）', source.includes('skill-drafts/${userId}/${draftId}/'))
   check('保存入口按 `kind` 分流（CREATE / REVISION 混用 ⇒ 400）', source.includes('SKILL_ERROR_CODES.DRAFT_KIND_MISMATCH'))
   check('绑定失败不影响保存（回 `bindError`）', source.includes('bindError = await tryBindSkill') && source.includes('bindError: null'))
   check('先写 S3 再写草稿 JSON（失败回收对象）', source.indexOf('await s3.putObject(bucket, key') < source.indexOf('record.files = [...record.files, file]'))
+  check(
+    'revision 保存把可见范围与版本写进同一个 updateMany（P1-24a-5）',
+    source.includes('...(visibility === undefined ? {} : { visibility })'),
+  )
+  check(
+    '`SHARED` 由服务层 `normalizeSkillVisibility` 拒绝（不是 schema 层）',
+    source.includes('normalizeSkillVisibility(input.visibility)'),
+  )
+  // P1-24a-6：创建与保存两处都拦"无来源 CREATE + 空正文"
+  check(
+    '建草稿时兜底拦无来源 CREATE 的空正文（a-6）',
+    source.includes("input.source === undefined && (input.markdown ?? '').trim() === ''"),
+  )
+  check(
+    'from-draft 拦无来源 CREATE 的空正文（a-6）',
+    source.includes("record.source === null && (input.markdown ?? record.markdown).trim() === ''"),
+  )
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -375,6 +425,239 @@ console.log('\n⑥′ 跨目录脚本识别')
   check(
     'allowAnySafePath 仍拒绝不安全路径',
     normalizeExtractedFiles([{ path: '../escape.md', content: 'x' }], { allowAnySafePath: true }).files.length === 0,
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ⑥″ 文件树编辑（P1-24a-7）：墓碑过滤 + 契约
+// ═════════════════════════════════════════════════════════════════════
+console.log('\n⑥″ 文件树编辑（a-7）')
+{
+  check(
+    '`removedPaths` 在对外形状里（旧草稿缺省 []）',
+    Array.isArray(skillDraftSchema.parse(draftFixture()).removedPaths) &&
+      skillDraftSchema.parse(draftFixture()).removedPaths.length === 0,
+  )
+  const merged = mergeFileEntries(
+    [{ path: 'references/n.md', kind: 'reference', mime: 'text/markdown', size: 1, sha256: 'n' }],
+    [
+      { path: 'references/keep.md', mime: 'text/markdown', size: 1, sha256: 'k', storageKey: 'v1/references/keep.md' },
+      { path: 'references/gone.md', mime: 'text/markdown', size: 1, sha256: 'g', storageKey: 'v1/references/gone.md' },
+    ],
+    ['references/gone.md'],
+  )
+  check('`mergeFileEntries` 过滤墓碑（删基准文件不会被补回）', !merged.some((file) => file.path === 'references/gone.md'))
+  check('`mergeFileEntries` 保留未删基准 + 草稿增量', merged.some((file) => file.path === 'references/keep.md') && merged.some((file) => file.path === 'references/n.md'))
+  check(
+    '`mergeFileEntries` 以墓碑为准（同路径不再从草稿残留）',
+    !mergeFileEntries(
+      [{ path: 'a.md', kind: 'reference', mime: 'text/markdown', size: 1, sha256: 'a' }],
+      [],
+      ['a.md'],
+    ).some((file) => file.path === 'a.md'),
+  )
+
+  check(
+    '`PUT /files/content` 契约：path + text',
+    skillDraftFileContentBodySchema.safeParse({ path: 'references/a.md', text: '# a' }).success,
+  )
+  check('`PUT /files/content` 缺 text ⇒ 400', !skillDraftFileContentBodySchema.safeParse({ path: 'references/a.md' }).success)
+  check(
+    '`POST /files/rename` 契约：from / to / kind',
+    skillDraftRenameBodySchema.safeParse({ from: 'references/a.md', to: 'references/b.md', kind: 'FILE' }).success,
+  )
+  check('重命名 SKILL.md ⇒ 400（守卫）', !skillDraftRenameBodySchema.safeParse({ from: 'SKILL.md', to: 'x.md', kind: 'FILE' }).success)
+  check(
+    '目录移动到自己的子目录 ⇒ 400',
+    !skillDraftRenameBodySchema.safeParse({ from: 'references', to: 'references/sub', kind: 'DIR' }).success,
+  )
+  check(
+    '`DELETE /files?path=&recursive=1` 解析出递归标记',
+    skillDraftFileQuerySchema.parse({ path: 'references', recursive: '1' }).recursive === true &&
+      skillDraftFileQuerySchema.parse({ path: 'references' }).recursive === false,
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ⑥‴ 草稿文件操作端到端（假 S3 + 内存草稿行；a-7）
+//
+// ⚠️ 只替换 S3 / Prisma 两个边界，其余走真服务代码 —— 守的是"墓碑互斥 / 目录递归 /
+//    重命名搬字节 / 目标冲突 400"这几条只在运行期暴露的判据。真 PG / 真 MinIO 留给 E2E。
+// ═════════════════════════════════════════════════════════════════════
+console.log('\n⑥‴ 草稿文件操作（a-7，假 S3）')
+{
+  const store = new Map<string, Buffer>()
+  const rows = new Map<string, { id: string; userId: string; kind: string; payload: unknown; expiresAt: Date; createdAt: Date; updatedAt: Date }>()
+  const { getS3Client } = await import('../src/infra/s3.ts')
+  const { getPrisma } = await import('../src/infra/prisma.ts')
+  const fakeBucketExists = (): Promise<boolean> => Promise.resolve(true)
+  const fakeS3 = {
+    bucketExists: fakeBucketExists,
+    makeBucket: (): Promise<void> => Promise.resolve(),
+    putObject: (_bucket: string, key: string, bytes: Buffer): Promise<unknown> => {
+      store.set(key, Buffer.from(bytes))
+      return Promise.resolve({ etag: '' })
+    },
+    getObject: (bucket: string, key: string): Promise<NodeJS.ReadableStream> => {
+      void bucket
+      const bytes = store.get(key)
+      if (bytes === undefined) {
+        const error = Object.assign(new Error('NoSuchKey'), { code: 'NoSuchKey' })
+        return Promise.reject(error)
+      }
+      return Promise.resolve(Readable.from([bytes]))
+    },
+    removeObjects: (_bucket: string, keys: string[]): Promise<unknown> => {
+      for (const key of keys) store.delete(key)
+      return Promise.resolve({})
+    },
+  }
+  Object.assign(getS3Client(), fakeS3)
+  const fakePrisma = {
+    skillDraft: {
+      findUnique: ({ where }: { where: { id: string } }) => Promise.resolve(rows.get(where.id) ?? null),
+      findMany: () => Promise.resolve([...rows.values()]),
+      upsert: ({ where, create, update }: { where: { id: string }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+        const existing = rows.get(where.id)
+        rows.set(where.id, (existing === undefined ? { ...create } : { ...existing, ...update }) as never)
+        return Promise.resolve(rows.get(where.id))
+      },
+      deleteMany: ({ where }: { where: { id: string } }) => {
+        rows.delete(where.id)
+        return Promise.resolve({ count: 0 })
+      },
+    },
+    skillFile: { findMany: () => Promise.resolve([]) },
+    skillProposal: { findUnique: () => Promise.resolve(null), findMany: () => Promise.resolve([]) },
+  }
+  Object.assign(getPrisma(), fakePrisma)
+  const {
+    createSkillDraft,
+    writeSkillDraftFileContent,
+    renameSkillDraftPath,
+    removeSkillDraftPath,
+    uploadSkillDraftFile,
+  } = await import('../src/services/skillDraft.service.ts')
+  const viewer = { id: 'a7-user', role: 'ADMIN' as const }
+  const draft = await createSkillDraft(
+    { kind: 'CREATE', name: '棵树', description: '需要整理文件时使用', runtime: 'SANDBOX', markdown: '# 棵树\n1.' },
+    viewer,
+  )
+  await writeSkillDraftFileContent(draft.id, { path: 'references/a.md', text: '# A' }, viewer)
+  await writeSkillDraftFileContent(draft.id, { path: 'references/b.md', text: '# B' }, viewer)
+  await writeSkillDraftFileContent(draft.id, { path: 'scripts/run.py', text: 'print(1)' }, viewer)
+  let current = await writeSkillDraftFileContent(draft.id, { path: "references/a.md", text: "# A2" }, viewer)
+  check(
+    '写文本文件 ⇒ 进 files（新建 + 原地替换不重复）',
+    current.draft.files.some((file) => file.path === "references/a.md") &&
+      current.draft.files.filter((file) => file.path === "references/a.md").length === 1 &&
+      current.draft.files.some((file) => file.path === "scripts/run.py"),
+  )
+
+  current = (await renameSkillDraftPath(draft.id, { from: 'references/a.md', to: 'references/c.md', kind: 'FILE' }, viewer))
+  check(
+    '重命名草稿文件：新路径进 files、旧路径**不进墓碑**（草稿对象换键即可，2026-11-19 修正）',
+    current.files.some((file) => file.path === 'references/c.md') &&
+      !current.files.some((file) => file.path === 'references/a.md') &&
+      !current.removedPaths.includes('references/a.md'),
+  )
+  check(
+    '重命名搬了字节（新键内容 = 原文）',
+    [...store.entries()].some(([key, bytes]) => key.endsWith('references/c.md') && bytes.toString('utf8') === '# A2'),
+  )
+
+  // 替换基准文件：`replace=1` 必须能过（以前只看 record.files ⇒ 基准文件被 400 "已有同名文件"）
+  // ⚠️ 此时 `references/a.md` 上**没有**草稿文件（只有墓碑 / 改名后的 `c.md`），
+  //    正是"基准文件被误判同占"的那种形状。上传必须能摘墓碑，否则物化时还会被过滤一次。
+  const replaced = await uploadSkillDraftFile(
+    draft.id,
+    { fileName: 'a.md', path: 'references/a.md', bytes: Buffer.from('# replaced'), replace: true },
+    viewer,
+  )
+  check(
+    '替换基准文件带 `replace=1` ⇒ 成功，且墓碑被摘掉（不变量 ①）',
+    replaced.file.size === Buffer.byteLength('# replaced') &&
+      replaced.draft.files.some((file) => file.path === 'references/a.md') &&
+      !replaced.draft.removedPaths.includes('references/a.md'),
+  )
+  let replacedNoFlag: unknown = null
+  try {
+    await uploadSkillDraftFile(
+      draft.id,
+      { fileName: 'a.md', path: 'references/a.md', bytes: Buffer.from('# again') },
+      viewer,
+    )
+  } catch (error) {
+    replacedNoFlag = error
+  }
+  check('不带 `replace` 的同名上传仍 400（不静默覆盖）', replacedNoFlag !== null && (replacedNoFlag as { code?: unknown }).code === 'VALIDATION')
+
+  let conflict: unknown = null
+  try {
+    await renameSkillDraftPath(draft.id, { from: 'references/c.md', to: 'references/b.md', kind: 'FILE' }, viewer)
+  } catch (error) {
+    conflict = error
+  }
+  check(
+    '目标冲突缺省 400（不静默覆盖）',
+    conflict !== null && (conflict as { code?: unknown }).code === 'VALIDATION',
+  )
+
+  current = (await renameSkillDraftPath(draft.id, { from: 'references', to: 'docs', kind: 'DIR' }, viewer))
+  check(
+    '目录重命名：前缀内文件全部搬走',
+    current.files.some((file) => file.path === 'docs/c.md') &&
+      current.files.some((file) => file.path === 'docs/b.md') &&
+      !current.files.some((file) => file.path.startsWith('references/')),
+  )
+
+  current = (await removeSkillDraftPath(draft.id, { path: 'docs', recursive: true }, viewer))
+  check(
+    '目录递归删除：草稿文件移除 + 路径进墓碑',
+    !current.files.some((file) => file.path.startsWith('docs/')) &&
+      // 重命名后目标目录里是"新写的草稿文件"，删除只进 `files` 移除（墓碑记源路径）。
+      // 这里直接断言"所有 docs 下的对象被回收、且不再出现在 files 里"。
+      current.files.length === 1 &&
+      current.files[0]?.path === 'scripts/run.py',
+  )
+
+  current = (await writeSkillDraftFileContent(draft.id, { path: 'docs/b.md', text: '# again' }, viewer)).draft
+  check(
+    '改回被删路径 ⇒ 自动摘墓碑（同一路径不同时在 files 与 removedPaths）',
+    current.files.some((file) => file.path === 'docs/b.md') && !current.removedPaths.includes('docs/b.md'),
+  )
+  check(
+    '改回被删路径 ⇒ 路径回到 files、墓碑摘掉',
+    current.files.some((file) => file.path === 'docs/b.md') && !current.removedPaths.includes('docs/b.md'),
+  )
+  check(
+    '被改名搬走的源路径不进墓碑（草稿对象只换键；`files` 里也没有它）',
+    !current.removedPaths.includes('references/a.md') && !current.files.some((file) => file.path === 'references/a.md'),
+  )
+
+  let entryGuard: unknown = null
+  try {
+    await removeSkillDraftPath(draft.id, { path: 'SKILL.md', recursive: false }, viewer)
+  } catch (error) {
+    entryGuard = error
+  }
+  check('删除 SKILL.md ⇒ 400（守卫）', entryGuard !== null && (entryGuard as { code?: unknown }).code === 'VALIDATION')
+
+  let traversal: unknown = null
+  try {
+    await removeSkillDraftPath(draft.id, { path: '../escape.md', recursive: false }, viewer)
+  } catch (error) {
+    traversal = error
+  }
+  check('`..` 路径被拒（400）', traversal !== null && (traversal as { code?: unknown }).code === 'VALIDATION')
+
+  const serviceSource = stripComments(readFileSync(new URL('../src/services/skillDraft.service.ts', import.meta.url), 'utf8'))
+  check(
+    '物化处都传了墓碑（REVISION / SESSION_OVERRIDE / PROPOSAL 贯通）',
+    // 三处物化入口都按墓碑过滤：REVISION / SESSION_OVERRIDE 走 `mergeFileEntries(..., removedPathsOf(..))`，
+    // PROPOSAL 走 `new Set(removedPathsOf(record))`（整版快照，不并入基准）
+    (serviceSource.match(/mergeFileEntries\([^;]*?removedPathsOf\(/gu) ?? []).length >= 2 &&
+      serviceSource.includes('const removed = new Set(removedPathsOf(record))'),
   )
 }
 

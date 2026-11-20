@@ -65,21 +65,29 @@ export function binsOf(text: string): string[] {
   return [...new Set(text.split(/[,，\s]+/u).map((item) => item.trim()).filter((item) => item !== ''))]
 }
 
-/** 审核文件树里的一行：基准 / 草稿的文件身份 + 改动状态 */
-export type SkillReviewFileStatus = 'ADDED' | 'MODIFIED' | 'UNCHANGED'
+/**
+ * 审核文件树里的一行：基准 / 草稿的文件身份 + 改动状态。
+ *
+ * `REMOVED` = 在基准里、但被草稿删除（墓碑 `removedPaths`，P1-24a-7）；`RENAMED` = 重命名后的目标路径
+ * （源路径表现为 `REMOVED`，目标路径表现为 `ADDED` 由组件在 `renameOf` 里覆写成 `RENAMED`）。
+ */
+export type SkillReviewFileStatus = 'ADDED' | 'MODIFIED' | 'REMOVED' | 'RENAMED' | 'UNCHANGED'
 
 export interface SkillReviewFile extends SkillFileEntry {
   status: SkillReviewFileStatus
   /** 该路径在基准版本里存在 */
   inBase: boolean
-  /** 该路径在草稿文件里存在（含替换同名基准文件） */
+  /** 该路径在草稿文件里存在（含替换同名基准文件；被删除的基准文件为 `false`） */
   inDraft: boolean
+  /** 该路径在草稿的墓碑里（已删除） */
+  removed: boolean
 }
 
 /**
  * 合并「草稿正文 + 草稿文件 + 基准文件」成审核文件清单。
  *
  * @param isTargeted `REVISION` / `SESSION_OVERRIDE` 才有基准；`CREATE` 不做改动判定。
+ * @param removedPaths 墓碑（草稿里删除的路径；P1-24a-7）—— 命中的基准文件标 `REMOVED`（仍在树里可取消）。
  */
 export function buildReviewFiles(input: {
   markdown: string
@@ -87,11 +95,13 @@ export function buildReviewFiles(input: {
   draftFiles: readonly SkillDraftFile[]
   baseFiles: readonly SkillFileEntry[]
   isTargeted: boolean
+  removedPaths?: readonly string[]
 }): SkillReviewFile[] {
+  const removed = new Set(input.removedPaths ?? [])
   const baseByPath = new Map(
     input.baseFiles.filter((file) => file.path !== SKILL_ENTRY_PATH).map((file) => [file.path, file]),
   )
-  const draftByPath = new Map(input.draftFiles.map((file) => [file.path, file]))
+  const draftByPath = new Map(input.draftFiles.filter((file) => !removed.has(file.path)).map((file) => [file.path, file]))
   const files: SkillReviewFile[] = []
 
   const entryModified = input.isTargeted && input.markdown !== input.baseMarkdown
@@ -105,13 +115,18 @@ export function buildReviewFiles(input: {
     status: entryModified ? 'MODIFIED' : 'UNCHANGED',
     inBase: input.baseFiles.some((file) => file.path === SKILL_ENTRY_PATH),
     inDraft: true,
+    removed: false,
   })
 
   for (const base of input.baseFiles) {
     if (base.path === SKILL_ENTRY_PATH) continue
+    if (removed.has(base.path)) {
+      files.push({ ...base, status: 'REMOVED', inBase: true, inDraft: false, removed: true })
+      continue
+    }
     const draft = draftByPath.get(base.path)
     if (draft === undefined) {
-      files.push({ ...base, status: 'UNCHANGED', inBase: true, inDraft: false })
+      files.push({ ...base, status: 'UNCHANGED', inBase: true, inDraft: false, removed: false })
       continue
     }
     files.push({
@@ -124,11 +139,12 @@ export function buildReviewFiles(input: {
       status: base.sha256 === draft.sha256 ? 'UNCHANGED' : 'MODIFIED',
       inBase: true,
       inDraft: true,
+      removed: false,
     })
   }
 
   for (const draft of input.draftFiles) {
-    if (baseByPath.has(draft.path)) continue
+    if (removed.has(draft.path) || baseByPath.has(draft.path)) continue
     files.push({
       path: draft.path,
       size: draft.size,
@@ -139,6 +155,7 @@ export function buildReviewFiles(input: {
       status: 'ADDED',
       inBase: false,
       inDraft: true,
+      removed: false,
     })
   }
 

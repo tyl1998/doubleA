@@ -32,6 +32,7 @@ import {
   SKILL_ERROR_CODES,
   appMsg,
   computeSkillDiff,
+  effectiveSkillRuntime,
   isSafeSkillPath,
   isSkillScriptPath,
   mergeSkillThreeWay,
@@ -352,7 +353,7 @@ export async function createProposalDraftFromFork(
     fork: {
       name: fork.name,
       description: fork.description,
-      runtime: fork.runtime,
+      runtime: effectiveSkillRuntime(fork.runtime),
       requiresBins: Array.isArray(fork.requiresBins)
         ? fork.requiresBins.filter((bin): bin is string => typeof bin === 'string')
         : [],
@@ -418,7 +419,7 @@ export async function createProposalDraftFromOverride(
     fork: {
       name: target.name,
       description: target.description,
-      runtime: target.runtime as SkillRuntime,
+      runtime: effectiveSkillRuntime(target.runtime),
       requiresBins: Array.isArray(target.requiresBins)
         ? target.requiresBins.filter((bin): bin is string => typeof bin === 'string')
         : [],

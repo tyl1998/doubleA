@@ -12,10 +12,12 @@
  * 前端**不**拿 `createdBy` 跟当前用户 id 比（那样 ADMIN 在界面上会连自己的编辑入口都没有）。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ② 建 = 上传 zip（没有"只填元数据"的建法）
+ * ② 建 Skill 的入口（P1-24a-6 起有两个）
  * ─────────────────────────────────────────────────────────────────────
- * 内容只能来自包（`PATCH` 不接 markdown / files），手工建出来的会是一个没有 `SKILL.md` 的空壳，
- * 绑上去之后 `load_skill` 必然失败 ⇒ 这里只给「导入 Skill」一个入口。
+ * · **新建 Skill**：填名称 / 用途说明 / 运行时 → 建 `CREATE` 草稿（带一段正文模板）→ 进 `/skills/drafts/:draftId`
+ *   写正文 → 「保存为我的 Skill」存 v1。**创建时就带正文模板**，不产生"只有元数据、没有 `SKILL.md`"的空壳。
+ * · **导入 zip**：内容自带 `SKILL.md`。
+ * 另有两个入口在别处：「另存为 Skill」由 Agent 工具发起（c-4c）；更新既有 Skill 走详情页（REVISION 草稿）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ③ 分页在服务端（`offset/limit/query`）
@@ -25,12 +27,13 @@
  */
 
 import { Alert, Button, Input, Table, Tag, Modal, Upload, type TableColumnsType } from 'antd'
-import { UploadOutlined } from '@ant-design/icons'
-import type { SkillItem } from '@doubulea/shared'
+import { PlusOutlined, UploadOutlined } from '@ant-design/icons'
+import { SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_CHARS, type SkillItem } from '@doubulea/shared'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import { useCreateSkill, useForkSkill, useRemoveSkill, useSkills } from '../../api/skills.js'
+import { useCreateSkillDraft } from '../../api/skillDrafts.js'
 import { useCreateSkillProposalDraft } from '../../api/skillProposals.js'
 import { useFeedback } from '../../app/feedback.js'
 import { useT } from '../../app/i18n.js'
@@ -51,11 +54,16 @@ export function SkillListPage() {
   const [keyword, setKeyword] = useState('')
   const [importOpen, setImportOpen] = useState(false)
   const [pickedFile, setPickedFile] = useState<File | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createName, setCreateName] = useState('')
+  const [createDescription, setCreateDescription] = useState('')
+  const [createRuntime, setCreateRuntime] = useState<'INLINE' | 'SANDBOX'>('INLINE')
   const [transferFor, setTransferFor] = useState<SkillItem | null>(null)
   const [upstreamFor, setUpstreamFor] = useState<SkillItem | null>(null)
 
   const skillsQuery = useSkills({ limit: SKILLS_PAGE_LIMIT, query: keyword })
   const createSkill = useCreateSkill()
+  const createDraft = useCreateSkillDraft()
   const removeSkill = useRemoveSkill()
   const forkSkill = useForkSkill()
   const createProposalDraft = useCreateSkillProposalDraft()
@@ -86,6 +94,41 @@ export function SkillListPage() {
           // 校验失败（`SKILL_IMPORT_INVALID`）的服务端文案带逐条原因（`reasons[]` 拼进 `msg`）
           feedback.fail(error, t('skillList.importFailed'))
         },
+      },
+    )
+  }
+
+  function openCreate(): void {
+    setCreateName('')
+    setCreateDescription('')
+    setCreateRuntime('INLINE')
+    setCreateOpen(true)
+  }
+
+  function closeCreate(): void {
+    setCreateOpen(false)
+  }
+
+  /** 新建 Skill：建一个带正文模板的 CREATE 草稿 → 进编辑页写正文 → 保存 v1（P1-24a-6） */
+  function submitCreate(): void {
+    const name = createName.trim()
+    const description = createDescription.trim()
+    if (name === '' || description === '') return
+    createDraft.mutate(
+      {
+        kind: 'CREATE',
+        name,
+        description,
+        runtime: createRuntime,
+        // 正文模板随创建一起写进草稿：即使编辑器里一个字没改，也不会存出"只有元数据的空壳"
+        markdown: t('skillList.createBodyTemplate', { name }),
+      },
+      {
+        onSuccess: (draft) => {
+          closeCreate()
+          navigate(skillDraftPath(draft.id))
+        },
+        onError: (error) => feedback.fail(error, t('skillList.createFailed')),
       },
     )
   }
@@ -184,14 +227,16 @@ export function SkillListPage() {
               <Tag className="tag--warn">{t('skillBadge.sandbox')}</Tag>
               <span className="ratio">{t('skillBadge.sandboxHint')}</span>
             </>
-          ) : (
+          ) : skill.runtime === 'INLINE' ? (
             <Tag>{t('skillBadge.inline')}</Tag>
+          ) : (
+            <Tag>{t('skillBadge.undeclared')}</Tag>
           )}
           {skill.hasScripts && <Tag color="orange">{t('skillBadge.hasScripts')}</Tag>}
-          {skill.runtime === 'INLINE' && !skill.hasScripts && (
+          {skill.runtime !== 'SANDBOX' && !skill.hasScripts && (
             <span className="ratio">{t('skillBadge.inlineBindable')}</span>
           )}
-          {skill.runtime === 'INLINE' && skill.hasScripts && (
+          {skill.runtime !== 'SANDBOX' && skill.hasScripts && (
             <span className="ratio">{t('skillBadge.scriptTaskAgentOnly')}</span>
           )}
         </span>
@@ -333,6 +378,9 @@ export function SkillListPage() {
         <Link to={SKILL_DRAFTS_PATH}>
           <Button>{t('skillDraftList.entry')}</Button>
         </Link>
+        <Button icon={<PlusOutlined />} onClick={openCreate}>
+          {t('skillList.create')}
+        </Button>
         <Button type="primary" onClick={() => setImportOpen(true)}>
           {t('skillList.import')}
         </Button>
@@ -395,9 +443,12 @@ export function SkillListPage() {
             lead={keyword.trim() === '' ? t('skillList.emptyLead') : t('skillList.noMatchLead')}
             action={
               keyword.trim() === '' ? (
-                <Button type="primary" onClick={() => setImportOpen(true)}>
-                  {t('skillList.import')}
-                </Button>
+                <div className="row row--wrap" style={{ gap: 'var(--sp-2)', justifyContent: 'center' }}>
+                  <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+                    {t('skillList.create')}
+                  </Button>
+                  <Button onClick={() => setImportOpen(true)}>{t('skillList.import')}</Button>
+                </div>
               ) : (
                 <Button onClick={() => setKeyword('')}>{t('skillList.clearFilter')}</Button>
               )
@@ -421,6 +472,60 @@ export function SkillListPage() {
           />
         </div>
       )}
+
+      <Modal
+        open={createOpen}
+        title={t('skillList.createTitle')}
+        okText={t('skillList.createOk')}
+        cancelText={t('common.cancel')}
+        okButtonProps={{
+          disabled: createName.trim() === '' || createDescription.trim() === '',
+          loading: createDraft.isPending,
+        }}
+        onOk={submitCreate}
+        onCancel={closeCreate}
+        maskClosable={!createDraft.isPending}
+      >
+        <div className="stack stack--tight">
+          <p className="ratio">{t('skillList.createLead')}</p>
+          <div>
+            <p className="block-label">{t('skillList.createName')}</p>
+            <Input
+              value={createName}
+              maxLength={SKILL_NAME_MAX_CHARS}
+              placeholder={t('skillList.createNameRequired')}
+              onChange={(event) => setCreateName(event.target.value)}
+            />
+          </div>
+          <div>
+            <p className="block-label">{t('skillList.createDescription')}</p>
+            <Input.TextArea
+              rows={3}
+              value={createDescription}
+              maxLength={SKILL_DESCRIPTION_MAX_CHARS}
+              placeholder={t('skillList.createDescriptionRequired')}
+              onChange={(event) => setCreateDescription(event.target.value)}
+            />
+            <p className="ratio">{t('skillList.createDescriptionHint')}</p>
+          </div>
+          <div>
+            <p className="block-label">{t('skillList.createRuntime')}</p>
+            <div className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+              {(['INLINE', 'SANDBOX'] as const).map((option) => (
+                <Button
+                  key={option}
+                  size="small"
+                  type={createRuntime === option ? 'primary' : 'default'}
+                  onClick={() => setCreateRuntime(option)}
+                >
+                  {t(option === 'SANDBOX' ? 'skillList.createRuntimeSandbox' : 'skillList.createRuntimeInline')}
+                </Button>
+              ))}
+            </div>
+            <p className="ratio">{t('skillList.createRuntimeHint')}</p>
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         open={importOpen}

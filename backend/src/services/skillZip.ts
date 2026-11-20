@@ -38,6 +38,7 @@ import {
   SKILL_DESCRIPTION_MAX_CHARS,
   checkSkillRuntimeConsistency,
   isSafeSkillPath,
+  isSkillScriptPath,
   skillDescriptionWithinLimit,
   type SkillRuntime,
 } from '@doubulea/shared'
@@ -72,13 +73,16 @@ export interface SkillFrontmatter {
 /** 一个**通过全部校验**的 Skill 包（还不含 slug / 名称判重 —— 那要看 DB） */
 export interface ParsedSkillZip {
   frontmatter: SkillFrontmatter
-  runtime: SkillRuntime
+  /** `null` = 包内没声明 `requires.runtime`（第三方 Skill 的常态；无脚本时能力等同 INLINE） */
+  runtime: SkillRuntime | null
   requiresBins: string[]
   files: SkillZipEntry[]
   /** `SKILL.md` 的文本（frontmatter 已解析；正文原样） */
   entryMarkdown: string
   /** `SKILL.md` 的正文长度（码点；a-2 写库前的"太长了"提示可用） */
   totalBytes: number
+  /** 包内没写 `name` 时的兜底名（SKILL.md 所在目录名，或正文一级标题；可能为空串） */
+  nameHint: string
 }
 
 // ───────────────────────────── zip 结构 ─────────────────────────────
@@ -95,6 +99,36 @@ const S_IFREG = 0o100000
 /** `.zip` 的 32 位上限与"需要 ZIP64"的哨兵值 */
 const ZIP32_MAX = 0xffff
 const UINT32_MAX = 0xffffffff
+
+/**
+ * 桌面压缩工具自动塞进来的**元数据垃圾**（不是 Skill 内容，也不该计入文件数与体积）。
+ *
+ * 为什么必须过滤而不是"当普通文件收下"：`__MACOSX/._SKILL.md` 这类文件是 AppleDouble
+ * 资源分叉，会被当成 `references/` 之外的杂项入库；`Thumbs.db` / `desktop.ini` 同理。
+ * 用户是在 Finder / 资源管理器里右键压缩的，这些文件他们根本看不见。
+ */
+function isJunkPath(path: string): boolean {
+  if (path.startsWith('__MACOSX/') || path === '__MACOSX') return true
+  return path
+    .split('/')
+    .some((segment) => segment === '.DS_Store' || segment === 'Thumbs.db' || segment === 'desktop.ini' || segment.startsWith('._'))
+}
+
+/**
+ * 找一个包的 **Skill 根**（返回要剥掉的顶层前缀）。
+ *
+ * · 根上有 `SKILL.md` ⇒ `''`（扁平包逐字不变）；
+ * · 否则若包里**只有一个** `.../SKILL.md` ⇒ 以它所在目录为根，支持
+ *   `repo/skills/x/SKILL.md` 这类多层包（旧实现只剥一层，多一层就报"缺少 SKILL.md"）；
+ * · 找不到 / 多个候选 ⇒ `''`（交给"缺少 SKILL.md"的报错说明）。
+ */
+function skillRootPrefixOf(paths: readonly string[]): string {
+  if (paths.includes(SKILL_ENTRY_PATH)) return ''
+  const candidates = paths.filter((path) => path.endsWith(`/${SKILL_ENTRY_PATH}`))
+  if (candidates.length !== 1) return ''
+  const entry = candidates[0]
+  return entry === undefined ? '' : entry.slice(0, entry.length - SKILL_ENTRY_PATH.length)
+}
 
 interface CentralEntry {
   name: string
@@ -241,6 +275,7 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   xls: 'application/vnd.ms-excel',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xmind: 'application/x-xmind',
   pdf: 'application/pdf',
   png: 'image/png',
   jpg: 'image/jpeg',
@@ -257,11 +292,19 @@ function mimeOf(path: string): string {
 
 // ───────────────────────────── frontmatter ─────────────────────────────
 
-/** 极简 YAML 子集解析：只认 Skill frontmatter 实际会用的 `key: value` 与一层 `嵌套:`（`requires`） */
+/**
+ * 极简 YAML 子集解析：`key: value`、一层嵌套（`requires`）、以及 `description: |` / `>` 块标量。
+ *
+ * 为什么不引完整 YAML 库：frontmatter 只有十来个键；但**块标量**必须支持 ——
+ * 官方 Skill 模板里多行 description 常写成 `description: >-` 接缩进段落，
+ * 不认识它就会把后续每一行都当成顶层键（描述变成 `>-`，或把正文里的 `xxx:` 误解析成字段）。
+ */
 export function parseSimpleYaml(text: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   let currentMap: Record<string, unknown> | null = null
-  for (const rawLine of text.split(/\r?\n/u)) {
+  const lines = text.split(/\r?\n/u)
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index] ?? ''
     if (rawLine.trim() === '' || rawLine.trim().startsWith('#')) continue
     const indented = /^\s+/u.test(rawLine)
     const line = rawLine.trim()
@@ -269,6 +312,26 @@ export function parseSimpleYaml(text: string): Record<string, unknown> {
     if (colon <= 0) continue
     const key = line.slice(0, colon).trim()
     const valueText = line.slice(colon + 1).trim()
+
+    // 块标量：`|` / `>`（可带 `-` / `+` 的 chomping 标记）
+    if (/^[|>][+-]?$/u.test(valueText)) {
+      const folded = valueText.startsWith('>')
+      const block: string[] = []
+      while (index + 1 < lines.length) {
+        const next = lines[index + 1] ?? ''
+        if (next.trim() !== '' && !/^\s+/u.test(next)) break
+        block.push(next.trim() === '' ? '' : next.replace(/^\s{1,4}/u, ''))
+        index += 1
+      }
+      const value = (folded ? block.join(' ') : block.join('\n')).trim()
+      if (indented && currentMap !== null) currentMap[key] = value
+      else {
+        out[key] = value
+        currentMap = null
+      }
+      continue
+    }
+
     if (indented && currentMap !== null) {
       currentMap[key] = parseScalar(valueText)
       continue
@@ -316,39 +379,43 @@ interface ParsedMarkdown {
 /**
  * 拆 `SKILL.md`：`---` frontmatter + 正文。
  *
- * 失败（没有 frontmatter / 不是对象 / `description` 缺失）一律抛 `SKILL_IMPORT_INVALID`：
- * `description` 是**模型选择 Skill 的唯一依据**（`子方案` §2.2），缺了它这个 Skill
- * 在目录里就是一行没有用途说明的 slug —— 与其入库后让用户自己发现，不如导入时就说清楚。
+ * **放宽口径（2026-11-19）**：第三方 / 本地 Skill 不写 frontmatter、不写 `requires.*` 是常态，
+ * 导入不再因此失败：
+ * · 没有 frontmatter ⇒ 按空对象处理（正文里的一级标题 / 首段作为 description 兜底）；
+ * · `description` 为空 ⇒ 从正文兜底；兜底后还是空才拒绝（它是模型选择 Skill 的唯一依据）；
+ * · `requires.runtime` 缺失 / 写成别的值（如 `python`）⇒ 视为**未声明**，不报错。
+ * 有结束标记缺失这种"文件本身坏了"的情况仍然直接拒。
  */
 function parseSkillMarkdown(markdown: string): ParsedMarkdown {
   const normalized = markdown.replace(/^\uFEFF/u, '')
-  if (!normalized.startsWith('---')) {
-    throw importError([`${SKILL_ENTRY_PATH} 缺少 YAML frontmatter（文件必须以 "---" 开头）`])
+  const hasFrontmatter = normalized.startsWith('---')
+  let headerText = ''
+  let body = normalized
+  if (hasFrontmatter) {
+    const end = normalized.indexOf('\n---', 3)
+    if (end < 0) {
+      throw importError([`${SKILL_ENTRY_PATH} 的 frontmatter 没有结束标记 "---"`])
+    }
+    headerText = normalized.slice(3, end)
+    body = normalized.slice(end + 4).replace(/^\r?\n/u, '')
   }
-  const end = normalized.indexOf('\n---', 3)
-  if (end < 0) {
-    throw importError([`${SKILL_ENTRY_PATH} 的 frontmatter 没有结束标记 "---"`])
-  }
-  const headerText = normalized.slice(3, end)
-  const body = normalized.slice(end + 4).replace(/^\r?\n/u, '')
-  const raw = parseSimpleYaml(headerText)
+  const raw = hasFrontmatter ? parseSimpleYaml(headerText) : {}
   const requiresRaw = raw.requires
   const requires =
     requiresRaw !== null && typeof requiresRaw === 'object' && !Array.isArray(requiresRaw)
       ? (requiresRaw as Record<string, unknown>)
       : {}
 
-  const description = typeof raw.description === 'string' ? raw.description.trim() : ''
+  const declared = typeof raw.description === 'string' ? raw.description.trim() : ''
+  const description = declared !== '' ? declared : descriptionFromBody(body)
   const reasons: string[] = []
   if (description === '') reasons.push(`${SKILL_ENTRY_PATH} 的 frontmatter 缺少 description（写明什么时候用这个 Skill）`)
   if (description !== '' && !skillDescriptionWithinLimit(description)) {
     reasons.push(`description 超长（上限 ${String(SKILL_DESCRIPTION_MAX_CHARS)} 个字符），请精简后再导入`)
   }
   const runtimeRaw = typeof requires.runtime === 'string' ? requires.runtime.trim().toLowerCase() : ''
-  const runtime = runtimeRaw === '' ? 'inline' : runtimeRaw
-  if (runtime !== 'inline' && runtime !== 'sandbox') {
-    reasons.push(`requires.runtime 只能是 inline / sandbox（收到 "${runtimeRaw}"）`)
-  }
+  // 只认两个合法值；其余（含拼错 / 写成解释器名）一律按"未声明"处理，不再 400
+  const runtime = runtimeRaw === 'inline' || runtimeRaw === 'sandbox' ? runtimeRaw : undefined
   if (reasons.length > 0) throw importError(reasons)
 
   const binsRaw = requires.bins
@@ -361,7 +428,7 @@ function parseSkillMarkdown(markdown: string): ParsedMarkdown {
       ...(typeof raw.name === 'string' && raw.name.trim() !== '' ? { name: raw.name.trim() } : {}),
       description,
       requires: {
-        runtime,
+        ...(runtime === undefined ? {} : { runtime }),
         ...(requires.scripts === true ? { scripts: true } : {}),
         ...(bins.length > 0 ? { bins } : {}),
       },
@@ -369,6 +436,44 @@ function parseSkillMarkdown(markdown: string): ParsedMarkdown {
     },
     body,
   }
+}
+
+/** 正文里的一级标题（没有 frontmatter 的纯 Markdown Skill 常见） */
+function firstHeadingOf(markdown: string): string {
+  const match = /^\s{0,3}#{1,6}\s+(.+)$/mu.exec(markdown)
+  const text = match?.[1] ?? ''
+  return text.replace(/\s*#+\s*$/u, '').trim()
+}
+
+/**
+ * 把正文首段当作 `description` 兜底（**只对"作者没写"生效**，不覆盖作者写的值）。
+ *
+ * 优先正文首段（标题下面的第一行说明），没有段落才退回第一个标题。
+ * 截断在 {@link SKILL_DESCRIPTION_MAX_CHARS} 以内：这段文字是平台代描述的，不是作者原文。
+ */
+function descriptionFromBody(body: string): string {
+  const paragraph: string[] = []
+  for (const rawLine of body.split(/\r?\n/u)) {
+    const line = rawLine.trim()
+    if (line === '' || line === '---' || line.startsWith('```')) continue
+    if (/^#{1,6}\s+/u.test(line)) continue
+    paragraph.push(line.replace(/^[-*+]\s+/u, '').replace(/^>\s*/u, '').trim())
+    break
+  }
+  const text = paragraph[0] ?? firstHeadingOf(body)
+  return [...text].slice(0, SKILL_DESCRIPTION_MAX_CHARS).join('').trim()
+}
+
+/**
+ * 包内没写 `name` 时的兜底：`SKILL.md` 所在目录名，其次正文一级标题。
+ *
+ * 目录名比"随机 slug"有用得多：`xmind-file-decomposer/SKILL.md` 直接就是 **xmind-file-decomposer**。
+ */
+function nameHintOf(prefix: string, declared: string | undefined, markdown: string): string {
+  if (declared !== undefined && declared !== '') return declared
+  const dir = prefix.split('/').filter((segment) => segment !== '').pop()
+  if (dir !== undefined && dir !== '') return dir
+  return firstHeadingOf(markdown)
 }
 
 // ───────────────────────────── 错误出口 ─────────────────────────────
@@ -414,15 +519,39 @@ export function parseSkillZip(
   // Windows 打出来的包里"目录"不一定是 `dir/`，但 external attributes 的 `FILE_ATTRIBUTE_DIRECTORY`
   // (0x10) 会在低 16 位；两种判法并上，避免把一个目录当文件读
   const isDirEntry = (entry: CentralEntry): boolean => entry.isDirectory || (entry.externalAttributes & 0x10) !== 0
-  const fileEntries = entries.filter((entry) => !isDirEntry(entry))
+  // 桌面压缩工具的元数据（`__MACOSX/` / `.DS_Store` / `Thumbs.db` / `desktop.ini` / `._*`）
+  // **先剔掉再计数**：它们既不该占文件数配额，也不该被当成 Skill 内容入库（见 {@link isJunkPath}）
+  const fileEntries = entries.filter(
+    (entry) => !isDirEntry(entry) && !isJunkPath(normalizeZipPath(entry.name.replace(/\\/gu, '/'))),
+  )
   if (fileEntries.length > limits.maxFiles) {
     reasons.push(`文件数超限：${String(fileEntries.length)} 个（上限 ${String(limits.maxFiles)}）`)
   }
 
+  /**
+   * 归一化的路径（剥掉 `SKILL.md` 所在目录之上的那层前缀；见 {@link skillRootPrefixOf}）。
+   *
+   * ⚠️ 只在根上没有 `SKILL.md` 时才剥 —— 已经合法的扁平包路径逐字不变（回归里逐条比对）。
+   */
+  const rawPaths = fileEntries.map((entry) => normalizeZipPath(entry.name.replace(/\\/gu, '/')))
+  const skillRootPrefix = skillRootPrefixOf(rawPaths)
+
   const parsed: SkillZipEntry[] = []
   let totalBytes = 0
-  for (const entry of fileEntries) {
-    const path = normalizeZipPath(entry.name.replace(/\\/gu, '/'))
+  for (let index = 0; index < fileEntries.length; index += 1) {
+    const entry = fileEntries[index]
+    const normalized = rawPaths[index]
+    if (entry === undefined || normalized === undefined) continue
+    // 多层包：`SKILL.md` 所在目录之外的东西不属于这个 Skill（README / 其他目录一律不收）
+    if (skillRootPrefix !== '' && !normalized.startsWith(skillRootPrefix)) continue
+    // 剥前缀**只在路径确实以它开头时**做；剥完为空（该条就是顶层目录本身）⇒ 跳过
+    const path =
+      skillRootPrefix !== '' && normalized.startsWith(skillRootPrefix)
+        ? normalized.slice(skillRootPrefix.length)
+        : normalized
+    if (path === '') continue
+    // 垃圾条目**不读字节**（它们的字节只会污染总体积与压缩比）
+    if (isJunkPath(normalized)) continue
     if (!isSafeSkillPath(path)) {
       reasons.push(`不允许的路径（绝对路径 / .. / 盘符 / 反斜杠 / 空段）：${entry.name}`)
       continue
@@ -472,6 +601,7 @@ export function parseSkillZip(
   }
 
   // ── ③ 重名（大小写敏感；同一路径出现两次会让 `@@unique([skillId, version, path])` 落库炸 500）──
+  // ⚠️ 必须比**剥前缀之后**的路径：`<dir>/SKILL.md` 与 `SKILL.md` 剥完会撞成同一条
   const seen = new Set<string>()
   for (const entry of parsed) {
     if (seen.has(entry.path)) {
@@ -485,20 +615,43 @@ export function parseSkillZip(
   const entry = parsed.find((item) => item.path === SKILL_ENTRY_PATH)
   if (entry === undefined) {
     reasons.push(`缺少 ${SKILL_ENTRY_PATH}（必须放在包根目录）`)
+    // 额外给一条**可操作**的线索：用户在 Finder / 资源管理器里"右键文件夹压缩"时，
+    // 包里会多一层目录，而这里因为"顶层混有散文件 / 有多个顶层目录"没能自动剥掉
+    const heads = new Set(
+      parsed.map((item) => item.path.slice(0, Math.max(item.path.indexOf('/'), 0))).filter((head) => head !== ''),
+    )
+    if (skillRootPrefix === '' && heads.size === 1) {
+      reasons.push(`压缩包顶层除目录外还有散文件；请在 Skill 目录内部全选文件后压缩（根目录直接是 ${SKILL_ENTRY_PATH}）`)
+    } else if (heads.size > 1) {
+      reasons.push(
+        `压缩包里有多个顶层目录（${[...heads].slice(0, 5).join(' / ')}）；请只打包一个 Skill 目录，或在 Skill 目录内部全选文件后压缩`,
+      )
+    }
   }
   if (reasons.length > 0 || entry === undefined) throw importError(reasons)
 
-  // ── ⑤ frontmatter（含 description 校验）──
+  // ── ⑤ frontmatter（字段尽量兜底，缺什么补什么而不是直接拒）──
   const markdown = entry.bytes.toString('utf8')
   const { frontmatter } = parseSkillMarkdown(markdown)
 
-  // ── ⑥ runtime 一致性（DB 字段是真相源，但导入时两边必须说同一件事）──
+  // ── ⑥ runtime：声明就尊重，没声明就留空；有脚本一律 sandbox（不再报错）──
   const rawRuntime = frontmatter.requires.runtime
-  const runtime = (rawRuntime === 'sandbox' ? 'SANDBOX' : 'INLINE') as SkillRuntime
-  if (options.expectedRuntime !== undefined && options.expectedRuntime !== runtime) {
-    throw importError([
-      `请求声明的运行时（${options.expectedRuntime}）与 ${SKILL_ENTRY_PATH} 里的 requires.runtime（${SKILL_RUNTIMES[runtime === 'SANDBOX' ? 1 : 0].toLowerCase()}）不一致`,
-    ])
+  const declaredRuntime: SkillRuntime | null =
+    rawRuntime === 'sandbox' ? 'SANDBOX' : rawRuntime === 'inline' ? 'INLINE' : null
+  const hasScriptFiles = parsed.some((item) => isSkillScriptPath(item.path))
+  const forcesSandbox = frontmatter.requires.scripts === true || hasScriptFiles
+  let runtime: SkillRuntime | null = forcesSandbox ? 'SANDBOX' : declaredRuntime
+  if (options.expectedRuntime !== undefined) {
+    if (runtime === null) {
+      // 包内没声明 ⇒ 尊重调用方显式选择
+      runtime = options.expectedRuntime
+    } else if (options.expectedRuntime !== runtime) {
+      throw importError([
+        `请求声明的运行时（${options.expectedRuntime}）与 ${SKILL_ENTRY_PATH} 里的 requires.runtime（${SKILL_RUNTIMES[
+          runtime === 'SANDBOX' ? 1 : 0
+        ].toLowerCase()}）不一致`,
+      ])
+    }
   }
   const consistency = checkSkillRuntimeConsistency({
     runtime,
@@ -514,6 +667,7 @@ export function parseSkillZip(
     files: parsed,
     entryMarkdown: markdown,
     totalBytes,
+    nameHint: nameHintOf(skillRootPrefix, frontmatter.name, markdown),
   }
 }
 
@@ -540,7 +694,8 @@ export function stripFrontmatter(markdown: string): string {
 export function composeSkillMarkdown(input: {
   name: string
   description: string
-  runtime: SkillRuntime
+  /** `null` = 未声明：不写 `requires.runtime`（有脚本时会自动补 `runtime: sandbox`） */
+  runtime: SkillRuntime | null
   requiresScripts: boolean
   requiresBins: readonly string[]
   body: string
@@ -561,12 +716,18 @@ export function composeSkillMarkdown(input: {
     const rendered = yamlValue(value)
     if (rendered !== null) lines.push(`${key}: ${rendered}`)
   }
-  lines.push('requires:')
-  lines.push(`  runtime: ${input.runtime === 'SANDBOX' ? 'sandbox' : 'inline'}`)
-  if (input.requiresScripts) lines.push('  scripts: true')
-  if (input.requiresBins.length > 0) {
-    lines.push(`  bins: [${input.requiresBins.map((bin) => yamlScalar(bin)).join(', ')}]`)
+  const requiresLines: string[] = []
+  if (input.requiresScripts) {
+    // 有脚本就必须是 sandbox（即使库里是"未声明"）
+    requiresLines.push('  runtime: sandbox')
+  } else if (input.runtime !== null) {
+    requiresLines.push(`  runtime: ${input.runtime === 'SANDBOX' ? 'sandbox' : 'inline'}`)
   }
+  if (input.requiresScripts) requiresLines.push('  scripts: true')
+  if (input.requiresBins.length > 0) {
+    requiresLines.push(`  bins: [${input.requiresBins.map((bin) => yamlScalar(bin)).join(', ')}]`)
+  }
+  if (requiresLines.length > 0) lines.push('requires:', ...requiresLines)
   lines.push('---', '', input.body)
   return lines.join('\n')
 }

@@ -33,6 +33,7 @@ import {
   SKILL_ERROR_CODES,
   appMsg,
   computeSkillDiff,
+  effectiveSkillRuntime,
   isSkillScriptPath,
   mergeSkillThreeWay,
   skillStoragePrefix,
@@ -396,7 +397,7 @@ export async function forkSkill(
     entryMarkdown: entryRewriter({
       name,
       description: source.description,
-      runtime: source.runtime,
+      runtime: effectiveSkillRuntime(source.runtime),
       requiresBins: requiresBinsOf(source.requiresBins),
       manifest: source.manifest,
     }),
@@ -405,7 +406,7 @@ export async function forkSkill(
     viewer,
     name,
     description: source.description,
-    runtime: source.runtime,
+    runtime: effectiveSkillRuntime(source.runtime),
     requiresBins: requiresBinsOf(source.requiresBins),
     manifest: source.manifest,
     parentSkillId: source.id,
@@ -600,7 +601,7 @@ export async function syncSkillUpstream(
   const requiresBins = requiresBinsOf(parent.requiresBins)
   let files: { path: string; bytes: Buffer; mime: string; sha256: string }[]
   let strategyLabel = 'fast-forward'
-  let savedRuntime: SkillRuntime = parent.runtime
+  let savedRuntime: SkillRuntime = effectiveSkillRuntime(parent.runtime)
   if (body.strategy === 'FAST_FORWARD') {
     const comparison = await compareForkWithBase(fork, parent.id)
     if (!comparison.comparable || !comparison.matches) {
@@ -621,7 +622,7 @@ export async function syncSkillUpstream(
       entryMarkdown: entryRewriter({
         name: fork.name,
         description: parent.description,
-        runtime: parent.runtime,
+        runtime: effectiveSkillRuntime(parent.runtime),
         requiresBins,
         manifest: parent.manifest,
       }),
@@ -680,7 +681,7 @@ export async function syncSkillUpstream(
       })
     }
     const requiresScripts = chosen.some((file) => isSkillScriptPath(file.path))
-    const movedRuntime: SkillRuntime = requiresScripts ? 'SANDBOX' : parent.runtime
+    const movedRuntime: SkillRuntime = requiresScripts ? 'SANDBOX' : effectiveSkillRuntime(parent.runtime)
     savedRuntime = movedRuntime
     const entryBytes = Buffer.from(
       composeSkillMarkdown({
@@ -830,7 +831,7 @@ export async function promoteConversationSkillOverride(
       code: SKILL_ERROR_CODES.DRAFT_INVALID,
     })
   }
-  if (source.runtime === 'INLINE' && rows.some((row) => row.path.startsWith('scripts/'))) {
+  if (effectiveSkillRuntime(source.runtime) === 'INLINE' && rows.some((row) => row.path.startsWith('scripts/'))) {
     throw AppError.validation(appMsg('app.m323', { p0: source.name }), {
       code: SKILL_ERROR_CODES.IMPORT_INVALID,
     })
@@ -847,7 +848,7 @@ export async function promoteConversationSkillOverride(
     entryMarkdown: entryRewriter({
       name,
       description: source.description,
-      runtime: source.runtime,
+      runtime: effectiveSkillRuntime(source.runtime),
       requiresBins,
       manifest: source.manifest,
     }),
@@ -856,7 +857,7 @@ export async function promoteConversationSkillOverride(
     viewer,
     name,
     description: source.description,
-    runtime: source.runtime,
+    runtime: effectiveSkillRuntime(source.runtime),
     requiresBins,
     manifest: source.manifest,
     parentSkillId: source.id,

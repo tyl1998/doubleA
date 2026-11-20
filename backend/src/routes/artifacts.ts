@@ -78,6 +78,7 @@ import { renderDocxToHtml } from '../services/docxPreview.js'
 import { buildContentDisposition } from '../services/document.service.js'
 import { HTML_PREVIEW_CSP, previewHeadersFor } from '../services/previewHeaders.js'
 import { parseXlsx, renderXlsxToHtml } from '../services/xlsxPreview.js'
+import { parseXmind } from '../services/xmindPreview.js'
 
 /**
  * 取调用者 —— **只取 `id`**（会话族不按角色判权，见 `conversation.service.ts` 文件头 ①）。
@@ -296,8 +297,8 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
    *
    * ★ **为什么是独立出口，而不是塞进 `/content`**：`/content` 是**字节代理** ——
    * 它的 `Content-Type` **唯一来源是 `artifacts.mime`**（判据 ⑤）。DOCX / XLSX 的原始字节是二进制 OOXML，
-   * 把它们当 `text/html` 直出是错的、也不安全。所以"取原始字节"（`/content`）与"渲染成 HTML"
-   * （本出口，`Content-Type` 来自**渲染产物**而非原始 mime）**必须是两条 URL**
+   * 把它们当 `text/html` 直出是错的、也不安全。所以"取原始字节"（`/content`）
+   * 与"渲染成 HTML"（本出口，`Content-Type` 来自**渲染产物**而非原始 mime）**必须是两条 URL**
    * （与 §三 1"两条出口不是一个端点加参数"同一条纪律）。
    *
    * ★ 转换器按形态分派（`previewKindOf`）：`docx` → `renderDocxToHtml`（mammoth）；
@@ -305,6 +306,7 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
    *
    * ★ 前端**只对 `previewKindOf(mime) ∈ {docx, xlsx}` 的产物**打这个端点（`artifactRenderUrl`），
    * 但 URL 可以手敲 ⇒ 这里按 mime **自己再判一次**：不是这两种形态一律 400。
+   * ⚠️ `xmind` **不走这里**：它走 `/outline`（结构化 JSON，前端画树），见本文件末尾那条路由。
    *
    * 归属判据复用 {@link openArtifactSource}（与下载 / 预览**同一条**，别人的产物 404）；
    * 隔离头复用 {@link HTML_PREVIEW_CSP}（文件头第 ① 条：响应头才是第一道，iframe 属性只是第二道）。
@@ -347,6 +349,43 @@ export function registerArtifactRoutes(app: FastifyInstance): void {
         .header('x-content-type-options', 'nosniff')
         .header('cache-control', 'private, no-store')
         .send(html)
+    },
+  )
+
+  /**
+   * 大纲预览（`GET /api/artifacts/:id/outline`）—— **XMIND 专用**（2026-11-20）。
+   *
+   * ★ 为什么是第三条出口，而不是继续塞进 `/render`：`.xmind` 的形态是**一棵可任意深的树**
+   * （真实数据：933 节点 / 7 层），服务端把它画成 HTML 只会有两种结果 —— 画布式版式在视口里
+   * 必然溢出、列表式版式丢层级感。所以服务端**只解包**（`parseXmind` → JSON），
+   * 由前端 `XmindOutlinePreview` 渲染"左树 + 右阅读区"，单节点正文按需展开。
+   * `/content` 仍然只回原始字节（zip ⇒ `attachment`），与 docx/xlsx 同一条纪律。
+   *
+   * 归属判据复用 {@link openArtifactSource}（别人的产物 404）；体积闸门复用
+   * `ARTIFACT_PREVIEW_MAX_INLINE_BYTES`（与前端同一个常量）。
+   */
+  app.get<{ Params: ArtifactIdParams }>(
+    '/api/artifacts/:id/outline',
+    { preHandler: app.requireAuth, schema: { params: artifactIdParamsSchema } },
+    async (request) => {
+      const source = await openArtifactSource({
+        artifactId: request.params.id,
+        userId: userIdOf(request),
+      })
+      if (previewKindOf(source.mime) !== 'xmind') throw AppError.validation(appMsg('app.m090'))
+      if (source.contentLength > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) {
+        throw AppError.validation(appMsg('app.m019'))
+      }
+
+      const bytes = await readStreamCapped(source.body, ARTIFACT_PREVIEW_MAX_INLINE_BYTES)
+      try {
+        const parsed = parseXmind(bytes)
+        return ok({ fileName: source.fileName, sheets: parsed.sheets, truncated: parsed.truncated })
+      } catch (error) {
+        if (error instanceof AppError) throw error
+        getLogger().warn({ err: error, artifactId: source.artifactId }, 'xmind 解析失败')
+        throw AppError.validation(appMsg('app.m091'))
+      }
     },
   )
 }

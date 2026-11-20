@@ -23,7 +23,7 @@
  *   Linux 上后端与 Docker 同宿主，出口② listener 直接绑沙箱网桥网关，**不需要 relay**。
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { platform } from 'node:os'
@@ -36,7 +36,7 @@ import { getLogger } from '../infra/logger.js'
 import { config, findWorkspaceRoot } from '../config.js'
 import { getDocker, listRuntimeImages, resolveDockerBin, withDockerEnv } from './docker.js'
 import { ensureSandboxNetwork } from './network.js'
-import { canBuildSandboxRuntime } from './runtimeBuild.js'
+import { canBuildSandboxRuntime, interpretBuildLine } from './runtimeBuild.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -132,26 +132,157 @@ async function ensureToolkitImage(note?: (event: string) => void): Promise<{ ok:
   return await buildToolkit(image, '', note)
 }
 
-/** 用仓库里的构建脚本建 toolkit（`scripts/sandbox-build.mjs`；脚本内部自己决定层版本） */
+/** 构建总时长上限（真跑很慢的机器也要留余量；挂住的判定交给下面的"无输出超时"） */
+const BUILD_TIMEOUT_MS = 60 * 60_000
+/**
+ * **无输出超时**：连续这么久没有任何构建输出就判挂住。
+ *
+ * 2026-11-19 实测：`docker build` 偶发卡在等 daemon 的某个响应上（CPU/fd 零增长、daemon 侧一声不响），
+ * 而原来的"整体 1 小时超时"意味着页面要白等一小时。正常构建每几秒就有输出（拉包/解压/写层），
+ * 10 分钟静默只可能是真挂了。判挂后**杀掉进程**并给出手动命令，不再无限等。
+ */
+const BUILD_SILENCE_TIMEOUT_MS = 10 * 60_000
+
+/**
+ * 用仓库里的构建脚本建 toolkit（`scripts/sandbox-build.mjs`；脚本内部自己决定层版本）。
+ *
+ * ⚠️ 用 `spawn` 而不是 `execFile`：`execFile` 只把输出攒在内存里、**不转发** ⇒ 自举期间页面上
+ *    只有 5s 心跳，构建跑 10 分钟看起来就是"卡死"。这里逐行读 stdout/stderr，按
+ *    `interpretBuildLine`（与按需构建共用同一份解析）把阶段/步骤号转成 `note` 事件写进任务快照。
+ */
 async function buildToolkit(image: string, prefix: string, note?: (event: string) => void): Promise<{ ok: boolean; detail: string }> {
   const script = bootstrapScript('sandbox-build.mjs', 'DOUBULEA_SANDBOX_BUILD_SCRIPT')
   if (!existsSync(script)) {
     return { ok: false, detail: `${prefix}且找不到 ${script}（无法构建 toolkit；请在宿主导入镜像或挂 infra/scripts）` }
   }
-  try {
-    // 只建 toolkit（base 是它的 FROM，脚本自己会先确保 base 存在）
-    note?.(`通过 ${script} 构建 ${image}（镜像构建可能要几分钟）`)
-    // 脚本内部自己定位 docker（`DOCKER_BIN` / `SANDBOX_DOCKER_BIN` / PATH）；宿主 dev 下后端 PATH
-    // 里没有 `/usr/local/bin` ⇒ 把已解析出来的那个二进制传给它，别让它再猜一遍。
-    await execFileAsync(process.execPath, [script, '--toolkit-only'], {
-      timeout: 60 * 60_000,
-      cwd: bootstrapCwd(),
-      env: withDockerEnv(),
-    })
-    return { ok: true, detail: `${prefix}已通过 ${script} 构建 ${image}` }
-  } catch (error) {
-    return { ok: false, detail: `${prefix}构建失败：${error instanceof Error ? error.message : String(error)}` }
+  // 只建 toolkit（base 是它的 FROM，脚本自己会先确保 base 存在）
+  note?.(`通过 ${script} 构建 ${image}（镜像构建可能要几分钟）`)
+  // 脚本内部自己定位 docker（`DOCKER_BIN` / `SANDBOX_DOCKER_BIN` / PATH）；宿主 dev 下后端 PATH
+  // 里没有 `/usr/local/bin` ⇒ 把已解析出来的那个二进制传给它，别让它再猜一遍。
+  const outcome = await runBuildScript(process.execPath, [script, '--toolkit-only'], {
+    cwd: bootstrapCwd(),
+    env: withDockerEnv({ ...process.env, DOCKER_BUILDKIT: '1' }),
+  }, note)
+  if (outcome.ok) return { ok: true, detail: `${prefix}已通过 ${script} 构建 ${image}` }
+  return { ok: false, detail: `${prefix}构建失败：${outcome.message}` }
+}
+
+/** 构建输出里可读的阶段说明（`interpretBuildLine` 只给 key，这里翻成人话） */
+const BUILD_PHASE_LABEL: Record<string, string> = {
+  preparing: '准备构建上下文',
+  apt: '安装系统依赖（apt）',
+  language: '安装语言 / 运行时组件',
+  verifying: '跑依赖自检',
+}
+
+/** ANSI 颜色序列（构建脚本自己会给 `[ok]` 上色；进快照前必须剥掉，否则页面显示乱码） */
+const ANSI_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'gu')
+
+/** 把一行构建输出压成一条 `note` 的正文；不值得展示的行返回 `undefined` */
+function buildEventOf(line: string, lastProgress: number): { text: string; progress: number } | undefined {
+  const text = line.replace(ANSI_PATTERN, '').trim()
+  if (text === '') return undefined
+  const interpreted = interpretBuildLine(text)
+  const progress = interpreted.progress ?? lastProgress
+  if (interpreted.phase !== undefined) {
+    const label = BUILD_PHASE_LABEL[interpreted.phase] ?? interpreted.phase
+    const detail = interpreted.detail === undefined ? '' : ` · ${interpreted.detail}`
+    return { text: `${label}${detail}`, progress }
   }
+  // 脚本自己的 `[ok]` / `== … ==` 行（层切换、自检结论）值得给运维看；其余 docker 原始噪声丢掉
+  if (/^(==|\[ok\]|\[fail\]|\[warn\])/u.test(text) || text.startsWith('$ ')) return { text, progress }
+  return undefined
+}
+
+/**
+ * 跑构建脚本并**流式转发**进度。返回结局而不是抛错（调用方只需要一句人话）。
+ *
+ * `silenceMs`：连续这么久没有任何输出 ⇒ 判挂住，`kill` 掉整棵进程树并如实失败。
+ */
+function runBuildScript(
+  command: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; silenceMs?: number },
+  note?: (event: string) => void,
+): Promise<{ ok: boolean; message: string }> {
+  const silenceMs = options.silenceMs ?? BUILD_SILENCE_TIMEOUT_MS
+  return new Promise((resolvePromise) => {
+    let child: ChildProcessWithoutNullStreams
+    try {
+      child = spawn(command, args, { cwd: options.cwd, env: options.env })
+    } catch (error) {
+      resolvePromise({ ok: false, message: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    let progress = 0
+    let lastNote = ''
+    let lastOutputAt = Date.now()
+    let timedOut = false
+    let failureText = ''
+    /** 失败时把最后几行原始输出带上（`note` 里被过滤掉的 docker 报错往往就在这里） */
+    const tail: string[] = []
+
+    const totalTimer = setTimeout(() => {
+      timedOut = true
+      failureText = `超过 ${Math.round(BUILD_TIMEOUT_MS / 60_000)} 分钟仍未结束`
+      child.kill('SIGKILL')
+    }, BUILD_TIMEOUT_MS)
+    // 静默判据单独一个定时器：每收到一次输出就重置（输出很碎，靠轮询会误判）
+    const silenceTimer = setTimeout(() => {
+      timedOut = true
+      failureText = `连续 ${Math.round(silenceMs / 60_000)} 分钟没有任何构建输出（docker build 挂住了）`
+      child.kill('SIGKILL')
+    }, silenceMs)
+
+    const onChunk = (chunk: Buffer): void => {
+      lastOutputAt = Date.now()
+      silenceTimer.refresh()
+      for (const raw of chunk.toString('utf8').split('\n')) {
+        if (raw.trim() !== '') {
+          tail.push(raw.trim())
+          if (tail.length > 20) tail.shift()
+        }
+        const event = buildEventOf(raw, progress)
+        if (event === undefined) continue
+        progress = event.progress
+        // 同一句重复打没有信息量（进度百分比已并入文案，仍重复就跳过）
+        if (event.text === lastNote) continue
+        lastNote = event.text
+        note?.(event.text)
+      }
+    }
+    child.stdout.on('data', onChunk)
+    child.stderr.on('data', onChunk)
+
+    const cleanup = (): void => {
+      clearTimeout(totalTimer)
+      clearTimeout(silenceTimer)
+    }
+    child.on('error', (error) => {
+      cleanup()
+      resolvePromise({ ok: false, message: error.message })
+    })
+    child.on('close', (code, signal) => {
+      cleanup()
+      if (timedOut) {
+        resolvePromise({
+          ok: false,
+          message: `${failureText}；已终止。可在宿主手动重跑：pnpm sandbox:build -- --toolkit-only`,
+        })
+        return
+      }
+      if (code === 0) {
+        resolvePromise({ ok: true, message: '' })
+        return
+      }
+      const why = signal === null ? `退出码 ${String(code)}` : `被信号 ${signal} 终止`
+      const context = tail.length > 0 ? `\n最后输出：\n${tail.slice(-5).join('\n')}` : ''
+      resolvePromise({
+        ok: false,
+        message: `${why}（${Math.round((Date.now() - lastOutputAt) / 1000)}s 前还有输出）${context}`,
+      })
+    })
+  })
 }
 
 /**

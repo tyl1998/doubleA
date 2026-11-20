@@ -65,6 +65,7 @@ import {
 } from '@doubulea/shared'
 
 import { ApiError } from '../../api/client.js'
+import { WorkspaceXmindPreview } from './WorkspaceXmindPreview.js'
 import { RuntimeSelect } from './RuntimeSelect.js'
 import {
   createWorkspaceFile,
@@ -1479,6 +1480,9 @@ export function WorkspacePanel({
                           if (dirty && savingPath === null) void save(activePath)
                         }}
                       />
+                    ) : previewKind === 'xmind' ? (
+                      // XMind 不走 HTML：大纲出口回结构化 JSON，这里画"左树 + 右阅读区"
+                      <WorkspaceXmindPreview conversationId={conversationId} path={activePath} />
                     ) : previewKind !== null ? (
                       /*
                         ★ 2026-10-30（用户反馈「Code 模式下图片 / docx 不能预览」）：只读文件不再一律
@@ -2021,8 +2025,8 @@ function WorkspacePathPrompt(props: {
  *   · `html`（含 SVG）→ **沙箱 iframe** 打 raw 出口：脚本不给、同源不给 —— 隔离头由后端
  *     `HTML_PREVIEW_CSP` 上（响应头才是第一道，`sandbox=""` 只是第二道，同 `HtmlPreview`）；
  *   · `pdf` → iframe 打 raw 出口，**刻意不加 `sandbox`**（加了浏览器内置 viewer 渲染不出来）；
- *   · `docx` / `xlsx` → iframe 打**渲染出口**（服务端 mammoth / xlsx 读取器转成 HTML），
- *     与 html 那一路同款沙箱。
+ *   · `docx` / `xlsx` → iframe 打**渲染出口**（服务端 mammoth / xlsx 读取器转成 HTML），与 html 那一路同款沙箱；
+ *   · `xmind` **不走这里**：它在调用点被拦下，改走大纲出口 + `XmindOutlinePreview`（结构化数据，不是 HTML）。
  *
  * ⚠️ SVG 会不会落到 `image`？不会 —— `previewKindOf` 把它归 `html`（见那里的判据 ②）。
  */

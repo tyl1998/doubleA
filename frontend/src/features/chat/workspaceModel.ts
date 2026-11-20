@@ -592,7 +592,7 @@ export function isImageMime(mime: string | null | undefined): boolean {
  * 只在**不可编辑**时被调用（可编辑的一律是 CodeMirror），所以这里只回答"剩下的怎么展示"：
  *   · `image` → `<img>`（raw 出口）
  *   · `html` / `pdf` → 沙箱 iframe / 浏览器 viewer（raw 出口）
- *   · `docx` / `xlsx` → 服务端渲染出口（`.../workspace/file/render`）
+ *   · `docx` / `xlsx` / `xmind` → 服务端渲染出口（`.../workspace/file/render`）
  *   · 其余 → `null`（"只能下载"的占位文案）
  */
 export function workspacePreviewKindOf(mime: string | null | undefined): PreviewKind | null {

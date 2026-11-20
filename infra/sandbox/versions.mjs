@@ -116,8 +116,14 @@ export const RUNTIME_IMAGE_NAME = 'doubulea/sandbox-runtime'
  * 认 `/doubulea:skills-refresh`）+ `Dockerfile` 第 5 节两条 `test -f` 断言。不 +1 的症状与
  * P1-9 R8 / P1-21 同款：后端注入刷新命令、manifest 也同步好了，而镜像里的 pi **根本不加载这个扩展**
  * ⇒ 模型一个 Skill 工具都看不到，后端日志里却没有一条错。
+ *
+ * ⚠️ **2026-11-19 起为 `10`**：修 `extensions/skills/index.ts` 的 TDZ —— 工厂里
+ * `const skillsDir = skillsDir()` 自遮蔽，扩展加载即抛
+ * `Cannot access 'skillsDir' before initialization`，pi 进程当场退出（症状是每次派活都以
+ * `UPSTREAM_ERROR · 沙箱引擎已退出` 收尾，而容器本身建得好好的）。
+ * 不 +1 的症状：宿主上是旧的 base:9 ⇒ 同样的报错原样复现。
  */
-export const BASE_LAYER_VERSION = '9'
+export const BASE_LAYER_VERSION = '10'
 
 /**
  * toolkit 层内容版本（加一个 python 包 / CLI 时 +1）
@@ -156,8 +162,11 @@ export const BASE_LAYER_VERSION = '9'
  *
  * ⚠️ **P1-24b-2 起为 `11`**：同"base 变了就换 tag"那条 —— base 升到 `8`（多了 skills 扩展），
  * toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-7 的那一份（扩展不在里面）。
+ *
+ * ⚠️ **2026-11-19 起为 `13`**：同"base 变了就换 tag"那条 —— base 升到 `10`（修 skills 扩展的
+ * TDZ 启动失败），toolkit 的 tag 不换 ⇒ `.env` 的 `SANDBOX_IMAGE` 仍指向基于 base-9 的那一份。
  */
-export const TOOLKIT_LAYER_VERSION = '12'
+export const TOOLKIT_LAYER_VERSION = '13'
 
 /**
  * 运行时层内容版本（P1-17a；加/换一个语言运行时、或改 runtime Dockerfile 时 +1）

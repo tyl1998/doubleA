@@ -623,7 +623,7 @@ export const APP_MESSAGES: Readonly<Record<string, AppMessageEntry>> = {
   // 容器内 Skill 目录不可见（P1-24b-2）：$HOME/.skills 缺失或指向别的会话 ⇒ 回收容器、本轮失败
   "容器内看不到本会话的 Skill 目录（$HOME/.skills 没有挂载或指向别的会话）。已回收该容器，请重新发送这一条；重建容器时会自动挂回并补齐 Skill 文件": { key: "app.m303", names: [] },
   // 草稿不存在 / 过期 / 已落库（P1-24c-1）：统一 404
-  "Skill 草稿不存在或已过期（草稿只保留 1 小时，编辑时会自动续期）；请重新发起，不要重复提交旧页面": { key: "app.m304", names: [] },
+  "Skill 草稿不存在或已过期（草稿保留 7 天，编辑时会自动续期）；请重新发起，不要重复提交旧页面": { key: "app.m304", names: [] },
   // 草稿内容校验失败（runtime 与 scripts/** 互斥、路径不安全等）
   "Skill 草稿内容不合规：{0}": { key: "app.m305", names: ["p0"] },
   // 草稿里仍有凭据形状的明文（保存前重跑 scan）

@@ -180,6 +180,11 @@ await it('A3b ★ DOCX/XLSX 是独立形态（P1-16）：**不是** html（原�
   )
 })
 
+await it('A3c ★ XMIND 是独立形态：**不是** none / text（原始字节是 zip 包），走 `/render` 出口', () => {
+  assertEqual(previewKindOf('application/x-xmind'), 'xmind', 'xmind')
+  assertEqual(previewKindOf('APPLICATION/X-XMIND'), 'xmind', '大小写不敏感')
+})
+
 await it('A4 大小写与参数都不影响判定（`text/HTML; charset=utf-8`）', () => {
   assertEqual(previewKindOf('TEXT/HTML'), 'html', '大小写')
   assertEqual(previewKindOf('text/html; charset=utf-8'), 'html', '带参数')

@@ -48,6 +48,7 @@ import {
   SKILL_LOAD_TOOL_NAME,
   SKILL_PAGE_DEFAULT_LIMIT,
   SKILL_READ_FILE_TOOL_NAME,
+  effectiveSkillRuntime,
   isSafeSkillPath,
   isSkillScriptPath,
   loadSkillArgsSchema,
@@ -283,7 +284,7 @@ export async function loadSkillSnapshot(
         slug: row.slug,
         name: row.name,
         description: row.description,
-        runtime: row.runtime,
+        runtime: effectiveSkillRuntime(row.runtime),
         pinnedVersion,
         currentVersion: row.version,
         version: pinnedVersion ?? row.version,
@@ -298,7 +299,7 @@ export async function loadSkillSnapshot(
     const override = overrideBySkill.get(row.id)
     entries.push(
       resolveSkillBindingEntry({
-        skill: row,
+        skill: { ...row, runtime: effectiveSkillRuntime(row.runtime) },
         pinnedVersion,
         ...(override === undefined
           ? {}

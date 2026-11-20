@@ -15,12 +15,14 @@
  */
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { SKILL_ENTRY_PATH } from '@doubulea/shared'
 import type {
   CreateSkillDraftBody,
   SaveSkillFromDraftBody,
   SaveSkillFromDraftResult,
   SaveSkillRevisionFromDraftBody,
   SkillChange,
+  SkillDetail,
   SkillDraft,
   SkillDraftFile,
   SkillDraftListResult,
@@ -114,15 +116,48 @@ export function useUploadSkillDraftFile(draftId: string) {
   })
 }
 
-/** 移除一个草稿文件 */
+/** 移除一个草稿文件 / 目录（`recursive=true` = 按目录前缀批量删；基准文件只加墓碑） */
 export function useRemoveSkillDraftFile(draftId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (path: string) =>
-      request<SkillDraft>(
-        `/api/skill-drafts/${encodeURIComponent(draftId)}/files?path=${encodeURIComponent(path)}`,
-        { method: 'DELETE' },
+    mutationFn: (input: string | { path: string; recursive?: boolean }) => {
+      const path = typeof input === 'string' ? input : input.path
+      const recursive = typeof input === 'string' ? false : input.recursive === true
+      const query = `path=${encodeURIComponent(path)}${recursive ? '&recursive=1' : ''}`
+      return request<SkillDraft>(`/api/skill-drafts/${encodeURIComponent(draftId)}/files?${query}`, {
+        method: 'DELETE',
+      })
+    },
+    onSuccess: (draft) => {
+      queryClient.setQueryData(skillDraftQueryKey(draftId), draft)
+    },
+  })
+}
+
+/** 新建 / 修改一个文本文件（P1-24a-7：`PUT /files/content`，JSON） */
+export function useWriteSkillDraftFileContent(draftId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: { path: string; text: string }) =>
+      request<{ draft: SkillDraft; file: SkillDraftFile }>(
+        `/api/skill-drafts/${encodeURIComponent(draftId)}/files/content`,
+        { method: 'PUT', body: input },
       ),
+    onSuccess: (result) => {
+      queryClient.setQueryData(skillDraftQueryKey(draftId), result.draft)
+    },
+  })
+}
+
+/** 重命名 / 移动文件或目录（P1-24a-7：`POST /files/rename`） */
+export function useRenameSkillDraftPath(draftId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: { from: string; to: string; kind: 'FILE' | 'DIR'; overwrite?: boolean }) =>
+      request<SkillDraft>(`/api/skill-drafts/${encodeURIComponent(draftId)}/files/rename`, {
+        method: 'POST',
+        body: input,
+      }),
     onSuccess: (draft) => {
       queryClient.setQueryData(skillDraftQueryKey(draftId), draft)
     },
@@ -170,6 +205,117 @@ export function useSaveSkillRevisionFromDraft(skillId: string) {
       void queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY })
       void queryClient.invalidateQueries({ queryKey: skillQueryKey(skillId) })
       queryClient.removeQueries({ queryKey: ['skill-drafts'] })
+    },
+  })
+}
+
+/** 详情页正文编辑的发布入参（P1-24a-5）：内容 + 元数据一次生成 vN+1 */
+export interface PublishSkillEditsInput {
+  skill: SkillDetail
+  metadata: {
+    name: string
+    description: string
+    visibility: 'PRIVATE' | 'PUBLIC'
+  }
+  /** `SKILL.md` 正文（可以是带 frontmatter 的原文；服务端会剥离后按 DB 字段重生成） */
+  markdown: string
+  changeSummary: string
+  /** `SKILL.md` 之外的文本文件（新增 / 修改）：路径与 UTF-8 正文 */
+  textFiles: readonly { path: string; text: string }[]
+  /** 二进制文件只允许**整文件替换**（路径不变） */
+  binaryFiles: readonly { path: string; file: File }[]
+  /** 重命名 / 移动（P1-24a-7：详情页树右键；按顺序在删除之前回放） */
+  renames?: readonly { from: string; to: string; kind: 'FILE' | 'DIR' }[]
+  /** 删除（P1-24a-7：草稿里只加墓碑，旧版本对象不动） */
+  removals?: readonly string[]
+}
+
+/** 往已存在的草稿里传一个文件（文件级发布不经过 Upload 组件） */
+async function uploadSkillEditFile(draftId: string, path: string, file: File): Promise<void> {
+  const form = new FormData()
+  form.append(SKILL_DRAFT_UPLOAD_FIELD, file)
+  form.append('path', path)
+  form.append('replace', '1')
+  await requestFormData<{ draft: SkillDraft; file: SkillDraftFile }>(
+    `/api/skill-drafts/${encodeURIComponent(draftId)}/files`,
+    form,
+  )
+}
+
+/**
+ * 详情页「保存」发布新版本（P1-24a-5）。
+ *
+ * 口径：**不新增第二套写入器** —— 编排现有草稿链（建 REVISION 草稿 → 上传改动文件 →
+ * `revisions/from-draft`），内容校验 / 脱敏闸门 / 整版合并 / CAS 全部沿用 c-1。
+ * 元数据（名称 / 描述在草稿里，可见范围随保存请求）与新版本同一次发布。
+ */
+export function usePublishSkillEdits() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (input: PublishSkillEditsInput): Promise<SaveSkillFromDraftResult> => {
+      const draft = await request<SkillDraft>('/api/skill-drafts', {
+        method: 'POST',
+        body: {
+          kind: 'REVISION',
+          targetSkillId: input.skill.id,
+          baseVersion: input.skill.version,
+          name: input.metadata.name.trim(),
+          description: input.metadata.description.trim(),
+          runtime: input.skill.runtime ?? 'INLINE',
+          requiresBins: input.skill.requiresBins,
+          markdown: input.markdown,
+        } satisfies CreateSkillDraftBody,
+      })
+      try {
+        // ⚠️ 回放顺序（2026-11-19）：**改名 → 落文件 → 删墓碑**。
+        //    改名端点会"把源对象搬到新路径"，源可以是基准文件；先落文件再改名，
+        //    "新建 A 再改名 A→B" 会把刚上传的字节搬到 B，留下空 A（多出一个文件）；
+        //    反过来的顺序对"改名后原地替换同一路径"再写一次即可覆盖，语义与页面上的累积一致。
+        for (const item of input.renames ?? []) {
+          await request<SkillDraft>(`/api/skill-drafts/${encodeURIComponent(draft.id)}/files/rename`, {
+            method: 'POST',
+            body: { from: item.from, to: item.to, kind: item.kind },
+          })
+        }
+        for (const file of input.textFiles) {
+          if (file.path === SKILL_ENTRY_PATH) continue
+          const name = file.path.split('/').pop() ?? file.path
+          await uploadSkillEditFile(draft.id, file.path, new File([file.text], name, { type: 'text/plain' }))
+        }
+        for (const item of input.binaryFiles) {
+          await uploadSkillEditFile(draft.id, item.path, item.file)
+        }
+        for (const path of input.removals ?? []) {
+          await request<SkillDraft>(
+            `/api/skill-drafts/${encodeURIComponent(draft.id)}/files?path=${encodeURIComponent(path)}`,
+            { method: 'DELETE' },
+          )
+        }
+        return await request<SaveSkillFromDraftResult>(
+          `/api/skills/${encodeURIComponent(input.skill.id)}/revisions/from-draft`,
+          {
+            method: 'POST',
+            body: {
+              draftId: draft.id,
+              fromVersion: input.skill.version,
+              changeSummary: input.changeSummary,
+              markdown: input.markdown,
+              visibility: input.metadata.visibility,
+            } satisfies SaveSkillRevisionFromDraftBody,
+          },
+        )
+      } catch (error) {
+        // 发布失败就把临时草稿丢掉（失败本身照常抛给界面）
+        await request<{ id: string }>(`/api/skill-drafts/${encodeURIComponent(draft.id)}`, {
+          method: 'DELETE',
+        }).catch(() => undefined)
+        throw error
+      }
+    },
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY })
+      void queryClient.invalidateQueries({ queryKey: skillQueryKey(result.skill.id) })
+      void queryClient.invalidateQueries({ queryKey: [...SKILL_DRAFTS_QUERY_KEY, 'list'] })
     },
   })
 }

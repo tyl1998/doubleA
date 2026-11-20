@@ -54,17 +54,30 @@ export function artifactDownloadUrl(artifactId: string): string {
 }
 
 /**
- * 渲染预览（`GET /api/artifacts/:id/render`）—— **DOCX 专用**（P1-16）。
+ * 渲染预览（`GET /api/artifacts/:id/render`）—— **OOXML 专用**（DOCX / XLSX，P1-16 起）。
  *
  * ⚠️ 它与 {@link artifactContentUrl} 是**两条出口**：`/content` 回**原始字节**（DOCX 是二进制
  * OOXML，`/content` 对它上 `octet-stream` + `attachment`），`/render` 回**服务端渲染好的 HTML**
- * （mammoth → HTML，带 CSP `sandbox` 头）。前端对 `previewKindOf === 'docx'` 的产物用这一条。
+ * （mammoth / 手写读取器 → HTML，带 CSP `sandbox` 头）。前端对 `previewKindOf` ∈
+ * {`docx`, `xlsx`} 的产物用这一条。
+ *
+ * ⚠️ `xmind` **不用这一条**（它不画 HTML）：见 {@link artifactOutlineUrl}。
  *
  * ⚠️ 与其他几个 URL Builder 同处本文件：F 组那条源码级断言要求"拼 `/api/artifacts/` 前缀"
  * 只在**这一个文件**里出现（否则第二处会各自演化）—— 所以别的模块一律调本函数，不自己拼。
  */
 export function artifactRenderUrl(artifactId: string): string {
   return `/api/artifacts/${encodeURIComponent(artifactId)}/render`
+}
+
+/**
+ * 大纲预览（`GET /api/artifacts/:id/outline`）—— **XMIND 专用**（2026-11-20）。
+ *
+ * 回的是**结构化 JSON**（`XmindOutline`），不是 HTML：服务端只解包，前端
+ * `XmindOutlinePreview` 画"左树 + 右阅读区"。与 `/render` 是两条出口，理由同上面那条注释。
+ */
+export function artifactOutlineUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}/outline`
 }
 
 /**

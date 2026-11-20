@@ -54,6 +54,16 @@ export const SKILL_RUNTIMES = ['INLINE', 'SANDBOX'] as const
 export type SkillRuntime = (typeof SKILL_RUNTIMES)[number]
 
 /**
+ * `runtime` 的**实际含义**：`null` = 包内没声明（第三方 Skill 常见），按 `INLINE` 执行。
+ *
+ * 只用于"取值给内部引擎 / 容器 manifest"的地方；管理面展示仍保留 `null`（显示"未声明"），
+ * 不要把 `null` 静默写成 `INLINE` 造成"作者没说过、平台却替他声明"的假象。
+ */
+export function effectiveSkillRuntime(runtime: SkillRuntime | null): SkillRuntime {
+  return runtime ?? 'INLINE'
+}
+
+/**
  * Skill 的可见性 —— **只支持两档**（`子方案/Skill能力.md` §3.1 / §5.3）。
  *
  * 列是 `AssetVisibility`（三值），但 Skill 没有受众表：声明 `SHARED` 只会退化成"只有
@@ -70,7 +80,11 @@ export type SkillSourceType = (typeof SKILL_SOURCE_TYPES)[number]
 
 /** Skill 名称 / description / 文件路径的上限（**导出成常量**：schema 报错文案与前端提示同源） */
 export const SKILL_NAME_MAX_CHARS = 128
-export const SKILL_DESCRIPTION_MAX_CHARS = 1000
+/**
+ * `description` 上限按 **Agent Skill 官方口径（1024）**：早期写死 1000 会把 1001~1024 的
+ * 合法第三方 Skill 挡在导入门外，收益为零。
+ */
+export const SKILL_DESCRIPTION_MAX_CHARS = 1024
 export const SKILL_SLUG_MAX_CHARS = 128
 export const SKILL_PATH_MAX_CHARS = 1024
 
@@ -592,7 +606,7 @@ export const SKILL_CATALOG_RESERVE_CHARS = 600
 /**
  * 每个 Skill 在目录栏里占的额度（码点）—— 超出时只截 description，**不丢条目**。
  *
- * 为什么要按条限额：一条 description 上限 {@link SKILL_DESCRIPTION_MAX_CHARS}（1000），
+ * 为什么要按条限额：一条 description 上限 {@link SKILL_DESCRIPTION_MAX_CHARS}（1024），
  * 绑 10 个就能把整段目录撑到 1 万字；而目录的作用只是"让模型知道该不该 load"，
  * 前一两百字足够。截断处带省略号，模型据此知道"完整说明要 load_skill 才有"。
  */
@@ -1127,7 +1141,7 @@ export const SKILL_ENTRY_PATH = 'SKILL.md'
  * 返回不合法原因（空数组 = 合法）；调用方把它塞进 `SKILL_IMPORT_INVALID` 的 `data.reasons[]`。
  */
 export function checkSkillRuntimeConsistency(input: {
-  runtime: SkillRuntime
+  runtime: SkillRuntime | null
   requiresScripts: boolean
   paths: readonly string[]
 }): string[] {
@@ -1181,7 +1195,11 @@ export const skillItemSchema = z.object({
   name: z.string(),
   slug: z.string(),
   description: z.string(),
-  runtime: z.enum(SKILL_RUNTIMES),
+  /**
+   * `null` = 导入的包**没有声明** `requires.runtime`（第三方 Skill 的常态）。
+   * 没有脚本时绑定能力等同 `INLINE`（见 {@link effectiveSkillRuntime}），但管理面如实显示"未声明"。
+   */
+  runtime: z.enum(SKILL_RUNTIMES).nullable(),
   /** 当前整版快照号（`skills.version`） */
   version: z.number().int().min(1),
   visibility: z.enum(SKILL_VISIBILITIES),
@@ -1693,12 +1711,14 @@ export type SkillProposalStatus = (typeof SKILL_PROPOSAL_STATUSES)[number]
 /**
  * 客户端**能直接建**的草稿类型（`POST /api/skill-drafts` 的 `kind` 取值域）。
  *
- * `PROPOSAL` 属 c-6、`SESSION_OVERRIDE` 属 c-4b ⇒ 本批拒绝。
- * ⚠️ **c-2 起 `CREATE` 也不在这个入口**：带来源的 CREATE 草稿只能由
- * `POST /api/conversations/:id/skills/extract` 生成（来源与消息范围必须由服务端判定，
- * 客户端说了不算）。于是这里只剩 `REVISION` —— 手动建空白草稿的入口随 c-2 一并去掉。
+ * `PROPOSAL` / `SESSION_OVERRIDE` 各有专用入口（c-6 / c-4b）⇒ 这里拒绝。
+ * **c-2 起 `CREATE` 曾被收掉**（带来源的 CREATE 只能由会话抽取生成），
+ * **P1-24a-6 重新放开"无来源 CREATE"**：页面新建 = 填元数据 + 写完 `SKILL.md` 正文 →
+ * 草稿 → `from-draft` 存 v1。放开的是"有正文的 CREATE"，**不是空白草稿**：
+ * 创建 schema 与保存入口两处都要求正文非空（见下 `superRefine` 与 `saveSkillFromDraft`）。
+ * schema **仍不收 `source`** ⇒ 客户端无法伪造会话来源，手建落库一律 `sourceType=MANUAL`。
  */
-export const SKILL_DRAFT_KINDS_SUPPORTED = ['REVISION'] as const
+export const SKILL_DRAFT_KINDS_SUPPORTED = ['CREATE', 'REVISION'] as const
 export type SupportedSkillDraftKind = (typeof SKILL_DRAFT_KINDS_SUPPORTED)[number]
 
 /** 草稿文件分类（目录约定：`references/` / `assets/` / `scripts/`） */
@@ -1716,8 +1736,12 @@ export const SKILL_REDACTION_MASK = '«已脱敏»'
 export const SKILL_DRAFT_MAX_FILES = 50
 export const SKILL_DRAFT_MAX_MARKDOWN_CHARS = 200_000
 export const SKILL_DRAFT_MAX_FILE_BYTES = 5 * 1024 * 1024
-/** 草稿存活时长（秒）—— 与 `backend` 的 `SKILL_DRAFT_TTL_SEC` 同值（1 小时，`GET/PUT` 续期） */
-export const SKILL_DRAFT_TTL_SEC = 3600
+/**
+ * 草稿保留时长（秒）—— 与 `backend` 的 `SKILL_DRAFT_TTL_SEC` 默认值同源（7 天，滑窗续期）。
+ *
+ * c-7a 起草稿落在 `skill_drafts` 表（跨设备恢复），保留期由后端配置决定；这里只作契约默认值。
+ */
+export const SKILL_DRAFT_TTL_SEC = 7 * 24 * 3600
 
 /**
  * 草稿内的一个文件（**前端拿不到 `draftKey`**：键由服务端拼，落库时按草稿内容复制）。
@@ -1781,6 +1805,14 @@ export const skillDraftSchema = z.object({
   /** `SKILL.md` 的**正文**（不含 frontmatter；见口径 ②） */
   markdown: z.string(),
   files: z.array(skillDraftFileSchema),
+  /**
+   * 本次草稿里**删除**的路径（P1-24a-7 墓碑；全是相对路径，不含 `SKILL.md`）。
+   *
+   * 删除基准文件只加墓碑、不动旧版本对象（整版快照纪律）；`mergeFileEntries` /
+   * `materializeDraftFiles` 一律过滤它。同一路径不会同时出现在 `files` 与这里 ——
+   * 新增 / 改回某路径时服务端会自动把墓碑摘掉（草稿 payload JSON，旧草稿缺省 `[]`）。
+   */
+  removedPaths: z.array(z.string()).catch([]),
   warnings: z.array(z.string()),
   /**
    * 生成时模型给出的**变更说明**（REVISION；审核页预填，用户可改）。
@@ -1902,6 +1934,12 @@ export const createSkillDraftBodySchema = z
       )
       .optional(),
     warnings: z.array(z.string().max(500)).max(50).optional(),
+    /** REVISION 的变更说明（审核页预填；P1-24a-7 详情页「编辑文件」进草稿时也带上） */
+    changeSummary: z
+      .string()
+      .trim()
+      .max(2000, validationMessage('validation.skillDraft.changeSummaryTooLong', { max: 2000 }))
+      .optional(),
   })
   .superRefine((value, ctx) => {
     // `SUPPORTED` 只有 CREATE / REVISION ⇒ `PROPOSAL` 需要比较类型已被收窄，故按字符串比较
@@ -1911,6 +1949,10 @@ export const createSkillDraftBodySchema = z
     }
     if (!isTargeted && value.targetSkillId !== undefined) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: validationMessage('validation.skillDraft.targetNotAllowed') })
+    }
+    // P1-24a-6：页面新建必须带**非空正文** —— 只有元数据的 CREATE 落库后必然 `load_skill` 失败（空壳）
+    if (String(value.kind) === 'CREATE' && (value.markdown === undefined || value.markdown.trim() === '')) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: validationMessage('validation.skillDraft.markdownRequired') })
     }
   })
 export type CreateSkillDraftBody = z.infer<typeof createSkillDraftBodySchema>
@@ -1973,14 +2015,79 @@ export const skillDraftIdParamsSchema = z.object({
 })
 export type SkillDraftIdParams = z.infer<typeof skillDraftIdParamsSchema>
 
-/** 移除草稿文件（`DELETE /api/skill-drafts/:draftId/files?path=`） */
+/**
+ * 移除草稿文件（`DELETE /api/skill-drafts/:draftId/files?path=&recursive=`）。
+ *
+ * `recursive=1` = 把 `path` 当成**目录前缀**批量删除（P1-24a-7；目录不是存储对象）。
+ */
 export const skillDraftFileQuerySchema = z.object({
   path: z
     .string({ required_error: validationMessage('validation.skillDraft.pathRequired') })
     .min(1, validationMessage('validation.skillDraft.pathRequired'))
     .max(SKILL_PATH_MAX_CHARS, validationMessage('validation.skillDraft.pathTooLong', { max: SKILL_PATH_MAX_CHARS })),
+  recursive: z
+    .union([z.boolean(), z.enum(['0', '1', 'true', 'false'])])
+    .optional()
+    .transform((value) => value === true || value === '1' || value === 'true'),
 })
 export type SkillDraftFileQuery = z.infer<typeof skillDraftFileQuerySchema>
+
+/**
+ * 新建 / 修改一个**文本文件**（`PUT /api/skill-drafts/:draftId/files/content`，P1-24a-7）。
+ *
+ * 与 multipart 上传的区别：文本走 JSON（UTF-8），二进制仍走 `POST /files`；两条路径写同一个
+ * 草稿 S3 键，判据（路径 / 大小 / 数量 / runtime 与 scripts 互斥 / secret scan）全在服务层共用。
+ * `SKILL.md` 不走这里 —— 正文只能通过草稿的 `markdown` 字段（frontmatter 仍由服务端生成）。
+ */
+export const skillDraftFileContentBodySchema = z.object({
+  path: z
+    .string({ required_error: validationMessage('validation.skillDraft.pathRequired') })
+    .trim()
+    .min(1, validationMessage('validation.skillDraft.pathRequired'))
+    .max(SKILL_PATH_MAX_CHARS, validationMessage('validation.skillDraft.pathTooLong', { max: SKILL_PATH_MAX_CHARS })),
+  text: z
+    .string({ required_error: validationMessage('validation.skillDraft.fileContentRequired') })
+    .max(
+      SKILL_DRAFT_MAX_FILE_BYTES,
+      validationMessage('validation.skillDraft.fileTooLarge', { max: SKILL_DRAFT_MAX_FILE_BYTES }),
+    ),
+})
+export type SkillDraftFileContentBody = z.infer<typeof skillDraftFileContentBodySchema>
+
+/** 文件 / 目录的重命名 / 移动（`POST /api/skill-drafts/:draftId/files/rename`，P1-24a-7） */
+export const SKILL_DRAFT_RENAME_KINDS = ['FILE', 'DIR'] as const
+export type SkillDraftRenameKind = (typeof SKILL_DRAFT_RENAME_KINDS)[number]
+
+export const skillDraftRenameBodySchema = z
+  .object({
+    from: z
+      .string({ required_error: validationMessage('validation.skillDraft.pathRequired') })
+      .trim()
+      .min(1, validationMessage('validation.skillDraft.pathRequired'))
+      .max(SKILL_PATH_MAX_CHARS, validationMessage('validation.skillDraft.pathTooLong', { max: SKILL_PATH_MAX_CHARS })),
+    to: z
+      .string({ required_error: validationMessage('validation.skillDraft.pathRequired') })
+      .trim()
+      .min(1, validationMessage('validation.skillDraft.pathRequired'))
+      .max(SKILL_PATH_MAX_CHARS, validationMessage('validation.skillDraft.pathTooLong', { max: SKILL_PATH_MAX_CHARS })),
+    kind: z.enum(SKILL_DRAFT_RENAME_KINDS, {
+      errorMap: () => ({ message: validationMessage('validation.skillDraft.renameKindNotAllowed', { allowed: SKILL_DRAFT_RENAME_KINDS.join(' / ') }) }),
+    }),
+    /** 目标冲突时是否覆盖；缺省 `false` ⇒ 400（不静默覆盖） */
+    overwrite: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.from === SKILL_ENTRY_PATH || value.to === SKILL_ENTRY_PATH) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: validationMessage('validation.skillDraft.entryNotRenamable') })
+    }
+    if (value.kind === 'DIR' && (value.to === value.from || value.to.startsWith(`${value.from}/`))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: validationMessage('validation.skillDraft.renameIntoSelf') })
+    }
+    if (value.kind === 'FILE' && value.to === value.from) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: validationMessage('validation.skillDraft.renameSamePath') })
+    }
+  })
+export type SkillDraftRenameBody = z.infer<typeof skillDraftRenameBodySchema>
 
 /**
  * 落库（`POST /api/skills/from-draft`）——**只收 `draftId` + 展示元数据**（口径 ①）。
@@ -2067,6 +2174,19 @@ export const saveSkillRevisionFromDraftBodySchema = z.object({
       SKILL_DRAFT_MAX_MARKDOWN_CHARS,
       validationMessage('validation.skillDraft.markdownTooLong', { max: SKILL_DRAFT_MAX_MARKDOWN_CHARS }),
     )
+    .optional(),
+  /**
+   * 详情页正文编辑（P1-24a-5）：**元数据改动与新版本合并发布**。
+   *
+   * 只收 `visibility` —— `name` / `description` 本来就在草稿里（建草稿时随正文一起提交），
+   * 这里再收一遍会变成"两个真相源"。`SHARED` 同样由服务层拒绝。
+   */
+  visibility: z
+    .enum(ASSET_VISIBILITIES, {
+      errorMap: () => ({
+        message: validationMessage('validation.skill.visibilityAllowed', { allowed: SKILL_VISIBILITIES.join(' / ') }),
+      }),
+    })
     .optional(),
   /**
    * 保存选项 ②：**顺带把这个 Agent 固定到新版本**（P1-24c-4；§10.5 保存选项第 2 条）。
@@ -2892,7 +3012,7 @@ export type PromoteSkillOverrideResult = z.infer<typeof promoteSkillOverrideResu
 //
 // 七条口径（每条错了都只在运行期暴露）：
 //   ① **diff 由服务端从基准内容算**（`computeSkillDiff`），`diff` 只用于展示 / 审计，不是可执行 patch；
-//   ② **提交时物化文件**到 `skill-proposals/{proposalId}/`：草稿 1 小时过期后提案仍可审；
+//   ② **提交时物化文件**到 `skill-proposals/{proposalId}/`：草稿过期后提案仍可审；
 //   ③ **接受落完整内容**（草稿 `markdown + files` / 三方合并结果），不执行客户端 patch；
 //   ④ **默认 `REQUIRE_BASE`**：`baseVersion !== 上游当前版本` ⇒ 409，不自动合并；
 //      只有显式 `THREE_WAY` 且 `resolutions` 覆盖全部冲突锚点才合并；

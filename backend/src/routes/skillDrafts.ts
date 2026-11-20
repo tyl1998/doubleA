@@ -10,13 +10,28 @@
  *   DELETE /api/skill-drafts/:draftId            丢弃
  *   POST   /api/skill-drafts/:draftId/files      上传单个文件（multipart：`file` + 可选 `path` + 可选 `replace`）
  *   GET    /api/skill-drafts/:draftId/files      单文件预览（`?path=`；文本全文 / 二进制元信息）
- *   DELETE /api/skill-drafts/:draftId/files      移除单个文件（`?path=`）
+ *   DELETE /api/skill-drafts/:draftId/files      移除文件 / 目录（`?path=&recursive=1`；P1-24a-7）
+ *   PUT    /api/skill-drafts/:draftId/files/content 新建 / 修改文本文件（JSON：`{ path, text }`；P1-24a-7）
+ *   POST   /api/skill-drafts/:draftId/files/rename  重命名 / 移动文件或目录（P1-24a-7）
+ *
+ * ⚠️ 文件树编辑（P1-24a-7）**不新增写库路径**：所有变更都只是草稿 payload 的改动
+ * （`files` 增量 + `removedPaths` 墓碑），发布仍走 `from-draft` / `revisions/from-draft`。
+ * `SKILL.md` 不在文件编辑里（正文只通过 `markdown`），不能删 / 重命名。
  *
  * ⚠️ **建草稿只收 JSON**：草稿文件走独立的上传端点，于是"一个请求既传 JSON 又传文件"的那种
  * 混合形态在这里不存在（`_data` / `request.file()` 的边界问题随之一并消失）。
  *
  * ⚠️ 保存入口不在这里（`POST /api/skills/from-draft` / `POST /api/skills/:id/revisions/from-draft`
  * 注册在 `routes/skills.ts`）：它们写的是 `skills` / `skill_files`，与「草稿」是两种资源。
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * `kind` 的取值域（P1-24a-6 重新放开 `CREATE`）
+ * ─────────────────────────────────────────────────────────────────────
+ * c-2 曾把 `CREATE` 收掉，只留会话抽取建带来源的草稿。a-6 恢复**页面新建**：
+ * · `kind=CREATE`：名称 / 描述 / 运行时 + **非空 `SKILL.md` 正文**（schema 与 `saveSkillFromDraft` 两处拦空壳）；
+ * · **不收 `source`**：客户端说了不算 ⇒ 手建草稿落库一律 `sourceType=MANUAL`；
+ * · `REVISION` 仍要 `targetSkillId + baseVersion`；`PROPOSAL` / `SESSION_OVERRIDE` 各有专用入口。
+ * 创建只产生草稿，**内容写入仍只有 `from-draft` 一条路径**（不给 `POST /api/skills` 加 JSON 建法）。
  */
 
 import {
@@ -24,12 +39,16 @@ import {
   appMsg,
   createSkillDraftBodySchema,
   ok,
+  skillDraftFileContentBodySchema,
   skillDraftFileQuerySchema,
   skillDraftIdParamsSchema,
+  skillDraftRenameBodySchema,
   updateSkillDraftBodySchema,
   type CreateSkillDraftBody,
+  type SkillDraftFileContentBody,
   type SkillDraftFileQuery,
   type SkillDraftIdParams,
+  type SkillDraftRenameBody,
   type UpdateSkillDraftBody,
 } from '@doubulea/shared'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -43,9 +62,11 @@ import {
   getSkillDraft,
   listSkillDrafts,
   previewSkillDraftFile,
-  removeSkillDraftFile,
+  removeSkillDraftPath,
+  renameSkillDraftPath,
   updateSkillDraft,
   uploadSkillDraftFile,
+  writeSkillDraftFileContent,
 } from '../services/skillDraft.service.js'
 
 /** 取调用者（`id` + `role`）—— 服务层按草稿归属判权 */
@@ -124,6 +145,7 @@ export function registerSkillDraftRoutes(app: FastifyInstance): void {
             requiresBins: body.requiresBins,
             markdown: body.markdown,
             warnings: body.warnings,
+            changeSummary: body.changeSummary,
           },
           viewerOf(request),
         ),
@@ -169,10 +191,38 @@ export function registerSkillDraftRoutes(app: FastifyInstance): void {
     async (request) => ok(await previewSkillDraftFile(request.params.draftId, request.query.path, viewerOf(request))),
   )
 
-  /** 移除单个草稿文件 */
+  /** 移除文件 / 目录（`recursive=1` = 按前缀批量删；基准文件只加墓碑） */
   app.delete<{ Params: SkillDraftIdParams; Querystring: SkillDraftFileQuery }>(
     '/api/skill-drafts/:draftId/files',
     { preHandler: app.requireAuth, schema: { params: skillDraftIdParamsSchema, querystring: skillDraftFileQuerySchema } },
-    async (request) => ok(await removeSkillDraftFile(request.params.draftId, request.query.path, viewerOf(request))),
+    async (request) =>
+      ok(
+        await removeSkillDraftPath(
+          request.params.draftId,
+          { path: request.query.path, recursive: request.query.recursive },
+          viewerOf(request),
+        ),
+      ),
+  )
+
+  /** 新建 / 修改一个文本文件（JSON：`{ path, text }`；二进制仍走上面的 multipart 上传） */
+  app.put<{ Params: SkillDraftIdParams; Body: SkillDraftFileContentBody }>(
+    '/api/skill-drafts/:draftId/files/content',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillDraftIdParamsSchema, body: skillDraftFileContentBodySchema },
+    },
+    async (request) =>
+      ok(await writeSkillDraftFileContent(request.params.draftId, request.body, viewerOf(request))),
+  )
+
+  /** 重命名 / 移动文件或目录（目标冲突缺省 400；`overwrite=true` 才覆盖） */
+  app.post<{ Params: SkillDraftIdParams; Body: SkillDraftRenameBody }>(
+    '/api/skill-drafts/:draftId/files/rename',
+    {
+      preHandler: app.requireAuth,
+      schema: { params: skillDraftIdParamsSchema, body: skillDraftRenameBodySchema },
+    },
+    async (request) => ok(await renameSkillDraftPath(request.params.draftId, request.body, viewerOf(request))),
   )
 }

@@ -55,6 +55,7 @@ import {
   checkSkillExtractRequest,
   clipSkillExtractText,
   detectSkillRevisionRisks,
+  effectiveSkillRuntime,
   isSkillScriptPath,
   normalizeExtractedFiles,
   parseSkillExtractOutput,
@@ -461,7 +462,7 @@ async function readRevisionBase(row: SkillRow): Promise<{
     skillId: row.id,
     name: row.name,
     description: row.description,
-    runtime: row.runtime,
+    runtime: effectiveSkillRuntime(row.runtime),
     version: row.version,
     markdown,
     files,
@@ -1117,7 +1118,7 @@ export async function extractSkillFromConversation(
     warnings.push('抽取结果带了 scripts/，运行时已自动改为 sandbox（脚本只能在 TaskAgent 沙箱里执行）')
   }
   // REVISION：模型没显式写 runtime 时 schema 会回落 INLINE；沙箱 Skill 不能被这次修订悄悄降级
-  const draftRuntime = revisionBase !== null && revisionBase.runtime === 'SANDBOX' ? 'SANDBOX' : runtimeOfOutput.runtime
+  const draftRuntime = revisionBase !== null && effectiveSkillRuntime(revisionBase.runtime) === 'SANDBOX' ? 'SANDBOX' : runtimeOfOutput.runtime
   const requiresBins = resolveExtractedBins({ declared: output.requiresBins, files: normalizedFiles.files })
   const draftFiles: DraftFileInput[] = [
     ...artifactFiles,
@@ -1127,7 +1128,7 @@ export async function extractSkillFromConversation(
   for (const file of draftFiles) redactions = mergeRedactions(redactions, scanSkillSecrets(file.content).redactions)
 
   // 覆写 inline Skill 时**不接受 scripts/**（脚本只能在 TaskAgent 沙箱里执行；§5.16.5）
-  if (overrideIntent && revisionBase !== null && revisionBase.runtime === 'INLINE' && draftFiles.some((file) => isSkillScriptPath(file.path))) {
+  if (overrideIntent && revisionBase !== null && effectiveSkillRuntime(revisionBase.runtime) === 'INLINE' && draftFiles.some((file) => isSkillScriptPath(file.path))) {
     throw AppError.validation(appMsg('app.m323', { p0: revisionBase.name }), {
       code: SKILL_ERROR_CODES.IMPORT_INVALID,
       reasons: ['inline Skill 的会话覆写不能包含 scripts/ 文件'],

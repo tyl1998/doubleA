@@ -6,7 +6,7 @@
  * ─────────────────────────────────────────────────────────────────────
  * · **是**：一条 Redis 短 TTL 队列 `skill-draft-notice:{conversationId}` —— 草稿入口工具
  *   （`request_skill_draft` / `request_skill_revision`）产出的"待展示提示"；
- * · **不是**：草稿本身（草稿在 `skill-draft:{draftId}`，见 c-1）、也不是记忆（同族形态，不同键）。
+ * · **不是**：草稿本身（草稿在 `skill_drafts` 表，见 c-1 / c-7a）、也不是记忆（同族形态，不同键）。
  *
  * 与 `memory.service` 的"待展示提示"同一套取舍：**不依赖同一轮 SSE 流**（`done` 之后工具才
  * 可能写完草稿）⇒ 前端在下一次拉取（本轮结束 / 聚焦 / 重连）时取。提示卡可关闭、幂等
@@ -15,7 +15,7 @@
  * 四条口径：
  *  ① **归属判据只有一处**：`conversations.userId`（不是你的 = 不存在 = 404，与抽取端点同一条）；
  *  ② **`GET` 不消费**：打开页面 / 重连会重复拉到，前端按 `id` 去重；只有 `POST`（OPEN / DISMISS）才移除；
- *  ③ **草稿没了提示也就不弹**：`draftId` 指向的 Redis 草稿已过期 ⇒ 拉取时顺手丢弃（`FOREIGN` 无草稿保留）；
+ *  ③ **草稿没了提示也就不弹**：`draftId` 指向的草稿已过期 / 已消耗 ⇒ 拉取时顺手丢弃（`FOREIGN` 无草稿保留）；
  *  ④ **读写恒不抛给业务错误**：Redis 抖动 ⇒ 按"没有提示"处理（提示只是锦上添花，不能拖垮对话页）。
  */
 
@@ -24,7 +24,8 @@ import { AppError, appMsg, type SkillDraftNotice } from '@doubulea/shared'
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma } from '../infra/prisma.js'
-import { ensureRedisConnected, readSkillDraftRaw } from '../infra/redis.js'
+import { ensureRedisConnected } from '../infra/redis.js'
+import { skillDraftExists } from './skillDraft.service.js'
 
 /** Redis 键（按会话；会话归本人，故不需要再带 userId） */
 export function skillDraftNoticeKey(conversationId: string): string {
@@ -129,7 +130,7 @@ export async function listSkillDraftNotices(
     const list = parseNoticeList(raw)
     const kept: SkillDraftNotice[] = []
     for (const notice of list) {
-      if (notice.draftId !== null && (await readSkillDraftRaw(notice.draftId)) === undefined) continue
+      if (notice.draftId !== null && !(await skillDraftExists(notice.draftId))) continue
       kept.push(notice)
     }
     if (kept.length !== list.length) {

@@ -33,6 +33,7 @@ import type {
   ArtifactListItem,
   ArtifactListResult,
   BatchDeleteArtifactsResult,
+  XmindOutline,
 } from '@doubulea/shared'
 
 import { request, requestBlob } from './client.js'
@@ -41,6 +42,7 @@ import {
   artifactContentUrl,
   artifactDeleteUrl,
   artifactDownloadUrl,
+  artifactOutlineUrl,
   artifactsCollectionUrl,
   decodeUtf8Text,
 } from '../components/ArtifactPreview/artifactPreview.js'
@@ -218,6 +220,19 @@ export async function fetchArtifactText(
 ): Promise<string | null> {
   const { blob } = await requestBlob(artifactContentUrl(artifactId), options)
   return decodeUtf8Text(await blob.arrayBuffer())
+}
+
+/**
+ * 取回 xmind 的**大纲**（`GET /api/artifacts/:id/outline`，2026-11-20）。
+ *
+ * 与 {@link fetchArtifactText} 的区别：那条取的是文本、做 UTF-8 严格解码；这条取的是
+ * **服务端解包好的结构化 JSON**（`XmindOutline`），前端直接画树。体积闸门由调用方与后端共同把关。
+ */
+export async function fetchArtifactOutline(
+  artifactId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<XmindOutline> {
+  return request<XmindOutline>(artifactOutlineUrl(artifactId), options)
 }
 
 /**

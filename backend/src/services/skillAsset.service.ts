@@ -45,6 +45,7 @@ import {
   ARTIFACT_PREVIEW_MAX_INLINE_BYTES,
   SKILL_ENTRY_PATH,
   SKILL_ERROR_CODES,
+  SKILL_NAME_MAX_CHARS,
   isLikelyScriptPath,
   isPreviewableSkillMime,
   isSafeSkillPath,
@@ -65,6 +66,7 @@ import {
   type SkillPage,
   type SkillVersion,
   type UpdateSkillBody,
+  type XmindOutline,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -97,6 +99,7 @@ import {
   type ParsedSkillZip,
 } from './skillZip.js'
 import { parseXlsx, renderXlsxToHtml } from './xlsxPreview.js'
+import { parseXmind } from './xmindPreview.js'
 
 /** 详情里变更记录的条数上限（版本历史页只需回看最近几版；完整列表属将来的分页端点） */
 const SKILL_CHANGES_PAGE_LIMIT = 50
@@ -500,7 +503,7 @@ function filesForVersion(
   meta: {
     name: string
     description: string
-    runtime: 'INLINE' | 'SANDBOX'
+    runtime: 'INLINE' | 'SANDBOX' | null
     requiresBins: readonly string[]
     /** 包里 frontmatter 的其余键（原样保留，见 `composeSkillMarkdown` 的 `extra`） */
     extra: Readonly<Record<string, unknown>>
@@ -563,17 +566,24 @@ export async function importSkillPackage(
   const parsed = parseSkillZip(input.zip, {
     ...(input.runtime === undefined ? {} : { expectedRuntime: input.runtime }),
   })
-  if (existing !== null && existing.runtime !== parsed.runtime) {
+  if (existing !== null && parsed.runtime !== null && existing.runtime !== parsed.runtime) {
     throw AppError.conflict(appMsg('app.m293', { p0: existing.name }), {
       code: SKILL_ERROR_CODES.RUNTIME_NOT_ALLOWED,
     })
   }
-  // `runtime` 与 `scripts/**` 的互斥已在 `parseSkillZip` 里判过（一致性校验），这里只管 DB 字段
+  // 包内**没声明** runtime（第三方 Skill 常态）⇒ 重新导入时继承库里已有值；
+  // 新建时留空（管理面显示"未声明"，执行侧按 INLINE 处理）
+  // `runtime` 与 `scripts/**` 的互斥已在 `parseSkillZip` 里按"有脚本 ⇒ sandbox"归一，这里只管 DB 字段
 
-  const name = (input.name?.trim() ?? parsed.frontmatter.name ?? (existing?.name ?? '')).trim()
+  // 名称兜底：frontmatter → 包内目录名 / 正文标题 → 重新导入时沿用旧名。
+  // 超长按**码点**截到列宽（128）而不是让 `VarChar(128)` 在落库时炸 500 —— 导入面以“能进来”优先。
+  const name = [...((input.name?.trim() || parsed.frontmatter.name || parsed.nameHint || existing?.name || '').trim())]
+    .slice(0, SKILL_NAME_MAX_CHARS)
+    .join('')
+    .trim()
   if (name === '') throw AppError.validation(appMsg('app.m299'), { code: SKILL_ERROR_CODES.IMPORT_INVALID })
-  const description = (input.description?.trim() ?? parsed.frontmatter.description ?? existing?.description ?? '').trim()
-  const runtime = parsed.runtime
+  const description = (input.description?.trim() || parsed.frontmatter.description || existing?.description || '').trim()
+  const runtime: 'INLINE' | 'SANDBOX' | null = parsed.runtime ?? existing?.runtime ?? null
   const requiresBins = parsed.requiresBins
 
   // `name` 与 `description` 会被重生成 ⇒ 不重复渲染；其余键原样保留
@@ -1051,6 +1061,39 @@ export async function renderSkillFileHtml(
   } catch (error) {
     if (error instanceof AppError) throw error
     getLogger().warn({ err: error, skillId: id, path: row.path, kind }, 'Skill OOXML 渲染失败')
+    throw AppError.validation(appMsg('app.m091'))
+  }
+}
+
+/**
+ * XMIND 的大纲解析（`GET /api/skills/:id/file/outline?path=&version=`，2026-11-20）。
+ *
+ * 与产物 / 工作区两条 outline 出口同一个解析器（`parseXmind`）；`.xmind` 是 zip 包，
+ * 原始字节绝不能当 HTML 直出。返回结构化 JSON，由前端 `XmindOutlinePreview` 渲染。
+ */
+export async function readSkillFileOutline(
+  id: string,
+  query: { path: string; version?: number },
+  viewer: SkillViewer,
+): Promise<XmindOutline> {
+  const skill = await requireSkill(id, viewer, 'view')
+  const row = await requireSkillFile(skill, query.path, query.version)
+  if (isPurgedSkillFile(row)) {
+    throw AppError.conflict(appMsg('app.m297', { p0: row.path, p1: query.version ?? skill.version }), {
+      code: SKILL_ERROR_CODES.VERSION_PURGED,
+    })
+  }
+  if (previewKindOf(row.mime) !== 'xmind') throw AppError.validation(appMsg('app.m090'))
+  const bytes = await readSkillFileObject(skill, row, query.version ?? skill.version)
+  if (bytes.length > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) throw AppError.validation(appMsg('app.m019'))
+
+  const fileName = fileNameOf(row.path)
+  try {
+    const parsed = parseXmind(bytes)
+    return { fileName, sheets: parsed.sheets, truncated: parsed.truncated }
+  } catch (error) {
+    if (error instanceof AppError) throw error
+    getLogger().warn({ err: error, skillId: id, path: row.path }, 'Skill xmind 解析失败')
     throw AppError.validation(appMsg('app.m091'))
   }
 }

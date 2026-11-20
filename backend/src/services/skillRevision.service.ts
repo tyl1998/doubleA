@@ -25,6 +25,7 @@
 import {
   AppError,
   appMsg,
+  effectiveSkillRuntime,
   skillVersionFromConfig,
   type SkillRevisionTarget,
   type SkillRevisionTargets,
@@ -115,7 +116,7 @@ export async function listSkillRevisionTargets(
       name: row.name,
       slug: row.slug,
       description: row.description,
-      runtime: row.runtime,
+      runtime: effectiveSkillRuntime(row.runtime),
       version: row.version,
       loadedVersion: loaded ?? null,
       mostRecent: false,

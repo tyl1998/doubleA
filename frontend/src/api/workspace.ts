@@ -33,7 +33,7 @@ import {
 import { openEventStream, request, requestBlob, requestFormData } from './client.js'
 import { currentLocale } from '../stores/locale.js'
 
-import type { WorkspaceEventItem } from '@doubulea/shared'
+import type { WorkspaceEventItem, XmindOutline } from '@doubulea/shared'
 
 /** 文件树的 query key（`["workspace-tree", conversationId]`） */
 export function workspaceTreeQueryKey(conversationId: string): readonly [string, string] {
@@ -297,6 +297,26 @@ export function workspaceRawUrl(conversationId: string, path: string): string {
 export function workspaceRenderUrl(conversationId: string, path: string): string {
   const query = new URLSearchParams({ path }).toString()
   return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/render?${query}`
+}
+
+/**
+ * 文件的**大纲出口 URL**（`GET .../workspace/file/outline?path=`，xmind 专用，2026-11-20）。
+ *
+ * 与 {@link workspaceRenderUrl} 并列的第三条出口：render 回 HTML（docx / xlsx），
+ * outline 回**结构化 JSON**（xmind），前端 `XmindOutlinePreview` 画"左树 + 右阅读区"。
+ */
+export function workspaceOutlineUrl(conversationId: string, path: string): string {
+  const query = new URLSearchParams({ path }).toString()
+  return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/file/outline?${query}`
+}
+
+/** 取回工作区 xmind 的大纲（结构化 JSON） */
+export function fetchWorkspaceOutline(
+  conversationId: string,
+  path: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<XmindOutline> {
+  return request<XmindOutline>(workspaceOutlineUrl(conversationId, path), options)
 }
 
 /**

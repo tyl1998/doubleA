@@ -442,15 +442,15 @@ export async function writeSkillLastLoaded(
 //
 // `skill-draft:{draftId}` → 整份草稿 JSON（`SkillDraftRecord`，见 `services/skillDraft.service.ts`）。
 //
-// 四条口径（每条错了都会造出一种"看起来能用"的错误行为）：
-//   · **TTL 即生命周期**：草稿不落库（§7.2 的 MVP 取舍），过期 = 不存在 ⇒ `GET/PUT` 一律 404
-//     `SKILL_DRAFT_NOT_FOUND`。`GET` / `PUT` / 上传文件都会**续期**（审核页每 60s 自动保存）；
+// ⚠️ **c-7a（2026-11-19）起草稿真相源是 `skill_drafts` 表**；这里的读写原语只保留给
+// **旧草稿迁移兜底**：服务层在表里查不到时读一次旧键，成功就写表并清旧键。新草稿不再写 Redis。
+//
+// 保留的四条口径（迁移读取仍然依赖它们）：
+//   · **TTL 即生命周期**：旧键过期 = 不存在（c-1 的 MVP 行为），迁移时按记录里的 `updatedAt` 再判一次；
 //   · **归属写在值里**（`userId`），键里只有 `draftId` —— 键名不进任何对外的列表，
 //     归属校验在服务层做（不是你的 / 不存在 / 过期 ⇒ 同一个 404，不泄漏存在性）；
-//   · **落库后用 `DEL` 消耗掉草稿**（同一个草稿不能被保存两次：第二次会 404）；
-//     文件对象（`skill-drafts/{userId}/{draftId}/...`）在落库成功后由服务层回收；
-//   · **读失败向上抛**（与 `readSkillLastLoaded` 的"恒不抛"刻意不同）：草稿是**用户正在编辑的东西**，
-//     悄悄当成"过期"会让用户以为辛苦编辑的内容丢了。
+//   · **读失败按不存在处理**：迁移读不到就回 404，不让 Redis 抖动把"草稿还在表里"的情况说成坏了；
+//   · 本人索引与全量扫描同样只服务迁移；新代码不应再调用 `addSkillDraftToUserIndex`。
 
 /** `skill-draft:{draftId}` 键名 */
 export function skillDraftKey(draftId: string): string {

@@ -236,10 +236,16 @@ const step = (text) => console.log(`\n${C.cyan}== ${text} ==${C.x}`)
 const ok = (text) => console.log(`  ${C.green}[ok]${C.x} ${text}`)
 const info = (text) => console.log(`  ${C.dim}${text}${C.x}`)
 
+/** 给 `docker build` 补 `--progress=plain`：非 tty（后端自举走 spawn 管道）下动态进度条会退化成噪声或干脆不输出 */
+function withPlainProgress(args) {
+  if (args[0] !== 'build' || args.includes('--progress')) return args
+  return [args[0], '--progress=plain', ...args.slice(1)]
+}
+
 function run(args, label) {
   console.log(`  ${C.dim}$ ${dockerBin} ${args.join(' ')}${C.x}`)
   if (dryRun) return 0
-  const result = spawnSync(dockerBin, args, { stdio: 'inherit', env: childEnv })
+  const result = spawnSync(dockerBin, withPlainProgress(args), { stdio: 'inherit', env: childEnv })
   if (result.error) {
     console.error(`${C.red}[fail]${C.x} ${label}：${result.error.message}`)
     process.exit(1)

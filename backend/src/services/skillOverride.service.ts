@@ -26,13 +26,13 @@ import {
   SKILL_ENTRY_PATH,
   SKILL_ERROR_CODES,
   appMsg,
+  effectiveSkillRuntime,
   skillOverridePrefix,
   type ConversationSkillOverrideDetail,
   type ConversationSkillOverrideFile,
   type ConversationSkillOverrideItem,
   type ConversationSkillOverridesResult,
   type SkillDraft,
-  type SkillRuntime,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -246,7 +246,7 @@ export async function createConversationSkillOverride(
   }
   const skill = await requireVisibleSkill(materialized.targetSkillId, viewer)
 
-  if (skill.runtime === 'INLINE' && materialized.files.some((file) => file.path.startsWith('scripts/'))) {
+  if (effectiveSkillRuntime(skill.runtime) === 'INLINE' && materialized.files.some((file) => file.path.startsWith('scripts/'))) {
     throw AppError.validation(appMsg('app.m323', { p0: skill.name }), {
       code: SKILL_ERROR_CODES.IMPORT_INVALID,
       reasons: ['inline Skill 的会话覆写不能包含 scripts/ 文件'],
@@ -401,7 +401,7 @@ export async function replaceConversationSkillOverride(
   const materialized = await materializeSkillOverrideDraft(input.draftId, viewer)
   assertDraftMatches(materialized, conversationId, { skillId: current.skillId, revision: current.revision })
   const skill = await requireVisibleSkill(current.skillId, viewer)
-  if (skill.runtime === 'INLINE' && materialized.files.some((file) => file.path.startsWith('scripts/'))) {
+  if (effectiveSkillRuntime(skill.runtime) === 'INLINE' && materialized.files.some((file) => file.path.startsWith('scripts/'))) {
     throw AppError.validation(appMsg('app.m323', { p0: skill.name }), {
       code: SKILL_ERROR_CODES.IMPORT_INVALID,
       reasons: ['inline Skill 的会话覆写不能包含 scripts/ 文件'],
@@ -524,7 +524,7 @@ export async function rebaseConversationSkillOverride(
     overrideId: row.id,
     name: skill.name,
     description: skill.description,
-    runtime: skill.runtime as SkillRuntime,
+    runtime: effectiveSkillRuntime(skill.runtime),
     requiresBins,
     markdown: stripFrontmatter(raw),
     changeSummary: `按上游 v${String(skill.version)} 重建（原覆写 r${String(row.revision)}）`,

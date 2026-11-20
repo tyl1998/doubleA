@@ -373,6 +373,8 @@ model User {
   skillProposals          SkillProposal[]         @relation("SkillProposalProposer")
   /// P1-24c-6：本用户审核过的更新建议（`skill_proposals.reviewed_by`）
   reviewedSkillProposals  SkillProposal[]         @relation("SkillProposalReviewer")
+  /// P1-24c-7a：本用户的 Skill 草稿（`skill_drafts.user_id`；跨设备恢复）
+  skillDrafts             SkillDraft[]
 
   @@map("users")
 }
@@ -1679,7 +1681,9 @@ model SkillExtractModelConfig {
 /// Skill 的运行时要求（`SKILL.md` frontmatter 的 `requires.runtime`，DB 字段是**真相源**）
 ///
 /// · `INLINE`  —— 只要说明 / 参考资料 ⇒ ChatBot 与 TaskAgent 都能绑；
-/// · `SANDBOX` —— 需要容器与脚本 ⇒ **只允许 TaskAgent**（ChatBot 绑定期 409 `SKILL_RUNTIME_NOT_ALLOWED`）。
+/// · `SANDBOX` —— 需要容器与脚本 ⇒ **只允许 TaskAgent**（ChatBot 绑定期 409 `SKILL_RUNTIME_NOT_ALLOWED`）；
+/// · `NULL`    —— 包内**没有声明**（第三方 Skill 常态）：没有脚本时能力等同 `INLINE`，
+///              管理面如实显示"未声明"，不替作者伪造一个 runtime。
 enum SkillRuntime {
   INLINE
   SANDBOX
@@ -1720,7 +1724,8 @@ model Skill {
   slug                 String          @db.VarChar(128)
   /// 模型选择 Skill 的**唯一依据**（写"什么时候用"，不是功能介绍）
   description          String          @db.Text
-  runtime              SkillRuntime    @default(INLINE)
+  /// `null` = 包内未声明（见 `enum SkillRuntime` 注释）；新写入一律显式给值
+  runtime              SkillRuntime?   @default(INLINE)
   /// `requires.bins`（脚本依赖的解释器 / 命令；只用于绑定期提示与 TaskAgent 预检，不阻断派活）
   requiresBins         Json            @default("[]") @map("requires_bins") @db.JsonB
   /// **整版快照号**（见上方口径）；指针语义 —— 当前版本
@@ -1886,6 +1891,48 @@ model SkillProposal {
   @@index([targetSkillId, status, createdAt(sort: Desc)])
   @@index([proposedBy, createdAt(sort: Desc)])
   @@map("skill_proposals")
+}
+
+/// 草稿类型（P1-24c-7a；与 `shared#SKILL_DRAFT_KINDS` 逐字一致）
+///
+/// 与 `skill_changes` / `skill_proposals` 的状态枚举分开：草稿类型是**创建入口**，
+/// 不是审核状态机（状态来自 `skill_proposals.status`，读取时实时投影）。
+enum SkillDraftKind {
+  CREATE
+  REVISION
+  PROPOSAL
+  SESSION_OVERRIDE
+
+  @@map("skill_draft_kind")
+}
+
+/// skill_drafts —— Skill 草稿（P1-24c-7a 从 Redis 迁到表；`子方案/会话生成Skill.md` §7.2）
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// 为什么值得一张表（c-1 的 MVP 取舍被本条增强替换）
+/// ─────────────────────────────────────────────────────────────────────
+/// · **跨设备恢复**：草稿不再随 Redis 重启 / 实例切换消失，换浏览器或另一台设备打开
+///   「我的草稿」能继续编辑；
+/// · **保留期按 `expires_at` 判定**：`GET/PUT` 续期（滑窗），过期行由读路径懒清理；
+/// · `payload` 是**服务端内部整份记录**（形状 = `skillDraft.service.ts#SkillDraftRecord`），
+///   对外只经 `toDraft()` 投影 —— 不拆成列，避免草稿字段演进时反复加迁移；
+/// · 文件仍在 S3 `skill-drafts/{userId}/{draftId}/`，表只存清单（path/mime/size/sha256）；
+/// · 归属 = `user_id`；删用户级联删草稿（S3 临时对象由保存 / 丢弃路径回收）。
+model SkillDraft {
+  id        String         @id @default(uuid(7)) @db.Uuid
+  userId    String         @map("user_id") @db.Uuid
+  kind      SkillDraftKind
+  /// 整份草稿记录（`SkillDraftRecord` JSON；对外投影见 `skillDraft.service.ts#toDraft`）
+  payload   Json           @db.JsonB
+  /// 过期时刻（`updated_at + SKILL_DRAFT_TTL_SEC`；读路径判过期并懒删）
+  expiresAt DateTime       @map("expires_at") @db.Timestamptz(3)
+  createdAt DateTime       @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime       @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("skill_drafts")
 }
 
 /// conversation_skill_overrides —— 会话级 Skill 覆写（P1-24c-4b；`子方案/Skill能力.md` §5.16）

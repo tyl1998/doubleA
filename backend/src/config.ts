@@ -785,13 +785,14 @@ const envSchema = z
      */
     SKILL_RUNTIME_ROOT: defaultedVar(z.string().trim(), ''),
     /**
-     * Skill 草稿的存活时长（秒，P1-24c-1）。Redis 草稿 TTL = 它；`GET/PUT` 每次续期。
+     * Skill 草稿的保留时长（秒，P1-24c-1；c-7a 起落 `skill_drafts` 表）。`GET/PUT` 每次续期（滑窗）。
      *
-     * 审核页每 60s 自动 `PUT` 一次 ⇒ 默认 1 小时足够"编辑 + 脱敏复核 + 保存"。
-     * 过期后草稿（含 S3 临时前缀下的文件）一律 404 `SKILL_DRAFT_NOT_FOUND`：草稿是**临时**资源，
-     * 不落库、不跨设备恢复（`子方案/会话生成Skill.md` §7.2）。
+     * 默认 7 天：草稿已跨设备可恢复，编辑到一半换浏览器 / 换机器仍能继续；审核页每 60s
+     * 自动 `PUT` 一次，持续编辑不会到期。过期后草稿（含 S3 临时前缀下的文件）一律 404
+     * `SKILL_DRAFT_NOT_FOUND`，过期行由读写路径懒删（`子方案/会话生成Skill.md` §7.2）。
+     * 已提交提案的草稿另有 30 天保留期（`SUBMITTED_DRAFT_TTL_SEC`）。
      */
-    SKILL_DRAFT_TTL_SEC: intVar('SKILL_DRAFT_TTL_SEC', 3600, { min: 60, max: 7 * 24 * 3600 }),
+    SKILL_DRAFT_TTL_SEC: intVar('SKILL_DRAFT_TTL_SEC', 7 * 24 * 3600, { min: 60, max: 30 * 24 * 3600 }),
     /** 单份草稿的文件数上限（含 `SKILL.md`；与导入的 `SKILL_MAX_FILES` 分开，草稿是手工编辑的面） */
     SKILL_DRAFT_MAX_FILES: intVar('SKILL_DRAFT_MAX_FILES', 50, { min: 1, max: 500 }),
     /** 草稿单文件字节上限（默认与导入同值 5MB） */
@@ -1342,7 +1343,7 @@ export interface AppConfig {
     runtimeRoot: string
     /** 草稿（c-1） */
     draft: {
-      /** 存活秒数（见 `SKILL_DRAFT_TTL_SEC`） */
+      /** 保留秒数（滑窗；见 `SKILL_DRAFT_TTL_SEC`） */
       ttlSec: number
       /** 文件数上限（含 `SKILL.md`；见 `SKILL_DRAFT_MAX_FILES`） */
       maxFiles: number

@@ -6,23 +6,24 @@
  * ─────────────────────────────────────────────────────────────────────
  * · `skill.service.ts`（a-1）= 纯判据；`skillAsset.service.ts`（a-2）= 导入 / 管理面编排；
  *   `sandbox/skillScript.ts#normalizeSkillDraftContent`（b-3 的纯函数簇）= 草稿内容的路径 / 一致性判据。
- * · **本文件（c-1）= 草稿编排**：Redis 草稿 JSON + S3 临时前缀 + 落库（v1 / vN+1）。
+ * · **本文件（c-1 / c-7a）= 草稿编排**：`skill_drafts` 表 + S3 临时前缀 + 落库（v1 / vN+1）。
  *
  * ─────────────────────────────────────────────────────────────────────
  * 七条口径（每条错了都只在运行期暴露）
  * ─────────────────────────────────────────────────────────────────────
  * ① **草稿是服务端资源**：前端只提交 `draftId` + 展示元数据。文件上传走独立端点、键由服务端拼，
  *    `storageKey` / `files` / `markdown` 一律**不**从保存入口读（口径见 `shared/src/skill.ts` 草稿段）。
- * ② **草稿 JSON 与文件分开存**：JSON 进 Redis（TTL = `config.skill.draft.ttlSec`，`GET/PUT` 续期），
- *    文件进 S3 `skill-drafts/{userId}/{draftId}/{path}`。**先写 S3、后写 JSON**：反过来会出现
- *    "草稿里列着一个不存在的对象"（落库时才炸，用户看不出哪一步坏的）。
+ * ② **草稿 JSON 与文件分开存**：JSON 进 `skill_drafts.payload`（保留期 = `config.skill.draft.ttlSec`，
+ *    `GET/PUT` 续期，c-7a 起跨设备可恢复），文件进 S3 `skill-drafts/{userId}/{draftId}/{path}`。
+ *    **先写 S3、后写 JSON**：反过来会出现"草稿里列着一个不存在的对象"（落库时才炸，用户看不出
+ *    哪一步坏的）。Redis 只在**旧草稿迁移兜底**里读一次（c-7a 之前的在途草稿）。
  * ③ **`SKILL.md` 的文件行是派生值**：它不进 `files[]`（正文在 `markdown` 字段里），落库 /
  *    下载时才由 `composeSkillMarkdown` 按 DB 字段重写 frontmatter（与导入同一条纪律）。
  *    **保存入口允许带"脱敏确认后的正文"**（审核页的「恢复」只活在这一次提交里），
  *    但它同样过 server-side scan：恢复回来的凭据形状一律 400 —— 见 `shared` 同名 schema 注释。
  * ④ **落库顺序 = 先 S3、后 DB**（照抄 `importSkillPackage`）：新建写 `skills/{id}/v1/`、
  *    revision 写 `skills/{id}/v{n+1}/`；DB 失败按前缀回收刚写的对象。
- * ⑤ **草稿用一次就消耗**：成功落库后 `DEL` Redis 键并回收 `skill-drafts/...` 下的对象；
+ * ⑤ **草稿用一次就消耗**：成功落库后删 `skill_drafts` 行并回收 `skill-drafts/...` 下的对象；
  *    重复提交旧页面 ⇒ 404（而不是产出第二份同名 Skill）。
  * ⑥ **脱敏与 secret scan 都在服务端**：草稿正文（及每个文本文件）保存 / 落库前**重跑**一次
  *    `scanSkillSecrets`；命中凭据形状 ⇒ 400 `SKILL_DRAFT_SECRET_FOUND`（带命中清单，不回显原文）。
@@ -43,6 +44,7 @@ import {
   AppError,
   computeSkillDiff,
   isSafeSkillPath,
+  effectiveSkillRuntime,
   isSkillScriptPath,
   scanSkillSecrets,
   skillStoragePrefix,
@@ -66,15 +68,7 @@ import {
 import { config } from '../config.js'
 import { getLogger } from '../infra/logger.js'
 import { getPrisma, Prisma } from '../infra/prisma.js'
-import {
-  addSkillDraftToUserIndex,
-  deleteSkillDraftRaw,
-  readSkillDraftIdsForUser,
-  readSkillDraftRaw,
-  removeSkillDraftFromUserIndex,
-  scanSkillDraftIds,
-  writeSkillDraftRaw,
-} from '../infra/redis.js'
+import { deleteSkillDraftRaw, readSkillDraftRaw, removeSkillDraftFromUserIndex } from '../infra/redis.js'
 import { getS3Client, isS3NoSuchKey } from '../infra/s3.js'
 import { normalizeSkillDraftContent } from '../sandbox/skillScript.js'
 import {
@@ -92,7 +86,7 @@ import {
 import { parentInfoOf, toItem as projectSkillItem } from './skillAsset.service.js'
 import { composeSkillMarkdown, importError, stripFrontmatter } from './skillZip.js'
 
-/** 草稿在 Redis 里的形状（**服务端内部**；对外只经 {@link toDraft} 投影，绝不原样透出 `files[].draftKey`） */
+/** 草稿在 `skill_drafts.payload` 里的形状（**服务端内部**；对外只经 {@link toDraft} 投影，绝不原样透出 `files[].draftKey`） */
 interface SkillDraftRecord {
   id: string
   userId: string
@@ -116,6 +110,13 @@ interface SkillDraftRecord {
   /** 生成时命中的风险提示（REVISION；审核页与现算结果取并集） */
   risks: string[]
   files: { path: string; kind: SkillDraftFileKind; mime: string; size: number; sha256: string }[]
+  /**
+   * 本次草稿里**删除**的路径（P1-24a-7 墓碑；旧草稿缺省 = `undefined`）。
+   *
+   * 与 `files` 互斥：同一个路径不会同时在两边（新增 / 改回时自动摘墓碑）。
+   * `SKILL.md` 永远不进这里 —— 正文只通过 `markdown` 改。
+   */
+  removedPaths?: string[]
   /** 草稿**建立时**的 secret scan 结果（用户逐项确认的基线；保存时还会重跑一次） */
   redactions: SkillRedaction[]
   /** 脱敏确认已由上一份已保存的草稿完成（内容原样搬运；审核页免一次重复确认） */
@@ -137,7 +138,7 @@ function draftTtlSec(): number {
 }
 
 /**
- * 已提交提案的草稿保留期（30 天）：审核可能持续多天，草稿不能按 1 小时的编辑 TTL 过期。
+ * 已提交提案的草稿保留期（30 天）：审核可能持续多天，草稿不能按编辑期保留期过期。
  * 到期后草稿从「我的草稿」消失，但提案文件已物化，审核方仍能继续处理。
  */
 const SUBMITTED_DRAFT_TTL_SEC = 30 * 24 * 3600
@@ -163,6 +164,111 @@ function skillDraftObjectKey(userId: string, draftId: string, path: string): str
 
 function expiresAtOf(record: SkillDraftRecord): string {
   return new Date(Date.parse(record.updatedAt) + ttlSecOf(record) * 1000).toISOString()
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 存储层（P1-24c-7a）：`skill_drafts` 表是**唯一真相源**
+//
+// c-1 的 MVP 把草稿 JSON 放在 Redis（`skill-draft:{draftId}`，1 小时 TTL）。c-7a 后落表：
+//   · 跨设备 / 跨实例可恢复（Redis 重启不再丢草稿）；
+//   · 保留期仍是滑窗（`expiresAt = updatedAt + ttl`），过期行在读写路径上懒删；
+//   · **旧 Redis 草稿照常能读**：DB 没有时读一次 Redis，成功就写进表并清掉旧键 ——
+//     部署期间正在编辑的草稿不会凭空 404（只兜这一批，之后 Redis 里不再写草稿）。
+// ═════════════════════════════════════════════════════════════════════
+
+/** 表行 → 服务端记录（`payload` 是整份 JSON；坏值当作不存在并懒删） */
+function recordFromRow(row: { id: string; payload: unknown }): SkillDraftRecord | null {
+  const payload = row.payload
+  if (payload === null || typeof payload !== 'object') return null
+  const record = payload as SkillDraftRecord
+  return record.id === row.id && typeof record.userId === 'string' ? record : null
+}
+
+/** 读表（不判归属 / 不判过期；调用方补） */
+async function readDraftRow(draftId: string): Promise<SkillDraftRecord | undefined> {
+  const row = await getPrisma().skillDraft.findUnique({
+    where: { id: draftId },
+    select: { id: true, payload: true },
+  })
+  return row === null ? undefined : (recordFromRow(row) ?? undefined)
+}
+
+/** 写表（`upsert`：建草稿与自动保存走同一条路径；`expiresAt` 与 `updatedAt` 同源） */
+async function writeDraftRow(record: SkillDraftRecord): Promise<void> {
+  const payload = record as unknown as Prisma.InputJsonValue
+  const expiresAt = new Date(expiresAtOf(record))
+  await getPrisma().skillDraft.upsert({
+    where: { id: record.id },
+    create: {
+      id: record.id,
+      userId: record.userId,
+      kind: record.kind,
+      payload,
+      expiresAt,
+      createdAt: new Date(record.createdAt),
+      updatedAt: new Date(record.updatedAt),
+    },
+    update: { payload, expiresAt, updatedAt: new Date(record.updatedAt) },
+  })
+}
+
+/** 删表行（幂等） */
+async function deleteDraftRow(draftId: string): Promise<void> {
+  await getPrisma().skillDraft.deleteMany({ where: { id: draftId } })
+}
+
+/** 删表行 + 清旧 Redis 键 / 索引（旧键可能不存在；失败不抛） */
+async function dropDraftRecordQuietly(record: SkillDraftRecord): Promise<void> {
+  try {
+    await deleteDraftRow(record.id)
+  } catch (error) {
+    getLogger().warn({ err: error, draftId: record.id }, '删除 Skill 草稿行失败（依赖过期懒清理）')
+  }
+  await deleteLegacyDraftQuietly(record)
+}
+
+/** 清掉 c-1 时代的 Redis 键与本人索引（幂等；失败只告警） */
+async function deleteLegacyDraftQuietly(record: Pick<SkillDraftRecord, 'id' | 'userId'>): Promise<void> {
+  await deleteSkillDraftRaw(record.id)
+  await removeSkillDraftFromUserIndex(record.userId, record.id)
+}
+
+/**
+ * 旧 Redis 草稿迁移兜底：DB 没有时读一次 `skill-draft:{draftId}`。
+ *
+ * 成功读到 ⇒ 写进表（best-effort）并清掉旧键；DB 写失败仍返回记录（Redis 还能读，
+ * 下一次访问会再试迁移）。读不到 ⇒ `undefined`（调用方统一 404）。
+ */
+async function readLegacyDraft(draftId: string): Promise<SkillDraftRecord | undefined> {
+  const raw = await readSkillDraftRaw(draftId)
+  if (raw === undefined) return undefined
+  let record: SkillDraftRecord
+  try {
+    record = JSON.parse(raw) as SkillDraftRecord
+  } catch {
+    await deleteSkillDraftRaw(draftId)
+    return undefined
+  }
+  if (record.id !== draftId) return undefined
+  if (isExpired(record)) {
+    await deleteLegacyDraftQuietly(record)
+    return undefined
+  }
+  try {
+    await writeDraftRow(record)
+  } catch (error) {
+    getLogger().warn({ err: error, draftId }, '迁移旧 Skill 草稿到 skill_drafts 失败（本次仍按 Redis 读取）')
+    return record
+  }
+  await deleteLegacyDraftQuietly(record)
+  getLogger().info({ draftId, userId: record.userId }, '已把旧 Skill 草稿迁移到 skill_drafts')
+  return record
+}
+
+/** 判断草稿是否仍可用（提示卡拉取时丢弃指向已过期草稿的提示；**不判归属**） */
+export async function skillDraftExists(draftId: string): Promise<boolean> {
+  const record = (await readDraftRow(draftId)) ?? (await readLegacyDraft(draftId))
+  return record !== undefined && !isExpired(record)
 }
 
 /** 提交状态投影：状态 / 审核意见以 `SkillProposal` 行为准 */
@@ -221,6 +327,7 @@ async function toDraft(record: SkillDraftRecord): Promise<SkillDraft> {
     requiresBins: [...record.requiresBins],
     markdown: record.markdown,
     files: record.files.map((file) => ({ ...file })),
+    removedPaths: removedPathsOf(record),
     warnings: [...record.warnings],
     changeSummary: record.changeSummary ?? '',
     risks: [...(record.risks ?? [])],
@@ -238,15 +345,58 @@ async function toDraft(record: SkillDraftRecord): Promise<SkillDraft> {
           },
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
-    // `expiresAt` 按"最后一次续期 + TTL"算：Redis 的精确定期时刻不对外承诺，这里给的是**上界**
+    // `expiresAt` 按"最后一次续期 + 保留期"算：与 `skill_drafts.expires_at` 同源
     expiresAt: expiresAtOf(record),
   }
 }
 
-/** 过期判定：`updatedAt + ttl < now` ⇒ 过期（Redis 那边通常已自然过期，这里兜时钟抖动） */
+/** 过期判定：`updatedAt + ttl < now` ⇒ 过期（读路径懒删；列上另有 `expires_at` 供列表过滤） */
 function isExpired(record: SkillDraftRecord): boolean {
   return Date.parse(expiresAtOf(record)) <= Date.now()
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// 删除墓碑（P1-24a-7）：`removedPaths` 是"这次草稿删掉了哪些路径"
+//
+// 三条不变量（错了都只在"保存后少/多文件"时才暴露）：
+//   ① 与 `record.files` 互斥 —— 新增 / 改回某路径时自动摘墓碑；
+//   ② `SKILL.md` 永不在墓碑里（正文只能改，不能删）；
+//   ③ 合并与物化都按它过滤，所以删除基准文件**不动旧版本对象**（整版快照纪律）。
+// ═════════════════════════════════════════════════════════════════════
+
+/** 读墓碑（旧草稿缺省 `[]`；顺手去重 / 剔除 `SKILL.md` / 非法路径） */
+function removedPathsOf(record: SkillDraftRecord): string[] {
+  const raw = record.removedPaths ?? []
+  const out: string[] = []
+  for (const path of raw) {
+    if (path === SKILL_ENTRY_PATH || !isSafeSkillPath(path) || out.includes(path)) continue
+    out.push(path)
+  }
+  return out
+}
+
+/** 把一组路径记进墓碑（幂等；`SKILL.md` / 非法路径忽略） */
+function addRemovedPaths(record: SkillDraftRecord, paths: readonly string[]): void {
+  const merged = new Set(removedPathsOf(record))
+  for (const path of paths) {
+    if (path === SKILL_ENTRY_PATH || !isSafeSkillPath(path)) continue
+    merged.add(path)
+  }
+  record.removedPaths = [...merged].sort((a, b) => a.localeCompare(b))
+}
+
+/** 从墓碑里摘掉这些路径（新增 / 改回 / 重命名到某路径时调用） */
+function dropRemovedPaths(record: SkillDraftRecord, paths: readonly string[]): void {
+  if (record.removedPaths === undefined || record.removedPaths.length === 0) return
+  const drop = new Set(paths)
+  record.removedPaths = record.removedPaths.filter((path) => !drop.has(path))
+}
+
+/** 某路径是否被前缀覆盖（`dir` 本身或 `dir/` 下） */
+function isUnderPath(path: string, prefix: string): boolean {
+  return path === prefix || path.startsWith(`${prefix}/`)
+}
+
 
 /** 草稿不存在统一出口（不存在 / 过期 / 不是你的 / 已落库 —— **不区分**，见文件头 ⑤） */
 function draftNotFound(): AppError {
@@ -259,30 +409,26 @@ function draftNotFound(): AppError {
  * @param mode `'view'` = `GET`（续期，不改内容）；`'edit'` = `PUT` / 上传 / 落库（同样续期）
  */
 async function requireDraft(draftId: string, viewer: SkillViewer): Promise<SkillDraftRecord> {
-  const raw = await readSkillDraftRaw(draftId)
-  if (raw === undefined) throw draftNotFound()
-  let record: SkillDraftRecord
-  try {
-    record = JSON.parse(raw) as SkillDraftRecord
-  } catch {
+  const record = (await readDraftRow(draftId)) ?? (await readLegacyDraft(draftId))
+  if (record === undefined) throw draftNotFound()
+  if (record.id !== draftId || record.userId !== viewer.id) throw draftNotFound()
+  if (isExpired(record)) {
+    // 只在归属确认后清理：不给"用 draftId 探测别人草稿是否过期"留副作用
+    await dropDraftRecordQuietly(record)
     throw draftNotFound()
   }
-  if (record.id !== draftId || record.userId !== viewer.id || isExpired(record)) throw draftNotFound()
   return record
 }
 
-/** 写回草稿（刷新 `updatedAt` ⇒ 同时续期 TTL） */
+/** 写回草稿（刷新 `updatedAt` ⇒ 同时续期保留期） */
 async function persist(record: SkillDraftRecord): Promise<SkillDraftRecord> {
   record.updatedAt = new Date().toISOString()
-  const ttlSec = ttlSecOf(record)
   try {
-    await writeSkillDraftRaw(record.id, JSON.stringify(record), ttlSec)
+    await writeDraftRow(record)
   } catch (error) {
     getLogger().error({ err: error, draftId: record.id }, '写入 Skill 草稿失败')
     throw AppError.internal(appMsg('app.m012'))
   }
-  // 索引与草稿同源续期：列表入口即使在提示卡关闭后也能找到这份草稿
-  await addSkillDraftToUserIndex(record.userId, record.id, ttlSec)
   return record
 }
 
@@ -329,8 +475,24 @@ export async function createSkillDraft(
   },
   viewer: SkillViewer,
 ): Promise<SkillDraft> {
-  if (input.kind === 'CREATE') assertDraftFilesShape(input.runtime, input.files ?? [])
+  if (input.kind === 'CREATE') {
+    assertDraftFilesShape(input.runtime, input.files ?? [])
+    // P1-24a-6：schema 已拦一次，这里再兜一次（防绕过 schema 的调用方写出"只有元数据的空壳"）
+    if (input.source === undefined && (input.markdown ?? '').trim() === '') {
+      throw AppError.validation(appMsg('app.m305', { p0: '新建 Skill 必须填写 SKILL.md 正文' }), {
+        code: SKILL_ERROR_CODES.DRAFT_INVALID,
+        reasons: ['SKILL.md 正文为空'],
+      })
+    }
+  }
   if (input.kind === 'REVISION') {
+    // P1-24a-7 详情页文件编辑：REVISION 草稿要求正文非空，否则保存时等于把 Skill 清空
+    if ((input.markdown ?? '').trim() === '') {
+      throw AppError.validation(appMsg('app.m305', { p0: '更新 Skill 必须提供非空的 SKILL.md 正文' }), {
+        code: SKILL_ERROR_CODES.DRAFT_INVALID,
+        reasons: ['SKILL.md 正文为空'],
+      })
+    }
     const target = await requireTargetSkill(input.targetSkillId ?? '', input.baseVersion ?? 0, viewer, 'edit')
     if (target.version !== input.baseVersion) {
       throw AppError.conflict(appMsg('app.m295'), { code: SKILL_ERROR_CODES.VERSION_CONFLICT })
@@ -496,48 +658,28 @@ export async function getSkillDraft(draftId: string, viewer: SkillViewer): Promi
   return toDraft(record)
 }
 
-function parseDraftRecord(raw: string): SkillDraftRecord | null {
-  try {
-    return JSON.parse(raw) as SkillDraftRecord
-  } catch {
-    return null
-  }
-}
-
 /**
  * 本人未过期的草稿列表（`GET /api/skill-drafts`）。
  *
  * 入口存在的理由：提示卡是一次性的（关闭 / 重新进会话后不再出现），
- * 但草稿还在 TTL 内 —— 没有列表就只能靠记住 draftId 走深链。
- * 排序按 `updatedAt` 倒序；读不到的条目顺手从索引剔除。
+ * 但草稿在保留期内 —— 没有列表就只能靠记住 draftId 走深链。
+ * 排序按 `updatedAt` 倒序；过期 / 坏 payload 的行顺手懒删。
+ *
+ * c-7a 起直接查 `skill_drafts`（跨设备一致）：换浏览器 / 换设备登录同一账号，
+ * 未提交的草稿仍在列表里；旧 Redis 草稿在首次被访问时迁移进表。
  */
 export async function listSkillDrafts(viewer: SkillViewer): Promise<SkillDraftListResult> {
-  let ids = await readSkillDraftIdsForUser(viewer.id)
-  if (ids.length === 0) {
-    // 索引上线前建的草稿没有登记：兜一次全量扫描，并把找到的补登记回去
-    const scanned = await scanSkillDraftIds()
-    const found: string[] = []
-    for (const id of scanned) {
-      const raw = await readSkillDraftRaw(id)
-      if (raw === undefined) continue
-      const record = parseDraftRecord(raw)
-      if (record === null || record.userId !== viewer.id || isExpired(record)) continue
-      found.push(id)
-      await addSkillDraftToUserIndex(viewer.id, id, ttlSecOf(record))
-    }
-    ids = found
-  }
+  const rows = await getPrisma().skillDraft.findMany({
+    where: { userId: viewer.id, expiresAt: { gt: new Date() } },
+    select: { id: true, payload: true },
+    orderBy: { updatedAt: 'desc' },
+  })
 
   const records: SkillDraftRecord[] = []
-  for (const id of ids) {
-    const raw = await readSkillDraftRaw(id)
-    if (raw === undefined) {
-      await removeSkillDraftFromUserIndex(viewer.id, id)
-      continue
-    }
-    const record = parseDraftRecord(raw)
+  for (const row of rows) {
+    const record = recordFromRow(row)
     if (record === null || record.userId !== viewer.id || isExpired(record)) {
-      await removeSkillDraftFromUserIndex(viewer.id, id)
+      await deleteDraftRow(row.id).catch(() => undefined)
       continue
     }
     records.push(record)
@@ -712,12 +854,11 @@ async function upsertDraftFiles(record: SkillDraftRecord, files: readonly DraftF
   }
 }
 
-/** 丢弃草稿（`DELETE`）：删 Redis 键 + 回收 S3 临时对象（尽力而为） */
+/** 丢弃草稿（`DELETE`）：删表行（含旧 Redis 键）+ 回收 S3 临时对象（尽力而为） */
 export async function deleteSkillDraft(draftId: string, viewer: SkillViewer): Promise<{ id: string }> {
   const record = await requireDraft(draftId, viewer)
   await assertDraftEditable(record)
-  await deleteSkillDraftRaw(record.id)
-  await removeSkillDraftFromUserIndex(record.userId, record.id)
+  await dropDraftRecordQuietly(record)
   await removeDraftObjectsQuietly(record)
   getLogger().info({ draftId: record.id }, '已丢弃 Skill 草稿')
   return { id: record.id }
@@ -812,13 +953,22 @@ export async function uploadSkillDraftFile(
     })
   }
   const existing = record.files.find((file) => file.path === path) ?? null
-  if (existing !== null && input.replace !== true) {
+  /**
+   * 整版文件集里已经有这个路径（草稿文件，或**未删除的基准文件**）。
+   *
+   * ⚠️ 以前只看 `record.files`：审核页对基准文件点「替换文件」带 `replace=1` 却仍被 400
+   * "已有同名文件"（2026-11-19 修正）—— 基准文件的 `storageKey` 不在草稿前缀下，
+   * 前端根本无法判断该不该带 `replace`。判据改用整版集合，语义与 `rename` 的"目标冲突"一致。
+   */
+  const effectivePaths = new Set((await effectiveFilesOf(record)).map((file) => file.path))
+  const existsActive = existing !== null || effectivePaths.has(path)
+  if (existsActive && input.replace !== true) {
     throw AppError.validation(appMsg('app.m305', { p0: `已有同名文件：${path}` }), {
       code: SKILL_ERROR_CODES.DRAFT_INVALID,
       reasons: [`已有同名文件：${path}`],
     })
   }
-  if (existing === null && record.files.length + 1 > config.skill.draft.maxFiles) {
+  if (!existsActive && effectivePaths.size + 1 > config.skill.draft.maxFiles) {
     throw AppError.validation(appMsg('app.m305', { p0: `文件数超过上限（${String(config.skill.draft.maxFiles)}）` }), {
       code: SKILL_ERROR_CODES.DRAFT_INVALID,
       reasons: [`文件数超过上限（${String(config.skill.draft.maxFiles)}）`],
@@ -861,6 +1011,12 @@ export async function uploadSkillDraftFile(
     existing === null
       ? [...record.files, file].sort((a, b) => a.path.localeCompare(b.path))
       : record.files.map((item) => (item.path === path ? file : item))
+  /**
+   * 不变量 ①：同一路径不能同时"在 files 里"与"在墓碑里"。
+   * ⚠️ 上传（含替换基准文件、删掉后又上传同名文件）必须摘墓碑，否则物化时会被 `removedPathsOf`
+   * 再过滤掉一次 —— 文件传上去了、保存出来却没有（`PUT /files/content` 一直有这一步，这里补齐）。
+   */
+  dropRemovedPaths(record, [path])
   // 文本文件顺带扫描（二进制不扫：正则对二进制是噪音）
   if (file.mime.startsWith('text/') || file.mime.includes('json') || file.mime.includes('xml')) {
     const scan = scanSkillSecrets(input.bytes.toString('utf8'))
@@ -983,6 +1139,380 @@ async function removeDraftObjectsQuietly(record: SkillDraftRecord): Promise<void
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// 文件树编辑（P1-24a-7）：写文本 / 重命名 / 递归删除
+//
+// 三条共用判据（与「上传一个文件」完全一致，只是入口不同）：
+//   · 路径先归一化再过 `isSafeSkillPath`（拒 `..` / 绝对路径 / 盘符 / 反斜杠）；
+//   · `runtime=INLINE` 不能带 `scripts/**`；
+//   · 上限按**整版集合**判（基准 − 墓碑 + 草稿增量），不只看 `record.files.length`。
+// 顺序始终是「先写 S3、后写草稿 JSON」；JSON 写失败回收刚写的键（文件头 ②）。
+// ═════════════════════════════════════════════════════════════════════
+
+/** 路径归一化（去 `./`、合并斜杠；其余非法形态交给 `isSafeSkillPath`） */
+function normalizeDraftPath(raw: string): string {
+  return raw.trim().replace(/^\.\//u, '').replace(/\/{2,}/gu, '/')
+}
+
+/** 统一 400（路径 / 数量 / 运行时互斥都用它；`data.code = DRAFT_INVALID` + `reasons`） */
+function draftInvalid(message: string): AppError {
+  return AppError.validation(appMsg('app.m305', { p0: message }), {
+    code: SKILL_ERROR_CODES.DRAFT_INVALID,
+    reasons: [message],
+  })
+}
+
+/** 草稿的基准文件（REVISION / SESSION_OVERRIDE / PROPOSAL 才有；CREATE ⇒ 空） */
+async function baseFilesOfDraft(record: SkillDraftRecord): Promise<BaseSkillFileRow[]> {
+  if (record.kind === 'CREATE' || record.targetSkillId === null || record.baseVersion === null) return []
+  return getPrisma().skillFile.findMany({
+    where: { skillId: record.targetSkillId, version: record.baseVersion, path: { not: SKILL_ENTRY_PATH } },
+    select: { path: true, size: true, sha256: true, mime: true, storageKey: true },
+  })
+}
+
+/** 草稿当前可见的文件集（草稿增量 ∪ 基准 − 墓碑） */
+async function effectiveFilesOf(record: SkillDraftRecord): Promise<{ path: string }[]> {
+  return mergeFileEntries(record.files, await baseFilesOfDraft(record), removedPathsOf(record))
+}
+
+/** 写一批对象到草稿前缀（失败回收已写的键并抛 500） */
+async function putDraftObjects(
+  record: SkillDraftRecord,
+  items: readonly { path: string; bytes: Buffer; mime: string }[],
+): Promise<string[]> {
+  const bucket = config.s3.bucket
+  const written: string[] = []
+  try {
+    const s3 = getS3Client()
+    if (!(await s3.bucketExists(bucket))) await s3.makeBucket(bucket)
+    for (const item of items) {
+      const key = skillDraftObjectKey(record.userId, record.id, item.path)
+      await s3.putObject(bucket, key, item.bytes, item.bytes.length, { 'Content-Type': item.mime })
+      written.push(key)
+    }
+    return written
+  } catch (error) {
+    getLogger().error({ err: error, draftId: record.id, count: items.length }, 'Skill 草稿对象写入失败，回收')
+    await removeKeysQuietly(written)
+    throw AppError.internal(appMsg('app.m012'))
+  }
+}
+
+/** 删草稿前缀下的对象（失败只告警：孤儿对象由清理器回收） */
+async function removeDraftObjectsAtPaths(record: SkillDraftRecord, paths: readonly string[]): Promise<void> {
+  await removeKeysQuietly(paths.map((path) => skillDraftObjectKey(record.userId, record.id, path)))
+}
+
+/**
+ * 写一个**文本文件**（`PUT /api/skill-drafts/:draftId/files/content`，P1-24a-7）。
+ *
+ * 新建或覆盖同名文件；同一路径若在墓碑里，会被自动摘掉（不变量 ①）。文本文件顺带重扫
+ * secret scan（与上传同口径：命中只是记进 `redactions`，落库时才会被拦）。
+ */
+export async function writeSkillDraftFileContent(
+  draftId: string,
+  input: { path: string; text: string },
+  viewer: SkillViewer,
+): Promise<{ draft: SkillDraft; file: SkillDraftFile }> {
+  const record = await requireDraft(draftId, viewer)
+  await assertDraftEditable(record)
+  const path = normalizeDraftPath(input.path)
+  if (path === SKILL_ENTRY_PATH) {
+    throw draftInvalid(`${SKILL_ENTRY_PATH} 的正文请用自动保存提交（PUT），不要作为文件写入`)
+  }
+  if (!isSafeSkillPath(path)) throw draftInvalid(`不允许的路径：${path}`)
+  if (input.text === '') {
+    throw AppError.validation(appMsg('validation.skillDraft.fileContentEmpty'), {
+      code: SKILL_ERROR_CODES.DRAFT_INVALID,
+      reasons: ['文件内容为空'],
+    })
+  }
+  const bytes = Buffer.from(input.text, 'utf8')
+  if (bytes.length > config.skill.draft.maxFileBytes) {
+    throw draftInvalid(`单个文件超过上限（${String(config.skill.draft.maxFileBytes)} 字节）：${path}`)
+  }
+  const kind = kindOfDraftPath(path)
+  if (record.runtime === 'INLINE' && kind === 'script') {
+    throw draftInvalid('runtime=inline 的草稿不能带 scripts/ 文件（请改成 sandbox）')
+  }
+  const existing = record.files.some((file) => file.path === path)
+  if (!existing) {
+    const nextCount = (await effectiveFilesOf(record)).filter((file) => file.path !== path).length + 1
+    if (nextCount > config.skill.draft.maxFiles) {
+      throw draftInvalid(`文件数超过上限（${String(config.skill.draft.maxFiles)}）`)
+    }
+  }
+
+  const file: SkillDraftFile = {
+    path,
+    kind,
+    mime: mimeOfDraftPath(path),
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  }
+  const previousFiles = record.files
+  const previousRemoved = record.removedPaths
+  const written = await putDraftObjects(record, [{ path, bytes, mime: file.mime }])
+  record.files = existing
+    ? record.files.map((item) => (item.path === path ? file : item))
+    : [...record.files, file].sort((a, b) => a.path.localeCompare(b.path))
+  dropRemovedPaths(record, [path])
+  const scan = scanSkillSecrets(input.text)
+  if (scan.redactions.length > 0) record.redactions = mergeRedactions(record.redactions, scan.redactions)
+  try {
+    await persist(record)
+  } catch (error) {
+    record.files = previousFiles
+    record.removedPaths = previousRemoved
+    // 覆盖时键没变（旧对象已被覆盖）⇒ 只回收新建文件
+    if (!existing) await removeKeysQuietly(written)
+    throw error
+  }
+  getLogger().info({ draftId, path, size: file.size, kind, created: !existing }, '已写入 Skill 草稿文本文件')
+  return { draft: await toDraft(record), file }
+}
+
+/**
+ * 重命名 / 移动文件或目录（`POST /api/skill-drafts/:draftId/files/rename`，P1-24a-7）。
+ *
+ * · **草稿内文件**：对象另写新键 → 旧路径进墓碑 → 旧草稿键回收；
+ * · **基准文件**：读基准对象 → 写新草稿键 → 旧路径进墓碑（旧版本对象**不动**）；
+ * · **目录**：按前缀收集（草稿 ∪ 基准 − 已删除）逐个搬；
+ * · 目标冲突缺省 400（`overwrite !== true`），不静默覆盖。
+ */
+export async function renameSkillDraftPath(
+  draftId: string,
+  input: { from: string; to: string; kind: 'FILE' | 'DIR'; overwrite?: boolean },
+  viewer: SkillViewer,
+): Promise<SkillDraft> {
+  const record = await requireDraft(draftId, viewer)
+  await assertDraftEditable(record)
+  const from = normalizeDraftPath(input.from)
+  const to = normalizeDraftPath(input.to)
+  if (from === SKILL_ENTRY_PATH || to === SKILL_ENTRY_PATH) {
+    throw draftInvalid(`${SKILL_ENTRY_PATH} 不能重命名（正文请在编辑器里改）`)
+  }
+  if (!isSafeSkillPath(from) || !isSafeSkillPath(to)) throw draftInvalid(`不允许的路径：${from} → ${to}`)
+  if (input.kind === 'FILE' && from === to) throw draftInvalid('目标路径与原路径相同')
+  if (input.kind === 'DIR' && (from === to || to.startsWith(`${from}/`))) {
+    throw draftInvalid('不能把目录移动到它自己或它的子目录里')
+  }
+
+  const baseFiles = (await baseFilesOfDraft(record)).filter(
+    (file) => !removedPathsOf(record).includes(file.path),
+  )
+  const targets =
+    input.kind === 'FILE'
+      ? [
+          ...record.files.filter((file) => file.path === from).map((file) => ({ path: from, mime: file.mime, draft: true })),
+          ...baseFiles.filter((file) => file.path === from).map((file) => ({ path: from, mime: file.mime, draft: false })),
+        ]
+      : [
+          ...record.files.filter((file) => isUnderPath(file.path, from)).map((file) => ({ path: file.path, mime: file.mime, draft: true })),
+          ...baseFiles.filter((file) => isUnderPath(file.path, from)).map((file) => ({ path: file.path, mime: file.mime, draft: false })),
+        ]
+  const map = (path: string): string =>
+    input.kind === 'FILE' ? to : `${to}${path.slice(from.length)}`
+  const moved = targets.map((item) => ({ ...item, next: map(item.path) }))
+
+  // 目标冲突：整版集合里已经存在同路径 ⇒ 缺省 400
+  // ⚠️ 注意这个集合是"整版文件路径"，**不带目录**：`a/x.md` 会让 `a` 本身不出现在这里（见下）。
+  const effective = await effectiveFilesOf(record)
+  const occupied = new Set(
+    effective
+      .filter((file) => !isUnderPath(file.path, from))
+      .map((file) => file.path),
+  )
+  if (!(input.overwrite === true) && moved.some((item) => occupied.has(item.next))) {
+    throw draftInvalid(`目标位置已有同名文件：${moved.find((item) => occupied.has(item.next))?.next ?? to}`)
+  }
+
+  // 目录改名 / 移动：目录不是存储对象（`skill_files` / S3 只存文件），前端树里的目录由路径前缀推出来。
+  //
+  // `targets` 为空 = 源目录下**没有任何活文件**（`targets` 与 `effective` 的 under-`from` 部分是同一批）。
+  // 旧实现到这里直接 404，于是详情页"新建空目录 → 改名"必然失败。分两种情况：
+  // · 源目录下已没有活文件（空目录 / 被删空）⇒ 目录本来就不落版本，当成成功的空操作；
+  // · 源目录是别的目录的子目录（`a` ⊂ `docs/a`）⇒ 把 `a/` 下所有活文件整体搬到 `b/` 前缀，
+  //   等价于"给目录改名"，不能因为"`a` 不是文件路径"就假装源不存在。
+  if (input.kind === 'DIR' && targets.length === 0) {
+    const sources = effective.filter((file) => isUnderPath(file.path, from)).map((file) => file.path)
+    if (sources.length === 0) {
+      getLogger().info({ draftId, from, to, kind: input.kind }, '已重命名 Skill 草稿空目录（无文件可搬）')
+      return toDraft(record)
+    }
+    const dirMoved = sources.map((path) => ({ path, next: `${to}${path.slice(from.length)}` }))
+    const occupiedNow = new Set(effective.map((file) => file.path))
+    if (!(input.overwrite === true) && dirMoved.some((item) => occupiedNow.has(item.next))) {
+      throw draftInvalid(`目标位置已有同名文件：${dirMoved.find((item) => occupiedNow.has(item.next))?.next ?? to}`)
+    }
+    const dirOwned = new Set(record.files.map((file) => file.path))
+    const dirToWrite: { path: string; bytes: Buffer; mime: string }[] = []
+    for (const item of dirMoved) {
+      if (!isSafeSkillPath(item.next)) throw draftInvalid(`不允许的路径：${item.next}`)
+      if (record.runtime === 'INLINE' && isSkillScriptPath(item.next)) {
+        throw draftInvalid('runtime=inline 的草稿不能带 scripts/ 文件（请改成 sandbox）')
+      }
+      const bytes = dirOwned.has(item.path)
+        ? await readDraftObject(record, item.path)
+        : await readBaseFileStrict(record, item.path, baseFiles)
+      dirToWrite.push({ path: item.next, bytes, mime: mimeOfDraftPath(item.next) })
+    }
+    await materializeRename(record, {
+      moved: dirMoved.map((item) => ({ path: item.path, next: item.next, tombstone: !dirOwned.has(item.path) })),
+      toWrite: dirToWrite,
+      baseFiles,
+    })
+    getLogger().info({ draftId, from, to, kind: input.kind, moved: dirMoved.length }, '已重命名 Skill 草稿目录')
+    return toDraft(record)
+  }
+  for (const item of moved) {
+    if (!isSafeSkillPath(item.next)) throw draftInvalid(`不允许的路径：${item.next}`)
+    if (record.runtime === 'INLINE' && isSkillScriptPath(item.next)) {
+      throw draftInvalid('runtime=inline 的草稿不能带 scripts/ 文件（请改成 sandbox）')
+    }
+  }
+
+  // 读源字节（草稿对象优先；基准对象读不到就拒绝，不搬空文件）
+  const toWrite: { path: string; bytes: Buffer; mime: string }[] = []
+  for (const item of moved) {
+    const bytes = item.draft
+      ? await readDraftObject(record, item.path)
+      : await readBaseFileStrict(record, item.path, baseFiles)
+    toWrite.push({ path: item.next, bytes, mime: mimeOfDraftPath(item.next) })
+  }
+  // ⚠️ 只有**基准活文件**要进墓碑。草稿文件（含刚改名过来的）只做"换行 + 回收旧键"，
+  //    否则 `a → c → b` 这种连续改名会把 `c` 也记成墓碑，而 `materializeDraftFiles` 是按
+  //    `draftPaths`（`a`、`b` 都在）跳过它的 —— 墓碑与 files 同时存在，审核页就显示成"已删除"。
+  await materializeRename(record, {
+    moved: moved.map((item) => ({ path: item.path, next: item.next, tombstone: !item.draft })),
+    toWrite,
+    baseFiles,
+  })
+  getLogger().info(
+    { draftId, from, to, kind: input.kind, moved: moved.length },
+    '已重命名 Skill 草稿路径',
+  )
+  return toDraft(record)
+}
+
+/**
+ * "改名 / 撤回改名"的落库实现：写目标对象 → 目标进 `files` / 摘墓碑 → 源进墓碑（若它还活着）。
+ *
+ * 删除时草稿对象会被回收，所以**撤销删除**只能走这里：从"还留着字节的那条路径"（改名目标）
+ * 把字节搬回原路径，而不是指望重新写一遍正文（二进制则根本无解）。
+ */
+async function materializeRename(
+  record: SkillDraftRecord,
+  input: {
+    /** `tombstone` 缺省 = `true`（源是本版基准里的活文件才需要墓碑；草稿文件换行不需要） */
+    moved: readonly { path: string; next: string; tombstone?: boolean }[]
+    toWrite: readonly { path: string; bytes: Buffer; mime: string }[]
+    baseFiles: readonly BaseSkillFileRow[]
+  },
+): Promise<void> {
+  const previousFiles = record.files
+  const previousRemoved = record.removedPaths
+  const written = await putDraftObjects(record, input.toWrite)
+  // 先落实"草稿文件的增删"：旧路径若原来是草稿文件 ⇒ 换成新文件行
+  const replaced = new Set(record.files.filter((file) => input.moved.some((item) => item.path === file.path)).map((file) => file.path))
+  record.files = record.files.filter((file) => !replaced.has(file.path))
+  for (const item of input.toWrite) {
+    record.files = [
+      ...record.files,
+      {
+        path: item.path,
+        kind: kindOfDraftPath(item.path),
+        mime: item.mime,
+        size: item.bytes.length,
+        sha256: createHash('sha256').update(item.bytes).digest('hex'),
+      },
+    ]
+    dropRemovedPaths(record, [item.path])
+  }
+  // 旧路径进墓碑（只对本版基准里**还活着**的路径 —— 已经删掉的源不必再记一次）；
+  // 同时被墓碑覆盖的草稿文件行一律摘掉（不变量 ①）
+  const liveBase = new Set(input.baseFiles.map((file) => file.path))
+  addRemovedPaths(
+    record,
+    input.moved
+      .filter((item) => item.tombstone !== false)
+      .map((item) => item.path)
+      .filter((path) => liveBase.has(path)),
+  )
+  const removed = new Set(removedPathsOf(record))
+  record.files = record.files.filter((file) => !removed.has(file.path)).sort((a, b) => a.path.localeCompare(b.path))
+  try {
+    await persist(record)
+  } catch (error) {
+    record.files = previousFiles
+    record.removedPaths = previousRemoved
+    await removeKeysQuietly(written)
+    throw error
+  }
+  // 旧草稿键回收（基准对象不动；失败只告警）
+  await removeDraftObjectsAtPaths(
+    record,
+    input.moved.map((item) => item.path).filter((path) => previousFiles.some((file) => file.path === path)),
+  )
+}
+
+/** 读基准对象；读不到 / 字节数对不上 ⇒ 抛 500（绝不搬空文件冒充） */
+async function readBaseFileStrict(
+  record: SkillDraftRecord,
+  path: string,
+  baseFiles: readonly BaseSkillFileRow[],
+): Promise<Buffer> {
+  const base = baseFiles.find((file) => file.path === path)
+  if (base === undefined || base.storageKey === '') {
+    throw AppError.notFound(appMsg('app.m296', { p0: path, p1: 0 }), { code: SKILL_ERROR_CODES.DRAFT_NOT_FOUND })
+  }
+  const bytes = await readSkillObjectQuietly(base.storageKey)
+  if (bytes.length !== base.size) {
+    getLogger().error({ draftId: record.id, path, expected: base.size, actual: bytes.length }, '基准文件读取失败')
+    throw AppError.internal(appMsg('app.m012'))
+  }
+  return bytes
+}
+
+/**
+ * 删除草稿里的文件 / 目录（`DELETE /api/skill-drafts/:draftId/files?path=&recursive=`，P1-24a-7）。
+ *
+ * · 草稿文件 ⇒ 从 `files` 移除并回收草稿对象；
+ * · 基准文件 ⇒ **只加墓碑**（旧版本对象不动 —— 整版快照纪律）；
+ * · `recursive` ⇒ 把 `path` 当目录前缀批量处理；`SKILL.md` 永远不删。
+ */
+export async function removeSkillDraftPath(
+  draftId: string,
+  input: { path: string; recursive: boolean },
+  viewer: SkillViewer,
+): Promise<SkillDraft> {
+  const record = await requireDraft(draftId, viewer)
+  await assertDraftEditable(record)
+  const path = normalizeDraftPath(input.path)
+  if (path === SKILL_ENTRY_PATH) throw draftInvalid(`${SKILL_ENTRY_PATH} 不能删除（正文请在编辑器里改）`)
+  if (!isSafeSkillPath(path)) throw AppError.validation(appMsg('validation.skill.pathUnsafe'))
+
+  const under = (candidate: string): boolean => (input.recursive ? isUnderPath(candidate, path) : candidate === path)
+  const draftHit = record.files.filter((file) => file.path !== SKILL_ENTRY_PATH && under(file.path))
+  const baseHit = (await baseFilesOfDraft(record)).filter(
+    (file) => file.path !== SKILL_ENTRY_PATH && under(file.path) && !removedPathsOf(record).includes(file.path),
+  )
+  if (draftHit.length === 0 && baseHit.length === 0) {
+    throw AppError.notFound(appMsg('app.m296', { p0: path, p1: 0 }), { code: SKILL_ERROR_CODES.DRAFT_NOT_FOUND })
+  }
+  const removeNow = new Set(draftHit.map((file) => file.path))
+  record.files = record.files.filter((file) => !removeNow.has(file.path))
+  addRemovedPaths(record, baseHit.map((file) => file.path))
+  await persist(record)
+  await removeDraftObjectsAtPaths(record, [...removeNow])
+  getLogger().info(
+    { draftId, path, recursive: input.recursive, draft: draftHit.length, base: baseHit.length },
+    '已删除 Skill 草稿路径',
+  )
+  return toDraft(record)
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // 落库（CREATE → v1 / REVISION → vN+1）
 // ═════════════════════════════════════════════════════════════════════
 
@@ -1042,14 +1572,19 @@ export interface BaseSkillFileRow {
  * 为什么必须有这一步：`record.files` 只装"这次新增 / 覆盖的文件"，
  * 直接把它当整版会把基准版本里的其他文件全部丢掉（2026-11-17：一份只改正文的修订会把
  * `vision.js` 删掉）。草稿里同路径的文件覆盖基准，其余基准文件原样保留。
+ *
+ * P1-24a-7 起再减去**墓碑**（`removedPaths`）：删掉的基准文件不能从基准里"补回来"；
+ * 墓碑与草稿文件理应互斥（服务层维护），这里仍按"以墓碑为准"过滤，避免老草稿的自相矛盾数据。
  */
-function mergeFileEntries(
+export function mergeFileEntries(
   draftFiles: readonly SkillDraftFile[],
   baseFiles: readonly BaseSkillFileRow[],
+  removedPaths: readonly string[] = [],
 ): { path: string; kind: SkillDraftFileKind; mime: string; size: number; sha256: string }[] {
+  const removed = new Set(removedPaths)
   const byPath = new Map<string, { path: string; kind: SkillDraftFileKind; mime: string; size: number; sha256: string }>()
   for (const base of baseFiles) {
-    if (base.path === SKILL_ENTRY_PATH) continue
+    if (base.path === SKILL_ENTRY_PATH || removed.has(base.path)) continue
     byPath.set(base.path, {
       path: base.path,
       kind: kindOfDraftPath(base.path),
@@ -1059,7 +1594,7 @@ function mergeFileEntries(
     })
   }
   for (const file of draftFiles) {
-    if (file.path === SKILL_ENTRY_PATH) continue
+    if (file.path === SKILL_ENTRY_PATH || removed.has(file.path)) continue
     byPath.set(file.path, { ...file })
   }
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path))
@@ -1089,8 +1624,9 @@ async function materializeDraftFiles(
     sha256: createHash('sha256').update(entryBytes).digest('hex'),
   })
   const draftPaths = new Set(record.files.map((file) => file.path))
+  const removed = new Set(removedPathsOf(record))
   for (const base of baseFiles) {
-    if (base.path === SKILL_ENTRY_PATH || draftPaths.has(base.path)) continue
+    if (base.path === SKILL_ENTRY_PATH || draftPaths.has(base.path) || removed.has(base.path)) continue
     const bytes = await readSkillObjectQuietly(base.storageKey)
     // 基准对象读不到 / 字节数对不上 ⇒ **拒绝保存**，绝不用空文件冒充（那等于静默删掉这个文件）
     if (base.storageKey === '' || bytes.length !== base.size) {
@@ -1100,6 +1636,7 @@ async function materializeDraftFiles(
     files.push({ path: base.path, bytes, mime: base.mime, sha256: base.sha256 })
   }
   for (const file of record.files) {
+    if (removed.has(file.path)) continue
     const bytes = await readDraftObject(record, file.path)
     files.push({ path: file.path, bytes, mime: file.mime, sha256: file.sha256 })
   }
@@ -1178,10 +1715,9 @@ export async function removeKeysQuietly(keys: readonly string[]): Promise<void> 
   }
 }
 
-/** 落库成功后消耗草稿（DEL + 回收临时对象；失败只告警 —— 草稿有 TTL，最坏是残留） */
+/** 落库成功后消耗草稿（删行 + 回收临时对象；失败只告警 —— 过期行会被懒清理） */
 async function consumeDraft(record: SkillDraftRecord): Promise<void> {
-  await deleteSkillDraftRaw(record.id)
-  await removeSkillDraftFromUserIndex(record.userId, record.id)
+  await dropDraftRecordQuietly(record)
   await removeDraftObjectsQuietly(record)
 }
 
@@ -1201,13 +1737,23 @@ export async function saveSkillFromDraft(
   if (record.kind !== 'CREATE') {
     throw AppError.validation(appMsg('app.m307', { p0: record.kind }), { code: SKILL_ERROR_CODES.DRAFT_KIND_MISMATCH })
   }
+  /**
+   * P1-24a-6 空壳闸门：**无来源**（页面手建）的 CREATE 草稿必须有正文。
+   * 会话抽取来的 CREATE 允许空正文（抽取本就可能只给文件），不在此拦截 —— 行为与 c-2/c-3 一致。
+   */
+  if (record.source === null && (input.markdown ?? record.markdown).trim() === '') {
+    throw AppError.validation(appMsg('app.m305', { p0: 'SKILL.md 正文为空，无法保存为 Skill' }), {
+      code: SKILL_ERROR_CODES.DRAFT_INVALID,
+      reasons: ['SKILL.md 正文为空'],
+    })
+  }
   const visibility = normalizeSkillVisibility(input.visibility)
 
   // 展示元数据：请求显式给的值**优先**（审核页可改名 / 改描述 / 改运行时），缺省用草稿里的
   const name = (input.name?.trim() ?? record.name).trim()
   const description = (input.description?.trim() ?? record.description).trim()
   const runtime = input.runtime ?? (record.runtime === 'SANDBOX' ? 'SANDBOX' : 'INLINE')
-  // 同 REVISION：请求里带的"脱敏确认后正文"优先于 Redis 里的旧副本（自动保存可能还没写回）
+  // 同 REVISION：请求里带的"脱敏确认后正文"优先于表里的旧副本（自动保存可能还没写回）
   const effective: SkillDraftRecord =
     input.markdown === undefined ? record : { ...record, markdown: input.markdown }
   const content = normalizeSkillDraftContent({
@@ -1359,10 +1905,13 @@ export async function saveSkillRevisionFromDraft(
   if (target.version !== input.fromVersion) {
     throw AppError.conflict(appMsg('app.m295'), { code: SKILL_ERROR_CODES.VERSION_CONFLICT })
   }
+  // P1-24a-5：详情页的元数据改动与新版本**同一次事务**发布（`SHARED` 仍由 normalize 拒绝）
+  const visibility =
+    input.visibility === undefined ? undefined : normalizeSkillVisibility(input.visibility)
 
   /**
    * 落库用的正文 = 请求里带的**脱敏确认后正文**（审核页最后一下编辑还没来得及被 800ms 自动保存
-   * 写回 Redis 时，以提交的这份为准）。文件清单仍只从服务端草稿读 —— 保存入口没有"客户端传文件"的口子。
+   * 写回草稿行时，以提交的这份为准）。文件清单仍只从服务端草稿读 —— 保存入口没有"客户端传文件"的口子。
    */
   const effective: SkillDraftRecord =
     input.markdown === undefined ? record : { ...record, markdown: input.markdown }
@@ -1380,8 +1929,15 @@ export async function saveSkillRevisionFromDraft(
     where: { skillId, version: target.version, path: { not: SKILL_ENTRY_PATH } },
     select: { path: true, size: true, sha256: true, mime: true, storageKey: true },
   })
-  // 校验与落库都用**整版文件集**（基准未改文件 + 草稿增量）；只拿 `effective.files` 会把既有文件丢掉
-  const mergedFiles = mergeFileEntries(effective.files, baseFiles)
+  // 校验与落库都用**整版文件集**（基准未改文件 + 草稿增量 − 墓碑）；只拿 `effective.files` 会把既有文件丢掉
+  const mergedFiles = mergeFileEntries(effective.files, baseFiles, removedPathsOf(effective))
+  // 上限按**整版集合**判（P1-24a-7：`effective.files` 只是增量，单看它会放过"基准 + 增量"超限）
+  if (mergedFiles.length > config.skill.draft.maxFiles) {
+    throw AppError.validation(appMsg('app.m305', { p0: `文件数超过上限（${String(config.skill.draft.maxFiles)}）` }), {
+      code: SKILL_ERROR_CODES.DRAFT_INVALID,
+      reasons: [`文件数超过上限（${String(config.skill.draft.maxFiles)}）`],
+    })
+  }
   const content = normalizeSkillDraftContent({
     markdown: effective.markdown,
     name: effective.name,
@@ -1439,6 +1995,7 @@ export async function saveSkillRevisionFromDraft(
           requiresBins: content.content.requiresBins,
           version: nextVersion,
           storageKey: skillStoragePrefix(skillId, nextVersion),
+          ...(visibility === undefined ? {} : { visibility }),
         },
       })
       if (updated.count === 0) {
@@ -1543,18 +2100,21 @@ export async function materializeSkillOverrideDraft(
     })
   }
   const target = await requireTargetSkill(record.targetSkillId, record.baseVersion, viewer, 'view')
-  if (target.runtime === 'INLINE' && record.files.some((file) => isSkillScriptPath(file.path))) {
+  const baseFilesRaw = await getPrisma().skillFile.findMany({
+    where: { skillId: target.id, version: record.baseVersion, path: { not: SKILL_ENTRY_PATH } },
+    select: { path: true, size: true, sha256: true, mime: true, storageKey: true },
+  })
+  // 覆写也是"基准 + 增量 − 墓碑"：不合并上游文件，保存一次覆写就会把没改的文件从会话里删掉；
+  // 只看 `record.files` 还会让"删掉上游脚本"的覆写被误判成"带 scripts/ 的 inline 覆写"（P1-24a-7）。
+  const removedPaths = removedPathsOf(record)
+  const baseFiles = baseFilesRaw.filter((file) => !removedPaths.includes(file.path))
+  const mergedFiles = mergeFileEntries(record.files, baseFilesRaw, removedPaths)
+  if (effectiveSkillRuntime(target.runtime) === 'INLINE' && mergedFiles.some((file) => isSkillScriptPath(file.path))) {
     throw AppError.validation(appMsg('app.m305', { p0: 'inline Skill 的覆写不能带 scripts/ 文件（脚本只能在 TaskAgent 沙箱里执行）' }), {
       code: SKILL_ERROR_CODES.IMPORT_INVALID,
       reasons: ['inline Skill 的覆写不能带 scripts/ 文件'],
     })
   }
-  const baseFiles = await getPrisma().skillFile.findMany({
-    where: { skillId: target.id, version: record.baseVersion, path: { not: SKILL_ENTRY_PATH } },
-    select: { path: true, size: true, sha256: true, mime: true, storageKey: true },
-  })
-  // 覆写也是"基准 + 增量"：不合并上游文件，保存一次覆写就会把没改的文件从会话里删掉
-  const mergedFiles = mergeFileEntries(record.files, baseFiles)
   const content = normalizeSkillDraftContent({
     markdown: record.markdown,
     name: record.name,
@@ -1574,7 +2134,7 @@ export async function materializeSkillOverrideDraft(
       requiresScripts: content.content.requiresScripts,
       extra: content.content.extra,
     },
-    [],
+    baseFiles,
   )
   return {
     draftId: record.id,
@@ -1591,7 +2151,7 @@ export async function materializeSkillOverrideDraft(
   }
 }
 
-/** 覆写落库成功后消耗草稿（DEL + 回收临时对象；失败只告警） */
+/** 覆写落库成功后消耗草稿（删行 + 回收临时对象；失败只告警） */
 export async function consumeSkillOverrideDraft(draftId: string, viewer: SkillViewer): Promise<void> {
   const record = await requireDraft(draftId, viewer)
   await consumeDraft(record)
@@ -1611,7 +2171,7 @@ export async function markSkillProposalSubmitted(
   markdownOverride?: string,
 ): Promise<void> {
   const record = await requireDraft(draftId, viewer)
-  // 审核页最后一下编辑可能还没被自动保存写回 Redis：把「真正提交的正文」留在草稿里，
+  // 审核页最后一下编辑可能还没被自动保存写回草稿行：把「真正提交的正文」留在草稿里，
   // 否则提交后再打开草稿会看到旧一版内容
   if (markdownOverride !== undefined) {
     record.markdown = markdownOverride
@@ -1664,7 +2224,7 @@ export async function materializeSkillProposalDraft(
   if (record.kind !== 'PROPOSAL') {
     throw AppError.validation(appMsg('app.m307', { p0: record.kind }), { code: SKILL_ERROR_CODES.DRAFT_KIND_MISMATCH })
   }
-  // 审核页最后一下编辑可能还没被自动保存写回 Redis：以提交的正文为准（仍要过下面的重扫）
+  // 审核页最后一下编辑可能还没被自动保存写回草稿行：以提交的正文为准（仍要过下面的重扫）
   if (markdownOverride !== undefined) record.markdown = markdownOverride
   if (record.targetSkillId === null || record.baseVersion === null) {
     throw AppError.validation(appMsg('app.m305', { p0: '更新建议草稿缺少目标 / 基准版本' }), {
@@ -1679,7 +2239,10 @@ export async function materializeSkillProposalDraft(
    * 这里**不能**再并入基准文件 —— 否则副本里删掉的文件会被上游基准悄悄补回来，
    * 提案的 `removedFiles` 永远为空。
    */
-  const mergedFiles = record.files.filter((file) => file.path !== SKILL_ENTRY_PATH)
+  const removed = new Set(removedPathsOf(record))
+  const mergedFiles = record.files.filter(
+    (file) => file.path !== SKILL_ENTRY_PATH && !removed.has(file.path),
+  )
   const content = normalizeSkillDraftContent({
     markdown: record.markdown,
     name: record.name,
@@ -1796,7 +2359,7 @@ export async function createSkillProposalDraftFromFork(input: {
   } catch (error) {
     record.files = []
     await removeKeysQuietly(written)
-    await deleteSkillDraftRaw(record.id).catch(() => undefined)
+    await dropDraftRecordQuietly(record)
     throw error instanceof AppError ? error : AppError.internal(appMsg('app.m012'))
   }
   getLogger().info(
@@ -1885,7 +2448,7 @@ export async function createSessionOverrideDraftFromExisting(input: {
   } catch (error) {
     record.files = []
     await removeKeysQuietly(written)
-    await deleteSkillDraftRaw(record.id).catch(() => undefined)
+    await dropDraftRecordQuietly(record)
     throw error instanceof AppError ? error : AppError.internal(appMsg('app.m012'))
   }
   getLogger().info({ draftId: record.id, targetSkillId: input.targetSkillId, baseVersion: input.baseVersion }, '已按当前上游重建会话覆写草稿')

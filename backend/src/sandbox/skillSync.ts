@@ -53,6 +53,7 @@ import {
   SKILL_ANY_TOOL_NAMES,
   appMsg,
   buildSkillManifestTools,
+  effectiveSkillRuntime,
   isSafeSkillPath,
   skillManifestFingerprint,
   skillManifestSchema,
@@ -542,7 +543,7 @@ export async function resolveDesiredSkills(
       name: row.name,
       description: row.description,
       version: override === undefined ? (pinned ?? row.version) : override.basedOnVersion,
-      runtime: row.runtime,
+      runtime: effectiveSkillRuntime(row.runtime),
       requiresBins: Array.isArray(row.requiresBins)
         ? (row.requiresBins as unknown[]).filter((item): item is string => typeof item === 'string')
         : [],

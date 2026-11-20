@@ -914,8 +914,10 @@ export type BatchDeleteArtifactsResult = z.infer<typeof batchDeleteArtifactsResu
  * 前端对它们走**渲染出口** `GET /api/artifacts/:id/render`（服务端转成净化 HTML：
  * docx → mammoth、xlsx → 手写零依赖读取器），渲染结果才带 HTML 那套 `text/html` + CSP `sandbox` 头
  * （见 `routes/artifacts.ts`）。
+ * ⚠️ `xmind` 是**另一种**独立形态：原始字节同样是 zip 包，但服务端不画图 —— 它走**大纲出口**
+ * `GET /api/artifacts/:id/outline`（解包成 JSON），由前端 `XmindOutlinePreview` 按"左树 + 右阅读区"渲染。
  */
-export const PREVIEW_KINDS = ['html', 'image', 'pdf', 'docx', 'xlsx', 'text', 'none'] as const
+export const PREVIEW_KINDS = ['html', 'image', 'pdf', 'docx', 'xlsx', 'xmind', 'text', 'none'] as const
 export type PreviewKind = (typeof PREVIEW_KINDS)[number]
 
 /**
@@ -932,6 +934,14 @@ export const XLSX_MIME =
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 /**
+ * XMind（思维导图包）的 mime —— 同上，唯一字面量。
+ *
+ * ⚠️ 它不是标准 mime（IANA 未注册），但 XMind 官方与各桌面端都认这一个；`.xmind` 本质是 **zip 包**
+ * （`content.json` + `metadata.json` + 资源），走**大纲出口**（服务端解包 → `outline` JSON → 前端左树右栏）。
+ */
+export const XMIND_MIME = 'application/x-xmind'
+
+/**
  * 图片 / PDF **直连渲染**（`<img>` / `<iframe>`）的体积闸门（10 MiB）。
  *
  * ⚠️ 放 `shared` 而不是 env：前端要**在发起请求之前**就知道"这个不值得内联"，
@@ -941,6 +951,51 @@ export const ARTIFACT_PREVIEW_MAX_INLINE_BYTES = 10 * 1024 * 1024
 
 /** MD / CSV / 文本类**取回文本**的体积闸门（2 MiB）—— 文本要进 JS 字符串并参与解析，比内联更紧 */
 export const ARTIFACT_PREVIEW_MAX_TEXT_BYTES = 2 * 1024 * 1024
+
+// ───────────────────── XMind 大纲（`xmind` 形态的数据契约）─────────────────────
+
+/**
+ * 大纲里的一棵节点（XMind 主题）。
+ *
+ * 它是**结构化数据**而不是 HTML：服务端只解包（`services/xmindPreview.ts`），
+ * 前端 `XmindOutlinePreview` 负责"左树 + 右阅读区"与"用例视图"。
+ * `title` 可能带换行（XMind 的节点正文就是这么存的：`操作步骤1: …` 下面紧跟 DB 断言）。
+ */
+export const xmindOutlineNodeSchema: z.ZodType<XmindOutlineNode> = z.lazy(() =>
+  z.object({
+    title: z.string(),
+    /** XMind 备注（`notes.plain.content`）；没有则不出现 */
+    note: z.string().optional(),
+    children: z.array(xmindOutlineNodeSchema),
+  }),
+)
+export interface XmindOutlineNode {
+  title: string
+  note?: string
+  children: XmindOutlineNode[]
+}
+
+/** 一张画布（XMind 的 `sheet`） */
+export const xmindOutlineSheetSchema = z.object({
+  title: z.string(),
+  /** 画布的根主题；老文件没有 `rootTopic` 时为 `null` */
+  root: xmindOutlineNodeSchema.nullable(),
+})
+export type XmindOutlineSheet = z.infer<typeof xmindOutlineSheetSchema>
+
+/**
+ * `GET /api/artifacts/:id/outline`（以及工作区 / Skill 的同类出口）的响应。
+ *
+ * `truncated` 是**事实**而不是错误：节点数 / 深度 / 字符总量触顶时置 `true`，界面照实说明
+ * （"只展开了一部分，完整内容请下载原文件"），与 CSV 截断同口径。
+ */
+export const xmindOutlineSchema = z.object({
+  /** 文件名（展示用；三处出口都带上，前端不必再传一次） */
+  fileName: z.string(),
+  sheets: z.array(xmindOutlineSheetSchema),
+  truncated: z.boolean(),
+})
+export type XmindOutline = z.infer<typeof xmindOutlineSchema>
 
 /**
  * 预览形态的**唯一判据**：`previewKindOf(mime)`。
@@ -981,6 +1036,8 @@ export function previewKindOf(mime: string | null | undefined): PreviewKind {
   if (base === DOCX_MIME) return 'docx'
   // XLSX：同样是二进制 OOXML，走**渲染出口**（服务端手写零依赖读取器 → HTML 表格）
   if (base === XLSX_MIME) return 'xlsx'
+  // XMind：zip 包（`content.json` 是思维导图树），走**渲染出口**（服务端解包 → HTML 嵌套列表）
+  if (base === XMIND_MIME) return 'xmind'
   // 文本 / 代码：**任何 `text/*`**（`text/html` 已在上面归 `html`）都按源码预览 —— 与工作区
   // `isWorkspaceTextMime` 同款口径（`text/x-java`、`text/x-go`、`text/css`、`text/x-sql`… 自动命中）；
   // 再把几个"其实是文本但不是 `text/*`"的显式列出。后端一律回 `text/plain; charset=utf-8`（安全）。

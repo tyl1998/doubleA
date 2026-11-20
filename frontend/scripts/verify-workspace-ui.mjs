@@ -87,6 +87,16 @@ const {
   WORKSPACE_RETENTION_NOTICE_DAYS,
 } = await import('../src/features/chat/workspaceModel.ts')
 
+const skillTree = await import('../src/pages/skills/skillDetailTreeModel.ts')
+const EmptyTreeEdits = skillTree.EmptyTreeEdits
+const effectiveDetailFiles = skillTree.effectiveDetailFiles
+const detailStatusOf = skillTree.detailStatusOf
+const planTreeSave = skillTree.planTreeSave
+const treeEditsEmpty = skillTree.treeEditsEmpty
+const treeEditCount = skillTree.treeEditCount
+const pendingDirsOf = skillTree.pendingDirsOf
+const keepPathOfDir = skillTree.keepPathOfDir
+
 // P1-23：读数改为"多收 locale 的纯函数"（译文在 `shared/src/i18n`）。本档统一用 zh 断言，
 // 中文形态与旧断言逐字一致（字典齐平由 `verify-i18n` 守着）。
 const ZH = 'zh'
@@ -282,6 +292,7 @@ it('W20b workspacePreviewKindOf：只读文件该用哪个渲染器（2026-10-30
     'xlsx',
     'xlsx → 服务端渲染出口',
   )
+  eq(workspacePreviewKindOf('application/x-xmind'), 'xmind', 'xmind → 大纲出口（结构化 JSON，不是 HTML）')
   eq(workspacePreviewKindOf('text/plain'), null, '文本走编辑器，不走预览')
   eq(workspacePreviewKindOf('application/octet-stream'), null, '未知类型只能下载')
   eq(workspacePreviewKindOf(null), null, '空安全')
@@ -556,6 +567,82 @@ it('W45 retentionDaysLeft：向上取整、过期归零，与 expiresAt 同口�
   eq(retentionDaysLeft('2026-10-01T00:00:00.000Z', now), 0, '已过期 ⇒ 0（不给负数）')
   eq(retentionDaysLeft('not-a-date', now), 0, '解析不了 ⇒ 0（不编造）')
   assert(WORKSPACE_RETENTION_NOTICE_DAYS >= 1, '提示阈值至少提前 1 天')
+})
+
+it('TD1 forBase 播种：未播种也能 delete（曾经 `declare basePaths` ⇒ 删除即白屏）', () => {
+  // 2026-11-19 事故：`basePaths` 用 `declare` 声明（无运行时字段），删除第一个文件就
+  // `for...of undefined`，详情页整页白屏。这里守两条：新建实例可直接用；forBase 会带入路径。
+  const fresh = new EmptyTreeEdits()
+  eq(fresh.basePaths.length, 0, '默认空数组（可迭代）')
+  const seeded = new EmptyTreeEdits().forBase([entry('a.md'), entry('references/b.md')])
+  eq(seeded.basePaths.join(','), 'a.md,references/b.md', 'forBase 收 SkillFileEntry 取 path')
+  eq(new EmptyTreeEdits().forBase(['x.md']).basePaths.join(','), 'x.md', 'forBase 也收裸路径')
+})
+
+it('TD2 删除基准文件 ⇒ 加墓碑，且清单里仍保留该行（树要置灰可撤销）', () => {
+  const base = [entry('SKILL.md', 10, 'text/markdown'), entry('references/a.md')]
+  const edits = new EmptyTreeEdits().forBase(base).withRemoval('references/a.md')
+  eq(planTreeSave(edits, '# md').removals.join(','), 'references/a.md', '基准文件走墓碑')
+  eq(effectiveDetailFiles(base, edits, null).some((file) => file.path === 'references/a.md'), true, '已删除行仍在树里')
+  eq(detailStatusOf('references/a.md', base, edits), 'REMOVED', '行状态 = REMOVED')
+  eq(detailStatusOf('references/a.md', base, edits.withoutRemoval('references/a.md')), null, '撤销后回到原始状态')
+})
+
+it('TD3 新建后删除 ⇒ 不残留待写入（不能悄悄写进 vN+1）', () => {
+  const base = [entry('SKILL.md', 10, 'text/markdown')]
+  const edits = new EmptyTreeEdits().forBase(base).withTextWrite('tmp.md', 'x').withRemoval('tmp.md')
+  const plan = planTreeSave(edits, '# md')
+  eq(plan.textWrites.length, 0, '待写文本已丢弃')
+  eq(plan.removals.length, 0, '新建文件不需要墓碑')
+  eq(treeEditsEmpty(edits), true, '回到原样 ⇒ 不再算"未保存"（否则保存按钮永远亮着）')
+})
+
+it('TD4 删除目录 ⇒ 基准文件全部走墓碑、目录内新建的丢弃', () => {
+  const base = [entry('SKILL.md', 10, 'text/markdown'), entry('docs/a.md'), entry('docs/deep/b.md')]
+  const edits = new EmptyTreeEdits()
+    .forBase(base)
+    .withTextWrite('docs/new.md', '# new')
+    .withRemovalOfDir('docs')
+  const plan = planTreeSave(edits, '# md')
+  eq([...plan.removals].sort().join(','), 'docs/a.md,docs/deep/b.md', '基准文件全进墓碑')
+  eq(plan.textWrites.length, 0, '目录内新建文件被丢弃')
+  eq(planTreeSave(edits.withDir('docs'), '# md').removals.includes('docs'), false, '新建目录不产生墓碑')
+})
+
+it('TD4b 新建文件夹 ⇒ 保存时补 `.keep`（否则保存 / 刷新后文件夹消失）', () => {
+  const base = [entry('SKILL.md', 10, 'text/markdown')]
+  const edits = new EmptyTreeEdits().forBase(base).withDir('docs')
+  const plan = planTreeSave(edits, '# md', 'keep\n')
+  eq(plan.textWrites.map((item) => item.path).join(','), 'docs/.keep', '目录以占位文件落进 vN+1')
+  eq(plan.textWrites[0].text, 'keep\n', '占位正文来自 i18n 文案')
+  eq(treeEditsEmpty(edits), false, '只新建一个文件夹也算"有未保存改动"（保存按钮要亮）')
+  eq(treeEditCount(edits), 1, '改动条数 = 1')
+  eq(pendingDirsOf(edits, effectiveDetailFiles(base, edits, null)).join(','), 'docs', '保存前树上看得见这个空目录')
+})
+
+it('TD4c 新建文件夹后往里放文件 ⇒ 不再补 `.keep`', () => {
+  const edits = new EmptyTreeEdits().forBase([]).withDir('docs').withTextWrite('docs/a.md', 'a')
+  const plan = planTreeSave(edits, '# md', 'keep\n')
+  eq(plan.textWrites.map((item) => item.path).join(','), 'docs/a.md', '目录已由文件带出来，不要多余的 .keep')
+  // 目录改名由服务端回放（`renames` 单独走一遍），这里只确认占位文件不会跟着冒出来
+  const renamed = edits.withRename({ from: 'docs', to: 'manual', kind: 'DIR' })
+  const renamedPlan = planTreeSave(renamed, '# md', 'keep\n')
+  eq(renamedPlan.textWrites.map((item) => item.path).join(','), 'docs/a.md', '目录改名不额外产出文件')
+  eq(renamedPlan.renames.map((item) => `${item.from}->${item.to}`).join(','), 'docs->manual', '改名交给回放')
+  eq(keepPathOfDir('manual'), 'manual/.keep', '占位路径由目录派生')
+})
+
+it('TD4d 新建空文件夹又删掉 ⇒ 不残留 `.keep`', () => {
+  const edits = new EmptyTreeEdits().forBase([]).withDir('docs').withRemovalOfDir('docs')
+  eq(planTreeSave(edits, '# md', 'keep\n').textWrites.length, 0, '删掉的目录没有占位文件')
+  eq(treeEditsEmpty(edits), true, '回到原样 ⇒ 不再算"未保存"')
+})
+
+it('TD5 SKILL.md 永不删除', () => {
+  const base = [entry('SKILL.md', 10, 'text/markdown')]
+  const edits = new EmptyTreeEdits().forBase(base).withRemoval('SKILL.md')
+  eq(planTreeSave(edits, '# md').removals.length, 0, '没有墓碑')
+  eq(effectiveDetailFiles(base, edits, null).length, 1, '正文行仍展示')
 })
 
 console.log('')

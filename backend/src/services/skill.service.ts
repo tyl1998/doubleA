@@ -94,7 +94,8 @@ export interface SkillRow {
   name: string
   slug: string
   description: string
-  runtime: SkillRuntime
+  /** `null` = 包内未声明 `requires.runtime`（见 `shared#effectiveSkillRuntime`） */
+  runtime: SkillRuntime | null
   version: number
   visibility: AssetVisibility
   sourceType: SkillSourceType

@@ -45,6 +45,7 @@ import type {
   SyncSkillUpstreamResult,
   TransferAssetBody,
   UpdateSkillBody,
+  XmindOutline,
 } from '@doubulea/shared'
 
 import { request, requestBlob, requestFormData, type DownloadedFile } from './client.js'
@@ -234,6 +235,24 @@ export function skillFileRawUrl(id: string, params: { path: string; version?: nu
   const search = new URLSearchParams({ path: params.path })
   if (params.version !== undefined) search.set('version', String(params.version))
   return `/api/skills/${encodeURIComponent(id)}/file/raw?${search.toString()}`
+}
+
+/** XMIND 解成大纲 JSON 的 URL（前端 `XmindOutlinePreview` 画树） */
+export function skillFileOutlineUrl(id: string, params: { path: string; version?: number }): string {
+  const search = new URLSearchParams({ path: params.path })
+  if (params.version !== undefined) search.set('version', String(params.version))
+  return `/api/skills/${encodeURIComponent(id)}/file/outline?${search.toString()}`
+}
+
+/** 取回 xmind 的大纲（`GET /api/skills/:id/file/outline`，2026-11-20） */
+export function fetchSkillFileOutline(
+  id: string,
+  params: { path: string; version?: number; signal?: AbortSignal },
+): Promise<XmindOutline> {
+  return request<XmindOutline>(
+    skillFileOutlineUrl(id, params),
+    params.signal === undefined ? {} : { signal: params.signal },
+  )
 }
 
 /** DOCX / XLSX 渲染成 HTML 的 URL */

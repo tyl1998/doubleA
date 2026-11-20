@@ -2640,6 +2640,13 @@
 /* ── Skill 文件树（2026-11-17）──────────────────────────────────────────────
    行样式复用 Code 模式的 `.ws__tree-*`；这里只加一个滚动上限，文件多时不把详情页撑高。 */
 .skill-tree-scroll { max-height: 520px; overflow: auto; }
+/* 详情页的树要"撑满左栏"，让面板空白处也能右键（Code 模式的右键手势） */
+.skill-tree-scroll--fill { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 220px; }
+.skill-tree-scroll--fill > .ws__tree { flex: 1 1 auto; }
+/* 左栏卡片与右栏等高：树面板吃掉剩余高度，底部留白也能右键 */
+.skill-detail__tree-card { display: flex; flex-direction: column; height: 100%; }
+.row > .col:has(> .skill-detail__tree-card) { display: flex; }
+.row > .col:has(> .skill-detail__tree-card) > .skill-detail__tree-card { flex: 1 1 auto; margin-bottom: 0; }
 
 /* 更新建议审核弹层的正文对照（等宽、可滚动；只做展示，不做编辑器） */
 .skill-proposal-diff {
@@ -2668,6 +2675,16 @@
 }
 .skill-status--added { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 32%, transparent); }
 .skill-status--modified { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
+.skill-status--removed { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); border-color: color-mix(in srgb, var(--danger) 32%, transparent); }
+
+/* 文件树编辑模式（P1-24a-7）：行内动作按钮 + 已删除行 */
+.ws__tree-liner { display: flex; align-items: center; }
+.ws__tree-liner > .ws__tree-row { flex: 1 1 auto; min-width: 0; }
+.skill-tree__row-actions { display: inline-flex; align-items: center; gap: 2px; padding-right: var(--sp-2); opacity: 0.55; }
+.skill-tree__row-actions .ant-btn { height: 20px; min-width: 20px; padding: 0 4px; }
+.ws__tree-liner:hover .skill-tree__row-actions { opacity: 1; }
+.ws__tree-row.is-removed { cursor: default; opacity: 0.7; }
+.ws__tree-name--struck { text-decoration: line-through; color: var(--muted-2); }
 
 /* ── Skill 审核（2026-11-17）：文件树 + 预览 / diff 两栏 ────────────────── */
 .skill-review { display: flex; flex-direction: column; gap: var(--sp-3); min-height: 0; }
@@ -2681,12 +2698,46 @@
 .skill-review__pane { min-height: 0; min-width: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--sp-3); }
 .skill-review__pane-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .skill-review__pane-head code { margin-right: auto; }
-.skill-review__editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-3); align-items: stretch; }
-.skill-review__editor-preview { max-height: 60vh; overflow: auto; border-left: 1px solid var(--rule); padding-left: var(--sp-3); }
+/*
+ * 正文编辑的两栏（左输入 / 右实时预览）：
+ * 两栏同高、各自滚动 —— 高度由**固定的编辑区高度**决定，而不是被内容撑开。
+ * 以前 `align-items: stretch` 配 `autoSize` 的 TextArea：输入框随内容长高、预览被 `max-height: 60vh`
+ * 截断，两栏长度永远对不上（用户反馈 2026-11-19）。
+ */
+.skill-review__editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: stretch;
+  height: min(60vh, 640px);
+}
+.skill-review__editor > .ant-input {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  resize: none;
+}
+
+/* TextArea 的 `autoSize` 写成内联 height，会盖掉上面那条 100% —— 用高优先级钉回"填满 + 自己滚" */
+.skill-review__editor > textarea.ant-input {
+  height: 100% !important;
+  max-height: 100%;
+  overflow-y: auto;
+}
+.skill-review__editor-preview {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  border-left: 1px solid var(--rule);
+  padding-left: var(--sp-3);
+}
 @media (max-width: 960px) {
   .skill-review__body { grid-template-columns: 1fr; }
   .skill-review__tree { max-height: 260px; }
-  .skill-review__editor { grid-template-columns: 1fr; }
+  .skill-review__editor { grid-template-columns: 1fr; height: auto; }
+  .skill-review__editor > .ant-input,
+  .skill-review__editor > textarea.ant-input { height: min(40vh, 420px) !important; }
+  .skill-review__editor-preview { height: min(40vh, 420px); }
   .skill-review__editor-preview { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: var(--sp-3); }
 }
 

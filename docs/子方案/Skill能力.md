@@ -1,7 +1,7 @@
 # 子方案 — Skill 能力（可绑定资产 + 渐进披露）
 
 > 上游基准：`01-整体需求与实施步骤.md`（决策 4/18/29/30/37；⚠️ **决策 7 已被本方案修订**，原文「插件/工作流/技能/变量均不做」不再适用于 Skill）、`02-后端设计.md`（§三 数据模型、§4.4 Agent 组件、§六 编排、§九 安全）、`03-前端设计.md`（§二 路由、§4.2 智能体编辑页）、`05-P系列计划拆分.md`（P1-24）。
-> 状态：**方案稿（2026-11-13，v3 评审修订），未开工**。本方案不改变现有 Agent / 知识库 / MCP 的语义，只新增一类可绑定资产与两条运行时的按需读取路径。
+> 状态：**a-1 ~ a-5 / b-1 ~ b-3 / c-1 ~ c-6 / c-7a 已落地（2026-11-13 ~ 2026-11-19，含 2026-11-18 审核内新增文件修复、2026-11-19 a-5 详情页正文编辑 + c-7a 草稿跨设备恢复）；c-7 其余可选增强未做；2026-11-19 新增的 a-6（页面内新建）已落地、a-7（文件树编辑）方案稿未开工**。本方案不改变现有 Agent / 知识库 / MCP 的语义，只新增一类可绑定资产与两条运行时的按需读取路径。
 > v3 订正（代码核对后，见 §3.1 版本模型 / §3.2 保留期与宿主目录 / §4.1 截断与分页 / §4.14 agentId / §6.3 信任边界 / §6.4 错误码口径）：① `skill_files.version` ≡ `skills.version`（整版快照，不引入单文件版本）；② 旧版本只回收 S3 对象、保留 `skill_files` 行，历史审计到"版本+路径+sha256"为止；③ `agent_components.config` 的 `pinnedMcpTools` 与 `skillVersion` 合并写、`sameComponentSet` 一并判等（原句"分 shape"会静默清掉常驻工具）；④ 公开 sandbox Skill 在**绑定期** 403，不做执行期"确认后放行"（`bash` 面前不成立）；⑤ 新增 `SKILL_RUNTIME_ROOT` 配置、目录属主对齐、独立 reaper，"mount 在但目录空"必走 rehydrate；⑥ Skill 工具自己按 `limit` 切片给 `nextOffset`，`truncateToolResult` 只兜底；⑦ Skill 子码一律走 `AppError.data.code`，不新增 `ERROR_CODES`；⑧ **新增 §5.16 会话级覆写**（2026-11-13 用户定案）：执行中发现流程/脚本不好用时不改上游，改为可在本会话整版覆写 `SKILL.md + references/assets + scripts`，优先级高于固定版本与最新版，要长期保留走 `promote` 成 fork；单独立批 `c-4b`。
 > 一句话：**Skill 是「说明 + 参考资料 + 可选脚本」的可复用资产；平台只把目录摘要放进上下文，模型按需加载正文，脚本只在 TaskAgent 沙箱里执行。**
 
@@ -69,16 +69,20 @@ requires:
 | `name` | Skill 展示名称；平台内按所属人 + 名称在**未删除资产**中判重（服务层判重，不用全表 `@unique`，避免软删后无法复用） |
 | `slug` | 工具引用与 API 路径使用的稳定标识；未删除范围内全局唯一、创建后不可改；工具参数一律用 slug，不用 name |
 | `description` | 模型选择 Skill 的唯一依据；必须写“什么时候用”，不是功能介绍 |
-| `requires.runtime` | `inline` = 只要说明/资料即可；`sandbox` = 需要容器与脚本 |
-| `requires.scripts` | 是否存在需要执行的脚本；**`true` 时必须 `runtime=sandbox`**，存在 `scripts/` 文件但声明 `inline` 直接拒绝 |
+| `requires.runtime` | `inline` = 只要说明/资料即可；`sandbox` = 需要容器与脚本；**缺省 = 未声明**（第三方 Skill 常态，DB 存 `NULL`，无脚本时能力等同 `inline`，管理面显示“未声明”）；写成别的值（如解释器名）也按未声明处理 |
+| `requires.scripts` | 是否存在需要执行的脚本；`true` 或包里存在脚本文件 ⇒ **按 `sandbox` 导入**（不拒绝） |
 | `requires.bins` | 可选，脚本依赖的命令/解释器，用于绑定校验与 TaskAgent 预检 |
 | `manifest` | frontmatter 原样保存，便于回显与后续扩展 |
 
-`description` 有长度上限（建议 1000 字符），超出时导入失败并给出明确提示；不要截断后静默入库。
+`description` 有长度上限（**1024 字符**，与 Agent Skill 官方口径一致），超出时导入失败并给出明确提示；不要截断后静默入库。缺 `description` 时从正文首段 / 一级标题兜底（兜底仍为空才拒绝）。
+
+`name` 缺失时依次用包内 `SKILL.md` 所在**目录名**、正文一级标题兜底，避免“GitHub 上下载的 Skill 能跑却不能导入”。
 
 `slug` 由服务端生成且只允许 ASCII：纯中文/符号名不能折成空串再靠序号凑，必须在 `slugify` 失败时回落 `skill-<shortid>`；用户手填 slug 也要过同一正则。否则中文名会重演 MCP `uniqueSlug` 的碰撞问题。
 
-**一致性校验（导入、重新导入、会话草稿保存三处共用同一函数）**：`runtime`、`requires.scripts`、`scripts/` 文件、`requires.bins` 必须互相一致；`scripts=true` 或存在脚本文件 ⇒ `sandbox`；`runtime=inline` 不得带脚本。DB 字段与 `SKILL.md` frontmatter 以 **DB 字段为真相源**，读取时由平台生成/覆盖 frontmatter，避免改名/改描述后模型读到旧值。
+**一致性口径（导入、重新导入、会话草稿保存三处共用同一函数）**：`scripts=true` 或存在脚本文件 ⇒ `sandbox`（导入时**自动归一**，不再因“声明 inline 却带脚本”失败）；`runtime=inline` 且带脚本仍属非法组合，只有草稿编辑面继续拦。`runtime` 缺省 ⇒ `NULL`（未声明）；重新导入时包内未声明则继承库里已有值。DB 字段与 `SKILL.md` frontmatter 以 **DB 字段为真相源**，读取时由平台生成/覆盖 frontmatter，避免改名/改描述后模型读到旧值。
+
+导入的其余放宽（2026-11-19）：`SKILL.md` 允许出现在**任意一层目录**（包里唯一一个 `*/SKILL.md` 即认定为根）；没有 frontmatter 的纯 Markdown Skill 也允许导入。
 
 ### 2.3 脚本路径与工作目录
 
@@ -94,6 +98,7 @@ TaskAgent 容器的工作目录是 `/work`，而 Skill 是只读挂载。为避�
 | Skill 类型 | ChatBot | TaskAgent |
 |---|---|---|
 | `runtime: inline` | 可绑定；读正文与 references | 可绑定；读正文与 references |
+| **未声明**（`runtime` 为 `NULL`） | 同 `inline`（无脚本时能力等价） | 同 `inline` |
 | `runtime: sandbox` | **禁止绑定**（409 `CONFLICT` + `data.code=SKILL_RUNTIME_NOT_ALLOWED`） | 可绑定；只读挂载 + 脚本执行 |
 
 MVP 采用二值门禁，不做 `runtime: sandbox` 在 ChatBot 上的“仅文档降级”。如果后续确有“文档部分有价值、脚本部分不可用”的混合 Skill，再引入显式 `allowPartial` 标记与 UI 提示；默认不静默降级。
@@ -705,7 +710,7 @@ GET    /api/skills/:id/file/raw?path=&version= 预览原始字节（inline；HTM
 GET    /api/skills/:id/file/render?path=&version= DOCX / XLSX 渲染成 HTML（inline）
 GET    /api/skills/:id/download?version= 整包 zip 下载（与上传同形态；version 缺省=当前版本）
 
-POST   /api/skill-drafts                新建编辑草稿（markdown + files；Redis + 临时 S3）
+POST   /api/skill-drafts                新建编辑草稿（markdown + files；skill_drafts 表 + 临时 S3）
 GET    /api/skill-drafts/:draftId       读取草稿（校验归属；续期 TTL）
 PUT    /api/skill-drafts/:draftId       自动保存/续期（长审核不丢）
 DELETE /api/skill-drafts/:draftId       丢弃草稿
@@ -714,7 +719,7 @@ DELETE /api/skill-drafts/:draftId       丢弃草稿
 约束：
 
 - **并发保护**：`PATCH` 带 `expectedUpdatedAt`，`import` / `revisions/from-draft` / `proposal accept` 带 `fromVersion`；不匹配返回 409 `CONFLICT` + `data.code ∈ {SKILL_VERSION_CONFLICT, SKILL_STALE}`，不自动合并。
-- **内容编辑走草稿**：`PATCH /api/skills/:id` 只改元数据，不改 `SKILL.md`/文件；要改内容必须 `POST/PUT /api/skill-drafts` 后走 `from-draft` 或 `revisions/from-draft`，由服务端生成新版本。这样不会出现「UI 有编辑器、后端没有写入口」。**2026-11-13 口径**：详情页当前的「保存」只是元数据保存（不升版本）；文件正文内联编辑 + 保存生成 `vN+1` 登记为 **P1-24a-5**，届时与草稿链二选一，不并行两套写入器。
+- **内容编辑走草稿**：`PATCH /api/skills/:id` 只改元数据，不改 `SKILL.md`/文件；要改内容必须 `POST/PUT /api/skill-drafts` 后走 `from-draft` 或 `revisions/from-draft`，由服务端生成新版本。这样不会出现「UI 有编辑器、后端没有写入口」。**P1-24a-5（2026-11-19 已落地）二选一结果：详情页正文编辑复用草稿链** —— 文本文件内联编辑、二进制整文件替换，保存时建 `REVISION` 草稿并走 `revisions/from-draft` 生成 `vN+1`；名称 / 描述随草稿、可见范围随保存请求**与新版本同事务发布**。**不新增第二套写入器**，也不在 `PATCH` 上开文件内容口子。
 - **frontmatter 由服务端生成**：DB 字段是真相源；保存时按 `name/description/runtime/requiresBins` 重写 `SKILL.md` frontmatter，读取时也以生成的为准。
 - `POST /api/skills` 与 `import` 接收 zip，服务端解包并校验；不把 zip 原样存为运行时资产。解包实现落在**新建的 `services/skillZip.ts`**（不要直接复用 `services/xlsxPreview.ts#readZipEntries`——它不读 external attributes，判不了符号链接），口径见 `会话生成Skill.md` §六。
 - 单文件大小、文件数、解压后总大小、路径深度都要有上限（常量或 config），并在错误里给出具体限制。
@@ -725,7 +730,7 @@ DELETE /api/skill-drafts/:draftId       丢弃草稿
 ### 5.2 前端
 
 - 新增 `frontend/src/pages/skills/`：列表、导入、详情（文件树 + Markdown 预览）、编辑元数据、可见范围。
-- `SKILL.md`/references 的内容编辑统一走 `skill-drafts` 自动保存（`PUT` 续期），保存时调 `revisions/from-draft` 生成新版本；**不要**在详情页直接 `PATCH` 文件或把 `storageKey` 交给前端。
+- `SKILL.md`/references 的内容编辑统一走 `skill-drafts` 自动保存（`PUT` 续期），保存时调 `revisions/from-draft` 生成新版本；**不要**在详情页直接 `PATCH` 文件或把 `storageKey` 交给前端。详情页（a-5）的内联编辑在发布时同样走这条链：文本改动进草稿 `markdown` / 文件上传，二进制只按原路径整文件替换；历史版本只读，旧版本对象不回收。
 - 版本历史页读 `GET /api/skills/:id/versions` / `changes`；旧版本文件预览带 `version` 参数。
 - `frontend/src/pages/agents/AgentFormPage.tsx` 增加 Skill 区：
   - 多选绑定；
@@ -800,7 +805,7 @@ DELETE /api/skill-drafts/:draftId       丢弃草稿
 5. **脱敏复核**：高亮 token / key / 密码 / URL / 邮箱 / 内部 ID / 业务单号；默认打码。**凭据形状（Authorization / Bearer / token / api_key / secret / password / cookie）禁止“恢复”**，只能保持打码或删除；业务 ID/URL 可逐项恢复。未确认前不能保存。
 6. **保存**：默认 `PRIVATE`；可选「同时绑定当前 Agent」。若当前 Agent 不可编辑，则只保存到“我的 Skills”。
 
-审核页必须是**可编辑的表单 + Markdown 预览**，不能只展示一段只读文本。用户应能删步骤、改顺序、改 description、移除文件引用。编辑过程中前端定期 `PUT /api/skill-drafts/:draftId` 自动保存并续期，不能因为审核超过 1 小时就丢草稿。
+审核页必须是**可编辑的表单 + Markdown 预览**，不能只展示一段只读文本。用户应能删步骤、改顺序、改 description、移除文件引用。编辑过程中前端定期 `PUT /api/skill-drafts/:draftId` 自动保存并续期，不能因为审核时间长 / 换设备就丢草稿。
 
 ### 5.7 API 与数据
 
@@ -822,7 +827,7 @@ POST /api/skills/from-draft
   resp: SkillItem
 ```
 
-- `draftId` 短期保存在 Redis（建议 1 小时，`GET/PUT` 自动续期），草稿文件放 `skill-drafts/{userId}/{draftId}/` 临时前缀；保存成功后复制到 `skills/{skillId}/v1/...` 并清理草稿。
+- 草稿记录落 `skill_drafts` 表（保留期默认 7 天滑窗，`GET/PUT` 自动续期；c-7a），草稿文件放 `skill-drafts/{userId}/{draftId}/` 临时前缀；保存成功后复制到 `skills/{skillId}/v1/...` 并清理草稿。
 - **`from-draft` 不接收客户端 `files/storageKey`**：文件清单只从服务端草稿读取；否则可以引用任意 S3 对象。请求体的 `markdown` 也不可信，服务端以草稿内容 + DB 元数据重新生成 frontmatter。
 - `GET /api/skill-drafts/:draftId` / `DELETE` 与 `from-draft` 一样校验 `draft.userId === viewer.id`；ADMIN 也不能读他人草稿。
 - `from-draft` / `revisions/from-draft` / Proposal 接受按 `(draftId, kind)` 幂等；重复提交返回同一结果，不重复生成版本。S3 先写、DB 后切；DB 失败留下的新版本对象按前缀清理。
@@ -987,7 +992,7 @@ sourceMessageIds     Json?           @map("source_message_ids") @db.JsonB
 | 谁可以建 | 只有会话发起者；**ADMIN 也不能给别人的会话建覆写**（与“不能导出他人会话”同一条纪律） |
 | 能改什么 | `SKILL.md` **+ `references/` + `assets/` + `scripts/`**（脚本一并可改，见 5.16.5） |
 | 生效时机 | **下一轮派活前**；当前轮不换（与 §5.9 / §5.11.1 的硬约束一致） |
-| 存储 | 复用草稿同源：Redis 索引 + S3 临时前缀 `skill-overrides/{conversationId}/{skillId}/`；DB 只存一行版本锚点（见 5.16.3） |
+| 存储 | 复用草稿同源：`skill_drafts` 草稿行 + S3 临时前缀 `skill-overrides/{conversationId}/{skillId}/`；DB 只存一行版本锚点（见 5.16.3） |
 | 生命周期 | 与会话保留期一致；会话删除 ⇒ 覆写随之回收 |
 | 与 fork 的区别 | fork 产出**独立资产**（可管理、可绑定、可共享）；覆写是**会话内的临时快照**，不可绑定、不可共享、不产生资产 |
 
@@ -1145,6 +1150,109 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 - 覆写 `inline` Skill 时带 `scripts/**` ⇒ 400（`SKILL_IMPORT_INVALID`）；
 - `promote` 成功后：新 Skill 出现在"我的 Skills"，`parentSkillId` 指向上游；**再**删覆写；顺序颠倒时给出明确错误而不是半完成；
 - 会话删除 ⇒ 覆写行与 S3 前缀一起回收；**上游 Skill 删除**时，覆写随 FK 级联删除（不保留孤儿覆写）。
+
+---
+
+## 五·补三、页面内新建 Skill 与文件树编辑（已落地）
+
+> **解决什么**：目前「我的 Skills」只有「导入 zip」一个创建入口；用户想直接在页面写一个 Skill，或对已有 Skill 增删改文件/目录，只能本地重新打包再导入。本方案在不新增写库路径的前提下补两条能力：
+> ① **页面新建**：填元数据 + 写 `SKILL.md` 正文 → 保存为 v1；
+> ② **文件树编辑**：文件/目录的新增、修改、删除、重命名（移动），在草稿里完成并一次发布为 vN+1。
+> **状态**：`P1-24a-6` 已落地（2026-11-19，页面新建）；`P1-24a-7` 已落地（2026-11-19，文件树编辑）。
+
+### 5.17 结论与边界
+
+| 维度 | 口径 |
+|---|---|
+| 写库路径 | **只有草稿链**：`POST /api/skill-drafts`（CREATE/REVISION）→ `POST /api/skills/from-draft` / `POST /api/skills/:id/revisions/from-draft`。**不给 `POST /api/skills` 增加 JSON 建法** —— 那会形成第二条内容写路径，重复 zip 校验、S3 写入、slug 判重与 frontmatter 生成 |
+| 页面新建 | 重新放开客户端建 `CREATE` 草稿；**不是**恢复“空白草稿”入口：创建时必须带 `name / description / runtime / 非空正文`，避免“只有元数据、没有 `SKILL.md` 的空壳” |
+| 文件/目录 | 目录不是存储对象（`skill_files` / S3 只存文件）；“目录操作”= 对路径前缀的批量文件操作；**空目录不落版本** |
+| 旧版本 | 任何修改都产出 `vN+1` 整版快照；旧版本只读、可下载，绝不改写 |
+| 编辑面 | 统一在 `/skills/drafts/:draftId`（`SkillDraftReview`）：新建、审核与改文件同一套 UI；详情页只加「编辑文件」入口建 `REVISION` 草稿，不再堆第二套文件变更编排 |
+| 权限 | 创建 = 登录用户；修改 = `canEdit`（所属人/ADMIN）；其余人只能 fork / 提交更新建议（现有 ACL 不变） |
+
+### 5.18 页面新建（P1-24a-6）✅ 已落地 2026-11-19
+
+**现状（可复用）**：`createSkillDraft` 服务已支持 `CREATE`（`backend/src/services/skillDraft.service.ts#createSkillDraft`），落库自动 `sourceType=MANUAL`；审核页也已按 `CREATE` 渲染（`frontend/src/features/skills/SkillDraftReview.tsx#saveLabelKey` 兜底）。阻塞点只有两处：
+
+- `SKILL_DRAFT_KINDS_SUPPORTED` 在 c-2 收成只剩 `REVISION`（`shared/src/skill.ts`），`POST /api/skill-drafts` 建不了 CREATE；
+- 「我的 Skills」列表页的「新建本地草稿」入口随 c-2 下线（`frontend/src/pages/skills/SkillListPage.tsx`）。
+
+**改动**：
+
+1. `shared/src/skill.ts`：`SKILL_DRAFT_KINDS_SUPPORTED = ['CREATE', 'REVISION']`；`createSkillDraftBodySchema.superRefine` 在 `kind=CREATE` 时要求 `markdown` trim 非空（复用 `validation.skillDraft.markdownRequired`）。schema **仍不接收 `source`** ⇒ 客户端无法伪造会话来源。
+2. `backend/src/services/skillDraft.service.ts`：`createSkillDraft` 对 `source === null` 的 CREATE 增加正文非空兜底（防绕过 schema）；`saveSkillFromDraft` 对“无来源草稿且正文为空”返回 400 `DRAFT_INVALID`（复用 `app.m305` + `reasons`），堵住空壳。
+3. `backend/src/routes/skillDrafts.ts` 文件头注释同步（CREATE 重新开放的理由与边界）。
+4. 前端：
+   - `SkillListPage` 头部「导入 Skill」旁加「新建 Skill」，空态也加入口；
+   - 新建弹窗只收 `name / description / runtime`（默认 INLINE），description 文案提示“写什么时候用”；
+   - 创建时写入一段正文模板（标题 + 使用场景 + 步骤），调 `useCreateSkillDraft({ kind: 'CREATE', ... })` → `navigate(skillDraftPath(id))`；
+   - `SkillDraftReview` 在 `kind=CREATE && source=null` 时标题/面包屑显示「新建 Skill」；
+   - 可见范围 / `slug` 当前不在审核页表单里：`from-draft` 缺省 `PRIVATE`（`normalizeSkillVisibility`）；a-6 可先默认 PRIVATE，后续在「设置」页签补选择器（`saveSkillFromDraftBodySchema` 已支持 `visibility/slug`）。
+5. i18n：新增 `skillList.create*`（zh/en）；正文标签复用 `skillDraft.markdownLabel` / `markdownHint`；后端复用 `app.m305` + `DRAFT_INVALID`，不新增 `app.mNNN`。
+
+**交互**：新建 Skill → 弹窗 → CREATE 草稿 → 编辑页写正文/加文件 → 「保存为我的 Skill」→ v1 → 详情页。中途退出可从 `/skills/drafts` 找回（保留期内有效，编辑页心跳续期，换设备也能继续）。
+
+**验收**：CREATE 成功 → v1 可见；正文为空在创建与保存两处都被拒；重名/slug 冲突 409；不会产生 `sourceType=CONVERSATION`。
+
+### 5.19 文件与目录编辑（P1-24a-7）✅ 已落地 2026-11-19
+
+#### 5.19.1 数据与合并口径
+
+- `SkillDraftRecord` 增 `removedPaths: string[]`（草稿 payload JSON；旧草稿缺省 `[]`，**无 Prisma 迁移**）。
+- 同一路径不能同时在 `record.files` 与 `removedPaths`：新增/改回该路径时自动从删除集合移除。
+- `mergeFileEntries` / `materializeDraftFiles` 过滤 `removedPaths`；`computeSkillDiff` 的 `afterFiles` 自然反映删除。
+- `SKILL.md` 不能删除/重命名，只能通过草稿的 `markdown` 字段改正文（frontmatter 仍由服务端生成）。
+- `PROPOSAL` / `SESSION_OVERRIDE` 复用物化的入口必须一并传 `removedPaths`，否则删除会被静默忽略（施工时逐处核对）。
+
+#### 5.19.2 API（全部挂 `/api/skill-drafts/:draftId`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `PUT` | `/files/content` | `{ path, text }`：新建/修改文本文件；UTF-8、大小上限、secret scan |
+| `POST` | `/files/rename` | `{ from, to, kind: 'FILE' \| 'DIR', overwrite?: false }`：文件或目录前缀移动 |
+| `DELETE` | `/files?path=&recursive=1` | 扩展现有：草稿文件移除 / 基准文件加墓碑 / 目录递归删除 |
+| `POST` | `/files` | 现有二进制上传（保持） |
+| `GET` | `/files?path=` | 现有预览（保持） |
+
+服务端口径：
+
+- 复用 `isSafeSkillPath`、`maxFiles`、`maxFileBytes`、runtime 与 `scripts/**` 互斥校验；整版集合按“基准 − 删除 + 新增/替换”判上限，不能只看 `record.files.length`。
+- 重命名：草稿内文件改 S3 键；基准文件读基准对象 → 写新草稿键 → 旧路径进 `removedPaths`；目标冲突默认 400，不静默覆盖。
+- 目录重命名/删除按前缀收集（草稿 ∪ 基准 − 已删除），一次写草稿 JSON；S3 先写后持久化，失败回收已写键。
+- 删除基准文件只加墓碑，不动旧版本对象（§3.2 的整版快照纪律）。
+
+#### 5.19.3 前端
+
+- `SkillFileTree` 增加**可选**编辑模式（默认只读，现有调用方不变）：树工具栏「新建文件 / 新建文件夹 / 上传到此目录」；行菜单「重命名 / 删除 / 下载」；`canEdit` 才显示；`SKILL.md` 的行操作置灰并说明原因。
+- `SkillDraftReview`：
+  - 右侧文本文件可在线编辑（不只 `SKILL.md`）；
+  - 树行标记 `ADDED / MODIFIED / REMOVED / RENAMED`；
+  - 目录删除确认展示将删除的文件数。
+- 详情页加「编辑文件」：建 `REVISION` 草稿 → 进同一编辑页；保存后回详情，旧版本只读（与 a-5 口径一致）。
+- 新建 Skill（a-6）的 CREATE 草稿使用同一套文件树操作。
+
+#### 5.19.4 明确不做 / 限制
+
+- **空目录不保留**：整版快照没有目录对象；需要空目录只能放占位文件（如 `.keep`），默认不做。
+- 不做拖拽移动、跨 Skill 复制、符号链接/可执行位语义。
+- 不做“直接改 S3/DB”的旁路；所有编辑都经草稿 + 发布。
+- 单批操作沿用文件数 / 单文件大小上限；目录批量移动同样受判。
+
+### 5.20 错误与 i18n
+
+- 子码继续走 `AppError.data.code`（`DRAFT_INVALID` / `DRAFT_NOT_FOUND`），**不新增** `ERROR_CODES`（§6.4）。
+- 新增用户可见文案走 i18n：前端 `skillFile.*` / `skillDraft.*`（zh+en）；后端如需独立文案用 `app.mNNN`（m340 起，`shared/src/appMessages.ts` + 两份字典齐平）。
+- 路径非法沿用 `validation.skill.pathUnsafe`。
+
+### 5.21 分批与验收
+
+- **P1-24a-6 · 页面新建**（依赖 c-1；a-2 的列表页/详情页）✅ 2026-11-19
+  - 验收：CREATE → v1；空正文/空描述被拒；重名 409；`/skills/drafts` 可见并续期。
+- **P1-24a-7 · 文件树编辑**（依赖 c-1、a-5、a-6）
+  - 验收：新建/改/删/重命名文件；目录批量删除与重命名；删除基准文件后 vN+1 少文件、vN 仍可下载；`SKILL.md` 守卫；冲突 400；`..` 路径拒绝；CREATE 草稿同样可用。
+- 回归：`skill-drafts:regression`（新增文件/目录用例）、`skill-revision` / `skill-override` / `skill-proposal:regression`（删除语义贯通）、`pnpm -r typecheck`、改动文件 `eslint`、`verify:i18n` 0 failures。
+- 工作量：a-6 约 0.5~1 天；a-7 文件级 ~1~1.5 天，目录级 +0.5~1 天；Proposal/覆写贯通 +0.5 天。
 
 ---
 
@@ -1419,9 +1527,19 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 - **`c-4b` 会话级覆写（Session Override，§5.16）**——依赖 c-1 的草稿基础设施，不依赖抽取；含 `scripts/**` 覆写与 TaskAgent 物化；**它同时要碰 a 批（解析优先级）与 b 批（`skillSync` 物化覆写目录），所以是唯一一个跨批的 c 项**；
 - `c-5` Fork + fast-forward；
 - `c-6` Proposal + 三方合并；
-- `c-7` 增强（可选）。
+- **`c-7a` 草稿跨设备恢复 ✅ 2026-11-19**：草稿 JSON 从 Redis 迁到 `skill_drafts` 表（保留期默认 7 天滑窗），见 `会话生成Skill.md` §7.2；
+- `c-7` 其余增强（可选：参数化建议 / 更细 diff / 抽取评测 / 沙箱试跑 / 会话级临时固定）。
 
 > ⚠️ `c-4b` 的跨批性质要提前说清：`§5.9` 的解析优先级函数、`§4.13` manifest 的 `override/overrideRevision` 字段、`§4.14` 的 fingerprint、`tool_calls` 的 `overrideRevision` 契约**必须在 a-1/a-3/b-1/b-2 时就把"覆写位"预留出来**（即字段先占位、行为恒为"无覆写"），否则 c-4b 落地时要回头改 a/b 批的契约与回归。宁可先留空位，也不要后补形状。
+
+### P1-24a-6 / P1-24a-7 · 页面内新建与文件树编辑（a-6 ✅ 2026-11-19；a-7 ✅ 2026-11-19）
+
+完整口径见 §5.17 ~ §5.21。
+
+- **`P1-24a-6` 页面新建 Skill**：重新放开客户端建 `CREATE` 草稿（无来源 ⇒ 落库 `MANUAL`），列表页「新建 Skill」→ 元数据弹窗 → 正文模板 → 审核页 → `from-draft` 保存 v1；创建与保存两处都要求正文非空，堵住空壳。**不新增端点、无迁移**。
+- **`P1-24a-7` Skill 文件树编辑**：草稿记录增 `removedPaths`（草稿 payload JSON，无迁移）；新增 `PUT /files/content`、`POST /files/rename`，扩展 `DELETE /files` 支持墓碑与目录递归；`mergeFileEntries` / `materializeDraftFiles` 过滤删除集合；`SkillFileTree` 可选编辑模式 + `SkillDraftReview` 文本文件在线编辑；详情页「编辑文件」统一进 REVISION 草稿。**空目录不落版本**；Proposal / 会话覆写复用物化处必须一并传 `removedPaths`。
+
+> ⚠️ 这两批是对 c-2「客户端不能建 CREATE」与 a-5「详情页只能改正文」的**有意扩展**：只放开“无来源 CREATE”与“经草稿的文件变更”，抽取链路（来源与消息范围服务端判定）不变；任何文件变更仍必须走草稿 + `vN+1`，不允许旁路写 S3/DB。
 
 本文件不再重复列旧 `P1-24c` / `P1-24d`，避免编号漂移。
 
@@ -1444,6 +1562,8 @@ POST   /api/conversations/:id/skill-overrides/:overrideId/promote   // 另存为
 | 11 | Skill 目录注入阈值在 MVP 是否启用 | **不启用**：MVP 全量注入 + 始终下发 `list_skills`；阈值留待 Skill 数量上来再说（§4.4） |
 | 12 | 执行中发现流程/脚本不好用，怎么"改完马上用"。能否改别人的 Skill | **不能改上游**。提供**会话级覆写**（§5.16）：`SKILL.md + references/assets + scripts` 整版覆写、只对本会话生效、不改 `skills.version`；要长期保留走 `promote` 成自己的 fork。**`c-4b` 单独立批，a/b 批预留字段占位** |
 | 13 | 会话级覆写是否跨设备 / 跨会话 | **不跨**：绑定 `conversationId`，与会话保留期同生共死；要跨会话就 promote 成 Skill |
+| 14 | Skill 是否支持空目录 | **不支持**：整版快照只存文件；需要空目录只能放占位文件（如 `.keep`），默认不做（§5.19.4） |
+| 15 | 页面新建能否只填元数据 | **不能**：创建与保存两处都要求 `SKILL.md` 正文非空，避免 `load_skill` 必然失败的空壳（§5.18） |
 
 **明确不做：**
 

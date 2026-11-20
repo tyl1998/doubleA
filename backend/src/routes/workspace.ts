@@ -62,6 +62,7 @@ import { buildContentDisposition } from '../services/document.service.js'
 import { renderDocxToHtml } from '../services/docxPreview.js'
 import { HTML_PREVIEW_CSP, workspaceRawHeadersFor } from '../services/previewHeaders.js'
 import { parseXlsx, renderXlsxToHtml } from '../services/xlsxPreview.js'
+import { parseXmind } from '../services/xmindPreview.js'
 import { SSE_RESPONSE_HEADERS } from '../orchestrator/sse.js'
 import { registerWorkspaceArtifact } from '../sandbox/index.js'
 import {
@@ -321,6 +322,34 @@ export function registerWorkspaceRoutes(app: FastifyInstance): void {
         .header('x-content-type-options', 'nosniff')
         .header('cache-control', 'private, no-store')
         .send(html)
+    },
+  )
+
+  /**
+   * 大纲预览（`GET .../workspace/file/outline?path=`）—— **XMIND 专用**（2026-11-20）。
+   *
+   * 与产物那条 `GET /api/artifacts/:id/outline` 同一件事、同一个解析器（`parseXmind`），
+   * 只是取字节的来源不同：产物在 S3、工作区在宿主盘。返回结构化 JSON，前端画"左树 + 右阅读区"。
+   */
+  app.get<{ Params: ConversationIdParams; Querystring: WorkspacePathQuery }>(
+    '/api/conversations/:id/workspace/file/outline',
+    { preHandler: app.requireAuth, schema: { params: conversationIdParamsSchema, querystring: workspacePathQuerySchema } },
+    async (request) => {
+      const userId = userIdOf(request)
+      await assertWorkspaceOwner(request.params.id, userId)
+      const source = await openWorkspaceFileSource(request.params.id, request.query.path)
+      if (previewKindOf(source.mime) !== 'xmind') throw AppError.validation(appMsg('app.m090'))
+      if (source.size > ARTIFACT_PREVIEW_MAX_INLINE_BYTES) {
+        throw AppError.validation(appMsg('app.m019'))
+      }
+      try {
+        const parsed = parseXmind(source.body)
+        return ok({ fileName: source.path, sheets: parsed.sheets, truncated: parsed.truncated })
+      } catch (error) {
+        if (error instanceof AppError) throw error
+        getLogger().warn({ err: error, path: source.path }, '工作区 xmind 解析失败')
+        throw AppError.validation(appMsg('app.m091'))
+      }
     },
   )
 

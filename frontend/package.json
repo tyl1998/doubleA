@@ -17,6 +17,7 @@
     "verify:admin-ui": "node --import tsx scripts/verify-admin-ui.mjs",
     "verify:mcp-ui": "node --import tsx scripts/verify-mcp-ui.mjs",
     "verify:artifact-preview": "node --import tsx scripts/verify-artifact-preview.mjs",
+    "verify:xmind-outline": "node --import tsx scripts/verify-xmind-outline.mjs",
     "verify:artifact-panel": "node --import tsx scripts/verify-artifact-panel.mjs",
     "verify:usage-ui": "node --import tsx scripts/verify-usage-ui.mjs",
     "verify:sandbox-instances-ui": "node --import tsx scripts/verify-sandbox-instances-ui.mjs",

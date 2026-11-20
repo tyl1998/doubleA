@@ -55,6 +55,7 @@ import {
   WORKSPACE_MIME_BY_EXTENSION,
   type WorkspaceChangeEntry,
   XLSX_MIME,
+  XMIND_MIME,
 } from '@doubulea/shared'
 
 import { config } from '../config.js'
@@ -91,7 +92,7 @@ export const ARTIFACT_EXEC_TIMEOUT_MS = 60_000
  * 旧版这里是一张"刻意保守"的小名单（只认文本/表格/网页/图片/PDF），后果是 `.java`/`.go`/`.css`…
  * 一律落 `octet-stream` ⇒ `previewKindOf` 返回 `none` ⇒ 产物连「预览」入口都没有（只能下载）。
  * 现在改成：**扩展名 → mime 的判据只有一处**（`shared#WORKSPACE_MIME_BY_EXTENSION`），产物在它之上：
- *   · **补产物专属**：`.docx` / `.xlsx`（工作区表没有，它们是产物渲染出口的新形态）；
+ *   · **补产物专属**：`.docx` / `.xlsx` / `.xmind`（工作区表对前两者已有，这里是同源引用；三者都是产物渲染出口的形态）；
  *   · **两处覆盖**：`.vue` / `.svelte` 工作区表给 `text/html`（编辑器当网页开），但**产物当源码**更合适
  *     ⇒ 覆盖成 `text/plain`（否则 `previewKindOf` 会把一份 SFC 当 HTML 直出）。
  * 其余一律沿用工作区表；**两张表对同一扩展名的结论不再各写一份、不会分叉**（旧注释警告的正是这一点）。
@@ -102,6 +103,7 @@ const ARTIFACT_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   // ── 产物专属（工作区表没有；对应 `/render` 渲染出口的新形态）──
   docx: DOCX_MIME,
   xlsx: XLSX_MIME,
+  xmind: XMIND_MIME,
   // ── 覆盖工作区表的取舍：SFC 产物按**源码**看，不按网页直出 ──
   vue: 'text/plain',
   svelte: 'text/plain',

@@ -1,7 +1,7 @@
 # 子方案 — 从会话生成 Skill（Conversation → Skill）
 
 > 上游基准：`01-整体需求与实施步骤.md`（决策 18/29/30/37；⚠️ **决策 7「技能不做」由本方案修订**，回写要求见 `Skill能力.md` §1.1）、`02-后端设计.md`（§三 数据模型、§六 编排、§九 安全）、`03-前端设计.md`（§二 路由、对话页 / 消息选择）、`05-P系列计划拆分.md`（P1-24c）、`子方案/Skill能力.md`（§五·补、§五·补二）。
-> 状态：**c-1 ~ c-6 已落地（2026-11-16 ~ 2026-11-17），c-7（增强，可选）未开工**。
+> 状态：**c-1 ~ c-6 已落地（2026-11-16 ~ 2026-11-17）；c-7a 草稿跨设备恢复已落地（2026-11-19），c-7 其余可选增强未开工**。2026-11-19 新增 **a-6（页面内新建）与 a-7（文件树编辑）** 方案稿（未开工），见 `Skill能力.md` §5.17 ~ §5.21。
 2026-11-17 另按实测反馈完成一轮收尾修复（审核弹窗重做、提示卡按会话隔离、抽取稳定性），见 §8.2 与 §十三。本文只展开 P1-24c「从会话沉淀 Skill」；Skill 的基础模型、运行时、ChatBot/TaskAgent 装配与版本生效见 `子方案/Skill能力.md`。v3 订正：① 错误子码一律走 `data.code`（§六）；② `bindToAgentId` 的失败语义（§六）；③ 导入校验复用 P1-12 `.doc` 嗅探与新建 `skillZip.ts`（§六）；④ **新增第四种作用域「只改本会话的 Skill」与会话级覆写**（§10.1 / `SkillDraftKind` 增 `SESSION_OVERRIDE` / 新增批次 `c-4b`）。
 > 一句话：**会话负责“把这次流程生成成 Skill 草稿”，用户审核后保存到“我的 Skills”；它不是会话级临时 Skill，也不会随会话继续变化而自动改写。**（例外是「只改本会话的 Skill」——那是**显式的会话级覆写**，见 `Skill能力.md` §5.16：用户主动要求、只影响本会话、不改上游、可随时放弃或 promote 成正式 Skill。）
 
@@ -16,7 +16,7 @@
 3. 生成**可编辑草稿**，默认 `PRIVATE`，保存到用户级“我的 Skills”，可再绑定到 Agent。
 4. 默认不泄露原始工具输出与敏感业务数据；脱敏结果必须可见、可确认。
 5. 生成的 Skill 仍是普通 Skill：运行时、权限、危险确认、egress 策略都不放宽。
-6. 草稿是**服务端资源**（`/api/skill-drafts`）：前端只提交 `draftId` 与元数据，不提交 `storageKey`；审核/编辑可持续一小时以上，`PUT` 自动保存并续期。
+6. 草稿是**服务端资源**（`/api/skill-drafts`）：前端只提交 `draftId` 与元数据，不提交 `storageKey`；审核/编辑可跨设备持续进行，`PUT` 自动保存并续期（保留期默认 7 天）。
 
 ### 1.2 非目标
 
@@ -388,7 +388,7 @@ POST /api/skills/:id/proposals
 口径：
 
 - `POST /api/skill-drafts` 用 multipart（`draft.json` + 文件）或纯 JSON（无文件）；服务端生成 `draftKey` 并写入临时前缀，**客户端不能指定 `storageKey`**；`PUT` 只更新草稿内容和元数据，不能改 `targetSkillId/fromVersion/baseVersion`。
-- 草稿短存 Redis（建议 1 小时，`GET/PUT` 续期）+ S3 临时前缀 `skill-drafts/{userId}/{draftId}/`；审核页编辑超过 1 小时不丢草稿。
+- 草稿落 `skill_drafts` 表（c-7a；保留期默认 7 天滑窗，`GET/PUT` 续期）+ S3 临时前缀 `skill-drafts/{userId}/{draftId}/`；审核页持续编辑不丢草稿，换设备也能继续。
 - **文件清单只从服务端草稿读取**：`from-draft` / revisions / proposals 都不接受客户端 `files/storageKey/markdown`；请求体只给 `draftId` + 展示元数据。服务端按草稿内容与 DB 字段重写 frontmatter。
 - `from-draft` 只接受 `kind=CREATE`，revisions 只接受 `kind=REVISION`，Proposal 只接受 `kind=PROPOSAL`；错配 400。
 - `from-draft` / revisions 校验草稿归属、过期时间、runtime 与文件安全；`CREATE` 复制临时文件到 `skills/{skillId}/v1/...`，`REVISION` 复制到 `skills/{skillId}/v{fromVersion+1}/...`，成功后清理草稿。
@@ -427,12 +427,15 @@ sourceMessageIds     Json?           @map("source_message_ids") @db.JsonB
 
 ### 7.2 草稿存储
 
-MVP 不建议新增 `skill_drafts` 表：
+**c-1（2026-11-16，MVP）**：JSON 草稿放 Redis（`skill-draft:{draftId}`，TTL 1 小时），`GET/PUT` 续期，审核页每 60s 自动 `PUT` 一次；文件放 S3 临时前缀 `skill-drafts/{userId}/{draftId}/`。
 
-- JSON 草稿放 Redis，TTL 1 小时；`GET/PUT` 续期，审核页每 60s 自动 `PUT` 一次；浏览器本地再留一份只用于断网恢复的副本（不代替服务端草稿）；
-- 文件放 S3 临时前缀 `skill-drafts/{userId}/{draftId}/`；Proposal 提交时再物化到 `skill-proposals/{proposalId}/`，避免草稿过期导致审核中的 Proposal 丢文件；
-- 过期后后台清理；
-- 如果后续需要“我的草稿 / 跨设备恢复”，再加 `skill_drafts` 表，不影响当前 API 形态。
+**c-7a（2026-11-19 已落地，草稿跨设备恢复）**：JSON 草稿落 `skill_drafts` 表（`id / user_id / kind / payload / expires_at / created_at / updated_at`）：
+
+- `payload` 是整份服务端记录，对外仍只经 `toDraft` 投影（API 形态不变）；文件仍在同一条 S3 前缀；
+- 保留期 = `SKILL_DRAFT_TTL_SEC`（默认 **7 天**，`GET/PUT` 滑窗续期）；列表直接查表，换设备 / Redis 重启后仍能看到并继续编辑；
+- 过期 / 坏 payload 行由读写路径懒删；归属仍是 `user_id`，不是本人 / 不存在 / 过期统一 404；
+- **迁移**：表里没有时读一次旧 `skill-draft:{draftId}`，成功就写表并清旧键（部署期在途草稿不丢），之后 Redis 不再写草稿；
+- Proposal 提交时仍物化到 `skill-proposals/{proposalId}/`，草稿过期不影响审核；已提交提案草稿另保留 30 天。
 
 ---
 
@@ -1060,7 +1063,7 @@ POST /api/skills/:id/sync-upstream
 范围：
 
 - `POST/GET/PUT/DELETE /api/skill-drafts`（`kind=CREATE/REVISION/PROPOSAL`）；
-- Redis 草稿 + S3 临时前缀 `skill-drafts/{userId}/{draftId}/`；`GET/PUT` 续期；草稿归属校验；
+- `skill_drafts` 草稿行 + S3 临时前缀 `skill-drafts/{userId}/{draftId}/`；`GET/PUT` 续期；草稿归属校验；
 - multipart 上传（`draft.json` + 文件）或 JSON（无文件）；服务端生成 `draftKey`，不接受客户端 `storageKey`；
 - 审核页骨架（可编辑表单 + Markdown 预览 + 脱敏复核 + secret scan）；
 - `POST /api/skills/from-draft` 保存 `PRIVATE` Skill（只收 `draftId + 元数据`）；
@@ -1069,7 +1072,7 @@ POST /api/skills/:id/sync-upstream
 验收：
 
 - 手动创建 `CREATE` 草稿 → 编辑 → 保存 v1 → “我的 Skills”可见；
-- 草稿过期前 `PUT` 续期，超过 1 小时不丢；
+- 草稿过期前 `PUT` 续期，跨设备 / 长时间编辑不丢；
 - `GET/PUT/DELETE` 非本人草稿返回 404/403；
 - 客户端传 `storageKey/files/markdown` 到保存入口被忽略/400；
 - 本批**不接会话抽取**。
@@ -1077,7 +1080,7 @@ POST /api/skills/:id/sync-upstream
 ### P1-24c-2 · SUMMARY 抽取 ✅ 2026-11-16 已落地
 
 > 落地口径与原文的四处差异（均已回写 `06` 施工记录）：① **c-2 起 `POST /api/skill-drafts` 只收 `REVISION`**
-> —— CREATE 草稿只能由抽取端点生成（来源与消息范围必须服务端判定），「我的 Skills」原「新建本地草稿」入口随之下线；
+> —— CREATE 草稿只能由抽取端点生成（来源与消息范围必须服务端判定），「我的 Skills」原「新建本地草稿」入口随之下线；**2026-11-19 增补**：a-6 重新开放客户端建**无来源** `CREATE` 草稿（落库 `sourceType=MANUAL`），但创建时必须带非空正文，不恢复旧“空白草稿”入口，见 `Skill能力.md` §5.18；
 > ② `TRACE` 对**任何** Agent 都 400（管线属 c-3，不静默降级成 SUMMARY）；`includeArtifacts` 只做矩阵放行
 > （ChatBot 带 ⇒ 400，TaskAgent 带本版不阻断、产物候选属 c-3）；③ 抽取模型配置**单列一张平台单例表**
 > （`skill_extract_model_config`），没配时优先用会话当前模型、再回落标题模型，都没有 ⇒ 502 `EXTRACT_MODEL_UNAVAILABLE`；
@@ -1241,7 +1244,7 @@ POST /api/skills/:id/sync-upstream
 
 ### P1-24c-7 · 增强（可选）
 
-- 草稿跨设备恢复（`skill_drafts` 表）；
+- ✅ 草稿跨设备恢复（`skill_drafts` 表）—— **c-7a 已落地（2026-11-19）**，见 §7.2；
 - 参数化建议与更细的 diff；
 - 抽取质量反馈 / 评测集；
 - “在沙箱试跑 Skill”；
@@ -1258,7 +1261,7 @@ POST /api/skills/:id/sync-upstream
 - 生成的 `SKILL.md` frontmatter 可解析，表单与正文一致；`scripts=true` ⇒ `runtime=sandbox`。
 - `runtime=sandbox` 的草稿只能绑定 TaskAgent。
 - 保存后“我的 Skills”显示来源会话与版本；删除会话后显示“来源会话已删除”。
-- 保存失败 / 草稿过期 / 权限不足都有明确错误，不产生半成品 Skill；审核超过 1 小时由 `PUT` 续期，不丢草稿。
+- 保存失败 / 草稿过期 / 权限不足都有明确错误，不产生半成品 Skill；审核期间（含换设备）由 `PUT` 续期，不丢草稿。
 - 更新 Skill 后下一轮生效，当前轮不受影响；TaskAgent 不删除会话即可拿到新内容。
 - 从会话纠正更新：只改相关步骤、生成 `vN+1`、旧版本保留；diff 由服务端从草稿计算；`fromVersion` 冲突返回 409；非所属人只能 fork；固定版本的 Agent 不自动升级；选择“仅这一次”时零写入。
 - 会话级覆写：B 改 A 的 Skill（含 `scripts/**`）→ 上游字节不变 → B 的下一轮生效；上游再更新时下一轮提示"覆写基于 vN，上游已到 vM"，默认保留覆写（`Skill能力.md` §5.16.4）。
@@ -1274,7 +1277,7 @@ POST /api/skills/:id/sync-upstream
 | # | 事项 | 当前建议 |
 |---|---|---|
 | 1 | 抽取模型用哪个 | 默认独立 `skill_extract_model`；没配时优先用会话当前模型（工具=本轮模型；直连 API=智能体默认模型），再回落标题模型；都不可用时报错 |
-| 2 | 草稿是否持久化 | MVP Redis + S3 临时；`GET/PUT` 续期；需要跨设备再加表 |
+| 2 | 草稿是否持久化 | ✅ 已定（c-7a，2026-11-19）：落 `skill_drafts` 表，保留期默认 7 天滑窗；文件仍在 S3 临时前缀 |
 | 3 | 是否允许从他人共享会话生成 | 不允许；只允许会话所有者 |
 | 4 | 是否自动绑定当前 Agent | 不自动；显式勾选 |
 | 5 | 是否生成脚本 | 仅 TRACE 且能稳定提取；否则只写命令参考 |

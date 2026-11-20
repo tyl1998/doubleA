@@ -17,6 +17,7 @@
  *   GET    /api/skills/:id/file?path=&version=    单文件预览（JSON）或下载（`download=1`，**字节流**）
  *   GET    /api/skills/:id/file/raw?path=&version= 预览用原始字节（inline；HTML/SVG 带 CSP）
  *   GET    /api/skills/:id/file/render?path=&version= DOCX / XLSX 渲染成 HTML（inline）
+ *   GET    /api/skills/:id/file/outline?path=&version= XMIND 解成大纲 JSON（前端画树）
  *   GET    /api/skills/:id/download?version=      整包 zip 下载（与上传同形态）
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ import {
   openSkillFileRawSource,
   openSkillFileSource,
   previewSkillFile,
+  readSkillFileOutline,
   removeSkill,
   renderSkillFileHtml,
   transferSkill,
@@ -404,6 +406,13 @@ export function registerSkillRoutes(app: FastifyInstance): void {
         .header('cache-control', 'private, no-store')
         .send(source.html)
     },
+  )
+
+  /** XMIND 大纲（解 zip 读 `content.json` → JSON；由前端画"左树 + 右阅读区"） */
+  app.get<{ Params: SkillIdParams; Querystring: SkillFileQuery }>(
+    '/api/skills/:id/file/outline',
+    { preHandler: app.requireAuth, schema: { params: skillIdParamsSchema, querystring: skillFileQuerySchema } },
+    async (request) => ok(await readSkillFileOutline(request.params.id, request.query, viewerOf(request))),
   )
 
   /** 整包下载（zip，与上传同形态；`version` 缺省 = 当前版本） */

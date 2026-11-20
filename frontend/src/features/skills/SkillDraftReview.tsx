@@ -12,7 +12,7 @@
  * 与聊天侧宽版 Drawer 共用本组件。
  */
 
-import { PlusOutlined, UploadOutlined } from '@ant-design/icons'
+import { UploadOutlined } from '@ant-design/icons'
 import {
   SKILL_DESCRIPTION_MAX_CHARS,
   SKILL_ENTRY_PATH,
@@ -24,7 +24,6 @@ import {
   scanSkillSecrets,
   type MessageKey,
   type SkillDraft,
-  type SkillDraftFileKind,
   type SkillRedactionKind,
   type SkillRevisionTarget,
 } from '@doubulea/shared'
@@ -47,11 +46,13 @@ import {
   fetchSkillDraftFile,
   useDeleteSkillDraft,
   useRemoveSkillDraftFile,
+  useRenameSkillDraftPath,
   useSaveSkillFromDraft,
   useSaveSkillRevisionFromDraft,
   useSkillDraft,
   useUpdateSkillDraft,
   useUploadSkillDraftFile,
+  useWriteSkillDraftFileContent,
 } from '../../api/skillDrafts.js'
 import { usePageCrumb } from '../../app/crumbContext.js'
 import { useFeedback } from '../../app/feedback.js'
@@ -107,8 +108,18 @@ function saveLabelKey(kind: SkillDraft['kind']): MessageKey {
 
 function statusLabelKey(status: SkillReviewFile['status']): MessageKey {
   if (status === 'ADDED') return 'skillDraft.statusAdded'
+  if (status === 'REMOVED') return 'skillDraft.statusRemoved'
+  if (status === 'RENAMED') return 'skillDraft.statusRenamed'
   if (status === 'MODIFIED') return 'skillDraft.statusModified'
   return 'skillDraft.statusUnchanged'
+}
+
+/** 状态标签颜色（`REMOVED` 用红色） */
+function statusColor(status: SkillReviewFile['status']): string | undefined {
+  if (status === 'ADDED' || status === 'RENAMED') return 'green'
+  if (status === 'MODIFIED') return 'orange'
+  if (status === 'REMOVED') return 'red'
+  return undefined
 }
 
 export interface SkillDraftReviewProps {
@@ -128,6 +139,8 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
   const deleteDraft = useDeleteSkillDraft()
   const uploadFile = useUploadSkillDraftFile(draftId)
   const removeFile = useRemoveSkillDraftFile(draftId)
+  const renamePath = useRenameSkillDraftPath(draftId)
+  const writeFileContent = useWriteSkillDraftFileContent(draftId)
   const saveNew = useSaveSkillFromDraft()
   const saveRevision = useSaveSkillRevisionFromDraft(draftQuery.data?.targetSkillId ?? '')
   const submitProposal = useSubmitSkillProposal(draftQuery.data?.targetSkillId ?? '')
@@ -163,11 +176,31 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
   const [selectedPath, setSelectedPath] = useState<string>(SKILL_ENTRY_PATH)
   const [replacingPath, setReplacingPath] = useState<string | null>(null)
   const [removingPath, setRemovingPath] = useState<string | null>(null)
+  /** P1-24a-7：新建文件 / 文件夹 / 重命名的输入框 */
+  const [pathModal, setPathModal] = useState<
+    | null
+    | { mode: 'CREATE_FILE'; dir: string; value: string }
+    | { mode: 'CREATE_DIR'; dir: string; value: string }
+    | { mode: 'RENAME'; from: string; kind: 'FILE' | 'DIR'; value: string }
+  >(null)
 
   /** 每次 `PUT` 成功后的基线（避免把用户刚敲的字覆盖成服务端旧值） */
   const baseline = useRef<SkillDraftForm | null>(null)
   /** 哪份草稿已经应用过"沿用上次脱敏确认"（每份只应用一次） */
   const carriedConfirmedFor = useRef<string | null>(null)
+  /**
+   * P1-24a-7：树工具栏 / 目录行的「上传到此目录」。
+   * 用一个**独立的隐藏 file input** 触发系统文件框，然后把文件 multipart 上传到该目录 ——
+   * 不用 antd `Upload` 在点击时动态定位目标目录（那个 `beforeUpload` 闭包拿不到"刚点的哪一行"）。
+   */
+  const filePickerRef = useRef<HTMLInputElement | null>(null)
+  const uploadDirRef = useRef<(dir: string) => void>(() => undefined)
+  useEffect(() => {
+    uploadDirRef.current = (dir: string) => {
+      filePickerRef.current?.setAttribute('data-dir', dir)
+      filePickerRef.current?.click()
+    }
+  })
 
   useEffect(() => {
     if (draftId === '') return
@@ -363,8 +396,9 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
       // 提案草稿是整版快照：基准文件不再并入，否则副本里删掉的文件会在审核页被当成"未改动"
       baseFiles: draft?.kind === 'PROPOSAL' ? [] : (baseSkill?.files ?? []),
       isTargeted,
+      removedPaths: draft?.removedPaths ?? [],
     })
-  }, [form?.markdown, baseMarkdown, draft?.files, draft?.kind, baseSkill?.files, isTargeted])
+  }, [form?.markdown, baseMarkdown, draft?.files, draft?.kind, draft?.removedPaths, baseSkill?.files, isTargeted])
   const selectedFile = reviewFiles.find((file) => file.path === selectedPath) ?? reviewFiles[0] ?? null
   const effectivePath = selectedFile?.path ?? null
   const baseReady = !isTargeted || baseSkill !== null || targetSkillQuery.isError
@@ -514,11 +548,6 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
     })
   }
 
-  const pickPath = (file: File, kind: SkillDraftFileKind): string => {
-    const folder = kind === 'script' ? 'scripts/' : kind === 'asset' ? 'assets/' : 'references/'
-    return `${folder}${file.name}`
-  }
-
   async function replaceDraftFile(path: string, file: File): Promise<void> {
     if (form === null) return
     if (isLikelyScriptPath(path) && form.runtime !== 'SANDBOX') {
@@ -537,21 +566,132 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
     }
   }
 
-  function removeDraftFile(path: string): void {
+  function removeDraftFile(path: string, recursive = false): void {
     setRemovingPath(path)
-    removeFile.mutate(path, {
-      onError: (error) => feedback.fail(error, t('skillDraft.fileRemoveFailed')),
-      onSettled: () => setRemovingPath(null),
+    removeFile.mutate(
+      { path, recursive },
+      {
+        onSuccess: () => feedback.ok(t('skillFile.deleted', { path })),
+        onError: (error) => feedback.fail(error, t('skillFile.deleteFailed')),
+        onSettled: () => setRemovingPath(null),
+      },
+    )
+  }
+
+  /**
+   * 撤销删除：把原内容用 `PUT /files/content` 写回即把该路径从墓碑里摘掉。
+   *
+   * · **基准文件**：字节在基准前缀（只读），从基准读回正文再写回草稿；
+   * · **草稿文件**：删除只从 `files` 摘掉行，草稿对象仍在，按原路径读回。
+   * 二进制文件没有"正文"可写 ⇒ 只能提示（`skillDraft.fileBinaryHint`），不假装恢复成功。
+   */
+  async function restoreDraftPath(path: string): Promise<void> {
+    try {
+      const text =
+        baseSkill?.files.some((file) => file.path === path) === true
+          ? await readSkillTextFile(baseSkillId, path, draft?.baseVersion ?? undefined)
+          : await fetchSkillDraftFile(draftId, path).then((preview) => (preview.kind === 'TEXT' ? preview.text : null))
+      if (text === null || text === undefined) {
+        feedback.note(t('skillDraft.fileBinaryHint'))
+        return
+      }
+      await writeFileContent.mutateAsync({ path, text })
+      feedback.ok(t('skillFile.restored', { path }))
+    } catch (error) {
+      feedback.fail(error, t('skillFile.fileCreateFailed'))
+    }
+  }
+
+  // ── P1-24a-7：新建文件 / 文件夹 / 重命名（都在草稿里完成） ──
+
+  function submitPathModal(): void {
+    if (pathModal === null) return
+    const raw = pathModal.value.trim()
+    if (raw === '') return
+    const parent = pathModal.mode === 'RENAME' ? null : pathModal.dir
+    const path = parent === null || parent === '' ? raw : `${parent}/${raw.replace(/^\/+?/u, '')}`
+    if (pathModal.mode === 'CREATE_FILE') {
+      if (form !== null && isLikelyScriptPath(path) && form.runtime !== 'SANDBOX') {
+        feedback.note(t('skillDraft.scriptNeedsSandbox'))
+        return
+      }
+      writeFileContent.mutate(
+        { path, text: `${t('skillFile.newFileTemplate')}\n` },
+        {
+          onSuccess: () => {
+            setSelectedPath(path)
+            feedback.ok(t('skillFile.fileCreated', { path }))
+            setPathModal(null)
+          },
+          onError: (error) => feedback.fail(error, t('skillFile.fileCreateFailed')),
+        },
+      )
+      return
+    }
+    if (pathModal.mode === 'CREATE_DIR') {
+      // 空目录不落版本：新建文件夹只提供一个 `.keep` 占位文件，用户可随即删除
+      const keep = `${path}/.keep`
+      writeFileContent.mutate(
+        { path: keep, text: `${t('skillFile.keepTemplate')}\n` },
+        {
+          onSuccess: () => {
+            feedback.ok(t('skillFile.fileCreated', { path: keep }))
+            setPathModal(null)
+          },
+          onError: (error) => feedback.fail(error, t('skillFile.fileCreateFailed')),
+        },
+      )
+      return
+    }
+    if (pathModal.mode === 'RENAME') {
+      renamePath.mutate(
+        { from: pathModal.from, to: path, kind: pathModal.kind },
+        {
+          onSuccess: () => {
+            feedback.ok(t('skillFile.renamed', { path }))
+            setPathModal(null)
+          },
+          onError: (error) => feedback.fail(error, t('skillFile.renameFailed')),
+        },
+      )
+    }
+  }
+
+  /** 删除文件 / 目录（目录先确认将删掉的文件数） */
+  function requestDelete(path: string, kind: 'FILE' | 'DIR'): void {
+    if (kind === 'FILE') {
+      Modal.confirm({
+        title: t('skillFile.deleteFileTitle'),
+        content: t('skillFile.deleteFileDesc', { path }),
+        okText: t('skillFile.confirm'),
+        okButtonProps: { danger: true },
+        cancelText: t('common.cancel'),
+        onOk: () => removeDraftFile(path),
+      })
+      return
+    }
+    const count = reviewFiles.filter(
+      (file) => file.path !== SKILL_ENTRY_PATH && file.status !== 'REMOVED' && (file.path === path || file.path.startsWith(`${path}/`)),
+    ).length
+    Modal.confirm({
+      title: t('skillFile.deleteDirTitle'),
+      content: t('skillFile.deleteDirDesc', { dir: path, count }),
+      okText: t('skillFile.confirm'),
+      okButtonProps: { danger: true },
+      cancelText: t('common.cancel'),
+      onOk: () => removeDraftFile(path, true),
     })
   }
 
-  function addDraftFile(file: File, kind: SkillDraftFileKind): boolean {
+  /** 在 `dir` 下上传文件（目录行菜单 / 左栏工具栏都由它决定去向） */
+  function addDraftFileTo(file: File, dir: string): boolean {
     if (form === null) return false
-    if (kind === 'script' && form.runtime !== 'SANDBOX') {
+    const name = file.name
+    const path = dir === '' ? name : `${dir}/${name}`
+    if (isLikelyScriptPath(path) && form.runtime !== 'SANDBOX') {
       feedback.note(t('skillDraft.scriptNeedsSandbox'))
       return false
     }
-    const path = pickPath(file, kind)
     uploadFile.mutate(
       { file, path },
       {
@@ -565,9 +705,34 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
     return false
   }
 
+  /** 文本文件内容保存（右侧编辑器 / 撤销删除共用；走同一份草稿写入端点） */
+  async function saveTextFile(path: string, text: string, baseline: string): Promise<void> {
+    if (text === baseline) return
+    try {
+      await writeFileContent.mutateAsync({ path, text })
+      setRedactionConfirmed(false)
+      feedback.ok(t('skillFile.fileCreated', { path }))
+    } catch (error) {
+      feedback.fail(error, t('skillDraft.fileEditFailed'))
+    }
+  }
+
+  /** 隐藏 file input 的回调：目标目录来自 input 的 `data-dir`（见 `uploadDirRef`） */
+  function onPickUploadFile(input: HTMLInputElement): void {
+    const file = input.files?.[0]
+    const dir = input.getAttribute('data-dir') ?? ''
+    input.value = ''
+    if (file !== undefined) addDraftFileTo(file, dir)
+  }
+
   const title = form.name.trim() === '' ? t('skillDraft.untitled') : form.name
   const modifiedCount = reviewFiles.filter((file) => file.status !== 'UNCHANGED').length
   const kindLabel = t(kindLabelKey(draft.kind))
+  // P1-24a-6：页面新建（无来源 CREATE）的标题点明"还在草稿里"，避免和已保存的 Skill 混淆
+  const headTitle =
+    draft.kind === 'CREATE' && draft.source === null
+      ? t('skillDraft.createHeadTitle', { name: title })
+      : title
 
   const actionButtons = submissionLocked ? (
     <div className={embedded ? 'skill-review__actions' : 'page__head-actions'}>
@@ -613,7 +778,7 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
       {embedded ? (
         <div className="skill-review__head">
           <div className="skill-review__head-main">
-            <strong>{title}</strong>
+            <strong>{headTitle}</strong>
             <span className="ratio">
               {kindLabel}
               {isTargeted && draft.baseVersion !== null ? ` · ${t('skillDraft.basedOn', { version: draft.baseVersion })}` : ''}
@@ -625,7 +790,7 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
       ) : (
         <div className="page__head">
           <div>
-            <h1>{title}</h1>
+            <h1>{headTitle}</h1>
             <p className="page__lead">
               {t('skillDraft.lead', { kind: kindLabel })}
               {isTargeted && draft.baseVersion !== null ? ` · ${t('skillDraft.basedOn', { version: draft.baseVersion })}` : ''}
@@ -663,7 +828,14 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
           <button type="button" aria-pressed={tab === 'files'} onClick={() => setTab('files')}>
             {t('skillDraft.reviewFiles')}
           </button>
-          <button type="button" aria-pressed={tab === 'settings'} onClick={() => setTab('settings')}>
+          <button
+            type="button"
+            aria-pressed={tab === 'settings'}
+            onClick={() => {
+              // 「设置」里既有元数据也有 `SKILL.md` 正文：默认落在概览，正文是一栏独立输入框
+              setTab('settings')
+            }}
+          >
             {t('skillDraft.reviewSettings')}
           </button>
         </div>
@@ -684,27 +856,29 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
                 const file = reviewFiles.find((item) => item.path === path)
                 return file === undefined || file.status === 'UNCHANGED' ? null : file.status
               }}
+              {...(submissionLocked
+                ? {}
+                : {
+                    actions: {
+                      busy: uploadFile.isPending || writeFileContent.isPending || renamePath.isPending,
+                      onCreateFile: (dir: string) => setPathModal({ mode: 'CREATE_FILE', dir, value: '' }),
+                      onCreateDir: (dir: string) => setPathModal({ mode: 'CREATE_DIR', dir, value: '' }),
+                      onUpload: (dir: string) => uploadDirRef.current?.(dir),
+                      onRename: (path: string, kind: 'FILE' | 'DIR') =>
+                        setPathModal({ mode: 'RENAME', from: path, kind, value: path }),
+                      onDelete: requestDelete,
+                      onRestore: (path: string) => {
+                        void restoreDraftPath(path)
+                      },
+                    },
+                  })}
             />
-            {submissionLocked ? null : (
-              <div className="row row--wrap" style={{ gap: 'var(--sp-2)', marginTop: 'var(--sp-3)' }}>
-                {(['reference', 'asset', 'script'] as const).map((kind) => (
-                  <Upload key={kind} showUploadList={false} beforeUpload={(file) => addDraftFile(file, kind)}>
-                    <Button size="small" icon={<PlusOutlined />} loading={uploadFile.isPending}>
-                      {t(
-                        kind === 'script'
-                          ? 'skillDraft.addScript'
-                          : kind === 'asset'
-                            ? 'skillDraft.addAsset'
-                            : 'skillDraft.addReference',
-                      )}
-                    </Button>
-                  </Upload>
-                ))}
-              </div>
-            )}
-            <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>
-              {t('skillDraft.fileFolderHint')}
-            </p>
+            <input
+              ref={filePickerRef}
+              type="file"
+              style={{ display: 'none' }}
+              onChange={(event) => onPickUploadFile(event.currentTarget)}
+            />
           </div>
 
           <div className="card card--pad skill-review__pane">
@@ -730,6 +904,8 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
                 replacing={replacingPath === selectedFile.path}
                 removing={removingPath === selectedFile.path}
                 onRemoveFile={removeDraftFile}
+                onSaveText={saveTextFile}
+                savingText={writeFileContent.isPending}
               />
             )}
           </div>
@@ -947,6 +1123,50 @@ export function SkillDraftReview({ draftId, embedded = false, onDone }: SkillDra
           ) : null}
         </div>
       )}
+
+      <Modal
+        open={pathModal !== null}
+        title={
+          pathModal === null
+            ? ''
+            : pathModal.mode === 'RENAME'
+              ? t('skillFile.renameTitle')
+              : pathModal.mode === 'CREATE_DIR'
+                ? t('skillFile.newFolder')
+                : t('skillFile.newFileTitle')
+        }
+        okText={t('skillFile.confirm')}
+        cancelText={t('common.cancel')}
+        okButtonProps={{ loading: writeFileContent.isPending || renamePath.isPending }}
+        onOk={submitPathModal}
+        onCancel={() => setPathModal(null)}
+        destroyOnHidden
+      >
+        {pathModal !== null && pathModal.mode === 'RENAME' ? (
+          <>
+            <p className="block-label">{t('skillFile.renameFromLabel')}</p>
+            <Input value={pathModal.from} disabled />
+            <p className="block-label">{t('skillFile.renameToLabel')}</p>
+            <Input
+              value={pathModal.value}
+              onChange={(event) => setPathModal({ ...pathModal, value: event.target.value })}
+            />
+          </>
+        ) : (
+          <>
+            <p className="block-label">{t('skillFile.newFilePathLabel')}</p>
+            <Input
+              autoFocus
+              value={pathModal?.value ?? ''}
+              onChange={(event) => {
+                if (pathModal !== null) setPathModal({ ...pathModal, value: event.target.value })
+              }}
+              onPressEnter={submitPathModal}
+            />
+            {pathModal !== null && pathModal.dir !== '' ? <p className="ratio">{pathModal.dir}/</p> : null}
+          </>
+        )}
+      </Modal>
     </div>
   )
 }
@@ -973,6 +1193,8 @@ function ReviewFilePane({
   replacing,
   removing,
   onRemoveFile,
+  onSaveText,
+  savingText,
 }: {
   draftId: string
   skillId: string
@@ -989,14 +1211,24 @@ function ReviewFilePane({
   replacing: boolean
   removing: boolean
   onRemoveFile: (path: string) => void
+  /** 文本文件（非 `SKILL.md`）内容保存（P1-24a-7：右侧编辑器直接写草稿） */
+  onSaveText: (path: string, text: string, baseline: string) => void
+  savingText: boolean
 }) {
   const { t } = useT()
   const isEntry = file.path === SKILL_ENTRY_PATH
-  const canDiff = isTargeted && file.status !== 'UNCHANGED'
+  const removed = file.removed
+  /** 非 `SKILL.md` 的文本文件可以在右侧直接编辑（P1-24a-7） */
+  const editableTextFile = !isEntry && !removed && file.previewable && !file.purged
+  const [textDraft, setTextDraft] = useState<string | null>(null)
+  const canDiff = isTargeted && file.status !== 'UNCHANGED' && !removed
   const [mode, setMode] = useState<FileViewMode>(canDiff ? 'DIFF' : 'CONTENT')
   /** 改动被用户在编辑里改回去后 `canDiff` 会变 false；此时 DIFF 按钮已隐藏，视图必须落回内容 */
+  const canEditHere = isEntry || editableTextFile
   const effectiveMode: FileViewMode =
-    (mode === 'DIFF' && !canDiff) || (readOnly && mode === 'EDIT') ? 'CONTENT' : mode
+    (mode === 'DIFF' && !canDiff) || (readOnly && mode === 'EDIT') || (mode === 'EDIT' && !canEditHere)
+      ? 'CONTENT'
+      : mode
 
   const baseQuery = useQuery({
     queryKey: ['skill-review-base-text', skillId, baseVersion ?? 0, file.path] as const,
@@ -1022,6 +1254,7 @@ function ReviewFilePane({
     : baseQuery.isPending || (file.inDraft && draftQuery.isPending)
   const failed = isEntry ? baseFailed : baseQuery.isError || draftQuery.isError
   const binary = !isEntry && (!file.previewable || file.purged)
+  const afterEditableText = editableTextFile ? (textDraft ?? afterText ?? '') : ''
 
   function renderContent(text: string): ReactNode {
     if (isMarkdownMime(file.mime)) return <MarkdownPreview text={text} />
@@ -1058,11 +1291,47 @@ function ReviewFilePane({
     }
     if (loading) return <p className="ratio">{t('skillDraft.diffFileLoading')}</p>
     if (failed) return <p className="ratio">{t('skillDraft.diffFileFailed')}</p>
-    const text = afterText ?? ''
+    const text = editableTextFile ? afterEditableText : (afterText ?? '')
     return text === '' ? <Empty description={t('skillDraft.previewEmpty')} /> : renderContent(text)
   }
 
   function renderEditor(): ReactNode {
+    if (!isEntry) {
+      return (
+        <div className="stack stack--tight">
+          <p className="block-label">{t('skillDraft.fileEditLabel')}</p>
+          <Input.TextArea
+            autoSize={{ minRows: 16, maxRows: 40 }}
+            value={afterEditableText}
+            readOnly={readOnly || failed || loading}
+            onChange={(event) => setTextDraft(event.target.value)}
+            spellCheck={false}
+            style={{ fontFamily: 'var(--font-mono)' }}
+          />
+          <p className="ratio">{t('skillDraft.fileEditHint')}</p>
+          <div className="row row--wrap" style={{ gap: 'var(--sp-2)' }}>
+            <Button
+              size="small"
+              type="primary"
+              loading={savingText}
+              disabled={textDraft === null || textDraft === (afterText ?? '')}
+              onClick={() => {
+                if (textDraft === null) return
+                onSaveText(file.path, textDraft, afterText ?? '')
+                setTextDraft(null)
+              }}
+            >
+              {t('common.save')}
+            </Button>
+            {textDraft !== null && textDraft !== (afterText ?? '') ? (
+              <Button size="small" onClick={() => setTextDraft(null)}>
+                {t('common.cancel')}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      )
+    }
     return (
       <div className="skill-review__editor">
         <Input.TextArea
@@ -1090,7 +1359,7 @@ function ReviewFilePane({
       <div className="skill-review__pane-head">
         <code>{file.path}</code>
         {file.status === 'UNCHANGED' ? null : (
-          <Tag color={file.status === 'ADDED' ? 'green' : 'orange'}>{t(statusLabelKey(file.status))}</Tag>
+          <Tag color={statusColor(file.status)}>{t(statusLabelKey(file.status))}</Tag>
         )}
         <span className="ratio num">{formatBytes(file.size)}</span>
         {file.purged ? <span className="ratio">{t('skillDetail.purgedTag')}</span> : null}
@@ -1106,13 +1375,13 @@ function ReviewFilePane({
           <button type="button" aria-pressed={mode === 'CONTENT'} onClick={() => setMode('CONTENT')}>
             {t('skillDraft.viewContent')}
           </button>
-          {isEntry && !readOnly ? (
+          {(isEntry || editableTextFile) && !readOnly ? (
             <button type="button" aria-pressed={mode === 'EDIT'} onClick={() => setMode('EDIT')}>
               {t('skillDraft.viewEdit')}
             </button>
           ) : null}
         </div>
-        {!isEntry && !readOnly ? (
+        {!isEntry && !readOnly && !removed ? (
           <Upload
             showUploadList={false}
             beforeUpload={(next) => {
@@ -1125,7 +1394,7 @@ function ReviewFilePane({
             </Button>
           </Upload>
         ) : null}
-        {!isEntry && !readOnly && file.inDraft ? (
+        {!isEntry && !readOnly && !removed && (file.inDraft || file.inBase) ? (
           <Button
             size="small"
             danger
@@ -1137,9 +1406,12 @@ function ReviewFilePane({
         ) : null}
       </div>
 
-      {effectiveMode === 'DIFF' && canDiff ? renderDiff() : null}
-      {effectiveMode === 'CONTENT' ? renderContentPane() : null}
-      {effectiveMode === 'EDIT' && isEntry ? renderEditor() : null}
+      {removed ? (
+        <Alert type="warning" showIcon message={t('skillDraft.fileDeletedHint')} />
+      ) : null}
+      {removed ? null : effectiveMode === 'DIFF' && canDiff ? renderDiff() : null}
+      {removed ? null : effectiveMode === 'CONTENT' ? renderContentPane() : null}
+      {removed ? null : effectiveMode === 'EDIT' && (isEntry || editableTextFile) ? renderEditor() : null}
 
       {!isEntry && file.inBase && file.inDraft && file.status !== 'UNCHANGED' ? (
         <p className="ratio" style={{ marginTop: 'var(--sp-2)' }}>

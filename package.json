@@ -37,6 +37,7 @@
     "verify:admin-ui": "pnpm --filter @doubulea/frontend verify:admin-ui",
     "verify:mcp-ui": "pnpm --filter @doubulea/frontend verify:mcp-ui",
     "verify:artifact-preview": "pnpm --filter @doubulea/frontend verify:artifact-preview",
+    "verify:xmind-outline": "pnpm --filter @doubulea/frontend verify:xmind-outline",
     "verify:artifact-panel": "pnpm --filter @doubulea/frontend verify:artifact-panel",
     "verify:usage-ui": "pnpm --filter @doubulea/frontend verify:usage-ui",
     "verify:sandbox-instances-ui": "pnpm --filter @doubulea/frontend verify:sandbox-instances-ui",

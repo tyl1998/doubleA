@@ -34,11 +34,12 @@
 import { useEffect, useState, type ReactElement } from 'react'
 import { Alert, Button, Drawer, Skeleton } from 'antd'
 
-import type { ArtifactItem } from '@doubulea/shared'
+import type { ArtifactItem, XmindOutline } from '@doubulea/shared'
 
-import { fetchArtifactText } from '../../api/artifacts.js'
+import { fetchArtifactOutline, fetchArtifactText } from '../../api/artifacts.js'
 import { describeError } from '../../api/client.js'
 import { useT } from '../../app/i18n.js'
+import { XmindOutlinePreview } from '../XmindOutline/XmindOutlinePreview.js'
 import { CsvPreview } from './CsvPreview.js'
 import { HtmlPreview } from './HtmlPreview.js'
 import { ImagePreview } from './ImagePreview.js'
@@ -64,6 +65,13 @@ type TextState =
   | { phase: 'not-utf8' }
   | { phase: 'error'; message: string }
 
+/** XMind 大纲那一路的取数状态（`xmind` 形态专用） */
+type OutlineState =
+  | { phase: 'idle' }
+  | { phase: 'loading' }
+  | { phase: 'ready'; outline: XmindOutline }
+  | { phase: 'error'; message: string }
+
 export interface ArtifactPreviewDrawerProps {
   /** 要预览的产物；`null` = 没有在预览（弹层 `open` 由调用方控） */
   artifact: ArtifactItem | null
@@ -77,6 +85,7 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
   // —— P0-3-11 起「下载」有了第二个入口，两处的文案与禁用判据必须同源
   const { downloading, download } = useArtifactDownload()
   const [text, setText] = useState<TextState>({ phase: 'idle' })
+  const [outline, setOutline] = useState<OutlineState>({ phase: 'idle' })
 
   const artifactId = artifact?.artifactId ?? ''
   const fileName = artifact?.fileName ?? ''
@@ -109,6 +118,26 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
     return () => controller.abort()
   }, [open, artifactId, view?.available, view?.kind])
 
+  // XMind 大纲：与文本那一路同样"关弹层就丢"，但取的是结构化 JSON（服务端已解包）
+  useEffect(() => {
+    if (!open || artifactId === '' || view === null || !view.available || view.kind !== 'xmind') {
+      setOutline({ phase: 'idle' })
+      return
+    }
+    const controller = new AbortController()
+    setOutline({ phase: 'loading' })
+    void (async () => {
+      try {
+        const loaded = await fetchArtifactOutline(artifactId, { signal: controller.signal })
+        setOutline({ phase: 'ready', outline: loaded })
+      } catch (error) {
+        if (controller.signal.aborted) return
+        setOutline({ phase: 'error', message: describeError(error).message })
+      }
+    })()
+    return () => controller.abort()
+  }, [open, artifactId, view?.available, view?.kind])
+
   /** 渲染器分派：**只有这一处**（`子方案④` §五 1：判据是 `previewKindOf`，不看扩展名） */
   function body(): ReactElement | null {
     if (view === null || !view.available) return null
@@ -122,6 +151,14 @@ export function ArtifactPreviewDrawer({ artifact, open, onClose }: ArtifactPrevi
       case 'xlsx':
         // XLSX 同样走**渲染出口**（服务端手写读取器 → HTML 表格），复用同一个沙箱 iframe
         return <HtmlPreview artifactId={artifactId} fileName={fileName} src={artifactRenderUrl(artifactId)} />
+      case 'xmind':
+        // XMIND 不走 HTML：服务端把它解成大纲 JSON，这里画"左树 + 右阅读区"（用例节点自动摊平）
+        return (
+          <XmindOutlinePreview
+            outline={outline.phase === 'ready' ? outline.outline : undefined}
+            error={outline.phase === 'error' ? outline.message : null}
+          />
+        )
       case 'image':
         return <ImagePreview artifactId={artifactId} fileName={fileName} />
       case 'pdf':

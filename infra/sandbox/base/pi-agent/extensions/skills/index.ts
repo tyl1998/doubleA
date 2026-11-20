@@ -103,7 +103,9 @@ export default function skillsExtension(pi: ExtensionAPI): void {
   // ⚠️ 约束①：工厂里只读 env、只挂 handler（不起 socket / 定时器）。
   //    目录只在执行期用（`skillsDir()`），这里喊一声只为了把"env 装配漏了"写进日志。
   announceSkillsDir()
-  const skillsDir = skillsDir()
+  // ⚠️ 不能写成 `const skillsDir = skillsDir()`：同名 `const` 会让右侧的解析落到它自己身上
+  //    （TDZ）⇒ 扩展加载即抛 `Cannot access 'skillsDir' before initialization`，引擎直接退出。
+  const skillsRoot = skillsDir()
   const backend = {
     backendUrl: process.env[BACKEND_URL_ENV]?.trim() ?? '',
     token: process.env[TOKEN_ENV]?.trim() ?? '',
@@ -121,7 +123,7 @@ export default function skillsExtension(pi: ExtensionAPI): void {
   async function loadManifest(): Promise<SkillManifest | null> {
     let text: string
     try {
-      text = await readFile(join(skillsDir, SKILL_MANIFEST_FILE), 'utf8')
+      text = await readFile(join(skillsRoot, SKILL_MANIFEST_FILE), 'utf8')
     } catch (error) {
       log('WARN', `读不到 ${SKILL_MANIFEST_FILE}（${describeError(error)}）⇒ 本会话不注册 Skill 工具`)
       return null
